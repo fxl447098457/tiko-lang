@@ -650,8 +650,8 @@ Each tests one state of the button with command identifier `idButton`.
 
 **Returns** 0 when the state is off. When it is on, the value is the state's own `TBSTATE_*`
 flag, not 1: `IsButtonEnabled` returns 4 (`TBSTATE_ENABLED`), `IsButtonHidden` 8,
-`IsButtonPressed` 2, `IsButtonIndeterminate` 16, `IsButtonHighlighted` 128 and `IsButtonChecked`
-1. Test them as true or false, not against 1.
+`IsButtonPressed` 2, `IsButtonIndeterminate` 16, `IsButtonHighlighted` 128 and
+`IsButtonChecked` 1. Test them as true or false, not against 1.
 
 **Example**
 

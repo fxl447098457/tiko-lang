@@ -310,10 +310,11 @@ and writing through it is refused. Going the other way — from `const` back to 
 To keep the text, assign the slice to a `ustring`. That makes the copy, once, at the point where
 you decide the text is worth keeping.
 
-`s[3 to 2]` is empty: a slice whose end is one before its start has no units. So `s[0 to len( s )
-- 1]` is the whole of `s` even when `s` is empty. Anything else outside the string is runtime
-error 6 — checked whenever a slice is made, in every build — and a range the compiler can see is
-wrong, such as `5 to 2` or past the end of a `string * 4`, is `TKO1051` before the program runs.
+`s[3 to 2]` is empty: a slice whose end is one before its start has no units. So
+`s[0 to len( s ) - 1]` is the whole of `s` even when `s` is empty. Anything else outside the
+string is runtime error 6 — checked whenever a slice is made, in every build — and a range the
+compiler can see is wrong, such as `5 to 2` or past the end of a `string * 4`, is `TKO1051` before
+the program runs.
 
 ### Slices in the standard library
 
