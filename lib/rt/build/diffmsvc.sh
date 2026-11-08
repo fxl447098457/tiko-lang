@@ -223,12 +223,12 @@ for src in $(ls "$RT_ROOT"/tests/abi/*.bas 2>/dev/null | sort); do
     # version of this script passed none of them and skipped 22 of 114 as "does
     # not build against fbc's runtime" -- which was this harness failing, not a
     # finding, and it would have made the identical/differing split a ratio over a
-    # biased subset. -l winspool and -l gdi32 are needed because io_printer draws
-    # through both and this link names the whole archive.
+    # biased subset. No -l winspool/-l gdi32: the reference links fbc's runtime
+    # on demand, and the subject links a freshly built tiko-rt whose printer
+    # driver resolves both DLLs at runtime.
     LANGOPT=""
     if grep -q 'NEEDS-LANG-FBLITE' "$src"; then LANGOPT="-lang fblite"; fi
     if grep -q 'NEEDS-LANG-QB' "$src"; then LANGOPT="-lang qb"; fi
-    EXTRALIBS="-l winspool -l gdi32"
 
     # ---------------------------------------------------------- reference
     #
@@ -248,7 +248,7 @@ for src in $(ls "$RT_ROOT"/tests/abi/*.bas 2>/dev/null | sort); do
     # tiko-rt's and tiko-rt is not exposed to it (it declares no array
     # parameter anywhere), but a harness that hides it inside an "ABI"
     # differential is worse than one that does not run at all.
-    if ! "$TKORT_FBC" "$src" -x "$ref" $(rt_incflags) $LANGOPT $MTOPT $EXTRALIBS \
+    if ! "$TKORT_FBC" "$src" -x "$ref" $(rt_incflags) $LANGOPT $MTOPT \
             -gen llvm -O "$PROBE_OPT" > "$WORK/$name.reflog" 2>&1; then
         skip=$((skip + 1))
         echo "diffmsvc: SKIP $name -- does not build against fbc's runtime" >&2
@@ -279,9 +279,11 @@ for src in $(ls "$RT_ROOT"/tests/abi/*.bas 2>/dev/null | sort); do
         continue
     fi
 
+    # THISLIB is built from the current sources: no winspool/gdi32 import
+    # libraries, because io/printerwin.tiko loads both DLLs at runtime.
     if ! "$CLANG" --target=x86_64-pc-windows-msvc "$obj" "$THISLIB" -o "$sub" \
             -nostdlib "-L$IMPLIBS" -lucrtbase -lkernel32 \
-            -lwinspool -lgdi32 -luser32 -ladvapi32 -lwinmm -lmsimg32 -lversion -limm32 -lws2_32 \
+            -luser32 -ladvapi32 -lwinmm -lmsimg32 -lversion -limm32 -lws2_32 \
             -Xlinker /INCLUDE:tkort_msvc_init_ \
             >> "$WORK/$name.sublog" 2>&1; then
         differ=$((differ + 1))

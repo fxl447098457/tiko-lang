@@ -122,6 +122,8 @@ A slice has a fixed length. Nothing done through it can grow or shrink its sourc
 
 `ustring( v )` and `string( v )` are not conversions; assignment or `cast` is the way back to an owned string.
 
+A slice has no NUL at its end, so it does not convert to a `zstring ptr` or `byref as zstring` parameter (`TKO0698`). To pass one to C, ask for the copy: `cast( string, v )` is terminated and lasts until the end of the statement.
+
 ## Parameters
 
 A parameter `byval v as const uslice` accepts any string:

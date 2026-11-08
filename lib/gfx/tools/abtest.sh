@@ -221,11 +221,14 @@ else
         # lld, '-nostdlib' so no Visual Studio CRT, ucrtbase.dll plus tiko-rt's
         # msvccrt.o in its place, and kernel32 named because '-nostdlib' drops
         # it. NOT -llegacy_stdio_definitions -- msvccrt.o defines sprintf, and
-        # the two collide.
+        # the two collide. No -lwinspool/-lgdi32 here: LIBFB_MSVC is built from
+        # the current sources, whose printer driver loads both DLLs at runtime.
+        # tiko's MSVC link line still names them, but only for the seed's older
+        # prebuilt libfb.a that the suite links.
         if ! "$CLANG" --target=x86_64-pc-windows-msvc -fuse-ld=lld "$obj" \
                  "$TKOGFX_MSVC" "$LIBFB_MSVC" -o "$exe" \
                  -nostdlib "-L$( cygpath -m "$MSVC_IMPLIBS" )" -lucrtbase -lkernel32 \
-                 -lwinspool -lgdi32 -luser32 -ladvapi32 -lwinmm -lmsimg32 -lversion -limm32 -lws2_32 \
+                 -luser32 -ladvapi32 -lwinmm -lmsimg32 -lversion -limm32 -lws2_32 \
                  -Xlinker /INCLUDE:tkort_msvc_init_ >> "$log" 2>&1; then
             echo "abtest: $name/windows-x86_64 -- DOES NOT LINK, still needs:" >&2
             grep -o 'undefined symbol: [A-Za-z0-9_@$]*' "$log" \

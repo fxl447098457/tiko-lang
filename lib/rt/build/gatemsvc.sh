@@ -235,11 +235,14 @@ for o in $TOBJS "$W/t/fbc-tests.o"; do cygpath -m "$o" >> "$W/objs.rsp"; done
 # archive being linked here, mainCRTStartup included.
 #
 # kernel32 IS NAMED because '-nostdlib' drops clang's own defaults with it: the thread
-# and timing layers need Sleep, CreateSemaphoreA and CloseHandle.
+# and timing layers need Sleep, CreateSemaphoreA and CloseHandle. winspool/gdi32 are
+# NOT named: $LIB is built from the current sources, and io/printerwin.tiko resolves
+# them through LoadLibrary/GetProcAddress. tiko's own MSVC link line keeps the two
+# only for the seed's older prebuilt libfb.a, which this gate does not link.
 if ! "$CLANGX" --target=x86_64-pc-windows-msvc "@$W/objs.rsp" \
         "$W/libfbcunit.a" "$LIB" -o "$W/gatemsvc.exe" \
         -nostdlib "-L$IMPLIBS" -lucrtbase -lkernel32 \
-        -lwinspool -lgdi32 -luser32 -ladvapi32 -lwinmm -lmsimg32 -lversion -limm32 -lws2_32 \
+        -luser32 -ladvapi32 -lwinmm -lmsimg32 -lversion -limm32 -lws2_32 \
         -Xlinker /INCLUDE:tkort_msvc_init_ -Xlinker /STACK:2097152 \
         > "$W/link.log" 2>&1; then
     echo "gatemsvc: LINK FAILED" >&2

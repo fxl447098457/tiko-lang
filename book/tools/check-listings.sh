@@ -32,6 +32,10 @@
 #                                              beside its tiko.toml, and the program run is
 #                                              out/debug/greeter -- what `tiko run` runs.
 #                                              Implies cwd: listing
+#                 linux-libdir: lib/dir        linux-x86_64 only, relative to the project: where
+#                                              the WSL host keeps a shared library it does not
+#                                              have installed. The build links from it (-p) and
+#                                              finds what those libraries need in turn
 #                 output: renamed.exe          the listing names its own program (a -x in its
 #                                              #cmdline, which wins over the harness's -o):
 #                                              that file, in the listing's directory, is run.
@@ -233,6 +237,7 @@ for f in "${listings[@]}"; do
   runenv="$(meta_get "$meta" env)"
   project="$(meta_get "$meta" project)"
   output="$(meta_get "$meta" output)"
+  linux_libdir="$(meta_get "$meta" linux-libdir)"
   [[ -n "$output" ]] && cwd=listing
   [[ -n "$prebuild" ]] && cwd=listing
   [[ -n "$project" ]] && cwd=listing
@@ -283,7 +288,7 @@ for f in "${listings[@]}"; do
         ( cd "$dir" && "$ltiko" build "$project" ) >> "$log" 2>&1; crc=$?
       else
         exe="$dir/out/debug/$project"; rm -f "$exe"
-        wsl -d "$WSL_DISTRO" -- bash -c "cd '$book_wsl/$dir' && '$lin_tiko' build $project" >> "$log" 2>&1; crc=$?
+        wsl -d "$WSL_DISTRO" -- bash -c "cd '$book_wsl/$dir' && ${linux_libdir:+LD_LIBRARY_PATH='$linux_libdir'} '$lin_tiko' build $project ${linux_libdir:+--options '-p $linux_libdir'}" >> "$log" 2>&1; crc=$?
       fi
     elif (( is_local )); then
       exe="$outdir/$name$xext"; rm -f "$exe"

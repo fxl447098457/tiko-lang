@@ -9,15 +9,16 @@ files, the same `Editor`, the same commands and the one `Execute`. It now runs o
 examples/tkControls/tpad/
     tiko.toml               the package (vendor/tkControls comes with the toolchain)
     textfile/textfile.tiko  the document -- UNCHANGED from the wiki
+    offsets/offsets.tiko    UTF-8 bytes (tkTextBox) and UTF-16 units (ustring)
     pad/pad.tiko            the window, on tkApp + tk controls
     tpad.tiko               the program, and its self-test
-    expected.txt            the wiki's self-test output, verbatim
+    expected.txt            what the self-test prints
 ```
 
 ## Result
 
-`tpad --selftest` drives the real window and prints what it saw. Its output is
-**byte-identical to the wiki's** (`expected.txt`) on:
+`tpad --selftest` drives the real window and prints what it saw. Its output matches
+`expected.txt` byte for byte, and its first 36 lines are the PsControls Notepad Tutorial's, on:
 - Windows (D3D11);
 - Linux X11;
 - Linux Wayland (WSLg);
@@ -28,9 +29,10 @@ say which. The self-test presses no modifier, so that choice is not in its outpu
 
 The output covers the layout, Open, the keys and typing, Find Next (including the "Cannot
 find" question), Save and the bytes on disk, the Save / Don't Save / Cancel questions, the
-scale change and the close.
+scale change, Find in text that is not ASCII, closing the window while a file dialog is up,
+the system's Quit, and the close.
 
-**A/B check:** making `MayDiscard` stop asking drops the three questions from the output, and
+**A/B check:** making `MayDiscard` stop asking drops its questions from the output, and
 the diff shows it. Reverted.
 
 **Screenshots:** `tpad --shot out.bmp file` renders at a pinned 1.75 in the dark theme.
@@ -49,7 +51,9 @@ Windows vs Wayland: 2.10% of pixels differ.
 | `PsForm.FromHwnd( h )->Tag` | `tkForm_FromWidget( w )->Tag` |
 | `PostMessage( WM_CARETMOVED )`, handled in `OnMessage` | `tkApp_RunOnUI( @CaretMoved, ed )`: the same "after the control has acted" |
 | An accelerator table (Ctrl+N, O, S, Shift+S, F, F3) | `tkForm_OnKeyDown`. The text box handles Ctrl+Z / X / C / V / A and leaves every other key unclaimed, so tpad's keys bubble up to the form |
-| `CISaveFileDialog` / `CIOpenFileDialog` | `SDL_ShowSaveFileDialog` / `SDL_ShowOpenFileDialog`. They are asynchronous, so `PickFile` pumps until the callback answers |
+| `CISaveFileDialog` / `CIOpenFileDialog` | `SDL_ShowSaveFileDialog` / `SDL_ShowOpenFileDialog`. They are asynchronous, so `PickFile` pumps until the callback answers, and `picking` holds off commands and the close meanwhile |
+| Selection offsets that match `ustring` units | UTF-8 byte offsets, converted by `offsets` |
+| Closing the window | Closing the window, and `SDL_EVENT_QUIT` turned into a close by `QuitHook` |
 | `SetWindowTextW` / `GetWindowTextW` | `SDL_SetWindowTitle` / `SDL_GetWindowTitle` (UTF-8, so the wiki's wstring-to-pipe warning is moot) |
 | `EM_SCROLLCARET` after `SetSel` | Nothing: `tkTextBox_SetSel` scrolls the caret into view itself |
 | A status bar paint callback (a PsStatusBar without one is blank) | None: tkStatusBar draws its panels itself |
@@ -90,6 +94,4 @@ same folder, as `tools/run-linux.sh` does.
 - The real file dialogs: the self-test scripts `pick`.
 - The real message box: the self-test scripts `ask`.
 - The menus driven by the mouse.
-- Non-ASCII text: tkTextBox offsets are UTF-8 bytes while `textfile`'s `instr` works on the
-  `ustring`, which is unchecked beyond ASCII.
 - An interactive pass.

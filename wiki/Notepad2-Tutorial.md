@@ -8,7 +8,7 @@
 
 This tutorial builds **`tpad`** again, the plain-text editor of the [Notepad Tutorial](Notepad-Tutorial): a menu bar, the text, a scroll bar, a status bar with the line and column, Find, and a question before unsaved work is thrown away. This time it is built on **tkControls**, which draw into SDL3 windows, so **one source builds and runs on Windows, Linux and macOS**.
 
-Most of the program does not change. The document module is the same file, word for word. The `Editor`, the commands and the one `Execute` are the same. What changes is what a window is made of: widgets instead of window handles, SDL events instead of Win32 messages. The program is about 800 lines of tiko, a sixth of them a self-test, and the self-test prints exactly what the PsControls one prints.
+Most of the program does not change. The document module is the same file, word for word. The `Editor`, the commands and the one `Execute` are the same. What changes is what a window is made of: widgets instead of window handles, SDL events instead of Win32 messages. The program is about 900 lines of tiko, a fifth of them a self-test, and the self-test begins by printing exactly what the PsControls one prints. Three things are new, because they only show up on other systems or in other languages: a text control that counts in bytes, a file dialog that does not stop the program, and a Quit that comes from the system.
 
 ![tpad on tkControls with a short file open, in the dark theme.](Notepad2-Tutorial.png)
 
@@ -20,12 +20,13 @@ Most of the program does not change. The document module is the same file, word 
 tpad/
     tiko.toml               the package, and the target tpad
     textfile/textfile.tiko  the document: load, save, find, line and column
+    offsets/offsets.tiko    UTF-8 bytes and ustring units
     pad/pad.tiko            the window: controls, menus, commands
     tpad.tiko               the program, and its self-test
     expected.txt            what the self-test prints
 ```
 
-The toolchain ships it as `examples/tkControls/tpad`. `textfile` imports no controls at all, `pad` is the window, and `tpad.tiko` starts it.
+The toolchain ships it as `examples/tkControls/tpad`. `textfile` and `offsets` import no controls at all, `pad` is the window, and `tpad.tiko` starts it.
 
 ```toml
 # tpad on tkControls: `tiko build tpad` writes tpad.exe
@@ -185,13 +186,44 @@ public sub LineColumn( byref text as const ustring, _
 end sub
 ```
 
-> ⚠️ **Offsets in a tkTextBox are UTF-8 bytes.** `GetSel` and `SetSel` count bytes, snapped to character boundaries. For ASCII text they equal `textfile`'s offsets, and ASCII is all the self-test uses.
+### Two ways of counting
+
+A `tkTextBox` holds UTF-8, and `GetSel` and `SetSel` count **bytes**, snapped to character boundaries. A `ustring` counts **UTF-16 units**, and so do `len`, `instr` and everything in `textfile`. While the text before an offset is ASCII the two numbers are equal; after the first character that is not, they differ. `offsets` converts between them:
+
+```freebasic
+#module "offsets"
+'' Two ways of counting the same position in a text. A ustring counts
+'' UTF-16 units; a tkTextBox counts UTF-8 bytes. They agree only while
+'' everything before the position is ASCII.
+''
+'' A string assigned from a ustring holds its UTF-8 bytes, and a ustring
+'' assigned from a string decodes them, so each conversion is a prefix
+'' turned into the other form and measured.
+
+'' How many ustring units the first `count` UTF-8 bytes of text make.
+public function UnitsIn( byref text as const ustring, _
+                         byval count as int32 ) as int32
+    dim as string utf8 = text
+    dim as ustring head = left( utf8, count )
+    return len( head )
+end function
+
+'' How many UTF-8 bytes the first `count` ustring units of text make.
+public function BytesIn( byref text as const ustring, _
+                         byval count as int32 ) as int32
+    dim as string head = left( text, count )
+    return len( head )
+end function
+```
+
+> ⚠️ **ASCII text hides this completely.** Without the conversions, Find Next for `lait` in a file that starts `café au lait` selects ` lai`: the search is right and the selection is one byte early for each two-byte character before it. `pad` converts wherever an offset crosses between the control and `textfile`, and the self-test searches text that is not ASCII.
 
 ## 3. The window's state
 
 ```freebasic
 #module "pad"
 #import "../textfile"
+#import "../offsets"
 #import "vendor/tkControls/tkApp"
 #import "vendor/tkControls/tkMenuBar"
 #import "vendor/tkControls/tkPopupMenu"
@@ -250,6 +282,7 @@ public type Editor
     as textfile.Document doc
     as ustring findWhat
     as boolean matchCase
+    as boolean picking          '' a file dialog is waiting for an answer
     as AskProc ask
     as PickProc pick
 end type
@@ -287,17 +320,20 @@ end function
 '' SDL's file dialogs are asynchronous: the answer arrives in a callback,
 '' perhaps on another thread. PickFile waits for it, pumping, so its
 '' caller sees a plain function -- as a modal Win32 dialog was.
-dim shared as SDL_AtomicInt gPickState      '' 0 waiting, 1 answered
-dim shared as ustring gPicked
+type PickWait
+    as SDL_AtomicInt answered   '' 0 waiting, 1 answered
+    as zstring ptr path         '' SDL's copy of the answer, or null
+end type
 
+'' May run on another thread, so it touches nothing but C memory.
 sub PickAnswered( byval userdata as any ptr, _
                   byval filelist as const zstring const ptr ptr, _
                   byval filter as long )
-    gPicked = ""
+    dim as PickWait ptr w = userdata
     if filelist <> 0 then
-        if filelist[0] <> 0 then gPicked = *filelist[0]
+        if filelist[0] <> 0 then w->path = SDL_strdup( filelist[0] )
     end if
-    SDL_SetAtomicInt( @gPickState, 1 )
+    SDL_SetAtomicInt( @w->answered, 1 )
 end sub
 
 function PickFile( byval f as TK_FORM ptr, byval saving as boolean, _
@@ -306,24 +342,43 @@ function PickFile( byval f as TK_FORM ptr, byval saving as boolean, _
     filters( 0 ).name = @"Text files" : filters( 0 ).pattern = @"txt"
     filters( 1 ).name = @"All files" : filters( 1 ).pattern = @"*"
     dim as string where = suggest
-    SDL_SetAtomicInt( @gPickState, 0 )
+    dim as PickWait w
     dim as SDL_Window ptr win = tkForm_Host( f )->win
     if saving then
-        SDL_ShowSaveFileDialog( @PickAnswered, 0, win, @filters( 0 ), 2, _
+        SDL_ShowSaveFileDialog( @PickAnswered, @w, win, @filters( 0 ), 2, _
                                 iif( len( where ), strptr( where ), 0 ) )
     else
-        SDL_ShowOpenFileDialog( @PickAnswered, 0, win, @filters( 0 ), 2, _
+        SDL_ShowOpenFileDialog( @PickAnswered, @w, win, @filters( 0 ), 2, _
                                 0, false )
     end if
-    do until SDL_GetAtomicInt( @gPickState ) = 1
+    do until SDL_GetAtomicInt( @w.answered ) = 1
         tkApp_Pump( )
         SDL_Delay( 10 )
     loop
-    return gPicked
+    dim as ustring picked
+    if w.path <> 0 then
+        picked = *w.path
+        SDL_free( w.path )
+    end if
+    return picked
+end function
+
+'' Every question for a path comes through here. The event loop runs
+'' while the dialog is up, so nothing else may start until it answers.
+function PickPath( byval ed as Editor ptr, byval saving as boolean, _
+                   byref suggest as ustring ) as ustring
+    ed->picking = true
+    dim as ustring p = ed->pick( ed->form, saving, suggest )
+    ed->picking = false
+    return p
 end function
 ```
 
 SDL's file dialogs do not block: they return at once and answer later, in a callback that may run on another thread. `PickFile` waits for that answer and keeps the window alive while it does, so its callers see a plain function that returns a path, as they would with a modal dialog.
+
+Because of that other thread, the callback touches nothing but C memory: it copies the path with `SDL_strdup` into the `PickWait` it was handed, and then sets the atomic, which tells the waiting code that the copy is ready. The copy becomes a `ustring` only back on the waiting side.
+
+> ⚠️ **The event loop keeps running under the dialog.** Whether the window beneath it takes input is the system's decision. If it does, File > Exit could destroy the form and delete the `Editor` while `PickFile`'s caller is still waiting to use it. So while `picking` is set, `Execute` starts nothing and the form refuses to close.
 
 ## 4. The text, its scroll bar and the status bar
 
@@ -400,8 +455,9 @@ end sub
 public sub ShowStatus( byval ed as Editor ptr )
     dim as integer first, last
     tkTextBox_GetSel( ed->text, first, last )
+    dim as ustring body = TextOf( ed )
     dim as int32 ln, col
-    textfile.LineColumn( TextOf( ed ), last, ln, col )
+    textfile.LineColumn( body, offsets.UnitsIn( body, last ), ln, col )
     tkStatusBar_SetText( ed->status, 0, "Ln " & ln & ", Col " & col )
     tkStatusBar_SetText( ed->status, 1, _
         iif( ed->doc.ending = textfile.LineEnding.CrLf, _
@@ -503,6 +559,7 @@ The text box handles Ctrl+Z, X, C, V and A itself, and **leaves every other key 
 ```freebasic
 '' The one place a command is carried out, wherever it came from.
 public sub Execute( byval ed as Editor ptr, byval id as long )
+    if ed->picking then exit sub
     select case id
     case CmdNew
         if MayDiscard( ed ) then
@@ -511,7 +568,7 @@ public sub Execute( byval ed as Editor ptr, byval id as long )
         end if
     case CmdOpen
         if MayDiscard( ed ) then
-            dim as ustring p = ed->pick( ed->form, false, "" )
+            dim as ustring p = PickPath( ed, false, "" )
             if len( p ) then OpenPath( ed, p )
         end if
     case CmdSave
@@ -575,7 +632,7 @@ end function
 '' Saves, asking for a name when there is none (or when asked to).
 function SaveDocument( byval ed as Editor ptr, byval newName as boolean ) as boolean
     if newName orelse len( ed->doc.path ) = 0 then
-        dim as ustring p = ed->pick( ed->form, true, textfile.DisplayName( ed->doc ) )
+        dim as ustring p = PickPath( ed, true, textfile.DisplayName( ed->doc ) )
         if len( p ) = 0 then return false
         ed->doc.path = p
     end if
@@ -609,13 +666,16 @@ sub FindAgain( byval ed as Editor ptr )
     if len( ed->findWhat ) = 0 then exit sub
     dim as integer first, last
     tkTextBox_GetSel( ed->text, first, last )
-    dim as int32 at = textfile.FindNext( TextOf( ed ), ed->findWhat, last, ed->matchCase )
+    dim as ustring body = TextOf( ed )
+    dim as int32 at = textfile.FindNext( body, ed->findWhat, _
+        offsets.UnitsIn( body, last ), ed->matchCase )
     if at < 0 then
         ed->ask( ed->form, "Cannot find """ & ed->findWhat & """", MBX_BTN_OK )
         exit sub
     end if
     '' SetSel scrolls the caret into view itself (no EM_SCROLLCARET).
-    tkTextBox_SetSel( ed->text, at, at + len( ed->findWhat ) )
+    tkTextBox_SetSel( ed->text, offsets.BytesIn( body, at ), _
+        offsets.BytesIn( body, at + len( ed->findWhat ) ) )
     ShowStatus( ed )
 end sub
 ```
@@ -681,6 +741,22 @@ end sub
 The Find box is a modal form. `tkForm_ShowModal` returns only once the box is closed, so its `FindBox` can live on the stack of `AskWhatToFind`. Enter in the search box is Find Next, through the box's Enter callback, and Esc closes a modal form with `TKAPP_IDCANCEL` by itself.
 
 ```freebasic
+'' The event hook is handed only the event, so the one window it
+'' protects is kept where the hook can reach it.
+function MainEditor( byval ed as Editor ptr = 0 ) as Editor ptr
+    static as Editor ptr kept
+    if ed <> 0 then kept = ed
+    return kept
+end function
+
+'' The system asking the whole program to quit (Cmd+Q, logging out)
+'' becomes an ordinary close, which asks first.
+function QuitHook( byval e as SDL_Event ptr ) as boolean
+    if e->type <> SDL_EVENT_QUIT then return false
+    tkForm_Close( MainEditor( )->form )
+    return true
+end function
+
 '' Builds the main window, with an empty, untitled document.
 public function Create( byval forcedScale as single = 0 ) as Editor ptr
     dim as Editor ptr ed = new Editor
@@ -698,16 +774,21 @@ public function Create( byval forcedScale as single = 0 ) as Editor ptr
     '' Asked before the window closes, however it is closed.
     tkForm_OnClose( f, _
         function( byval f as TK_FORM ptr ) as boolean
-            return MayDiscard( f->Tag )
+            dim as Editor ptr ed = f->Tag
+            if ed->picking then return false
+            return MayDiscard( ed )
         end function )
     '' No OnScaleChanged: a scale change re-sizes the fonts a control was
     '' given; it never hands every control the UI font, so the text stays
     '' monospaced by itself.
     tkForm_OnDestroy( f, _
         sub( byval f as TK_FORM ptr )
+            tkHost_RemoveEventHook( @QuitHook )
             delete cast( Editor ptr, f->Tag )
             f->Tag = 0
         end sub )
+    MainEditor( ed )
+    tkHost_AddEventHook( @QuitHook )
 
     ShowTitle( ed )
     ShowStatus( ed )
@@ -716,6 +797,8 @@ end function
 ```
 
 `MayDiscard` asks Save, Don't Save or Cancel before New, Open or closing; returning `false` from `OnClose` keeps the window open.
+
+> ⚠️ **Closing the window is not the only way to end the program.** Cmd+Q on a Mac reaches it as `SDL_EVENT_QUIT`, an event that belongs to no window, and left alone it closes every window without asking. `tkHost_AddEventHook` sees each event first, and `QuitHook` turns this one into an ordinary close.
 
 A change of display scale re-sizes the fonts the controls were given and changes nothing else, so the text stays monospaced without any code. `forcedScale` pins a scale instead of the display's; the self-test uses it, so its layout is the same on every machine.
 
@@ -807,7 +890,8 @@ The first build compiles the tkControls modules the program imports; later build
 '' The person, scripted: what the test answers to each question.
 function ScriptedAsk( byval f as TK_FORM ptr, byref text as ustring, _
                       byval buttons as long ) as long
-    static as long replies( ... ) = { MBX_IDCANCEL, MBX_IDNO, MBX_IDNO }
+    static as long replies( ... ) = { MBX_IDCANCEL, MBX_IDNO, _
+                                      MBX_IDCANCEL, MBX_IDNO }
     static as int32 n
     print "  asked: "; text
     if buttons = MBX_BTN_OK then return MBX_IDOK
@@ -821,6 +905,15 @@ function ScriptedPick( byval f as TK_FORM ptr, byval saving as boolean, _
                        byref suggest as ustring ) as ustring
     print "  picked: lf.tmp"
     return "lf.tmp"
+end function
+
+'' A person who tries to close the window while the dialog is up.
+function ImpatientPick( byval f as TK_FORM ptr, byval saving as boolean, _
+                        byref suggest as ustring ) as ustring
+    pad.Execute( f->Tag, pad.CmdExit )
+    tkForm_Close( f )
+    print "  window closed: "; cbool( tkForm_Host( f )->bQuit )
+    return ""
 end function
 
 '' Lets queued events arrive, as the loop would.
@@ -931,6 +1024,30 @@ function SelfTest( byval ed as pad.Editor ptr ) as long
           cbool( tkTextBox_GetFont( ed->text ) = _
                  tkForm_Font( ed->form, TKFONT_MONO ) )
 
+    print "== text that is not ASCII, Find Next for ""lait"", twice"
+    fs.WriteAllText( "lf.tmp", "caf" & wchr( &hE9 ) & !" au lait\n" & _
+                     "na" & wchr( &hEF ) & "ve lait" )
+    pad.Execute( ed, pad.CmdOpen )
+    ed->findWhat = "lait"
+    pad.Execute( ed, pad.CmdFindNext )
+    print "  selected: "; tkTextBox_GetSelText( ed->text )
+    Report( ed )
+    pad.Execute( ed, pad.CmdFindNext )
+    print "  selected: "; tkTextBox_GetSelText( ed->text )
+    Report( ed )
+
+    print "== File > Exit while the file dialog is open"
+    ed->pick = @ImpatientPick
+    pad.Execute( ed, pad.CmdOpen )
+    ed->pick = @ScriptedPick
+
+    print "== type, then the system asks the program to quit"
+    Type_( ed, "x" )
+    e.type = SDL_EVENT_QUIT
+    SDL_PushEvent( @e )
+    Pump( )
+    print "  window closed: "; cbool( h->bQuit )
+
     print "== type, then close the window"
     Type_( ed, "x" )
     tkForm_Close( ed->form )
@@ -940,7 +1057,7 @@ function SelfTest( byval ed as pad.Editor ptr ) as long
 end function
 ```
 
-Its output, the same on Windows, Linux and macOS, and line for line the same as the [Notepad Tutorial](Notepad-Tutorial#8-testing-the-window-with-nobody-at-it)'s:
+Its output is the same on Windows, Linux and macOS. Up to the section on text that is not ASCII it is, line for line, the same as the [Notepad Tutorial](Notepad-Tutorial#8-testing-the-window-with-nobody-at-it)'s; the sections from there on are the three things new in this program:
 
 ```text
 == a new window
@@ -979,8 +1096,22 @@ Its output, the same on Windows, Linux and macOS, and line for line the same as 
   status: Ln 1, Col 1 | Windows (CRLF) | UTF-8
 == moved to a monitor at twice the DPI
   the text is still monospaced: true
+== text that is not ASCII, Find Next for "lait", twice
+  picked: lf.tmp
+  selected: lait
+  title:  lf.tmp - tpad
+  status: Ln 1, Col 13 | Unix (LF) | UTF-8
+  selected: lait
+  title:  lf.tmp - tpad
+  status: Ln 2, Col 11 | Unix (LF) | UTF-8
+== File > Exit while the file dialog is open
+  window closed: false
+== type, then the system asks the program to quit
+  asked: Do you want to save changes to lf.tmp?
+  answered: Cancel
+  window closed: false
 == type, then close the window
-  asked: Do you want to save changes to Untitled?
+  asked: Do you want to save changes to lf.tmp?
   answered: Don't Save
   window closed: true
 ```
@@ -998,7 +1129,9 @@ Its output, the same on Windows, Linux and macOS, and line for line the same as 
 | `PsForm.FromHwnd( h )->Tag` | `tkForm_FromWidget( w )->Tag` |
 | `PostMessageW( WM_CARETMOVED )`, handled in `OnMessage` | `tkApp_RunOnUI( @CaretMoved, ed )` |
 | An accelerator table | `tkForm_OnKeyDown`: keys the text box leaves unclaimed reach the form |
-| `CISaveFileDialog` and `CIOpenFileDialog` | `SDL_ShowSaveFileDialog` and `SDL_ShowOpenFileDialog`, waited for by `PickFile` |
+| `CISaveFileDialog` and `CIOpenFileDialog` | `SDL_ShowSaveFileDialog` and `SDL_ShowOpenFileDialog`, waited for by `PickFile`, with `picking` guarding the window meanwhile |
+| Selection offsets that match `ustring` units | UTF-8 byte offsets, converted by `offsets` |
+| Closing the window | Closing the window, and `SDL_EVENT_QUIT` through `QuitHook` |
 | `SetWindowTextW` and `GetWindowTextW` | `SDL_SetWindowTitle` and `SDL_GetWindowTitle`, in UTF-8 |
 | `EM_SCROLLCARET` after `SetSel` | Nothing: `tkTextBox_SetSel` scrolls the caret into view |
 | A status bar paint callback | Nothing: `tkStatusBar` draws its panels |

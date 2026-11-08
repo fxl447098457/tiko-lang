@@ -1,0 +1,255 @@
+'' ANCHOR: all
+'' ANCHOR: head
+#cmdline "-s gui"
+#import "std/fs"
+#import "std/strings"
+#import "./pad"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkStatusBar"
+#import "vendor/tkControls/tkMessageBox"
+
+using tkApp
+using tkHost
+using tkTextBox
+using tkStatusBar
+using tkMessageBox
+
+'' tpad [file]                 run it
+'' tpad --selftest             drive the real window, print what it saw
+'' tpad --shot out.bmp [file]  render once, dark theme, and save it
+'' ANCHOR_END: head
+
+'' ANCHOR: script
+'' The person, scripted: what the test answers to each question.
+function ScriptedAsk( byval f as TK_FORM ptr, byref text as ustring, _
+                      byval buttons as long ) as long
+    static as long replies( ... ) = { MBX_IDCANCEL, MBX_IDNO, _
+                                      MBX_IDCANCEL, MBX_IDNO }
+    static as int32 n
+    print "  asked: "; text
+    if buttons = MBX_BTN_OK then return MBX_IDOK
+    n += 1
+    print "  answered: "; iif( replies( n - 1 ) = MBX_IDNO, _
+                               "Don't Save", "Cancel" )
+    return replies( n - 1 )
+end function
+
+function ScriptedPick( byval f as TK_FORM ptr, _
+                       byval saving as boolean, _
+                       byref suggest as ustring ) as ustring
+    print "  picked: lf.tmp"
+    return "lf.tmp"
+end function
+
+'' A person who tries to close the window while the dialog is up.
+function ImpatientPick( byval f as TK_FORM ptr, _
+                        byval saving as boolean, _
+                        byref suggest as ustring ) as ustring
+    pad.Execute( f->Tag, pad.CmdExit )
+    tkForm_Close( f )
+    print "  window closed: "; cbool( tkForm_Host( f )->bQuit )
+    return ""
+end function
+'' ANCHOR_END: script
+
+'' ANCHOR: drive
+'' Lets queued events arrive, as the loop would.
+sub Pump( )
+    tkApp_Pump( )
+end sub
+
+'' Keeps the loop turning for a while.
+sub PumpFor( byval ms as uint64 )
+    dim as uint64 start = SDL_GetTicks( )
+    do until SDL_GetTicks( ) - start >= ms
+        Pump( )
+        SDL_Delay( 10 )
+    loop
+end sub
+
+'' A key, delivered where the keyboard would deliver it.
+sub Press( byval ed as pad.Editor ptr, byval key as long )
+    dim as SDL_Event e
+    e.type = SDL_EVENT_KEY_DOWN
+    e.key.windowID = tkForm_Host( ed->form )->winId
+    e.key.key = key
+    e.key.down = true
+    SDL_PushEvent( @e )
+    Pump( )
+end sub
+
+'' Typed text, as the system hands it over after the keys: UTF-8. The
+'' event points at this string, so it has to outlive the event.
+sub TypeText( byval ed as pad.Editor ptr, byref s as ustring )
+    static as string typed
+    typed = s
+    dim as SDL_Event e
+    e.type = SDL_EVENT_TEXT_INPUT
+    e.text.windowID = tkForm_Host( ed->form )->winId
+    e.text.text = strptr( typed )
+    SDL_PushEvent( @e )
+    Pump( )
+end sub
+
+sub Report( byval ed as pad.Editor ptr )
+    dim as ustring title = _
+        *SDL_GetWindowTitle( tkForm_Host( ed->form )->win )
+    print "  title:  "; title
+    print "  status: "; tkStatusBar_GetText( ed->status, 0 ); " | "; _
+          tkStatusBar_GetText( ed->status, 1 ); " | "; _
+          tkStatusBar_GetText( ed->status, 2 )
+end sub
+'' ANCHOR_END: drive
+
+'' ANCHOR: test
+function SelfTest( byval ed as pad.Editor ptr ) as long
+    ed->ask = @ScriptedAsk
+    ed->pick = @ScriptedPick
+    fs.WriteAllText( "lf.tmp", !"one\ntwo\nthree\n" )
+    dim as TK_HOST ptr h = tkForm_Host( ed->form )
+    tkForm_Show( ed->form )
+    Pump( )
+
+    print "== a new window"
+    Report( ed )
+    print "== the layout, at 600 x 400"
+    SDL_SetWindowSize( h->win, 600, 400 )
+    PumpFor( 300 )
+    print "  text meets the scroll bar: "; _
+          cbool( ed->text->x + ed->text->cw = ed->scroll->x )
+    print "  text meets the status bar: "; _
+          cbool( ed->text->y + ed->text->ch = ed->status->y )
+    print "  status bar is as wide as the window: "; _
+          cbool( ed->status->cw = h->root->cw )
+
+    print "== File > Open"
+    pad.Execute( ed, pad.CmdOpen )
+    Report( ed )
+    print "== Down, Down, End, and type ""!"""
+    tkHost_SetFocus( h, ed->text )
+    Press( ed, SDLK_DOWN )
+    Press( ed, SDLK_DOWN )
+    Press( ed, SDLK_END )
+    TypeText( ed, "!" )
+    Report( ed )
+
+    print "== Find Next, for ""T"", twice"
+    ed->findWhat = "T"
+    pad.Execute( ed, pad.CmdFindNext )
+    Report( ed )
+    pad.Execute( ed, pad.CmdFindNext )
+    Report( ed )
+    print "== Find Next, for ""four"""
+    ed->findWhat = "four"
+    pad.Execute( ed, pad.CmdFindNext )
+
+    print "== File > Save"
+    pad.Execute( ed, pad.CmdSave )
+    Report( ed )
+    dim as ustring saved = fs.ReadAllText( "lf.tmp" ).Value( )
+    print "  on disk: "; strings.Escape( saved )
+
+    print "== type, then File > New, twice"
+    TypeText( ed, "?" )
+    pad.Execute( ed, pad.CmdNew )
+    Report( ed )
+    pad.Execute( ed, pad.CmdNew )
+    Report( ed )
+
+    print "== moved to a monitor at twice the DPI"
+    h->fScaleForced = 2 * h->fScale
+    dim as SDL_Event e
+    e.type = SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED
+    e.window.windowID = h->winId
+    SDL_PushEvent( @e )
+    Pump( )
+    print "  the text is still monospaced: "; _
+          cbool( tkTextBox_GetFont( ed->text ) = _
+                 tkForm_Font( ed->form, TKFONT_MONO ) )
+
+    print "== text that is not ASCII, Find Next for ""lait"", twice"
+    fs.WriteAllText( "lf.tmp", "caf" & wchr( &hE9 ) & !" au lait\n" & _
+                     "na" & wchr( &hEF ) & "ve lait" )
+    pad.Execute( ed, pad.CmdOpen )
+    ed->findWhat = "lait"
+    pad.Execute( ed, pad.CmdFindNext )
+    print "  selected: "; tkTextBox_GetSelText( ed->text )
+    Report( ed )
+    pad.Execute( ed, pad.CmdFindNext )
+    print "  selected: "; tkTextBox_GetSelText( ed->text )
+    Report( ed )
+
+    print "== File > Exit while the file dialog is open"
+    ed->pick = @ImpatientPick
+    pad.Execute( ed, pad.CmdOpen )
+    ed->pick = @ScriptedPick
+
+    print "== type, then the system asks the program to quit"
+    TypeText( ed, "x" )
+    e.type = SDL_EVENT_QUIT
+    SDL_PushEvent( @e )
+    Pump( )
+    print "  window closed: "; cbool( h->bQuit )
+
+    print "== type, then close the window"
+    TypeText( ed, "x" )
+    tkForm_Close( ed->form )
+    print "  window closed: "; cbool( h->bQuit )
+    fs.RemoveFile( "lf.tmp" )
+    return 0
+end function
+'' ANCHOR_END: test
+
+'' ANCHOR: shot
+'' Renders the window once and saves what it drew.
+sub TakeShot( byval ed as pad.Editor ptr, byref file as ustring )
+    tkForm_Show( ed->form )
+    PumpFor( 300 )
+    dim as TK_HOST ptr h = tkForm_Host( ed->form )
+    tkHost_Render( h )
+    tkHost_RenderTo( h, false )
+    dim as SDL_Surface ptr s = SDL_RenderReadPixels( h->renderer, 0 )
+    dim as string path = file
+    if s then
+        SDL_SaveBMP( s, strptr( path ) )
+        SDL_DestroySurface( s )
+    end if
+end sub
+'' ANCHOR_END: shot
+
+'' ANCHOR: main
+dim as string first = command( 1 )
+dim as boolean testing = (first = "--selftest")
+dim as boolean shooting = (first = "--shot")
+
+dim as TKAPP_OPTIONS opts
+if testing orelse shooting then opts.ThemeMode = TKAPP_THEME_DARK
+if tkApp_Init( opts ) = false then
+    print "tkApp_Init: " & *SDL_GetError( )
+    end 1
+end if
+
+'' 0 means the display's own scale. A test pins it, so that its layout
+'' is the same on every machine.
+dim as single uiScale = val( environ( "TPAD_SCALE" ) )
+if testing then uiScale = 1.0
+if shooting then uiScale = 1.75
+dim as pad.Editor ptr ed = pad.Create( uiScale )
+
+if testing then
+    dim as long result = SelfTest( ed )
+    tkApp_Shutdown( )
+    end result
+end if
+if shooting then
+    if len( command( 3 ) ) then pad.OpenPath( ed, command( 3 ) )
+    TakeShot( ed, command( 2 ) )
+    tkApp_Shutdown( )
+    end 0
+end if
+
+if len( first ) then pad.OpenPath( ed, first )
+end tkApp_Run( ed->form )
+'' ANCHOR_END: main
+'' ANCHOR_END: all

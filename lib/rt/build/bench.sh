@@ -77,34 +77,21 @@ benches=$(find "$RT_ROOT/tests/bench" -name '*.bas' 2>/dev/null | sort)
 
 # ------------------------------------------------------------------ build
 
-# THE PRINTER AND GDI IMPORT LIBRARIES, exactly as diff.sh links them.
-#
-# tiko-rt's io_fileopen.o and io_openqb.o both reference fb_DevLptOpen, which is
-# still fbc's -- and fbc's dev_lpt.o pulls io_printer.o, which imports
-# StartPage, WritePrinter, ClosePrinter and a dozen others from winspool and
-# gdi32. Without these the FB side does not link at all, while the C side does,
-# because nothing in the C archive references fb_DevLptOpen unless a program
-# calls OPEN.
-#
-# THIS WAS SILENTLY BROKEN FROM THE MOMENT THE FILE LAYER LANDED. bench.sh was
-# not re-run between then and now, so RFC-0004 section 5's numbers were measured
-# against a runtime that predates io_fileopen.o -- the script would have died on
-# its first benchmark had anyone asked it to. diff.sh has carried these two -l
-# flags since it was written; bench.sh never did.
-#
-# They change nothing about what is measured: no benchmark calls a printer
-# function, and BOTH sides get the same flags.
-case "$TARGET" in
-    win64)       BENCHLIBS="-l winspool -l gdi32" ;;
-    *)           BENCHLIBS="" ;;
-esac
+# NO PRINTER/GDI IMPORT LIBRARIES. Both sides used to take `-l winspool
+# -l gdi32`: the FB side's file layer pulls io_openqb.o, which takes the
+# address of fb_DevLptOpen, which pulls io_printerwin.o, which imported
+# WritePrinter/CreateDCA and a dozen others statically. The C side never
+# needed them, but BOTH sides got the same flags so the comparison stayed
+# symmetric. io/printerwin.tiko now resolves all of them through
+# LoadLibrary/GetProcAddress, so a freshly built runtime has nothing left
+# for either -l to resolve. No benchmark prints anything.
 
 for src in $benches; do
     name=$(basename "$src" .bas)
     for which in c fb; do
         case $which in c) libp="$CLIB" ;; fb) libp="$FLIB" ;; esac
         "$GATE_FBC" "$src" -i "$FBC_TREE/src/inc" -gen gcc -O 2 \
-            -p "$libp" -x "$WORK/$name-$which$EXT" $BENCHLIBS \
+            -p "$libp" -x "$WORK/$name-$which$EXT" \
             > "$WORK/$name-$which.buildlog" 2>&1 \
             || rt_die "benchmark $name failed to build against the $which runtime; see $WORK/$name-$which.buildlog"
     done

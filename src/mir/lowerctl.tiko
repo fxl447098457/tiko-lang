@@ -411,6 +411,11 @@ sub LowerSelect( byref c as Ctx, byval id as Tko.NodeId )
     '' The subject is evaluated ONCE into a slot holding its descriptor pointer, so a
     '' subject with a side effect runs once however many cases follow.
     dim as int32 strMode = -1
+    '' THE PROBE'S ANSWER IS THE SUBJECT. StrDescriptorOf_ emits the subject's code, so asking
+    '' it twice ran 'select case f( )' twice over a slice-returning f, and the first pool
+    '' descriptor was never released: one lost per execution of the SELECT.
+    dim as MirValue subjProbe
+    dim as boolean subjProbed = false
     '' ...AND A WIDE CHAIN, which Check types STRING: 'select case w & "y"' went to the
     '' narrow descriptor path, declined, and the whole SELECT was dropped -- no case ran.
     '' fbc compares every case value against the chain with fb_WstrCompare.
@@ -421,8 +426,10 @@ sub LowerSelect( byref c as Ctx, byval id as Tko.NodeId )
         if IsStringType( c, subjT ) orelse (StrSwapKind_( c, subjT, sn0 ) >= 0) then
             strMode = 0
         elseif c.types->Kind( subjT ) = Tko.TK_UDT then
-            dim as MirValue probe
-            if StrDescriptorOf_( c, sp->a, probe ) then strMode = 0
+            if StrDescriptorOf_( c, sp->a, subjProbe ) then
+                strMode = 0
+                subjProbed = true
+            end if
         end if
     end if
 
@@ -442,6 +449,9 @@ sub LowerSelect( byref c as Ctx, byval id as Tko.NodeId )
         dim as boolean got = false
         if strMode = 1 then
             got = WideOperand_( c, sp->a, sv )
+        elseif subjProbed then
+            sv = subjProbe
+            got = true
         else
             got = StrDescriptorOf_( c, sp->a, sv )
         end if
@@ -480,7 +490,12 @@ sub LowerSelect( byref c as Ctx, byval id as Tko.NodeId )
         '' case value released it: 'case "Ux", "Uy"' missed. fbc: fb_UStrInit into TMP.
         dim as boolean copySubj = (strMode = 0)
         dim as boolean askOwn = copySubj andalso (c.udtTemps.Count = smark)
-        if askOwn andalso (not subjChainU) then
+        '' ...AND A STRING SLICE IS ALWAYS A POOL DESCRIPTOR over its bytes (LowerSliceCast).
+        '' StrArgOwnDescriptor_ answers "owns it" for anything that is not a string, so the
+        '' first case value released it and each later one released it again, and two later
+        '' temporaries then shared one descriptor: instr( f( ), "." ) compared f( ) with itself.
+        dim as boolean subjSlice = (Slices.SliceUnitOfType( *c.types, *c.names, subjT ) <> Slices.SU_NONE)
+        if askOwn andalso (not subjChainU) andalso (not subjSlice) then
             copySubj = (StrArgOwnDescriptor_( c, sp->a, subjT ) = false)
         end if
         if copySubj then

@@ -63,24 +63,15 @@ OBJS=$(ls "$OBJDIR"/*.o 2>/dev/null) || rt_die "no objects in $OBJDIR"
 MTOBJDIR="$RT_ROOT/obj/$TARGET/$CFG/mt"
 MTOBJS=$(ls "$MTOBJDIR"/*.o 2>/dev/null || true)
 
-# EXTRA LIBRARIES THE OVER-LINK NEEDS.
-#
-# This harness names EVERY tiko-rt object on the command line, which is already
-# unlike a real link: a real program pulls only the archive members it uses. Once
-# tiko-rt owned the LPRINT entry points, every one of those objects referenced
-# fb_LPrintInit, which lives in fbc's file_openlpt.o, which pulls io_printer.o,
-# which needs winspool -- so all 72 differentials failed to link at once with
-# undefined EnumPrintersA -- and then, once those were named, undefined
-# __imp_CreateDCA, because io_printer.o also draws through gdi32.
-#
-# fbc's own driver adds winspool only for a program that uses LPRINT, and the
-# GATE is unaffected because it merges into the archive and the linker still
-# pulls members on demand. It is only this script's over-linking that needs the
-# library named, so it is named here rather than worked around in the runtime.
-case "$TARGET" in
-    win64)       EXTRALIBS="-l winspool -l gdi32" ;;
-    *)           EXTRALIBS="" ;;
-esac
+# NO EXTRA LIBRARIES. This harness names EVERY tiko-rt object on the command
+# line, which is already unlike a real link: a real program pulls only the
+# archive members it uses. Until io/printerwin.tiko moved its spooler and GDI
+# calls behind LoadLibrary/GetProcAddress, that over-linking dragged
+# io_printerwin.o -- and with it undefined EnumPrintersA, __imp_CreateDCA and
+# a dozen more -- into all 72 differentials, so this script passed
+# `-l winspool -l gdi32` on BOTH links. The rebuilt object has no undefined
+# Win32 symbols beyond four from kernel32, and fbc's own driver never needed
+# the two for a program that does not use LPRINT. Neither side does now.
 
 WORK="$RT_ROOT/obj/diff"
 rm -rf "$WORK"; mkdir -p "$WORK"
@@ -142,7 +133,7 @@ for src in "$RT_ROOT"/tests/abi/*.bas; do
         WRAP="$WRAP -Wl --wrap=$sym"
     done
 
-    if ! "$TKORT_FBC" "$src" -x "$WORK/$name-stock.exe" $(rt_incflags) $GENOPT $LANGOPT $MTOPT $WRAP $EXTRALIBS \
+    if ! "$TKORT_FBC" "$src" -x "$WORK/$name-stock.exe" $(rt_incflags) $GENOPT $LANGOPT $MTOPT $WRAP \
             > "$WORK/$name-stock.build" 2>&1; then
         echo "diff: SKIP $name -- does not build against fbc's runtime" >&2
         sed 's/^/    /' "$WORK/$name-stock.build" >&2
@@ -151,7 +142,7 @@ for src in "$RT_ROOT"/tests/abi/*.bas; do
     fi
 
     # Merged: the same program, tiko-rt's objects ahead of the archive.
-    if ! "$TKORT_FBC" "$src" -x "$WORK/$name-rt.exe" $(rt_incflags) $GENOPT $LANGOPT $MTOPT $WRAP $THISOBJS $EXTRALIBS \
+    if ! "$TKORT_FBC" "$src" -x "$WORK/$name-rt.exe" $(rt_incflags) $GENOPT $LANGOPT $MTOPT $WRAP $THISOBJS \
             > "$WORK/$name-rt.build" 2>&1; then
         echo "diff: FAIL $name -- does not link over tiko-rt" >&2
         sed 's/^/    /' "$WORK/$name-rt.build" >&2
