@@ -145,7 +145,12 @@ build_one( ) {
     RTW_INC=$(rt_incflags)
     RTW_FLAGS="$FLAGS $mtdef $(rt_abi_define "$target")"
     RTW_PIC=$picdef
+    # THE COMPILER'S TARGET NAME, not this build's: 'win64ucrt' is a FLAVOR of the
+    # same tiko target -- same triple, same ABI, different CRT -- and tiko knows
+    # 'win64', not the flavor. The flavor travels in RTW_FLAGS as TKORT_UCRT; only
+    # the archive and the object directory this build writes differ.
     RTW_TARGET=$target
+    case "$target" in win64ucrt) RTW_TARGET=win64 ;; esac
     export TKORT_TIKO CLANG RT_ROOT RTW_WHAT RTW_TARGET RTW_INC RTW_FLAGS RTW_PIC
     rt_sources | awk -v d="$objdir" '{ o = $0; gsub("/", "_", o); sub(/\.tiko$/, ".o", o); print $0, d "/" o }' \
         > "$objdir/.pairs"
@@ -245,7 +250,7 @@ build_one( ) {
         # neither is POSIX. Matching the full target name instead would
         # mean adding "windows-x86_64" to every EMPTY-ON line in the tree, and
         # again to each one for any later ABI variant.
-        case $target in windows-x86_64) __base=win64 ;; *) __base=$target ;; esac
+        case $target in windows-x86_64|win64ucrt) __base=win64 ;; *) __base=$target ;; esac
         if grep -qE "EMPTY-ON:.*($target|$__base)" "$RT_ROOT/src/$_src" 2>/dev/null; then
             : # declared empty for this target
         else

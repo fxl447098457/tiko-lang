@@ -876,7 +876,7 @@ private sub EmitInst( byref e as EmitCtx, byref ins as MirInst )
                 dim as MirType p1 = cast( MirType, cf->retTy2 )
                 dim as string pty = LlvmPairType( p0, p1 )
                 dim as string dst = ValStr( e, ins.b )
-                Line( e, res & ".pair = call " & pty & " " & target_ & "(" & args & ")" )
+                Line( e, res & ".pair = call " & CallConvAttr( e, cf ) & pty & " " & target_ & "(" & args & ")" )
                 Line( e, res & " = extractvalue " & pty & " " & res & ".pair, 0" )
                 Line( e, res & ".1 = extractvalue " & pty & " " & res & ".pair, 1" )
                 Line( e, "store " & LlvmType( p0 ) & " " & res & ", ptr " & dst & _
@@ -888,9 +888,9 @@ private sub EmitInst( byref e as EmitCtx, byref ins as MirInst )
             end if
         end if
         if rt = MT_VOID then
-            Line( e, "call " & sig & " " & target_ & "(" & args & ")" )
+            Line( e, "call " & CallConvAttr( e, cf ) & sig & " " & target_ & "(" & args & ")" )
         else
-            Line( e, res & " = call " & RetExtAttr( *e.tgt, cf ) & sig & " " & target_ & "(" & args & ")" )
+            Line( e, res & " = call " & CallConvAttr( e, cf ) & RetExtAttr( *e.tgt, cf ) & sig & " " & target_ & "(" & args & ")" )
         end if
 
     '' llvm.va_start takes ONLY the list pointer. MIR carries the last named parameter
@@ -1097,7 +1097,28 @@ function ByvalAttr _
     dim as int32 sz = 0
     if i < f->paramAggs.Count then sz = cast( int32, f->paramAggs[i] )
     if sz <= 0 then return ""
-    return " byval(" & AggType( sz ) & ") align " & str( AlignOf( e, MT_AGG, sz ) )
+    dim as int32 al = AlignOf( e, MT_AGG, sz )
+    '' i386 HANDS EVERY STACK ARGUMENT A 4-ALIGNED SLOT: clang writes
+    '' 'byval(%struct.B24) align 4' even for a struct whose own alignment is 8
+    '' (measured, clang 21.1.3, i686-w64-windows-gnu, {long long x 3}) -- the struct's
+    '' own alignment would promise an 8-aligned area a C caller does not provide.
+    if e.tgt->layout.arch = ARCH_X86_32 then al = 4
+    return " byval(" & AggType( sz ) & ") align " & str( al )
+end function
+
+'' THE CALLING CONVENTION IN THE IR, 'x86_stdcallcc' and nothing else. On x86-64
+'' stdcall collapsed into cdecl -- both caller-cleanup -- so none was ever spelled
+'' here; i386 keeps them apart, clang spelling the stdcall one over the decorated
+'' name the mangler already writes. Measured, clang 21.1.3, i686-w64-windows-gnu:
+'' 'define x86_stdcallcc void @"\01_StdCall@8"(i32, i32)'. Like byval and sret it
+'' must read the same at declare/define and every call.
+private function CallConvAttr _
+    ( byref e as EmitCtx, byval f as MirFunction ptr ) as string
+
+    if f = nullptr then return ""
+    if e.tgt->layout.arch <> ARCH_X86_32 then return ""
+    if f->callConv <> TKO_CC_STDCALL then return ""
+    return "x86_stdcallcc "
 end function
 
 private function ParamList _
@@ -1155,7 +1176,7 @@ private sub EmitFunction( byref e as EmitCtx, byval f as MirFunction ptr )
         dim as string extra = ""
         dim as string dn = e.names->Spelling( f->name )
         if (dn = "_setjmp") orelse (dn = "__intrinsic_setjmp") then extra = " returns_twice"
-        e.outp += "declare " & RetExtAttr( *e.tgt, f ) & ret & " " & GlobalName( e, f->name ) & _
+        e.outp += "declare " & CallConvAttr( e, f ) & RetExtAttr( *e.tgt, f ) & ret & " " & GlobalName( e, f->name ) & _
                   "(" & ParamList( e, f, false ) & ")" & extra & chr( 10 )
         return
     end if
@@ -1219,7 +1240,7 @@ private sub EmitFunction( byref e as EmitCtx, byval f as MirFunction ptr )
         '' statement, where the parameters already hold their values, not the 'sub' line.
         e.dbgLine = 0
     end if
-    e.outp += "define " & linkage & iif( f->isHidden, "hidden ", "" ) & RetExtAttr( *e.tgt, f ) & ret & " " & GlobalName( e, f->name ) & _
+    e.outp += "define " & linkage & iif( f->isHidden, "hidden ", "" ) & CallConvAttr( e, f ) & RetExtAttr( *e.tgt, f ) & ret & " " & GlobalName( e, f->name ) & _
               "(" & ParamList( e, f, true ) & ") nounwind uwtable(sync)" & FrameAttr_( e ) & cmdt & dbgAttr & " {" & chr( 10 )
 
     '' Per-function value bookkeeping. Sized to nextTemp because that is the highest

@@ -1,12 +1,24 @@
 # ci.yml -- the first second machine (review BLD-13, 2026-10-24).
 #
-# Windows and Linux: fetch the pinned seed, build Debug with the test runner, lint, run the
-# suite. The fbc gates (crosslink, check-*.sh) need fbc-modern and stay a local or
-# self-hosted job: without an oracle they exit 77, SKIPPED.
+# Windows and Linux: fetch the pinned seed, build Debug with the test runner, lint. The
+# fbc gates (crosslink, check-*.sh) need fbc-modern and stay a local or self-hosted job:
+# without an oracle they exit 77, SKIPPED.
 #
-# THE SUITE STILL LINKS toolchains/tiko-<host>/lib (review BLD-01), which is gitignored. The
-# seed IS a packaged toolchain, so its lib/ and inc/ are laid out there for the tests. When
-# the suite builds lib/rt for itself this step goes.
+# THE SUITE STILL LINKS toolchains/tiko-<host>/lib (review BLD-01), which is gitignored.
+# The seed IS a packaged toolchain, so its lib/ and inc/ are laid out there for the tests.
+# When the suite builds lib/rt for itself this step goes.
+#
+# EVERYTHING RUNS IN PARALLEL (2026-11-08). Both builders compile, lint and upload bin/;
+# five suite shards PER SYSTEM download it and each runs a slice of tests/ by directory,
+# hand-balanced against measured durations -- mir and diagnostics are dumps and
+# compile-to-error (fast), std's RUN tests compile and execute (slow, one shard of their
+# own). The wall clock is the builders plus the slowest shard. Two mingw lanes -- win32
+# and win64 -- build and smoke their target in parallel with all of it: build/smoke.sh
+# compiles and runs seven programs against the target's own runtime archive, on runners
+# whose only mingw is the winlibs one the lane downloads and caches.
+#
+# The full suite cannot go per-target yet (its cli tests name the target in the file);
+# that, and a win32 lane in these jobs proper, stay Phase 4.
 name: ci
 
 on:
@@ -25,16 +37,13 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
     env:
       GH_TOKEN: ${{ github.token }}
       TIKO_EDITOR_DIR: /c/nonexistent
-      # vendor-pscontrols-public-helpers compiles all of vendor/PsControls cold: 253 s on
-      # Windows and 388 s on Linux in a Debug build, alone. 300 killed it.
-      TIKO_TEST_TIMEOUT: "900"
     steps:
       # THE BYTES AS COMMITTED, as tiko-lang's own checkouts have them (core.autocrlf false).
       # The runner's default, true, turned pkg/sys/posix/*.ti into CRLF while .gitattributes
@@ -42,13 +51,13 @@ jobs:
       - name: No line-ending conversion
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+      - name: Cache the pinned seed
+        uses: actions/cache@v4
+        with:
+          path: seed/cache
+          key: seed-windows-${{ hashFiles('seed/seed.lock') }}
       - name: Fetch the pinned seed
-        run: sh seed/fetch-seed.sh --host windows
-      - name: Lay out the seed's toolchain where the tests link it
-        run: |
-          mkdir -p toolchains
-          cp -r seed/cache/windows/tiko-windows toolchains/tiko-windows || cp -r seed/cache/windows toolchains/tiko-windows
-          ls toolchains/tiko-windows/lib
+        run: [ -d seed/cache/windows ] || sh seed/fetch-seed.sh --host windows
       - name: clang
         run: |
           command -v clang || echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
@@ -58,18 +67,75 @@ jobs:
         run: |
           bash build/lint.sh
           bash lib/rt/build/lint.sh
-      - name: Suite
-        run: bash build/test.sh --no-build
+      - name: Upload bin for the shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bin
+          path: bin/
+          retention-days: 1
+
+  suite-windows:
+    # THE WINDOWS SHARDS -- the slices of tests/, on the artifact's binaries. --no-build
+    # skips the staleness logic; the lib/rt each shard needs is rebuilt by test.sh's
+    # overlay against the downloaded binaries.
+    runs-on: windows-latest
+    timeout-minutes: 40
+    needs: windows
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TIKO_EDITOR_DIR: /c/nonexistent
+      TIKO_TEST_TIMEOUT: "900"
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: diagnostics
+            dirs: "tests/diagnostics tests/types tests/symbols tests/api tests/mangle tests/lexer tests/rtl tests/check"
+          - name: mir
+            dirs: "tests/mir"
+          - name: codegen
+            dirs: "tests/codegen tests/parser tests/pp tests/c2t tests/cimport"
+          - name: modules-driver
+            dirs: "tests/modules tests/driver tests/source tests/abi tests/expected tests/semantic tests/vendor"
+          - name: std
+            dirs: "tests/std"
+    steps:
+      - name: No line-ending conversion
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Cache the pinned seed
+        uses: actions/cache@v4
+        with:
+          path: seed/cache
+          key: seed-windows-${{ hashFiles('seed/seed.lock') }}
+      - name: Fetch the pinned seed
+        run: [ -d seed/cache/windows ] || sh seed/fetch-seed.sh --host windows
+      - name: Lay out the seed's toolchain where the tests link it
+        run: |
+          mkdir -p toolchains
+          cp -r seed/cache/windows/tiko-windows toolchains/tiko-windows || cp -r seed/cache/windows toolchains/tiko-windows
+      - name: clang
+        run: |
+          command -v clang || echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+      - name: Download bin
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-bin
+          path: bin/
+      - name: Suite (shard ${{ matrix.shard.name }})
+        run: bash build/test.sh --no-build ${{ matrix.shard.dirs }}
 
   linux:
+    # THE LINUX BUILDER: compiles the compiler and the runner, lints, and uploads bin/
+    # for the shards. Nothing here runs the suite.
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 40
     env:
       GH_TOKEN: ${{ github.token }}
       TIKO_EDITOR_DIR: /nonexistent
-      # vendor-pscontrols-public-helpers compiles all of vendor/PsControls cold: 253 s on
-      # Windows and 388 s on Linux in a Debug build, alone. 300 killed it.
-      TIKO_TEST_TIMEOUT: "900"
     steps:
       - uses: actions/checkout@v4
       - name: LLVM 18
@@ -79,8 +145,13 @@ jobs:
           echo "TIKO_CLANG=/usr/bin/clang-18" >> "$GITHUB_ENV"
           echo "TIKO_AR=/usr/bin/llvm-ar-18" >> "$GITHUB_ENV"
           echo "TIKO_NM=/usr/bin/llvm-nm-18" >> "$GITHUB_ENV"
+      - name: Cache the pinned seed
+        uses: actions/cache@v4
+        with:
+          path: seed/cache
+          key: seed-linux-${{ hashFiles('seed/seed.lock') }}
       - name: Fetch the pinned seed
-        run: sh seed/fetch-seed.sh --host linux
+        run: [ -d seed/cache/linux ] || sh seed/fetch-seed.sh --host linux
       - name: Lay out the seed's toolchain where the tests link it
         run: |
           mkdir -p toolchains
@@ -92,5 +163,162 @@ jobs:
         run: |
           bash build/lint.sh
           bash lib/rt/build/lint.sh
-      - name: Suite
-        run: bash build/test.sh --no-build
+      - name: Upload bin for the shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bin
+          path: bin/
+          retention-days: 1
+
+  suite-linux:
+    # THE LINUX SHARDS -- the same slices the windows shards run, on faster runners.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: linux
+    env:
+      TIKO_EDITOR_DIR: /nonexistent
+      TIKO_TEST_TIMEOUT: "900"
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: diagnostics
+            dirs: "tests/diagnostics tests/types tests/symbols tests/api tests/mangle tests/lexer tests/rtl tests/check"
+          - name: mir
+            dirs: "tests/mir"
+          - name: codegen
+            dirs: "tests/codegen tests/parser tests/pp tests/c2t tests/cimport"
+          - name: modules-driver
+            dirs: "tests/modules tests/driver tests/source tests/abi tests/expected tests/semantic tests/vendor"
+          - name: std
+            dirs: "tests/std"
+    steps:
+      - uses: actions/checkout@v4
+      - name: LLVM 18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18 llvm-18
+          echo "TIKO_CLANG=/usr/bin/clang-18" >> "$GITHUB_ENV"
+          echo "TIKO_AR=/usr/bin/llvm-ar-18" >> "$GITHUB_ENV"
+          echo "TIKO_NM=/usr/bin/llvm-nm-18" >> "$GITHUB_ENV"
+      - name: Cache the pinned seed
+        uses: actions/cache@v4
+        with:
+          path: seed/cache
+          key: seed-linux-${{ hashFiles('seed/seed.lock') }}
+      - name: Fetch the pinned seed
+        run: [ -d seed/cache/linux ] || sh seed/fetch-seed.sh --host linux
+      - name: Lay out the seed's toolchain where the tests link it
+        run: |
+          mkdir -p toolchains
+          cp -r seed/cache/linux/tiko-linux toolchains/tiko-linux || cp -r seed/cache/linux toolchains/tiko-linux
+      - name: Download bin
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-bin
+          path: bin/
+      - name: Make the binaries executable
+        run: chmod +x bin/*
+      - name: Suite (shard ${{ matrix.shard.name }})
+        run: bash build/test.sh --no-build ${{ matrix.shard.dirs }}
+
+  win32-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      TIKO_EDITOR_DIR: /c/nonexistent
+    steps:
+      - name: No line-ending conversion
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      # THE i686 MSVCRT-FLAVOR WINLIBS, the same build the win32 bring-up ran against
+      # (gcc 16.2.0-r2): clang finds the sysroot through the gcc this puts on PATH.
+      - name: Cache the mingw32 toolchain
+        id: mingw32
+        uses: actions/cache@v4
+        with:
+          path: ~/mingw32
+          key: winlibs-i686-16.2.0-msvcrt-14.0.0-r2
+      - name: Fetch the mingw32 toolchain
+        if: steps.mingw32.outputs.cache-hit != 'true'
+        run: |
+          # THE RELEASE CDN ANSWERS 504 SOMETIMES -- curl retries five times before
+          # this step gives up, and the size check catches a truncated archive: the
+          # zip is 274 MB and a silent half-download unzip-reports-nothing on.
+          curl -sL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o winlibs32.zip "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-msvcrt-r2/winlibs-i686-posix-dwarf-gcc-16.2.0-mingw-w64msvcrt-14.0.0-r2.zip"
+          [ "$(stat -c%s winlibs32.zip)" -gt 200000000 ] || { echo "winlibs32.zip truncated" >&2; exit 1; }
+          mkdir -p ~/mingw32
+          unzip -q winlibs32.zip -d ~/mingw32
+          ~/mingw32/mingw32/bin/gcc.exe --version | head -1
+      - name: mingw32 on PATH
+        run: echo "$HOME/mingw32/mingw32/bin" >> "$GITHUB_PATH"
+      - name: Cache the pinned seed
+        uses: actions/cache@v4
+        with:
+          path: seed/cache
+          key: seed-windows-${{ hashFiles('seed/seed.lock') }}
+      - name: Fetch the pinned seed
+        run: [ -d seed/cache/windows ] || sh seed/fetch-seed.sh --host windows
+      - name: clang
+        run: echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+      - name: Build (Release, no dll)
+        run: bash build/build.sh Release --no-dll
+      - name: lib/rt for win32
+        run: TIKORT_TIKO="$PWD/bin/tiko.exe" bash lib/rt/build/build.sh Release win32
+      - name: Smoke (win32)
+        run: |
+          bash build/smoke.sh win32
+          bash build/smoke.sh win32 --mt
+
+  win64-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      TIKO_EDITOR_DIR: /c/nonexistent
+    steps:
+      - name: No line-ending conversion
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      # THE x86_64 MSVCRT-FLAVOR WINLIBS -- lib/win64 is an msvcrt-flavor archive, and
+      # the ucrt-flavor mingw a runner might carry does not answer its imports.
+      - name: Cache the mingw64 toolchain
+        id: mingw64
+        uses: actions/cache@v4
+        with:
+          path: ~/mingw64
+          key: winlibs-x86_64-16.2.0-msvcrt-14.0.0-r2
+      - name: Fetch the mingw64 toolchain
+        if: steps.mingw64.outputs.cache-hit != 'true'
+        run: |
+          curl -sL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o winlibs64.zip "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-msvcrt-r2/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64msvcrt-14.0.0-r2.zip"
+          [ "$(stat -c%s winlibs64.zip)" -gt 200000000 ] || { echo "winlibs64.zip truncated" >&2; exit 1; }
+          mkdir -p ~/mingw64
+          unzip -q winlibs64.zip -d ~/mingw64
+          ~/mingw64/mingw64/bin/gcc.exe --version | head -1
+      - name: mingw64 on PATH
+        run: echo "$HOME/mingw64/mingw64/bin" >> "$GITHUB_PATH"
+      - name: Cache the pinned seed
+        uses: actions/cache@v4
+        with:
+          path: seed/cache
+          key: seed-windows-${{ hashFiles('seed/seed.lock') }}
+      - name: Fetch the pinned seed
+        run: [ -d seed/cache/windows ] || sh seed/fetch-seed.sh --host windows
+      - name: clang
+        run: echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+      - name: Build (Release, no dll)
+        run: bash build/build.sh Release --no-dll
+      - name: lib/rt for win64
+        run: TIKORT_TIKO="$PWD/bin/tiko.exe" bash lib/rt/build/build.sh Release win64
+      - name: Smoke (win64)
+        run: |
+          bash build/smoke.sh win64
+          bash build/smoke.sh win64 --mt

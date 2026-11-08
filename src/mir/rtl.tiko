@@ -116,49 +116,53 @@ function RtlByName( byref nm as string ) as RtlId
     return RTL_NONE
 end function
 
+'' THE 'z' LETTER AS A TYPE: the pointer-width signed integer every RTL count,
+'' index and length tag travels in -- i64 on the 64-bit targets, i32 on win32,
+'' where RtlSignature's own letter says i32 and a caller spelling i64 signs a
+'' call its own declare refuses.
+function RtlWordType( byval is32 as boolean ) as MirType
+    return iif( is32, MT_I32, MT_I64 )
+end function
+
 function RtlLinkName( byval r as RtlId, byval is32 as boolean ) as string
     dim as string nm = RtlSymbol( r, is32 )
     if is32 = false then return nm
-    dim as string ps = RtlParams( r )
-    if instr( ps, "." ) > 0 then return "_" & nm
+    '' THE BARE NAME ON WIN32 TOO. This used to spell the DECORATED object symbol --
+    '' '_fb_Init@12' -- because fbc's -gen gas pipeline left the decoration to the
+    '' name. LLVM's i386 COFF backend applies BOTH decorations itself, from the
+    '' call's convention: 'bar' assembles to '_bar', and an 'x86_stdcallcc' call to
+    '' 'CloseHandle' assembles to '_CloseHandle@4' (measured, clang 21.1.3,
+    '' i686-w64-windows-gnu). Decorating here as well doubled every one of them --
+    '' '_Sleep@4@4' -- and nothing linked. The convention now travels beside the
+    '' name, as RtlCallConv, and the IR carries the bare spelling.
+    return nm
+end function
 
-    '' NOT EVERYTHING IN THE RUNTIME IS STDCALL ON WIN32. fb_ErrorThrowEx is cdecl --
-    '' measured, libfb.a carries '_fb_ErrorThrowEx' with no '@20' -- and decorating it
-    '' emits a name the linker cannot resolve. Found by check-rtl the moment the entry
-    '' was added, which is the whole reason that gate compares the DECORATED name.
-    if r = RTL_ERROR_THROW then return "_" & nm
-    '' libc is CDECL: the leading underscore is all win32 adds, no '@N'.
+'' THE CONVENTION AN RTL ENTRY IS CALLED WITH ON WIN32, which used to be folded
+'' into the decorated name above and now rides on the IR. Everything is STDCALL --
+'' the rtlib's FBCALL on win32 -- except the families measured cdecl, each with the
+'' libfb.a object that proves it. The measurement comments are the old ones, kept.
+function RtlCallConv( byval r as RtlId, byval is32 as boolean ) as uint8
+    if is32 = false then return TKO_CC_CDECL
+    dim as string ps = RtlParams( r )
+    if instr( ps, "." ) > 0 then return TKO_CC_CDECL
+
     select case r
+    case RTL_ERROR_THROW : return TKO_CC_CDECL
     case RTL_FREE, RTL_MALLOC, RTL_CALLOC, RTL_REALLOC, RTL_MEMSET, _
          RTL_POW, RTL_ATAN2, RTL_ATEXIT
-        return "_" & nm
-    '' The rest of libc and libgcc, reached through 'procptr( fb_MemMove )' and its
-    '' eleven siblings. Same rule, measured the same way.
+        return TKO_CC_CDECL
     case RTL_MEM_MOVE, RTL_MEM_COPY, RTL_RENAME, RTL_C_MAIN, RTL_DIVDI3, _
          RTL_UDIVDI3, RTL_MODDI3, RTL_UMODDI3, RTL_FIXUNSDFDI
-        return "_" & nm
-    '' ...and four of the runtime's own, which are cdecl where their families are not.
-    '' Measured: libfb.a carries '_fb_ErrorResume' with no '@N' while every fb_Error*
-    '' entry point beside them is decorated.
+        return TKO_CC_CDECL
     case RTL_ERROR_RESUME, RTL_ERROR_RESUME_NEXT, RTL_ERROR_THROW_AT, RTL_H_PUT_ADD, RTL_PATH_RENAME
-        return "_" & nm
-    '' ...AND SO ARE THE PUT BLENDERS, alone among the graphics family. Measured: every
-    '' fb_Gfx* entry point is __stdcall with an asm name on win32 and every fb_hPut* is
-    '' plain cdecl with none. Not a rule anyone would guess from the family they are in.
+        return TKO_CC_CDECL
     case RTL_GFX_PUT_TRANS, RTL_GFX_PUT_PSET, RTL_GFX_PUT_PRESET, RTL_GFX_PUT_AND, _
          RTL_GFX_PUT_OR, RTL_GFX_PUT_XOR, RTL_GFX_PUT_ALPHA, RTL_GFX_PUT_BLEND, _
          RTL_GFX_PUT_CUSTOM
-        return "_" & nm
+        return TKO_CC_CDECL
     end select
-
-    dim as int32 total = 0
-    for i as int32 = 0 to len( ps ) - 1
-        dim as MirType t = RtlTypeOfLetter( mid( ps, i + 1, 1 ), true )
-        dim as int32 sz = 4
-        if (t = MT_I64) orelse (t = MT_F64) then sz = 8
-        total += sz
-    next
-    return "_" & nm & "@" & total
+    return TKO_CC_STDCALL
 end function
 
 function RtlParams( byval r as RtlId ) as string

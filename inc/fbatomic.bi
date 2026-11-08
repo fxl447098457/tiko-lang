@@ -21,24 +21,19 @@ namespace FB
 
 '' EXTERN "C" is required: inside a namespace, ALIAS sets the base identifier
 '' but FreeBASIC still applies namespace mangling on top of it.
-'' FBCALL is __stdcall on 32-bit Windows and nothing everywhere else, so the
-'' runtime exports _fb_Foo@N there and fb_Foo elsewhere.  An EXTERN "C" block
-'' forces cdecl and fails to link on win32 ONLY -- and ALIAS does not rescue it,
-'' because inside a NAMESPACE fbc mangles past the alias.  So match the
-'' convention rather than fight it.
+'' THE CONVENTION IS CDECL, ON EVERY TARGET. The comment below said FBCALL --
+'' stdcall on 32-bit Windows -- which was fbc's own libfb's truth; tiko-rt
+'' defines the atomics cdecl (src/rt thread/claimlock.tiko declares them
+'' TKORT_CDECL, and lib/win32/libfbmt.a carries the undecorated _fb_AtomicCasLong,
+'' measured). extern "Windows" here made the call _fb_AtomicCasLong@12 against
+'' the undecorated definition -- lld resolved it with a warning and the stack
+'' disagreed by eight bytes on every atomic step; t3_conc -mt ran and crashed
+'' nothing only because three arguments hid it. The 'Resolving _<name>@N by
+'' linking to _<name>' warning is this mistake's fingerprint.
 ''
-'' Copied from fbclaim.bi rather than re-derived: it was found by rebuilding the
-'' win32 toolchain, not by any win64 test, because win64 has one calling
+'' The old #ifdef chose "Windows" for win32 by fbc's convention; win64 has one
 '' convention and cannot tell the two apart.
-#ifdef __FB_WIN32__
-	#ifdef __FB_64BIT__
-		extern "C"
-	#else
-		extern "Windows"
-	#endif
-#else
-	extern "C"
-#endif
+extern "C"
 
 '' Adds v to *p and returns the value held BEFORE the add, which is what makes
 '' "was I the last reference?" a single atomic step: pass -1 and test the

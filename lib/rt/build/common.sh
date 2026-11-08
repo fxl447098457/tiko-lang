@@ -57,15 +57,14 @@ fi
 # The targets of R3, as amended 2026-09-04. Any other target is not a gap to be
 # filled later: it is out of scope, and the build refuses it rather than guessing.
 #
-# X86-64 IS THE SUPPORTED ARCHITECTURE. win32 was removed here first, ahead of
-# the source changes, because this line is the whole of RFC-0007 phase 3 and
-# putting it back is the whole of undoing it. Everything after this point in the
-# plan deletes code and is not reversible for one edit.
+# X86-64 IS THE SUPPORTED ARCHITECTURE, and win32 is back in the Windows family
+# (2026-11-08) after D14 removed it: the MinGW ABI under i686-w64-windows-gnu,
+# whose msvcrt links no UCRT update. Linux and macOS have no 32-bit member.
 #
 # ARM64 is considered and not implemented -- fbc-modern refuses aarch64 outright
 # (error 83), so there is no runtime to build and no fbc archive to gate against.
 # RFC-0007 section 9.
-RT_TARGETS="win64 linux-x86_64"
+RT_TARGETS="win64 linux-x86_64 win32"
 
 # BUILD-ONLY TARGETS. Buildable, and deliberately NOT in RT_TARGETS, because
 # RT_TARGETS is what gate.sh, symbols.sh and diff.sh validate against -- leaving
@@ -81,7 +80,7 @@ RT_TARGETS="win64 linux-x86_64"
 # macos-arm64 (docs/tiko-macos RFC-0001) is build-only for the same reason as ARM64 above:
 # fbc has no aarch64, so there is nothing to gate it against. Its oracle is tiko's own
 # linux-x86_64 output, compared by lib/rt/build/darwinlane.sh on the Mac.
-RT_BUILD_ONLY_TARGETS="windows-x86_64 macos-arm64"
+RT_BUILD_ONLY_TARGETS="windows-x86_64 macos-arm64 win64ucrt"
 
 # Include path: tiko-rt's own src/, then tiko-lang's inc/ (phase H, 2026-10-10), which
 # supplies crt/long.bi -- the only header lint lets through. It was fbc-modern's src/inc
@@ -128,6 +127,8 @@ rt_target_triple( ) {
         linux-x86_64)          echo "x86_64-pc-linux-gnu" ;;
         macos-arm64)           echo "arm64-apple-macosx13.0" ;;
         win64|windows-x86_64)  echo "x86_64-w64-windows-gnu" ;;
+        win64ucrt)             echo "x86_64-w64-windows-gnu" ;;
+        win32)                 echo "i686-w64-windows-gnu" ;;
         *) echo "rt_target_triple: no triple for target '$1'" >&2; return 1 ;;
     esac
 }
@@ -139,10 +140,15 @@ rt_target_triple( ) {
 # __mingw_sprintf at all. Same mechanism as -d ENABLE_MT.
 rt_abi_define( ) {
     case "$1" in
-        windows-x86_64) echo "-d TKORT_MSVC" ;;
-        *)      echo "" ;;
+        windows-x86_64) echo "-d TKORT_MSVC -d TKORT_FBCALL= -d TKORT_STDCALL= -d TKORT_CDECL=" ;;
+        win64ucrt)      echo "-d TKORT_UCRT -d TKORT_FBCALL=cdecl -d TKORT_STDCALL= -d TKORT_CDECL=" ;;
+        win32)          echo "-d TKORT_FBCALL=stdcall -d TKORT_STDCALL=stdcall -d TKORT_CDECL=cdecl" ;;
+        *)      echo "-d TKORT_FBCALL=cdecl -d TKORT_STDCALL= -d TKORT_CDECL=" ;;
     esac
 }
+
+# win32 takes NO define, like win64: it is the MinGW ABI, and the sources' MinGW
+# spellings (__iob_func, strcasecmp) are the ones its msvcrt resolves.
 
 # THE TRIPLE clang IS GIVEN, or empty when fbc's own assemble step is right.
 #

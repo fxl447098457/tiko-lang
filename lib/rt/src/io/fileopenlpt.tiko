@@ -1,0 +1,103 @@
+'' fileopenlpt.tiko -- THE PRINTER CHANNEL, and nothing else. fbc's own build
+'' keeps these in file_openlpt.o, apart from the file layer, and so does this:
+'' the two entry points here are the only callers of fb_DevLptOpen outside the
+'' LPT device itself, and keeping them in their own member is what lets a
+'' program that never LPRINTs and never OPENs "LPT:" leave the printer layer --
+'' io_devlptopen, io_devlpttest, io_printerwin, io_devlptio -- and its
+'' WINSPOOL.DRV and GDI32.dll imports out of the binary entirely. In
+'' file_openlpt.o they were measured out of it: the same program that imports
+'' four DLLs with the printer linked imports kernel32 and the CRT without it.
+''
+'' THE PRINTER HANDLE OPENS ITSELF ONCE AND REGISTERS AN atexit. fb_LPrintInit is
+'' the only entry point in the printer layer that names a device string of its
+'' own -- and the string is per-platform, "LPT:EMU=TTY" on Windows and "LPT:"
+'' elsewhere, which is why LPRINT talks to the system default printer and cannot
+'' be redirected by an argument.
+
+#include once "inc/descriptors.ti"
+#include once "inc/file.ti"
+#include once "inc/iolock.ti"
+#include once "inc/rterror.ti"
+
+'' The mode/access/lock/encoding constants, as fileopen.tiko spells them from
+'' fb_file.h.
+const FB_FILE_ACCESS_ANY       = 0
+const FB_FILE_ACCESS_READ      = 1
+const FB_FILE_ACCESS_WRITE     = 2
+const FB_FILE_ACCESS_READWRITE = 3
+
+const FB_FILE_LOCK_SHARED    = 0
+const FB_FILE_LOCK_READ      = 1
+const FB_FILE_LOCK_WRITE     = 2
+const FB_FILE_LOCK_READWRITE = 3
+
+'' ASCII is zero and is also the default, so a handle whose encoding was never
+'' set is an ASCII handle.
+const FB_FILE_ENCOD_DEFAULT = FB_FILE_ENCOD_ASCII
+
+'' The device-open hook type, as fileopen.tiko spells it from fb_file.h.
+type FnFileOpen as function cdecl _
+	( byval h as FB_FILE ptr, byval filename as zstring ptr, byval fname_len as uinteger ) as int32
+
+extern "c"   '' NON-FBCALL: fbc's own code calls them, generated code does not.
+
+	declare function tkrt_DevLptOpen alias "fb_DevLptOpen" _
+		( byval h as FB_FILE ptr, byval f as zstring ptr, byval l as uinteger ) as int32
+	declare function tkort_FileOpenVfsRawEx alias "fb_FileOpenVfsRawEx" _
+		( byval h as FB_FILE ptr, byval filename as zstring ptr, byval filename_length as uinteger, _
+		  byval mode as uint32, byval acc as uint32, byval lock_ as uint32, byval reclen as int32, _
+		  byval encod_ as int32, byval pfnOpen as FnFileOpen ) as int32
+	declare function tkort_FileOpenVfsEx alias "fb_FileOpenVfsEx" _
+		( byval h as FB_FILE ptr, byval str_filename as FBSTRING ptr, _
+		  byval mode as uint32, byval acc as uint32, byval lock_ as uint32, byval reclen as int32, _
+		  byval encod_ as int32, byval pfnOpen as FnFileOpen ) as int32
+	declare function tkort_hFileStrToEncoding alias "fb_hFileStrToEncoding" _
+		( byval encod_ as zstring ptr ) as int32
+	declare function tkrt_ErrorSetNum alias "fb_ErrorSetNum" ( byval e as int32 ) as int32
+
+end extern
+
+'' THE PRINTER DEVICE STRING IS FIXED AND PER-PLATFORM. There is no argument, so
+'' LPRINT always means the system default printer -- `OPEN LPT "x.txt" ...` opens
+'' a different channel that LPRINT never looks at.
+#ifdef __FB_WIN32__
+	dim shared as zstring * 16 pszPrinterDev = "LPT:EMU=TTY"
+#elseif defined( __FB_LINUX__ )
+	dim shared as zstring * 16 pszPrinterDev = "LPT:"
+#else
+	dim shared as zstring * 16 pszPrinterDev = "LPT1:"
+#endif
+
+'' atexit, not fb_End: the printer handle is opened lazily by the first LPRINT,
+'' so nothing in the normal shutdown path knows it exists.
+private sub hClosePrinterHandle cdecl ( )
+	if( TKORT_HANDLE_PRINTER()->hooks = nullptr ) then exit sub
+	TKORT_HANDLE_PRINTER()->hooks->pfnClose( TKORT_HANDLE_PRINTER() )
+end sub
+
+function tkort_LPrintInit alias "fb_LPrintInit" ( ) as int32
+
+	if( TKORT_HANDLE_PRINTER()->hooks = nullptr ) then
+		dim as int32 res = tkort_FileOpenVfsRawEx( TKORT_HANDLE_PRINTER(), _
+		                                          @pszPrinterDev, len( pszPrinterDev ), _
+		                                          FB_FILE_MODE_APPEND, FB_FILE_ACCESS_WRITE, _
+		                                          FB_FILE_LOCK_READWRITE, 0, _
+		                                          FB_FILE_ENCOD_DEFAULT, @tkrt_DevLptOpen )
+		'' REGISTERED ONLY ON SUCCESS, so a machine with no printer does not
+		'' get an atexit that calls through a NULL hook table.
+		if( res = FB_RTERROR_OK ) then atexit( @hClosePrinterHandle )
+		return res
+	end if
+
+	return tkrt_ErrorSetNum( FB_RTERROR_OK )
+end function
+
+function tkort_FileOpenLpt alias "fb_FileOpenLpt" _
+	( byval s as FBSTRING ptr, byval mode as uint32, byval acc as uint32, _
+	  byval lock_ as uint32, byval fnum as int32, byval reclen as int32, _
+	  byval encod_ as zstring ptr ) as int32
+
+	if( TKORT_FILE_INDEX_VALID( fnum ) = 0 ) then return tkrt_ErrorSetNum( FB_RTERROR_ILLEGALFUNCTIONCALL )
+	return tkort_FileOpenVfsEx( TKORT_FILE_TO_HANDLE( fnum ), s, mode, acc, lock_, reclen, _
+	                            tkort_hFileStrToEncoding( encod_ ), @tkrt_DevLptOpen )
+end function

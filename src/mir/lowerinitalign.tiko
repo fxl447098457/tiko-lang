@@ -17,7 +17,7 @@
 declare function AlignUdt_ _
     ( byref c as Ctx, byval t as Tko.TypeId, byval leaf0 as int32, byval lst as Tko.NodeId, _
       byref ci as int32, byref vNode as containers.Array( of uint32 ), byref vStart as containers.Array( of uint32 ), _
-      byval depth as int32 ) as boolean
+      byval depth as int32, byval inBase as boolean = false ) as boolean
 
 private function IsBracketed_( byref c as Ctx, byval v as Tko.NodeId ) as boolean
     select case c.ast->Kind( v )
@@ -78,13 +78,13 @@ end function
 function AlignUdt_ _
     ( byref c as Ctx, byval t as Tko.TypeId, byval leaf0 as int32, byval lst as Tko.NodeId, _
       byref ci as int32, byref vNode as containers.Array( of uint32 ), byref vStart as containers.Array( of uint32 ), _
-      byval depth as int32 ) as boolean
+      byval depth as int32, byval inBase as boolean = false ) as boolean
 
     if depth > 8 then return false
     dim as int32 ui = c.udts->Find( t )
     if ui < 0 then return false
     dim as containers.Array( of uint32 ) lo, lty, lft
-    if FlattenUdtFields_( c, t, 0, lo, lty, 0, lft ) = false then return false
+    if FlattenUdtFields_( c, t, 0, lo, lty, 0, lft, inBase ) = false then return false
     dim as int32 n = ListCount_( c, lst )
     dim as int32 li = 0
     '' WHICH FIELDS TAKE A VALUE AT ALL: a UNION -- named, or anonymous inside the type --
@@ -117,6 +117,36 @@ function AlignUdt_ _
             end if
         wend
         if (fs = nullptr) orelse (fs->name <> fld->name) then return false
+        '' THE BASE THE CONSTRUCTOR BUILDS TAKES VALUES FOR ITS FIELDS, NOT FOR ITS
+        '' VPTR -- ON THE BASE CHAIN OF THE TYPE BEING INITIALISED, AND NOWHERE ELSE.
+        '' 'extends object' -- and any base with a constructor -- was built by the
+        '' prologue before this list runs; FlattenUdtFields_ dropped the vptr's leaves
+        '' (same measurement, same reason), so the values for the base's own fields are
+        '' paired by walking INTO the base. Without the walk the value fell through to
+        '' the whole-object store that overwrote the vptr -- the Dog half of t2_oop,
+        '' on win32 and win64 alike. A class reached as an ORDINARY FIELD's type keeps
+        '' the original walk: its value is one whole object, not a field list (Map's
+        '' ( pairkey, long ) pair is why the flag exists -- measured,
+        '' tests/std/generics/container-map). A plain base -- no ctor, no vptr --
+        '' fills positionally, as fbc does.
+        if ((depth = 0) orelse inBase) andalso (c.udts->baseName <> 0) andalso _
+           (fld->name = c.udts->baseName) then
+            dim as Tko.TypeId bt = c.types->Unqualify( fld->type_ )
+            if (c.types->Kind( bt ) = Tko.TK_UDT) andalso _
+               (TypeNeedsInit_( c, bt ) orelse _
+                (StructorWithArity( c, StructorOf( c, bt, "__ctor" ), 0 ) <> Tko.SYMBOL_NONE)) then
+                dim as int32 a2 = li, b2 = li
+                while (b2 < lo.Count) andalso (cast( int32, lo[b2] ) < fld->offset + fsz)
+                    b2 += 1
+                wend
+                if b2 > a2 then
+                    if ci >= n then return true   '' the rest takes its defaults
+                    if AlignUdt_( c, bt, leaf0 + a2, lst, ci, vNode, vStart, depth + 1, true ) = false then return false
+                end if
+                li = b2
+                continue for
+            end if
+        end if
         dim as int32 fd = fs->anonDepth
         if fd > 16 then return false
         dim as int32 firstNew = fd - fs->anonOpen + 1

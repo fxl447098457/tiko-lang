@@ -1,0 +1,76 @@
+'' abiaapcs.tiko -- the AAPCS64 (Apple) half of the ABI rewriter, a unit beside
+'' abi.tiko: that file passed the 1500-line lint cap, and these four are the pieces
+'' only its callers reach, so the split is along the one seam the API already has.
+'' The underscore-free spellings are the unit's public face, declared in abi.ti.
+
+#import "std/containers"
+#include once "codegen/abi.ti"
+
+namespace Tko.Codegen
+
+using Tko.Mir
+
+'' ---------------------------------------------------------------- AAPCS64 (Apple)
+''
+'' MEASURED, clang 21, 'arm64-apple-macosx13.0' -- what clang writes for a C struct
+'' passed and returned by value (docs/tiko-macos FACTS.md):
+''
+''     an HFA of N <= 4 floats / doubles     [N x float] / [N x double], both ways
+''     anything else, 1 to 8 bytes           argument i64; result the integer of its
+''                                           size (i8 i16 i24 i32 ... i64)
+''     anything else, 9 to 16 bytes          [2 x i64], both ways
+''     over 16 bytes                         argument: a pointer to the CALLER's copy,
+''                                           not byval; result: sret
+''
+'' A result of 3, 5, 6 or 7 bytes goes back as i64 here, where clang writes i24 ... i56:
+'' MIR has no such integers, and in x0 the two are the same bits -- each side reads only
+'' the bytes the aggregate has. Every other shape is clang's own spelling.
+''
+'' The arrays are what make the backend honour AAPCS64's "registers or the stack, never
+'' both": see the MirType comment in mir.ti. So there is no register budget to keep here,
+'' unlike SysV's.
+function AapcsHfaType( byval cls as uint32 ) as MirType
+    dim as int32 n = TKO_AA_HFAN( cls )
+    if (TKO_AA_IS( cls ) = false) orelse (n = 0) then return MT_VOID
+    dim as boolean dbl = ((cls and TKO_AA_HFA_DBL) <> 0)
+    select case n
+    case 1 : return iif( dbl, MT_HFA_F64_1, MT_HFA_F32_1 )
+    case 2 : return iif( dbl, MT_HFA_F64_2, MT_HFA_F32_2 )
+    case 3 : return iif( dbl, MT_HFA_F64_3, MT_HFA_F32_3 )
+    case 4 : return iif( dbl, MT_HFA_F64_4, MT_HFA_F32_4 )
+    end select
+    return MT_VOID
+end function
+
+'' The type an aggregate ARGUMENT travels as; MT_PTR is the address of the caller's copy.
+'' No class recorded is the integer rule by size, as SysV's size-only fallback is.
+function AapcsArgType( byval sz as int32, byval cls as uint32 ) as MirType
+    dim as MirType h = AapcsHfaType( cls )
+    if h <> MT_VOID then return h
+    if sz <= 8 then return MT_I64
+    if sz <= 16 then return MT_A2_I64
+    return MT_PTR
+end function
+
+'' ...and a RESULT, MT_VOID for one that goes through the hidden pointer.
+function AapcsRetType( byval sz as int32, byval cls as uint32 ) as MirType
+    dim as MirType h = AapcsHfaType( cls )
+    if h <> MT_VOID then return h
+    if sz <= 8 then
+        dim as MirType it = DirectIntType( sz )
+        return iif( it <> MT_VOID, it, MT_I64 )
+    end if
+    if sz <= 16 then return MT_A2_I64
+    return MT_VOID
+end function
+
+'' THE COPY EACH REGISTER FORM IS LOADED FROM AND STORED TO: a whole i64 or [2 x i64] is
+'' moved at once, so the slot is rounded up to 8 or 16 bytes. An HFA's array is exactly
+'' its members, which those sizes also cover; past 16 it is the aggregate itself.
+function AapcsSlotSize( byval sz as int32 ) as int32
+    if sz <= 8 then return 8
+    if sz <= 16 then return 16
+    return sz
+end function
+
+end namespace

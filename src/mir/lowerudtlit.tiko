@@ -48,11 +48,13 @@ private function FlattenInitValues_ _
     return true
 end function
 
-'' Defined below, and used above it: FreeBASIC needs the forward declaration.
+'' Defined below, and used above it: FreeBASIC needs the forward declaration. inBase
+'' marks the base chain of the type being initialised -- the only place the base's leaves leave.
 declare function FlattenUdtFields_ _
     ( byref c as Ctx, byval t as Tko.TypeId, byval base_ as int32, _
       byref offs as containers.Array( of uint32 ), byref tys as containers.Array( of uint32 ), _
-      byval depth as int32, byref fts as containers.Array( of uint32 ) ) as boolean
+      byval depth as int32, byref fts as containers.Array( of uint32 ), _
+      byval inBase as boolean = false ) as boolean
 
 '' Matching an initialiser's values to the fields they fill -- AlignInitValues_. Split out
 '' at the 1500-line cap, and INCLUDED here because it shares this unit's private helpers.
@@ -1012,7 +1014,8 @@ end function
 function FlattenUdtFields_ _
     ( byref c as Ctx, byval t as Tko.TypeId, byval base_ as int32, _
       byref offs as containers.Array( of uint32 ), byref tys as containers.Array( of uint32 ), _
-      byval depth as int32, byref fts as containers.Array( of uint32 ) ) as boolean
+      byval depth as int32, byref fts as containers.Array( of uint32 ), _
+      byval inBase as boolean = false ) as boolean
 
     if depth > 8 then return false
     dim as int32 ui = c.udts->Find( t )
@@ -1023,6 +1026,46 @@ function FlattenUdtFields_ _
     for i as int32 = 0 to n - 1
         dim as Tko.UdtField ptr fld = @c.udts->fields[f0 + i]
         if fld->bitWidth <> 0 then return false
+        '' A BASE THE CONSTRUCTOR BUILDS CONTRIBUTES ITS FIELDS, NOT ITS VPTR -- BUT
+        '' ONLY ON THE BASE CHAIN OF THE TYPE BEING INITIALISED. A plain base fills
+        '' positionally, as fbc does (fbc-modern, 1, 2, 3 at 0, 4, 8). A base WITH a
+        '' constructor -- 'extends object', anything virtual -- was BUILT by the
+        '' prologue (EmitCtorPrologue_) before the list runs: its vptr is stored there,
+        '' and a leaf on it pairs the first value with the vptr. Measured: 'dim a as
+        '' Animal = type( "generic" )' stored the literal at offset 0 and the first
+        '' virtual call jumped to 0x656e6567 -- the bytes of "generic". fbc refuses the
+        '' form (error 99); tiko takes it as an extension, so on the base chain this
+        '' walks INTO the constructed base and drops only the vptr's bytes -- why Dog
+        '' still fills the inherited name.
+        '' THE SCOPE IS THE CHAIN, and inBase is why. A class reached as an ORDINARY
+        '' FIELD's type keeps the original flatten: its value is ONE WHOLE OBJECT,
+        '' located by the vptr leaf -- Map's ( pairkey, long ) pair: walking in emptied
+        '' pairkey's leaves, two values paired against one, TKO0994 stopped the build
+        '' (tests/std/generics/container-map).
+        if ((depth = 0) orelse inBase) andalso (c.udts->baseName <> 0) andalso _
+           (fld->name = c.udts->baseName) then
+            dim as Tko.TypeId bt = c.types->Unqualify( fld->type_ )
+            if (c.types->Kind( bt ) = Tko.TK_UDT) andalso _
+               (TypeNeedsInit_( c, bt ) orelse _
+                (StructorWithArity( c, StructorOf( c, bt, "__ctor" ), 0 ) <> Tko.SYMBOL_NONE)) then
+                dim as containers.Array( of uint32 ) bo
+                dim as containers.Array( of uint32 ) bty
+                dim as containers.Array( of uint32 ) bfts
+                if FlattenUdtFields_( c, bt, base_ + fld->offset, bo, bty, depth + 1, bfts, true ) = false then return false
+                dim as int32 skipB = 0
+                if c.vts <> nullptr then
+                    if c.vts->Find( bt ) >= 0 then skipB = c.types->target.pointerBits \ 8
+                end if
+                for k as int32 = 0 to bo.Count - 1
+                    if cast( int32, bo[k] ) >= base_ + fld->offset + skipB then
+                        offs.Push( bo[k] )
+                        tys.Push( bty[k] )
+                        fts.Push( bfts[k] )
+                    end if
+                next
+                continue for
+            end if
+        end if
         dim as MirType fmt = LowerType( fld->type_, *c.types )
         '' A BUILTIN STRING BASE IS NO LEAF. 'type DVARIANT extends wstring' has a BASE of
         '' the unsized builtin 'wstring', which takes no room in the layout (--dump-udt puts

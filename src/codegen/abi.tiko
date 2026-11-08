@@ -25,68 +25,9 @@ private function AbiIsAapcs_( byref target as TargetDescription ) as boolean
     return (target.abi = ABI_AAPCS64_APPLE)
 end function
 
-'' ---------------------------------------------------------------- AAPCS64 (Apple)
-''
-'' MEASURED, clang 21, 'arm64-apple-macosx13.0' -- what clang writes for a C struct
-'' passed and returned by value (docs/tiko-macos FACTS.md):
-''
-''     an HFA of N <= 4 floats / doubles     [N x float] / [N x double], both ways
-''     anything else, 1 to 8 bytes           argument i64; result the integer of its
-''                                           size (i8 i16 i24 i32 ... i64)
-''     anything else, 9 to 16 bytes          [2 x i64], both ways
-''     over 16 bytes                         argument: a pointer to the CALLER's copy,
-''                                           not byval; result: sret
-''
-'' A result of 3, 5, 6 or 7 bytes goes back as i64 here, where clang writes i24 ... i56:
-'' MIR has no such integers, and in x0 the two are the same bits -- each side reads only
-'' the bytes the aggregate has. Every other shape is clang's own spelling.
-''
-'' The arrays are what make the backend honour AAPCS64's "registers or the stack, never
-'' both": see the MirType comment in mir.ti. So there is no register budget to keep here,
-'' unlike SysV's.
-private function AapcsHfaType_( byval cls as uint32 ) as MirType
-    dim as int32 n = TKO_AA_HFAN( cls )
-    if (TKO_AA_IS( cls ) = false) orelse (n = 0) then return MT_VOID
-    dim as boolean dbl = ((cls and TKO_AA_HFA_DBL) <> 0)
-    select case n
-    case 1 : return iif( dbl, MT_HFA_F64_1, MT_HFA_F32_1 )
-    case 2 : return iif( dbl, MT_HFA_F64_2, MT_HFA_F32_2 )
-    case 3 : return iif( dbl, MT_HFA_F64_3, MT_HFA_F32_3 )
-    case 4 : return iif( dbl, MT_HFA_F64_4, MT_HFA_F32_4 )
-    end select
-    return MT_VOID
-end function
-
-'' The type an aggregate ARGUMENT travels as; MT_PTR is the address of the caller's copy.
-'' No class recorded is the integer rule by size, as SysV's size-only fallback is.
-private function AapcsArgType_( byval sz as int32, byval cls as uint32 ) as MirType
-    dim as MirType h = AapcsHfaType_( cls )
-    if h <> MT_VOID then return h
-    if sz <= 8 then return MT_I64
-    if sz <= 16 then return MT_A2_I64
-    return MT_PTR
-end function
-
-'' ...and a RESULT, MT_VOID for one that goes through the hidden pointer.
-private function AapcsRetType_( byval sz as int32, byval cls as uint32 ) as MirType
-    dim as MirType h = AapcsHfaType_( cls )
-    if h <> MT_VOID then return h
-    if sz <= 8 then
-        dim as MirType it = DirectIntType( sz )
-        return iif( it <> MT_VOID, it, MT_I64 )
-    end if
-    if sz <= 16 then return MT_A2_I64
-    return MT_VOID
-end function
-
-'' THE COPY EACH REGISTER FORM IS LOADED FROM AND STORED TO: a whole i64 or [2 x i64] is
-'' moved at once, so the slot is rounded up to 8 or 16 bytes. An HFA's array is exactly
-'' its members, which those sizes also cover; past 16 it is the aggregate itself.
-private function AapcsSlotSize_( byval sz as int32 ) as int32
-    if sz <= 8 then return 8
-    if sz <= 16 then return 16
-    return sz
-end function
+'' THE AAPCS64 HALF -- AapcsHfaType, AapcsArgType, AapcsRetType, AapcsSlotSize --
+'' is the abiaapcs unit beside this one: this file passed the 1500-line lint cap,
+'' and those four are the pieces only this unit's callers reach.
 
 private function AbiIsWin64_( byref target as TargetDescription ) as boolean
     select case target.abi
@@ -97,12 +38,23 @@ private function AbiIsWin64_( byref target as TargetDescription ) as boolean
     return false
 end function
 
+'' ABI_WIN32 TAKES ITS OWN BRANCH, ahead of every call to AbiIsWin64_, the way
+'' AAPCS64 does: the size-only question it answers is not win64's.
+private function AbiIsWin32_( byref target as TargetDescription ) as boolean
+    return (target.abi = ABI_WIN32)
+end function
+
 function ClassifyAggregate _
     ( byval sizeBytes as int32, byref target as TargetDescription ) as AbiClassKind
 
     if AbiIsAapcs_( target ) then
         if sizeBytes > 16 then return ABIC_INDIRECT
         return ABIC_DIRECT_INT
+    end if
+    if AbiIsWin32_( target ) then
+        '' EVERY AGGREGATE ON THE STACK, at every size: i386 cdecl has no register
+        '' classes to coerce into, and the signature spells 'ptr byval'.
+        return ABIC_INDIRECT
     end if
     if AbiIsWin64_( target ) then
         if DirectIntType( sizeBytes ) <> MT_VOID then return ABIC_DIRECT_INT
@@ -165,8 +117,45 @@ private function RetDirect_ _
 
     t1 = MT_VOID
     if AbiIsAapcs_( target ) then
-        t0 = AapcsRetType_( sz, cls )
+        t0 = AapcsRetType( sz, cls )
         return (t0 <> MT_VOID)
+    end if
+    if AbiIsWin32_( target ) then
+        '' ABI_WIN32, MEASURED, clang 21.1.3, 'i686-w64-windows-gnu', struct returns
+        '' of every size from 1 to 24 bytes:
+        ''
+        ''     1, 2, 4 bytes      the integer of the size (i8, i16, i32) -- except a
+        ''                        4-byte struct whose one field is float, which comes
+        ''                        back in st0 as 'float', so the class decides at 4 too
+        ''     3 bytes            sret (a hidden pointer), align 1
+        ''     5, 6, 7, 8 bytes   i64, whatever the fields are: {int,int} as i64,
+        ''                        {float,float} as i64, {float,int} as i64 -- packed
+        ''                        into edx:eax -- except ONE eightbyte of SSE covering
+        ''                        all eight bytes ({double}), which is 'double' in st0
+        ''     over 8 bytes       sret, at the struct's own alignment (measured 4 and 8)
+        ''
+        '' The class is the frontend's eightbyte walk, which runs for this target as
+        '' for SysV; with NO class recorded the size-only integer stands, as SysV's
+        '' fallback does. retTy2 stays MT_VOID always: nothing on i386 returns a
+        '' two-register PAIR that the i64 spelling does not cover.
+        dim as uint32 e0 = TKO_EB0( cls )
+        if sz > 8 then return false
+        if sz <= 2 then return (DirectIntType( sz ) <> MT_VOID)
+        if sz = 3 then return false
+        if sz = 4 then
+            if (e0 = TKO_EB_SSE) andalso (TKO_EB1( cls ) = TKO_EB_NONE) then
+                t0 = MT_F32
+            else
+                t0 = MT_I32
+            end if
+            return true
+        end if
+        if (e0 = TKO_EB_SSE) andalso (TKO_EB1( cls ) = TKO_EB_NONE) then
+            t0 = MT_F64
+        else
+            t0 = MT_I64
+        end if
+        return true
     end if
     t0 = DirectIntType( sz )
     if AbiIsWin64_( target ) then return (t0 <> MT_VOID)
@@ -186,6 +175,8 @@ private function SysvReturnUnmodelled_ _
 
     '' AAPCS64 models every size.
     if AbiIsAapcs_( target ) then return false
+    '' So does ABI_WIN32: at most eight bytes, and RetDirect_ answers every size.
+    if AbiIsWin32_( target ) then return false
     if AbiIsWin64_( target ) then return false
     if (sz <= 0) orelse (sz > 16) then return false
     return (cls = 0) andalso (DirectIntType( sz ) = MT_VOID)
@@ -194,7 +185,13 @@ end function
 '' A SysV register slot is WHOLE EIGHTBYTES: a register is loaded out of it and stored
 '' into it at full width, and a thirteen-byte slot would take an i64 at offset 8.
 private function RegSlotSize_( byval sz as int32, byref target as TargetDescription ) as int32
-    if AbiIsAapcs_( target ) then return AapcsSlotSize_( sz )
+    if AbiIsAapcs_( target ) then return AapcsSlotSize( sz )
+    if AbiIsWin32_( target ) then
+        '' ABI_WIN32: a direct return travels in the register(s) its size picks, and the
+        '' slot holds exactly the aggregate -- an i64 load of a 5-byte return reads the
+        '' three bytes past it in edx:eax's other half, not in a slot.
+        return sz
+    end if
     if AbiIsWin64_( target ) then return sz
     return (sz + 7) and (not 7)
 end function
@@ -204,7 +201,11 @@ end function
 '' left when the last one is 3, 5, 6 or 7 bytes -- 'i32' over 3, 'i64' over 5 to 7.
 '' Every other size is exactly its registers. Win64 passes no aggregate in pieces.
 private function ArgSlotSize_( byval sz as int32, byref target as TargetDescription ) as int32
-    if AbiIsAapcs_( target ) then return AapcsSlotSize_( sz )
+    if AbiIsAapcs_( target ) then return AapcsSlotSize( sz )
+    if AbiIsWin32_( target ) then
+        '' ABI_WIN32: every aggregate argument is a byval copy, and the slot IS the copy.
+        return sz
+    end if
     if AbiIsWin64_( target ) then return sz
     dim as int32 tail_ = sz and 7
     select case tail_
@@ -459,7 +460,7 @@ private sub RewriteCallArgs _
         if AbiIsAapcs_( *r.tgt ) then
             dim as uint32 acls = 0
             if i < callee->paramClasses.Count then acls = callee->paramClasses[i]
-            dim as MirType at_ = AapcsArgType_( sz, acls )
+            dim as MirType at_ = AapcsArgType( sz, acls )
             if at_ = MT_PTR then
                 r.m->argPool.Push( cast( uint32, MV_LOCAL ) )
                 r.m->argPool.Push( cast( uint32, slot ) )
@@ -471,6 +472,22 @@ private sub RewriteCallArgs _
                 r.st->coercedParams += 1
             end if
             newCount += 1
+            continue for
+        end if
+
+        if AbiIsWin32_( *r.tgt ) then
+            '' EVERY AGGREGATE ON THE STACK, at every size: the slot's address is the
+            '' argument and the signature marks it byval. clang spells the small ones
+            '' flattened -- 'i32, i32' for {int,int}, one 'i64' for {long long} --
+            '' but on i386 cdecl a flattened argument and a byval copy put THE SAME
+            '' BYTES at the same stack offsets, so the two spellings interoperate in
+            '' both directions. Measured against clang 21.1.3 for aggregates of 1, 2,
+            '' 3, 4, 5, 7, 8, 12, 16, 20 and 24 bytes, and for float and double
+            '' fields of every shape it flattens.
+            r.m->argPool.Push( cast( uint32, MV_LOCAL ) )
+            r.m->argPool.Push( cast( uint32, slot ) )
+            newCount += 1
+            r.st->indirectParams += 1
             continue for
         end if
 
@@ -840,10 +857,22 @@ private sub RewriteSignature _
         '' ---- AAPCS64: one parameter, never byval -- over 16 bytes the callee is handed the
         '' address of the caller's copy in a register, which is Win64's shape, not SysV's.
         if AbiIsAapcs_( target ) then
-            ptys.Push( cast( uint8, AapcsArgType_( sz, packed ) ) )
+            ptys.Push( cast( uint8, AapcsArgType( sz, packed ) ) )
             paggs.Push( cast( uint32, sz ) )
             pcls.Push( packed )
             pattr.Push( TKO_PA_NONE )
+            pexts.Push( TKO_PX_NONE ) : pnarr.Push( ptys[ptys.Count - 1] )
+            porig.Push( i ) : ppart.Push( 0 )
+            continue for
+        end if
+
+        if AbiIsWin32_( target ) then
+            '' BYVAL, the SysV MEMORY spelling, at every size -- see RewriteCallArgs
+            '' for why the flattened spellings clang writes interoperate with it.
+            ptys.Push( cast( uint8, MT_PTR ) )
+            paggs.Push( cast( uint32, sz ) )
+            pcls.Push( packed )
+            pattr.Push( TKO_PA_BYVAL )
             pexts.Push( TKO_PX_NONE ) : pnarr.Push( ptys[ptys.Count - 1] )
             porig.Push( i ) : ppart.Push( 0 )
             continue for
@@ -1387,7 +1416,7 @@ sub LowerModule _
       byref target as TargetDescription, byref st as AbiStats )
 
     select case target.abi
-    case ABI_WIN64, ABI_SYSV_AMD64, ABI_AAPCS64_APPLE
+    case ABI_WIN64, ABI_SYSV_AMD64, ABI_AAPCS64_APPLE, ABI_WIN32
     case else
         Tko.TargetIce( "abi LowerModule", target.id )
     end select

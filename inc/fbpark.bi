@@ -56,7 +56,7 @@ namespace FB
 '' calling convention and cannot tell the two apart.
 #ifdef __FB_WIN32__
 	#ifdef __FB_64BIT__
-		extern "C"
+		extern "rtlib"
 	#else
 		extern "Windows"
 	#endif
