@@ -176,6 +176,7 @@ public type DBGENGINE
     pauseReq   as boolean
     exitPosted as boolean
     entryDone  as boolean
+    atEntry    as boolean      ' this stop is the entry on 'main' and nothing else: the host may run on
     mainBpId   as long
     exitCode   as long
     ' sources and breakpoints
@@ -213,6 +214,13 @@ public type DBGENGINE
     globLoaded as boolean
     globFirst  as long
     globCount  as long
+    ' the other modules' globals: lldb's globals scope is the stopped frame's module alone
+    libDir     as string       ' the compiler's package tree: its modules' globals are not the program's
+    extNames(any) as string    ' their names, listed once a session
+    extN       as long
+    extListed  as boolean
+    extFirst   as long
+    extCount   as long
 end type
 
 public dim shared gDbgE as DBGENGINE
@@ -536,6 +544,7 @@ private sub ResetNodes_()
     gDbgE.ndN = 0
     gDbgE.poolN = 0
     gDbgE.globLoaded = false
+    gDbgE.extCount = 0
     redim gDbgE.locLoaded( DBGE_MAXFRAMES )
     redim gDbgE.locFirst( DBGE_MAXFRAMES )
     redim gDbgE.locCount( DBGE_MAXFRAMES )
@@ -563,6 +572,7 @@ private sub HandleStop_( byref d as JDOC, byval body as long )
     dim as long ids = JGet( d, body, "hitBreakpointIds" )
     dim as long r = DBGP_STOP_STEP
     gDbgE.excepCode = 0 : gDbgE.excepIsWrite = 0 : gDbgE.excepTarget = 0 : gDbgE.excepText = ""
+    gDbgE.atEntry = false
 
     dim as boolean isExc = (why = "exception")
     dim as boolean isBrk = (instr( lcase( desc ), "0x80000003" ) > 0)
@@ -587,6 +597,7 @@ private sub HandleStop_( byref d as JDOC, byval body as long )
         r = DBGP_STOP_BREAKPOINT
         if (gDbgE.entryDone = false) andalso HasId_( d, ids, gDbgE.mainBpId ) then
             gDbgE.entryDone = true
+            gDbgE.atEntry = true
             r = DBGP_STOP_STEP
         elseif gDbgE.tempArmed then
             for i as long = 0 to gDbgE.bidN - 1
@@ -621,6 +632,8 @@ private sub HandleStop_( byref d as JDOC, byval body as long )
             next
         end if
     end if
+    ' A BREAKPOINT ON THE PROGRAM'S FIRST STATEMENT shares main's address: that stop is both.
+    if r <> DBGP_STOP_STEP then gDbgE.atEntry = false
     if (r = DBGP_STOP_USERBREAK) andalso ((gDbgE.frN = 0) orelse (len( gDbgE.fr(0).path ) = 0)) then PickUserThread_()
     ' RUN TO CURSOR ENDS AT ANY STOP, as the old engine's temporary breakpoint did.
     DisarmTemp_()
@@ -943,6 +956,8 @@ public function Engine_Start( byref exe as const string, byref args as const Arr
     gDbgE.pauseReq = false
     gDbgE.exitPosted = false
     gDbgE.entryDone = false
+    gDbgE.extListed = false
+    gDbgE.extN = 0
     gDbgE.exitCode = 0
     gDbgE.frN = 0
     gDbgE.bidN = 0
@@ -1217,6 +1232,125 @@ private function FrameId_( byval fi as long ) as long
     return gDbgE.fr(fi).id
 end function
 
+' Every file under a directory, as "|name|name|", lower case.
+private sub LibFileNames_( byref dir_ as const ustring, byref names as string )
+    dim as Array( of fs.DirEntry ) es
+    fs.ListDir( dir_, es )
+    for each e as fs.DirEntry in es
+        if e.IsDirectory( ) then
+            LibFileNames_( e.Path( ), names )
+        else
+            names &= lcase( e.Name( ) ) & "|"
+        end if
+    next
+end sub
+
+' lldb says a variable's file by name alone. A name the compiler's packages do not use is the
+' program's; one they do is theirs unless lldb can place it elsewhere (a module of data alone has
+' no lines for it to look at, and a program's own 'strings.tiko' has).
+private function IsLibFile_( byref file_ as const string, byref libNames as const string, byval fid as long ) as boolean
+    if instr( libNames, "|" & lcase( file_ ) & "|" ) = 0 then return false
+    dim as JDOC d
+    if Dap_Request( "evaluate", "{""expression"":" & Q_( "`source info -f " & file_ & " -c 1" ) & ",""frameId"":" & fid & _
+                    ",""context"":""repl""}", d, 5000 ) = false then return true
+    dim as string text = rtrim( JGetStr( d, JGet( d, 0, "body" ), "result" ), any !"\r\n " )
+    dim as long p = instrrev( text, "): " )
+    if p = 0 then return true
+    dim as ustring where_ = mid( text, p + 3 ), lib_ = gDbgE.libDir
+    return fs.PathStartsWith( where_, lib_ )
+end function
+
+' One line of 'target variable -c': "app.exe`file.tiko:12: (type) name = value". FALSE for a line
+' that continues a long value, and for another image's variable: Linux lists the C library's too.
+private function ParseGlobalLine_( byref ln as const string, byref file_ as string, byref nm as string ) as boolean
+    dim as long q = instr( ln, "`" )
+    dim as string image = mid( gDbgE.exe, instrrev( gDbgE.exe, any "\/" ) + 1 )
+    if lcase( left( ln, q - 1 ) ) <> lcase( image ) then return false
+    dim as long p = instr( q, ln, ": (" )
+    if p = 0 then return false
+    dim as long c = instrrev( ln, ":", p - 1 )
+    if c <= q then return false
+    file_ = mid( ln, q + 1, c - q - 1 )
+    ' the type can hold parentheses of its own: 'long(1 to 3)'
+    dim as long depth = 0, i = p + 2
+    do while i <= len( ln )
+        dim as string ch = mid( ln, i, 1 )
+        if ch = "(" then depth += 1
+        if ch = ")" then depth -= 1
+        if depth = 0 then exit do
+        i += 1
+    loop
+    if i > len( ln ) then return false
+    dim as long e = instr( i + 2, ln, " = " )
+    nm = iif( e > 0, mid( ln, i + 2, e - i - 2 ), mid( ln, i + 2 ) )
+    return len( nm ) > 0
+end function
+
+' The names of the program's globals in every module, once a session: lldb can list them all but
+' hands back only text, so each is then read by name. A 'common' is listed once per module.
+private sub ListAllGlobals_( byval fid as long )
+    gDbgE.extListed = true
+    gDbgE.extN = 0
+    dim as JDOC d
+    if Dap_Request( "evaluate", "{""expression"":""`target variable -c -r .*"",""frameId"":" & fid & _
+                    ",""context"":""repl""}", d, 15000 ) = false then exit sub
+    dim as string text = JGetStr( d, JGet( d, 0, "body" ), "result" )
+    dim as string libNames = "|"
+    if len( gDbgE.libDir ) then
+        dim as ustring lib_ = gDbgE.libDir
+        LibFileNames_( lib_, libNames )
+    end if
+    dim as long st = 1
+    do while st <= len( text )
+        dim as long e = instr( st, text, chr( 10 ) )
+        if e = 0 then e = len( text ) + 1
+        dim as string file_, nm
+        if ParseGlobalLine_( rtrim( mid( text, st, e - st ), chr( 13 ) ), file_, nm ) then
+            dim as boolean seen = false
+            for i as long = 0 to gDbgE.extN - 1
+                if lcase( gDbgE.extNames(i) ) = lcase( nm ) then seen = true : exit for
+            next
+            if (seen = false) andalso (IsLibFile_( file_, libNames, fid ) = false) then
+                if gDbgE.extN > ubound( gDbgE.extNames ) then redim preserve gDbgE.extNames( gDbgE.extN * 2 + 15 )
+                gDbgE.extNames( gDbgE.extN ) = nm
+                gDbgE.extN += 1
+            end if
+        end if
+        st = e + 1
+    loop
+end sub
+
+' The globals of the modules the stopped frame is not in, after its own.
+private sub LoadOtherGlobals_( byval fid as long )
+    if gDbgE.extListed = false then ListAllGlobals_( fid )
+    gDbgE.extCount = 0
+    if gDbgE.extN = 0 then exit sub
+    dim as long tmp( gDbgE.extN - 1 )
+    dim as long n = 0
+    for i as long = 0 to gDbgE.extN - 1
+        dim as string nm = gDbgE.extNames(i)
+        dim as boolean own = false
+        for k as long = 0 to gDbgE.globCount - 1
+            if lcase( gDbgE.nd( gDbgE.pool( gDbgE.globFirst + k ) ).nm ) = lcase( nm ) then own = true : exit for
+        next
+        if own then continue for
+        ' '::' because a bare name finds the frame's own local of that name first
+        dim as string path = "::" & nm
+        dim as JDOC d
+        if EvalPath_( path, fid, d ) = false then continue for                  ' dropped by the linker: nothing references it
+        dim as long body = JGet( d, 0, "body" )
+        dim as string res = JGetStr( d, body, "result" )
+        if right( res, 5 ) = "@ 0x0" then continue for                         ' likewise, an array
+        tmp(n) = MakeNode_( nm, res, JGetStr( d, body, "type" ), path, cint( JGetNum( d, body, "variablesReference" ) ), fid )
+        n += 1
+    next
+    gDbgE.extFirst = gDbgE.poolN
+    for k as long = 0 to n - 1
+        PoolPush_( tmp(k) )
+    next
+    gDbgE.extCount = n
+end sub
+
 ' The frame's Locals (and, for frame 0, the Globals) scopes.
 private sub EnsureScopes_( byval fi as long, byval wantGlobals as boolean )
     dim as long fid = FrameId_( fi )
@@ -1238,7 +1372,12 @@ private sub EnsureScopes_( byval fi as long, byval wantGlobals as boolean )
             gDbgE.globLoaded = true
         end if
     next
-    if wantGlobals then gDbgE.globLoaded = true else gDbgE.locLoaded( fi ) = true
+    if wantGlobals then
+        gDbgE.globLoaded = true
+        LoadOtherGlobals_( fid )
+    else
+        gDbgE.locLoaded( fi ) = true
+    end if
 end sub
 
 public function Engine_LocalCount( byval fi as long ) as long
@@ -1257,12 +1396,13 @@ end function
 public function Engine_GlobalCount() as long
     if (gDbgE.active = false) orelse gDbgE.running orelse (gDbgE.frN = 0) then return 0
     EnsureScopes_( 0, true )
-    return gDbgE.globCount
+    return gDbgE.globCount + gDbgE.extCount
 end function
 
 public function Engine_GlobalNode( byval index as long ) as long
     if (index < 0) orelse (Engine_GlobalCount() <= index) then return -1
-    return gDbgE.pool( gDbgE.globFirst + index )
+    if index < gDbgE.globCount then return gDbgE.pool( gDbgE.globFirst + index )
+    return gDbgE.pool( gDbgE.extFirst + index - gDbgE.globCount )
 end function
 
 public function Engine_ChildCount( byval ni as long ) as long

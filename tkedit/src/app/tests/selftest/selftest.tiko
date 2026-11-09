@@ -1937,6 +1937,65 @@ public sub DebugVarsPass( byref t as Tally, byval sc as single )
         WaitDebug( mw, false )
     end if
     if mw.DebugActive( ) then mw.Execute( Cmd.StopDebugging ) : WaitDebug( mw, false )
+    ' ---- a breakpoint on the program's first statement is at main's own address: that stop is
+    '      the breakpoint, not the entry stop a session skips
+    mw.View( ).ToggleBreakpoint( 8 )
+    mw.View( ).ToggleBreakpoint( 4 )                       ' "dim as Point pt"
+    mw.Execute( Cmd.StartDebugging )
+    stopped = WaitBuild( mw ) andalso WaitDebug( mw, true )
+    t.Check( stopped andalso (mw.View( ).ExecLine( ) = 4) andalso (instr( mw.DbgStatus, "breakpoint" ) > 0), _
+             P( sc, "debug vars: a breakpoint on the first statement stops: " & mw.DbgStatus ) )
+    if stopped then
+        mw.Execute( Cmd.StepOver )
+        t.Check( WaitDebug( mw, true ) andalso (mw.View( ).ExecLine( ) > 4), _
+                 P( sc, strings.Format( "debug vars: and a step from it is shown, line {}", mw.View( ).ExecLine( ) + 1 ) ) )
+    end if
+    if mw.DebugActive( ) then mw.Execute( Cmd.StopDebugging ) : WaitDebug( mw, false )
+    ' ---- Globals: 'dim shared' only -- a module-level 'dim' is main's local
+    mw.View( ).ToggleBreakpoint( 4 )
+    dim as ustring procF = fs.PathJoin( dir_, "proc.tiko" )
+    fs.WriteAllText( procF, "sub work()" & nl & "    dim as long inner = 3" & nl & "    print inner" & nl & "end sub" & nl & _
+        "dim shared as long counter = 7" & nl & "dim as long outer = 9" & nl & "counter += outer" & nl & "work()" & nl )
+    mw.OpenFile( procF )
+    mw.View( ).ToggleBreakpoint( 2 )                       ' "    print inner"
+    mw.Execute( Cmd.StartDebugging )
+    stopped = WaitBuild( mw ) andalso WaitDebug( mw, true )
+    t.Check( stopped andalso (mw.View( ).ExecLine( ) = 2), P( sc, "debug vars: stopped inside the procedure: " & mw.DbgStatus ) )
+    if stopped then
+        dim as debugpane.Pane ptr dp = @mw.Out.Debug
+        dim as TK_WIDGET ptr loc = dp->lists( debugpane.DebugList.Locals ), glob = dp->lists( debugpane.DebugList.Globals )
+        tkTest_PumpFor( h, 30 )
+        t.Check( TopNames( loc ) = "inner", P( sc, "debug vars: Locals, the procedure's own: " & TopNames( loc ) ) )
+        t.Check( TopNames( glob ) = "counter", P( sc, "debug vars: Globals, dim shared only: " & TopNames( glob ) ) )
+        dim as long rCounter = FindRow( glob, "counter" )
+        t.Check( (rCounter >= 0) andalso (tkListTree_GetCellText( glob, rCounter, 1 ) = "16"), P( sc, "debug vars: and its value" ) )
+    end if
+    if mw.DebugActive( ) then mw.Execute( Cmd.StopDebugging ) : WaitDebug( mw, false )
+    ' ---- Globals of every module of the program; the compiler's own packages' are not the program's
+    mw.View( ).ToggleBreakpoint( 2 )
+    dim as ustring multi = fs.PathJoin( dir_, "multi" )
+    fs.CreateDirAll( fs.PathJoin( multi, "helper" ) )
+    fs.WriteAllText( fs.PathJoin( multi, project.MANIFEST_FILE ), "[package]" & nl & "name = ""app""" & nl & "version = ""0.1.0""" & nl & nl & _
+        "[target.main]" & nl & "main = ""main.tiko""" & nl )
+    fs.WriteAllText( fs.PathJoin( multi, "helper", "helper.tiko" ), "#module ""helper""" & nl & "dim shared as long gHelp = 41" & nl & _
+        "public sub Touch()" & nl & "    gHelp += 1" & nl & "end sub" & nl )
+    dim as ustring multiMain = fs.PathJoin( multi, "main.tiko" )
+    fs.WriteAllText( multiMain, "#import ""app/helper""" & nl & "#import ""std/fs""" & nl & "#import ""std/strings""" & nl & _
+        "dim shared as long gMain = 1" & nl & "helper.Touch()" & nl & "print gMain; fs.IsFile( ""x"" ); strings.Format( ""{}"", 1 )" & nl & "print ""end""" & nl )
+    t.Check( mw.OpenProject( fs.PathJoin( multi, project.MANIFEST_FILE ) ), P( sc, "debug vars: the two-module project opened" ) )
+    mw.OpenFile( multiMain )
+    mw.View( ).ToggleBreakpoint( 6 )                       ' "print ""end"""
+    mw.Execute( Cmd.StartDebugging )
+    stopped = WaitBuild( mw ) andalso WaitDebug( mw, true )
+    t.Check( stopped, P( sc, "debug vars: the two-module program stopped: " & mw.DbgStatus ) )
+    if stopped then
+        dim as TK_WIDGET ptr glob = mw.Out.Debug.lists( debugpane.DebugList.Globals )
+        tkTest_PumpFor( h, 30 )
+        t.Check( TopNames( glob ) = "gmain ghelp", P( sc, "debug vars: Globals of both modules, std's left out: " & TopNames( glob ) ) )
+        dim as long rHelp = FindRow( glob, "ghelp" )
+        t.Check( (rHelp >= 0) andalso (tkListTree_GetCellText( glob, rHelp, 1 ) = "42"), P( sc, "debug vars: and the other module's value" ) )
+    end if
+    if mw.DebugActive( ) then mw.Execute( Cmd.StopDebugging ) : WaitDebug( mw, false )
     for each d as DocRef in mw.Docs
         d->Main.SetSavePoint( )
     next
@@ -2652,13 +2711,17 @@ public sub IntelPass( byref t as Tally, byval sc as single )
         ' an auto-property's accessor clause: `get, set`, `get, private set`, `get, init`; and
         ' `ustring` is in keywords/tiko.txt
         dim as ustring tx = "property P as long get, set" & lf & "property Q as long get, private set" & lf & _
-                            "property R as long get, init" & lf & "dim u as ustring" & lf & "f( a, set )" & lf
+                            "property R as long get, init" & lf & "dim u as ustring" & lf & "f( a, set )" & lf & _
+                            "dim s as slice" & lf & "dim v as uslice" & lf & "dim w as wslice" & lf
         v->SetText( tx )
         tkCodeEdit_Send( sw, SCI_COLOURISE, 0, -1 )
         t.Check( tkCodeEdit_Send( sw, SCI_GETSTYLEAT, instr( tx, "get, set" ) + 4 ) = SCE_B_KEYWORD, P( sc, "get, set is" ) )
         t.Check( tkCodeEdit_Send( sw, SCI_GETSTYLEAT, instr( tx, "private set" ) + 7 ) = SCE_B_KEYWORD, P( sc, "get, private set is" ) )
         t.Check( tkCodeEdit_Send( sw, SCI_GETSTYLEAT, instr( tx, "init" ) - 1 ) = SCE_B_KEYWORD, P( sc, "get, init is" ) )
         t.Check( tkCodeEdit_Send( sw, SCI_GETSTYLEAT, instr( tx, "ustring" ) - 1 ) = SCE_B_KEYWORD, P( sc, "ustring is" ) )
+        t.Check( tkCodeEdit_Send( sw, SCI_GETSTYLEAT, instr( tx, "as slice" ) + 2 ) = SCE_B_KEYWORD, P( sc, "slice is" ) )
+        t.Check( tkCodeEdit_Send( sw, SCI_GETSTYLEAT, instr( tx, "uslice" ) - 1 ) = SCE_B_KEYWORD, P( sc, "uslice is" ) )
+        t.Check( tkCodeEdit_Send( sw, SCI_GETSTYLEAT, instr( tx, "wslice" ) - 1 ) = SCE_B_KEYWORD, P( sc, "wslice is" ) )
         t.Check( tkCodeEdit_Send( sw, SCI_GETSTYLEAT, instr( tx, "a, set" ) + 2 ) <> SCE_B_KEYWORD, P( sc, "f( a, set ) is not" ) )
         v->SetText( keep )
         tkCodeEdit_Send( sw, SCI_DOCUMENTEND )
