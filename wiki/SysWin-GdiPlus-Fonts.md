@@ -102,13 +102,13 @@ function WndProc( byval hwnd as HWND, byval uMsg as UINT, byval wParam as WPARAM
                 fam(1).GenericSerif( @fam(1) )
                 fam(2).GenericMonospace( @fam(2) )
                 dim y as single = 15
-                for i as long = 0 to 2
+                for each byref f in fam
                     dim wszName as wstring * LF_FACESIZE
-                    fam(i).GetFamilyName( @wszName )
-                    dim fnt as CGpFont = CGpFont( @fam(i), 24, FontStyleRegular, UnitPixel )
+                    f.GetFamilyName( @wszName )
+                    dim fnt as CGpFont = CGpFont( @f, 24, FontStyleRegular, UnitPixel )
                     g.DrawString( @wszName, -1, @fnt, 20.0!, y, @ink )
                     ' line spacing in pixels = em size * line spacing / em height
-                    y += 24 * fam(i).GetLineSpacing( FontStyleRegular ) / fam(i).GetEmHeight( FontStyleRegular )
+                    y += 24 * f.GetLineSpacing( FontStyleRegular ) / f.GetEmHeight( FontStyleRegular )
                 next
             end scope
             EndPaint( hwnd, @ps )

@@ -162,15 +162,15 @@ MutexUnlock hmutexstart
 
 '' wait for all threads to complete
 
-For i As Integer = 1 To 9
+For Each t As Any Ptr In threads
 
-    If threads(i) <> 0 Then
+    If t <> 0 Then
 
-        ThreadWait threads(i)
+        ThreadWait t
 
     End If
 
-Next i
+Next
 
 MutexDestroy hmutexready
 

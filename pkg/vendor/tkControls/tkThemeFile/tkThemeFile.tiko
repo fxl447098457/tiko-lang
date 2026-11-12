@@ -1,0 +1,469 @@
+' tkThemeFile -- a .tktheme read at run time (docs/tkDesigner/THEMES.md, TH8), so an app's users
+' can install themes. What it installs is what the module the Form Designer generates from the same
+' file installs: both variants (tkTheme's preset, the accent derived in, then the roles the file
+' sets), the shape, the styles (with simple mode for roles) and the per-type colours (with simple
+' mode for states).
+'
+'   tkTheme_Load( path )              read it and make it the app's theme, after tkApp_Init; false
+'                                     (tkTheme_LoadError says why) leaves the current theme alone
+'   tkThemeFile_Read( path, tf, e )   read it into tf, without installing
+'   tkThemeFile_ApplyOptions( tf, o ) its fonts, into the options BEFORE tkApp_Init (fonts are
+'                                     opened there; tkTheme_Load can't change them afterwards)
+'   tkThemeFile_Install( tf )         install tf; its tables are BORROWED, so tf must outlive them
+'
+' The reader is lenient, as a program meeting a user's file should be: only text that isn't TOML,
+' or isn't format 1, fails. A value it can't use is skipped and noted in Problems; tables it doesn't
+' know ([dark.editor], tkEdit's own) are ignored. The designer's Check is the strict one.
+'
+' It knows each control type's colour fields from tkThemeFile.gen.tiko (tkmetagen writes it from
+' tkMeta/controls.toml), not from tkMeta, which links every control.
+#module "tkThemeFile"
+
+#import "std/config"
+#import "std/fs"
+#import "../tkApp" public
+using tkApp
+using tkTheme
+
+public const as long TKTHEMEFILE_FORMAT = 1
+
+' A theme as a program wears it. Types( i ).pSrc points into Src.
+public type TKTHEME_FILE
+    Name           as ustring
+    Dark           as TKTHEME_COLORS
+    Light          as TKTHEME_COLORS
+    Shape          as TKTHEME_SHAPE
+    FontUIFile     as ustring              ' "" = leave tkApp's
+    FontUIBoldFile as ustring
+    FontUISize     as long                 ' 0 = leave tkApp's
+    GlyphFontFile  as ustring
+    FontMonoFile   as ustring
+    Styles( any )  as TKTHEME_STYLE
+    nStyles        as long
+    Src( any )     as TKCOLOR_SRC
+    nSrc           as long
+    Types( any )   as TKTHEME_TYPERECIPE
+    nTypes         as long
+    Problems( any ) as ustring             ' what was skipped, and why
+    nProblems      as long
+end type
+
+' ---- each control type's colour fields (filled by tkThemeFile.gen.tiko) -----------------------------
+
+type FIELD_
+    Name  as string
+    Part  as string
+    State as string
+    Group as string
+    Ink   as boolean
+end type
+
+type FIELDTYPE_
+    Name  as string
+    First as long
+    n     as long
+end type
+
+dim shared as FIELDTYPE_ gTypes_( any )
+dim shared as long gnTypes_
+dim shared as FIELD_ gFields_( any )
+dim shared as long gnFields_
+dim shared as boolean gFieldsFilled_
+
+
+private sub Type_( byref name_ as const string )
+    redim preserve gTypes_( 0 to gnTypes_ )
+    gTypes_( gnTypes_ ).Name = name_
+    gTypes_( gnTypes_ ).First = gnFields_
+    gnTypes_ += 1
+end sub
+
+private sub Field_( byref name_ as const string, byref part as const string, byref state as const string, _
+                    byref grp as const string, byval bInk as boolean )
+    redim preserve gFields_( 0 to gnFields_ )
+    with gFields_( gnFields_ )
+        .Name = name_ : .Part = part : .State = state : .Group = grp : .Ink = bInk
+    end with
+    gnFields_ += 1
+    gTypes_( gnTypes_ - 1 ).n += 1
+end sub
+
+private function TypeIndex_( byref name_ as const string ) as long
+    if gFieldsFilled_ = false then
+        gFieldsFilled_ = true
+        Fields_( )
+    end if
+    for i as long = 0 to gnTypes_ - 1
+        if gTypes_( i ).Name = name_ then return i
+    next
+    return -1
+end function
+
+' The slot of (group, part, state) in a type; -1 when its grid has no such cell.
+private function Cell_( byval ti as long, byref grp as const string, byref part as const string, byref state as const string ) as long
+    if len( part ) = 0 then return -1
+    for s as long = 0 to gTypes_( ti ).n - 1
+        with gFields_( gTypes_( ti ).First + s )
+            if (.Group = grp) andalso (.Part = part) andalso (.State = state) then return s
+        end with
+    next
+    return -1
+end function
+
+' ---- reading --------------------------------------------------------------------------------------
+
+private sub Problem_( byref tf as TKTHEME_FILE, byref what as const ustring )
+    redim preserve tf.Problems( 0 to tf.nProblems )
+    tf.Problems( tf.nProblems ) = what
+    tf.nProblems += 1
+end sub
+
+private function Str_( byref t as config.TomlValue ) as ustring
+    dim as ustring none = ""
+    return t.AsString( ).ValueOr( none )
+end function
+
+private function StrOf_( byref t as config.TomlValue, byref k as const ustring ) as ustring
+    dim as config.TomlValue ptr p = t.Find( k )
+    if p = 0 then return ""
+    return Str_( *p )
+end function
+
+private function IntOf_( byref t as config.TomlValue, byref k as const ustring, byval dflt as long ) as long
+    dim as config.TomlValue ptr p = t.Find( k )
+    if p = 0 then return dflt
+    dim as longint d = dflt
+    return clng( p->AsInt( ).ValueOr( d ) )
+end function
+
+private function IsTable_( byref t as config.TomlValue ) as boolean
+    return t.Kind( ) = config.TOML_TABLE
+end function
+
+' "#RRGGBB" or "#RRGGBBAA" to &hAARRGGBB.
+private function Hex_( byref t as const ustring, byref c as ulong ) as boolean
+    if left( t, 1 ) <> "#" then return false
+    dim as ustring h = mid( t, 2 )
+    if (len( h ) <> 6) andalso (len( h ) <> 8) then return false
+    for i as long = 1 to len( h )
+        if instr( "0123456789abcdefABCDEF", mid( h, i, 1 ) ) = 0 then return false
+    next
+    dim as ulong a = 255
+    if len( h ) = 8 then a = valulng( "&h" & mid( h, 7, 2 ) )
+    c = (a shl 24) or valulng( "&h" & left( h, 6 ) )
+    return true
+end function
+
+' A colour value as text: a string, or { dark, light } as "dark|light". "" when it is neither.
+private function ColorText_( byref v as config.TomlValue ) as ustring
+    if IsTable_( v ) then return StrOf_( v, "dark" ) & "|" & StrOf_( v, "light" )
+    if v.Kind( ) = config.TOML_STRING then return Str_( v )
+    return ""
+end function
+
+' "@Role", "#hex|#hex" or "#hex" as a recipe entry for slot.
+private function ToSrc_( byref t as const ustring, byval slot as long, byref s as TKCOLOR_SRC ) as boolean
+    dim as ulong c, c2
+    if left( t, 1 ) = "@" then
+        dim as long r = tkTheme_RoleByName( mid( t, 2 ) )
+        if r < 0 then return false
+        s = tkTheme_SrcRole( slot, r )
+        return true
+    end if
+    dim as long bar = instr( t, "|" )
+    if bar then
+        if (Hex_( left( t, bar - 1 ), c ) = false) orelse (Hex_( mid( t, bar + 1 ), c2 ) = false) then return false
+        s = tkTheme_SrcFixed2( slot, c, c2 )
+        return true
+    end if
+    if Hex_( t, c ) = false then return false
+    s = tkTheme_SrcFixed( slot, c )
+    return true
+end function
+
+' One variant: the preset, its accent (else the file's) derived in, then the roles it sets.
+private function Variant_( byref tf as TKTHEME_FILE, byval v as config.TomlValue ptr, byref fileAccent as const ustring, _
+                           byval isDark as boolean ) as TKTHEME_COLORS
+    dim as TKTHEME_COLORS t
+    if isDark then t = tkTheme_Dark( ) else t = tkTheme_Light( )
+    dim as ustring where = iif( isDark, "dark", "light" )
+    dim as ustring acc = fileAccent
+    dim as ulong c
+    if v then
+        dim as config.TomlValue ptr a = v->Find( "accent" )
+        if a then
+            if Hex_( ColorText_( *a ), c ) then acc = ColorText_( *a ) else Problem_( tf, where & ".accent: not a colour" )
+        end if
+    end if
+    if len( acc ) andalso Hex_( acc, c ) then t = tkTheme_Derive( t, c )
+    if v = 0 then return t
+    ' roles in theme order, as the generated module sets them
+    dim as ulong rc( 0 to TKROLE_COUNT - 1 )
+    dim as boolean rs( 0 to TKROLE_COUNT - 1 )
+    for i as long = 0 to v->Count( ) - 1
+        dim as ustring k = v->KeyAt( i )
+        dim byref as config.TomlValue x = v->Item( i )
+        if (k = "accent") orelse IsTable_( x ) then continue for        ' [dark.editor]: tkEdit's own
+        dim as long r = tkTheme_RoleByName( k )
+        if r < 0 then
+            Problem_( tf, where & ": '" & k & "' is not a theme role" )
+        elseif Hex_( ColorText_( x ), c ) = false then
+            Problem_( tf, where & "." & k & ": not a colour" )
+        else
+            if r = TKROLE_WINDOW then c or= &hFF000000ul               ' a form is always opaque
+            rc( r ) = c
+            rs( r ) = true
+        end if
+    next
+    for r as long = 0 to TKROLE_COUNT - 1
+        if rs( r ) then tkTheme_SetRole( t, r, rc( r ) )
+    next
+    return t
+end function
+
+' Simple mode for roles, entry k: the role a style sets, the one that follows it, and the rule.
+private sub Family_( byval k as long, byref src_ as long, byref dst as long, byref rule as long )
+    select case k
+    case 0 : src_ = TKROLE_SURFACE : dst = TKROLE_SURFACEHOT : rule = TKDERIVE_HOT
+    case 1 : src_ = TKROLE_SURFACE : dst = TKROLE_SURFACEDISABLED : rule = TKDERIVE_DISABLED
+    case 2 : src_ = TKROLE_TEXT : dst = TKROLE_TEXTHOT : rule = TKDERIVE_SAME
+    case 3 : src_ = TKROLE_TEXT : dst = TKROLE_TEXTDISABLED : rule = TKDERIVE_DISABLED
+    case 4 : src_ = TKROLE_ACCENT : dst = TKROLE_ACCENTHOT : rule = TKDERIVE_HOT
+    case 5 : src_ = TKROLE_BORDER : dst = TKROLE_BORDERDISABLED : rule = TKDERIVE_DISABLED
+    end select
+end sub
+
+private sub PushSrc_( byref tf as TKTHEME_FILE, byref s as TKCOLOR_SRC )
+    redim preserve tf.Src( 0 to tf.nSrc )
+    tf.Src( tf.nSrc ) = s
+    tf.nSrc += 1
+end sub
+
+' One [controls.X] or [styles.S.X] block as a type recipe: each field it sets, in struct order, then
+' simple mode's derived states -- a part whose Normal colour is set and whose Hot, Pressed or Disabled
+' colour isn't gets that state from Normal (ink parts copy it for Hot and Pressed). A type with no
+' colour fields, or a field it lacks, gives no entries.
+private sub TypeBlock_( byref tf as TKTHEME_FILE, byref typeName as const ustring, byref styleName as const ustring, _
+                        byref b as config.TomlValue, byref where as const ustring )
+    redim preserve tf.Types( 0 to tf.nTypes )
+    with tf.Types( tf.nTypes )
+        .TypeName = left( typeName, 31 )
+        .StyleName = left( styleName, 31 )
+        .n = 0
+        .pSrc = 0
+    end with
+    dim as long at0 = tf.nSrc
+    dim as long ti = TypeIndex_( typeName )
+    if ti < 0 then Problem_( tf, where & ": '" & typeName & "' is not a control with theme colours" )
+    if ti >= 0 then
+        dim as long n = gTypes_( ti ).n, f0 = gTypes_( ti ).First
+        dim as boolean isSet( 0 to n )
+        for slot as long = 0 to n - 1
+            dim as config.TomlValue ptr p = b.Find( gFields_( f0 + slot ).Name )
+            if p = 0 then continue for
+            dim as TKCOLOR_SRC s
+            if ToSrc_( ColorText_( *p ), slot, s ) then
+                PushSrc_( tf, s )
+                isSet( slot ) = true
+            else
+                Problem_( tf, where & "." & gFields_( f0 + slot ).Name & ": not a colour" )
+            end if
+        next
+        for slot as long = 0 to n - 1
+            if isSet( slot ) = false then continue for
+            with gFields_( f0 + slot )
+                if (len( .Part ) = 0) orelse (.State <> "Normal") then continue for
+                dim as long hot = Cell_( ti, .Group, .Part, "Hot" )
+                dim as long prs = Cell_( ti, .Group, .Part, "Pressed" )
+                dim as long dis = Cell_( ti, .Group, .Part, "Disabled" )
+                dim as long hotRule = TKDERIVE_HOT, prsRule = TKDERIVE_PRESSED
+                if .Ink then
+                    hotRule = TKDERIVE_SAME
+                    prsRule = TKDERIVE_SAME
+                end if
+                if (hot >= 0) andalso (isSet( hot ) = false) then PushSrc_( tf, tkTheme_SrcDerive( hot, hotRule, slot ) )
+                if (prs >= 0) andalso (isSet( prs ) = false) then PushSrc_( tf, tkTheme_SrcDerive( prs, prsRule, slot ) )
+                if (dis >= 0) andalso (isSet( dis ) = false) then PushSrc_( tf, tkTheme_SrcDerive( dis, TKDERIVE_DISABLED, slot ) )
+            end with
+        next
+    end if
+    tf.Types( tf.nTypes ).n = tf.nSrc - at0
+    tf.nTypes += 1
+end sub
+
+' The type recipes' entries, one run each in Src in recipe order: pointed at once Src is final.
+private sub Link_( byref tf as TKTHEME_FILE )
+    dim as long at0 = 0
+    for i as long = 0 to tf.nTypes - 1
+        if tf.Types( i ).n > 0 then tf.Types( i ).pSrc = @tf.Src( at0 ) else tf.Types( i ).pSrc = 0
+        at0 += tf.Types( i ).n
+    next
+end sub
+
+' tf as an empty theme: the presets, nothing else.
+public sub tkThemeFile_Clear( byref tf as TKTHEME_FILE )
+    tf.Name = ""
+    tf.Dark = tkTheme_Dark( )
+    tf.Light = tkTheme_Light( )
+    tf.Shape.CornerRadius = -1
+    tf.Shape.BorderWidth = -1
+    tf.FontUIFile = "" : tf.FontUIBoldFile = "" : tf.FontUISize = 0
+    tf.GlyphFontFile = "" : tf.FontMonoFile = ""
+    erase tf.Styles, tf.Src, tf.Types, tf.Problems
+    tf.nStyles = 0 : tf.nSrc = 0 : tf.nTypes = 0 : tf.nProblems = 0
+end sub
+
+' A .tktheme's text into tf. False (errText says why) when it isn't TOML or isn't format 1; anything
+' else it can't use is skipped and listed in tf.Problems.
+public function tkThemeFile_Parse( byref text as const ustring, byref tf as TKTHEME_FILE, byref errText as ustring ) as boolean
+    tkThemeFile_Clear( tf )
+    errText = ""
+    dim as config.ConfigResultToml r = config.ParseToml( text )
+    if r.IsOk( ) = false then
+        errText = r.Failure( ).Message( )
+        return false
+    end if
+    dim as config.TomlValue root = r.Value( )
+    dim as long fmt = IntOf_( root, "format", 0 )
+    if fmt <> TKTHEMEFILE_FORMAT then
+        errText = "format " & fmt & " is not one this version reads (expected " & TKTHEMEFILE_FORMAT & ")"
+        return false
+    end if
+    tf.Name = StrOf_( root, "name" )
+    dim as ustring acc
+    dim as ulong c
+    dim as config.TomlValue ptr p = root.Find( "accent" )
+    if p then
+        if Hex_( ColorText_( *p ), c ) then acc = ColorText_( *p ) else Problem_( tf, "accent: not a colour" )
+    end if
+    tf.Dark = Variant_( tf, root.Find( "dark" ), acc, true )
+    tf.Light = Variant_( tf, root.Find( "light" ), acc, false )
+
+    p = root.Find( "fonts" )
+    if p then
+        dim as config.TomlValue ptr f = p->Find( "ui" )
+        if f then
+            tf.FontUIFile = StrOf_( *f, "file" )
+            tf.FontUIBoldFile = StrOf_( *f, "bold" )
+            tf.FontUISize = IntOf_( *f, "size", 0 )
+        end if
+        f = p->Find( "glyph" )
+        if f then tf.GlyphFontFile = StrOf_( *f, "file" )
+        f = p->Find( "mono" )
+        if f then tf.FontMonoFile = StrOf_( *f, "file" )
+    end if
+    p = root.Find( "shape" )
+    if p then
+        tf.Shape.CornerRadius = IntOf_( *p, "CornerRadius", -1 )
+        tf.Shape.BorderWidth = IntOf_( *p, "BorderWidth", -1 )
+    end if
+
+    ' every [controls.X], then each style's [styles.S.X], as the generated module orders them
+    p = root.Find( "controls" )
+    if p then
+        for i as long = 0 to p->Count( ) - 1
+            if IsTable_( p->Item( i ) ) then
+                TypeBlock_( tf, p->KeyAt( i ), "", p->Item( i ), "controls." & p->KeyAt( i ) )
+            else
+                Problem_( tf, "controls." & p->KeyAt( i ) & ": not a table" )
+            end if
+        next
+    end if
+    p = root.Find( "styles" )
+    if p then
+        for i as long = 0 to p->Count( ) - 1
+            dim as ustring nm = p->KeyAt( i )
+            dim byref as config.TomlValue body = p->Item( i )
+            if IsTable_( body ) = false then
+                Problem_( tf, "styles." & nm & ": not a table" )
+                continue for
+            end if
+            dim as TKTHEME_STYLE st
+            st.Name = left( nm, 31 )
+            dim as boolean setRole( 0 to TKROLE_COUNT - 1 )
+            for j as long = 0 to body.Count( ) - 1
+                dim as ustring k = body.KeyAt( j )
+                dim as long rl = tkTheme_RoleByName( k )
+                if rl >= 0 then
+                    if ToSrc_( ColorText_( body.Item( j ) ), 0, st.remap( rl ) ) then
+                        setRole( rl ) = true
+                    else
+                        Problem_( tf, "styles." & nm & "." & k & ": not a colour" )
+                    end if
+                elseif IsTable_( body.Item( j ) ) then
+                    TypeBlock_( tf, k, nm, body.Item( j ), "styles." & nm & "." & k )
+                else
+                    Problem_( tf, "styles." & nm & ": '" & k & "' is not a theme role" )
+                end if
+            next
+            for k as long = 0 to 5
+                dim as long src_, dst, rule
+                Family_( k, src_, dst, rule )
+                if setRole( src_ ) andalso (setRole( dst ) = false) then st.remap( dst ) = tkTheme_SrcDerive( 0, rule, src_ )
+            next
+            redim preserve tf.Styles( 0 to tf.nStyles )
+            tf.Styles( tf.nStyles ) = st
+            tf.nStyles += 1
+        next
+    end if
+    Link_( tf )
+    return true
+end function
+
+' A .tktheme file into tf (see tkThemeFile_Parse).
+public function tkThemeFile_Read( byref path as const ustring, byref tf as TKTHEME_FILE, byref errText as ustring ) as boolean
+    dim as fs.FsResultUStr r = fs.ReadAllText( path )
+    if r.IsOk( ) = false then
+        tkThemeFile_Clear( tf )
+        errText = path & ": " & r.Failure( ).Message( )
+        return false
+    end if
+    if tkThemeFile_Parse( r.Value( ), tf, errText ) then return true
+    errText = path & ": " & errText
+    return false
+end function
+
+' The theme's fonts, into the options before tkApp_Init (fonts are opened there).
+public sub tkThemeFile_ApplyOptions( byref tf as TKTHEME_FILE, byref o as TKAPP_OPTIONS )
+    if len( tf.FontUIFile ) then o.FontUIFile = tf.FontUIFile
+    if len( tf.FontUIBoldFile ) then o.FontUIBoldFile = tf.FontUIBoldFile
+    if tf.FontUISize then o.FontUISize = tf.FontUISize
+    if len( tf.GlyphFontFile ) then o.GlyphFontFile = tf.GlyphFontFile
+    if len( tf.FontMonoFile ) then o.FontMonoFile = tf.FontMonoFile
+end sub
+
+' Makes tf the app's theme, after tkApp_Init: both variants (the theme mode picks one), the shape,
+' the styles and the per-type colours. Its tables are borrowed: tf must outlive its use.
+public sub tkThemeFile_Install( byref tf as TKTHEME_FILE )
+    tkTheme_SetShape( tf.Shape )
+    if tf.nStyles then tkTheme_SetStyles( @tf.Styles( 0 ), tf.nStyles ) else tkTheme_SetStyles( 0, 0 )
+    if tf.nTypes then tkTheme_SetTypeRecipes( @tf.Types( 0 ), tf.nTypes ) else tkTheme_SetTypeRecipes( 0, 0 )
+    tkApp_SetThemePair( tf.Dark, tf.Light )
+end sub
+
+' tkTheme_Load's own copies: the one installed, and the one the next load reads into.
+dim shared as TKTHEME_FILE gLoaded_( 0 to 1 )
+dim shared as long gCur_ = -1
+dim shared as ustring gLoadError_
+
+' Reads a .tktheme and makes it the app's theme (after tkApp_Init). False when it can't be read, or
+' isn't TOML, or isn't format 1: the current theme stays, and tkTheme_LoadError says why. Its fonts
+' are not applied (see tkThemeFile_ApplyOptions).
+public function tkTheme_Load( byref path as const ustring ) as boolean
+    dim as long nxt = iif( gCur_ = 0, 1, 0 )
+    if tkThemeFile_Read( path, gLoaded_( nxt ), gLoadError_ ) = false then return false
+    tkThemeFile_Install( gLoaded_( nxt ) )
+    gCur_ = nxt
+    return true
+end function
+
+' Why the last tkTheme_Load failed; "" when it didn't.
+public function tkTheme_LoadError( ) as ustring
+    return gLoadError_
+end function
+
+' The theme tkTheme_Load installed last (its Problems say what it skipped); 0 before one did.
+public function tkTheme_Loaded( ) as TKTHEME_FILE ptr
+    if gCur_ < 0 then return 0
+    return @gLoaded_( gCur_ )
+end function

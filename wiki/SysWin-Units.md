@@ -375,9 +375,6 @@ Converts pixels to a dialog's dialog units: the inverse of
 [DialogUnitsToPixels](#dialogunitstopixels), rounded to whole units. In the same dialog, 200 ×
 200 pixels are 67 × 53 dialog units.
 
-The ratio is worked out from the values given, so neither `pixelX` nor `pixelY` may be 0: a 0
-gives the most negative `long` in that result, and the function still returns `true`.
-
 | Parameter | Meaning |
 | --- | --- |
 | `hDlg` | The dialog, created from a template. |

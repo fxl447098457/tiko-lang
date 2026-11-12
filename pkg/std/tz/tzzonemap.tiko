@@ -1,0 +1,194 @@
+#module "tz"
+#import "std/chrono"
+'' std/tz: local -> instant. A wall-clock reading in a zone names one instant,
+'' two (an OVERLAP: the clock fell back and the reading happened twice) or none
+'' (a GAP: the clock sprang forward over it). MapLocal says which; TryResolve and
+'' Resolve apply a Disambiguation policy.
+''
+'' FINDING THE CANDIDATES, by zone kind:
+''   a zone file   every offset in force within 27 hours either side of the
+''                 reading, from its transitions -- exact, because the file has
+''                 them all. 27 h covers any offset (RFC 8536 allows -25:59:59 ..
+''                 +25:59:59) and Pacific/Apia's whole skipped day in 2011.
+''   Local         the offsets a day before and a day after, as std/chrono's
+''                 AssumeLocal does: the OS has no transition table to read, and
+''                 that bracket holds for every zone that changes at most once in
+''                 two days.
+''   fixed         its one offset.
+'' Each offset o is then tried: the reading less o is a candidate when the zone's
+'' offset at that instant really is o.
+''
+'' A GAP'S WIDTH is the difference of the offsets either side of it. Moving
+'' forward takes the offset from before the gap (the reading less it lands after
+'' the transition); moving backward takes the offset from after it.
+''
+'' All of this is in whole unix seconds. A transition falls on a whole second, so
+'' a reading's fraction of a second never moves it across one, and the fraction
+'' is carried through unchanged.
+
+const TZ_MAP_WINDOW = 97200     '' 27 hours
+
+function TimeZone.OffSec_( byval t as longint ) as long
+    select case this.m_e->kind
+    case TZK_FIXED
+        return this.m_e->fixedOff
+    case TZK_RULES
+        return this.m_e->rules.OffsetSecondsAt( t )
+    case else
+        return tzSysOffset( t )
+    end select
+end function
+
+'' The candidates for wall reading W (unix seconds of the reading taken as if
+'' UTC): 1 or 2, earlier in A; 0 for a gap, with the offsets either side of it;
+'' -1 when nothing can be placed in years 1..9999.
+function TimeZone.Map_( byval w as longint, byref a as longint, byref b as longint, _
+                        byref gapBefore as long, byref gapAfter as long ) as long
+    '' the offsets to try, and for a zone file the transitions between them
+    dim as long offs( 0 to 15 ), nOff = 0
+    dim as longint trT( 0 to 15 )
+    dim as long trBefore( 0 to 15 ), trAfter( 0 to 15 ), nTr = 0
+
+    select case this.m_e->kind
+    case TZK_FIXED
+        offs( 0 ) = this.m_e->fixedOff
+        nOff = 1
+    case TZK_RULES
+        dim as longint t = tzClampUnix( w - TZ_MAP_WINDOW ), tr
+        offs( 0 ) = this.m_e->rules.OffsetSecondsAt( t )
+        nOff = 1
+        while nTr < 16 andalso this.m_e->rules.TryNextTransition( t, tr ) andalso tr <= w + TZ_MAP_WINDOW
+            trT( nTr ) = tr
+            trBefore( nTr ) = this.m_e->rules.OffsetSecondsAt( tr - 1 )
+            trAfter( nTr ) = this.m_e->rules.OffsetSecondsAt( tr )
+            nTr += 1
+            if nOff < 16 then
+                offs( nOff ) = trAfter( nTr - 1 )
+                nOff += 1
+            end if
+            t = tr
+        wend
+    case else
+        offs( 0 ) = tzSysOffset( tzClampUnix( w - 86400 ) )
+        offs( 1 ) = tzSysOffset( tzClampUnix( w + 86400 ) )
+        nOff = 2
+        if offs( 0 ) <> offs( 1 ) then
+            '' a stand-in transition: only its two offsets are read
+            trBefore( 0 ) = offs( 0 )
+            trAfter( 0 ) = offs( 1 )
+            trT( 0 ) = TZ_MIN_UNIX
+            nTr = 1
+        end if
+    end select
+
+    '' the candidates, ascending, without repeats
+    dim as longint cand( 0 to 15 )
+    dim as long nc = 0
+    for k as long = 0 to nOff - 1
+        dim as longint c = w - offs( k )
+        if c < TZ_MIN_UNIX orelse c > TZ_MAX_UNIX then continue for
+        if this.OffSec_( c ) <> offs( k ) then continue for
+        dim as boolean dup = false
+        for j as long = 0 to nc - 1
+            if cand( j ) = c then dup = true
+        next
+        if dup then continue for
+        dim as long j = nc
+        while j > 0 andalso cand( j - 1 ) > c
+            cand( j ) = cand( j - 1 )
+            j -= 1
+        wend
+        cand( j ) = c
+        nc += 1
+    next
+    if nc > 0 then
+        a = cand( 0 )
+        b = cand( nc - 1 )
+        return iif( nc = 1, 1, 2 )
+    end if
+
+    '' none: the gap the reading falls in, if it is one
+    for k as long = 0 to nTr - 1
+        if trAfter( k ) > trBefore( k ) then
+            '' a zone file says exactly where; Local's stand-in is the bracket
+            if this.m_e->kind <> TZK_RULES orelse _
+               ( w >= trT( k ) + trBefore( k ) andalso w < trT( k ) + trAfter( k ) ) then
+                gapBefore = trBefore( k )
+                gapAfter = trAfter( k )
+                return 0
+            end if
+        end if
+    next
+    return -1
+end function
+
+'' The wall reading as whole unix seconds and the ticks of the second it is in.
+sub tzWallSeconds( byref wall as chrono.DateTime, byref w as longint, byref subT as longint )
+    dim as longint t = wall.AssumeUtc( ).Ticks - chrono.DT_TICKS_TO_UNIX_EPOCH
+    w = tzFloorDiv( t, chrono.DT_TICKS_PER_SECOND )
+    subT = t - w * chrono.DT_TICKS_PER_SECOND
+end sub
+
+function tzInstantAt( byval s as longint, byval subT as longint ) as chrono.Instant
+    return chrono.Instant.FromTicks( s * chrono.DT_TICKS_PER_SECOND + subT + chrono.DT_TICKS_TO_UNIX_EPOCH )
+end function
+
+function TimeZone.MapLocal( byref wall as chrono.DateTime, byref a as chrono.Instant, _
+                            byref b as chrono.Instant ) as long
+    if this.m_e = nullptr orelse wall.IsValid = false then
+        error 1
+        return 0
+    end if
+    dim as longint w, subT, ca, cb
+    dim as long gb, ga
+    tzWallSeconds( wall, w, subT )
+    dim as long n = this.Map_( w, ca, cb, gb, ga )
+    if n <= 0 then return 0
+    a = tzInstantAt( ca, subT )
+    b = tzInstantAt( cb, subT )
+    return n
+end function
+
+function TimeZone.TryResolve( byref wall as chrono.DateTime, byval policy as Disambiguation, _
+                              byref result as chrono.Instant ) as boolean
+    if this.m_e = nullptr orelse wall.IsValid = false then
+        error 1
+        return false
+    end if
+    dim as longint w, subT, ca, cb, r
+    dim as long gb, ga
+    tzWallSeconds( wall, w, subT )
+    select case this.Map_( w, ca, cb, gb, ga )
+    case 1
+        r = ca
+    case 2
+        select case policy
+        case dzCompatible, dzEarlier
+            r = ca
+        case dzLater
+            r = cb
+        case else
+            return false
+        end select
+    case 0
+        select case policy
+        case dzCompatible, dzLater
+            r = w - gb                  '' forward: the offset from before the gap
+        case dzEarlier
+            r = w - ga                  '' backward: the offset from after it
+        case else
+            return false
+        end select
+        if r < TZ_MIN_UNIX orelse r > TZ_MAX_UNIX then return false
+    case else
+        return false
+    end select
+    result = tzInstantAt( r, subT )
+    return true
+end function
+
+function TimeZone.Resolve( byref wall as chrono.DateTime, byval policy as Disambiguation ) as chrono.Instant
+    dim as chrono.Instant r
+    if this.TryResolve( wall, policy, r ) = false then error 1
+    return r
+end function

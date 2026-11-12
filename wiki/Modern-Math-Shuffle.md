@@ -24,8 +24,8 @@ dim as int32 a( 0 to 4 ) = { 1, 2, 3, 4, 5 }
 Shuffle( r, a( ) )
 
 dim as int32 total = 0
-for i as int32 = 0 to 4
-    total += a( i )
+for each v in a
+    total += v
 next
 print total                  '' 15 -- the same elements, reordered
 ```

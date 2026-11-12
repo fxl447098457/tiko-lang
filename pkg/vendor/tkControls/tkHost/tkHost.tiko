@@ -212,6 +212,9 @@ public type TK_WIDGET_
     cursor        as long = TK_CURSOR_ARROW
     proc          as tkWidgetProc
     pData         as any ptr            ' the control's own state
+    ' tkTheme's, opaque here: one plain (callocate'd) block each, freed by tkWidget_Destroy.
+    pThemeScope   as any ptr            ' a theme for this subtree (tkTheme_ApplyTo); 0 = inherit
+    pColorRecipe  as any ptr            ' per-field colour overrides (tkTheme_SetRecipe)
 end type
 
 public type TK_FONT
@@ -855,6 +858,37 @@ private sub SetHostDeep( byval w as TK_WIDGET ptr, byval h as TK_HOST ptr )
     wend
 end sub
 
+' msg to every descendant of w (not w itself). A TKM_THEMECHANGED stops at a subtree that carries
+' its own theme (pThemeScope): that subtree's theme did not change.
+private sub BroadcastTree( byval w as TK_WIDGET ptr, byval msg as long )
+    dim as TK_WIDGET ptr c = w->pFirst
+    while c
+        if (msg <> TKM_THEMECHANGED) orelse (c->pThemeScope = 0) then
+            SendSimple( c, msg )
+            BroadcastTree( c, msg )
+        end if
+        c = c->pNext
+    wend
+end sub
+
+' msg to w and its whole subtree (tkTheme_ApplyTo's broadcast), with BroadcastTree's scope rule
+' below w.
+public sub tkWidget_Broadcast( byval w as TK_WIDGET ptr, byval msg as long )
+    if w = 0 then exit sub
+    SendSimple( w, msg )
+    BroadcastTree( w, msg )
+    if w->pHost then w->pHost->bDirty = true
+end sub
+
+' The nearest widget at or above w that carries a theme scope; 0 = the app's theme.
+private function ScopeOwner( byval w as TK_WIDGET ptr ) as TK_WIDGET ptr
+    while w
+        if w->pThemeScope then return w
+        w = w->pParent
+    wend
+    return 0
+end function
+
 ' SetParent: move w and its subtree under newParent, on the same surface or another one (a
 ' dialog recreated at its final size -- on Wayland a surface resized after its renderer exists
 ' keeps a stale drawable). The old surface forgets any capture, focus or hot widget inside it.
@@ -869,10 +903,13 @@ public sub tkWidget_Reparent( byval w as TK_WIDGET ptr, byval newParent as TK_WI
         if IsWithin( w, hOld->pLastDown ) then hOld->pLastDown = 0
         hOld->bDirty = true
     end if
+    dim as TK_WIDGET ptr scopeOld = ScopeOwner( w->pParent )
     Unlink( w )
     AppendChild( newParent, w )
     SetHostDeep( w, hNew )
     hNew->bDirty = true
+    ' moved between differently themed subtrees: it restyles (a widget with its own scope keeps it)
+    if (w->pThemeScope = 0) andalso (ScopeOwner( newParent ) <> scopeOld) then tkWidget_Broadcast( w, TKM_THEMECHANGED )
 end sub
 
 ' EnableWindow: a disabled widget (and its subtree) gets no input, is skipped by Tab, and gives
@@ -983,6 +1020,8 @@ public sub tkWidget_Destroy( byval w as TK_WIDGET ptr )
     end if
     SendSimple( w, TKM_DESTROY )
     Unlink( w )
+    if w->pThemeScope then deallocate( w->pThemeScope )
+    if w->pColorRecipe then deallocate( w->pColorRecipe )
     delete w
 end sub
 
@@ -1219,15 +1258,6 @@ private sub SyncCursor( byval h as TK_HOST ptr )
     gCursorNow = c
 end sub
 
-private sub BroadcastTree( byval w as TK_WIDGET ptr, byval msg as long )
-    dim as TK_WIDGET ptr c = w->pFirst
-    while c
-        SendSimple( c, msg )
-        BroadcastTree( c, msg )
-        c = c->pNext
-    wend
-end sub
-
 ' Send msg to every widget of every live surface (what PsRegistry's broadcasts did). Used for
 ' TKM_THEMECHANGED; clrWindow, when non-zero, becomes the background of the main windows and
 ' dialogs (a popup keeps its own).
@@ -1235,6 +1265,7 @@ public sub tkHost_BroadcastAll( byval msg as long, byval clrWindow as ulong = 0 
     for i as long = 0 to gnHosts - 1
         dim as TK_HOST ptr h = gHosts(i)
         if h->bClosed then continue for
+        if (msg = TKM_THEMECHANGED) andalso (h->root->pThemeScope <> 0) then continue for   ' its own theme
         if (clrWindow <> 0) andalso ((h->kind = TK_SURF_MAIN) orelse (h->kind = TK_SURF_DIALOG)) then h->clrBack = clrWindow
         BroadcastTree( h->root, msg )
         h->bDirty = true

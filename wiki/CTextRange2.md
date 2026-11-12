@@ -11,7 +11,7 @@ A `CTextRange2` wraps one `ITextRange2` interface: a span of text in a rich edit
 
 **Positions.** Character positions count from 0. A range covers its start up to, not including, its end, so `Range( 0, 5 )` is the first five characters; when start and end are equal the range is an *insertion point* (TOM calls it degenerate). One end is the *active* end, the one that moves when the range is extended. A range keeps up with edits elsewhere in the text: insert before it and its positions move on.
 
-**Ownership.** The constructor takes over the pointer it is given and the destructor releases it, so `dim r as CTextRange2 = pRichEdit->Range( 0, 5 )` is the whole job. Members that return another interface (`GetDuplicate`, `GetFont`, `GetPara`, `GetRow` …) hand you a reference you own: wrap it in its class, or release it. The pointer is in the public field `m_pTextRange2`; pass that where a member wants an `ITextRange2 ptr`. Do not copy one `CTextRange2` into another: the copy shares the pointer without adding a reference, and both destructors release it.
+**Ownership.** The constructor takes over the pointer it is given and the destructor releases it, so `dim r as CTextRange2 = pRichEdit->Range( 0, 5 )` is the whole job. Members that return another interface (`GetDuplicate`, `GetFont`, `GetPara`, `GetRow` …) hand you a reference you own: wrap it in its class, or release it. The pointer is in the public field `m_pTextRange2`; pass that where a member wants an `ITextRange2 ptr`.
 
 **Selection members.** `ITextRange2` also carries the `ITextSelection` members (`MoveLeft`, `HomeKey`, `TypeText`, `GetType` …). On a range that is not the selection the control answers `E_NOTIMPL`; they are for [CTextSelection2](CTextSelection2).
 

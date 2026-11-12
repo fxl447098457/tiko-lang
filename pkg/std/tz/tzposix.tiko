@@ -1,0 +1,247 @@
+#module "tz"
+'' std/tz: POSIX TZ strings -- the rule a TZif footer gives for every instant
+'' after the file's last transition, and the form a TZ environment variable may
+'' take.
+''
+''     std offset [dst [offset] [,start[/time],end[/time]]]
+''
+'' NAMES are three or more letters, or anything alphanumeric with + and - in
+'' angle brackets: "<-03>3" is a zone three hours WEST of UTC called "-03".
+'' OFFSETS are POSIX's, the time ADDED to local time to reach UTC -- the
+'' opposite sign of everything else in this module, and converted on the way
+'' in. A missing daylight offset is one hour ahead of standard time.
+'' RULES are Jn (1..365, February 29 never counted), n (0..365, counted) or
+'' Mm.w.d (weekday d, Sunday = 0, of week w of month m; w = 5 is the LAST such
+'' weekday). /time is local time of day, default 02:00, and may be negative or
+'' up to 167 hours (RFC 8536's extension: "all year daylight time" is written
+'' "EST5EDT,0/0,J365/25"). A daylight name with no rules gets the US rules,
+'' M3.2.0,M11.1.0, as glibc gives it.
+
+function tzpIsDigit( byval c as long ) as boolean
+    return c >= 48 andalso c <= 57
+end function
+
+function tzpIsAlpha( byval c as long ) as boolean
+    return ( c >= 65 andalso c <= 90 ) orelse ( c >= 97 andalso c <= 122 )
+end function
+
+function tzpAt( byref s as string, byval i as long ) as long
+    if i >= len( s ) then return -1
+    return s[i]
+end function
+
+function tzpName( byref s as string, byref i as long, byref name_ as string ) as boolean
+    dim as long j
+    if tzpAt( s, i ) = 60 then                              '' '<'
+        j = i + 1
+        while tzpAt( s, j ) <> 62                           '' '>'
+            dim as long c = tzpAt( s, j )
+            if c < 0 then return false
+            if tzpIsDigit( c ) = false andalso tzpIsAlpha( c ) = false _
+               andalso c <> 43 andalso c <> 45 then return false
+            j += 1
+        wend
+        if j - i - 1 < 3 then return false
+        name_ = mid( s, i + 2, j - i - 1 )
+        i = j + 1
+    else
+        j = i
+        while tzpIsAlpha( tzpAt( s, j ) )
+            j += 1
+        wend
+        if j - i < 3 then return false
+        name_ = mid( s, i + 1, j - i )
+        i = j
+    end if
+    return true
+end function
+
+'' 1..maxDigits decimal digits.
+function tzpNum( byref s as string, byref i as long, byref v as long, byval maxDigits as long ) as boolean
+    dim as long n = 0
+    v = 0
+    while tzpIsDigit( tzpAt( s, i ) )
+        if n = maxDigits then return false
+        v = v * 10 + ( s[i] - 48 )
+        n += 1
+        i += 1
+    wend
+    return n > 0
+end function
+
+'' [+|-]hh[:mm[:ss]], as seconds, hh at most maxHours.
+function tzpHms( byref s as string, byref i as long, byref secs as long, byval maxHours as long ) as boolean
+    dim as long sign_ = 1, hh, mm = 0, ss = 0
+    if tzpAt( s, i ) = 43 then
+        i += 1
+    elseif tzpAt( s, i ) = 45 then
+        sign_ = -1
+        i += 1
+    end if
+    if tzpNum( s, i, hh, 3 ) = false orelse hh > maxHours then return false
+    if tzpAt( s, i ) = 58 then
+        i += 1
+        if tzpNum( s, i, mm, 2 ) = false orelse mm > 59 then return false
+        if tzpAt( s, i ) = 58 then
+            i += 1
+            if tzpNum( s, i, ss, 2 ) = false orelse ss > 59 then return false
+        end if
+    end if
+    secs = sign_ * ( hh * 3600 + mm * 60 + ss )
+    return true
+end function
+
+function tzpRule( byref s as string, byref i as long, byref r as TzRule_ ) as boolean
+    dim as long c = tzpAt( s, i )
+    if c = 74 then                                          '' 'J'
+        i += 1
+        r.kind = TZ_RULE_JULIAN1
+        if tzpNum( s, i, r.day, 3 ) = false then return false
+        if r.day < 1 orelse r.day > 365 then return false
+    elseif tzpIsDigit( c ) then
+        r.kind = TZ_RULE_JULIAN0
+        if tzpNum( s, i, r.day, 3 ) = false then return false
+        if r.day > 365 then return false
+    elseif c = 77 then                                      '' 'M'
+        i += 1
+        r.kind = TZ_RULE_MONTH
+        if tzpNum( s, i, r.mon, 2 ) = false orelse r.mon < 1 orelse r.mon > 12 then return false
+        if tzpAt( s, i ) <> 46 then return false
+        i += 1
+        if tzpNum( s, i, r.week, 1 ) = false orelse r.week < 1 orelse r.week > 5 then return false
+        if tzpAt( s, i ) <> 46 then return false
+        i += 1
+        if tzpNum( s, i, r.wday, 1 ) = false orelse r.wday > 6 then return false
+    else
+        return false
+    end if
+    r.time = 7200
+    if tzpAt( s, i ) = 47 then                              '' '/'
+        i += 1
+        if tzpHms( s, i, r.time, 167 ) = false then return false
+    end if
+    return true
+end function
+
+function tzParsePosix( byref s as string, byref p as TzPosix_ ) as boolean
+    dim as TzPosix_ q
+    dim as long i = 0, off
+
+    if tzpName( s, i, q.stdAbbr ) = false then return false
+    if tzpHms( s, i, off, 24 ) = false then return false
+    q.stdOff = -off
+
+    dim as long c = tzpAt( s, i )
+    if c >= 0 andalso c <> 44 then                          '' a daylight name
+        if tzpName( s, i, q.dstAbbr ) = false then return false
+        q.hasDst = true
+        q.dstOff = q.stdOff + 3600
+        c = tzpAt( s, i )
+        if tzpIsDigit( c ) orelse c = 43 orelse c = 45 then
+            if tzpHms( s, i, off, 24 ) = false then return false
+            q.dstOff = -off
+        end if
+    end if
+
+    if tzpAt( s, i ) = 44 then                              '' ','
+        if q.hasDst = false then return false
+        i += 1
+        if tzpRule( s, i, q.startRule ) = false then return false
+        if tzpAt( s, i ) <> 44 then return false
+        i += 1
+        if tzpRule( s, i, q.endRule ) = false then return false
+    elseif q.hasDst then
+        q.startRule.kind = TZ_RULE_MONTH
+        q.startRule.mon = 3 : q.startRule.week = 2 : q.startRule.wday = 0
+        q.startRule.time = 7200
+        q.endRule.kind = TZ_RULE_MONTH
+        q.endRule.mon = 11 : q.endRule.week = 1 : q.endRule.wday = 0
+        q.endRule.time = 7200
+    end if
+    if i <> len( s ) then return false
+
+    p = q
+    return true
+end function
+
+'' ------------------------------------------------------------ evaluation
+
+'' The unix day a rule names in year y.
+function tzRuleDay( byref r as TzRule_, byval y as longint ) as longint
+    dim as longint jan1 = tzDaysFromCivil( y, 1, 1 )
+    select case r.kind
+    case TZ_RULE_JULIAN1
+        dim as longint d = jan1 + r.day - 1
+        if tzIsLeap( y ) andalso r.day >= 60 then d += 1
+        return d
+    case TZ_RULE_JULIAN0
+        return jan1 + r.day
+    case else
+        dim as longint first = tzDaysFromCivil( y, r.mon, 1 )
+        dim as long md = 1 + ( ( r.wday - tzWeekday( first ) + 7 ) mod 7 ) + ( r.week - 1 ) * 7
+        dim as long dim_ = tzDaysInMonth( y, r.mon )
+        while md > dim_
+            md -= 7
+        wend
+        return first + md - 1
+    end select
+end function
+
+'' The rule's changes in years y0..y1 as unix seconds, ascending, with KIND 1
+'' for into daylight time and 0 for out of it. A start is read in standard
+'' time and an end in daylight time, which is what the rule's local times mean.
+'' At EQUAL times the end comes first, so "daylight time all year" -- each
+'' year's end meeting the next year's start -- reads as daylight time.
+function tzPosixEventsK( byref p as TzPosix_, byval y0 as longint, byval y1 as longint, _
+                         ev( ) as longint, kd( ) as long ) as long
+    dim as long n = clng( y1 - y0 + 1 ) * 2
+    if n <= 0 then return 0
+    redim ev( 0 to n - 1 )
+    redim kd( 0 to n - 1 )
+    dim as long m = 0
+    for y as longint = y0 to y1
+        ev( m ) = tzRuleDay( p.startRule, y ) * 86400 + p.startRule.time - p.stdOff
+        kd( m ) = 1
+        m += 1
+        ev( m ) = tzRuleDay( p.endRule, y ) * 86400 + p.endRule.time - p.dstOff
+        kd( m ) = 0
+        m += 1
+    next
+    '' insertion sort: a handful of values
+    for a as long = 1 to n - 1
+        dim as longint t = ev( a )
+        dim as long k = kd( a )
+        dim as long b = a - 1
+        while b >= 0
+            if ev( b ) < t orelse ( ev( b ) = t andalso kd( b ) <= k ) then exit while
+            ev( b + 1 ) = ev( b )
+            kd( b + 1 ) = kd( b )
+            b -= 1
+        wend
+        ev( b + 1 ) = t
+        kd( b + 1 ) = k
+    next
+    return n
+end function
+
+function tzPosixEvents( byref p as TzPosix_, byval y0 as longint, byval y1 as longint, _
+                        ev( ) as longint ) as long
+    dim as long kd( any )
+    return tzPosixEventsK( p, y0, y1, ev( ), kd( ) )
+end function
+
+'' Daylight time at t: the kind of the last change at or before it. Two years
+'' back is enough for any rule time (167 h at most).
+function tzPosixIsDst( byref p as TzPosix_, byval t as longint ) as boolean
+    if p.hasDst = false then return false
+    dim as longint y = tzYearFromDays( tzFloorDiv( t + p.stdOff, 86400 ) )
+    dim as longint ev( any )
+    dim as long kd( any )
+    dim as long n = tzPosixEventsK( p, y - 2, y + 1, ev( ), kd( ) )
+    dim as long state = 0
+    for i as long = 0 to n - 1
+        if ev( i ) > t then exit for
+        state = kd( i )
+    next
+    return state = 1
+end function

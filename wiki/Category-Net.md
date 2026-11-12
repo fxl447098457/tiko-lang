@@ -54,8 +54,8 @@ A `SocketAddress` is an address and a port: `SocketAddress( ip, port )`, the fie
 
 dim r as net.NetResultAddrs = net.Resolve( "localhost", 8080 )
 if r.IsOk( ) then
-    for i as long = 0 to r.Value( ).Count( ) - 1
-        print r.Value( ).items( i ).ToString( )
+    for each a in r.Value( )
+        print a.ToString( )
     next
 end if
 ```

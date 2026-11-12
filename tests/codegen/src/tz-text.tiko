@@ -1,0 +1,156 @@
+'' std/tz phase Z5: ZonedDateTime as text -- RFC 9557 and the VV / v pattern letters.
+'' Prints "ok", or the first failed check. $TZDIR is tests/codegen/tzdata (tzdata 2026f).
+''   1. ToIsoString: offsets with seconds only when non-zero, fractions, UTC, fixed zones
+''   2. TryParseIso: every offset form, Z, no offset, a date alone, [+05:30], critical
+''      and elective annotations, and the refusals
+''   3. offset against zone: opReject / opUse / opPrefer / opIgnore on text whose offset
+''      the zone does not have there, and on an overlap where it picks the instant
+''   4. ToString / TryFormat with VV and v; TryParseExact with VV
+''   5. round trips: 3000 random values over five zones, ISO and a VV pattern
+#import "std/tz"
+#import "std/chrono"
+#import "std/os"
+using tz
+
+dim shared as long failures = 0
+sub check( byval ok as boolean, byref what as string )
+    if ok = false then
+        if failures = 0 then print "FAIL: "; what
+        failures += 1
+    end if
+end sub
+
+function at( byval y as long, byval mo as long, byval d as long, _
+             byval h as long = 0, byval mi as long = 0, byval s as long = 0 ) as chrono.Instant
+    return chrono.DateTime( y, mo, d, h, mi, s, 0 ).AssumeUtc( )
+end function
+
+function parsed( byref s as const ustring, byval o as OffsetPolicy = opReject, byval p as Disambiguation = dzCompatible ) as ZonedDateTime
+    dim as ZonedDateTime r
+    if ZonedDateTime.TryParseIso( s, r, o, p ) = false then return ZonedDateTime.Invalid( )
+    return r
+end function
+
+os.SetEnv( "TZDIR", "tests/codegen/tzdata" )
+dim as TimeZone sj = TimeZone.FindById( "America/St_Johns" ), ny = TimeZone.FindById( "America/New_York" )
+dim as TimeZone am = TimeZone.FindById( "Europe/Amsterdam" )
+
+'' ---------------------------------------------------------------- 1. output
+check( ZonedDateTime.FromInstant( at( 2025, 7, 4, 16 ), ny ).ToIsoString( ) = "2025-07-04T12:00:00-04:00[America/New_York]", "New_York" )
+check( ZonedDateTime.FromInstant( at( 2025, 1, 15 ), sj ).ToIsoString( ) = "2025-01-14T20:30:00-03:30[America/St_Johns]", "St_Johns" )
+check( ZonedDateTime.FromInstant( at( 1930, 1, 15, 12 ), am ).ToIsoString( ) = "1930-01-15T12:19:32+00:19:32[Europe/Amsterdam]", "Amsterdam seconds" )
+check( ZonedDateTime.FromInstant( at( 2025, 1, 1 ), TimeZone.Utc( ) ).ToIsoString( ) = "2025-01-01T00:00:00+00:00[UTC]", "UTC is +00:00, not Z" )
+check( ZonedDateTime.FromInstant( at( 2025, 1, 1 ), TimeZone.FixedOffset( 19800 ) ).ToIsoString( ) = "2025-01-01T05:30:00+05:30[+05:30]", "fixed zone" )
+check( ZonedDateTime.FromInstant( at( 2025, 1, 1 ).Add( chrono.TimeSpan.FromMilliseconds( 250 ) ), ny ).ToIsoString( ) _
+       = "2024-12-31T19:00:00.2500000-05:00[America/New_York]", "fraction: seven digits" )
+check( ZonedDateTime.FromInstant( at( 2025, 7, 4, 16 ), ny ).ToString( ) = ZonedDateTime.FromInstant( at( 2025, 7, 4, 16 ), ny ).ToIsoString( ), "ToString( ) is ISO" )
+
+'' ---------------------------------------------------------------- 2. input
+dim as chrono.Instant noonNY = at( 2025, 7, 4, 16 )
+check( parsed( "2025-07-04T12:00:00-04:00[America/New_York]" ).ToInstant( ) = noonNY, "full form" )
+check( parsed( "2025-07-04T12:00-04:00[America/New_York]" ).ToInstant( ) = noonNY, "no seconds" )
+check( parsed( "2025-07-04T12:00:00-0400[America/New_York]" ).ToInstant( ) = noonNY, "-0400" )
+check( parsed( "2025-07-04T12:00:00-04[America/New_York]" ).ToInstant( ) = noonNY, "-04" )
+check( parsed( "2025-07-04T12:00:00-04:00:00[America/New_York]" ).ToInstant( ) = noonNY, "-04:00:00" )
+check( parsed( "2025-07-04T12:00:00-040000[America/New_York]" ).ToInstant( ) = noonNY, "-040000" )
+check( parsed( "2025-07-04 12:00:00-04:00[America/New_York]" ).ToInstant( ) = noonNY, "space separator" )
+check( parsed( "2025-07-04T12:00:00[America/New_York]" ).ToInstant( ) = noonNY, "no offset: the wall reading" )
+check( parsed( "2025-07-04T16:00:00Z[America/New_York]" ).ToInstant( ) = noonNY, "Z names the instant" )
+check( parsed( "2025-07-04T16:00:00Z[America/New_York]" ).Hour = 12, "Z, read in the zone" )
+check( parsed( "2025-07-04T12:00:00-04:00[!America/New_York]" ).ToInstant( ) = noonNY, "critical zone" )
+check( parsed( "2025-07-04T12:00:00-04:00[america/new_york]" ).Zone.Id = "America/New_York", "zone id canonical" )
+check( parsed( "2025-07-04T12:00:00-04:00[America/New_York][u-ca=gregory]" ).ToInstant( ) = noonNY, "u-ca=gregory" )
+check( parsed( "2025-07-04T12:00:00-04:00[America/New_York][!u-ca=iso8601]" ).IsValid, "critical u-ca=iso8601" )
+check( parsed( "2025-07-04T12:00:00-04:00[America/New_York][u-ca=hebrew]" ).IsValid, "elective u-ca ignored" )
+check( parsed( "2025-07-04T12:00:00-04:00[America/New_York][foo=bar]" ).IsValid, "elective unknown ignored" )
+check( parsed( "2025-07-04T12:00:00.25-04:00[America/New_York]" ).ToInstant( ) = noonNY.Add( chrono.TimeSpan.FromMilliseconds( 250 ) ), "fraction" )
+check( parsed( "2025-01-01T05:30:00+05:30[+05:30]" ).Zone.Id = "+05:30", "[+05:30]" )
+check( parsed( "1930-01-15T12:19:32+00:19:32[Europe/Amsterdam]" ).ToInstant( ) = at( 1930, 1, 15, 12 ), "Amsterdam seconds back" )
+check( parsed( "2018-11-04[America/Sao_Paulo]" ).ToInstant( ) = at( 2018, 11, 4, 3 ), "a date alone: its first instant (Sao_Paulo 01:00)" )
+scope
+    dim as string bad = "2025-07-04T12:00:00-04:00|2025-07-04T12:00:00-04:00[]|2025-07-04T12:00:00-04:00[America/Nowhere]|" _
+        & "2025-07-04T12:00:00-04:00[America/New_York]x|2025-07-04T12:00:00-04:00[America/New_York|" _
+        & "2025-07-04T12:00:00-04:00[America/New_York][Europe/London]|2025-07-04T12:00:00-04:00[u-ca=gregory][America/New_York]|" _
+        & "2025-07-04T12:00:00-04:00[America/New_York][!foo=bar]|2025-07-04T12:00:00-04:00[America/New_York][!u-ca=hebrew]|" _
+        & "2025-07-04T12:00:00-04:00[America/New_York][FOO=bar]|2025-07-04T12:00:00-04:00[America/New_York][=x]|" _
+        & "2025-07-04T12:00:00-4:00[America/New_York]|2025-07-04T12:00:00-04:60[America/New_York]|" _
+        & "2025-07-04T12:00:00-24:00[America/New_York]|2025-07-04T12:00:00-04:00:60[America/New_York]|" _
+        & "2025-07-04T12:00:00-04:00[+5:30]|2025-07-04T12:00:00-04:00[+05:30:00]|2025-13-04T12:00:00-04:00[America/New_York]|" _
+        & "2025-07-04T25:00:00-04:00[America/New_York]|[America/New_York]"
+    dim as long bp = 1
+    do
+        dim as long e = instr( bp, bad, "|" )
+        dim as string one = iif( e = 0, mid( bad, bp ), mid( bad, bp, e - bp ) )
+        dim as ZonedDateTime r
+        check( ZonedDateTime.TryParseIso( one, r ) = false andalso r.IsValid = false, "refused: [" & one & "]" )
+        if e = 0 then exit do
+        bp = e + 1
+    loop
+end scope
+
+'' ---------------------------------------------------------------- 3. offset vs zone
+scope
+    '' -05:00 is not New York's offset on 4 July
+    dim as string t = "2025-07-04T12:00:00-05:00[America/New_York]"
+    check( parsed( t ).IsValid = false, "opReject refuses a wrong offset" )
+    check( parsed( t, opUse ).ToInstant( ) = at( 2025, 7, 4, 17 ) andalso parsed( t, opUse ).Hour = 13, "opUse: the offset's instant, 13:00 EDT" )
+    check( parsed( t, opPrefer ).ToInstant( ) = noonNY, "opPrefer falls back to the wall" )
+    check( parsed( t, opIgnore ).ToInstant( ) = noonNY, "opIgnore: the wall" )
+    '' an overlap: the offset picks which 01:30
+    check( parsed( "2025-11-02T01:30:00-02:30[America/St_Johns]" ).ToInstant( ) = at( 2025, 11, 2, 4 ), "overlap, -02:30" )
+    check( parsed( "2025-11-02T01:30:00-03:30[America/St_Johns]" ).ToInstant( ) = at( 2025, 11, 2, 5 ), "overlap, -03:30" )
+    check( parsed( "2025-11-02T01:30:00-03:30[America/St_Johns]", opPrefer ).ToInstant( ) = at( 2025, 11, 2, 5 ), "overlap, prefer -03:30" )
+    check( parsed( "2025-11-02T01:30:00-03:30[America/St_Johns]", opIgnore ).ToInstant( ) = at( 2025, 11, 2, 4 ), "overlap, ignore: earlier" )
+    check( parsed( "2025-11-02T01:30:00-03:30[America/St_Johns]", opIgnore, dzLater ).ToInstant( ) = at( 2025, 11, 2, 5 ), "overlap, ignore + later" )
+    '' no offset in a gap or overlap: the policy decides
+    check( parsed( "2025-03-09T02:30:00[America/St_Johns]" ).Hour = 3, "gap, compatible" )
+    check( parsed( "2025-03-09T02:30:00[America/St_Johns]", opReject, dzReject ).IsValid = false, "gap, reject" )
+end scope
+
+'' ---------------------------------------------------------------- 4. patterns
+scope
+    dim as ZonedDateTime z = ZonedDateTime.FromInstant( at( 2025, 7, 4, 16 ), ny )
+    check( z.ToString( "yyyy-MM-dd HH:mm VV" ) = "2025-07-04 12:00 America/New_York", "VV" )
+    check( z.ToString( "HH:mm v" ) = "12:00 EDT", "v" )
+    check( z.ToString( "yyyy-MM-dd'T'HH:mmzzz '[VV]' VV" ) = "2025-07-04T12:00-04:00 [VV] America/New_York", "quoted VV stays text" )
+    check( z.ToString( "HH:mm K" ) = "12:00 -04:00", "K" )
+    dim as ustring r
+    check( z.TryFormat( "HH:mm V", r ) = false andalso z.TryFormat( "HH:mm VVV", r ) = false andalso z.TryFormat( "HH:mm vv", r ) = false, "wrong V/v runs refused" )
+    dim as ZonedDateTime a = ZonedDateTime.FromInstant( at( 1930, 1, 15, 12 ), am )
+    check( a.ToString( "HH:mm:ss zzz v" ) = "12:19:32 +00:20 AMT", "pattern: the true wall, the offset rounded" )
+    dim as ZonedDateTime p
+    check( ZonedDateTime.TryParseExact( "2025-07-04 12:00 America/New_York", "yyyy-MM-dd HH:mm VV", p ) andalso p.ToInstant( ) = noonNY, "parse VV" )
+    check( ZonedDateTime.TryParseExact( "2025-07-04 12:00 -04:00 America/New_York", "yyyy-MM-dd HH:mm zzz VV", p ) andalso p.ToInstant( ) = noonNY, "parse zzz VV" )
+    check( ZonedDateTime.TryParseExact( "2025-07-04 12:00 -05:00 America/New_York", "yyyy-MM-dd HH:mm zzz VV", p ) = false, "parse wrong offset: rejected" )
+    check( ZonedDateTime.TryParseExact( "2025-07-04 12:00 -05:00 America/New_York", "yyyy-MM-dd HH:mm zzz VV", p, opUse ) andalso p.Hour = 13, "parse wrong offset, opUse" )
+    check( ZonedDateTime.TryParseExact( "2025-07-04 12:00 +05:30", "yyyy-MM-dd HH:mm VV", p ) andalso p.Zone.Id = "+05:30", "parse VV of a fixed zone" )
+    check( ZonedDateTime.TryParseExact( "2025-07-04 12:00 EDT", "yyyy-MM-dd HH:mm v", p ) = false, "v cannot be parsed" )
+    check( ZonedDateTime.TryParseExact( "America/New_York 2025-07-04", "VV yyyy-MM-dd", p ) = false, "VV must end the pattern" )
+    check( ZonedDateTime.TryParseExact( "2025-07-04 12:00 America/Nowhere", "yyyy-MM-dd HH:mm VV", p ) = false, "unknown zone" )
+end scope
+
+'' ---------------------------------------------------------------- 5. round trips
+scope
+    dim as ulongint sd = 4242ull
+    for k as long = 1 to 3000
+        sd xor= sd shl 13 : sd xor= sd shr 7 : sd xor= sd shl 17
+        dim as TimeZone z
+        select case k mod 5
+        case 0 : z = sj
+        case 1 : z = ny
+        case 2 : z = am
+        case 3 : z = TimeZone.FindById( "Australia/Lord_Howe" )
+        case else : z = TimeZone.FixedOffset( -12600 )
+        end select
+        dim as longint t = TZ_MIN_UNIX + 86400 * 2 + cast( longint, sd mod culngint( TZ_MAX_UNIX - TZ_MIN_UNIX - 86400 * 4 ) )
+        dim as ZonedDateTime v = ZonedDateTime.FromInstant( chrono.Instant.FromUnixSeconds( t ), z )
+        dim as ustring s = v.ToIsoString( )
+        dim as ZonedDateTime back
+        check( ZonedDateTime.TryParseIso( s, back ) andalso back = v, "ISO round trip " & s )
+        dim as ustring f = v.ToString( "yyyy-MM-dd HH:mm:ss VV" )
+        check( ZonedDateTime.TryParseExact( f, "yyyy-MM-dd HH:mm:ss VV", back, opReject, dzCompatible ) _
+               andalso ( back = v orelse back.ToWall( ) = v.ToWall( ) ), "pattern round trip " & f )
+    next
+end scope
+
+if failures = 0 then print "ok" else print failures; " failures"

@@ -120,10 +120,7 @@ function SetPos( byval hSB as HWND, byval nPos as long, byval fRedraw as boolean
 Moves the thumb to `nPos`, which should lie within the range; `fRedraw` `true` redraws the
 scroll bar at once.
 
-**Returns** the number `SetScrollPos` gives back, a position, turned into a `boolean`: `true`
-when that position is nonzero, `false` when it is 0 or the call failed. It is not a success
-flag, and which position Windows returns (the old one or the new) depends on the version of the
-control in use.
+**Returns** If the function succeeds, the return value is the previous position of the scroll box. If the function fails, the return value is zero. To get extended error information, call [GetLastError](https://learn.microsoft.com/en-us/windows/desktop/api/errhandlingapi/nf-errhandlingapi-getlasterror).
 
 **Example**
 

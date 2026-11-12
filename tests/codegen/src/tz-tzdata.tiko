@@ -1,0 +1,119 @@
+'' std/tzdata (phase Z6): the zone database inside the program. Prints "ok", or the
+'' first failed check. $TZDIR is emptied, so on Windows the embedded database is the
+'' only source; on Linux and macOS the system's files still come first.
+''   1. the database: its version, its ids, every one loads
+''   2. Windows: the embedded zones against the tzdata 2026f fixtures (the same build,
+''      fat files) at 2000 instants each and every transition 1900..2100
+''   3. Windows: Local's IANA id comes from CLDR's map of the OS zone's key, and that
+''      zone agrees with the OS on 2010..2030
+''   4. Linux / macOS: the system tree still answers first
+#import "std/tz"
+#import "std/tzdata"
+#import "std/chrono"
+#import "std/os"
+#import "std/containers"
+using tz
+
+dim shared as long failures = 0
+sub check( byval ok as boolean, byref what as string )
+    if ok = false then
+        if failures = 0 then print "FAIL: "; what
+        failures += 1
+    end if
+end sub
+
+function readFile( byref path as string ) as string
+    dim as long f = freefile
+    if open( path for binary access read as #f ) <> 0 then return ""
+    dim as string s = space( lof( f ) )
+    if len( s ) > 0 then get #f, , s
+    close #f
+    return s
+end function
+
+os.SetEnv( "TZDIR", "" )
+
+'' ---------------------------------------------------------------- 1. the database
+check( tzdata.Version( ) = "2026f", "tzdata.Version " & tzdata.Version( ) )
+dim as containers.Array( of ustring ) ids = TimeZone.AvailableIds( )
+#ifdef __FB_WIN32__
+check( TimeZone.DataVersion( ) = "2026f", "DataVersion is the embedded one" )
+check( ids.Count( ) = 597, "597 ids (598 less Factory): " & ids.Count( ) )
+#else
+check( ids.Count( ) > 300, "system ids: " & ids.Count( ) )
+#endif
+scope
+    dim as boolean paris = false, eastern = false, factory = false
+    for i as long = 0 to ids.Count( ) - 1
+        if ids[i] = "Europe/Paris" then paris = true
+        if ids[i] = "US/Eastern" then eastern = true
+        if ids[i] = "Factory" then factory = true
+        dim as TimeZone z
+        check( TimeZone.TryFindById( ids[i], z ) andalso z.Id = ids[i], "loads: " & ids[i] )
+        if i > 0 then check( ids[i - 1] < ids[i], "sorted at " & ids[i] )
+    next
+    check( paris andalso factory = false, "Paris listed, Factory not" )
+#ifdef __FB_WIN32__
+    check( eastern, "US/Eastern listed" )
+#endif
+    '' Ubuntu 24.04 moved the backward links (US/Eastern, ...) to tzdata-legacy: a
+    '' system tree may lack them, and then the embedded database answers
+    dim as TimeZone ue
+    check( TimeZone.TryFindById( "US/Eastern", ue ) andalso ue.Id = "US/Eastern", "US/Eastern loads, from the system or the embedded copy" )
+end scope
+check( TimeZone.FindById( "europe/PARIS" ).Id = "Europe/Paris", "case-insensitive, canonical" )
+'' the module registered first; a second database is refused
+#embed Again "../../../pkg/std/tzdata/tzdata.tzdb"
+check( TimeZone.RegisterDatabase( @Again( 0 ), ubound( Again ) + 1 ) = false, "a second registration is refused" )
+
+#ifdef __FB_WIN32__
+'' ---------------------------------------------------------------- 2. against the fixtures
+scope
+    dim as string fx = "America/St_Johns Australia/Lord_Howe Asia/Kathmandu Pacific/Apia Europe/Dublin " _
+        & "Africa/Casablanca Pacific/Kiritimati Europe/Amsterdam America/Sao_Paulo America/New_York Europe/London Asia/Kolkata US/Eastern"
+    dim as long p = 1
+    do
+        dim as long e = instr( p, fx, " " )
+        dim as string id = iif( e = 0, mid( fx, p ), mid( fx, p, e - p ) )
+        dim as TzRules f
+        check( TzRules.TryParse( readFile( "tests/codegen/tzdata/" & id ), f ), "fixture " & id )
+        dim as TimeZone z = TimeZone.FindById( id )
+        dim as ulongint sd = 777ull + len( id )
+        for k as long = 1 to 2000
+            sd xor= sd shl 13 : sd xor= sd shr 7 : sd xor= sd shl 17
+            dim as longint t = TZ_MIN_UNIX + cast( longint, sd mod culngint( TZ_MAX_UNIX - TZ_MIN_UNIX ) )
+            dim as chrono.Instant i = chrono.Instant.FromUnixSeconds( t )
+            check( z.OffsetSecondsAt( i ) = f.OffsetSecondsAt( t ) andalso z.IsDaylightSavingTime( i ) = f.IsDstAt( t ) _
+                   andalso z.AbbreviationAt( i ) = f.AbbreviationAt( t ), "embedded = fixture: " & id & " at " & t )
+        next
+        dim as chrono.Instant cur = chrono.DateTime( 1900, 1, 1 ).AssumeUtc( ), nx
+        dim as longint tf = cur.UnixSeconds, tr
+        while z.TryNextTransition( cur, nx ) andalso nx < chrono.DateTime( 2100, 1, 1 ).AssumeUtc( )
+            check( f.TryNextTransition( tf, tr ) andalso tr = nx.UnixSeconds, "transitions: " & id )
+            cur = nx
+            tf = tr
+        wend
+        if e = 0 then exit do
+        p = e + 1
+    loop
+end scope
+
+'' ---------------------------------------------------------------- 3. Local's id
+scope
+    dim as TimeZone l = TimeZone.Local( )
+    if len( l.Id ) > 0 then
+        dim as TimeZone z = TimeZone.FindById( l.Id )
+        for h as long = 0 to 20 * 365 * 24 step 97
+            dim as chrono.Instant i = chrono.DateTime( 2010, 1, 1 ).AssumeUtc( ).Add( chrono.TimeSpan.FromHours( h ) )
+            check( z.OffsetSecondsAt( i ) = l.OffsetSecondsAt( i ), "Local's IANA zone agrees with the OS at " & i.ToIsoString( ) & " (" & l.Id & ")" )
+        next
+    else
+        print "note: this machine's zone has no IANA id here (automatic DST off, or a key CLDR does not map)"
+    end if
+end scope
+#else
+'' ---------------------------------------------------------------- 4. system first
+check( TimeZone.DataVersion( ) <> "" , "system DataVersion" )
+#endif
+
+if failures = 0 then print "ok" else print failures; " failures"

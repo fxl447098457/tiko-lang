@@ -14,8 +14,8 @@ TimeZoneInfo.LocalOffsetAt( byref i as Instant ) as int16
 
 - The offset **at that instant**, not right now. Converting a July timestamp with January's offset is the commonest time-zone bug there is, and this is the call that avoids it.
 - Minutes east of UTC: a zone behind UTC gives a negative number.
-- An Invalid instant gives 0.
-- Only the machine's own zone is available: there are no named zones and no time-zone database.
+- An Invalid instant gives 0, which is also UTC's offset. [TryLocalOffsetAt](Modern-Chrono-TimeZoneInfo-TryLocalOffsetAt) returns false there instead.
+- This is the machine's own zone. For any zone by its IANA name, see [TimeZone.OffsetSecondsAt](Modern-Tz-TimeZone-OffsetSecondsAt).
 
 ## Examples
 

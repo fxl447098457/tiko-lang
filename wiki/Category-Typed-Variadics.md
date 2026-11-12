@@ -5,8 +5,8 @@
 ```freebasic
 function Sum( nums() as const long ... ) as long
     dim as long t
-    for i as integer = lbound( nums ) to ubound( nums )
-        t += nums( i )
+    for each n in nums
+        t += n
     next
     return t
 end function
@@ -32,8 +32,8 @@ The variadic is an array parameter -- a name with `()`, `as`, the element type -
 
 ```freebasic
 sub LogAll( byref prefix as const ustring, items() as const ustring ... )
-    for i as integer = lbound( items ) to ubound( items )
-        print prefix; items( i )
+    for each item in items
+        print prefix; item
     next
 end sub
 
@@ -75,8 +75,8 @@ constructor Item( byref v as const ustring )
 end constructor
 
 sub Show( items() as const Item ... )
-    for i as integer = lbound( items ) to ubound( items )
-        if items( i ).kind = 1 then print items( i ).d else print items( i ).s
+    for each byref it in items
+        if it.kind = 1 then print it.d else print it.s
     next
 end sub
 

@@ -1,0 +1,160 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' colorval -- colours as the .tkform and .tktheme files spell them, and the recipe entries they make
+' (docs/tkDesigner/THEMES.md):
+'   "#RRGGBB" / "#RRGGBBAA"   a fixed colour, both variants (alpha last, as CSS spells it)
+'   "@Accent"                 a theme role, followed through every theme change
+'   "#AAAAAA|#BBBBBB"         one colour in a dark theme, another in a light one; the files write it
+'                             { dark = "#AAAAAA", light = "#BBBBBB" }
+' The canonical text is upper case, and drops an alpha of FF.
+#module "colorval"
+
+#import "std/containers"
+#import "vendor/tkControls/tkMeta"
+#import "../model"
+using containers
+using tkMeta
+using tkTheme
+using model
+
+private function HexDigits_( byref t as const ustring ) as boolean
+    for i as long = 1 to len( t )
+        if instr( "0123456789abcdefABCDEF", mid( t, i, 1 ) ) = 0 then return false
+    next
+    return true
+end function
+
+' "#RRGGBB" or "#RRGGBBAA" to &hAARRGGBB.
+public function ParseHex( byref t as const ustring, byref c as ulong ) as boolean
+    if left( t, 1 ) <> "#" then return false
+    dim as ustring h = mid( t, 2 )
+    if ((len( h ) <> 6) andalso (len( h ) <> 8)) orelse (HexDigits_( h ) = false) then return false
+    dim as ulong rgb = valulng( "&h" & left( h, 6 ) )
+    dim as ulong a = 255
+    if len( h ) = 8 then a = valulng( "&h" & mid( h, 7, 2 ) )
+    c = (a shl 24) or rgb
+    return true
+end function
+
+public function HexText( byval c as ulong ) as ustring
+    dim as ustring t = "#" & hex( c and &hFFFFFFul, 6 )
+    if (c shr 24) <> 255 then t &= hex( c shr 24, 2 )
+    return t
+end function
+
+' A property's "&hAARRGGBB" as a colour value: what an old form's colour property becomes.
+public function FromPropValue( byref v as const ustring ) as ustring
+    if lcase( left( v, 2 ) ) <> "&h" then return ""
+    dim as ustring h = mid( v, 3 )
+    if (len( h ) = 0) orelse (len( h ) > 8) orelse (HexDigits_( h ) = false) then return ""
+    return HexText( valulng( "&h" & h ) )
+end function
+
+' The canonical text of a colour value, or "" when it isn't one. Roles and pairs only where allowed.
+public function Canonical( byref t as const ustring, byval allowRole as boolean = true, byval allowPair as boolean = true ) as ustring
+    dim as ulong c, c2
+    if left( t, 1 ) = "@" then
+        if allowRole = false then return ""
+        if tkTheme_RoleByName( mid( t, 2 ) ) < 0 then return ""
+        return t
+    end if
+    dim as long bar = instr( t, "|" )
+    if bar then
+        if allowPair = false then return ""
+        if (ParseHex( left( t, bar - 1 ), c ) = false) orelse (ParseHex( mid( t, bar + 1 ), c2 ) = false) then return ""
+        return HexText( c ) & "|" & HexText( c2 )
+    end if
+    if ParseHex( t, c ) = false then return ""
+    return HexText( c )
+end function
+
+' Why a value isn't a colour, for a problem report.
+public function Explain( byref t as const ustring ) as ustring
+    if left( t, 1 ) = "@" then return "'" & mid( t, 2 ) & "' is not a theme role"
+    return "'" & t & "' is not a colour (#RRGGBB, #RRGGBBAA, @Role, or { dark, light })"
+end function
+
+' A canonical value as the recipe entry for one slot.
+public function ToSrc( byref t as const ustring, byval slot as long, byref s as TKCOLOR_SRC ) as boolean
+    dim as ulong c, c2
+    if left( t, 1 ) = "@" then
+        dim as long r = tkTheme_RoleByName( mid( t, 2 ) )
+        if r < 0 then return false
+        s = tkTheme_SrcRole( slot, r )
+        return true
+    end if
+    dim as long bar = instr( t, "|" )
+    if bar then
+        if (ParseHex( left( t, bar - 1 ), c ) = false) orelse (ParseHex( mid( t, bar + 1 ), c2 ) = false) then return false
+        s = tkTheme_SrcFixed2( slot, c, c2 )
+        return true
+    end if
+    if ParseHex( t, c ) = false then return false
+    s = tkTheme_SrcFixed( slot, c )
+    return true
+end function
+
+private function U_( byval c as ulong ) as ustring
+    return "&h" & hex( c, 8 ) & "ul"
+end function
+
+public function RoleConst( byval r as long ) as ustring
+    return "TKROLE_" & ucase( tkTheme_RoleName( r ) )
+end function
+
+private function RuleConst_( byval rule as long ) as ustring
+    select case rule
+    case TKDERIVE_HOT      : return "TKDERIVE_HOT"
+    case TKDERIVE_PRESSED  : return "TKDERIVE_PRESSED"
+    case TKDERIVE_DISABLED : return "TKDERIVE_DISABLED"
+    end select
+    return "TKDERIVE_SAME"
+end function
+
+' An entry as tiko source: "tkTheme_SrcFixed( 3, &hFFC62828ul )". slotText stands for the slot.
+public function SrcExpr( byref s as TKCOLOR_SRC, byref slotText as const ustring ) as ustring
+    select case s.kind
+    case TKSRC_ROLE   : return "tkTheme_SrcRole( " & slotText & ", " & RoleConst( s.arg ) & " )"
+    case TKSRC_FIXED  : return "tkTheme_SrcFixed( " & slotText & ", " & U_( s.value ) & " )"
+    case TKSRC_FIXED2 : return "tkTheme_SrcFixed2( " & slotText & ", " & U_( s.value ) & ", " & U_( s.value2 ) & " )"
+    case TKSRC_DERIVE : return "tkTheme_SrcDerive( " & slotText & ", " & RuleConst_( s.arg ) & ", " & s.value & " )"
+    end select
+    return ""
+end function
+
+' The recipe entries for a list of field = value settings of one control type: each set field, in
+' struct order, then simple mode's derived states -- a part whose Normal colour is set and whose
+' Hot, Pressed or Disabled colour isn't gets that state from Normal (ink parts copy it for Hot and
+' Pressed). Settings the type doesn't have are skipped (validate reports them).
+public sub Entries( byref fields as Array( of Setting ), byval m as TKMETA_CONTROL ptr, list as Array( of TKCOLOR_SRC ) )
+    if (m = 0) orelse (m->NumColorSlots = 0) then exit sub
+    dim as Array( of boolean ) isSet
+    isSet.Reserve( m->NumColorSlots )
+    isSet.SetCount( m->NumColorSlots )
+    for slot as long = 0 to m->NumColorSlots - 1
+        dim as long i = FindSetting( fields, m->Colors( slot ).Name )
+        if i < 0 then continue for
+        dim as TKCOLOR_SRC s
+        if ToSrc( fields[i].Value, slot, s ) then
+            list.Push( s )
+            isSet[slot] = true
+        end if
+    next
+    for slot as long = 0 to m->NumColorSlots - 1
+        if isSet[slot] = false then continue for
+        with m->Colors( slot )
+            if (len( .Part ) = 0) orelse (.State <> "Normal") then continue for
+            dim as long hot = tkMeta_ColorCell( m, .Group, .Part, "Hot" )
+            dim as long prs = tkMeta_ColorCell( m, .Group, .Part, "Pressed" )
+            dim as long dis = tkMeta_ColorCell( m, .Group, .Part, "Disabled" )
+            if (hot >= 0) andalso (isSet[hot] = false) then list.Push( tkTheme_SrcDerive( hot, iif( .bInk, TKDERIVE_SAME, TKDERIVE_HOT ), slot ) )
+            if (prs >= 0) andalso (isSet[prs] = false) then list.Push( tkTheme_SrcDerive( prs, iif( .bInk, TKDERIVE_SAME, TKDERIVE_PRESSED ), slot ) )
+            if (dis >= 0) andalso (isSet[dis] = false) then list.Push( tkTheme_SrcDerive( dis, TKDERIVE_DISABLED, slot ) )
+        end with
+    next
+end sub

@@ -284,6 +284,7 @@ What differs, what is refused and why is on
 | [Language reference](wiki/Home.md) | every keyword, operator and intrinsic |
 | [Goroutines tutorial](wiki/Modern-Goroutines-Tutorial.md) | concurrency from first `spawn` to cancellation |
 | [Packages and Modules Tutorial](wiki/Packages-and-Modules-Tutorial.md) | `#import`, the standard library and splitting a program into modules |
+| [AI Cheatsheet](wiki/AI-Cheatsheet.md) | the language and standard library on one page, for AI coding agents; plain markdown at [tiko-lang.net/ai-cheatsheet.md](https://tiko-lang.net/ai-cheatsheet.md) |
 | [bench/](bench/README.md) | the benchmarks and how to run them |
 
 ## Contributing

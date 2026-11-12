@@ -523,8 +523,7 @@ function GetOptions() as EXPLORER_BROWSER_OPTIONS
 ```
 
 The first form reads the current options into `*pdwFlag`. The second form calls the same method
-but returns its `HRESULT`, not the options: 0 after a successful call, whatever the options
-are. Read the options with the first form.
+and returns the options.
 
 | Parameter | Meaning |
 | --- | --- |
@@ -817,8 +816,7 @@ delete pEvents              ' only for a handler that was never attached
 virtual function QueryInterface( byval as REFIID, byval as PVOID ptr ) as HRESULT
 ```
 
-Hands out the handler itself for `IID_IExplorerBrowserEvents` and `IID_IUnknown`. It does not
-add a reference for the caller.
+Hands out the handler itself for `IID_IExplorerBrowserEvents` and `IID_IUnknown`.
 
 **Returns** `S_OK`, `E_NOINTERFACE` for another interface, or `E_INVALIDARG` for a `NULL`
 pointer.

@@ -17,6 +17,7 @@
 #import "vendor/tkControls/tkLayout"
 #import "../model"
 #import "../catalog"
+#import "../colorval"
 using containers
 using outcome
 using tkMeta
@@ -83,6 +84,58 @@ private sub ReadSettings_( byref t as config.TomlValue, byref list as Array( of 
     next
 end sub
 
+' [control.colors]: style = "Name", then field = "#..." | "@Role" | { dark = "#...", light = "#..." }.
+' Values are kept in colorval's canonical text; what isn't a colour is a problem.
+private sub ReadColors_( byref t as config.TomlValue, byref c as FormControl, byref where as const ustring, byref doc as FormDoc )
+    for i as long = 0 to t.Count( ) - 1
+        dim as ustring k = t.KeyAt( i )
+        dim byref as config.TomlValue v = t.Item( i )
+        if k = "style" then
+            c.StyleName = Str_( v )
+            continue for
+        end if
+        dim as ustring raw
+        if v.Kind( ) = config.TOML_STRING then
+            raw = Str_( v )
+        elseif v.Kind( ) = config.TOML_TABLE then
+            OnlyKeys_( v, "dark light", where & " colour '" & k & "'", doc )
+            raw = StrOf_( v, "dark" ) & "|" & StrOf_( v, "light" )
+        else
+            doc.Problems.Push( where & ": colour '" & k & "' is not a string or { dark, light }" )
+            continue for
+        end if
+        dim as ustring canon = colorval.Canonical( raw )
+        if len( canon ) = 0 then
+            doc.Problems.Push( where & ": colour '" & k & "': " & colorval.Explain( raw ) )
+            continue for
+        end if
+        PutSetting( c.Colors, k, canon )
+    next
+end sub
+
+' An old form's colour property that the inspector no longer shows (tkMeta's inspector = false) is
+' the same field of the control's colour struct: it moves into [control.colors], and the next save
+' writes it there. TextBox's CueBannerColor is its struct's CueColor.
+private sub MigrateColorProps_( byref c as FormControl )
+    dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
+    if (m = 0) orelse (m->NumColorSlots = 0) then exit sub
+    dim as long i = 0
+    while i < c.Props.Count( )
+        dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, c.Props[i].Key )
+        if (p <> 0) andalso (p->Kind = "color") andalso (p->bInspector = false) then
+            dim as ustring fld = c.Props[i].Key
+            if fld = "CueBannerColor" then fld = "CueColor"
+            dim as ustring v = colorval.FromPropValue( c.Props[i].Value )
+            if (tkMeta_ColorSlot( m, fld ) >= 0) andalso (len( v ) > 0) then
+                if FindSetting( c.Colors, fld ) < 0 then PutSetting( c.Colors, fld, v )
+                c.Props.Remove( i )
+                continue while
+            end if
+        end if
+        i += 1
+    wend
+end sub
+
 private sub ReadControl_( byref t as config.TomlValue, byref doc as FormDoc )
     dim as FormControl c
     c.Name = StrOf_( t, "name" )
@@ -96,7 +149,7 @@ private sub ReadControl_( byref t as config.TomlValue, byref doc as FormDoc )
     c.W = IntOf_( t, "w", 0 )
     c.H = IntOf_( t, "h", 0 )
     dim as ustring where = "control '" & c.Name & "'"
-    OnlyKeys_( t, "name type parent page x y w h anchor dock pages custom_type custom_module props events items", where, doc )
+    OnlyKeys_( t, "name type parent page x y w h anchor dock pages custom_type custom_module props events items colors", where, doc )
     dim as config.TomlValue ptr p = t.Find( "anchor" )
     if p then
         if AnchorFromWords( Str_( *p ), c.Anchor ) = false then
@@ -135,6 +188,9 @@ private sub ReadControl_( byref t as config.TomlValue, byref doc as FormDoc )
     if p then ReadSettings_( *p, c.Props, where, doc )
     p = t.Find( "events" )
     if p then ReadSettings_( *p, c.Events, where, doc )
+    p = t.Find( "colors" )
+    if p then ReadColors_( *p, c, where, doc )
+    MigrateColorProps_( c )
     doc.Controls.Push( c )
 end sub
 
@@ -233,6 +289,15 @@ private function SettingLine_( byref s as Setting ) as ustring
     return k & " = " & Quote_( s.Value ) & NL
 end function
 
+' A colour: a string, or a pair as { dark, light }.
+private function ColorLine_( byref s as Setting ) as ustring
+    dim as ustring k = s.Key
+    if IsBareKey_( k ) = false then k = Quote_( k )
+    dim as long bar = instr( s.Value, "|" )
+    if bar then return k & " = { dark = " & Quote_( left( s.Value, bar - 1 ) ) & ", light = " & Quote_( mid( s.Value, bar + 1 ) ) & " }" & NL
+    return k & " = " & Quote_( s.Value ) & NL
+end function
+
 ' Known keys in the control table's order, then whatever the table doesn't know, as found.
 private sub WriteProps_( byref o as ustring, byref c as FormControl, byval m as TKMETA_CONTROL ptr )
     if c.Props.Count( ) = 0 then exit sub
@@ -259,6 +324,25 @@ private sub WriteProps_( byref o as ustring, byref c as FormControl, byval m as 
     end if
     for j as long = 0 to c.Props.Count( ) - 1
         if done[j] = false then o &= SettingLine_( c.Props[j] )
+    next
+end sub
+
+' The style first, then the fields in the colour struct's order, then any the struct doesn't know.
+private sub WriteColors_( byref o as ustring, byref c as FormControl, byval m as TKMETA_CONTROL ptr )
+    if (len( c.StyleName ) = 0) andalso (c.Colors.Count( ) = 0) then exit sub
+    o &= NL & "[control.colors]" & NL
+    if len( c.StyleName ) then o &= "style = " & Quote_( c.StyleName ) & NL
+    dim as Array( of boolean ) done
+    done.Reserve( c.Colors.Count( ) )
+    done.SetCount( c.Colors.Count( ) )
+    if m then
+        for slot as long = 0 to m->NumColorSlots - 1
+            dim as long i = FindSetting( c.Colors, m->Colors( slot ).Name )
+            if i >= 0 then o &= ColorLine_( c.Colors[i] ) : done[i] = true
+        next
+    end if
+    for j as long = 0 to c.Colors.Count( ) - 1
+        if done[j] = false then o &= ColorLine_( c.Colors[j] )
     next
 end sub
 
@@ -330,6 +414,7 @@ public function Render( byref doc as FormDoc ) as ustring
         end if
         dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
         WriteProps_( o, c, m )
+        WriteColors_( o, c, m )
         WriteEvents_( o, c, m )
         for each it as FormItem in c.Items
             o &= NL & "[[control.items]]" & NL

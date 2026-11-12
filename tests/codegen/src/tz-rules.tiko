@@ -1,0 +1,358 @@
+'' std/tz phase Z1: the TZif reader and POSIX TZ rules. Prints "ok", or the first
+'' failed check. Reads the fixtures in tests/codegen/tzdata -- tzdata 2026f, copied
+'' unchanged from a Linux /usr/share/zoneinfo, laid out as one -- and the slim files in
+'' tests/codegen/tzdata-slim, so every value is exact.
+''   1. anchors: one per hard case (half-hour zones, 30-minute DST, a skipped day,
+''      negative DST, a Ramadan suspension, +14, sub-minute LMT, a midnight gap,
+''      the footer past the table, both ends of the range)
+''   2. transitions: walked forward and back over 1900..2100 they agree, each one
+''      moves the clock, and an hourly scan of 2020..2030 finds no change between
+''      two of them
+''   3. POSIX TZ strings, valid and not
+''   4. hostile input: every truncation and every single-byte mutation of every
+''      fixture parses or is refused, and never crashes; leap-second files and v1
+''      files; slim files (zic -b slim) give exactly what the fat ones give
+''   5. Linux and macOS: 2000 instants per zone, each zone read from the system's
+''      own file, against the C library's localtime_r under TZ=<zone> -- offset, DST
+''      flag and abbreviation
+#import "std/tz"
+#import "std/chrono"
+using tz
+
+dim shared as long failures = 0
+sub check( byval ok as boolean, byref what as string )
+    if ok = false then
+        if failures = 0 then print "FAIL: "; what
+        failures += 1
+    end if
+end sub
+
+function u( byval y as long, byval mo as long, byval d as long, _
+            byval h as long = 0, byval mi as long = 0, byval s as long = 0 ) as longint
+    return chrono.DateTime( y, mo, d, h, mi, s, 0 ).AssumeUtc( ).UnixSeconds
+end function
+
+function readFile( byref path as string ) as string
+    dim as long f = freefile
+    if open( path for binary access read as #f ) <> 0 then return ""
+    dim as string s = space( lof( f ) )
+    if len( s ) > 0 then get #f, , s
+    close #f
+    return s
+end function
+
+const DIR_ = "tests/codegen/tzdata/"
+const NZONES = 13
+function zoneIds( byval i as long ) as string
+    select case i
+    case 0 : return "America/St_Johns"
+    case 1 : return "Australia/Lord_Howe"
+    case 2 : return "Asia/Kathmandu"
+    case 3 : return "Pacific/Apia"
+    case 4 : return "Europe/Dublin"
+    case 5 : return "Africa/Casablanca"
+    case 6 : return "Pacific/Kiritimati"
+    case 7 : return "Europe/Amsterdam"
+    case 8 : return "America/Sao_Paulo"
+    case 9 : return "America/New_York"
+    case 10 : return "Europe/London"
+    case 11 : return "Asia/Kolkata"
+    case else : return "UTC"
+    end select
+end function
+
+function fileOf( byref id as string ) as string
+    return DIR_ & id
+end function
+
+function load( byref id as string ) as TzRules
+    dim as TzRules r
+    dim as string b = readFile( fileOf( id ) )
+    check( len( b ) > 0, "fixture missing: " & id )
+    check( TzRules.TryParse( b, r ), "parse " & id )
+    return r
+end function
+
+'' ---------------------------------------------------------------- 1. anchors
+dim as longint t
+
+dim as TzRules sj = load( "America/St_Johns" )
+check( sj.Version >= 2, "St_Johns v2+" )
+check( sj.PosixRule = "NST3:30NDT,M3.2.0,M11.1.0", "St_Johns footer " & sj.PosixRule )
+check( sj.OffsetSecondsAt( u( 2025, 1, 15 ) ) = -12600, "St_Johns winter" )
+check( sj.OffsetSecondsAt( u( 2025, 7, 15 ) ) = -9000, "St_Johns summer" )
+check( sj.AbbreviationAt( u( 2025, 1, 15 ) ) = "NST", "St_Johns NST" )
+check( sj.AbbreviationAt( u( 2025, 7, 15 ) ) = "NDT", "St_Johns NDT" )
+check( sj.IsDstAt( u( 2025, 7, 15 ) ) andalso sj.IsDstAt( u( 2025, 1, 15 ) ) = false, "St_Johns DST flag" )
+check( sj.TryNextTransition( u( 2025, 1, 1 ), t ) andalso t = u( 2025, 3, 9, 5, 30 ), "St_Johns spring 2025" )
+check( sj.TryNextTransition( t, t ) andalso t = u( 2025, 11, 2, 4, 30 ), "St_Johns fall 2025" )
+check( sj.TryPreviousTransition( u( 2025, 11, 2, 4, 30 ), t ) andalso t = u( 2025, 3, 9, 5, 30 ), "St_Johns previous" )
+'' far past the table: the footer
+check( sj.OffsetSecondsAt( u( 2300, 7, 1 ) ) = -9000, "St_Johns 2300 footer" )
+check( sj.TryNextTransition( u( 2300, 1, 1 ), t ) andalso t = u( 2300, 3, 11, 5, 30 ), "St_Johns 2300 spring" )
+
+dim as TzRules lh = load( "Australia/Lord_Howe" )
+check( lh.OffsetSecondsAt( u( 2025, 1, 15 ) ) = 39600, "Lord_Howe summer +11" )
+check( lh.OffsetSecondsAt( u( 2025, 7, 15 ) ) = 37800, "Lord_Howe winter +10:30" )
+
+dim as TzRules kt = load( "Asia/Kathmandu" )
+check( kt.OffsetSecondsAt( u( 1985, 6, 1 ) ) = 19800, "Kathmandu +05:30 before 1986" )
+check( kt.OffsetSecondsAt( u( 2025, 6, 1 ) ) = 20700, "Kathmandu +05:45" )
+check( kt.TryNextTransition( u( 2000, 1, 1 ), t ) = false, "Kathmandu no transition since" )
+
+dim as TzRules ap = load( "Pacific/Apia" )
+dim as longint skip = u( 2011, 12, 30, 10 )
+check( ap.OffsetSecondsAt( skip - 1 ) = -36000, "Apia -10 before the skip" )
+check( ap.OffsetSecondsAt( skip ) = 50400, "Apia +14 after it" )
+check( ap.TryNextTransition( u( 2011, 12, 1 ), t ) andalso t = skip, "Apia skip found" )
+
+dim as TzRules db = load( "Europe/Dublin" )
+check( db.OffsetSecondsAt( u( 2025, 1, 15 ) ) = 0, "Dublin winter 0" )
+check( db.OffsetSecondsAt( u( 2025, 7, 15 ) ) = 3600, "Dublin summer +1" )
+check( db.AbbreviationAt( u( 2025, 1, 15 ) ) = "GMT" andalso db.AbbreviationAt( u( 2025, 7, 15 ) ) = "IST", "Dublin names" )
+check( db.IsDstAt( u( 2025, 1, 15 ) ) <> db.IsDstAt( u( 2025, 7, 15 ) ), "Dublin DST flag differs" )
+
+dim as TzRules cb = load( "Africa/Casablanca" )
+check( cb.OffsetSecondsAt( u( 2025, 3, 10 ) ) = 0, "Casablanca Ramadan +00" )
+check( cb.OffsetSecondsAt( u( 2025, 6, 1 ) ) = 3600, "Casablanca +01" )
+
+check( load( "Pacific/Kiritimati" ).OffsetSecondsAt( u( 2025, 1, 1 ) ) = 50400, "Kiritimati +14" )
+
+dim as TzRules am = load( "Europe/Amsterdam" )
+check( am.OffsetSecondsAt( u( 1930, 1, 15 ) ) = 1172, "Amsterdam +00:19:32" )
+check( am.AbbreviationAt( u( 1930, 1, 15 ) ) = "AMT", "Amsterdam AMT" )
+
+dim as TzRules sp = load( "America/Sao_Paulo" )
+check( sp.TryNextTransition( u( 2018, 10, 1 ), t ) andalso t = u( 2018, 11, 4, 3 ), "Sao_Paulo midnight gap" )
+check( sp.OffsetSecondsAt( t - 1 ) = -10800 andalso sp.OffsetSecondsAt( t ) = -7200, "Sao_Paulo gap offsets" )
+check( sp.TryNextTransition( u( 2020, 1, 1 ), t ) = false, "Sao_Paulo no DST since 2019" )
+
+dim as TzRules ny = load( "America/New_York" )
+check( ny.PosixRule = "EST5EDT,M3.2.0,M11.1.0", "New_York footer" )
+check( ny.OffsetSecondsAt( u( 2100, 1, 1 ) ) = -18000, "New_York 2100 EST" )
+check( ny.OffsetSecondsAt( u( 2100, 7, 1 ) ) = -14400, "New_York 2100 EDT" )
+check( ny.TryNextTransition( u( 2100, 1, 1 ), t ) andalso t = u( 2100, 3, 14, 7 ), "New_York 2100 spring" )
+check( ny.OffsetSecondsAt( TZ_MIN_UNIX ) = -17762, "New_York year 1 is LMT -4:56:02" )
+check( ny.AbbreviationAt( TZ_MIN_UNIX ) = "LMT", "New_York LMT" )
+check( ny.OffsetSecondsAt( TZ_MAX_UNIX ) = -18000, "New_York 9999-12-31 EST" )
+check( ny.TryNextTransition( u( 9999, 12, 1 ), t ) = false, "New_York none past 9999" )
+check( ny.TryPreviousTransition( u( 1800, 1, 1 ), t ) = false, "New_York none before LMT ended" )
+
+dim as TzRules ld = load( "Europe/London" )
+check( ld.OffsetSecondsAt( u( 1970, 1, 15 ) ) = 3600, "London British Standard Time" )
+check( ld.AbbreviationAt( u( 1970, 1, 15 ) ) = "BST", "London BST in January 1970" )
+
+check( load( "Asia/Kolkata" ).OffsetSecondsAt( u( 2025, 1, 1 ) ) = 19800, "Kolkata" )
+dim as TzRules utc = load( "UTC" )
+check( utc.OffsetSecondsAt( u( 2025, 1, 1 ) ) = 0 andalso utc.AbbreviationAt( 0 ) = "UTC", "UTC" )
+check( utc.TryNextTransition( TZ_MIN_UNIX, t ) = false andalso utc.TryPreviousTransition( TZ_MAX_UNIX, t ) = false, "UTC none" )
+
+'' ---------------------------------------------------------------- 2. transitions
+for z as long = 0 to NZONES - 1
+    dim as TzRules r = load( zoneIds( z ) )
+    dim as longint fwd( any ), cur = u( 1900, 1, 1 ), hiT = u( 2100, 1, 1 )
+    dim as long nf = 0
+    while r.TryNextTransition( cur, t ) andalso t < hiT
+        check( t > cur, "next is after: " & zoneIds( z ) )
+        check( r.OffsetSecondsAt( t ) <> r.OffsetSecondsAt( t - 1 ), "next moves the clock: " & zoneIds( z ) )
+        redim preserve fwd( 0 to nf )
+        fwd( nf ) = t
+        nf += 1
+        cur = t
+        if nf > 2000 then exit while
+    wend
+    '' backwards gives the same list
+    cur = hiT
+    dim as long nb = nf
+    while r.TryPreviousTransition( cur, t ) andalso t >= u( 1900, 1, 1 ) + 1
+        nb -= 1
+        check( nb >= 0 andalso fwd( iif( nb >= 0, nb, 0 ) ) = t, "previous matches next: " & zoneIds( z ) )
+        if nb < 0 then exit while
+        cur = t
+    wend
+    check( nb = 0, "previous count matches next: " & zoneIds( z ) )
+    '' an hourly scan finds no change the walk missed
+    dim as long k = 0
+    while k < nf andalso fwd( k ) <= u( 2020, 1, 1 )
+        k += 1
+    wend
+    dim as longint h = u( 2020, 1, 1 )
+    dim as long prevOff = r.OffsetSecondsAt( h )
+    while h < u( 2030, 1, 1 )
+        h += 3600
+        dim as long o = r.OffsetSecondsAt( h )
+        if o <> prevOff then
+            check( k < nf andalso fwd( iif( k < nf, k, 0 ) ) > h - 3600 andalso fwd( iif( k < nf, k, 0 ) ) <= h, _
+                   "hourly change is a transition: " & zoneIds( z ) )
+            k += 1
+        end if
+        prevOff = o
+    wend
+next
+
+'' ---------------------------------------------------------------- 3. POSIX TZ strings
+dim as TzRules p
+check( TzRules.TryParsePosix( "EST5EDT,M3.2.0,M11.1.0", p ), "posix US" )
+check( p.OffsetSecondsAt( u( 2025, 1, 1 ) ) = -18000 andalso p.OffsetSecondsAt( u( 2025, 7, 1 ) ) = -14400, "posix US offsets" )
+check( p.TryNextTransition( u( 2025, 1, 1 ), t ) andalso t = u( 2025, 3, 9, 7 ), "posix US spring" )
+check( p.TryNextTransition( t, t ) andalso t = u( 2025, 11, 2, 6 ), "posix US fall" )
+check( p.TryPreviousTransition( u( 2025, 3, 9, 7 ), t ) andalso t = u( 2024, 11, 3, 6 ), "posix US previous" )
+check( TzRules.TryParsePosix( "EST5EDT", p ) andalso p.OffsetSecondsAt( u( 2025, 7, 1 ) ) = -14400, "posix default rules" )
+check( TzRules.TryParsePosix( "<+0330>-3:30", p ) andalso p.OffsetSecondsAt( 0 ) = 12600 _
+       andalso p.AbbreviationAt( 0 ) = "+0330", "posix bracket name" )
+check( p.TryNextTransition( 0, t ) = false, "posix fixed has no transitions" )
+check( TzRules.TryParsePosix( "AEST-10AEDT,M10.1.0,M4.1.0/3", p ), "posix southern" )
+check( p.OffsetSecondsAt( u( 2025, 1, 15 ) ) = 39600 andalso p.OffsetSecondsAt( u( 2025, 7, 15 ) ) = 36000, "posix southern offsets" )
+check( TzRules.TryParsePosix( "IST-1GMT0,M10.5.0,M3.5.0/1", p ), "posix negative DST" )
+check( p.OffsetSecondsAt( u( 2025, 1, 15 ) ) = 0 andalso p.OffsetSecondsAt( u( 2025, 7, 15 ) ) = 3600, "posix negative DST offsets" )
+check( p.IsDstAt( u( 2025, 1, 15 ) ) andalso p.IsDstAt( u( 2025, 7, 15 ) ) = false, "posix negative DST flag" )
+check( TzRules.TryParsePosix( "EST5EDT,0/0,J365/25", p ), "posix all-year DST" )
+check( p.OffsetSecondsAt( u( 2025, 1, 1 ) ) = -14400 andalso p.OffsetSecondsAt( u( 2025, 12, 31, 23 ) ) = -14400, "posix all-year DST offsets" )
+check( p.OffsetSecondsAt( u( 2026, 1, 1, 5 ) ) = -14400 andalso p.OffsetSecondsAt( u( 2026, 1, 1, 4, 59 ) ) = -14400, "posix all-year DST seam" )
+check( p.TryNextTransition( u( 2025, 1, 1 ), t ) = false, "posix all-year DST has no transitions" )
+check( TzRules.TryParsePosix( "CET-1CEST,J60/2,J300/3", p ) andalso p.OffsetSecondsAt( u( 2024, 3, 1, 12 ) ) = 7200, "posix Jn skips Feb 29" )
+check( p.OffsetSecondsAt( u( 2024, 2, 29, 12 ) ) = 3600, "posix Jn Feb 29 before J60" )
+check( TzRules.TryParsePosix( "UTC0", p ) andalso p.OffsetSecondsAt( 0 ) = 0, "posix UTC0" )
+dim as string badPosix = "|E5|EST|EST5,M3.2.0,M11.1.0|EST5EDT,M13.1.0,M11.1.0|EST5EDT,M3.2.0|<AB>5|EST25|" _
+    & "EST5EDT,M3.2.0/168,M11.1.0|EST5x?|EST5EDT,M3.6.0,M11.1.0|EST5EDT,M3.2.7,M11.1.0|EST5EDT,J0,J365|<A>B>5"
+dim as long bp = 1
+do
+    dim as long e = instr( bp, badPosix, "|" )
+    dim as string one = iif( e = 0, mid( badPosix, bp ), mid( badPosix, bp, e - bp ) )
+    check( TzRules.TryParsePosix( one, p ) = false, "posix refused: [" & one & "]" )
+    if e = 0 then exit do
+    bp = e + 1
+loop
+
+'' ---------------------------------------------------------------- 4. hostile input
+for z as long = 0 to NZONES - 1
+    dim as string b = readFile( fileOf( zoneIds( z ) ) )
+    dim as TzRules r
+    for n as long = 0 to len( b ) - 1
+        check( TzRules.TryParse( left( b, n ), r ) = false, "truncated accepted: " & zoneIds( z ) & " at " & n )
+    next
+    for i as long = 0 to len( b ) - 1
+        dim as string m = b
+        m[i] = m[i] xor &hFF
+        dim as TzRules mr
+        if TzRules.TryParse( m, mr ) then
+            '' accepted: then every lookup must still answer
+            dim as longint tt
+            dim as long o = mr.OffsetSecondsAt( 0 ) + mr.OffsetSecondsAt( TZ_MIN_UNIX ) + mr.OffsetSecondsAt( TZ_MAX_UNIX )
+            dim as ustring ab = mr.AbbreviationAt( u( 2025, 1, 1 ) )
+            mr.TryNextTransition( 0, tt )
+            mr.TryPreviousTransition( u( 2025, 1, 1 ), tt )
+        end if
+    next
+next
+dim as TzRules nr
+check( TzRules.TryParse( "", nr ) = false andalso nr.IsValid = false, "empty refused, result untouched" )
+check( nr.OffsetSecondsAt( 0 ) = 0 andalso nr.TryNextTransition( 0, t ) = false, "invalid rules answer nothing" )
+
+'' a minimal v1 file: one type, UTC, no transitions -- and the same with one leap second
+function v1File( byval leap as long ) as string
+    dim as string s = "TZif" & string( 16, 0 )
+    dim as long counts( 0 to 5 ) = { 0, 0, leap, 0, 1, 4 }
+    for c as long = 0 to 5
+        s &= chr( 0, 0, 0, counts( c ) )
+    next
+    s &= chr( 0, 0, 0, 0, 0, 0 ) & "UTC" & chr( 0 )
+    if leap then s &= string( 8, 0 )
+    return s
+end function
+check( TzRules.TryParse( v1File( 0 ), p ) andalso p.Version = 1 andalso p.AbbreviationAt( 0 ) = "UTC", "v1 minimal" )
+check( TzRules.TryParse( v1File( 1 ), p ) = false, "leap-second file refused" )
+
+'' New_York read as a v1 file: the version byte set to 0 and the v2 part cut off
+scope
+    dim as string b = readFile( fileOf( "America/New_York" ) )
+    dim as long cnt( 0 to 5 )
+    for c as long = 0 to 5
+        cnt( c ) = ( b[20 + c * 4] shl 24 ) or ( b[21 + c * 4] shl 16 ) or ( b[22 + c * 4] shl 8 ) or b[23 + c * 4]
+    next
+    dim as long blk = cnt( 3 ) * 5 + cnt( 4 ) * 6 + cnt( 5 ) + cnt( 2 ) * 8 + cnt( 1 ) + cnt( 0 )
+    dim as string v1 = left( b, 44 + blk )
+    v1[4] = 0
+    dim as TzRules r1
+    check( TzRules.TryParse( v1, r1 ) andalso r1.Version = 1 andalso r1.PosixRule = "", "New_York as v1" )
+    for y as long = 1902 to 2037
+        check( r1.OffsetSecondsAt( u( y, 1, 15 ) ) = ny.OffsetSecondsAt( u( y, 1, 15 ) ) _
+               andalso r1.OffsetSecondsAt( u( y, 7, 15 ) ) = ny.OffsetSecondsAt( u( y, 7, 15 ) ), "v1 agrees with v2 in " & y )
+    next
+end scope
+
+'' ---------------------------------------------------------------- 4b. slim files
+'' zic -b slim from the same tzdata 2026f source: almost no 32-bit data, no
+'' transitions past the last rule change, everything else from the footer. They
+'' must give exactly what the fat files give.
+for z as long = 0 to 4
+    dim as string id
+    select case z
+    case 0 : id = "America/New_York"
+    case 1 : id = "America/St_Johns"
+    case 2 : id = "Australia/Lord_Howe"
+    case 3 : id = "Europe/Dublin"
+    case else : id = "Pacific/Apia"
+    end select
+    dim as TzRules fat = load( id ), slim
+    dim as string sf = "tests/codegen/tzdata-slim/" & id
+    check( TzRules.TryParse( readFile( sf ), slim ), "slim parse " & id )
+    check( slim.TransitionCount < fat.TransitionCount, "slim is slim: " & id )
+    check( slim.PosixRule = fat.PosixRule, "slim footer " & id )
+    dim as ulongint sd = 2463534242ull
+    dim as longint lo = u( 1800, 1, 1 ), span = u( 2400, 1, 1 ) - u( 1800, 1, 1 )
+    for k as long = 1 to 5000
+        sd xor= sd shl 13 : sd xor= sd shr 7 : sd xor= sd shl 17
+        dim as longint tt = lo + cast( longint, sd mod culngint( span ) )
+        check( slim.OffsetSecondsAt( tt ) = fat.OffsetSecondsAt( tt ) andalso slim.IsDstAt( tt ) = fat.IsDstAt( tt ) _
+               andalso slim.AbbreviationAt( tt ) = fat.AbbreviationAt( tt ), "slim = fat: " & id & " at " & tt )
+    next
+    dim as longint a = u( 1900, 1, 1 ), b = a, ta, tb
+    while fat.TryNextTransition( a, ta ) andalso ta < u( 2100, 1, 1 )
+        check( slim.TryNextTransition( b, tb ) andalso tb = ta, "slim transitions: " & id & " after " & a )
+        a = ta : b = tb
+    wend
+next
+
+'' ---------------------------------------------------------------- 5. the libc oracle
+#ifdef __FB_UNIX__
+type OracleTm
+    as long tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst
+    as long pad_
+    as longint tm_gmtoff
+    as zstring ptr tm_zone
+end type
+extern "C"
+    declare function oLocaltimeR alias "localtime_r" ( byval t as longint ptr, byval r as OracleTm ptr ) as OracleTm ptr
+    declare function oSetenv alias "setenv" ( byval n as zstring ptr, byval v as zstring ptr, byval o as long ) as long
+    declare sub oTzset alias "tzset" ( )
+end extern
+scope
+    dim as ulongint seed = 88172645463325252ull
+    dim as longint lo = u( 1900, 1, 1 ), span = u( 2100, 1, 1 ) - u( 1900, 1, 1 )
+    for z as long = 0 to NZONES - 1
+        '' THE SYSTEM'S OWN FILE, the one localtime_r reads: a system tzdata built
+        '' without backzone (macOS) differs from these fixtures for merged zones before
+        '' 1970 -- Europe/Amsterdam is Brussels there until 1946 -- and comparing the
+        '' fixture with it would test the data, not the reader. The fixtures' own
+        '' values are pinned by the anchors above.
+        dim as TzRules r
+        check( TzRules.TryParse( readFile( "/usr/share/zoneinfo/" & zoneIds( z ) ), r ), "system file " & zoneIds( z ) )
+        dim as string spec = ":" & zoneIds( z )
+        oSetenv( "TZ", strptr( spec ), 1 )
+        oTzset( )
+        for k as long = 1 to 2000
+            seed xor= seed shl 13 : seed xor= seed shr 7 : seed xor= seed shl 17
+            dim as longint tt = lo + cast( longint, seed mod culngint( span ) )
+            dim as OracleTm tmv
+            if oLocaltimeR( @tt, @tmv ) = nullptr then continue for
+            dim as string ab = *tmv.tm_zone
+            check( r.OffsetSecondsAt( tt ) = tmv.tm_gmtoff, "oracle offset " & zoneIds( z ) & " at " & tt )
+            check( r.IsDstAt( tt ) = ( tmv.tm_isdst > 0 ), "oracle DST " & zoneIds( z ) & " at " & tt )
+            check( r.AbbreviationAt( tt ) = ab, "oracle abbreviation " & zoneIds( z ) & " at " & tt )
+        next
+    next
+end scope
+#endif
+
+if failures = 0 then print "ok" else print failures; " failures"

@@ -295,8 +295,7 @@ With `item = 0` the item goes at the end of the menu, with the `MF_*` flags in `
 result is that of [AppendItem](#appenditem). With any other `item` it is inserted **before** an
 existing item: the one at position `item` when `fByPosition` is `true`, or the one with the
 identifier `item` otherwise (at the end when there is no such item), and in that last case the
-new item also takes `item` as its own identifier. An inserted item keeps the default state:
-`fState` is not applied to it, and the function returns `false` even though the item is there.
+new item also takes `item` as its own identifier.
 
 The submenu becomes part of the menu and is destroyed with it.
 
@@ -890,12 +889,7 @@ Microsoft Learn: [CheckMenuItem](https://learn.microsoft.com/en-us/windows/win32
 function ToggleItem( byval hMenu as HMENU, byval uItem as DWORD, byval fByPosition as long = false ) as long
 ```
 
-Checks or unchecks an item, keeping the rest of its state. The decision is taken on the item's
-whole state, not on the check mark alone: an item with **any** state bit set (checked, greyed,
-highlighted, default) is unchecked, and only an item whose state is 0 is checked. For a plain
-enabled item that is a toggle; a greyed or default item that is unchecked stays unchecked. To
-toggle such items, test `MFS_CHECKED` with [GetState](#getitemstate-getstate) and call
-[CheckItem](#checkitem) or [UncheckItem](#uncheckitem).
+Checks or unchecks an item, keeping the rest of its state.
 
 **Returns** the previous check state, as [CheckItem](#checkitem), or -1 when there is no such
 item.
@@ -912,9 +906,7 @@ Menu.ToggleItem( Menu.GetHandle( hwnd ), 2001 )
 function ToggleCheckState( byval hMenu as HMENU, byval item as long, byval fByPosition as boolean = false ) as boolean
 ```
 
-Checks or unchecks an item, deciding as [ToggleItem](#toggleitem) does, and then sets its state
-to just checked or just unchecked: a greyed item comes out enabled. Use it for plain enabled
-items; it redraws the bar.
+Checks or unchecks an item, deciding as [ToggleItem](#toggleitem) does; it redraws the bar.
 
 **Returns** `true` on success.
 
@@ -951,19 +943,15 @@ Microsoft Learn: [CheckMenuRadioItem](https://learn.microsoft.com/en-us/windows/
 function IsItemChecked( byval hMenu as HMENU, byval uItem as DWORD, byval fByPosition as long = false ) as boolean
 ```
 
-Tests an item's state for a check mark. The test is on the whole state: it returns `true` for a
-checked item, but also for an item that is greyed, disabled, highlighted, the default, opens a
-submenu or does not exist. For a plain enabled item it answers the question; otherwise test
-`MFS_CHECKED` with [GetState](#getitemstate-getstate).
+Tests an item's state for a check mark.
 
-**Returns** `true` or `false` as described.
+**Returns** `true` if the item is checked; `false` otherwise.
 
 **Example**
 
 ```freebasic
 dim hMenu as HMENU = Menu.GetHandle( hwnd )
 if Menu.IsItemChecked( hMenu, 2001 ) then print "on"
-dim bChecked as boolean = ( Menu.GetState( hMenu, 2001 ) and MFS_CHECKED ) <> 0
 ```
 
 Microsoft Learn: [GetMenuState](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmenustate)
@@ -1201,22 +1189,12 @@ function SetItemInfo overload( byval hMenu as HMENU, byval item as UINT, byval f
 function SetItemInfo overload( byval hMenu as HMENU, byval item as UINT, byval fByPositon as boolean, byref mii as MENUITEMINFOW ) as boolean
 ```
 
-Passes a `MENUITEMINFOW` on to Windows to change the attributes named in `fMask`, redrawing the
-bar on success. Before passing it, the function sets `cbSize` to the size of a `MENUINFO`
-(40 bytes), not of a `MENUITEMINFOW` (80); Windows rejects that size, and the call returns
-`false` with `GetLastError()` 87 (`ERROR_INVALID_PARAMETER`). Call `SetMenuItemInfoW` directly,
-with `cbSize = sizeof( MENUITEMINFOW )`, and then [DrawBar](#drawbar).
-
-**Returns** `false`, as described.
+**Returns** `true`, on success; `false`otherwise.
 
 **Example**
 
 ```freebasic
-dim mii as MENUITEMINFOW
-mii.cbSize = sizeof( MENUITEMINFOW )
-mii.fMask = MIIM_STRING : mii.dwTypeData = @wstr( "&Quit" )
-SetMenuItemInfoW( Menu.GetHandle( hwnd ), 1003, false, @mii )
-if Menu.SetItemInfo( Menu.GetHandle( hwnd ), 1003, false, mii ) = false then print GetLastError()
+Menu.SetMenuItemInfoW( Menu.GetHandle( hwnd ), 1003, false, @mii )
 ```
 
 Microsoft Learn: [SetMenuItemInfoW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setmenuiteminfow)
@@ -1782,9 +1760,7 @@ function ConvertToPARGB32( byval hDC as HDC, byval pargb as DWORD ptr, byval hbm
 
 A helper of [AddIconToItem](#addicontoitem): reads the mask bitmap `hbmp` and gives the pixels at
 `pargb` an alpha byte from it, making a pixel transparent (0) where the mask is set and opaque
-where it is clear. The mask is read one pixel further only after a set mask pixel, and the row
-padding `cxRow - sizeImage.cx` is added after every pixel, so the result follows the mask only
-for masks that are all clear and buffers with no padding.
+where it is clear.
 
 **Returns** `true` whenever `hDC`, `pargb` and `hbmp` are not `NULL`, whether or not the pixels
 were read; `false` otherwise.
@@ -1810,21 +1786,9 @@ function ConvertBufferToPARGB32( byval hPaintBuffer as HPAINTBUFFER, byval hDC a
 
 A helper of [AddIconToItem](#addicontoitem): looks at the pixels of a buffered-paint buffer into
 which an icon has been drawn and, when none has alpha, converts them with the icon's mask
-through [ConvertToPARGB32](#converttopargb32). When the buffer already has alpha it returns
-`true` and changes nothing; after a conversion it returns `false` (the conversion's `true` is
-read as a failure code), which is why [AddIconToItem](#addicontoitem) adds nothing for an icon
-without alpha.
+through [ConvertToPARGB32](#converttopargb32).
 
-**Returns** `true` when the buffer had alpha; `false` after a conversion, on failure or for a
-`NULL` argument.
-
-**Example**
-
-```freebasic
-dim sz as SIZE : sz.cx = 16 : sz.cy = 16
-dim hPaintBuffer as HPAINTBUFFER   ' from BeginBufferedPaint
-dim bAlpha as boolean = Menu.ConvertBufferToPARGB32( hPaintBuffer, NULL, NULL, sz )   ' false: no buffer
-```
+**Returns** `true` when the buffer had alpha; `false` otherwise.
 
 Microsoft Learn: [GetBufferedPaintBits](https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-getbufferedpaintbits)
 

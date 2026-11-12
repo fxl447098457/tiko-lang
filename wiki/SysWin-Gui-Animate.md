@@ -226,9 +226,6 @@ function CloseClip( byval hAnimate as HWND ) as boolean
 
 Closes the open clip and clears the control.
 
-**Returns** the control's reply to an open request without a clip, which is `false` even when
-an open clip was closed: it is not a success flag.
-
 **Example**
 
 ```freebasic

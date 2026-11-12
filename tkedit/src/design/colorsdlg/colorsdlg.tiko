@@ -1,0 +1,507 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' colorsdlg -- one control's [control.colors] (docs/tkDesigner/THEMES.md, TH6): the style it wears,
+' and colours of its own over the project theme.
+'
+'   Simple      one row a main part (Back, Fore, Border, ...): its Normal colour. The part's Hot,
+'               Pressed and Disabled follow it (simple mode), unless set on the other page.
+'   All states  every field of the colour struct, each with a swatch of what the control shows and
+'               where that comes from: this control, derived, the style, the type, the theme.
+'
+' A value is "#RRGGBB[AA]", "@Role", or empty (inherit). "Different in light mode" makes a field a
+' dark|light pair; the box then edits the variant shown. The preview is a real control of the type
+' (and a disabled one) in a scope wearing the project theme, with the recipe as generated code gives it.
+#module "colorsdlg"
+
+#import "std/containers"
+#import "std/fs"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkMeta"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkTabControl"
+#import "vendor/tkControls/tkSelectBar"
+#import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkCheckBox"
+#import "vendor/tkControls/tkPanel"
+#import "vendor/tkControls/tkColorPicker"
+#import "vendor/tkControls/tkTheme"
+#import "../model"
+#import "../catalog"
+#import "../themefile"
+#import "../colorval"
+using containers
+using tkApp
+using tkMeta
+using tkListTree
+using tkButton
+using tkLabel
+using tkTextBox
+using tkTabControl
+using tkSelectBar
+using tkComboBox
+using tkCheckBox
+using tkPanel
+using tkColorPicker
+using tkTheme
+using tkHost
+using tkPaint
+using model
+
+const as long WIN_CX = 760
+const as long WIN_CY = 520
+const as long ROW_CY = 28
+const as long GAP = 8
+const as long MAX_PARTS = 8
+
+public type ColorsDialog
+    Win as TK_FORM ptr
+    Meta as TKMETA_CONTROL ptr
+    StyleName as ustring
+    Colors as Array( of Setting )
+    Theme as themefile.ThemeDoc
+    Tables as themefile.ThemeTables
+    IsDark as boolean = true
+    Loading as boolean
+    Accepted as boolean
+    IsModal as boolean
+    Parts as Array( of long )            ' the Simple page's rows: each a part's Normal slot
+
+    LblStyle as TK_WIDGET ptr
+    CmbStyle as TK_WIDGET ptr
+    SelVariant as TK_WIDGET ptr
+    Tabs as TK_WIDGET ptr
+    PartLabels( 0 to MAX_PARTS - 1 ) as TK_WIDGET ptr
+    PartEdits( 0 to MAX_PARTS - 1 ) as TK_WIDGET ptr
+    PartPicks( 0 to MAX_PARTS - 1 ) as TK_WIDGET ptr
+    PartSources( 0 to MAX_PARTS - 1 ) as TK_WIDGET ptr
+    Fields as TK_WIDGET ptr
+    TxtField as TK_WIDGET ptr
+    BtnFieldPick as TK_WIDGET ptr
+    BtnFieldReset as TK_WIDGET ptr
+    ChkPair as TK_WIDGET ptr
+    LblFieldSource as TK_WIDGET ptr
+    Preview as TK_WIDGET ptr
+    PvLive as TK_WIDGET ptr
+    PvOff as TK_WIDGET ptr
+    BtnOk as TK_WIDGET ptr
+    BtnCancel as TK_WIDGET ptr
+
+    declare sub Open( byval owner as TK_FORM ptr, byref typeName as const ustring, byref styleName_ as const ustring, _
+                      byref colors_ as Array( of Setting ), byref themePath as const ustring, byref title as const ustring )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub Finish( byval ok as boolean )
+    declare sub Layout( )
+    declare sub LoadFields( )
+    declare sub LoadField( )
+    declare sub Refresh( )
+    declare function Effective( byval slot as long ) as ulong
+    declare function ShownValue( byval slot as long ) as ustring
+    declare sub SetValue( byval slot as long, byref text as const ustring )
+    declare sub FieldChanged( byval w as TK_WIDGET ptr )
+    declare sub PairToggled( )
+    declare sub PickInto( byval box as TK_WIDGET ptr )
+    declare function SourceText( byval slot as long ) as ustring
+end type
+
+private function DlgOf( byval w as TK_WIDGET ptr ) as ColorsDialog ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub OnText( byval h as TK_WIDGET ptr )
+    dim as ColorsDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->FieldChanged( h )
+end sub
+
+private sub OnStyle( byval h as TK_WIDGET ptr, byval a as long, byval b as long )
+    dim as ColorsDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->FieldChanged( h )
+end sub
+
+private sub OnVariant( byval h as TK_WIDGET ptr, byval oldIdx as long, byval newIdx as long )
+    dim as ColorsDialog ptr d = DlgOf( h )
+    if (d = 0) orelse d->Loading then exit sub
+    d->IsDark = (newIdx = 0)
+    d->LoadFields( )
+    d->Refresh( )
+end sub
+
+private sub OnFieldPick( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as ColorsDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->LoadField( )
+end sub
+
+private sub OnPair( byval h as TK_WIDGET ptr, byval checked as boolean )
+    dim as ColorsDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->PairToggled( )
+end sub
+
+private sub OnButton( byval h as TK_WIDGET ptr, byval id as long )
+    dim as ColorsDialog ptr d = DlgOf( h )
+    if d = 0 then exit sub
+    select case h
+    case d->BtnOk         : d->Finish( true )
+    case d->BtnCancel     : d->Finish( false )
+    case d->BtnFieldPick  : d->PickInto( d->TxtField )
+    case d->BtnFieldReset
+        d->SetValue( tkListTree_GetCurSel( d->Fields ), "" )
+        d->LoadFields( )
+        d->Refresh( )
+    case else
+        for i as long = 0 to MAX_PARTS - 1
+            if h = d->PartPicks( i ) then d->PickInto( d->PartEdits( i ) )
+        next
+    end select
+end sub
+
+' A field row: the default row, then a swatch of what the preview control shows for it.
+private sub PaintField( byval pi as TKLISTTREE_PAINTINFO ptr )
+    tkListTree_PaintRowDefault( pi )
+    dim as ColorsDialog ptr d = DlgOf( pi->hList )
+    if (d = 0) orelse (pi->itemID < 0) orelse (pi->itemID >= d->Meta->NumColorSlots) then exit sub
+    dim as long s = tkHost_Scale( pi->hList->pHost, 4 ), w_ = tkHost_Scale( pi->hList->pHost, 36 )
+    dim as TKRECT rc = pi->rc
+    rc.left = rc.right - w_ - s
+    rc.right -= s
+    rc.top += s
+    rc.bottom -= s
+    pi->b->SetBackColor( d->Effective( pi->itemID ) or &hFF000000ul )
+    pi->b->PaintRect( @rc )
+end sub
+
+private function MakeButton_( byval parent as TK_WIDGET ptr, byref text as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    dim as ustring t = text
+    tkButton_SetText( b, t )
+    tkButton_SetClickCallback( b, @OnButton )
+    return b
+end function
+
+private function MakeText_( byval parent as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr t = tkTextBox_Create( parent, 1 )
+    tkTextBox_SetChangeCallback( t, @OnText )
+    return t
+end function
+
+private function MakeLabel_( byval parent as TK_WIDGET ptr, byref text as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr l = tkLabel_Create( parent, 1 )
+    tkLabel_SetText( l, text )
+    return l
+end function
+
+' A control of the type for the preview, with a word of text where it takes one.
+private function MakeSample_( byval m as TKMETA_CONTROL ptr, byval parent as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as ustring arg = m->CreateArgDflt
+    dim as TK_WIDGET ptr w = m->Create( parent, 1, arg )
+    if w = 0 then return 0
+    dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, "Text" )
+    if (p <> 0) andalso (p->Apply <> 0) then p->Apply( w, m->Name )
+    return w
+end function
+
+sub ColorsDialog.Open( byval owner as TK_FORM ptr, byref typeName as const ustring, byref styleName_ as const ustring, _
+                       byref colors_ as Array( of Setting ), byref themePath as const ustring, byref title as const ustring )
+    Meta = catalog.Find( typeName )
+    if (Meta = 0) orelse (Meta->NumColorSlots = 0) then exit sub
+    StyleName = styleName_
+    Colors = colors_
+    dim as ustring none, e
+    dim as ustring text = fs.ReadAllText( themePath ).ValueOr( none )
+    if len( text ) then themefile.Parse( text, Theme, e )
+
+    dim as ustring t = title
+    dim as single sc = 0
+    if owner then sc = tkForm_Host( owner )->fScaleForced
+    Win = tkApp_NewForm( t, WIN_CX, WIN_CY, owner, sc )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    Loading = true
+
+    LblStyle = MakeLabel_( root_, i18n.Tr( "designer.colors_style", "Style" ) )
+    CmbStyle = tkComboBox_Create( root_, 1 )
+    tkComboBox_AddItem( CmbStyle, i18n.Tr( "designer.colors_no_style", "(none)" ) )
+    dim as long styleRow = 0, n = 1
+    for each st as themefile.ThemeStyle in Theme.Styles
+        tkComboBox_AddItem( CmbStyle, st.Name )
+        if st.Name = StyleName then styleRow = n
+        n += 1
+    next
+    if (len( StyleName ) > 0) andalso (styleRow = 0) then
+        tkComboBox_AddItem( CmbStyle, StyleName )        ' a style the theme no longer has: kept, shown
+        styleRow = n
+    end if
+    tkComboBox_SetCurSel( CmbStyle, styleRow )
+    tkComboBox_SetSelChangeCallback( CmbStyle, @OnStyle )
+    SelVariant = tkSelectBar_Create( root_, 1 )
+    tkSelectBar_AddPanel( SelVariant, i18n.Tr( "designer.theme_dark", "Dark" ) )
+    tkSelectBar_AddPanel( SelVariant, i18n.Tr( "designer.theme_light", "Light" ) )
+    tkSelectBar_SetCurSel( SelVariant, 0 )
+    tkSelectBar_SetSelChangeCallback( SelVariant, @OnVariant )
+
+    Tabs = tkTabControl_Create( root_, 1 )
+    dim as TK_WIDGET ptr pSimple = tkTabControl_GetPage( Tabs, tkTabControl_AddPage( Tabs, i18n.Tr( "designer.colors_simple", "Simple" ) ) )
+    dim as TK_WIDGET ptr pAll = tkTabControl_GetPage( Tabs, tkTabControl_AddPage( Tabs, i18n.Tr( "designer.colors_all", "All States" ) ) )
+
+    ' the Simple page: a main part is one with a Normal colour, outside the Checked / On / Off grids
+    for slot as long = 0 to Meta->NumColorSlots - 1
+        with Meta->Colors( slot )
+            if (len( .Part ) > 0) andalso (.State = "Normal") andalso (len( .Group ) = 0) andalso (Parts.Count( ) < MAX_PARTS) then Parts.Push( slot )
+        end with
+    next
+    for i as long = 0 to Parts.Count( ) - 1
+        PartLabels( i ) = MakeLabel_( pSimple, Meta->Colors( Parts[i] ).Part )
+        PartEdits( i ) = MakeText_( pSimple )
+        PartPicks( i ) = MakeButton_( pSimple, i18n.Tr( "designer.theme_pick", "Pick..." ) )
+        PartSources( i ) = MakeLabel_( pSimple, "" )
+    next
+
+    Fields = tkListTree_Create( pAll, 1 )
+    tkListTree_SetPaintCallback( Fields, @PaintField )
+    tkListTree_SetSelChangeCallback( Fields, @OnFieldPick )
+    for slot as long = 0 to Meta->NumColorSlots - 1
+        tkListTree_AddString( Fields, Meta->Colors( slot ).Name, slot )
+    next
+    tkListTree_SetCurSel( Fields, 0 )
+    TxtField = MakeText_( pAll )
+    BtnFieldPick = MakeButton_( pAll, i18n.Tr( "designer.theme_pick", "Pick..." ) )
+    BtnFieldReset = MakeButton_( pAll, i18n.Tr( "designer.theme_reset", "Reset" ) )
+    ChkPair = tkCheckBox_Create( pAll, 1 )
+    tkCheckBox_SetText( ChkPair, i18n.Tr( "designer.colors_pair", "Different in light mode" ) )
+    tkCheckBox_SetCheckChangedCallback( ChkPair, @OnPair )
+    LblFieldSource = MakeLabel_( pAll, "" )
+
+    Preview = tkPanel_Create( root_, 1 )
+    PvLive = MakeSample_( Meta, Preview )
+    PvOff = MakeSample_( Meta, Preview )
+    if PvOff then tkWidget_Enable( PvOff, false )
+
+    BtnOk = MakeButton_( root_, i18n.Tr( "designer.ok", "OK" ) )
+    BtnCancel = MakeButton_( root_, i18n.Tr( "designer.cancel", "Cancel" ) )
+
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        cast( ColorsDialog ptr, f->Tag )->Layout( )
+    end sub )
+    Loading = false
+    this.LoadFields( )
+    tkForm_Show( Win )
+    this.Layout( )
+    this.Refresh( )
+end sub
+
+function ColorsDialog.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub ColorsDialog.Close( )
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+end sub
+
+sub ColorsDialog.Finish( byval ok as boolean )
+    Accepted = ok
+    if IsModal then tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+end sub
+
+sub ColorsDialog.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long g = tkForm_Scale( Win, GAP ), rh = tkForm_Scale( Win, ROW_CY ), cw = root_->cw, ch = root_->ch
+    dim as long pvW = tkForm_Scale( Win, 220 ), bw = tkForm_Scale( Win, 90 )
+    tkWidget_SetPos( LblStyle, g, g, tkForm_Scale( Win, 60 ), rh )
+    tkWidget_SetPos( CmbStyle, g + tkForm_Scale( Win, 64 ), g, tkForm_Scale( Win, 200 ), rh )
+    tkWidget_SetPos( SelVariant, g + tkForm_Scale( Win, 280 ), g, tkForm_Scale( Win, 180 ), rh )
+    dim as long top = 2 * g + rh, bottomY = ch - g - rh
+    dim as long tw = cw - pvW - 3 * g, th = bottomY - g - top
+    tkWidget_SetPos( Tabs, g, top, tw, th )
+    tkWidget_SetPos( Preview, cw - pvW - g, top, pvW, th )
+    tkWidget_SetPos( BtnCancel, cw - g - bw, bottomY, bw, rh )
+    tkWidget_SetPos( BtnOk, cw - 2 * (g + bw), bottomY, bw, rh )
+
+    dim as long pw = tw, ph = th - tkTabControl_GetTabHeight( Tabs )
+    dim as long lw = tkForm_Scale( Win, 110 ), ew = tkForm_Scale( Win, 130 ), kw = tkForm_Scale( Win, 80 )
+    for i as long = 0 to Parts.Count( ) - 1
+        dim as long y = g + i * (rh + g)
+        tkWidget_SetPos( PartLabels( i ), g, y, lw, rh )
+        tkWidget_SetPos( PartEdits( i ), 2 * g + lw, y, ew, rh )
+        tkWidget_SetPos( PartPicks( i ), 3 * g + lw + ew, y, kw, rh )
+        tkWidget_SetPos( PartSources( i ), 4 * g + lw + ew + kw, y, pw - (5 * g + lw + ew + kw), rh )
+    next
+    tkWidget_SetPos( Fields, g, g, pw - 2 * g, ph - 4 * g - 2 * rh )
+    dim as long y2 = ph - 2 * g - 2 * rh
+    tkWidget_SetPos( TxtField, g, y2, ew, rh )
+    tkWidget_SetPos( BtnFieldPick, 2 * g + ew, y2, kw, rh )
+    tkWidget_SetPos( BtnFieldReset, 3 * g + ew + kw, y2, kw, rh )
+    tkWidget_SetPos( ChkPair, 4 * g + ew + 2 * kw, y2, pw - (5 * g + ew + 2 * kw), rh )
+    tkWidget_SetPos( LblFieldSource, g, ph - g - rh, pw - 2 * g, rh )
+
+    dim as long sh = tkForm_Scale( Win, Meta->Height_ ), sw = pvW - 4 * g
+    if PvLive then tkWidget_SetPos( PvLive, 2 * g, 2 * g, sw, sh )
+    if PvOff then tkWidget_SetPos( PvOff, 2 * g, 4 * g + sh, sw, sh )
+end sub
+
+' ---- values ----------------------------------------------------------------------------------------
+
+' This control's own value for a slot, as the variant shown sees it ("" = inherited).
+function ColorsDialog.ShownValue( byval slot as long ) as ustring
+    dim as long i = FindSetting( Colors, Meta->Colors( slot ).Name )
+    if i < 0 then return ""
+    dim as ustring v = Colors[i].Value
+    dim as long bar = instr( v, "|" )
+    if bar then
+        if IsDark then return left( v, bar - 1 )
+        return mid( v, bar + 1 )
+    end if
+    return v
+end function
+
+' A value typed for a slot: "" inherits; a pair keeps its other half; anything not yet a colour waits.
+sub ColorsDialog.SetValue( byval slot as long, byref text as const ustring )
+    if (slot < 0) orelse (slot >= Meta->NumColorSlots) then exit sub
+    dim as ustring nm = Meta->Colors( slot ).Name, t = trim( text )
+    dim as long i = FindSetting( Colors, nm )
+    if len( t ) = 0 then
+        if i >= 0 then Colors.Remove( i )
+        exit sub
+    end if
+    dim as ustring c = colorval.Canonical( t, true, false )
+    if len( c ) = 0 then exit sub
+    if (i >= 0) andalso (instr( Colors[i].Value, "|" ) > 0) andalso (left( c, 1 ) = "#") then
+        dim as ustring v = Colors[i].Value
+        dim as long bar = instr( v, "|" )
+        if IsDark then c = c & mid( v, bar ) else c = left( v, bar ) & c
+    end if
+    PutSetting( Colors, nm, c )
+end sub
+
+sub ColorsDialog.LoadFields( )
+    Loading = true
+    for i as long = 0 to Parts.Count( ) - 1
+        tkTextBox_SetText( PartEdits( i ), this.ShownValue( Parts[i] ) )
+    next
+    Loading = false
+    this.LoadField( )
+end sub
+
+sub ColorsDialog.LoadField( )
+    dim as long slot = tkListTree_GetCurSel( Fields )
+    if (slot < 0) orelse (slot >= Meta->NumColorSlots) then exit sub
+    Loading = true
+    tkTextBox_SetText( TxtField, this.ShownValue( slot ) )
+    dim as long i = FindSetting( Colors, Meta->Colors( slot ).Name )
+    tkCheckBox_SetChecked( ChkPair, (i >= 0) andalso (instr( Colors[i].Value, "|" ) > 0) )
+    tkLabel_SetText( LblFieldSource, this.SourceText( slot ) )
+    Loading = false
+end sub
+
+private function FieldText_( byval w as TK_WIDGET ptr ) as ustring
+    return trim( tkTextBox_GetText( w ) )
+end function
+
+sub ColorsDialog.FieldChanged( byval w as TK_WIDGET ptr )
+    if w = CmbStyle then
+        dim as long r = tkComboBox_GetCurSel( CmbStyle )
+        if r <= 0 then StyleName = "" else StyleName = tkComboBox_GetItemText( CmbStyle, r )
+    elseif w = TxtField then
+        this.SetValue( tkListTree_GetCurSel( Fields ), FieldText_( TxtField ) )
+        tkLabel_SetText( LblFieldSource, this.SourceText( tkListTree_GetCurSel( Fields ) ) )
+    else
+        for i as long = 0 to Parts.Count( ) - 1
+            if w = PartEdits( i ) then this.SetValue( Parts[i], FieldText_( w ) )
+        next
+    end if
+    this.Refresh( )
+end sub
+
+' Ticked: the field becomes a pair, both halves its current colour (the box then edits the variant
+' shown). Unticked: the variant shown's half is the one colour.
+sub ColorsDialog.PairToggled( )
+    dim as long slot = tkListTree_GetCurSel( Fields )
+    if (slot < 0) orelse (slot >= Meta->NumColorSlots) then exit sub
+    dim as ustring nm = Meta->Colors( slot ).Name
+    dim as long i = FindSetting( Colors, nm )
+    if tkCheckBox_GetChecked( ChkPair ) then
+        dim as ulong c = this.Effective( slot )
+        dim as ustring h = colorval.HexText( c )
+        if i >= 0 then
+            dim as ulong x
+            if colorval.ParseHex( Colors[i].Value, x ) then h = Colors[i].Value
+        end if
+        PutSetting( Colors, nm, h & "|" & h )
+    elseif i >= 0 then
+        dim as ustring v = this.ShownValue( slot )
+        Colors[i].Value = v
+    end if
+    this.LoadField( )
+    this.Refresh( )
+end sub
+
+sub ColorsDialog.PickInto( byval box as TK_WIDGET ptr )
+    dim as ulong c = &hFF808080ul
+    colorval.ParseHex( FieldText_( box ), c )
+    dim as ubyte a = c shr 24
+    if tkColorPicker_DoModal( tkForm_Widget( Win ), c, a ) then
+        tkTextBox_SetText( box, colorval.HexText( (c and &hFFFFFFul) or (culng( a ) shl 24) ) )
+        this.FieldChanged( box )
+    end if
+end sub
+
+' ---- the preview -----------------------------------------------------------------------------------------
+
+' What the preview control shows for a slot now.
+function ColorsDialog.Effective( byval slot as long ) as ulong
+    if (PvLive = 0) orelse (Meta->GetColors = 0) then return 0
+    dim as ulong v( 0 to Meta->NumColorSlots - 1 )
+    Meta->GetColors( PvLive, @v( 0 ) )
+    return v( slot )
+end function
+
+function ColorsDialog.SourceText( byval slot as long ) as ustring
+    select case themefile.SourceOf( Theme, Meta, StyleName, Colors, slot, IsDark )
+    case themefile.FROM_CONTROL : return i18n.Tr( "designer.colors_from_control", "set on this control" )
+    case themefile.FROM_DERIVED : return i18n.Tr( "designer.colors_from_derived", "follows this control's Normal colour" )
+    case themefile.FROM_STYLE   : return i18n.Tr( "designer.colors_from_style", "from the style" )
+    case themefile.FROM_TYPE    : return i18n.Tr( "designer.colors_from_type", "from the theme, for this type" )
+    end select
+    return i18n.Tr( "designer.colors_from_theme", "from the theme" )
+end function
+
+' The preview wears the project theme (a scope, its styles and type recipes) and the recipe the
+' generated code will give it; the sources follow.
+sub ColorsDialog.Refresh( )
+    if Win = 0 then exit sub
+    dim as TKTHEME_COLORS t = themefile.Resolve( Theme, IsDark )
+    dim as TKTHEME_SHAPE sh = themefile.ShapeOf( Theme )
+    Tables.Build( Theme )
+    tkTheme_ApplyTo( Preview, t, @sh, Tables.StylePtr( ), Tables.Styles.Count( ), Tables.TypePtr( ), Tables.Types.Count( ) )
+    dim as Array( of TKCOLOR_SRC ) recipe
+    colorval.Entries( Colors, Meta, recipe )
+    dim as TK_WIDGET ptr pv( 0 to 1 ) = { PvLive, PvOff }
+    for k as long = 0 to 1
+        if pv( k ) = 0 then continue for
+        if recipe.Count( ) then
+            tkTheme_SetRecipeNamed( pv( k ), StyleName, @recipe[0], recipe.Count( ) )
+        else
+            tkTheme_SetRecipeNamed( pv( k ), StyleName, 0, 0 )
+        end if
+    next
+    for i as long = 0 to Parts.Count( ) - 1
+        tkLabel_SetText( PartSources( i ), this.SourceText( Parts[i] ) )
+    next
+    tkWidget_Invalidate( Fields )
+    tkWidget_Invalidate( tkForm_Widget( Win ) )
+end sub

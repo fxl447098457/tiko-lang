@@ -11,7 +11,7 @@ A `CTextSelection2` wraps the `ITextSelection2` interface of a rich edit control
 
 **Positions.** Character positions count from 0; the selection covers its start up to, not including, its end, and a caret is a selection whose start equals its end. One end is *active*: the one the caret is at and that Shift+arrow moves.
 
-**Ownership.** The constructor and `Let` take over the pointer they are given and the destructor releases it, so `dim sel as CTextSelection2 = pRichEdit->Selection2()` is the whole job. [Attach](#attach) can add a reference instead; [Detach](#detach) gives the pointer back to you. Members that return another interface (`GetDuplicate`, `GetFont`, `GetPara` …) hand you a reference you own. Do not copy one `CTextSelection2` into another with `dim b as CTextSelection2 = a`: the copy shares the pointer without adding a reference, and both destructors release it.
+**Ownership.** The constructor and `Let` take over the pointer they are given and the destructor releases it, so `dim sel as CTextSelection2 = pRichEdit->Selection2()` is the whole job. [Attach](#attach) can add a reference instead; [Detach](#detach) gives the pointer back to you. Members that return another interface (`GetDuplicate`, `GetFont`, `GetPara` …) hand you a reference you own.
 
 **Results.** Most members return the value an interface method reports rather than its result code. The class extends `CTextObjectBase`: after any call `GetLastResult()` returns the `HRESULT` of the method (`S_OK`, `S_FALSE`, `E_NOTIMPL` …) and `GetErrorInfo()` turns it into text.
 

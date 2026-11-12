@@ -9,18 +9,114 @@
 '' The OS already knows the user's zone and keeps its rules current; shipping
 '' and maintaining a copy of the tzdb is a project of its own.  Nothing here
 '' forecloses a future ZonedDateTime -- DateTime already carries an offset.
+
+'' The OS zone's offset at a UTC tick count.  Every lookup in this file goes
+'' through here.  Windows converts nothing before 1601-01-01, FILETIME's
+'' epoch, and the runtime then answers 0 -- UTC, silently.  No zone kept
+'' daylight time before 1916, so the answer there is the earliest rule's
+'' STANDARD offset: whichever of mid-January and mid-July 1601 is not DST.  The
+'' day's margin is for a negative offset, whose reading of 1601-01-01T00:00Z
+'' is still in 1600.
+function dtZoneOffsetAt( byval utc as longint ) as short
+    if fb_DtIsValidTicks( utc ) = 0 then return 0
+#ifdef __FB_WIN32__
+    if utc < DT_TICKS_TO_FILETIME + DT_TICKS_PER_DAY then
+        dim as longint jan = DT_TICKS_TO_FILETIME + 14 * DT_TICKS_PER_DAY
+        dim as longint jul = jan + 181 * DT_TICKS_PER_DAY
+        if fb_DtZoneIsDst( jan ) <> 0 then return cshort( fb_DtZoneOffsetAt( jul ) )
+        return cshort( fb_DtZoneOffsetAt( jan ) )
+    end if
+#endif
+    return cshort( fb_DtZoneOffsetAt( utc ) )
+end function
+
+function dtClampTicks( byval t as longint ) as longint
+    if t < DT_MIN_TICKS then return DT_MIN_TICKS
+    if t > DT_MAX_TICKS then return DT_MAX_TICKS
+    return t
+end function
+
+'' True when the OS zone's offset at UTC tick count u is offMin.
+function dtZoneFits( byval u as longint, byval offMin as short ) as boolean
+    if fb_DtIsValidTicks( u ) = 0 then return false
+    return dtZoneOffsetAt( u ) = offMin
+end function
+
+'' The UTC tick count a wall-clock reading in the OS zone names.  The offsets
+'' a day either side bracket the transition, if there is one, and each is
+'' tried; the reading names
+''     one instant -- the usual case;
+''     two         -- a fall-back overlap.  PREFER is taken when it is one of
+''                    the two offsets, otherwise the EARLIER instant, which is
+''                    what java.time and Temporal do;
+''     none        -- a spring-forward gap.  The offset from BEFORE the gap
+''                    places it after the gap, so the reading moves forward by
+''                    the gap's length: 02:30 in a 02:00 -> 03:00 gap is 03:30.
+'' DT_INVALID_TICKS when it cannot be placed in range.  The wall reading is
+'' NEVER looked up as if it were UTC: within an offset's width of a
+'' transition, that answers for the wrong side of it.
+function dtResolveLocal( byval wall as longint, byval prefer as short ) as longint
+    if fb_DtIsValidTicks( wall ) = 0 then return DT_INVALID_TICKS
+    dim as short a = dtZoneOffsetAt( dtClampTicks( wall - DT_TICKS_PER_DAY ) )
+    dim as short b = dtZoneOffsetAt( dtClampTicks( wall + DT_TICKS_PER_DAY ) )
+    dim as longint ua = wall - clngint( a ) * DT_TICKS_PER_MINUTE
+    dim as longint ub = wall - clngint( b ) * DT_TICKS_PER_MINUTE
+    dim as boolean okA = dtZoneFits( ua, a )
+    dim as boolean okB = dtZoneFits( ub, b )
+    if okA andalso okB then
+        if prefer = a then return ua
+        if prefer = b then return ub
+        if ua < ub then return ua
+        return ub
+    end if
+    if okA then return ua
+    if okB then return ub
+    if fb_DtIsValidTicks( ua ) = 0 then return DT_INVALID_TICKS
+    return ua
+end function
+
+'' After a calendar step: SRC is the value stepped from, R the step's result
+'' with SRC's offset still on it.  The offset is re-resolved ONLY for a local
+'' reading -- one whose offset is the OS zone's at its own instant.  A UTC or
+'' other fixed-offset value is not in the OS zone, and relabelling its result
+'' with the local offset would move it to another instant.  In an overlap the
+'' result keeps SRC's offset, as java.time's plusDays does.
+'' LIMIT: a DateTime carries no zone, so a fixed offset that happens to equal
+'' the OS zone's at that instant -- a UTC value on a London machine in winter
+'' -- is taken as local.
+function dtCalendarRelocal( byref src as DateTime, byref r as DateTime ) as DateTime
+    if r.IsValid = false then return DateTime.Invalid( )
+    if src.HasOffset = false then return r
+    dim as Instant i = src.ToInstant( )
+    if i.IsValid = false then return r
+    if dtZoneOffsetAt( i.Ticks ) <> src.OffsetMinutes then return r
+    dim as longint u = dtResolveLocal( r.Ticks, src.OffsetMinutes )
+    if u = DT_INVALID_TICKS then return DateTime.Invalid( )
+    return DateTime.FromInstant( Instant( u ), dtZoneOffsetAt( u ) )
+end function
+
 namespace TimeZoneInfo
 
     '' The offset AT A GIVEN INSTANT, not "right now".  Converting a July
     '' timestamp with January's offset is the commonest timezone bug there is,
     '' and an API offering only "the current offset" makes it the default.
+    '' An Invalid instant answers 0, which is also UTC's offset -- kept for the
+    '' tests this module was ported with.  TryLocalOffsetAt says which it was.
     public function LocalOffsetAt( byref i as Instant ) as short
         if i.IsValid = false then return 0
-        return cshort( fb_DtZoneOffsetAt( i.Ticks ) )
+        return dtZoneOffsetAt( i.Ticks )
+    end function
+
+    '' False, with result left alone, for an Invalid instant.  An OS lookup
+    '' that fails still answers 0: the runtime has no way to say so yet.
+    public function TryLocalOffsetAt( byref i as Instant, byref result as short ) as boolean
+        if i.IsValid = false then return false
+        result = dtZoneOffsetAt( i.Ticks )
+        return true
     end function
 
     public function LocalOffset( ) as short
-        return cshort( fb_DtZoneOffsetAt( fb_DtClockUtcNow( ) ) )
+        return dtZoneOffsetAt( fb_DtClockUtcNow( ) )
     end function
 
     public function IsDaylightSavingTime( byref i as Instant ) as boolean
@@ -32,6 +128,11 @@ namespace TimeZoneInfo
         return fb_DtZoneSupportsDst( ) <> 0
     end function
 
+    '' StandardName and DaylightName are OS DISPLAY TEXT, not portable values:
+    '' Windows gives display names ("Newfoundland Standard Time"), Linux and
+    '' macOS abbreviations ("NST").  Both are this year's names, not the ones
+    '' in force at any other time.  A zone with no DST gives Windows' own
+    '' daylight name on Windows and the standard name elsewhere.
     public function StandardName( ) as ustring
         dim as zstring * 160 buf
         dim as long n = fb_DtZoneStandardName( @buf, 160 )
@@ -55,14 +156,28 @@ function DateTime.ToLocal( ) as DateTime
     dim as Instant i = this.ToInstant( )
     if i.IsValid = false then i = this.AssumeUtc( )
     if i.IsValid = false then return DateTime.Invalid( )
-    return DateTime.FromInstant( i, cshort( fb_DtZoneOffsetAt( i.Ticks ) ) )
+    return DateTime.FromInstant( i, dtZoneOffsetAt( i.Ticks ) )
+end function
+
+'' Reads the wall-clock value as a reading in the OS zone, whatever the
+'' carried offset says -- the local twin of AssumeUtc.  Inside a fall-back
+'' overlap it is the EARLIER of the two instants; inside a spring-forward gap
+'' the reading moves forward by the gap's length.  Programs that care about an
+'' exact point in time should carry an Instant.
+function DateTime.AssumeLocal( ) as Instant
+    if this.IsValid = false then return Instant.Invalid( )
+    dim as longint u = dtResolveLocal( this.m_ticks, DT_OFFSET_UNSPECIFIED )
+    if u = DT_INVALID_TICKS then return Instant.Invalid( )
+    return Instant( u )
 end function
 
 '' -- calendar-preserving arithmetic ------------------------------------
 ''
 '' AddDays( 1 ) is exact tick arithmetic: 86400 seconds, which does NOT keep
 '' the wall-clock time across a DST boundary.  These operate on the civil
-'' fields and then re-resolve the offset, so they DO.
+'' fields and then, for a local reading, re-resolve the offset, so they DO --
+'' except inside a spring-forward gap, where the reading does not exist and
+'' moves forward by the gap.  See dtCalendarRelocal.
 ''     "24 hours from now"  -> AddDays( 1 )
 ''     "same time tomorrow" -> AddCalendarDays( 1 )
 function DateTime.AddCalendarDays( byval n as long ) as DateTime
@@ -72,17 +187,11 @@ function DateTime.AddCalendarDays( byval n as long ) as DateTime
     dim as DateTime r = DateTime.FromTicks( _
         clngint( d.DayNumber ) * DT_TICKS_PER_DAY + ( this.m_ticks mod DT_TICKS_PER_DAY ), _
         this.m_offset )
-    if r.IsValid = false then return DateTime.Invalid( )
-    if this.HasOffset = false then return r
-    '' re-resolve the offset for the new local time
-    return r.WithOffset( cshort( fb_DtZoneOffsetAt( r.AssumeUtc( ).Ticks ) ) )
+    return dtCalendarRelocal( this, r )
 end function
 
 function DateTime.AddCalendarMonths( byval n as long ) as DateTime
-    dim as DateTime r = this.AddMonths( n )
-    if r.IsValid = false then return DateTime.Invalid( )
-    if this.HasOffset = false then return r
-    return r.WithOffset( cshort( fb_DtZoneOffsetAt( r.AssumeUtc( ).Ticks ) ) )
+    return dtCalendarRelocal( this, this.AddMonths( n ) )
 end function
 
 function DateTime.AddCalendarYears( byval n as long ) as DateTime

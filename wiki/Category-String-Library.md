@@ -216,9 +216,9 @@ The result is a table:
 
 ```freebasic
 dim rows as Array( of CsvRow ) = SplitCsv( text )
-for r as integer = 0 to rows.Count( ) - 1
-    for c as integer = 0 to rows[ r ].fields.Count( ) - 1
-        print rows[ r ].fields[ c ]
+for each byref row in rows
+    for each fld in row.fields
+        print fld
     next
 next
 ```

@@ -45,9 +45,9 @@ dim as Array( of CsvRow ) bad = SplitCsv( !"a,\"never closed" )
 if bad.Count( ) = 0 then print "malformed CSV"
 
 '' Walking a table
-for r as integer = 0 to t.Count( ) - 1
-    for c as integer = 0 to t[ r ].fields.Count( ) - 1
-        print t[ r ].fields[ c ];
+for each byref row in t
+    for each fld in row.fields
+        print fld;
     next
     print
 next

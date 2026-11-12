@@ -108,9 +108,9 @@ Sub get_array()
 
     ' print out result
 
-    For i As Integer = 0 To 10-1
+    For Each value As Long In an_array
 
-        Print an_array(i)
+        Print value
 
     Next
 

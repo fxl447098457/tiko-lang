@@ -35,8 +35,8 @@ print Beta( b( ), b( ) ).Value( )        '' 1
 
 '' A constant benchmark has no variance, so no slope.
 dim as float64 flat_( 0 to 11 )
-for k as int32 = 0 to 11
-    flat_( k ) = 0.01
+for each byref v in flat_
+    v = 0.01
 next
 print Beta( r( ), flat_( ) ).Failure( ).Message( )
 ```

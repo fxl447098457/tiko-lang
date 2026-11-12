@@ -1,0 +1,144 @@
+'' std/chrono: a wall-clock reading in the OS zone is resolved without looking it up
+'' as if it were UTC, and only a local reading follows the OS zone. Prints "ok", or
+'' the first failed check. Host-independent: every check is an invariant that holds
+'' in any zone; the transition checks run in whichever transitions this machine's
+'' zone has in 2025 and in none on a zone without DST.
+''   1. AddCalendarDays / Months / Years keep a fixed offset that is not the OS
+''      zone's. They relabelled it with the local offset, which moved the instant.
+''   2. A local reading's AddCalendarDays carries the offset in force AT the result.
+''      The wall reading was looked up as UTC, which answers for the wrong side of a
+''      transition for an offset's width after it.
+''   3. AssumeLocal: a wall reading taken from an instant names that wall reading
+''      again; in an overlap it is the earlier instant; in a gap it moves forward.
+''   4. Windows: before 1601 the offset is the zone's standard one, not 0.
+''   5. TryLocalOffsetAt is false for an Invalid instant.
+''   6. Zone names: from tm_zone on Unix, not the process-global tzname.
+#import "std/chrono"
+using chrono
+
+dim shared as long failures = 0
+sub check( byval ok as boolean, byref what as string )
+    if ok = false then
+        if failures = 0 then print "FAIL: "; what
+        failures += 1
+    end if
+end sub
+
+'' 6. zone names: always a standard name; a DST zone's two names differ; on Unix a
+'' zone with no DST names its standard time for both (it read tzname[1], which is
+'' the zone's last DST name, however old). FIRST, before any lookup: glibc's
+'' localtime_r rewrites tzname for the instant it converts, so after one the old
+'' answer depended on which instants came before.
+dim as ustring sn = TimeZoneInfo.StandardName( ), dn = TimeZoneInfo.DaylightName( )
+check( len( sn ) > 0, "StandardName non-empty" )
+check( len( dn ) > 0, "DaylightName non-empty" )
+if TimeZoneInfo.SupportsDaylightSavingTime( ) then
+    check( sn <> dn, "DST zone: names differ" )
+#ifndef __FB_WIN32__
+else
+    check( sn = dn, "no-DST zone: daylight name is the standard one" )
+#endif
+end if
+
+'' 1. a fixed offset no zone has keeps its offset and steps exact days
+dim as DateTime f = DateTime( 2025, 3, 8, 2, 30, 0, 0 ).WithOffset( 797 )
+for k as long = 1 to 400
+    dim as DateTime r = f.AddCalendarDays( k )
+    check( r.OffsetMinutes = 797, "fixed offset kept, day " & k )
+    check( ( r.ToInstant( ) - f.ToInstant( ) ).Ticks = clngint( k ) * DT_TICKS_PER_DAY, "fixed offset exact days " & k )
+next
+check( f.AddCalendarMonths( 5 ).OffsetMinutes = 797, "fixed offset kept, months" )
+check( f.AddCalendarYears( 2 ).OffsetMinutes = 797, "fixed offset kept, years" )
+
+'' ... and so does UTC, wherever the OS zone is not UTC at both ends
+dim as DateTime z = DateTime( 2025, 7, 1, 12, 0, 0, 0 ).WithOffset( 0 )
+dim as DateTime z1 = z.AddCalendarDays( 1 )
+if TimeZoneInfo.LocalOffsetAt( z.ToInstant( ) ) <> 0 then
+    check( z1.OffsetMinutes = 0, "UTC kept" )
+    check( z1.ToIsoString( ) = "2025-07-02T12:00:00Z", "UTC exact day" )
+end if
+
+'' 2 and 3, hour by hour through 2025: every local reading
+dim as Instant t0 = DateTime( 2025, 1, 1, 0, 30, 0, 0 ).AssumeUtc( )
+dim as Instant prevI = t0
+dim as short prevOff = TimeZoneInfo.LocalOffsetAt( t0 )
+dim as long transitions = 0
+for h as long = 0 to 365 * 24
+    dim as Instant i = t0.Add( TimeSpan.FromHours( h ) )
+    dim as short off = TimeZoneInfo.LocalOffsetAt( i )
+    dim as DateTime lr = DateTime.FromInstant( i, off )
+
+    '' 2: the offset carried is the one in force at the result's instant
+    dim as DateTime nx = lr.AddCalendarDays( 1 )
+    check( nx.IsValid, "AddCalendarDays valid at hour " & h )
+    check( nx.OffsetMinutes = TimeZoneInfo.LocalOffsetAt( nx.ToInstant( ) ), _
+           "AddCalendarDays offset in force, from " & lr.ToIsoString( ) )
+
+    '' 3: a reading that exists names itself again
+    dim as Instant back = lr.AssumeLocal( )
+    dim as DateTime again = DateTime.FromInstant( back, TimeZoneInfo.LocalOffsetAt( back ) )
+    check( again.Ticks = lr.Ticks, "AssumeLocal round trip " & lr.ToIsoString( ) )
+    check( back.Ticks <= i.Ticks, "AssumeLocal earlier instant " & lr.ToIsoString( ) )
+
+    if off <> prevOff then
+        transitions += 1
+        '' the transition's instant T, to the minute: transitions fall on minutes
+        dim as long loM = 0, hiM = 60
+        while hiM - loM > 1
+            dim as long mM = ( loM + hiM ) \ 2
+            if TimeZoneInfo.LocalOffsetAt( prevI.Add( TimeSpan.FromMinutes( mM ) ) ) = prevOff then
+                loM = mM
+            else
+                hiM = mM
+            end if
+        wend
+        dim as Instant tr = prevI.Add( TimeSpan.FromMinutes( hiM ) )
+        check( TimeZoneInfo.LocalOffsetAt( tr ) = off, "transition found" )
+        '' the first wall reading after the transition, and the step into it
+        '' from the same reading a day before
+        dim as long widthMin = abs( clng( off ) - clng( prevOff ) )
+        dim as DateTime wallAfter = DateTime.FromInstant( tr, off )
+        dim as DateTime dayBefore = wallAfter.AddCalendarDays( -1 )
+        if TimeZoneInfo.LocalOffsetAt( dayBefore.ToInstant( ) ) = dayBefore.OffsetMinutes then
+            dim as DateTime stepped = dayBefore.AddCalendarDays( 1 )
+            check( stepped.OffsetMinutes = TimeZoneInfo.LocalOffsetAt( stepped.ToInstant( ) ), _
+                   "step across transition " & stepped.ToIsoString( ) )
+        end if
+        '' a reading inside the overlap or the gap, whose wall span starts at
+        '' T read under the smaller of the two offsets
+        dim as short lowOff = iif( off < prevOff, off, prevOff )
+        dim as DateTime wallIn = DateTime.FromInstant( tr, lowOff ).AddMinutes( widthMin \ 2 )
+        dim as Instant m = wallIn.WithOffset( DT_OFFSET_UNSPECIFIED ).AssumeLocal( )
+        check( m.IsValid, "AssumeLocal in transition" )
+        if off < prevOff then
+            '' overlap: the earlier instant, under the earlier offset
+            check( TimeZoneInfo.LocalOffsetAt( m ) = prevOff, "overlap takes the earlier instant" )
+        else
+            '' gap: forward by the gap's width, under the later offset
+            dim as DateTime moved = DateTime.FromInstant( m, TimeZoneInfo.LocalOffsetAt( m ) )
+            check( moved.Ticks - wallIn.Ticks = clngint( widthMin ) * DT_TICKS_PER_MINUTE, "gap moves forward" )
+            check( TimeZoneInfo.LocalOffsetAt( m ) = off, "gap lands after the transition" )
+        end if
+    end if
+    prevOff = off
+    prevI = i
+next
+
+#ifdef __FB_WIN32__
+'' 4. no zone kept DST before 1916; Windows has no rules before 1601
+dim as Instant y1500 = DateTime( 1500, 6, 1, 0, 0, 0, 0 ).AssumeUtc( )
+dim as Instant jan = DateTime( 1700, 1, 15, 12, 0, 0, 0 ).AssumeUtc( )
+dim as Instant jul = DateTime( 1700, 7, 15, 12, 0, 0, 0 ).AssumeUtc( )
+dim as short std_ = iif( TimeZoneInfo.IsDaylightSavingTime( jan ), _
+                         TimeZoneInfo.LocalOffsetAt( jul ), TimeZoneInfo.LocalOffsetAt( jan ) )
+check( TimeZoneInfo.LocalOffsetAt( y1500 ) = std_, "pre-1601 standard offset" )
+#endif
+
+'' 5. TryLocalOffsetAt says when there was no offset to give
+dim as short tryOff = 12345
+check( TimeZoneInfo.TryLocalOffsetAt( Instant.Invalid( ), tryOff ) = false, "Try on Invalid is false" )
+check( tryOff = 12345, "Try on Invalid leaves the result alone" )
+check( TimeZoneInfo.TryLocalOffsetAt( t0, tryOff ), "Try on a valid instant" )
+check( tryOff = TimeZoneInfo.LocalOffsetAt( t0 ), "Try agrees with LocalOffsetAt" )
+
+if failures = 0 then print "ok" else print failures; " failures"

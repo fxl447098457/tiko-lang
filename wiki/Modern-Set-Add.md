@@ -24,8 +24,8 @@ print seen.Add( "ada" )      '' false -- already there
 '' Deduplicating a stream in one pass
 dim as ustring names( 0 to 2 ) = { "ada", "grace", "ada" }
 dim uniq as Set( of ustring )
-for i as integer = 0 to ubound( names )
-    if uniq.Add( names( i ) ) then print "new: " & names( i )
+for each n in names
+    if uniq.Add( n ) then print "new: " & n
 next
 ```
 

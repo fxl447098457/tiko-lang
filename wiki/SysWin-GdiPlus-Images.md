@@ -1618,16 +1618,13 @@ Microsoft Learn: [Metafile::SetDownLevelRasterizationLimit](https://learn.micros
 ### EmfToWmfBits
 
 ```freebasic
-function EmfToWmfBits( byval hEmf as HENHMETAFILE, byval cbData16 as UINT, byval pData16 as byte ptr, byval iMapMode as INT_ = MM_ANISOTROPIC, byval eFlags as INT_ = EmfToWmfBitsFlagsDefault ) as GpStatus
+function EmfToWmfBits( byval hEmf as HENHMETAFILE, byval cbData16 as UINT, byval pData16 as byte ptr, byval iMapMode as INT_ = MM_ANISOTROPIC, byval eFlags as INT_ = EmfToWmfBitsFlagsDefault ) as UINT
 ```
 
 Converts the enhanced metafile `hEmf` (not this object's metafile) to the older WMF format and
 writes the WMF bytes into `pData16`, a buffer of `cbData16` bytes. Call it first with `NULL` and
 0 to learn the size, then with a buffer that large. `SetWinMetaFileBits` turns the bytes into an
 `HMETAFILE`.
-
-Although declared as a `GpStatus`, the value returned is a **size**: the number of bytes the WMF
-needs or that were written, 0 on failure. `GetLastStatus()` holds the same number.
 
 | Parameter | Meaning |
 | --- | --- |

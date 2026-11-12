@@ -170,4 +170,4 @@ not 0 and 3           3     ...and tighter than and: (not 0) and 3
 
 `&` binds looser than `+` and `-`, so `"a" & 1 + 2` means `"a" & (1 + 2)`, and both compilers print `a3`.
 
-<!-- 247 reserved words, 104 runtime names, generated 2026-11-08 from src/lexer/keywords.ti, src/symbols/resolvertl.tiko and src/parser/prectable.ti at ec6351fda -->
+<!-- 247 reserved words, 104 runtime names, generated 2026-11-11 from src/lexer/keywords.ti, src/symbols/resolvertl.tiko and src/parser/prectable.ti at 3ca5ef67d -->

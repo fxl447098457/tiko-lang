@@ -134,8 +134,7 @@ the bar in simple mode instead.
 | `rgWidths` | The right edge of each part. |
 | `strSizes` | The widths, for example `"120,80,-1"`. |
 
-**Returns** the first form `true` on success; the second `true` for two parts or more, and
-`false` for one width or none.
+**Returns** `true` on success.
 
 **Example**
 

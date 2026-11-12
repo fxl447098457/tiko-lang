@@ -1,0 +1,218 @@
+#module "tz"
+'' std/tz: the TZif reader (RFC 8536) -- the compiled zone files zic writes and
+'' Linux and macOS ship in /usr/share/zoneinfo.
+''
+'' Layout: a 44-byte header (magic "TZif", a version byte, 15 reserved, six
+'' big-endian counts), then a data block with 32-bit times. From version 2 a
+'' second header and data block follow with 64-bit times, then the footer
+'' "\n<POSIX TZ string>\n". A v2+ reader SKIPS the 32-bit block and reads the
+'' 64-bit one, which covers years the 32-bit one cannot.
+''
+'' Every count is checked against what remains BEFORE anything is read, and
+'' the result is only assigned once the whole file has been accepted.
+
+'' Ample for any real zone: the largest "fat" file is under 4 KB.
+const TZIF_MAX_BYTES = 1048576
+
+'' RFC 8536 section 3.2: utoff must lie in -89999 .. 93599 (-24:59:59 .. +25:59:59).
+const TZIF_MIN_UTOFF = -89999
+const TZIF_MAX_UTOFF = 93599
+
+type TzifHeader_
+    as long version                 '' 1 for the "\0" byte, else the digit
+    as longint isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
+end type
+
+'' Big-endian, built a byte at a time in an unsigned value and only then
+'' reinterpreted, so no conversion can saturate or sign-extend on the way.
+function tzifBeU32( byval p as const ubyte ptr ) as longint
+    dim as ulongint u = 0
+    for i as long = 0 to 3
+        u = ( u shl 8 ) or p[i]
+    next
+    return cast( longint, u )
+end function
+
+function tzifBe32( byval p as const ubyte ptr ) as long
+    dim as ulong u = 0
+    for i as long = 0 to 3
+        u = ( u shl 8 ) or p[i]
+    next
+    return cast( long, u )
+end function
+
+function tzifBe64( byval p as const ubyte ptr ) as longint
+    dim as ulongint u = 0
+    for i as long = 0 to 7
+        u = ( u shl 8 ) or p[i]
+    next
+    return cast( longint, u )
+end function
+
+'' Reads a header at p[pos]; false when it is short or not TZif.
+function tzifHeader( byval p as const ubyte ptr, byval n as longint, byval pos_ as longint, _
+                     byref h as TzifHeader_ ) as boolean
+    if n - pos_ < 44 then return false
+    dim as const ubyte ptr q = p + pos_
+    if q[0] <> 84 orelse q[1] <> 90 orelse q[2] <> 105 orelse q[3] <> 102 then return false  '' TZif
+    select case q[4]
+    case 0
+        h.version = 1
+    case 50 to 57                   '' '2' .. '9': a later version reads as the latest known
+        h.version = q[4] - 48
+    case else
+        return false
+    end select
+    '' Counts are unsigned 32-bit; read as longint so none can go negative.
+    h.isutcnt  = tzifBeU32( q + 20 )
+    h.isstdcnt = tzifBeU32( q + 24 )
+    h.leapcnt  = tzifBeU32( q + 28 )
+    h.timecnt  = tzifBeU32( q + 32 )
+    h.typecnt  = tzifBeU32( q + 36 )
+    h.charcnt  = tzifBeU32( q + 40 )
+    return true
+end function
+
+'' The data block's size for times of TSIZE bytes; -1 when the counts break the
+'' format's own rules.
+function tzifBlockSize( byref h as TzifHeader_, byval tsize as long ) as longint
+    if h.typecnt < 1 orelse h.typecnt > 256 then return -1     '' indices are one byte
+    if h.charcnt < 1 then return -1
+    if h.isstdcnt <> 0 andalso h.isstdcnt <> h.typecnt then return -1
+    if h.isutcnt <> 0 andalso h.isutcnt <> h.typecnt then return -1
+    if h.timecnt > TZIF_MAX_BYTES orelse h.charcnt > TZIF_MAX_BYTES _
+       orelse h.leapcnt > TZIF_MAX_BYTES then return -1
+    return h.timecnt * tsize + h.timecnt + h.typecnt * 6 + h.charcnt _
+         + h.leapcnt * ( tsize + 4 ) + h.isstdcnt + h.isutcnt
+end function
+
+function TzRules.TryParse( byval p as const ubyte ptr, byval n as longint, _
+                           byref result as TzRules ) as boolean
+    if p = nullptr orelse n < 44 orelse n > TZIF_MAX_BYTES then return false
+
+    dim as TzifHeader_ h
+    if tzifHeader( p, n, 0, h ) = false then return false
+    dim as long tsize = 4
+    dim as longint pos_ = 44
+    dim as longint blk = tzifBlockSize( h, 4 )
+    if blk < 0 orelse blk > n - pos_ then return false
+
+    if h.version >= 2 then
+        '' skip the 32-bit block; the 64-bit one follows with its own header
+        pos_ += blk
+        dim as long v1 = h.version
+        if tzifHeader( p, n, pos_, h ) = false then return false
+        if h.version <> v1 then return false
+        pos_ += 44
+        tsize = 8
+        blk = tzifBlockSize( h, 8 )
+        if blk < 0 orelse blk > n - pos_ then return false
+    end if
+
+    '' Leap-second files count TAI-like seconds; chrono's time scale has none.
+    if h.leapcnt <> 0 then return false
+
+    dim as TzRules r
+    r.m_version = h.version
+    dim as long tc = clng( h.timecnt ), ty = clng( h.typecnt ), cc = clng( h.charcnt )
+
+    '' transition times, strictly ascending
+    if tc > 0 then
+        redim r.m_trans( 0 to tc - 1 )
+        redim r.m_idx( 0 to tc - 1 )
+    end if
+    for i as long = 0 to tc - 1
+        dim as longint t
+        if tsize = 8 then t = tzifBe64( p + pos_ ) else t = tzifBe32( p + pos_ )
+        if i > 0 andalso t <= r.m_trans( i - 1 ) then return false
+        r.m_trans( i ) = t
+        pos_ += tsize
+    next
+    '' the type in force from each
+    for i as long = 0 to tc - 1
+        dim as long k = p[pos_]
+        if k >= ty then return false
+        r.m_idx( i ) = k
+        pos_ += 1
+    next
+
+    '' the types; their abbreviations come from the character table after them
+    redim r.m_types( 0 to ty - 1 )
+    dim as longint chars = pos_ + clngint( ty ) * 6
+    for i as long = 0 to ty - 1
+        dim as const ubyte ptr q = p + pos_
+        dim as long off = tzifBe32( q )
+        if off < TZIF_MIN_UTOFF orelse off > TZIF_MAX_UTOFF then return false
+        if q[4] > 1 then return false
+        dim as long ai = q[5]
+        if ai >= cc then return false
+        '' the abbreviation runs to a NUL that must lie inside the table
+        dim as long e = ai
+        while e < cc andalso p[chars + e] <> 0
+            e += 1
+        wend
+        if e >= cc then return false
+        dim as string a = space( e - ai )
+        for j as long = 0 to e - ai - 1
+            a[j] = p[chars + ai + j]
+        next
+        r.m_types( i ).offset = off
+        r.m_types( i ).isDst = ( q[4] = 1 )
+        r.m_types( i ).abbr = a
+        pos_ += 6
+    next
+    '' leap records (none, refused above), then the standard/wall and UT/local
+    '' indicators: 0 or 1 each, and read by nothing here -- they only matter to
+    '' a POSIX rule applied without a footer
+    pos_ = chars + cc
+    dim as long nind = clng( h.isstdcnt + h.isutcnt )
+    for i as long = 0 to nind - 1
+        if p[pos_ + i] > 1 then return false
+    next
+    pos_ += nind
+
+    '' the footer: "\n" TZ "\n". An empty TZ string means none.
+    if h.version >= 2 then
+        if pos_ >= n orelse p[pos_] <> 10 then return false
+        dim as longint e = pos_ + 1
+        while e < n andalso p[e] <> 10
+            e += 1
+        wend
+        if e >= n then return false
+        dim as longint fl = e - pos_ - 1
+        if fl > 0 then
+            dim as string f = space( fl )
+            for j as longint = 0 to fl - 1
+                f[j] = p[pos_ + 1 + j]
+            next
+            if tzParsePosix( f, r.m_footer ) = false then return false
+            r.m_hasFooter = true
+            r.m_footerText = f
+        end if
+    end if
+
+    r.m_valid = true
+    result = r
+    return true
+end function
+
+function TzRules.TryParse( byref bytes as string, byref result as TzRules ) as boolean
+    if len( bytes ) = 0 then return false
+    return TzRules.TryParse( cptr( const ubyte ptr, strptr( bytes ) ), len( bytes ), result )
+end function
+
+function TzRules.TryParsePosix( byref s as string, byref result as TzRules ) as boolean
+    dim as TzRules r
+    if tzParsePosix( s, r.m_footer ) = false then return false
+    r.m_hasFooter = true
+    r.m_footerText = s
+    r.m_version = 0
+    '' One type, the standard time, for completeness: lookups never reach it,
+    '' since a TzRules with a footer and no transitions always reads the footer.
+    redim r.m_types( 0 to 0 )
+    r.m_types( 0 ).offset = r.m_footer.stdOff
+    r.m_types( 0 ).abbr = r.m_footer.stdAbbr
+    r.m_valid = true
+    result = r
+    return true
+end function

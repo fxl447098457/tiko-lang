@@ -317,13 +317,50 @@ timestamp from another season and the most common time-zone bug there is.
 `DaylightName( )` complete the set. `WallClock.Now( )` records the offset it was read under, so it
 converts back to the right instant even across a change.
 
-There is no database of named zones. chrono cannot answer "what time is it in Tokyo?" from the
-name alone, and has no rule for a wall time that occurs twice when the clocks go back. A program
-that must know an exact point in time should carry an `Instant`, store and send it in UTC, and
-convert to local time only for display.
-
 The output of this listing is the same everywhere because it prints only facts that hold in every
 zone; the offsets themselves depend on the machine.
+
+### Named zones
+
+chrono knows one zone, the machine's. **`std/tz`** knows them all, by their IANA names
+(`America/New_York`, `Europe/London`), with their history: the date New York changes to daylight
+time has moved several times, most recently in 2007, and a timestamp from any era converts by the
+rules of its own day.
+
+```tiko
+{{#include ../examples/ch26/named-zones.tiko}}
+```
+
+```text
+{{#include ../examples/ch26/named-zones.out}}
+```
+
+`TimeZone.FindById( name )` looks a zone up. On Linux and macOS `std/tz` reads the zone files the
+system installs; **`#import "std/tzdata"`** builds a copy of the database into the program (about
+250 KB), which is what makes the listing run on Windows, and is the fallback wherever a system's
+files are missing.
+
+A **`ZonedDateTime`** is an instant together with its zone. The instant is what it *is*; the
+wall-clock reading is worked out from the zone's rules. That is why one value can be the earlier
+01:30 of 2 November and another the later one: the readings are equal, the instants an hour apart.
+Two ways of moving it in time match the two kinds of arithmetic in this chapter. `Add( span )`
+adds elapsed time. `AddCalendarDays( n )` keeps the wall-clock reading and works the offset out
+again, so the weekly call stays at 09:00 New York time across the change, and the first week is 167
+hours long.
+
+A wall-clock reading in a zone names **one** instant, **two** when the clocks go back, or **none**
+when they go forward. `MapLocal` reports which. `FromLocal` takes a `Disambiguation` for the other
+two cases: `dzCompatible` (the default) takes the earlier of two and moves a skipped reading forward
+by the length of the gap; `dzEarlier` and `dzLater` choose; `dzReject` refuses, and `TryFromLocal`
+reports it as `false`.
+
+`ToIsoString` writes the zone after the offset, `2025-11-02T01:30:00-05:00[America/New_York]`,
+and `ParseIso` reads it back to the same instant in the same zone. In a pattern, `VV` is the zone's
+name and `v` its abbreviation at that instant. Store the name: `CST` is the abbreviation of three
+different zones.
+
+A program that must know an exact point in time still carries an `Instant` and stores it in UTC; a
+zone is what turns it into a reading that a person in a particular place expects.
 
 ## Clocks
 
@@ -428,7 +465,10 @@ merged log.
   error: quote literal letters.
 - `AddDays` is exact; `AddMonths` and `AddYears` clamp at month end and do not reverse.
   `EndOf*` is the last tick. Print `IsoWeekYear` with `IsoWeek`.
-- Time zones are the operating system's: `TimeZoneInfo.LocalOffsetAt( instant )`.
+- The machine's zone: `TimeZoneInfo.LocalOffsetAt( instant )`. Any zone by name: `#import "std/tz"`,
+  `TimeZone.FindById`, and a `ZonedDateTime` for an instant in a zone; `#import "std/tzdata"` for
+  the database inside the program. A reading names one instant, two or none: `MapLocal` and a
+  `Disambiguation` policy.
 - `Stopwatch` for elapsed time, `CpuClock` for processor time, `WallClock` for the time of day.
 - `FromSerial`/`Serial` bridge to `datetime.bi`.
 
@@ -443,3 +483,6 @@ merged log.
    29 February. Which line has to change, and why is `AddYears` no longer enough?
 5. `iso-log-times.tiko` prints its times in UTC. Print them instead in the offset of the first line
    of the log, using `DateTime.FromInstant`.
+6. Print a table of the next ten changes of offset in `Europe/London`, `America/New_York` and
+   `Australia/Sydney`, sorted by instant, each as its local reading before and after the change.
+   Which zone changes in the opposite direction to the others, and why?

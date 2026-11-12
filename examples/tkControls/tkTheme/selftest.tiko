@@ -138,8 +138,256 @@ sub Images()
     tkHost_Destroy( h )
 end sub
 
+' ---- TH1 (docs/tkDesigner/THEMES.md): derivation, recipes, styles, shape, scopes ------------
+' Golden colours were computed independently (float32 lerp, round half to even), not read back.
+dim shared as long gHits(0 to 31)
+
+function Counter( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg = TKM_THEMECHANGED then gHits(w->ctrlId) += 1 : return true
+    return false
+end function
+
+sub ZeroHits()
+    for i as long = 0 to 31
+        gHits(i) = 0
+    next
+end sub
+
+sub Derivation()
+    tkTest_Begin( "derive" )
+    dim as TKTHEME_COLORS d = tkTheme_Dark(), l = tkTheme_Light()
+    tkTest_Check( "roles by index", tkTheme_Role( d, TKROLE_WINDOW ) = d.Window andalso tkTheme_Role( d, TKROLE_ERROR ) = d.Error _
+        andalso tkTheme_Role( d, TKROLE_SELECTED ) = d.Selected andalso tkTheme_Role( d, TKROLE_COUNT ) = 0 )
+    dim as TKTHEME_COLORS e = d
+    tkTheme_SetRole( e, TKROLE_TRACK, &hFF010203ul )
+    tkTest_Check( "SetRole writes that field only", e.Track = &hFF010203ul andalso e.Text = d.Text andalso e.Success = d.Success )
+    tkTest_Check( "contrast white/black = 21, a colour on itself = 1", _
+        abs( tkTheme_Contrast( &hFFFFFFFFul, &hFF000000ul ) - 21 ) < 0.0001 andalso abs( tkTheme_Contrast( d.Text, d.Text ) - 1 ) < 0.0001 )
+    tkTest_Check( "a translucent colour is blended before measuring", tkTheme_Over( &h80FFFFFFul, &hFF000000ul ) = &hFF808080ul _
+        andalso abs( tkTheme_Contrast( &h80FFFFFFul, &hFF000000ul ) - 5.3172 ) < 0.001 )
+
+    dim as TKTHEME_COLORS r = tkTheme_Derive( d, tkRGB( 220, 60, 60 ) )
+    tkTest_Check( "Derive( Dark, red ): accent roles", r.Accent = &hFFDC3C3Cul andalso r.FocusRing = &hFFDC3C3Cul _
+        andalso r.AccentHot = &hFFE36363ul andalso r.Selected = &hFF752F33ul andalso r.SelectedText = &hFFFFFFFFul, _
+        hex( r.AccentHot ) & " " & hex( r.Selected ) )
+    tkTest_Check( "Derive leaves every other role", r.Window = d.Window andalso r.Surface = d.Surface andalso r.Text = d.Text _
+        andalso r.Border = d.Border andalso r.Error = d.Error andalso r.IsDark )
+    dim as TKTHEME_COLORS y = tkTheme_Derive( l, tkRGB( 255, 220, 0 ) )
+    tkTest_Check( "Derive( Light, yellow ): a low-contrast accent is darkened to 3:1", y.Accent = &hFF968200ul _
+        andalso y.AccentHot = &hFF786800ul andalso y.Selected = &hFF968200ul andalso y.SelectedText = &hFF000000ul _
+        andalso tkTheme_Contrast( y.Accent, l.Window ) >= 3, hex( y.Accent ) )
+    tkTest_Check( "Derive forces the accent opaque", (tkTheme_Derive( d, &h40DC3C3Cul ).Accent shr 24) = 255 )
+
+    dim as ulong s = tkRGB( 200, 40, 40 )
+    tkTest_Check( "rules on dark", tkTheme_DeriveColor( TKDERIVE_HOT, s, d ) = &hFFC83C3Dul _
+        andalso tkTheme_DeriveColor( TKDERIVE_PRESSED, s, d ) = &hFFC85154ul _
+        andalso tkTheme_DeriveColor( TKDERIVE_DISABLED, s, d ) = &hFF74262Aul andalso tkTheme_DeriveColor( TKDERIVE_SAME, s, d ) = s )
+    tkTest_Check( "rules on light", tkTheme_DeriveColor( TKDERIVE_HOT, s, l ) = &hFFB42727ul _
+        andalso tkTheme_DeriveColor( TKDERIVE_PRESSED, s, l ) = &hFF9E2626ul andalso tkTheme_DeriveColor( TKDERIVE_DISABLED, s, l ) = &hFFDE8E8Eul )
+    tkTest_Check( "a rule keeps the source's alpha", tkTheme_DeriveColor( TKDERIVE_HOT, &h80C82828ul, d ) = &h80C83C3Dul )
+end sub
+
+' A stand-in colour struct: four ulongs, as every control's is.
+type FAKE_COLORS
+    Back    as ulong
+    Fore    as ulong
+    BackHot as ulong
+    Border  as ulong
+end type
+
+function FakeFrom( byref t as TKTHEME_COLORS ) as FAKE_COLORS
+    dim as FAKE_COLORS c
+    c.Back = t.Surface : c.Fore = t.Text : c.BackHot = t.SurfaceHot : c.Border = t.Border
+    return c
+end function
+
+' What a TH2 control will do in its ApplyTheme.
+function Resolved( byval w as TK_WIDGET ptr ) as FAKE_COLORS
+    dim as TKTHEME_COLORS t = tkTheme_RolesFor( w )
+    dim as FAKE_COLORS c = FakeFrom( t )
+    tkTheme_ResolveInto( w, t, cast( ulong ptr, @c ), sizeof( FAKE_COLORS ) \ 4 )
+    return c
+end function
+
+sub Recipes()
+    tkTest_Begin( "recipe" )
+    tkTheme_Apply( tkTheme_Dark() )
+    dim as TK_HOST ptr h = tkHost_Create( "recipes", 200, 120, tkHost_FontDir() & TK_FONT_UI, 1 )
+    dim as TK_WIDGET ptr w = tkWidget_Create( h, 20, @Counter, 0 )
+    ZeroHits()
+    dim as FAKE_COLORS c = Resolved( w )
+    tkTest_Check( "no recipe: the theme's mapping, untouched", c.Back = tkTheme_Dark().Surface andalso c.BackHot = tkTheme_Dark().SurfaceHot )
+
+    dim as TKCOLOR_SRC src(0 to 3)
+    src(0) = tkTheme_SrcFixed( 0, tkRGB( 200, 40, 40 ) )                          ' Back: fixed red
+    src(1) = tkTheme_SrcDerive( 2, TKDERIVE_HOT, 0 )                              ' BackHot from Back
+    src(2) = tkTheme_SrcRole( 1, TKROLE_TEXTSTRONG )                              ' Fore: a role
+    src(3) = tkTheme_SrcFixed2( 3, tkRGB( 0, 128, 0 ), tkRGB( 0, 0, 255 ) )       ' Border: per variant
+    tkTheme_SetRecipe( w, 0, @src(0), 4 )
+    tkTest_Check( "SetRecipe copies and tells the widget", tkTheme_RecipeCount( w ) = 4 andalso gHits(20) = 1 )
+    src(0) = tkTheme_SrcFixed( 0, 0 )
+    c = Resolved( w )
+    tkTest_Check( "dark: fixed, derived, role, dark twin", c.Back = &hFFC82828ul andalso c.BackHot = &hFFC83C3Dul _
+        andalso c.Fore = &hFFFFFFFFul andalso c.Border = &hFF008000ul, hex( c.Back ) & " " & hex( c.BackHot ) )
+    tkTheme_Apply( tkTheme_Light() )
+    c = Resolved( w )
+    tkTest_Check( "light: the SAME recipe follows the switch", c.Back = &hFFC82828ul andalso c.BackHot = &hFFB42727ul _
+        andalso c.Fore = &hFF000000ul andalso c.Border = &hFF0000FFul )
+
+    ' several entries for one slot: the last wins, a derive included
+    dim as TKCOLOR_SRC two(0 to 3)
+    two(0) = tkTheme_SrcFixed( 0, &hFF111111ul )
+    two(1) = tkTheme_SrcFixed( 0, &hFF222222ul )
+    two(2) = tkTheme_SrcDerive( 2, TKDERIVE_SAME, 0 )
+    two(3) = tkTheme_SrcFixed( 2, &hFF333333ul )
+    tkTheme_SetRecipe( w, 0, @two(0), 4 )
+    c = Resolved( w )
+    tkTest_Check( "duplicates: the last entry wins", c.Back = &hFF222222ul andalso c.BackHot = &hFF333333ul )
+    two(3) = tkTheme_SrcDerive( 2, TKDERIVE_SAME, 0 )
+    two(2) = tkTheme_SrcFixed( 2, &hFF333333ul )
+    tkTheme_SetRecipe( w, 0, @two(0), 4 )
+    c = Resolved( w )
+    tkTest_Check( "a later derive beats an earlier fixed", c.BackHot = &hFF222222ul )
+    dim as TKCOLOR_SRC bad(0 to 1)
+    bad(0) = tkTheme_SrcFixed( 9, &hFFFFFFFFul )
+    bad(1) = tkTheme_SrcDerive( 1, TKDERIVE_SAME, 40 )
+    tkTheme_SetRecipe( w, 0, @bad(0), 2 )
+    c = Resolved( w )
+    tkTest_Check( "a slot or source past the struct is ignored", c.Fore = tkTheme_Light().Text )
+    tkTheme_ClearRecipe( w )
+    tkTest_Check( "ClearRecipe", tkTheme_RecipeCount( w ) = 0 andalso Resolved( w ).Back = tkTheme_Light().Surface )
+    tkHost_Destroy( h )
+    tkTheme_Apply( tkTheme_Dark() )
+end sub
+
+dim shared as TKTHEME_STYLE gStyles(0 to 1)
+
+sub Styles()
+    tkTest_Begin( "styles" )
+    dim as TKTHEME_COLORS d = tkTheme_Dark()
+    ' 1 Primary: faces read Accent, text reads SelectedText, the hot face derives from the NEW face
+    gStyles(0).remap(TKROLE_SURFACE) = tkTheme_SrcRole( 0, TKROLE_ACCENT )
+    gStyles(0).remap(TKROLE_TEXT) = tkTheme_SrcRole( 0, TKROLE_SELECTEDTEXT )
+    gStyles(0).remap(TKROLE_SURFACEHOT) = tkTheme_SrcDerive( 0, TKDERIVE_SAME, TKROLE_SURFACE )
+    ' 2 Swap: Surface and Accent trade places (role sources read the theme BEFORE the remap)
+    gStyles(1).remap(TKROLE_SURFACE) = tkTheme_SrcRole( 0, TKROLE_ACCENT )
+    gStyles(1).remap(TKROLE_ACCENT) = tkTheme_SrcRole( 0, TKROLE_SURFACE )
+    dim as TKTHEME_COLORS p = tkTheme_Remap( d, gStyles(0) )
+    tkTest_Check( "Remap: Primary", p.Surface = tkRGB( 86, 156, 214 ) andalso p.Text = tkRGB( 255, 255, 255 ) _
+        andalso p.SurfaceHot = tkRGB( 86, 156, 214 ) andalso p.Border = d.Border )
+    dim as TKTHEME_COLORS q = tkTheme_Remap( d, gStyles(1) )
+    tkTest_Check( "Remap: roles swap", q.Surface = tkRGB( 86, 156, 214 ) andalso q.Accent = tkRGB( 44, 49, 58 ) )
+
+    dim as TK_HOST ptr h = tkHost_Create( "styles", 200, 120, tkHost_FontDir() & TK_FONT_UI, 1 )
+    dim as TK_WIDGET ptr w = tkWidget_Create( h, 21, @Counter, 0 )
+    ZeroHits()
+    tkTheme_SetStyles( @gStyles(0), 2 )
+    tkTest_Check( "SetStyles restyles every widget", gHits(21) = 1 )
+    tkTheme_SetRecipe( w, 1, 0, 0 )
+    tkTest_Check( "a style alone is a recipe", tkTheme_RecipeStyle( w ) = 1 andalso tkTheme_RecipeCount( w ) = 0 )
+    tkTest_Check( "RolesFor: the app's styles", tkTheme_RolesFor( w ).Surface = tkRGB( 86, 156, 214 ) )
+    tkTheme_SetRecipe( w, 3, 0, 0 )
+    tkTest_Check( "an unknown style id is no style", tkTheme_RolesFor( w ).Surface = d.Surface )
+    ' entries resolve against the STYLED roles
+    dim as TKCOLOR_SRC one = tkTheme_SrcRole( 3, TKROLE_SURFACE )
+    tkTheme_SetRecipe( w, 1, @one, 1 )
+    tkTest_Check( "a role entry reads the styled theme", Resolved( w ).Border = tkRGB( 86, 156, 214 ) )
+    tkTheme_SetStyles( 0, 0 )
+    tkTest_Check( "no styles: the style id is ignored", tkTheme_RolesFor( w ).Surface = d.Surface )
+    tkHost_Destroy( h )
+end sub
+
+sub Scopes()
+    tkTest_Begin( "scope" )
+    tkTheme_Apply( tkTheme_Dark() )
+    dim as TKTHEME_COLORS proj = tkTheme_Light()
+    proj.Window = &h80FAF0E6ul                      ' translucent on purpose: it must come back opaque
+    proj.Surface = tkRGB( 1, 2, 3 )
+    dim as TK_HOST ptr h = tkHost_Create( "scopes", 300, 200, tkHost_FontDir() & TK_FONT_UI, 1 )
+    dim as TK_WIDGET ptr a = tkWidget_Create( h, 10, @Counter, 0 )
+    dim as TK_WIDGET ptr a1 = tkWidget_CreateChild( a, 11, @Counter, 0 )
+    dim as TK_WIDGET ptr b = tkWidget_Create( h, 12, @Counter, 0 )
+    dim as TK_WIDGET ptr b1 = tkWidget_CreateChild( b, 13, @Counter, 0 )
+    dim as TK_WIDGET ptr c = tkWidget_Create( h, 14, @Counter, 0 )
+    ZeroHits()
+    tkTheme_ApplyTo( a, proj )
+    tkTest_Check( "ApplyTo reaches the subtree and only it", gHits(10) = 1 andalso gHits(11) = 1 andalso gHits(12) = 0 andalso gHits(13) = 0 )
+    tkTest_Check( "Of: inside the scope its theme, outside the app's", tkTheme_Of( a1 ).Surface = tkRGB( 1, 2, 3 ) _
+        andalso tkTheme_Of( b1 ).Surface = tkTheme_Dark().Surface andalso tkTheme_HasScope( a ) andalso (tkTheme_HasScope( a1 ) = false) )
+    tkTest_Check( "a scope's Window is forced opaque", tkTheme_Of( a ).Window = &hFFFAF0E6ul )
+    ZeroHits()
+    tkTheme_Apply( tkTheme_Light() )
+    tkTest_Check( "the app's theme change skips the scoped subtree", gHits(10) = 0 andalso gHits(11) = 0 andalso gHits(12) = 1 andalso gHits(13) = 1 )
+    tkTest_Check( "and the scope's theme is unchanged", tkTheme_Of( a1 ).Surface = tkRGB( 1, 2, 3 ) )
+
+    ' a nested scope keeps its own when the outer one changes
+    dim as TKTHEME_COLORS inner = tkTheme_Dark()
+    inner.Surface = tkRGB( 9, 9, 9 )
+    tkTheme_ApplyTo( a1, inner )
+    ZeroHits()
+    tkTheme_ApplyTo( a, tkTheme_Dark() )
+    tkTest_Check( "nested: the outer re-apply skips the inner scope", gHits(10) = 1 andalso gHits(11) = 0 andalso tkTheme_Of( a1 ).Surface = tkRGB( 9, 9, 9 ) )
+
+    ' moving between differently themed subtrees restyles; within one does not
+    ZeroHits()
+    tkWidget_Reparent( b1, a )
+    tkTest_Check( "Reparent into a scope: told", gHits(13) = 1 andalso tkTheme_Of( b1 ).Surface = tkTheme_Dark().Surface )
+    tkWidget_Reparent( b1, b )
+    tkTest_Check( "and back out: told again", gHits(13) = 2 )
+    tkWidget_Reparent( b1, c )
+    tkTest_Check( "between two unscoped parents: not told", gHits(13) = 2 )
+
+    ' shape
+    dim as TKTHEME_SHAPE sh0 = tkTheme_GetShape()
+    tkTest_Check( "default shape: every control's own", sh0.CornerRadius = -1 andalso sh0.BorderWidth = -1 andalso tkTheme_ShapeOf( b1 ).CornerRadius = -1 )
+    dim as TKTHEME_SHAPE sh
+    sh.CornerRadius = 6 : sh.BorderWidth = 2
+    ZeroHits()
+    tkTheme_SetShape( sh )
+    tkTest_Check( "SetShape broadcasts, outside scopes", gHits(12) = 1 andalso gHits(10) = 0 andalso tkTheme_ShapeOf( b1 ).CornerRadius = 6 )
+    tkTheme_SetShape( sh )
+    tkTest_Check( "an equal shape is not re-broadcast", gHits(12) = 1 )
+    dim as TKTHEME_SHAPE ssh
+    ssh.CornerRadius = 12
+    tkTheme_ApplyTo( a, tkTheme_Dark(), @ssh )
+    tkTest_Check( "a scope's shape; a nested scope has its own", tkTheme_ShapeOf( a ).CornerRadius = 12 andalso tkTheme_ShapeOf( a ).BorderWidth = -1 _
+        andalso tkTheme_ShapeOf( a1 ).CornerRadius = -1 )
+    tkTheme_SetShape( sh0 )
+
+    ' a scope's styles replace the app's
+    tkTheme_SetStyles( @gStyles(0), 1 )
+    tkTheme_ApplyTo( a, tkTheme_Dark(), 0, @gStyles(1), 1 )
+    tkTheme_SetRecipe( a, 1, 0, 0 )
+    tkTheme_SetRecipe( b, 1, 0, 0 )
+    tkTest_Check( "style 1 inside the scope is the scope's (Swap)", tkTheme_RolesFor( a ).Accent = tkRGB( 44, 49, 58 ) )
+    tkTest_Check( "style 1 outside is the app's (Primary)", tkTheme_RolesFor( b ).Text = tkRGB( 255, 255, 255 ) )
+    tkTheme_SetStyles( 0, 0 )
+
+    ZeroHits()
+    tkTheme_ClearScope( a )
+    tkTest_Check( "ClearScope: back to the app's, told, inner scope untouched", (tkTheme_HasScope( a ) = false) _
+        andalso tkTheme_Of( a ).Surface = tkTheme_Light().Surface andalso gHits(10) = 1 andalso gHits(11) = 0 _
+        andalso tkTheme_Of( a1 ).Surface = tkRGB( 9, 9, 9 ) )
+
+    ' a whole surface with its own theme: the app's broadcast skips it
+    dim as TK_HOST ptr pop = tkHost_CreatePopup( h, 10, 10, 100, 60 )
+    dim as TK_WIDGET ptr pw = tkWidget_Create( pop, 15, @Counter, 0 )
+    tkTheme_ApplyTo( tkHost_Root( pop ), proj )
+    ZeroHits()
+    tkTheme_Apply( tkTheme_Dark() )
+    tkTest_Check( "a scoped surface root: the app's change skips it", gHits(15) = 0 andalso gHits(12) = 1 )
+    ' destroying scoped and recipe-carrying widgets frees their blocks (a crash would end the run)
+    tkWidget_Destroy( a )
+    tkHost_Destroy( h )
+    tkTest_Check( "scoped widgets destroy cleanly", true )
+end sub
+
 if tkTest_Init() = false then end 99
 Themes()
+Derivation()
+Recipes()
+Styles()
+Scopes()
 Images()
 dim as long nFail = tkTest_Report( "tkTheme" )
 tkTest_Quit()

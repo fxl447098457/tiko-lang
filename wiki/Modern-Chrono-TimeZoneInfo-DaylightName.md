@@ -12,7 +12,8 @@ TimeZoneInfo.DaylightName( ) as ustring
 
 ## Notes
 
-- For display only, like `StandardName`.
+- For display only, like `StandardName`: a display name on Windows, an abbreviation on Linux and macOS.
+- A zone with no daylight saving time gives the standard name on Linux and macOS; Windows gives its own daylight name for the zone even then.
 - An empty string when the OS gives no name.
 
 ## Examples

@@ -15,6 +15,7 @@ tiko is a compiled, statically typed programming language for building fast, sel
 | [Feature Index](Feature-Index) | Every language feature and library, one line each, with its reference page |
 | [Function Finder](Function-Finder) | Every function, grouped by what you want to do, with one line on what each one does |
 | [FAQ](tiko-lang-FAQ) | Short answers to the questions that come up first |
+| [AI Cheatsheet](AI-Cheatsheet) | The whole language and standard library on one page, for AI coding agents: syntax, idioms and the mistakes that break builds |
 
 ## Tutorials
 
@@ -58,7 +59,7 @@ Every listing in the book is a real program, compiled and run on Windows, Linux 
 
 **Values and text:** [Optional](Category-Optional) · [Result](Category-Result) · [SharedPtr and WeakPtr](Category-Smart-Pointers) · [String Library](Category-String-Library) · [Format](Category-Format) · [Codec](Category-Codec) · [Hash](Category-Hash) · [UUID](Category-UUID)
 
-**System and numbers:** [Chrono Date and Time](Category-Date-and-Time-Chrono) · [Filesystem Library](Category-Filesystem) · [File Streams](Category-File-Streams) · [OS](Category-OS) · [Process](Category-Process) · [Net](Category-Net) · [HTTP and TLS](Category-Http) · [Config](Category-Config) · [Math Library](Category-Math-Library) · [Finance](Category-Finance) · [Logging](Category-Logging) · [Terminal TUI Library](Category-Terminal-TUI-Library)
+**System and numbers:** [Chrono Date and Time](Category-Date-and-Time-Chrono) · [Time Zones](Category-Time-Zones) · [Filesystem Library](Category-Filesystem) · [File Streams](Category-File-Streams) · [OS](Category-OS) · [Process](Category-Process) · [Net](Category-Net) · [HTTP and TLS](Category-Http) · [Config](Category-Config) · [Math Library](Category-Math-Library) · [Finance](Category-Finance) · [Logging](Category-Logging) · [Terminal TUI Library](Category-Terminal-TUI-Library)
 
 ## The toolchain
 

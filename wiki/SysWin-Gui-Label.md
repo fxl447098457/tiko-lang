@@ -108,14 +108,9 @@ The icon comes from `LoadIconW` and is shared, so nothing is freed at the end.
 function GetText( byval hStatic as HWND ) as ustring
 ```
 
-Returns the label's text. The string ends with the null character that ends the text, so
-`len()` is one more than the number of characters and a comparison with a literal is false.
-Remove it with `rtrim( ..., chr(0) )`. The buffer is sized from
-[GetTextLength](#gettextlength); where that count is larger than the text, the string also ends
-in spaces after the null.
+Returns the label's text.
 
-**Returns** the text and its terminating null; for an empty label, a string of one null
-character.
+**Returns** the text of the control for an empty label, an empty string.
 
 **Example**
 
@@ -132,9 +127,7 @@ Microsoft Learn: [GetWindowTextW](https://learn.microsoft.com/en-us/windows/win3
 function GetTextLength( byval hStatic as HWND ) as long
 ```
 
-Returns the length of the label's text as the ANSI function `GetWindowTextLength` measures it:
-the number of characters for text that the system code page can represent, possibly more for
-text a double-byte code page stores in two bytes per character.
+Returns the length of the label's text.
 
 **Returns** the length, or 0 when the label has no text.
 
@@ -194,8 +187,7 @@ function Disable( byval hStatic as HWND ) as boolean
 
 Disables the label: its text is greyed out and it sends no notifications.
 
-**Returns** `true` when the label was enabled before the call, `false` when it was already
-disabled (the opposite of what `Button.Disable` returns).
+**Returns** `true` or `false`.
 
 **Example**
 

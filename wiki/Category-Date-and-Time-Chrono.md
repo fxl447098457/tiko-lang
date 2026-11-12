@@ -270,7 +270,8 @@ components
 offsets and instants
 
 .WithOffset( offMin )   reinterpret   .ToOffset( offMin )   convert
-.AssumeUtc -> Instant   .ToInstant -> Instant   .ToLocal -> DateTime
+.AssumeUtc -> Instant   .AssumeLocal -> Instant
+.ToInstant -> Instant   .ToLocal -> DateTime
 
 exact arithmetic -- ticks, no calendar
 
@@ -360,17 +361,19 @@ TimeZoneInfo -- the OS zone
 
 ```freebasic
 TimeZoneInfo.LocalOffsetAt( instant )      the offset AT THAT INSTANT
+TimeZoneInfo.TryLocalOffsetAt( instant, off )   false for an Invalid instant
 TimeZoneInfo.LocalOffset                   the offset right now
 TimeZoneInfo.IsDaylightSavingTime( instant )
 TimeZoneInfo.SupportsDaylightSavingTime
-TimeZoneInfo.StandardName / .DaylightName
+TimeZoneInfo.StandardName / .DaylightName  display text: "Newfoundland Standard
+                                           Time" on Windows, "NST" elsewhere
 
 LocalOffsetAt EXISTS BECAUSE "the current offset" IS THE WRONG DEFAULT.
 Converting a July timestamp with January's offset is the commonest timezone
 bug there is, and an API offering only LocalOffset makes it the easy path.
 ```
 
-Pages: [LocalOffsetAt](Modern-Chrono-TimeZoneInfo-LocalOffsetAt) · [LocalOffset](Modern-Chrono-TimeZoneInfo-LocalOffset) · [IsDaylightSavingTime](Modern-Chrono-TimeZoneInfo-IsDaylightSavingTime) · [SupportsDaylightSavingTime](Modern-Chrono-TimeZoneInfo-SupportsDaylightSavingTime) · [StandardName](Modern-Chrono-TimeZoneInfo-StandardName) · [DaylightName](Modern-Chrono-TimeZoneInfo-DaylightName)
+Pages: [LocalOffsetAt](Modern-Chrono-TimeZoneInfo-LocalOffsetAt) · [TryLocalOffsetAt](Modern-Chrono-TimeZoneInfo-TryLocalOffsetAt) · [LocalOffset](Modern-Chrono-TimeZoneInfo-LocalOffset) · [IsDaylightSavingTime](Modern-Chrono-TimeZoneInfo-IsDaylightSavingTime) · [SupportsDaylightSavingTime](Modern-Chrono-TimeZoneInfo-SupportsDaylightSavingTime) · [StandardName](Modern-Chrono-TimeZoneInfo-StandardName) · [DaylightName](Modern-Chrono-TimeZoneInfo-DaylightName)
 
 ## EXACT ARITHMETIC vs CALENDAR ARITHMETIC
 
@@ -379,12 +382,16 @@ Three families, and the names say which is which.
 ```freebasic
 AddDays( 1 )            exactly 86400 seconds. Does NOT keep the wall-clock
                         time across a DST boundary.
-AddCalendarDays( 1 )    same wall-clock time tomorrow. Re-resolves the
-                        offset, so across a DST boundary it is 23 or 25
-                        hours of real time.
+AddCalendarDays( 1 )    same wall-clock time tomorrow. Re-resolves a local
+                        reading's offset, so across a DST boundary it is
+                        23 or 25 hours of real time.
 AddMonths( 1 )          calendar months, offset untouched.
 AddCalendarMonths( 1 )  calendar months, offset re-resolved.
 ```
+
+ONLY A LOCAL READING FOLLOWS THE OS ZONE: one whose offset is the zone's at its own instant, as WallClock.Now and ToLocal give. A UTC or other fixed-offset value keeps its offset, so AddCalendarDays( 1 ) on 2025-07-01T12:00Z is 2025-07-02T12:00Z on every machine. A DateTime carries no zone, so a fixed offset that happens to equal the zone's at that instant -- UTC on a London machine in winter -- is taken as local.
+
+A wall reading that falls in a fall-back overlap keeps the offset it started with; one that falls in a spring-forward gap does not exist and moves forward by the gap, so 02:30 in a 02:00 -> 03:00 gap becomes 03:30.
 
 "24 hours from now" is AddDays( 1 ). "Same time tomorrow" is AddCalendarDays( 1 ). They differ twice a year, and a program that means one and writes the other is correct in testing and wrong in October.
 
@@ -668,7 +675,7 @@ ToString( "d" )                  the named int16-date format, not a field
 ToLocaleString                   not reproducible; never write it to a file
 ```
 
-TIME ZONES ARE THE OS's. There is no IANA tzdb, no named zones and no DST-ambiguity policy. Programs that care about an exact point in time should carry an Instant and never round-trip through a naive DateTime.
+TIME ZONES HERE ARE THE OS's: the machine's own zone. Every other zone, by its IANA name, is [Time Zones](Category-Time-Zones) (std/tz). AssumeLocal reads a wall reading in the OS zone: in a fall-back overlap it names the EARLIER instant, and in a spring-forward gap the reading moves forward by the gap. Programs that care about an exact point in time should carry an Instant and never round-trip through a naive DateTime.
 
 ## WHERE THIS DIFFERS FROM datetime.bi
 
@@ -728,22 +735,15 @@ that needs a table which must be updated by hand and which no OS exposes
 reliably. UTC-SLS and the smeared clocks are what production systems
 actually run.
 
-THE IANA TZ DATABASE, NAMED ZONES, AND DST-AMBIGUITY POLICIES. The OS
-already knows the user's zone and keeps its rules current; shipping and
-maintaining a copy of the tzdb is a project of its own. Nothing here
-forecloses a future ZonedDateTime -- DateTime already carries an offset.
+NAMED ZONES. They are std/tz: TimeZone, ZonedDateTime, the policies for a
+reading that happens twice or never, and std/tzdata for the database itself.
+See [Time Zones](Category-Time-Zones).
 
 NON-GREGORIAN CALENDARS. Proleptic Gregorian, year 1 to 9999, and no
 calendar abstraction to make room for others.
 
 A LENIENT PARSER. There is no equivalent of DateValue's guessing. If the
 input is not ISO 8601, name the pattern.
-
-AssumeLocal. The shipped module has AssumeUtc, ToInstant and ToLocal but
-not AssumeLocal. Compose it as
-d.WithOffset( TimeZoneInfo.LocalOffset ).ToInstant( ) when the value is
-known to be present-day; a fall-back hour makes the general case
-ambiguous.
 ```
 
 ## Implementation
@@ -1042,6 +1042,7 @@ Every entry, grouped by task. [Dates and times](Functions-Dates) lists them besi
 | [DateTime.ToLocal](Modern-Chrono-DateTime-ToLocal) | Returns the same moment shown at the machine's local UTC offset. | `std/chrono` |
 | [DateTime.FromInstant](Modern-Chrono-DateTime-FromInstant) | Returns the date-time a moment shows on a clock with the given UTC offset. | `std/chrono` |
 | [TimeZoneInfo.LocalOffsetAt](Modern-Chrono-TimeZoneInfo-LocalOffsetAt) | Returns the local zone's UTC offset in minutes at a given moment, DST included. | `std/chrono` |
+| [TimeZoneInfo.TryLocalOffsetAt](Modern-Chrono-TimeZoneInfo-TryLocalOffsetAt) | Gets the local zone's UTC offset at a given moment, returning false for an Invalid moment. | `std/chrono` |
 | [TimeZoneInfo.LocalOffset](Modern-Chrono-TimeZoneInfo-LocalOffset) | Returns the local zone's UTC offset in minutes right now. | `std/chrono` |
 | [TimeZoneInfo.IsDaylightSavingTime](Modern-Chrono-TimeZoneInfo-IsDaylightSavingTime) | Returns true if daylight saving time is in force in the local zone at a given moment. | `std/chrono` |
 | [TimeZoneInfo.SupportsDaylightSavingTime](Modern-Chrono-TimeZoneInfo-SupportsDaylightSavingTime) | Returns true if the local zone observes daylight saving time at all. | `std/chrono` |

@@ -3,6 +3,7 @@
 '
 '   <module>/<module>.forms.tiko   the typed wrapper for that control: Text, Checked, ...
 '   tkMeta/tkMeta.gen.tiko         the table a form designer reads: names, kinds, apply thunks
+'   tkThemeFile/tkThemeFile.gen.tiko   each control type's colour fields, for loading a .tktheme at run time
 '
 '   tkmetagen <path to pkg/vendor/tkControls>
 '
@@ -151,6 +152,86 @@ function SetterParam_( byref kind as const ustring ) as ustring
     return "byval v as " & TypeOf_( kind )
 end function
 
+sub Fail_( byref msg as const ustring )
+    print "tkmetagen: " & msg
+    end 1
+end sub
+
+' The fields of "public type st" in root/mod/mod.tiko, in order: names in names(), types in types().
+' Comments and blank lines are skipped.
+function StructFields_( byref root as const ustring, byref mod_ as const ustring, byref st as const ustring, _
+                        names() as ustring, types() as ustring ) as long
+    dim as ustring path = root & "/" & mod_ & "/" & mod_ & ".tiko"
+    dim as ustring text = fs.ReadAllText( path ).ValueOr( "" )
+    if len( text ) = 0 then Fail_( "cannot read " & path )
+    dim as long at = instr( text, NL & "public type " & st & NL )
+    if at = 0 then Fail_( mod_ & ": no ""public type " & st & """ in " & path )
+    at = instr( at + 1, text, NL ) + 1                   ' past the "public type" line
+    dim as long n = 0
+    do
+        dim as long eol = instr( at, text, NL )
+        if eol = 0 then Fail_( mod_ & ": " & st & " has no end type" )
+        dim as ustring ln = mid( text, at, eol - at )
+        at = eol + 1
+        dim as long q = instr( ln, "'" )
+        if q then ln = left( ln, q - 1 )
+        ln = trim( ln, any !" \t\r" )
+        if len( ln ) = 0 then continue do
+        if lcase( ln ) = "end type" then exit do
+        dim as long sp = instr( ln, " as " )
+        if sp = 0 then Fail_( mod_ & ": cannot read the " & st & " line '" & ln & "'" )
+        redim preserve names( 0 to n ), types( 0 to n )
+        names( n ) = trim( left( ln, sp - 1 ) )
+        dim as ustring ty = trim( mid( ln, sp + 4 ) )
+        dim as long eq = instr( ty, "=" )
+        if eq then ty = trim( left( ty, eq - 1 ) )
+        types( n ) = lcase( ty )
+        n += 1
+    loop
+    return n
+end function
+
+' color_fields must list the struct's fields, every one, in order, all ulong; parts and states
+' must come from the dialog's vocabulary, and no two fields may be one grid cell.
+sub CheckColors_( byref ctl as TomlValue, byref root as const ustring )
+    dim as ustring name_ = Str_( ctl, "name" ), mod_ = Str_( ctl, "module" )
+    dim as TomlValue ptr col = ctl.Find( "colors" )
+    dim as TomlValue ptr flds = ctl.Find( "color_fields" )
+    if col = 0 then
+        if flds then Fail_( name_ & ": color_fields without colors" )
+        exit sub
+    end if
+    if flds = 0 then Fail_( name_ & ": colors without color_fields" )
+    dim as ustring st = Str_( *col, "struct" )
+    dim as ustring names( any ), types( any )
+    dim as long n = StructFields_( root, mod_, st, names(), types() )
+    if flds->Count( ) <> n then Fail_( name_ & ": color_fields lists " & flds->Count( ) & " fields, " & st & " has " & n )
+    for i as long = 0 to n - 1
+        dim as TomlValue ptr f = @flds->Item( i )
+        if types( i ) <> "ulong" then Fail_( name_ & ": " & st & "." & names( i ) & " is " & types( i ) & ", not ulong" )
+        if Str_( *f, "field" ) <> names( i ) then Fail_( name_ & ": color_fields entry " & i & " is " & Str_( *f, "field" ) & ", the struct's is " & names( i ) )
+        dim as ustring part = Str_( *f, "part" ), state = Str_( *f, "state" ), grp = Str_( *f, "group" )
+        if len( part ) then
+            select case state
+            case "Normal", "Hot", "Pressed", "Disabled", "Selected", "Open"
+            case else : Fail_( name_ & "." & names( i ) & ": unknown state '" & state & "'" )
+            end select
+        elseif len( state ) orelse len( grp ) then
+            Fail_( name_ & "." & names( i ) & ": a state or group needs a part" )
+        end if
+        select case grp
+        case "", "Checked", "On", "Off"
+        case else : Fail_( name_ & "." & names( i ) & ": unknown group '" & grp & "'" )
+        end select
+        for j as long = 0 to i - 1
+            dim as TomlValue ptr g = @flds->Item( j )
+            if len( part ) andalso (Str_( *g, "part" ) = part) andalso (Str_( *g, "state" ) = state) andalso (Str_( *g, "group" ) = grp) then
+                Fail_( name_ & ": " & names( j ) & " and " & names( i ) & " are the same grid cell" )
+            end if
+        next
+    next
+end sub
+
 sub Save_( byref path as const ustring, byref text as const ustring )
     if fs.WriteAllText( path, text ).IsOk( ) = false then
         print "cannot write " & path
@@ -243,7 +324,7 @@ end function
 
 sub GenMeta( byref root_ as TomlValue, byref root as const ustring )
     dim as TomlValue ptr ctls = root_.Find( "control" )
-    dim as ustring imports, usings, thunks, fill
+    dim as ustring imports, usings, thunks, fill, fields
     dim as ustring o = GENERATED & NL & "#module ""tkMeta""" & NL & NL
     for c as long = 0 to ctls->Count( ) - 1
         dim as TomlValue ptr ctl = @ctls->Item( c )
@@ -274,10 +355,42 @@ sub GenMeta( byref root_ as TomlValue, byref root as const ustring )
                 & Quote_( Str_( *ctl, "default_event" ) ) & ", " & Quote_( Str_( *ctl, "container" ) ) & ", @C_" & name_ & ", " _
                 & Quote_( Str_( *ctl, "create_arg" ) ) & ", " & Quote_( argKind ) & ", " & Quote_( argEnum ) & ", " & Quote_( Str_( *ctl, "create_arg_default" ) ) & " )" & NL
 
+        dim as TomlValue ptr col = ctl->Find( "colors" )
+        if col then
+            dim as ustring st = Str_( *col, "struct" ), cg = Str_( *col, "get" ), ct = Str_( *col, "theme" )
+            thunks &= "private sub G_" & name_ & "( byval w as TK_WIDGET ptr, byval pSlots as ulong ptr )" & NL
+            if Flag_( *col, "get_returns", false ) then
+                thunks &= "    *cast( " & st & " ptr, pSlots ) = " & cg & "( w )" & NL
+            else
+                thunks &= "    " & cg & "( w, cast( " & st & " ptr, pSlots ) )" & NL
+            end if
+            thunks &= "end sub" & NL & NL
+            thunks &= "private sub T_" & name_ & "( byref t as TKTHEME_COLORS, byval pSlots as ulong ptr )" & NL
+            thunks &= "    *cast( " & st & " ptr, pSlots ) = " & ct & "( t )" & NL & "end sub" & NL & NL
+            fill &= "    Colors_( " & Quote_( st ) & ", " & Quote_( cg ) & ", " & Quote_( ct ) & ", @G_" & name_ & ", @T_" & name_ & " )" & NL
+            dim as TomlValue ptr flds = ctl->Find( "color_fields" )
+            fields &= "    Type_( " & Quote_( name_ ) & " )" & NL
+            for i as long = 0 to flds->Count( ) - 1
+                dim as TomlValue ptr f = @flds->Item( i )
+                dim as ustring args = Quote_( Str_( *f, "field" ) ) & ", " & Quote_( Str_( *f, "part" ) ) & ", " & Quote_( Str_( *f, "state" ) ) & ", " _
+                        & Quote_( Str_( *f, "group" ) ) & ", " & iif( Flag_( *f, "ink", false ), "true", "false" ) & " )" & NL
+                fill &= "    Color_( " & args
+                fields &= "    Field_( " & args
+            next
+        end if
+
         dim as TomlValue ptr props = ctl->Find( "props" )
         for i as long = 0 to props->Count( ) - 1
             dim as TomlValue ptr p = @props->Item( i )
             dim as ustring pn = Str_( *p, "name" ), kind = Str_( *p, "kind" ), s_ = Str_( *p, "set" ), g = Str_( *p, "get" )
+            dim as ustring shape = Str_( *p, "theme" )
+            select case shape
+            case "", "CornerRadius", "BorderWidth"
+            case else : Fail_( name_ & "." & pn & ": unknown theme shape '" & shape & "'" )
+            end select
+            if len( shape ) andalso (kind <> "int") then Fail_( name_ & "." & pn & ": a theme shape must be an int property" )
+            dim as long shapeScale = Int_( *p, "scale" )
+            if len( shape ) andalso (shapeScale < 1) then shapeScale = 1
             dim as ustring en = Str_( *p, "enum" ), id_ = name_ & "_" & pn
             dim as ustring applyRef = "0", readRef = "0", fontRef = "0"
             if kind = "font" then
@@ -316,7 +429,8 @@ sub GenMeta( byref root_ as TomlValue, byref root as const ustring )
             end if
             fill &= "    Prop_( " & Quote_( pn ) & ", " & Quote_( kind ) & ", " & Quote_( Str_( *p, "default" ) ) & ", " & Quote_( en ) & ", " _
                     & Quote_( s_ ) & ", " & Quote_( g ) & ", " & applyRef & ", " & readRef & ", " & fontRef & ", " _
-                    & iif( Flag_( *p, "design", true ), "true", "false" ) & " )" & NL
+                    & iif( Flag_( *p, "design", true ), "true", "false" ) & ", " _
+                    & iif( Flag_( *p, "inspector", true ), "true", "false" ) & ", " & Quote_( shape ) & ", " & shapeScale & " )" & NL
         next
 
         dim as TomlValue ptr evs = ctl->Find( "events" )
@@ -326,9 +440,12 @@ sub GenMeta( byref root_ as TomlValue, byref root as const ustring )
                     & Quote_( Str_( *e, "sig" ) ) & ", " & Quote_( Str_( *e, "params" ) ) & ", " & Quote_( Str_( *e, "args" ) ) & " )" & NL
         next
     next
-    o &= "#import ""../tkHost""" & NL & imports & "using tkHost" & NL & "using tkPaint" & NL & usings & NL & thunks
+    o &= "#import ""../tkHost""" & NL & imports & "using tkHost" & NL & "using tkPaint" & NL & usings & "using tkTheme" & NL & NL & thunks
     o &= "sub Fill_( )" & NL & fill & "end sub" & NL
     Save_( root & "/tkMeta/tkMeta.gen.tiko", o )
+    ' the same colour fields for tkThemeFile, which must not link every control as tkMeta does
+    Save_( root & "/tkThemeFile/tkThemeFile.gen.tiko", GENERATED & NL & "#module ""tkThemeFile""" & NL & NL _
+           & "#import ""../tkTheme""" & NL & NL & "sub Fields_( )" & NL & fields & "end sub" & NL )
 end sub
 
 dim as ustring root = command( 1 )
@@ -343,6 +460,9 @@ if r.IsOk( ) = false then
 end if
 dim as TomlValue doc = r.Value( )
 dim as TomlValue ptr ctls = doc.Find( "control" )
+for c as long = 0 to ctls->Count( ) - 1
+    CheckColors_( ctls->Item( c ), root )
+next
 for c as long = 0 to ctls->Count( ) - 1
     GenWrapper( ctls->Item( c ), root )
 next

@@ -5,10 +5,10 @@
 The functions to get the current time, add days and months, parse and print dates, grouped by what you want to do. The **From** column says what a program needs before it can call one:
 
 - **built-in**: nothing; it is always available.
-- `std/chrono`: `#import "std/chrono"`, then `using chrono` to call it by its bare name.
+- `std/<Name>`: `#import "std/<Name>"`, then `using <Name>` to call it by its bare name.
 - `datetime.bi`: `#include "datetime.bi"`.
 
-Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Time how long something takes](#time-how-long-something-takes) · [Make a date, a time or a date-time](#make-a-date-a-time-or-a-date-time) · [Read the year, month, day and time](#read-the-year-month-day-and-time) · [Add days, months and years](#add-days-months-and-years) · [Compare dates and count the days between](#compare-dates-and-count-the-days-between) · [Turn dates and durations into text](#turn-dates-and-durations-into-text) · [Read dates and durations from text](#read-dates-and-durations-from-text) · [Weekdays, weeks and quarters](#weekdays-weeks-and-quarters) · [Month and weekday names](#month-and-weekday-names) · [Jump to the start or end of a day, week, month or year](#jump-to-the-start-or-end-of-a-day-week-month-or-year) · [Leap years and month lengths](#leap-years-and-month-lengths) · [TimeSpan: make a duration](#timespan-make-a-duration) · [TimeSpan: totals and parts](#timespan-totals-and-parts) · [TimeSpan: arithmetic and comparison](#timespan-arithmetic-and-comparison) · [Work with UTC and time-zone offsets](#work-with-utc-and-time-zone-offsets) · [Show a date the way the user's machine writes it](#show-a-date-the-way-the-users-machine-writes-it) · [Convert to Unix time, FILETIME and other numbers](#convert-to-unix-time-filetime-and-other-numbers) · [Check a value is valid, and the range limits](#check-a-value-is-valid-and-the-range-limits) · [Set the system clock](#set-the-system-clock)
+Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Time how long something takes](#time-how-long-something-takes) · [Make a date, a time or a date-time](#make-a-date-a-time-or-a-date-time) · [Read the year, month, day and time](#read-the-year-month-day-and-time) · [Add days, months and years](#add-days-months-and-years) · [Compare dates and count the days between](#compare-dates-and-count-the-days-between) · [Turn dates and durations into text](#turn-dates-and-durations-into-text) · [Read dates and durations from text](#read-dates-and-durations-from-text) · [Weekdays, weeks and quarters](#weekdays-weeks-and-quarters) · [Month and weekday names](#month-and-weekday-names) · [Jump to the start or end of a day, week, month or year](#jump-to-the-start-or-end-of-a-day-week-month-or-year) · [Leap years and month lengths](#leap-years-and-month-lengths) · [TimeSpan: make a duration](#timespan-make-a-duration) · [TimeSpan: totals and parts](#timespan-totals-and-parts) · [TimeSpan: arithmetic and comparison](#timespan-arithmetic-and-comparison) · [Work with UTC and time-zone offsets](#work-with-utc-and-time-zone-offsets) · [Use named time zones (std/tz)](#use-named-time-zones-stdtz) · [Show a date the way the user's machine writes it](#show-a-date-the-way-the-users-machine-writes-it) · [Convert to Unix time, FILETIME and other numbers](#convert-to-unix-time-filetime-and-other-numbers) · [Check a value is valid, and the range limits](#check-a-value-is-valid-and-the-range-limits) · [Set the system clock](#set-the-system-clock)
 
 ## Get the current date and time
 
@@ -22,6 +22,7 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [WallClock.Today](Modern-Chrono-WallClock-Today) | Returns today's local date as a LocalDate. | `std/chrono` |
 | [WallClock.TimeOfDay](Modern-Chrono-WallClock-TimeOfDay) | Returns the current local time of day as a LocalTime. | `std/chrono` |
 | [WallClock.Resolution](Modern-Chrono-WallClock-Resolution) | Returns the smallest step the wall clock reports, as a TimeSpan. | `std/chrono` |
+| [ZonedDateTime.Now](Modern-Tz-ZonedDateTime-Now) | Returns the current moment as it reads in a time zone. | `std/tz` |
 
 ## Time how long something takes
 
@@ -64,6 +65,9 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [LocalTime.FromTicks](Modern-Chrono-LocalTime-FromTicks) | Creates a time of day from 100 ns ticks since midnight, or Invalid past a whole day. | `std/chrono` |
 | [LocalTime.Midnight](Modern-Chrono-LocalTime-Midnight) | Returns the time of day 00:00:00. | `std/chrono` |
 | [LocalTime.Noon](Modern-Chrono-LocalTime-Noon) | Returns the time of day 12:00:00. | `std/chrono` |
+| [ZonedDateTime.FromInstant](Modern-Tz-ZonedDateTime-FromInstant) | Returns a moment as it reads in a time zone. | `std/tz` |
+| [ZonedDateTime.FromLocal](Modern-Tz-ZonedDateTime-FromLocal) | Returns a wall-clock reading in a zone; a policy settles a repeated or skipped one. | `std/tz` |
+| [ZonedDateTime.TryFromLocal](Modern-Tz-ZonedDateTime-TryFromLocal) | Makes a wall-clock reading in a time zone, returning false when the policy refuses it. | `std/tz` |
 
 ## Read the year, month, day and time
 
@@ -95,6 +99,17 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [LocalTime.Second](Modern-Chrono-LocalTime-Second) | Returns the second, 0 to 59. | `std/chrono` |
 | [LocalTime.Millisecond](Modern-Chrono-LocalTime-Millisecond) | Returns the milliseconds within the second, 0 to 999. | `std/chrono` |
 | [LocalTime.Microsecond](Modern-Chrono-LocalTime-Microsecond) | Returns the microseconds within the second, the milliseconds included. | `std/chrono` |
+| [ZonedDateTime.Year](Modern-Tz-ZonedDateTime-Year) | Returns the year of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.Month](Modern-Tz-ZonedDateTime-Month) | Returns the month, 1 to 12 of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.Day](Modern-Tz-ZonedDateTime-Day) | Returns the day of the month of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.Hour](Modern-Tz-ZonedDateTime-Hour) | Returns the hour, 0 to 23 of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.Minute](Modern-Tz-ZonedDateTime-Minute) | Returns the minute of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.Second](Modern-Tz-ZonedDateTime-Second) | Returns the second of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.Millisecond](Modern-Tz-ZonedDateTime-Millisecond) | Returns the millisecond of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.DayOfWeek](Modern-Tz-ZonedDateTime-DayOfWeek) | Returns the weekday, 1 = Monday to 7 = Sunday of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.DayOfYear](Modern-Tz-ZonedDateTime-DayOfYear) | Returns the day of the year, 1 to 366 of the wall-clock reading in the zone. | `std/tz` |
+| [ZonedDateTime.GetDate](Modern-Tz-ZonedDateTime-GetDate) | Returns the date of the wall-clock reading. | `std/tz` |
+| [ZonedDateTime.GetTimeOfDay](Modern-Tz-ZonedDateTime-GetTimeOfDay) | Returns the time of day of the wall-clock reading. | `std/tz` |
 
 ## Add days, months and years
 
@@ -121,6 +136,11 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [LocalDate.AddDays](Modern-Chrono-LocalDate-AddDays) | Returns the date moved by a number of days. | `std/chrono` |
 | [LocalDate.AddMonths](Modern-Chrono-LocalDate-AddMonths) | Returns the date moved by whole months, clamping the day to the month's end. | `std/chrono` |
 | [LocalDate.AddYears](Modern-Chrono-LocalDate-AddYears) | Returns the date moved by whole years; 29 February becomes the 28th if needed. | `std/chrono` |
+| [ZonedDateTime.Add](Modern-Tz-ZonedDateTime-Add) | Adds elapsed time, whatever the clocks do meanwhile. | `std/tz` |
+| [ZonedDateTime.Subtract](Modern-Tz-ZonedDateTime-Subtract) | Subtracts elapsed time, whatever the clocks do meanwhile. | `std/tz` |
+| [ZonedDateTime.AddCalendarDays](Modern-Tz-ZonedDateTime-AddCalendarDays) | Returns the same wall-clock time a number of days later, across any change of offset. | `std/tz` |
+| [ZonedDateTime.AddCalendarMonths](Modern-Tz-ZonedDateTime-AddCalendarMonths) | Returns the same wall-clock time some months later, clamping the day to the month's end. | `std/tz` |
+| [ZonedDateTime.AddCalendarYears](Modern-Tz-ZonedDateTime-AddCalendarYears) | Returns the same wall-clock time some years later, clamping 29 February to the 28th. | `std/tz` |
 
 ## Compare dates and count the days between
 
@@ -131,6 +151,7 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [Instant.CompareTo](Modern-Chrono-Instant-CompareTo) | Returns -1, 0 or 1 to order two moments, or -2 if either is Invalid. | `std/chrono` |
 | [LocalDate.CompareTo](Modern-Chrono-LocalDate-CompareTo) | Returns -1, 0 or 1 to order two dates, or -2 if either is Invalid. | `std/chrono` |
 | [LocalTime.CompareTo](Modern-Chrono-LocalTime-CompareTo) | Returns -1, 0 or 1 to order two times of day, or -2 if either is Invalid. | `std/chrono` |
+| [ZonedDateTime.CompareTo](Modern-Tz-ZonedDateTime-CompareTo) | Compares two values by the moment they name: -1, 0 or 1. | `std/tz` |
 
 ## Turn dates and durations into text
 
@@ -145,6 +166,9 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [LocalTime.ToString](Modern-Chrono-LocalTime-ToString) | Returns the time of day as ISO 8601 text, the same as ToIsoString. | `std/chrono` |
 | [TimeSpan.ToIsoString](Modern-Chrono-TimeSpan-ToIsoString) | Returns the duration as ISO 8601 text, such as PT1H30M. | `std/chrono` |
 | [TimeSpan.ToString](Modern-Chrono-TimeSpan-ToString) | Returns the duration as ISO 8601 text, the same as ToIsoString. | `std/chrono` |
+| [ZonedDateTime.ToIsoString](Modern-Tz-ZonedDateTime-ToIsoString) | Writes the value as ISO 8601 text with the zone in brackets, which reads back exactly. | `std/tz` |
+| [ZonedDateTime.ToString](Modern-Tz-ZonedDateTime-ToString) | Writes the value as ISO 8601 text, or through a pattern with VV for the zone id. | `std/tz` |
+| [ZonedDateTime.TryFormat](Modern-Tz-ZonedDateTime-TryFormat) | Formats the value through a pattern, returning false for a bad pattern. | `std/tz` |
 
 ## Read dates and durations from text
 
@@ -164,6 +188,11 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [LocalTime.TryParseIso](Modern-Chrono-LocalTime-TryParseIso) | Reads ISO text into a time of day; returns false and sets it Invalid on failure. | `std/chrono` |
 | [TimeSpan.ParseIso](Modern-Chrono-TimeSpan-ParseIso) | Reads an ISO 8601 duration such as P1DT2H into a TimeSpan, or Invalid on failure. | `std/chrono` |
 | [TimeSpan.TryParseIso](Modern-Chrono-TimeSpan-TryParseIso) | Reads an ISO 8601 duration; returns false and sets it Invalid on failure. | `std/chrono` |
+| [ZonedDateTime.TryParseIso](Modern-Tz-ZonedDateTime-TryParseIso) | Reads ISO 8601 text with a [Zone/Id] annotation, returning false if it cannot. | `std/tz` |
+| [ZonedDateTime.ParseIso](Modern-Tz-ZonedDateTime-ParseIso) | Reads ISO 8601 text with a [Zone/Id] annotation, or stops with an error. | `std/tz` |
+| [ZonedDateTime.TryParseExact](Modern-Tz-ZonedDateTime-TryParseExact) | Reads text in a pattern that ends in VV, returning false if it does not match. | `std/tz` |
+| [ZonedDateTime.ParseExact](Modern-Tz-ZonedDateTime-ParseExact) | Reads text in a pattern that ends in VV, or stops with an error. | `std/tz` |
+| [OffsetPolicy](Modern-Tz-OffsetPolicy) | Chooses what parsing does when the text's offset and its zone disagree. | `std/tz` |
 
 ## Weekdays, weeks and quarters
 
@@ -189,6 +218,9 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [WeekdayName](Weekdayname) | Returns the name of a weekday number in the system's language, or its abbreviation. | `datetime.bi` |
 | [DateTime.MonthName](Modern-Chrono-DateTime-MonthName) | Returns a month's name in the user's language, or its abbreviation. | `std/chrono` |
 | [DateTime.WeekdayName](Modern-Chrono-DateTime-WeekdayName) | Returns a weekday's name in the user's language, 1 being Monday, or its abbreviation. | `std/chrono` |
+| [TimeZone.AbbreviationAt](Modern-Tz-TimeZone-AbbreviationAt) | Returns the zone's abbreviation at a given moment, such as EST or CEST. | `std/tz` |
+| [ZonedDateTime.Abbreviation](Modern-Tz-ZonedDateTime-Abbreviation) | Returns the zone's abbreviation at this moment, such as EDT. | `std/tz` |
+| [TzRules.AbbreviationAt](Modern-Tz-TzRules-AbbreviationAt) | Returns the zone's abbreviation at a moment given in Unix seconds. | `std/tz` |
 
 ## Jump to the start or end of a day, week, month or year
 
@@ -209,6 +241,7 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [LocalDate.EndOfMonth](Modern-Chrono-LocalDate-EndOfMonth) | Returns the last day of the date's month. | `std/chrono` |
 | [LocalDate.IsFirstDayOfMonth](Modern-Chrono-LocalDate-IsFirstDayOfMonth) | Returns true if the date is the first day of its month. | `std/chrono` |
 | [LocalDate.IsLastDayOfMonth](Modern-Chrono-LocalDate-IsLastDayOfMonth) | Returns true if the date is the last day of its month. | `std/chrono` |
+| [ZonedDateTime.StartOfDay](Modern-Tz-ZonedDateTime-StartOfDay) | Returns the first moment of the date in the zone, which is not always midnight. | `std/tz` |
 
 ## Leap years and month lengths
 
@@ -277,14 +310,58 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [DateTime.IsUtc](Modern-Chrono-DateTime-IsUtc) | Returns true if the offset is zero; a date-time with no offset is not UTC. | `std/chrono` |
 | [DateTime.ToInstant](Modern-Chrono-DateTime-ToInstant) | Returns the moment the date-time names, or Invalid if it has no offset. | `std/chrono` |
 | [DateTime.AssumeUtc](Modern-Chrono-DateTime-AssumeUtc) | Returns the moment the date-time names if its clock reading is taken as UTC. | `std/chrono` |
+| [DateTime.AssumeLocal](Modern-Chrono-DateTime-AssumeLocal) | Returns the moment the date-time names if its clock reading is taken as local time. | `std/chrono` |
 | [DateTime.ToLocal](Modern-Chrono-DateTime-ToLocal) | Returns the same moment shown at the machine's local UTC offset. | `std/chrono` |
 | [DateTime.FromInstant](Modern-Chrono-DateTime-FromInstant) | Returns the date-time a moment shows on a clock with the given UTC offset. | `std/chrono` |
 | [TimeZoneInfo.LocalOffsetAt](Modern-Chrono-TimeZoneInfo-LocalOffsetAt) | Returns the local zone's UTC offset in minutes at a given moment, DST included. | `std/chrono` |
+| [TimeZoneInfo.TryLocalOffsetAt](Modern-Chrono-TimeZoneInfo-TryLocalOffsetAt) | Gets the local zone's UTC offset at a given moment, returning false for an Invalid moment. | `std/chrono` |
 | [TimeZoneInfo.LocalOffset](Modern-Chrono-TimeZoneInfo-LocalOffset) | Returns the local zone's UTC offset in minutes right now. | `std/chrono` |
 | [TimeZoneInfo.IsDaylightSavingTime](Modern-Chrono-TimeZoneInfo-IsDaylightSavingTime) | Returns true if daylight saving time is in force in the local zone at a given moment. | `std/chrono` |
 | [TimeZoneInfo.SupportsDaylightSavingTime](Modern-Chrono-TimeZoneInfo-SupportsDaylightSavingTime) | Returns true if the local zone observes daylight saving time at all. | `std/chrono` |
 | [TimeZoneInfo.StandardName](Modern-Chrono-TimeZoneInfo-StandardName) | Returns the OS's name for the local zone's standard time. | `std/chrono` |
 | [TimeZoneInfo.DaylightName](Modern-Chrono-TimeZoneInfo-DaylightName) | Returns the OS's name for the local zone's daylight saving time. | `std/chrono` |
+| [TimeZone.OffsetSecondsAt](Modern-Tz-TimeZone-OffsetSecondsAt) | Returns the zone's offset from UTC in seconds at a given moment. | `std/tz` |
+| [TimeZone.OffsetAt](Modern-Tz-TimeZone-OffsetAt) | Returns the zone's offset from UTC at a given moment as a TimeSpan. | `std/tz` |
+| [TimeZone.StandardOffsetAt](Modern-Tz-TimeZone-StandardOffsetAt) | Returns the zone's standard offset at a given moment, leaving daylight time out. | `std/tz` |
+| [TimeZone.IsDaylightSavingTime](Modern-Tz-TimeZone-IsDaylightSavingTime) | Returns true if the zone's rules call that moment daylight time. | `std/tz` |
+| [ZonedDateTime.OffsetSeconds](Modern-Tz-ZonedDateTime-OffsetSeconds) | Returns the offset from UTC in force at this moment, in seconds. | `std/tz` |
+| [ZonedDateTime.Offset](Modern-Tz-ZonedDateTime-Offset) | Returns the offset from UTC in force at this moment as a TimeSpan. | `std/tz` |
+| [ZonedDateTime.IsDaylightSavingTime](Modern-Tz-ZonedDateTime-IsDaylightSavingTime) | Returns true if the zone's rules call this moment daylight time. | `std/tz` |
+| [TzRules.OffsetSecondsAt](Modern-Tz-TzRules-OffsetSecondsAt) | Returns the offset from UTC in seconds at a moment given in Unix seconds. | `std/tz` |
+| [TzRules.StandardOffsetSecondsAt](Modern-Tz-TzRules-StandardOffsetSecondsAt) | Returns the standard offset in seconds at a moment in Unix seconds, leaving DST out. | `std/tz` |
+| [TzRules.IsDstAt](Modern-Tz-TzRules-IsDstAt) | Returns true if the rules call a moment, given in Unix seconds, daylight time. | `std/tz` |
+
+## Use named time zones (std/tz)
+
+| Function | What it does | From |
+|---|---|---|
+| [TimeZone.FindById](Modern-Tz-TimeZone-FindById) | Returns the time zone with an IANA id such as Europe/Paris, or stops with an error. | `std/tz` |
+| [TimeZone.TryFindById](Modern-Tz-TimeZone-TryFindById) | Looks up a time zone by IANA id, returning false when there is no such zone. | `std/tz` |
+| [TimeZone.Utc](Modern-Tz-TimeZone-Utc) | Returns the UTC time zone, which needs no zone database. | `std/tz` |
+| [TimeZone.FixedOffset](Modern-Tz-TimeZone-FixedOffset) | Returns a time zone that is always a fixed number of seconds ahead of UTC. | `std/tz` |
+| [TimeZone.Local](Modern-Tz-TimeZone-Local) | Returns the machine's own time zone, answered by the operating system. | `std/tz` |
+| [TimeZone.AvailableIds](Modern-Tz-TimeZone-AvailableIds) | Returns every zone id the first zone source holds, sorted. | `std/tz` |
+| [TimeZone.DataVersion](Modern-Tz-TimeZone-DataVersion) | Returns the tz database release the first zone source holds, such as 2026f. | `std/tz` |
+| [TimeZone.RegisterDatabase](Modern-Tz-TimeZone-RegisterDatabase) | Gives std/tz a zone database to fall back on, in the .tzdb format tools/tzdb makes. | `std/tz` |
+| [TimeZone.Id](Modern-Tz-TimeZone-Id) | Returns the zone's id: its IANA name, UTC, or a fixed offset such as +05:30. | `std/tz` |
+| [TimeZone.IsFixed](Modern-Tz-TimeZone-IsFixed) | Returns true if the zone is UTC or a fixed offset, with no rules that change. | `std/tz` |
+| [TimeZone.TryNextTransition](Modern-Tz-TimeZone-TryNextTransition) | Finds the next moment the zone's offset changes after a given moment. | `std/tz` |
+| [TimeZone.TryPreviousTransition](Modern-Tz-TimeZone-TryPreviousTransition) | Finds the last moment before a given moment when the zone's offset changed. | `std/tz` |
+| [TimeZone.MapLocal](Modern-Tz-TimeZone-MapLocal) | Counts the moments a wall-clock reading names in the zone: 1, 2 or 0. | `std/tz` |
+| [TimeZone.TryResolve](Modern-Tz-TimeZone-TryResolve) | Turns a wall-clock reading in the zone into one moment, under a Disambiguation policy. | `std/tz` |
+| [TimeZone.Resolve](Modern-Tz-TimeZone-Resolve) | Returns the moment a wall-clock reading names in the zone, or stops with an error. | `std/tz` |
+| [Disambiguation](Modern-Tz-Disambiguation) | Chooses what a wall-clock reading that happened twice, or never, should mean. | `std/tz` |
+| [ZonedDateTime.Zone](Modern-Tz-ZonedDateTime-Zone) | Returns the time zone of a ZonedDateTime. | `std/tz` |
+| [ZonedDateTime.WithZoneSameInstant](Modern-Tz-ZonedDateTime-WithZoneSameInstant) | Returns the same moment as it reads in another time zone. | `std/tz` |
+| [ZonedDateTime.WithZoneSameLocal](Modern-Tz-ZonedDateTime-WithZoneSameLocal) | Returns the same wall-clock reading in another time zone, which is a different moment. | `std/tz` |
+| [TzRules.TryParse](Modern-Tz-TzRules-TryParse) | Reads one zone's rules from the bytes of a compiled zone file, or returns false. | `std/tz` |
+| [TzRules.TryParsePosix](Modern-Tz-TzRules-TryParsePosix) | Reads one zone's rules from a POSIX TZ string such as EST5EDT,M3.2.0,M11.1.0. | `std/tz` |
+| [TzRules.Version](Modern-Tz-TzRules-Version) | Returns the zone file's format version, 1 to 4, or 0 for rules from a POSIX TZ string. | `std/tz` |
+| [TzRules.TransitionCount](Modern-Tz-TzRules-TransitionCount) | Returns how many transitions the zone file lists, before its rule for later years. | `std/tz` |
+| [TzRules.PosixRule](Modern-Tz-TzRules-PosixRule) | Returns the POSIX TZ rule that covers the years after the file's last transition. | `std/tz` |
+| [TzRules.TryNextTransition](Modern-Tz-TzRules-TryNextTransition) | Finds the next change of offset after a moment, in Unix seconds. | `std/tz` |
+| [TzRules.TryPreviousTransition](Modern-Tz-TzRules-TryPreviousTransition) | Finds the last change of offset before a moment, in Unix seconds. | `std/tz` |
+| [tzdata.Version](Modern-Tz-Tzdata-Version) | Returns the release of the zone database std/tzdata puts in the program, such as 2026f. | `std/tzdata` |
 
 ## Show a date the way the user's machine writes it
 
@@ -315,6 +392,9 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [DateTime.JulianDay](Modern-Chrono-DateTime-JulianDay) | Returns the Julian day, a fractional day count whose days start at noon. | `std/chrono` |
 | [DateTime.JulianDayNumber](Modern-Chrono-DateTime-JulianDayNumber) | Returns the whole Julian day number, without the fraction. | `std/chrono` |
 | [DateTime.FromJulianDay](Modern-Chrono-DateTime-FromJulianDay) | Creates a date-time from a fractional Julian day. | `std/chrono` |
+| [ZonedDateTime.ToInstant](Modern-Tz-ZonedDateTime-ToInstant) | Returns the moment a ZonedDateTime names. | `std/tz` |
+| [ZonedDateTime.ToDateTime](Modern-Tz-ZonedDateTime-ToDateTime) | Returns the wall-clock reading with its offset as a chrono DateTime. | `std/tz` |
+| [ZonedDateTime.ToWall](Modern-Tz-ZonedDateTime-ToWall) | Returns the wall-clock reading alone, as a DateTime with no offset. | `std/tz` |
 
 ## Check a value is valid, and the range limits
 
@@ -335,6 +415,11 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 | [TimeSpan.Invalid](Modern-Chrono-TimeSpan-Invalid) | Returns the Invalid duration, which spreads to anything computed from it. | `std/chrono` |
 | [TimeSpan.MinValue](Modern-Chrono-TimeSpan-MinValue) | Returns the most negative duration a TimeSpan can hold. | `std/chrono` |
 | [TimeSpan.MaxValue](Modern-Chrono-TimeSpan-MaxValue) | Returns the longest duration a TimeSpan can hold. | `std/chrono` |
+| [TimeZone.IsValid](Modern-Tz-TimeZone-IsValid) | Returns true if the time zone refers to a zone; a dim'd TimeZone does not. | `std/tz` |
+| [ZonedDateTime.Invalid](Modern-Tz-ZonedDateTime-Invalid) | Returns an Invalid ZonedDateTime, the value arithmetic gives outside the years 1 to 9999. | `std/tz` |
+| [ZonedDateTime.IsValid](Modern-Tz-ZonedDateTime-IsValid) | Returns true unless the ZonedDateTime is Invalid. | `std/tz` |
+| [TzRules.IsValid](Modern-Tz-TzRules-IsValid) | Returns true if the rules were read; a dim'd TzRules has none. | `std/tz` |
+| [TZ_MIN_UNIX and TZ_MAX_UNIX](Modern-Tz-Constants) | Gives the range std/tz works in, 0001-01-01 to 9999-12-31, in Unix seconds. | `std/tz` |
 
 ## Set the system clock
 
@@ -346,6 +431,7 @@ Jump to: [Get the current date and time](#get-the-current-date-and-time) · [Tim
 ## See Also
 
 - [Date and Time (Chrono) guide](Category-Date-and-Time-Chrono)
+- [Time Zones guide](Category-Time-Zones)
 - [Date and Time Functions](Category-Date-and-Time-Functions)
 - [Date and time functions overview](Date-and-Time-Functions)
 

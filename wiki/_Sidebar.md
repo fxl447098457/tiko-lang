@@ -8,6 +8,7 @@
 - [Feature Index](Feature-Index)
 - [Compatibility](Compatibility)
 - [FAQ](tiko-lang-FAQ)
+- [AI Cheatsheet](AI-Cheatsheet)
 
 ### Documentation
 
@@ -48,6 +49,7 @@
 - [Result](Category-Result)
 - [Smart Pointers](Category-Smart-Pointers)
 - [Date and Time (Chrono)](Category-Date-and-Time-Chrono)
+- [Time Zones](Category-Time-Zones)
 - [Filesystem](Category-Filesystem)
 - [File Streams](Category-File-Streams)
 - [Config (INI and TOML)](Category-Config)

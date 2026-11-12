@@ -119,8 +119,8 @@ end type
 
 destructor FormApp( )
 	'' whoever holds the pointers owns them.
-	for i as int32 = 0 to gFields.Count( ) - 1
-		if( gFields[i] <> 0 ) then delete gFields[i]
+	for each fld in gFields
+		if( fld <> 0 ) then delete fld
 	next
 	gFields.Clear( )
 end destructor

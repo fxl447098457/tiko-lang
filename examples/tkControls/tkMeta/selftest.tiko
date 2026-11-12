@@ -3,6 +3,7 @@
 #import "vendor/tkControls/tkMeta"
 #import "vendor/tkControls/tkTest"
 using tkMeta
+using tkTheme
 using tkTest
 using tkHost
 using tkPaint
@@ -29,6 +30,41 @@ function NeedsContent( byref who as const ustring ) as boolean
     return false
 end function
 
+' An int the control keeps as given (MonthCount is 1 or 2).
+function IntValue( byref who as const ustring ) as ustring
+    if who = "DatePicker.MonthCount" then return "2"
+    return "3"
+end function
+
+' A value for a "list" property: one per slot, of the slot's kind.
+function ListValue( byref pairs as const ustring ) as ustring
+    dim as ustring o
+    for i as long = 0 to tkMeta_ListCount( pairs ) - 1
+        if i then o &= ","
+        select case tkMeta_ListSlot( pairs, i )
+        case "int", "float" : o &= "1"
+        case "color"        : o &= "&hFF112233"
+        case "bool"         : o &= "true"
+        case else           : o &= "a"
+        end select
+    next
+    return o
+end function
+
+' The colour struct, read before any property pins it: every slot is the theme's, through both thunks.
+sub CheckColors( byval c as TKMETA_CONTROL ptr, byval w as TK_WIDGET ptr )
+    if c->NumColorSlots = 0 then exit sub
+    tkTest_Check( c->Name & " has colour thunks", (c->GetColors <> 0) andalso (c->ThemeColors <> 0) andalso (len( c->ColorStruct ) > 0) )
+    dim as ulong got( 0 to c->NumColorSlots - 1 ), want( 0 to c->NumColorSlots - 1 )
+    c->GetColors( w, @got( 0 ) )
+    c->ThemeColors( tkTheme_Of( w ), @want( 0 ) )
+    dim as long d = -1
+    for i as long = 0 to c->NumColorSlots - 1
+        if got( i ) <> want( i ) then d = i : exit for
+    next
+    tkTest_Check( c->Name & ": GetColors = ThemeColors at create, slot for slot", d = -1, "slot " & d )
+end sub
+
 sub TryValue( byval c as TKMETA_CONTROL ptr, byval p as TKMETA_PROP ptr, byval w as TK_WIDGET ptr, byref v as const ustring )
     p->Apply( w, v )
     if (p->Read_ = 0) orelse NeedsContent( c->Name & "." & p->Name ) then exit sub
@@ -42,6 +78,7 @@ sub CheckControl( byval c as TKMETA_CONTROL ptr, byval h as TK_HOST ptr, byval p
     tkTest_Check( c->Name & " created", w <> 0 )
     if w = 0 then exit sub
     tkWidget_SetPos( w, 10, 10, cint( c->Width_ * h->fScale ), cint( c->Height_ * h->fScale ) )
+    CheckColors( c, w )
 
     for i as long = 0 to c->NumProps - 1
         dim as TKMETA_PROP ptr p = @c->Props( i )
@@ -56,7 +93,7 @@ sub CheckControl( byval c as TKMETA_CONTROL ptr, byval h as TK_HOST ptr, byval p
         case "file"
             TryValue( c, p, w, "no-such-file.png" )
         case "int"
-            TryValue( c, p, w, "3" )
+            TryValue( c, p, w, IntValue( c->Name & "." & p->Name ) )
         case "bool"
             TryValue( c, p, w, "true" )
             TryValue( c, p, w, "false" )
@@ -72,6 +109,10 @@ sub CheckControl( byval c as TKMETA_CONTROL ptr, byval h as TK_HOST ptr, byval p
                 TryValue( c, p, w, shown )
                 e += 1
             loop
+        case "list"
+            dim as ustring v = ListValue( p->EnumPairs )
+            tkTest_Check( c->Name & "." & p->Name & " list value fits", len( tkMeta_ListFault( v, p->EnumPairs ) ) = 0, v )
+            p->Apply( w, v )
         case else
             tkTest_Check( c->Name & "." & p->Name & " has a known kind", false, p->Kind )
         end select
@@ -100,6 +141,30 @@ sub RunPass( byval fScale as single )
     tkTest_Check( "find a property", tkMeta_FindProp( tkMeta_Find( "Button" ), "Text" ) <> 0 )
     tkTest_Check( "find an event", tkMeta_FindEvent( tkMeta_Find( "Button" ), "Click" ) <> 0 )
     tkTest_Check( "a click handler takes nothing", len( tkMeta_FindEvent( tkMeta_Find( "Button" ), "Click" )->Params ) = 0 )
+    ' Themes (THEMES.md, TH3): which controls have a colour struct, which properties a theme's shape
+    ' supplies, which colour properties the inspector leaves to the Colors dialog.
+    dim as long nColors = 0, nSlots = 0, nShape = 0, nHidden = 0
+    for i as long = 0 to tkMeta_Count( ) - 1
+        dim as TKMETA_CONTROL ptr c = tkMeta_At( i )
+        if c->NumColorSlots then nColors += 1 : nSlots += c->NumColorSlots
+        for k as long = 0 to c->NumProps - 1
+            if len( c->Props( k ).ThemeShape ) then nShape += 1
+            if c->Props( k ).bInspector = false then nHidden += 1
+        next
+    next
+    tkTest_Check( "23 controls describe a colour struct, 292 fields", (nColors = 23) andalso (nSlots = 292), nColors & " / " & nSlots )
+    tkTest_Check( "12 shape properties, 14 hidden colour properties", (nShape = 12) andalso (nHidden = 14), nShape & " / " & nHidden )
+    dim as TKMETA_CONTROL ptr btn = tkMeta_Find( "Button" )
+    tkTest_Check( "Button: slot by name, cell by part and state", (tkMeta_ColorSlot( btn, "FocusRingColor" ) = 16) _
+        andalso (tkMeta_ColorCell( btn, "", "Back", "Hot" ) = 4) andalso (tkMeta_ColorCell( btn, "", "Back", "Open" ) = -1) )
+    dim as TKMETA_PROP ptr cc = tkMeta_FindProp( btn, "CornerCurvature" )
+    tkTest_Check( "Button.CornerCurvature is the theme's CornerRadius x 2", (cc->ThemeShape = "CornerRadius") andalso (cc->ShapeScale = 2) )
+    dim as TKMETA_CONTROL ptr chk = tkMeta_Find( "CheckBox" )
+    dim as long sl = tkMeta_ColorCell( chk, "Checked", "Box", "Pressed" )
+    tkTest_Check( "CheckBox: the Checked grid", (sl >= 0) andalso (chk->Colors( sl ).Name = "BoxColorCheckedPressed") )
+    tkTest_Check( "ink parts are marked", chk->Colors( tkMeta_ColorSlot( chk, "ForeColor" ) ).bInk andalso (chk->Colors( tkMeta_ColorSlot( chk, "BackColor" ) ).bInk = false) )
+    tkTest_Check( "a hidden colour property", tkMeta_FindProp( tkMeta_Find( "Label" ), "TextColor" )->bInspector = false _
+        andalso tkMeta_FindProp( tkMeta_Find( "ListTree" ), "BackColor" )->bInspector )
     for i as long = 0 to tkMeta_Count( ) - 1
         CheckControl( tkMeta_At( i ), h, root_, 100 + i )
     next

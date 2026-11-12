@@ -20,10 +20,7 @@ formatting. You get one from a range or the selection, and from the document's d
 **Ownership.** The constructor takes the `ITextFont2` pointer as it is, without adding a
 reference (pass `true` as the second argument to add one), and the destructor releases it. So
 `dim f as CTextFont2 = rng.GetFont()` takes over the pointer `GetFont` returned and needs no
-release of its own. The class has no copy constructor or assignment of its own: a copy shares the
-same pointer and both copies release it, so pass a `CTextFont2` `byref` and do not copy it. The
-pointer is in the public field `m_pTextFont2`, for calls into the interface the class does not
-wrap.
+release of its own.
 
 **Three forms of each property.** Most attributes come as `GetX()`, which returns the value;
 `SetX( Value )`, which returns the `HRESULT`; and a property `X` to read and assign

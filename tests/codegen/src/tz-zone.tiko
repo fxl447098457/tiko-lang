@@ -1,0 +1,258 @@
+'' std/tz phase Z2: TimeZone -- ids, the zone cache, $TZDIR, the Local zone, UTC and
+'' fixed offsets. Prints "ok", or the first failed check. $TZDIR is pointed at
+'' tests/codegen/tzdata (tzdata 2026f laid out as a zoneinfo tree, with an alias, a
+'' posix/ and right/ copy, localtime, posixrules, tzdata.zi and a .tab file).
+''   1. threads: 8 threads find the same zones at once, on an empty cache
+''   2. every fixture zone found by id, and in agreement with its file read directly
+''   3. ids: case-insensitive, returned canonical; links keep their name; the
+''      invalid ones are refused before any file is touched
+''   4. UTC, fixed offsets, AvailableIds, DataVersion, StandardOffsetAt
+''   5. Local agrees with chrono.TimeZoneInfo, and its scanned transitions are real
+''   6. Linux and macOS: the system tree (TZDIR emptied) -- every id it lists loads
+''      and agrees with glibc's localtime_r
+#import "std/tz"
+#import "std/chrono"
+#import "std/os"
+#import "std/containers"
+#import "std/outcome"
+using tz
+
+dim shared as long failures = 0
+sub check( byval ok as boolean, byref what as string )
+    if ok = false then
+        if failures = 0 then print "FAIL: "; what
+        failures += 1
+    end if
+end sub
+
+function at( byval y as long, byval mo as long, byval d as long, _
+             byval h as long = 0, byval mi as long = 0, byval s as long = 0 ) as chrono.Instant
+    return chrono.DateTime( y, mo, d, h, mi, s, 0 ).AssumeUtc( )
+end function
+
+function readFile( byref path as string ) as string
+    dim as long f = freefile
+    if open( path for binary access read as #f ) <> 0 then return ""
+    dim as string s = space( lof( f ) )
+    if len( s ) > 0 then get #f, , s
+    close #f
+    return s
+end function
+
+const NZONES = 14
+function zoneIds( byval i as long ) as string
+    select case i
+    case 0 : return "Africa/Casablanca"
+    case 1 : return "America/New_York"
+    case 2 : return "America/Sao_Paulo"
+    case 3 : return "America/St_Johns"
+    case 4 : return "Asia/Kathmandu"
+    case 5 : return "Asia/Kolkata"
+    case 6 : return "Australia/Lord_Howe"
+    case 7 : return "Europe/Amsterdam"
+    case 8 : return "Europe/Dublin"
+    case 9 : return "Europe/London"
+    case 10 : return "Pacific/Apia"
+    case 11 : return "Pacific/Kiritimati"
+    case 12 : return "US/Eastern"
+    case else : return "UTC"
+    end select
+end function
+
+os.SetEnv( "TZDIR", "tests/codegen/tzdata" )
+
+'' ---------------------------------------------------------------- 1. threads
+dim shared as long threadBad = 0
+sub worker( byval p as any ptr )
+    dim as long seed = cast( long, cast( integer, p ) )
+    for k as long = 1 to 300
+        dim as long i = ( seed * 7 + k ) mod NZONES
+        dim as string id = zoneIds( i )
+        if ( k and 1 ) then id = lcase( id )
+        dim as TimeZone z
+        if TimeZone.TryFindById( id, z ) = false orelse lcase( z.Id ) <> lcase( zoneIds( i ) ) then
+            threadBad += 1
+        end if
+        if TimeZone.Local( ).IsValid = false then threadBad += 1
+    next
+end sub
+scope
+    dim as any ptr th( 0 to 7 )
+    for i as long = 0 to 7
+        th( i ) = threadcreate( @worker, cast( any ptr, cast( integer, i + 1 ) ) )
+    next
+    for i as long = 0 to 7
+        threadwait( th( i ) )
+    next
+    check( threadBad = 0, "threads: " & threadBad & " bad lookups" )
+end scope
+
+'' ---------------------------------------------------------------- 2. every zone
+for z as long = 0 to NZONES - 1
+    dim as string id = zoneIds( z )
+    dim as TimeZone tzn
+    check( TimeZone.TryFindById( id, tzn ), "find " & id )
+    check( tzn.Id = id andalso tzn.IsFixed = ( id = "UTC" ), "id " & id & " -> " & tzn.Id )
+    if id = "UTC" then continue for
+    dim as TzRules r
+    check( TzRules.TryParse( readFile( "tests/codegen/tzdata/" & id ), r ), "file " & id )
+    dim as ulongint sd = 1234567ull + z
+    for k as long = 1 to 300
+        sd xor= sd shl 13 : sd xor= sd shr 7 : sd xor= sd shl 17
+        dim as longint t = TZ_MIN_UNIX + cast( longint, sd mod culngint( TZ_MAX_UNIX - TZ_MIN_UNIX ) )
+        dim as chrono.Instant i = chrono.Instant.FromUnixSeconds( t )
+        check( tzn.OffsetSecondsAt( i ) = r.OffsetSecondsAt( t ) _
+               andalso tzn.OffsetAt( i ).Ticks = clngint( r.OffsetSecondsAt( t ) ) * chrono.DT_TICKS_PER_SECOND _
+               andalso tzn.IsDaylightSavingTime( i ) = r.IsDstAt( t ) _
+               andalso tzn.AbbreviationAt( i ) = r.AbbreviationAt( t ), "zone = file: " & id & " at " & t )
+    next
+    '' transitions through the Instant layer, 2000..2030
+    dim as chrono.Instant cur = at( 2000, 1, 1 ), nx
+    dim as longint tc = cur.UnixSeconds, tr
+    while tzn.TryNextTransition( cur, nx ) andalso nx < at( 2030, 1, 1 )
+        check( r.TryNextTransition( tc, tr ) andalso tr = nx.UnixSeconds, "transition " & id )
+        cur = nx
+        tc = tr
+    wend
+next
+
+'' a transition is still "previous" to an instant a fraction of a second after it
+scope
+    dim as TimeZone sj = TimeZone.FindById( "America/St_Johns" )
+    dim as chrono.Instant tr, p
+    check( sj.TryNextTransition( at( 2025, 1, 1 ), tr ), "St_Johns next" )
+    check( sj.TryPreviousTransition( tr.Add( chrono.TimeSpan.FromMilliseconds( 500 ) ), p ) andalso p = tr, "previous at +0.5 s" )
+    check( sj.TryPreviousTransition( tr, p ) andalso p < tr, "previous is strictly before" )
+end scope
+
+'' ---------------------------------------------------------------- 3. ids
+scope
+    dim as TimeZone a, b
+    check( TimeZone.TryFindById( "AMERICA/new_york", a ) andalso a.Id = "America/New_York", "case-insensitive -> " & a.Id )
+    check( TimeZone.TryFindById( "America/New_York", b ) andalso a = b, "same zone, any spelling" )
+    check( TimeZone.TryFindById( "us/EASTERN", b ) andalso b.Id = "US/Eastern" andalso a <> b, "link keeps its name" )
+    check( a.OffsetSecondsAt( at( 2025, 7, 1 ) ) = b.OffsetSecondsAt( at( 2025, 7, 1 ) ), "link has the rules" )
+    dim as string bad = "|/America/New_York|America//New_York|America/New_York/|../tzdata/UTC|America/../UTC|" _
+        & "America\New_York|America/New York|Europe/Nowhere|tzdata.zi|zone1970.tab|posix|America|" & string( 256, "A" ) _
+        & "|C:/dev/tiko-lang/tests/codegen/tzdata/UTC|America/New_York" & chr( 0 ) & "x"
+    dim as long bp = 1
+    do
+        dim as long e = instr( bp, bad, "|" )
+        dim as string one = iif( e = 0, mid( bad, bp ), mid( bad, bp, e - bp ) )
+        dim as TimeZone z
+        check( TimeZone.TryFindById( one, z ) = false andalso z.IsValid = false, "refused: [" & one & "]" )
+        if e = 0 then exit do
+        bp = e + 1
+    loop
+end scope
+
+'' ---------------------------------------------------------------- 4. UTC, fixed, lists
+scope
+    dim as TimeZone u = TimeZone.Utc( ), v
+    check( u.Id = "UTC" andalso u.IsFixed andalso u.OffsetSecondsAt( at( 2025, 1, 1 ) ) = 0, "Utc" )
+    check( TimeZone.TryFindById( "utc", v ) andalso v = u, "utc is Utc" )
+    check( u.AbbreviationAt( at( 2025, 1, 1 ) ) = "UTC", "Utc abbreviation" )
+    dim as chrono.Instant n
+    check( u.TryNextTransition( at( 2025, 1, 1 ), n ) = false andalso u.TryPreviousTransition( at( 2025, 1, 1 ), n ) = false, "Utc no transitions" )
+    dim as TimeZone f = TimeZone.FixedOffset( 19800 )
+    check( f.Id = "+05:30" andalso f.IsFixed andalso f.OffsetSecondsAt( at( 2025, 1, 1 ) ) = 19800 _
+           andalso f.AbbreviationAt( at( 2025, 1, 1 ) ) = "+05:30" andalso f.IsDaylightSavingTime( at( 2025, 1, 1 ) ) = false, "+05:30" )
+    check( TimeZone.FixedOffset( -12600 ).Id = "-03:30" andalso TimeZone.FixedOffset( 1172 ).Id = "+00:19:32" _
+           andalso TimeZone.FixedOffset( 0 ).Id = "+00:00", "fixed ids" )
+    check( TimeZone.FixedOffset( 19800 ) = f andalso f <> u, "fixed equality" )
+    check( f.TryNextTransition( at( 2025, 1, 1 ), n ) = false, "fixed no transitions" )
+
+    dim as containers.Array( of ustring ) ids = TimeZone.AvailableIds( )
+    check( ids.Count( ) = NZONES, "AvailableIds count " & ids.Count( ) )
+    for i as long = 0 to NZONES - 1
+        if i < ids.Count( ) then check( ids[i] = zoneIds( i ), "AvailableIds[" & i & "] = " & ids[i] )
+    next
+    check( TimeZone.DataVersion( ) = "2026f", "DataVersion " & TimeZone.DataVersion( ) )
+
+    dim as TimeZone sj = TimeZone.FindById( "America/St_Johns" ), db = TimeZone.FindById( "Europe/Dublin" )
+    dim as TimeZone lh = TimeZone.FindById( "Australia/Lord_Howe" )
+    check( sj.StandardOffsetAt( at( 2025, 7, 1 ) ).TotalMinutes = -210, "St_Johns standard in summer" )
+    check( sj.StandardOffsetAt( at( 2025, 1, 1 ) ).TotalMinutes = -210, "St_Johns standard in winter" )
+    check( lh.StandardOffsetAt( at( 2025, 1, 15 ) ).TotalMinutes = 630, "Lord_Howe standard in its summer" )
+    '' Dublin: the file's standard time is the summer's +1, winter is "daylight" at 0
+    check( db.OffsetAt( at( 2025, 1, 15 ) ).TotalMinutes = 0, "Dublin winter offset" )
+    check( db.StandardOffsetAt( at( 2025, 1, 15 ) ).TotalMinutes = _
+           iif( db.IsDaylightSavingTime( at( 2025, 1, 15 ) ), 60, 0 ), "Dublin standard follows the file's flag" )
+end scope
+
+'' ---------------------------------------------------------------- 5. Local
+scope
+    dim as TimeZone l = TimeZone.Local( )
+    check( l.IsValid andalso l.IsFixed = false andalso TimeZone.Local( ) = l, "Local" )
+    for k as long = 0 to 499
+        dim as chrono.Instant i = at( 1990, 1, 1 ).Add( chrono.TimeSpan.FromHours( k * 1013 ) )
+        check( l.OffsetSecondsAt( i ) = chrono.TimeZoneInfo.LocalOffsetAt( i ) * 60 _
+               andalso l.IsDaylightSavingTime( i ) = chrono.TimeZoneInfo.IsDaylightSavingTime( i ), "Local = TimeZoneInfo" )
+    next
+    dim as chrono.Instant tr, back
+    if chrono.TimeZoneInfo.SupportsDaylightSavingTime( ) then
+        check( l.TryNextTransition( at( 2025, 1, 1 ), tr ), "Local next transition" )
+        check( l.OffsetSecondsAt( tr ) <> l.OffsetSecondsAt( tr.Subtract( chrono.TimeSpan.FromSeconds( 1 ) ) ), "Local transition moves the clock" )
+        check( l.TryPreviousTransition( tr.Add( chrono.TimeSpan.FromDays( 2 ) ), back ) andalso back = tr, "Local previous finds it again" )
+    end if
+#ifdef __FB_WIN32__
+    '' the OS zone's key through CLDR's map -- "" unless that zone loads (here from
+    '' $TZDIR's fixtures), and when it does it agrees with the OS
+    if len( l.Id ) > 0 then
+        dim as TimeZone want
+        check( TimeZone.TryFindById( l.Id, want ), "Local id loads: " & l.Id )
+        for k as long = 0 to 99
+            dim as chrono.Instant i = at( 2015, 1, 1 ).Add( chrono.TimeSpan.FromHours( k * 877 ) )
+            check( want.OffsetSecondsAt( i ) = l.OffsetSecondsAt( i ), "Local id agrees with the OS: " & l.Id )
+        next
+    end if
+#else
+    dim as outcome.Optional( of ustring ) tzv = os.GetEnv( "TZ" )
+    dim as TimeZone want
+    if tzv.HasValue( ) andalso TimeZone.TryFindById( mid( tzv.Value( ), iif( left( tzv.Value( ), 1 ) = ":", 2, 1 ) ), want ) then
+        check( l.Id = want.Id, "Local id from TZ: " & l.Id )
+    end if
+#endif
+end scope
+
+'' ---------------------------------------------------------------- 6. the system tree
+#ifndef __FB_WIN32__
+type OracleTm
+    as long tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst
+    as long pad_
+    as longint tm_gmtoff
+    as zstring ptr tm_zone
+end type
+extern "C"
+    declare function oLocaltimeR alias "localtime_r" ( byval t as longint ptr, byval r as OracleTm ptr ) as OracleTm ptr
+    declare function oSetenv alias "setenv" ( byval n as zstring ptr, byval v as zstring ptr, byval o as long ) as long
+    declare sub oTzset alias "tzset" ( )
+end extern
+scope
+    os.SetEnv( "TZDIR", "" )
+    dim as containers.Array( of ustring ) ids = TimeZone.AvailableIds( )
+    check( ids.Count( ) > 300, "system ids: " & ids.Count( ) )
+    dim as boolean sawNY = false
+    for i as long = 0 to ids.Count( ) - 1
+        dim as string id = ids[i]
+        if id = "America/New_York" then sawNY = true
+        check( left( id, 6 ) <> "posix/" andalso left( id, 6 ) <> "right/" andalso id <> "localtime", "listed: " & id )
+        dim as TimeZone z
+        check( TimeZone.TryFindById( id, z ), "system zone loads: " & id )
+        if z.IsValid = false then continue for
+        dim as string spec = ":" & id
+        oSetenv( "TZ", strptr( spec ), 1 )
+        oTzset( )
+        for k as long = 0 to 3
+            dim as longint t = at( 1950 + k * 25, 1 + k * 3, 15 ).UnixSeconds
+            dim as OracleTm tmv
+            if oLocaltimeR( @t, @tmv ) = nullptr then continue for
+            check( z.OffsetSecondsAt( chrono.Instant.FromUnixSeconds( t ) ) = tmv.tm_gmtoff, "system oracle " & id )
+        next
+    next
+    check( sawNY, "system ids have America/New_York" )
+    check( len( TimeZone.DataVersion( ) ) > 0, "system DataVersion" )
+end scope
+#endif
+
+if failures = 0 then print "ok" else print failures; " failures"

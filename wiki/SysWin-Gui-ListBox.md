@@ -1200,8 +1200,7 @@ function Enable( byval hListBox as HWND ) as boolean
 
 Enables the list box, so that it takes mouse and keyboard input again.
 
-**Returns** `true` when the list box was disabled before the call, `false` when it was already
-enabled.
+**Returns** `true` or `false`.
 
 **Example**
 
@@ -1219,8 +1218,7 @@ function Disable( byval hListBox as HWND ) as boolean
 
 Disables the list box: it is greyed out and ignores the mouse and the keyboard.
 
-**Returns** `true` when the list box was enabled before the call, `false` when it was already
-disabled (the opposite of what `Button.Disable` returns).
+**Returns** `true` or `false`.
 
 **Example**
 

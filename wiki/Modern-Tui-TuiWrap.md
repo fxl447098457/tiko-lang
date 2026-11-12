@@ -21,8 +21,8 @@ Word-wraps to a column width, returning the lines. Embedded chr(10) starts a new
 using tui
 
 dim as TuiStringArray lines_ = TuiWrap( "the quick brown fox jumps", 10 )
-for i as int32 = 0 to lines_.Count( ) - 1
-    print "["; lines_[i]; "]"
+for each ln in lines_
+    print "["; ln; "]"
 next
 '' [the quick ]
 '' [brown fox ]

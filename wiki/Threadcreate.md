@@ -170,11 +170,11 @@ End Sub
 
     '' This is the main thread. Now wait until all child threads have finished.
 
-    For i As Integer = 0 To MAX_THREADS-1
+    For Each h As Any Ptr In handles
 
-        If handles(i) <> 0 Then
+        If h <> 0 Then
 
-            ThreadWait(handles(i))
+            ThreadWait(h)
 
         End If
 

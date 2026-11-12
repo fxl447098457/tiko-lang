@@ -16,6 +16,7 @@
 #import "tkc/i18n"
 #import "tkc/docencoding"
 #import "tkc/project"
+#import "tkc/themes"
 #import "tka/documents"
 #import "tks/parser"
 #import "tkd/canvas"
@@ -27,6 +28,9 @@
 #import "tkd/codegen"
 #import "tkd/reconcile"
 #import "tkd/itemsdlg"
+#import "tkd/themefile"
+#import "tkd/themecenter"
+#import "tkd/colorsdlg"
 #import "vendor/tkControls/tkMeta"
 #import "vendor/tkControls/tkApp"
 #import "vendor/tkControls/tkLayout"
@@ -231,6 +235,70 @@ sub Window.FinishItems( byval apply_ as boolean )
     next
 end sub
 
+' ---- a control's [control.colors]: the Colors dialog ----------------------------------------------------
+
+' The project's theme for a form's previews and its surface; "" (the presets) outside a project.
+function Window.ProjectThemePath( ) as ustring
+    if ProjOpen = false then return ""
+    return fs.PathJoin( fs.PathParent( Proj.Path ), "appTheme", "appTheme.tktheme" )
+end function
+
+' Every open form (and Test Form) in the project's theme as it is now.
+sub Window.RefreshFormThemes( )
+    for each d as DocRef in Docs
+        if d->Designer then
+            d->Designer->ThemePath = this.ProjectThemePath( )
+            d->Designer->ApplyProjectTheme( )
+        end if
+    next
+    if Preview then
+        Preview->ThemePath = this.ProjectThemePath( )
+        Preview->ApplyProjectTheme( )
+    end if
+end sub
+
+sub Window.OpenColors( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
+    if ColorsDlg then exit sub
+    dim as long i = FindControl( c->Doc, name_ )
+    if i < 0 then exit sub
+    dim as FormControl ctl = c->Doc.Controls[i]
+    ColorsDlg = new colorsdlg.ColorsDialog
+    ColorsOf = c
+    ColorsName = name_
+    ColorsDlg->Open( form, ctl.TypeName, ctl.StyleName, ctl.Colors, this.ProjectThemePath( ), _
+                     name_ & " - " & i18n.Tr( "designer.colors", "Colours" ) )
+    if ColorsDlg->Win = 0 then
+        delete ColorsDlg
+        ColorsDlg = 0
+    end if
+end sub
+
+' OK: the dialog's style and colours into the control, as one change (one undo step).
+sub Window.FinishColors( byval apply_ as boolean )
+    if ColorsDlg = 0 then exit sub
+    dim as colorsdlg.ColorsDialog ptr dlg = ColorsDlg
+    dim as canvas.FormCanvas ptr c = ColorsOf
+    ColorsDlg = 0
+    dim as ustring style_ = dlg->StyleName
+    dim as Array( of Setting ) colors = dlg->Colors
+    dlg->Close( )
+    delete dlg
+    if c->Glass then tkHost_SetFocus( c->Glass->pHost, c->Glass )
+    if apply_ = false then exit sub
+    dim as long i = FindControl( c->Doc, ColorsName )
+    if i < 0 then exit sub
+    dim as FormDoc trial = c->Doc
+    trial.Controls[i].StyleName = style_
+    trial.Controls[i].Colors = colors
+    dim as ustring fault = c->ApplyEdit( trial, true, "" )
+    if len( fault ) then this.SetMessage( fault )
+end sub
+
+sub Window.EditColors( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
+    this.OpenColors( c, name_ )
+    if ColorsDlg then this.FinishColors( ColorsDlg->RunModal( ) )
+end sub
+
 sub Window.EditItems( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
     this.OpenItems( c, name_ )
     if ItemsDlg then this.FinishItems( ItemsDlg->RunModal( ) )
@@ -265,6 +333,10 @@ sub Window.TestForm( )
     PreviewForm->Tag = @this
     Preview = new canvas.FormCanvas
     Preview->Live = true
+    ' in the project's theme, the variant the design surface shows
+    Preview->ThemePath = this.ProjectThemePath( )
+    Preview->PreviewSet = true
+    Preview->PreviewDark = d->Designer->ShowsDark( )
     Preview->Create( tkForm_Widget( PreviewForm ), 1 )
     dim as TK_WIDGET ptr r = tkForm_Widget( PreviewForm )
     tkWidget_SetPos( Preview->Frame, 0, 0, r->cw, r->ch )
@@ -385,18 +457,62 @@ private function GuiManifest_( byref pkg as const ustring ) as ustring
     return strings.Replace( project.NewManifestText( pkg, pkg, "main.tiko" ), "# subsystem = 'console'", "subsystem = 'gui'     " )
 end function
 
-' The main that shows one form.
+' The main that shows one form, in the project's theme (appTheme: its fonts before Init, the rest after).
 private function FormMain_( byref pkg as const ustring, byref formName as const ustring ) as ustring
     dim as ustring nl = wchr( 10 )
     return "' " & pkg & ": starts the program and shows its first form." & nl _
         & "#import ""vendor/tkControls/tkApp""" & nl _
+        & "#import ""./appTheme""" & nl _
         & "#import ""./" & formName & """" & nl _
         & "using tkApp" & nl & nl _
         & "dim as TKAPP_OPTIONS options" & nl _
+        & "appTheme.ApplyOptions( options )" & nl _
         & "if tkApp_Init( options ) = false then end 1" & nl _
+        & "appTheme.Install( )" & nl _
         & "dim as " & formName & ".Form mainForm" & nl _
         & "mainForm.Build( )" & nl _
         & "end tkApp_Run( mainForm.Wnd )" & nl
+end function
+
+' The project's theme: appTheme/appTheme.tktheme, the presets named "Default", and its module.
+private function CreateThemeFiles_( byref dir_ as const ustring ) as boolean
+    dim as ustring folder = fs.PathJoin( dir_, "appTheme" )
+    dim as ustring path = fs.PathJoin( folder, "appTheme.tktheme" )
+    if fs.IsFile( path ) then return true
+    fs.CreateDirAll( folder )
+    dim as ustring text = themefile.DefaultText( "Default" )
+    dim as themefile.ThemeDoc doc
+    dim as ustring e
+    if themefile.Parse( text, doc, e ) = false then return false
+    if WriteNew_( path, text ) = false then return false
+    return WriteNew_( fs.PathJoin( folder, "appTheme.design.tiko" ), themefile.Generate( doc, "appTheme", "appTheme.tktheme", text ) )
+end function
+
+' appTheme.design.tiko (or any X.design.tiko) from a .tktheme's text. False, with a message, when the
+' theme has a problem.
+function Window.WriteThemeGenerated( byref path as const ustring, byref text as const ustring ) as boolean
+    dim as themefile.ThemeDoc doc
+    dim as ustring e
+    dim as Array( of ustring ) problems
+    if themefile.Parse( text, doc, e ) = false then
+        problems.Push( e )
+    else
+        themefile.Check( doc, problems )
+    end if
+    if problems.Count( ) then
+        this.SetMessage( fs.PathFileName( path ) & ": " & problems[0] )
+        return false
+    end if
+    dim as ustring generated = themefile.Generate( doc, fs.PathStem( path ), fs.PathFileName( path ), text )
+    dim as ustring target = left( path, instrrev( path, "." ) - 1 ) & ".design.tiko", none
+    if fs.IsFile( target ) then
+        if codegen.WithoutCr( fs.ReadAllText( target ).ValueOr( none ) ) = generated then return true
+    end if
+    if fs.WriteAtomic( target, generated ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( target ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    return true
 end function
 
 ' A project around a form that has none: tiko.toml and a main beside the form's folder, because that
@@ -416,7 +532,8 @@ function Window.NewProjectForForm( byref formPath as const ustring ) as boolean
             return false
         end if
         dim as ustring pkg = PackageName_( fs.PathFileName( dir_ ) )
-        if (WriteNew_( manifest, GuiManifest_( pkg ) ) = false) orelse (WriteNew_( mainPath, FormMain_( pkg, formName ) ) = false) then
+        if (WriteNew_( manifest, GuiManifest_( pkg ) ) = false) orelse (WriteNew_( mainPath, FormMain_( pkg, formName ) ) = false) _
+           orelse (CreateThemeFiles_( dir_ ) = false) then
             this.SetMessage( pkg & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
             return false
         end if
@@ -466,6 +583,7 @@ function Window.NewFormProject( byref folder as const ustring ) as boolean
     dim as ustring pkg = fs.PathFileName( dir_ )
     dim as boolean ok = WriteNew_( manifest, GuiManifest_( pkg ) )
     ok = ok andalso WriteNew_( fs.PathJoin( dir_, "main.tiko" ), FormMain_( pkg, "frmMain" ) )
+    ok = ok andalso CreateThemeFiles_( dir_ )
     dim as ustring formPath = CreateFormFiles_( dir_, "frmMain" )
     if (ok = false) orelse (len( formPath ) = 0) then
         this.SetMessage( pkg & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
@@ -560,6 +678,13 @@ function Window.PrepareForms( ) as boolean
             elseif this.WriteGenerated( d ) = false then
                 ok = false
             end if
+        elseif lcase( right( d->Path, 8 ) ) = ".tktheme" then
+            ' an open theme: saved first when the user wants that (AfterSave generates), else generated
+            if Prefs.SaveBeforeBuild andalso d->IsModified( ) then
+                if this.SaveDoc( d, false ) = false then ok = false
+            elseif this.WriteThemeGenerated( d->Path, d->Text( ) ) = false then
+                ok = false
+            end if
         end if
     next
     if len( SaveNote ) then
@@ -617,3 +742,108 @@ sub Window.AddFormOverlay( byval d as DocRef, byref o as parser.ScanOptions )
     o.OverlayPaths.Push( base_ & ".design.tiko" )
     o.OverlayTexts.Push( codegen.Generate( f->Designer->Doc, moduleName, fs.PathFileName( formPath ), f->Text( ) ) )
 end sub
+
+' ---- the Theme Center: the project's appTheme --------------------------------------------------------
+
+private sub ThemeSaved_( byval tc as themecenter.ThemeDialog ptr )
+    dim as Window ptr mw = tc->Host
+    if mw then mw->SaveTheme( tc )
+end sub
+
+private sub ThemeClosed_( byval tc as themecenter.ThemeDialog ptr )
+    dim as Window ptr mw = tc->Host
+    if mw then mw->CloseThemeCenter( )
+end sub
+
+' Form > Project Theme...: the project's appTheme/appTheme.tktheme in the Theme Center (the
+' presets, named "Default", when the project has none yet).
+sub Window.OpenThemeCenter( )
+    if ProjOpen = false then exit sub
+    this.OpenThemeCenterOn( this.ProjectThemePath( ), false )
+end sub
+
+' The Theme Center on a theme: the project's appTheme, or (forEditor) tkEdit's own -- whose Save
+' writes the file and applies it, no module and no main.
+sub Window.OpenThemeCenterOn( byref path as const ustring, byval forEditor as boolean )
+    if ThemeDlg then
+        if ThemeDlg->Win then tkForm_Show( ThemeDlg->Win )
+        exit sub
+    end if
+    ThemeDlg = new themecenter.ThemeDialog
+    ThemeDlg->Host = @this
+    ThemeDlg->ForEditor = forEditor
+    ThemeDlg->OnSave = @ThemeSaved_
+    ThemeDlg->OnClose = @ThemeClosed_
+    dim as ustring title
+    if forEditor then title = i18n.Tr( "designer.theme_editor_title", "tkEdit Theme" )
+    ThemeDlg->Open( form, path, fs.PathJoin( ConfigDir, themes.THEME_DIR ), title )
+end sub
+
+sub Window.CloseThemeCenter( )
+    if ThemeDlg = 0 then exit sub
+    dim as themecenter.ThemeDialog ptr d = ThemeDlg
+    ThemeDlg = 0
+    d->Close( )
+    delete d
+end sub
+
+' The Theme Center's Save: the theme where it came from, and -- in the project -- its generated
+' module, and main.tiko made to install it (through its buffer when it is open). Save to Library
+' writes the file only. False, with a message, when the theme can't be built.
+function Window.SaveTheme( byval tc as themecenter.ThemeDialog ptr ) as boolean
+    dim as Array( of ustring ) problems = tc->Problems( )
+    if problems.Count( ) then
+        this.SetMessage( fs.PathFileName( tc->Path ) & ": " & problems[0] )
+        return false
+    end if
+    dim as ustring text = themefile.Render( tc->Doc )
+    fs.CreateDirAll( fs.PathParent( tc->Path ) )
+    ' an open buffer of the file takes the text, so its undo and the disk agree
+    dim as DocRef open_ = 0
+    for each d as DocRef in Docs
+        if (len( d->Path ) > 0) andalso fs.PathEquals( d->Path, tc->Path ) then open_ = d
+    next
+    if open_ then
+        open_->Main.ReplaceAllText( text )
+        if this.SaveDoc( open_, false ) = false then return false
+    elseif fs.WriteAtomic( tc->Path, text ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( tc->Path ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    if tc->SavingToLibrary then
+        this.SetMessage( strings.Format( i18n.Tr( "designer.theme_saved", "{} saved" ), tc->Path ) )
+        return true
+    end if
+    if tc->ForEditor then
+        this.ReloadTheme( )
+        this.SetMessage( strings.Format( i18n.Tr( "designer.theme_saved", "{} saved" ), tc->Path ) )
+        return true
+    end if
+    if this.WriteThemeGenerated( tc->Path, text ) = false then return false
+    ' the project's main installs the theme, as a new project's does
+    if ProjOpen then
+        dim as ustring mainPath = fs.PathJoin( fs.PathParent( Proj.Path ), "main.tiko" ), none, outText
+        dim as DocRef mainDoc = 0
+        for each d as DocRef in Docs
+            if (len( d->Path ) > 0) andalso fs.PathEquals( d->Path, mainPath ) then mainDoc = d
+        next
+        dim as ustring mainText
+        if mainDoc then mainText = mainDoc->Text( ) else mainText = fs.ReadAllText( mainPath ).ValueOr( none )
+        if len( mainText ) then
+            select case themefile.InstallIntoMain( codegen.WithoutCr( mainText ), outText )
+            case 1
+                if mainDoc then
+                    mainDoc->Main.ReplaceAllText( outText )
+                else
+                    fs.WriteAtomic( mainPath, outText )
+                end if
+            case -1
+                this.SetMessage( i18n.Tr( "designer.theme_main_by_hand", "main.tiko: add appTheme.ApplyOptions and appTheme.Install around tkApp_Init" ) )
+                return true
+            end select
+        end if
+    end if
+    this.RefreshFormThemes( )
+    this.SetMessage( strings.Format( i18n.Tr( "designer.theme_saved", "{} saved" ), tc->Path ) )
+    return true
+end function

@@ -1,0 +1,799 @@
+#module "tz"
+#import "std/chrono"
+#import "std/fs"
+#import "std/os"
+#import "std/outcome"
+#import "std/containers"
+'' std/tz: TimeZone -- a zone found by its IANA id, the machine's own zone, UTC
+'' or a fixed offset, answering for any chrono.Instant.
+''
+''     #import "std/tz"
+''     dim as tz.TimeZone paris = tz.TimeZone.FindById( "Europe/Paris" )
+''     print paris.OffsetAt( chrono.WallClock.UtcNow( ) ).TotalHours
+''     print paris.AbbreviationAt( chrono.WallClock.UtcNow( ) )        '' "CET"
+''
+'' WHERE ZONES COME FROM, in order -- the first that has the id wins:
+''     $TZDIR                        when set
+''     /usr/share/zoneinfo           Linux and macOS (macOS links it to /var/db/timezone)
+''     the embedded database         when the program imports std/tzdata
+'' Windows has no zone files of its own: there a named zone needs std/tzdata
+'' (or $TZDIR). "UTC" is built in everywhere.
+''
+'' THE EMBEDDED DATABASE is registered by std/tzdata when that module starts, through
+'' RegisterDatabase; a program may register one of its own built by tools/tzdb
+'' instead. The first registration is kept; later ones answer false.
+''
+'' IDS are checked BEFORE anything touches the filesystem: segments of letters,
+'' digits, "_", "+" and "-" joined by "/", at most 255 characters. No "." at all,
+'' so no "..", and no leading "/": an id from user input cannot name another file.
+'' They match CASE-INSENSITIVELY and come back spelled as the files spell them
+'' ("europe/paris" finds "Europe/Paris"). A LINK keeps the name asked for:
+'' "US/Eastern" is "US/Eastern" with New York's rules.
+''
+'' Each zone is loaded once per process and kept: a TimeZone is a reference to
+'' it, so copying one is cheap and it may be used from any thread. The cache is
+'' never emptied, so a change to $TZDIR or to the files after a zone was first
+'' found is not seen for that zone.
+''
+'' MISUSE IS A RUNTIME ERROR (pkg/std/README.md): an Invalid TimeZone, or an
+'' Invalid Instant, given to any lookup is runtime error 1. FindById of an id
+'' that is not found is runtime error 1 too; TryFindById answers false.
+
+const TZK_FIXED  = 0            '' UTC and fixed offsets
+const TZK_RULES  = 1            '' a zone file
+const TZK_SYSTEM = 2            '' the OS zone, through std/chrono's TimeZoneInfo
+
+const TZ_MAX_FIXED = 64800      '' +-18:00, chrono.DateTime's limit
+
+type TzEntry_
+    as ustring id                   '' as reported
+    as ustring key                  '' the cache key: the id lower-cased
+    as long kind
+    as long fixedOff
+    as TzRules rules
+end type
+
+'' What to do with a wall-clock reading that names two instants (an OVERLAP,
+'' when the clock falls back) or none (a GAP, when it springs forward).
+'' Temporal's four, under Temporal's meanings:
+''     overlap        gap
+''     dzCompatible   earlier        forward by the gap's width     (the default)
+''     dzEarlier      earlier        backward by the gap's width
+''     dzLater        later          forward by the gap's width
+''     dzReject       refused        refused
+public enum Disambiguation
+    dzCompatible
+    dzEarlier
+    dzLater
+    dzReject
+end enum
+
+public type TimeZone
+    declare static function TryFindById( byref zoneId as const ustring, byref result as TimeZone ) as boolean
+    declare static function FindById   ( byref zoneId as const ustring ) as TimeZone
+    declare static function Utc        ( ) as TimeZone
+    '' -64800 .. 64800 seconds; outside it, runtime error 1.
+    declare static function FixedOffset( byval seconds as long ) as TimeZone
+    '' The OS zone: agrees with chrono.TimeZoneInfo everywhere. Its Id is the
+    '' machine's IANA id where one can be found, else "".
+    declare static function Local      ( ) as TimeZone
+    '' Every id the first zone source holds, sorted; empty when there is none.
+    declare static function AvailableIds( ) as containers.Array( of ustring )
+    '' The tz database release the first source holds ("2026f"), or "".
+    declare static function DataVersion ( ) as ustring
+    '' A zone database (tools/tzdb/pack.py's .tzdb format) for lookups to fall
+    '' back on. The bytes are read in place and must outlive the program -- an
+    '' #embed does. False when they are not a database, or one is registered.
+    declare static function RegisterDatabase( byval p as const ubyte ptr, byval n as longint ) as boolean
+
+    declare property IsValid( ) as boolean
+    declare property Id     ( ) as ustring
+    declare property IsFixed( ) as boolean
+
+    declare function OffsetSecondsAt     ( byref i as chrono.Instant ) as long
+    declare function OffsetAt            ( byref i as chrono.Instant ) as chrono.TimeSpan
+    declare function StandardOffsetAt    ( byref i as chrono.Instant ) as chrono.TimeSpan
+    '' The FILE's flag: Europe/Dublin's winter is daylight time with offset 0
+    '' ("negative DST"). To ask "is the clock ahead of standard", compare
+    '' OffsetAt with StandardOffsetAt.
+    declare function IsDaylightSavingTime( byref i as chrono.Instant ) as boolean
+    declare function AbbreviationAt      ( byref i as chrono.Instant ) as ustring
+
+    '' Changes of offset, strictly after / strictly before. The Local zone has
+    '' no transition table to read, so it is SCANNED a day at a time for ten
+    '' years and the change found to the second: a change further away than that
+    '' is not reported, and two within one day can hide each other.
+    declare function TryNextTransition    ( byref after  as chrono.Instant, byref result as chrono.Instant ) as boolean
+    declare function TryPreviousTransition( byref before as chrono.Instant, byref result as chrono.Instant ) as boolean
+
+    '' LOCAL -> INSTANT. WALL is read as a wall-clock reading in this zone; its
+    '' offset, if it carries one, is ignored, as DateTime.AssumeLocal ignores it.
+    '' MapLocal answers how many instants the reading names -- 1 normally, 2 in
+    '' an overlap, 0 in a gap -- with them in A and B, earlier first (B = A when
+    '' there is one). A reading whose instants fall outside years 1..9999 names
+    '' none and is no gap: MapLocal 0, and every policy fails.
+    declare function MapLocal( byref wall as chrono.DateTime, byref a as chrono.Instant, _
+                               byref b as chrono.Instant ) as long
+    '' False, with result left alone, when the policy refuses the reading
+    '' (dzReject on an overlap or a gap) or it cannot be placed in range.
+    declare function TryResolve( byref wall as chrono.DateTime, byval policy as Disambiguation, _
+                                 byref result as chrono.Instant ) as boolean
+    '' TryResolve's plain form: runtime error 1 where TryResolve is false.
+    declare function Resolve( byref wall as chrono.DateTime, _
+                              byval policy as Disambiguation = dzCompatible ) as chrono.Instant
+
+private:
+    as TzEntry_ ptr m_e
+    declare function Entry_( byref i as chrono.Instant ) as TzEntry_ ptr
+    declare function OffSec_( byval t as longint ) as long
+    declare function Map_( byval w as longint, byref a as longint, byref b as longint, _
+                           byref gapBefore as long, byref gapAfter as long ) as long
+end type
+
+'' Same zone: the same id, so "US/Eastern" and "America/New_York" are not equal.
+public declare operator = ( byref a as TimeZone, byref b as TimeZone ) as boolean
+public declare operator <> ( byref a as TimeZone, byref b as TimeZone ) as boolean
+
+'' ------------------------------------------------------------ the cache
+
+type TzRegistry_
+    as any ptr lock
+    as TzEntry_ ptr ents( any )
+    as TzEntry_ ptr localEnt
+    '' the registered database, if any: its ids, their lower-cased keys, and each
+    '' one's TZif bytes as an offset and length into dbData
+    as boolean dbSet
+    as const ubyte ptr dbData
+    as ustring dbVersion
+    as ustring dbIds( any )
+    as ustring dbKeys( any )
+    as long dbOff( any )
+    as long dbLen( any )
+    declare constructor( )
+end type
+
+constructor TzRegistry_( )
+    this.lock = mutexcreate( )
+end constructor
+
+dim shared tzReg as TzRegistry_
+
+declare function tzDbFind( byref key as const ustring, byref canon as ustring, byref r as TzRules ) as boolean
+
+'' The entry under KEY, or nullptr. Takes the lock.
+function tzRegFind( byref key as const ustring ) as TzEntry_ ptr
+    dim as TzEntry_ ptr r = nullptr
+    mutexlock( tzReg.lock )
+    for i as long = 0 to ubound( tzReg.ents )
+        if tzReg.ents( i )->key = key then
+            r = tzReg.ents( i )
+            exit for
+        end if
+    next
+    mutexunlock( tzReg.lock )
+    return r
+end function
+
+'' Adds E unless another thread got there first, and answers the entry that
+'' is in the cache either way. E is built OUTSIDE the lock -- reading a file
+'' under it would serialise every lookup behind the slowest disk.
+function tzRegAdd( byval e as TzEntry_ ptr ) as TzEntry_ ptr
+    dim as TzEntry_ ptr r = nullptr
+    mutexlock( tzReg.lock )
+    for i as long = 0 to ubound( tzReg.ents )
+        if tzReg.ents( i )->key = e->key then
+            r = tzReg.ents( i )
+            exit for
+        end if
+    next
+    if r = nullptr then
+        dim as long n = ubound( tzReg.ents ) + 1
+        redim preserve tzReg.ents( 0 to n )
+        tzReg.ents( n ) = e
+        r = e
+    end if
+    mutexunlock( tzReg.lock )
+    if r <> e then delete e
+    return r
+end function
+
+function tzNewFixed( byref id as const ustring, byval off as long ) as TzEntry_ ptr
+    dim as TzEntry_ ptr e = new TzEntry_
+    e->id = id
+    e->key = lcase( id )
+    e->kind = TZK_FIXED
+    e->fixedOff = off
+    return e
+end function
+
+'' ------------------------------------------------------------ ids and sources
+
+function tzIdValid( byref id as const ustring ) as boolean
+    dim as long n = len( id )
+    if n = 0 orelse n > 255 then return false
+    dim as boolean segStart = true
+    for i as long = 0 to n - 1
+        dim as long c = id[i]
+        if c = 47 then                                     '' '/'
+            if segStart then return false                   '' leading, or an empty segment
+            segStart = true
+        elseif ( c >= 48 andalso c <= 57 ) orelse ( c >= 65 andalso c <= 90 ) _
+               orelse ( c >= 97 andalso c <= 122 ) orelse c = 95 orelse c = 43 orelse c = 45 then
+            segStart = false
+        else
+            return false
+        end if
+    next
+    return segStart = false                                 '' no trailing '/'
+end function
+
+function tzTrimSep( byref p as const ustring ) as ustring
+    dim as ustring r = p
+    while len( r ) > 1 andalso ( right( r, 1 ) = "/" orelse right( r, 1 ) = "\" )
+        r = left( r, len( r ) - 1 )
+    wend
+    return r
+end function
+
+'' The zone directories to search, in order. Only those that exist.
+sub tzSourceDirs( dirs as containers.Array( of ustring ) )
+    dim as outcome.Optional( of ustring ) v = os.GetEnv( "TZDIR" )
+    if v.HasValue( ) andalso len( v.Value( ) ) > 0 then
+        if fs.IsDir( v.Value( ) ) then dirs.Push( tzTrimSep( v.Value( ) ) )
+    end if
+#ifndef __FB_WIN32__
+    if fs.IsDir( "/usr/share/zoneinfo" ) then dirs.Push( "/usr/share/zoneinfo" )
+#endif
+end sub
+
+'' Each segment of ID matched in its directory, exactly if it can be and
+'' case-insensitively if not. CANON gets the files' own spelling.
+function tzResolveIn( byref root as const ustring, byref id as const ustring, _
+                      byref canon as ustring, byref path as ustring ) as boolean
+    dim as ustring cur = root, rest = id
+    canon = ""
+    while len( rest ) > 0
+        dim as long k = instr( rest, "/" )
+        dim as ustring seg
+        if k = 0 then
+            seg = rest
+            rest = ""
+        else
+            seg = left( rest, k - 1 )
+            rest = mid( rest, k + 1 )
+        end if
+        dim as ustring found, foundPath
+        dim as ustring segL = lcase( seg )
+        for each r in fs.ReadDir( cur )
+            if r.IsOk( ) then
+                dim as ustring nm = r.Value( ).Name( )
+                if nm = seg then
+                    found = nm
+                    foundPath = r.Value( ).Path( )
+                    exit for
+                end if
+                if len( found ) = 0 andalso lcase( nm ) = segL then
+                    found = nm
+                    foundPath = r.Value( ).Path( )
+                end if
+            end if
+        next
+        if len( found ) = 0 then return false
+        if len( canon ) = 0 then canon = found else canon = canon & "/" & found
+        cur = foundPath
+    wend
+    path = cur
+    return fs.IsFile( cur )
+end function
+
+'' FILE READING STAYS OFF THE STACK AND AWAY FROM FREEFILE. A zone may be
+'' looked up from a thread made by threadcreate, whose stack on Linux and macOS
+'' is the C library's minimum (16 KiB on glibc) unless the caller asked for
+'' more: fs.ReadAllBytes keeps a 64 KiB buffer on the stack and overran it.
+'' freefile hands two threads the same number. So each read is an fs.File (a
+'' handle of its own) into a string on the heap.
+
+'' At most MAXBYTES bytes of the file at PATH; false when it cannot be read or is
+'' longer than that.
+function tzReadFile( byref path as const ustring, byval maxBytes as longint, byref out_ as string ) as boolean
+    dim as fs.File f
+    if f.OpenRead( path ).IsOk( ) = false then return false
+    dim as fs.FsResultI64 sz = f.Size( )
+    if sz.IsOk( ) = false orelse sz.Value( ) > maxBytes then return false
+    dim as longint n = sz.Value( )
+    out_ = space( n )
+    dim as longint got = 0
+    while got < n
+        dim as fs.FsResultI64 r = f.Read( cptr( ubyte ptr, strptr( out_ ) ) + got, n - got )
+        if r.IsOk( ) = false then return false
+        if r.Value( ) = 0 then exit while
+        got += r.Value( )
+    wend
+    if got < n then out_ = left( out_, got )
+    return true
+end function
+
+function tzLoadRules( byref path as const ustring, byref r as TzRules ) as boolean
+    dim as string b
+    if tzReadFile( path, TZIF_MAX_BYTES, b ) = false then return false
+    return TzRules.TryParse( b, r )
+end function
+
+function tzIsTzif( byref path as const ustring ) as boolean
+    dim as fs.File f
+    if f.OpenRead( path ).IsOk( ) = false then return false
+    dim as string m = space( 4 )
+    dim as fs.FsResultI64 r = f.Read( cptr( ubyte ptr, strptr( m ) ), 4 )
+    return r.IsOk( ) andalso r.Value( ) = 4 andalso m = "TZif"
+end function
+
+'' The first line of a small text file, trimmed; "" when there is none.
+function tzFirstLine( byref path as const ustring ) as string
+    dim as string s
+    if tzReadFile( path, 1048576, s ) = false then return ""
+    dim as long k = instr( s, chr( 10 ) )
+    if k > 0 then s = left( s, k - 1 )
+    return trim( s, any " " & chr( 9, 13 ) )
+end function
+
+'' "+05:30", "-03:30", "+00:19:32".
+function tzFormatOffset( byval s as long ) as ustring
+    dim as long a = abs( s )
+    dim as ustring r = "+"
+    if s < 0 then r = "-"
+    r &= right( "0" & ( a \ 3600 ), 2 ) & ":" _
+                     & right( "0" & ( ( a mod 3600 ) \ 60 ), 2 )
+    if ( a mod 60 ) <> 0 then r &= ":" & right( "0" & ( a mod 60 ), 2 )
+    return r
+end function
+
+'' ------------------------------------------------------------ construction
+
+function TimeZone.Utc( ) as TimeZone
+    dim as TimeZone z
+    z.m_e = tzRegFind( "utc" )
+    if z.m_e = nullptr then z.m_e = tzRegAdd( tzNewFixed( "UTC", 0 ) )
+    return z
+end function
+
+function TimeZone.FixedOffset( byval seconds as long ) as TimeZone
+    dim as TimeZone z
+    if seconds < -TZ_MAX_FIXED orelse seconds > TZ_MAX_FIXED then
+        error 1
+        return z
+    end if
+    dim as ustring fid = tzFormatOffset( seconds )
+    z.m_e = tzRegFind( fid )
+    if z.m_e = nullptr then z.m_e = tzRegAdd( tzNewFixed( fid, seconds ) )
+    return z
+end function
+
+function TimeZone.TryFindById( byref zoneId as const ustring, byref result as TimeZone ) as boolean
+    if ucase( zoneId ) = "UTC" then
+        result = TimeZone.Utc( )
+        return true
+    end if
+    if tzIdValid( zoneId ) = false then return false
+    dim as ustring key = lcase( zoneId )
+    dim as TzEntry_ ptr e = tzRegFind( key )
+    if e = nullptr then
+        dim as containers.Array( of ustring ) dirs
+        tzSourceDirs( dirs )
+        for d as long = 0 to dirs.Count( ) - 1
+            dim as ustring canon, path
+            dim as TzRules r
+            if tzResolveIn( dirs[d], zoneId, canon, path ) andalso tzLoadRules( path, r ) then
+                e = new TzEntry_
+                e->id = canon
+                e->key = key
+                e->kind = TZK_RULES
+                e->rules = r
+                exit for
+            end if
+        next
+        if e = nullptr then
+            '' the embedded database last
+            dim as ustring canon
+            dim as TzRules r
+            if tzDbFind( key, canon, r ) = false then return false
+            e = new TzEntry_
+            e->id = canon
+            e->key = key
+            e->kind = TZK_RULES
+            e->rules = r
+        end if
+        e = tzRegAdd( e )
+    end if
+    result.m_e = e
+    return true
+end function
+
+'' The database at P, N bytes long, read into the registry's index. Defensive
+'' like the TZif reader: every length is checked before it is read.
+function tzDbBe32( byval p as const ubyte ptr ) as longint
+    return ( clngint( p[0] ) shl 24 ) or ( clngint( p[1] ) shl 16 ) or ( clngint( p[2] ) shl 8 ) or clngint( p[3] )
+end function
+
+function TimeZone.RegisterDatabase( byval p as const ubyte ptr, byval n as longint ) as boolean
+    if p = nullptr orelse n < 13 then return false
+    if p[0] <> 84 orelse p[1] <> 90 orelse p[2] <> 68 orelse p[3] <> 66 then return false   '' TZDB
+    if tzDbBe32( p + 4 ) <> 1 then return false
+    dim as longint pos_ = 8
+    dim as long vl = p[pos_]
+    pos_ += 1
+    if vl = 0 orelse pos_ + vl + 4 > n then return false
+    dim as string ver = space( vl )
+    for i as long = 0 to vl - 1
+        ver[i] = p[pos_ + i]
+    next
+    pos_ += vl
+    dim as longint cnt = tzDbBe32( p + pos_ )
+    pos_ += 4
+    if cnt < 1 orelse cnt > 65536 then return false
+    dim as ustring ids( 0 to cnt - 1 ), keys( 0 to cnt - 1 )
+    dim as long offs( 0 to cnt - 1 ), lens( 0 to cnt - 1 )
+    for k as long = 0 to cnt - 1
+        if pos_ >= n then return false
+        dim as long il = p[pos_]
+        pos_ += 1
+        if il = 0 orelse pos_ + il + 8 > n then return false
+        dim as string idText = space( il )
+        for i as long = 0 to il - 1
+            idText[i] = p[pos_ + i]
+        next
+        pos_ += il
+        if tzIdValid( idText ) = false then return false
+        ids( k ) = idText
+        keys( k ) = lcase( idText )
+        offs( k ) = clng( tzDbBe32( p + pos_ ) )
+        lens( k ) = clng( tzDbBe32( p + pos_ + 4 ) )
+        pos_ += 8
+    next
+    '' every file must lie inside the data that follows the index
+    dim as longint dataLen = n - pos_
+    for k as long = 0 to cnt - 1
+        if offs( k ) < 0 orelse lens( k ) < 44 orelse clngint( offs( k ) ) + lens( k ) > dataLen then return false
+    next
+
+    dim as boolean ok = false
+    mutexlock( tzReg.lock )
+    if tzReg.dbSet = false then
+        redim tzReg.dbIds( 0 to cnt - 1 )
+        redim tzReg.dbKeys( 0 to cnt - 1 )
+        redim tzReg.dbOff( 0 to cnt - 1 )
+        redim tzReg.dbLen( 0 to cnt - 1 )
+        for k as long = 0 to cnt - 1
+            tzReg.dbIds( k ) = ids( k )
+            tzReg.dbKeys( k ) = keys( k )
+            tzReg.dbOff( k ) = offs( k )
+            tzReg.dbLen( k ) = lens( k )
+        next
+        tzReg.dbData = p + pos_
+        tzReg.dbVersion = ver
+        tzReg.dbSet = true
+        ok = true
+    end if
+    mutexunlock( tzReg.lock )
+    return ok
+end function
+
+'' KEY (a lower-cased id) in the registered database: its spelling and its rules.
+function tzDbFind( byref key as const ustring, byref canon as ustring, byref r as TzRules ) as boolean
+    dim as const ubyte ptr q = nullptr
+    dim as long ln = 0
+    mutexlock( tzReg.lock )
+    if tzReg.dbSet then
+        for k as long = 0 to ubound( tzReg.dbKeys )
+            if tzReg.dbKeys( k ) = key then
+                canon = tzReg.dbIds( k )
+                q = tzReg.dbData + tzReg.dbOff( k )
+                ln = tzReg.dbLen( k )
+                exit for
+            end if
+        next
+    end if
+    mutexunlock( tzReg.lock )
+    if q = nullptr then return false
+    return TzRules.TryParse( q, ln, r )
+end function
+
+function TimeZone.FindById( byref zoneId as const ustring ) as TimeZone
+    dim as TimeZone z
+    if TimeZone.TryFindById( zoneId, z ) = false then error 1
+    return z
+end function
+
+'' The machine's IANA id, or "".
+function tzLocalId( ) as ustring
+#ifdef __FB_WIN32__
+    '' TimeZoneKeyName through CLDR's windowsZones table, and only if that zone can
+    '' be loaded -- with std/tzdata imported, or through $TZDIR
+    dim as ustring winKey = tzWindowsLocalKey( )
+    if len( winKey ) = 0 then return ""
+    dim as ustring mapped = tzWindowsToIana( winKey )
+    if len( mapped ) = 0 then return ""
+    dim as TimeZone z
+    if TimeZone.TryFindById( mapped, z ) then return z.Id
+    return ""
+#else
+    dim as TimeZone z
+    dim as ustring s
+    dim as long k
+    dim as outcome.Optional( of ustring ) v = os.GetEnv( "TZ" )
+    if v.HasValue( ) then
+        s = v.Value( )
+        if left( s, 1 ) = ":" then s = mid( s, 2 )
+        if len( s ) = 0 then return "UTC"                    '' glibc: TZ="" is UTC
+        if left( s, 1 ) = "/" then
+            k = instrrev( s, "zoneinfo/" )
+            if k = 0 then return ""
+            s = mid( s, k + 9 )
+        end if
+        if TimeZone.TryFindById( s, z ) then return z.Id
+        return ""                                           '' a POSIX TZ string, say
+    end if
+    dim as fs.FsResultUStr lk = fs.ReadLink( "/etc/localtime" )
+    if lk.IsOk( ) then
+        s = lk.Value( )
+        k = instrrev( s, "zoneinfo/" )
+        if k > 0 andalso TimeZone.TryFindById( mid( s, k + 9 ), z ) then return z.Id
+    end if
+    s = tzFirstLine( "/etc/timezone" )
+    if len( s ) > 0 andalso TimeZone.TryFindById( s, z ) then return z.Id
+    return ""
+#endif
+end function
+
+function TimeZone.Local( ) as TimeZone
+    dim as TimeZone z
+    mutexlock( tzReg.lock )
+    z.m_e = tzReg.localEnt
+    mutexunlock( tzReg.lock )
+    if z.m_e <> nullptr then return z
+
+    dim as TzEntry_ ptr e = new TzEntry_
+    e->id = tzLocalId( )
+    e->key = ""                     '' never matched by tzRegFind: not in ents
+    e->kind = TZK_SYSTEM
+    mutexlock( tzReg.lock )
+    if tzReg.localEnt = nullptr then tzReg.localEnt = e
+    z.m_e = tzReg.localEnt
+    mutexunlock( tzReg.lock )
+    if z.m_e <> e then delete e
+    return z
+end function
+
+function tzWalkFilter( byref e as const fs.DirEntry, byval user as any ptr ) as long
+    if e.IsDirectory( ) then
+        '' posix/ repeats every zone; right/ counts leap seconds
+        if e.Name( ) = "posix" orelse e.Name( ) = "right" then return fs.WALK_SKIP
+        return fs.WALK_DESCEND
+    end if
+    return fs.WALK_YIELD
+end function
+
+function TimeZone.AvailableIds( ) as containers.Array( of ustring )
+    dim as containers.Array( of ustring ) ids, dirs
+    tzSourceDirs( dirs )
+    if dirs.Count( ) = 0 then
+        '' no directory: the embedded database, if there is one
+        mutexlock( tzReg.lock )
+        if tzReg.dbSet then
+            for k as long = 0 to ubound( tzReg.dbIds )
+                if tzReg.dbIds( k ) <> "Factory" then ids.Push( tzReg.dbIds( k ) )
+            next
+        end if
+        mutexunlock( tzReg.lock )
+        containers.Sort( ids )
+        return ids
+    end if
+    dim as ustring root = dirs[0]
+    dim as fs.WalkOptions opts
+    opts.YieldDirectories = false
+    opts.Filter = @tzWalkFilter
+    for each r in fs.WalkDir( root, opts )
+        if r.IsOk( ) = false then continue for
+        dim as ustring p = r.Value( ).Path( )
+        dim as ustring rel = mid( p, len( root ) + 2 )
+        for i as long = 0 to len( rel ) - 1
+            if rel[i] = 92 then rel[i] = 47                    '' '\' -> '/'
+        next
+        '' not zones, though they are zone files: the machine's own zone and
+        '' the POSIX default rules
+        if rel = "localtime" orelse rel = "posixrules" orelse rel = "Factory" then continue for
+        '' tzIdValid refuses '.', which drops zone.tab, tzdata.zi, +VERSION, ...
+        if tzIdValid( rel ) andalso tzIsTzif( p ) then ids.Push( rel )
+    next
+    containers.Sort( ids )
+    return ids
+end function
+
+function TimeZone.DataVersion( ) as ustring
+    dim as containers.Array( of ustring ) dirs
+    tzSourceDirs( dirs )
+    if dirs.Count( ) = 0 then
+        dim as ustring v
+        mutexlock( tzReg.lock )
+        if tzReg.dbSet then v = tzReg.dbVersion
+        mutexunlock( tzReg.lock )
+        return v
+    end if
+    dim as string s = tzFirstLine( dirs[0] & "/tzdata.zi" )
+    if left( s, 10 ) = "# version " then return trim( mid( s, 11 ) )
+    return tzFirstLine( dirs[0] & "/+VERSION" )
+end function
+
+'' ------------------------------------------------------------ lookups
+
+property TimeZone.IsValid( ) as boolean
+    return this.m_e <> nullptr
+end property
+
+property TimeZone.Id( ) as ustring
+    if this.m_e = nullptr then return ""
+    return this.m_e->id
+end property
+
+property TimeZone.IsFixed( ) as boolean
+    if this.m_e = nullptr then return false
+    return this.m_e->kind = TZK_FIXED
+end property
+
+'' The entry, after the misuse checks every lookup makes.
+function TimeZone.Entry_( byref i as chrono.Instant ) as TzEntry_ ptr
+    if this.m_e = nullptr orelse i.IsValid = false then error 1
+    return this.m_e
+end function
+
+function tzSysOffset( byval t as longint ) as long
+    dim as chrono.Instant i = chrono.Instant.FromUnixSeconds( t )
+    return clng( chrono.TimeZoneInfo.LocalOffsetAt( i ) ) * 60
+end function
+
+function TimeZone.OffsetSecondsAt( byref i as chrono.Instant ) as long
+    dim as TzEntry_ ptr e = this.Entry_( i )
+    if e = nullptr then return 0
+    select case e->kind
+    case TZK_FIXED
+        return e->fixedOff
+    case TZK_RULES
+        return e->rules.OffsetSecondsAt( i.UnixSeconds )
+    case else
+        return clng( chrono.TimeZoneInfo.LocalOffsetAt( i ) ) * 60
+    end select
+end function
+
+function TimeZone.OffsetAt( byref i as chrono.Instant ) as chrono.TimeSpan
+    return chrono.TimeSpan( clngint( this.OffsetSecondsAt( i ) ) * chrono.DT_TICKS_PER_SECOND )
+end function
+
+function TimeZone.IsDaylightSavingTime( byref i as chrono.Instant ) as boolean
+    dim as TzEntry_ ptr e = this.Entry_( i )
+    if e = nullptr then return false
+    select case e->kind
+    case TZK_FIXED
+        return false
+    case TZK_RULES
+        return e->rules.IsDstAt( i.UnixSeconds )
+    case else
+        return chrono.TimeZoneInfo.IsDaylightSavingTime( i )
+    end select
+end function
+
+'' The Local zone's abbreviation is the OS's name for standard or daylight time
+'' THIS year (chrono.TimeZoneInfo.StandardName / DaylightName): display names on
+'' Windows, abbreviations elsewhere.
+function TimeZone.AbbreviationAt( byref i as chrono.Instant ) as ustring
+    dim as TzEntry_ ptr e = this.Entry_( i )
+    if e = nullptr then return ""
+    select case e->kind
+    case TZK_FIXED
+        return e->id
+    case TZK_RULES
+        return e->rules.AbbreviationAt( i.UnixSeconds )
+    case else
+        if chrono.TimeZoneInfo.IsDaylightSavingTime( i ) then return chrono.TimeZoneInfo.DaylightName( )
+        return chrono.TimeZoneInfo.StandardName( )
+    end select
+end function
+
+function TimeZone.StandardOffsetAt( byref i as chrono.Instant ) as chrono.TimeSpan
+    dim as TzEntry_ ptr e = this.Entry_( i )
+    dim as long s = 0
+    if e <> nullptr then
+        select case e->kind
+        case TZK_FIXED
+            s = e->fixedOff
+        case TZK_RULES
+            s = e->rules.StandardOffsetSecondsAt( i.UnixSeconds )
+        case else
+            '' the nearest day outside daylight time, back then forward
+            s = this.OffsetSecondsAt( i )
+            if chrono.TimeZoneInfo.IsDaylightSavingTime( i ) then
+                dim as longint t = i.UnixSeconds
+                for d as long = 1 to 400
+                    dim as longint c = t - clngint( d ) * 86400
+                    if c >= TZ_MIN_UNIX andalso chrono.TimeZoneInfo.IsDaylightSavingTime( chrono.Instant.FromUnixSeconds( c ) ) = false then
+                        s = tzSysOffset( c )
+                        exit for
+                    end if
+                    c = t + clngint( d ) * 86400
+                    if c <= TZ_MAX_UNIX andalso chrono.TimeZoneInfo.IsDaylightSavingTime( chrono.Instant.FromUnixSeconds( c ) ) = false then
+                        s = tzSysOffset( c )
+                        exit for
+                    end if
+                next
+            end if
+        end select
+    end if
+    return chrono.TimeSpan( clngint( s ) * chrono.DT_TICKS_PER_SECOND )
+end function
+
+'' The Local zone, scanned: a day at a time for ten years, then halved to the
+'' second. DIR is 1 for the next change, -1 for the previous.
+function tzSysScan( byval t as longint, byval dir_ as long, byref r as longint ) as boolean
+    dim as long o0 = tzSysOffset( iif( dir_ > 0, t, t - 1 ) )
+    dim as longint prev = t
+    for d as long = 1 to 3653
+        dim as longint c = t + clngint( dir_ ) * d * 86400
+        if c > TZ_MAX_UNIX orelse c < TZ_MIN_UNIX then return false
+        if tzSysOffset( c ) <> o0 then
+            '' the change lies between prev and c
+            dim as longint lo = iif( dir_ > 0, prev, c ), hi = iif( dir_ > 0, c, prev )
+            dim as long oLo = tzSysOffset( lo )
+            while hi - lo > 1
+                dim as longint md = lo + ( hi - lo ) \ 2
+                if tzSysOffset( md ) = oLo then lo = md else hi = md
+            wend
+            r = hi
+            return true
+        end if
+        prev = c
+    next
+    return false
+end function
+
+function TimeZone.TryNextTransition( byref after as chrono.Instant, byref result as chrono.Instant ) as boolean
+    dim as TzEntry_ ptr e = this.Entry_( after )
+    if e = nullptr then return false
+    dim as longint s = after.UnixSeconds, t
+    dim as boolean ok
+    select case e->kind
+    case TZK_FIXED
+        return false
+    case TZK_RULES
+        ok = e->rules.TryNextTransition( s, t )
+    case else
+        ok = tzSysScan( s, 1, t )
+    end select
+    if ok then result = chrono.Instant.FromUnixSeconds( t )
+    return ok
+end function
+
+function TimeZone.TryPreviousTransition( byref before as chrono.Instant, byref result as chrono.Instant ) as boolean
+    dim as TzEntry_ ptr e = this.Entry_( before )
+    if e = nullptr then return false
+    '' Unix seconds floor; a transition AT the floor is still before an instant
+    '' a fraction of a second later, so round up when there is a fraction.
+    dim as longint s = before.UnixSeconds, t
+    if chrono.Instant.FromUnixSeconds( s ).Ticks < before.Ticks then s += 1
+    dim as boolean ok
+    select case e->kind
+    case TZK_FIXED
+        return false
+    case TZK_RULES
+        ok = e->rules.TryPreviousTransition( s, t )
+    case else
+        ok = tzSysScan( s, -1, t )
+    end select
+    if ok then result = chrono.Instant.FromUnixSeconds( t )
+    return ok
+end function
+
+operator = ( byref a as TimeZone, byref b as TimeZone ) as boolean
+    return a.Id = b.Id andalso a.IsValid = b.IsValid
+end operator
+
+operator <> ( byref a as TimeZone, byref b as TimeZone ) as boolean
+    return not ( a = b )
+end operator

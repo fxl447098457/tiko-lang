@@ -1,0 +1,322 @@
+#module "tz"
+#import "std/chrono"
+'' std/tz: ZonedDateTime as text -- RFC 9557 (ISO 8601 with a [Zone/Id]
+'' annotation) and std/chrono's patterns with the zone letters VV and v.
+''
+'' OUTPUT is single-valued: chrono's ISO wall reading (a fraction only when it is
+'' not zero, and then seven digits), the offset as +HH:MM -- +HH:MM:SS only when
+'' the seconds are not zero, so a present-day value is plain RFC 3339 -- and the
+'' zone id in brackets. UTC writes "+00:00[UTC]", not "Z": Z would claim the
+'' local offset is unknown.
+''
+'' INPUT takes what chrono's ISO parser takes for the wall reading, the offset
+'' in any of Z, +HH, +HHMM, +HH:MM, +HHMMSS and +HH:MM:SS, then the annotations.
+'' The offset is parsed here, not by chrono, because chrono's DateTime holds
+'' whole minutes and a historical offset has seconds.
+
+const TZ_OFFSET_NONE = &h7FFFFFFF        '' no offset in the text
+const TZ_OFFSET_Z    = &h7FFFFFFE        '' "Z": the instant is known, the offset is not
+const TZ_TEXT_OFFSET_LIMIT = 86399       '' +-23:59:59
+
+'' "+05:30", "-03:30", "+00:19:32": the offset part of the ISO form.
+function tzIsoOffset( byval s as long ) as ustring
+    return tzFormatOffset( s )
+end function
+
+function ZonedDateTime.ToIsoString( ) as ustring
+    if this.Check_( ) = false then return ""
+    dim as ustring r = this.Wall_( ).ToIsoString( ) & tzIsoOffset( this.m_offset )
+    if len( this.m_zone.Id ) > 0 then r &= "[" & this.m_zone.Id & "]"
+    return r
+end function
+
+function ZonedDateTime.ToString( ) as ustring
+    return this.ToIsoString( )
+end function
+
+'' TEXT as a quoted pattern literal: '' for an apostrophe.
+function tzQuoteLiteral( byref text as const ustring ) as ustring
+    dim as ustring r = "'"
+    for i as long = 1 to len( text )
+        dim as ustring c = mid( text, i, 1 )
+        if c = "'" then r &= "''" else r &= c
+    next
+    return r & "'"
+end function
+
+'' PATTERN with VV and v replaced by quoted literals; false when a V or v run has
+'' the wrong length. Quoted text and backslash escapes are copied as they are.
+function tzRewritePattern( byref pattern as const ustring, byref id as const ustring, _
+                           byref abbr as const ustring, byref out_ as ustring ) as boolean
+    dim as long n = len( pattern ), i = 1
+    out_ = ""
+    while i <= n
+        dim as ustring c = mid( pattern, i, 1 )
+        if c = "'" then
+            '' a quoted run, '' inside it being one apostrophe
+            dim as long j = i + 1
+            while j <= n
+                if mid( pattern, j, 1 ) = "'" then
+                    if j < n andalso mid( pattern, j + 1, 1 ) = "'" then
+                        j += 2
+                        continue while
+                    end if
+                    exit while
+                end if
+                j += 1
+            wend
+            out_ &= mid( pattern, i, j - i + 1 )
+            i = j + 1
+        elseif c = "\" then
+            out_ &= mid( pattern, i, 2 )
+            i += 2
+        elseif c = "V" orelse c = "v" then
+            dim as long j = i
+            while j <= n andalso mid( pattern, j, 1 ) = c
+                j += 1
+            wend
+            if c = "V" then
+                if j - i <> 2 then return false
+                out_ &= tzQuoteLiteral( id )
+            else
+                if j - i <> 1 then return false
+                out_ &= tzQuoteLiteral( abbr )
+            end if
+            i = j
+        else
+            out_ &= c
+            i += 1
+        end if
+    wend
+    return true
+end function
+
+function ZonedDateTime.TryFormat( byref pattern as const ustring, byref result as ustring ) as boolean
+    if this.Check_( ) = false then return false
+    dim as ustring p
+    if tzRewritePattern( pattern, this.m_zone.Id, this.Abbreviation, p ) = false then return false
+    '' the TRUE wall reading, carrying the rounded offset for z / K only: built
+    '' from ToDateTime( ) the fields would be the rounded offset's reading, which
+    '' the zone never showed (Lord_Howe's +10:36:20 would print 20 s early)
+    dim as long m = ( abs( this.m_offset ) + 30 ) \ 60
+    if this.m_offset < 0 then m = -m
+    if m < chrono.DT_OFFSET_MIN orelse m > chrono.DT_OFFSET_MAX then return false
+    dim as string r
+    if chrono.DateTime.FromTicks( this.Wall_( ).Ticks, cshort( m ) ).TryFormat( p, r ) = false then return false
+    result = r
+    return true
+end function
+
+function ZonedDateTime.ToString( byref pattern as const ustring ) as ustring
+    dim as ustring r
+    if this.TryFormat( pattern, r ) = false then error 1
+    return r
+end function
+
+'' ------------------------------------------------------------ parsing
+
+function tzDigits( byref s as const ustring, byval i as long, byval n as long, byref v as long ) as boolean
+    v = 0
+    if i + n - 1 > len( s ) then return false
+    for k as long = i to i + n - 1
+        dim as long c = s[k - 1]
+        if c < 48 orelse c > 57 then return false
+        v = v * 10 + ( c - 48 )
+    next
+    return true
+end function
+
+'' An offset as text: Z, or a sign and HH, HHMM, HH:MM, HHMMSS or HH:MM:SS.
+function tzParseOffsetText( byref t as const ustring, byref secs as long ) as boolean
+    if t = "Z" orelse t = "z" then
+        secs = TZ_OFFSET_Z
+        return true
+    end if
+    dim as long n = len( t ), hh, mm = 0, ss = 0, sign_
+    if n < 3 then return false
+    select case t[0]
+    case 43 : sign_ = 1
+    case 45 : sign_ = -1
+    case else : return false
+    end select
+    if tzDigits( t, 2, 2, hh ) = false then return false
+    select case n
+    case 3
+    case 5
+        if tzDigits( t, 4, 2, mm ) = false then return false
+    case 6
+        if t[3] <> 58 orelse tzDigits( t, 5, 2, mm ) = false then return false
+    case 7
+        if tzDigits( t, 4, 2, mm ) = false orelse tzDigits( t, 6, 2, ss ) = false then return false
+    case 9
+        if t[3] <> 58 orelse t[6] <> 58 then return false
+        if tzDigits( t, 5, 2, mm ) = false orelse tzDigits( t, 8, 2, ss ) = false then return false
+    case else
+        return false
+    end select
+    if mm > 59 orelse ss > 59 then return false
+    secs = sign_ * ( hh * 3600 + mm * 60 + ss )
+    if abs( secs ) > TZ_TEXT_OFFSET_LIMIT then return false
+    return true
+end function
+
+'' WALL in Z with text offset OFF (or TZ_OFFSET_NONE / TZ_OFFSET_Z) under the
+'' two policies.
+function tzZonedFromParts( byref wall as chrono.DateTime, byval off as long, byref z as TimeZone, _
+                           byval offsets as OffsetPolicy, byval policy as Disambiguation, _
+                           byref result as ZonedDateTime ) as boolean
+    dim as longint wt = wall.Ticks
+    if off = TZ_OFFSET_Z orelse ( off <> TZ_OFFSET_NONE andalso offsets = opUse ) then
+        dim as longint o = iif( off = TZ_OFFSET_Z, 0, off )
+        dim as chrono.Instant i = chrono.Instant.FromTicks( wt - o * chrono.DT_TICKS_PER_SECOND )
+        if i.IsValid = false then return false
+        result = ZonedDateTime.FromInstant( i, z )
+        return true
+    end if
+    if off <> TZ_OFFSET_NONE andalso offsets <> opIgnore then
+        '' the instant the offset names, if the zone has that offset there
+        dim as chrono.Instant a, b
+        dim as long n = z.MapLocal( wall, a, b )
+        if n >= 1 andalso z.OffsetSecondsAt( a ) = off then
+            result = ZonedDateTime.FromInstant( a, z )
+            return true
+        end if
+        if n = 2 andalso z.OffsetSecondsAt( b ) = off then
+            result = ZonedDateTime.FromInstant( b, z )
+            return true
+        end if
+        if offsets = opReject then return false
+    end if
+    return ZonedDateTime.TryFromLocal( wall, z, policy, result )
+end function
+
+'' The zone of an annotation: an IANA id, or an offset "+05:30" (RFC 9557's
+'' offset time zone: whole minutes).
+function tzZoneFromAnnotation( byref t as const ustring, byref z as TimeZone ) as boolean
+    if len( t ) > 0 andalso ( t[0] = 43 orelse t[0] = 45 ) then
+        dim as long secs
+        if len( t ) <> 6 orelse tzParseOffsetText( t, secs ) = false then return false
+        if abs( secs ) > TZ_MAX_FIXED then return false
+        z = TimeZone.FixedOffset( secs )
+        return true
+    end if
+    return TimeZone.TryFindById( t, z )
+end function
+
+function ZonedDateTime.TryParseIso( byref s as const ustring, byref result as ZonedDateTime, _
+                                    byval offsets as OffsetPolicy, byval policy as Disambiguation ) as boolean
+    dim as long lb = instr( s, "[" )
+    if lb = 0 then return false                        '' no zone: not a zoned date-time
+    dim as ustring dt = left( s, lb - 1 )
+
+    '' the annotations: [zone] first, then [key=value]s, nothing after the last
+    dim as TimeZone z
+    dim as boolean haveZone = false
+    dim as long i = lb
+    while i <= len( s )
+        if mid( s, i, 1 ) <> "[" then return false
+        dim as long rb = instr( i, s, "]" )
+        if rb = 0 then return false
+        dim as ustring body = mid( s, i + 1, rb - i - 1 )
+        dim as boolean critical = ( left( body, 1 ) = "!" )
+        if critical then body = mid( body, 2 )
+        if len( body ) = 0 then return false
+        dim as long eq = instr( body, "=" )
+        if eq = 0 then
+            if haveZone orelse i <> lb then return false   '' one zone, and first
+            if tzZoneFromAnnotation( body, z ) = false then return false
+            haveZone = true
+        else
+            dim as ustring key = left( body, eq - 1 ), value = mid( body, eq + 1 )
+            if len( key ) = 0 orelse len( value ) = 0 then return false
+            for k as long = 0 to len( key ) - 1
+                dim as long c = key[k]
+                if not ( ( c >= 97 andalso c <= 122 ) orelse ( c >= 48 andalso c <= 57 ) orelse c = 45 orelse c = 95 ) then return false
+            next
+            if key = "u-ca" then
+                if critical andalso value <> "gregory" andalso value <> "iso8601" then return false
+            elseif critical then
+                return false
+            end if
+        end if
+        i = rb + 1
+    wend
+    if haveZone = false then return false
+
+    '' the offset: Z at the end, or the last sign after the time
+    dim as long off = TZ_OFFSET_NONE
+    dim as ustring wallText = dt
+    dim as long tpos = 0
+    for k as long = 1 to len( dt )
+        dim as ustring c = mid( dt, k, 1 )
+        if c = "T" orelse c = "t" orelse c = " " then
+            tpos = k
+            exit for
+        end if
+    next
+    if tpos > 0 then
+        dim as long sp = 0
+        for k as long = len( dt ) to tpos + 1 step -1
+            dim as ustring c = mid( dt, k, 1 )
+            if c = "+" orelse c = "-" orelse ( k = len( dt ) andalso ( c = "Z" orelse c = "z" ) ) then
+                sp = k
+                exit for
+            end if
+        next
+        if sp > 0 then
+            if tzParseOffsetText( mid( dt, sp ), off ) = false then return false
+            wallText = left( dt, sp - 1 )
+        end if
+    end if
+
+    dim as chrono.DateTime wall
+    if chrono.DateTime.TryParseIso( wallText, wall ) = false then return false
+    if wall.HasOffset then return false
+    if tpos = 0 then
+        '' a date alone: the first instant of that day
+        dim as ZonedDateTime d
+        if ZonedDateTime.TryFromLocal( wall, z, dzCompatible, d ) = false then return false
+        result = d.StartOfDay( )
+        return result.IsValid
+    end if
+    return tzZonedFromParts( wall, off, z, offsets, policy, result )
+end function
+
+function ZonedDateTime.ParseIso( byref s as const ustring, byval offsets as OffsetPolicy, _
+                                 byval policy as Disambiguation ) as ZonedDateTime
+    dim as ZonedDateTime r
+    if ZonedDateTime.TryParseIso( s, r, offsets, policy ) = false then error 1
+    return r
+end function
+
+function ZonedDateTime.TryParseExact( byref s as const ustring, byref pattern as const ustring, _
+                                      byref result as ZonedDateTime, _
+                                      byval offsets as OffsetPolicy, byval policy as Disambiguation ) as boolean
+    '' the pattern must end in VV and hold no v (an abbreviation names no zone)
+    dim as ustring probe
+    if tzRewritePattern( pattern, chr( 1 ), chr( 2 ), probe ) = false then return false
+    if instr( probe, chr( 2 ) ) > 0 then return false
+    dim as long n = len( pattern )
+    if n < 2 orelse right( pattern, 2 ) <> "VV" then return false
+    dim as ustring head = left( pattern, n - 2 )
+    if instr( probe, chr( 1 ) ) <> len( probe ) - 1 then return false   '' VV only once, at the end
+    '' the longest zone id the text ends with that the head also parses before
+    for k as long = 0 to len( s ) - 1
+        dim as ustring idText = mid( s, k + 1 )
+        dim as TimeZone z
+        if tzZoneFromAnnotation( idText, z ) = false then continue for
+        dim as chrono.DateTime dtv
+        if chrono.DateTime.TryParseExact( left( s, k ), head, dtv ) = false then continue for
+        dim as long off = TZ_OFFSET_NONE
+        if dtv.HasOffset then off = clng( dtv.OffsetMinutes ) * 60
+        return tzZonedFromParts( dtv.WithOffset( chrono.DT_OFFSET_UNSPECIFIED ), off, z, offsets, policy, result )
+    next
+    return false
+end function
+
+function ZonedDateTime.ParseExact( byref s as const ustring, byref pattern as const ustring, _
+                                   byval offsets as OffsetPolicy, byval policy as Disambiguation ) as ZonedDateTime
+    dim as ZonedDateTime r
+    if ZonedDateTime.TryParseExact( s, pattern, r, offsets, policy ) = false then error 1
+    return r
+end function

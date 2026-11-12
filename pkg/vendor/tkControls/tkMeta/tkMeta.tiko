@@ -11,8 +11,10 @@
 #module "tkMeta"
 
 #import "../tkHost" public
+#import "../tkTheme" public
 using tkHost
 using tkPaint
+using tkTheme
 
 public enum TKMETA_CONTAINER_KIND
     TKMETA_NOT_CONTAINER = 0
@@ -26,6 +28,9 @@ public type TKMETA_ApplyProc as sub( byval w as TK_WIDGET ptr, byref v as const 
 public type TKMETA_ReadFunc as function( byval w as TK_WIDGET ptr ) as ustring
 public type TKMETA_FontProc as sub( byval w as TK_WIDGET ptr, byval f as TTF_Font ptr )
 public type TKMETA_CreateFunc as function( byval hParent as TK_WIDGET ptr, byval id as long, byref arg as const ustring ) as TK_WIDGET ptr
+' A control's colour struct as ulongs (NumColorSlots of them): what it shows, and what a theme gives it.
+public type TKMETA_GetColorsProc as sub( byval w as TK_WIDGET ptr, byval pSlots as ulong ptr )
+public type TKMETA_ThemeColorsProc as sub( byref t as TKTHEME_COLORS, byval pSlots as ulong ptr )
 
 public type TKMETA_PROP
     Name         as ustring
@@ -38,6 +43,18 @@ public type TKMETA_PROP
     Read_        as TKMETA_ReadFunc   ' 0 when write-only, or a font
     ApplyFont    as TKMETA_FontProc   ' fonts only
     bDesign      as boolean        ' false: not applied on the design canvas
+    bInspector   as boolean        ' false: not shown in the inspector (a colour the Colors dialog edits)
+    ThemeShape   as ustring        ' "CornerRadius" / "BorderWidth": the theme supplies it while unset
+    ShapeScale   as long           ' the property's value = the theme's x this
+end type
+
+' One field of a control's colour struct; its index in Colors is its ulong slot.
+public type TKMETA_COLORFIELD
+    Name   as ustring
+    Part   as ustring              ' "" = an "other" colour, outside the grid
+    State  as ustring              ' Normal Hot Pressed Disabled Selected Open
+    Group  as ustring              ' "", or a second grid: Checked, On, Off
+    bInk   as boolean              ' text-like: simple mode copies Normal to Hot and Pressed
 end type
 
 public type TKMETA_EVENT
@@ -67,6 +84,14 @@ public type TKMETA_CONTROL
     NumProps      as long
     Events( any ) as TKMETA_EVENT
     NumEvents     as long
+    ' The colour struct (none: ColorStruct = "", NumColorSlots = 0)
+    ColorStruct   as ustring
+    ColorGet      as ustring
+    ColorTheme    as ustring
+    GetColors     as TKMETA_GetColorsProc
+    ThemeColors   as TKMETA_ThemeColorsProc
+    Colors( any ) as TKMETA_COLORFIELD
+    NumColorSlots as long
 end type
 
 dim shared as TKMETA_CONTROL gControls( any )
@@ -94,13 +119,16 @@ end sub
 
 private sub Prop_( byref name_ as const ustring, byref kind as const ustring, byref dflt as const ustring, _
                    byref en as const ustring, byref s_ as const ustring, byref g as const ustring, _
-                   byval a as TKMETA_ApplyProc, byval r as TKMETA_ReadFunc, byval f as TKMETA_FontProc, byval bDesign as boolean )
+                   byval a as TKMETA_ApplyProc, byval r as TKMETA_ReadFunc, byval f as TKMETA_FontProc, byval bDesign as boolean, _
+                   byval bInspector as boolean, byref shape as const ustring, byval shapeScale as long )
     with gControls( gnControls - 1 )
         redim preserve .Props( 0 to .NumProps )
         .Props( .NumProps ).Name = name_ : .Props( .NumProps ).Kind = kind : .Props( .NumProps ).DefaultValue = dflt
         .Props( .NumProps ).EnumPairs = en : .Props( .NumProps ).SetName = s_ : .Props( .NumProps ).GetName = g
         .Props( .NumProps ).Apply = a : .Props( .NumProps ).Read_ = r : .Props( .NumProps ).ApplyFont = f
         .Props( .NumProps ).bDesign = bDesign
+        .Props( .NumProps ).bInspector = bInspector
+        .Props( .NumProps ).ThemeShape = shape : .Props( .NumProps ).ShapeScale = shapeScale
         .NumProps += 1
     end with
 end sub
@@ -112,6 +140,25 @@ private sub Event_( byref name_ as const ustring, byref s_ as const ustring, byr
         .Events( .NumEvents ).Name = name_ : .Events( .NumEvents ).SetName = s_ : .Events( .NumEvents ).TypeName = t
         .Events( .NumEvents ).Sig = sig : .Events( .NumEvents ).Params = params : .Events( .NumEvents ).Args = args
         .NumEvents += 1
+    end with
+end sub
+
+private sub Colors_( byref struct_ as const ustring, byref getName as const ustring, byref themeName as const ustring, _
+                     byval g as TKMETA_GetColorsProc, byval t as TKMETA_ThemeColorsProc )
+    with gControls( gnControls - 1 )
+        .ColorStruct = struct_ : .ColorGet = getName : .ColorTheme = themeName
+        .GetColors = g : .ThemeColors = t
+    end with
+end sub
+
+private sub Color_( byref name_ as const ustring, byref part as const ustring, byref state as const ustring, _
+                    byref grp as const ustring, byval bInk as boolean )
+    with gControls( gnControls - 1 )
+        redim preserve .Colors( 0 to .NumColorSlots )
+        .Colors( .NumColorSlots ).Name = name_ : .Colors( .NumColorSlots ).Part = part
+        .Colors( .NumColorSlots ).State = state : .Colors( .NumColorSlots ).Group = grp
+        .Colors( .NumColorSlots ).bInk = bInk
+        .NumColorSlots += 1
     end with
 end sub
 
@@ -252,4 +299,25 @@ public function tkMeta_FindEvent( byval c as TKMETA_CONTROL ptr, byref name_ as 
         if c->Events( i ).Name = name_ then return @c->Events( i )
     next
     return 0
+end function
+
+' The slot of a colour field by name; -1 when the control has no such field.
+public function tkMeta_ColorSlot( byval c as TKMETA_CONTROL ptr, byref name_ as const ustring ) as long
+    if c = 0 then return -1
+    for i as long = 0 to c->NumColorSlots - 1
+        if c->Colors( i ).Name = name_ then return i
+    next
+    return -1
+end function
+
+' The slot of (group, part, state); -1 when the grid has no such cell.
+public function tkMeta_ColorCell( byval c as TKMETA_CONTROL ptr, byref grp as const ustring, byref part as const ustring, _
+                                  byref state as const ustring ) as long
+    if (c = 0) orelse (len( part ) = 0) then return -1
+    for i as long = 0 to c->NumColorSlots - 1
+        with c->Colors( i )
+            if (.Group = grp) andalso (.Part = part) andalso (.State = state) then return i
+        end with
+    next
+    return -1
 end function

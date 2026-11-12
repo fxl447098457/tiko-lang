@@ -142,13 +142,13 @@ Dim As String formatStr(...) = {"","0","0.00","#,##0","#,##0.00","0%", "0.00%", 
 
 ?
 
-For iFormat As Integer = 0 To UBound(formatStr)
+For Each fmt As String In formatStr
 
-    ? formatStr(iFormat),,
+    ? fmt,,
 
-    For iNumber As Integer = 0 To UBound(numberVal)
+    For Each number As Double In numberVal
 
-        ? Format(numberVal(iNumber), formatStr(iFormat)),
+        ? Format(number, fmt),
 
     Next
 
@@ -186,9 +186,9 @@ Dim As String formatStr(...) = {"yyyy-mm-dd","d-mmmm-yy","d-mmm","mmmm-yyyy","h:
 
 ?
 
-For iFormat As Integer = 0 To UBound(formatStr)
+For Each fmt As String In formatStr
 
-    ? formatStr(iFormat),, Format(dateTimeVal, formatStr(iFormat))
+    ? fmt,, Format(dateTimeVal, fmt)
 
 Next
 ```

@@ -455,14 +455,13 @@ function GetForegroundColor() as ARGB
 ```
 
 The first form stores the foreground colour in the `ARGB` that `colour` points to. The form
-without an argument returns the status of the call (0 on success), not the colour; use the first
-form to read it.
+without an argument returns the colour.
 
 | Parameter | Meaning |
 | --- | --- |
 | `colour` | The variable that receives the colour. |
 
-**Returns** the status.
+**Returns** the colour.
 
 **Example**
 
@@ -483,13 +482,13 @@ function GetBackgroundColor() as ARGB
 ```
 
 The same for the background colour: the first form stores it in the variable `colour` points
-to; the form without an argument returns the status (0 on success), not the colour.
+to; the form without an argument returns the colour.
 
 | Parameter | Meaning |
 | --- | --- |
 | `colour` | The variable that receives the colour. |
 
-**Returns** the status.
+**Returns** the colour.
 
 **Example**
 
@@ -1395,19 +1394,18 @@ Microsoft Learn: [PathGradientBrush::PathGradientBrush](https://learn.microsoft.
 ### GetCenterColor
 
 ```freebasic
-function GetCenterColor( byval colour as ARGB ptr ) as GpStatus
+function GetCenterColor( byval colour as ARGB ptr ) as ARGB
 function GetCenterColor() as ARGB
 ```
 
 The first form stores the colour of the centre point in the `ARGB` that `colour` points to. The
-form without an argument returns the status of the call (0 on success), not the colour; use the
-first form to read it.
+form without an argument returns the ARGB colour.
 
 | Parameter | Meaning |
 | --- | --- |
 | `colour` | The variable that receives the colour. |
 
-**Returns** the status.
+**Returns** the colour.
 
 **Example**
 

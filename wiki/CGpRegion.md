@@ -638,21 +638,16 @@ Microsoft Learn: [Region::GetData](https://learn.microsoft.com/en-us/windows/win
 ### IsVisible
 
 ```freebasic
-function IsVisible( byval pt as GpPointF ptr, byval pGraphics as CGpGraphics_ ptr ) as GpStatus
-function IsVisible( byval pt as GpPoint ptr, byval pGraphics as CGpGraphics_ ptr ) as GpStatus
-function IsVisible( byval x as single, byval y as single, byval pGraphics as CGpGraphics_ ptr ) as GpStatus
-function IsVisible( byval rc as GpRectF ptr, byval pGraphics as CGpGraphics_ ptr ) as GpStatus
-function IsVisible( byval rc as GpRect ptr, byval pGraphics as CGpGraphics_ ptr ) as GpStatus
-function IsVisible( byval x as single, byval y as single, byval nWidth as single, byval nHeight as single, byval pGraphics as CGpGraphics_ ptr ) as GpStatus
+function IsVisible( byval pt as GpPointF ptr, byval pGraphics as CGpGraphics_ ptr ) as Boolean
+function IsVisible( byval pt as GpPoint ptr, byval pGraphics as CGpGraphics_ ptr ) as Boolean
+function IsVisible( byval x as single, byval y as single, byval pGraphics as CGpGraphics_ ptr ) as Boolean
+function IsVisible( byval rc as GpRectF ptr, byval pGraphics as CGpGraphics_ ptr ) as Boolean
+function IsVisible( byval rc as GpRect ptr, byval pGraphics as CGpGraphics_ ptr ) as Boolean
+function IsVisible( byval x as single, byval y as single, byval nWidth as single, byval nHeight as single, byval pGraphics as CGpGraphics_ ptr ) as Boolean
 ```
 
 Tells whether a point lies in the region, or whether any part of a rectangle does. `pGraphics`
 may be `NULL`; when it is given, its world transformation applies.
-
-The result is declared as a `GpStatus` but holds the answer, not a status: **1** when the point
-or rectangle is in the region, **0** when it is not. Test it with `if r.IsVisible( ... ) then`
-or `<> 0`; comparing it with `true` is always false. The call's real status is in
-`GetLastStatus()`.
 
 | Parameter | Meaning |
 | --- | --- |
@@ -660,7 +655,7 @@ or `<> 0`; comparing it with `true` is always false. The call's real status is i
 | `rc`, `x`, `y`, `nWidth`, `nHeight` | The rectangle. |
 | `pGraphics` | A graphics object, or `NULL`. |
 
-**Returns** 1 if visible, 0 if not.
+**Returns** `true` if visible, `false` if not.
 
 **Example**
 

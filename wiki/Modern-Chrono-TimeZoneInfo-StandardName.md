@@ -13,6 +13,8 @@ TimeZoneInfo.StandardName( ) as ustring
 ## Notes
 
 - The name is whatever the OS calls the zone, for display only: it is not a key into any zone database.
+- Windows gives a display name ("Newfoundland Standard Time"); Linux and macOS give an abbreviation ("NST").
+- This year's name, not the name in force at any other time.
 - An empty string when the OS gives no name.
 
 ## Examples

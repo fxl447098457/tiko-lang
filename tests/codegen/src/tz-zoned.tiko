@@ -1,0 +1,161 @@
+'' std/tz phase Z4: ZonedDateTime. Prints "ok", or the first failed check. $TZDIR is
+'' tests/codegen/tzdata (tzdata 2026f).
+''   1. construction: FromInstant, FromLocal under each policy, TryFromLocal, Now, Invalid
+''   2. fields, offset, abbreviation, DST flag; ToDateTime rounding a sub-minute offset
+''      and keeping the instant (Amsterdam +00:19:32 -> +00:20)
+''   3. exact against calendar arithmetic across St_Johns' 2025 changes; calendar steps
+''      into an overlap keep the offset they had; into a gap move forward; month clamps
+''   4. zone changes: WithZoneSameInstant converts, WithZoneSameLocal reinterprets
+''   5. StartOfDay: plain, a fall-back day, Sao_Paulo's 01:00 day, Apia's skipped day
+''   6. comparison and equality; Invalid carried through arithmetic and conversions
+''   7. 3000 random instants x zones: the round trips hold
+#import "std/tz"
+#import "std/chrono"
+#import "std/os"
+using tz
+
+dim shared as long failures = 0
+sub check( byval ok as boolean, byref what as string )
+    if ok = false then
+        if failures = 0 then print "FAIL: "; what
+        failures += 1
+    end if
+end sub
+
+function at( byval y as long, byval mo as long, byval d as long, _
+             byval h as long = 0, byval mi as long = 0, byval s as long = 0 ) as chrono.Instant
+    return chrono.DateTime( y, mo, d, h, mi, s, 0 ).AssumeUtc( )
+end function
+
+function wl( byval y as long, byval mo as long, byval d as long, _
+             byval h as long = 0, byval mi as long = 0, byval s as long = 0 ) as chrono.DateTime
+    return chrono.DateTime( y, mo, d, h, mi, s, 0 )
+end function
+
+os.SetEnv( "TZDIR", "tests/codegen/tzdata" )
+dim as TimeZone sj = TimeZone.FindById( "America/St_Johns" )
+dim as TimeZone ny = TimeZone.FindById( "America/New_York" )
+dim as TimeZone ld = TimeZone.FindById( "Europe/London" )
+
+'' ---------------------------------------------------------------- 1. construction
+dim as ZonedDateTime z = ZonedDateTime.FromInstant( at( 2025, 7, 4, 16 ), ny )
+check( z.IsValid andalso z.Zone = ny, "FromInstant" )
+check( z.Year = 2025 andalso z.Month = 7 andalso z.Day = 4 andalso z.Hour = 12 andalso z.Minute = 0, "New_York 12:00 EDT" )
+check( z.OffsetSeconds = -14400 andalso z.Offset.TotalHours = -4 andalso z.Abbreviation = "EDT" andalso z.IsDaylightSavingTime, "EDT" )
+check( z.DayOfWeek = 5 andalso z.DayOfYear = 185, "a Friday, day 185" )
+check( z.ToInstant( ) = at( 2025, 7, 4, 16 ), "ToInstant" )
+check( z.ToDateTime( ).ToIsoString( ) = "2025-07-04T12:00:00-04:00", "ToDateTime " & z.ToDateTime( ).ToIsoString( ) )
+check( z.ToWall( ).HasOffset = false andalso z.ToWall( ).Hour = 12, "ToWall" )
+check( z.GetDate( ) = chrono.LocalDate( 2025, 7, 4 ) andalso z.GetTimeOfDay( ).Hour = 12, "GetDate / GetTimeOfDay" )
+
+dim as ZonedDateTime r
+'' 01:30 on St_Johns' 2025 fall-back night, twice
+check( ZonedDateTime.FromLocal( wl( 2025, 11, 2, 1, 30 ), sj ).ToInstant( ) = at( 2025, 11, 2, 4 ), "FromLocal overlap compatible" )
+check( ZonedDateTime.FromLocal( wl( 2025, 11, 2, 1, 30 ), sj, dzLater ).ToInstant( ) = at( 2025, 11, 2, 5 ), "FromLocal overlap later" )
+check( ZonedDateTime.FromLocal( wl( 2025, 11, 2, 1, 30 ), sj, dzLater ).OffsetSeconds = -12600, "later is NST" )
+check( ZonedDateTime.TryFromLocal( wl( 2025, 11, 2, 1, 30 ), sj, dzReject, r ) = false andalso r.IsValid = false, "TryFromLocal reject" )
+'' 02:30 on its spring-forward morning, never
+check( ZonedDateTime.FromLocal( wl( 2025, 3, 9, 2, 30 ), sj ).Hour = 3, "FromLocal gap forward to 03:30" )
+check( ZonedDateTime.FromLocal( wl( 2025, 3, 9, 2, 30 ), sj, dzEarlier ).Hour = 1, "FromLocal gap backward to 01:30" )
+
+dim as ZonedDateTime nw = ZonedDateTime.Now( ld )
+check( nw.IsValid andalso abs( ( nw.ToInstant( ) - chrono.WallClock.UtcNow( ) ).TotalSeconds ) < 5, "Now" )
+check( ZonedDateTime.Invalid( ).IsValid = false andalso r.IsValid = false, "Invalid; a dim'd one too" )
+
+'' ---------------------------------------------------------------- 2. sub-minute offsets
+scope
+    dim as TimeZone am = TimeZone.FindById( "Europe/Amsterdam" )
+    dim as ZonedDateTime a = ZonedDateTime.FromInstant( at( 1930, 1, 15, 12 ), am )
+    check( a.OffsetSeconds = 1172 andalso a.Abbreviation = "AMT", "Amsterdam +00:19:32" )
+    check( a.Hour = 12 andalso a.Minute = 19 andalso a.Second = 32, "wall 12:19:32" )
+    dim as chrono.DateTime d = a.ToDateTime( )
+    check( d.OffsetMinutes = 20, "ToDateTime rounds +00:19:32 to +00:20" )
+    check( d.ToInstant( ) = a.ToInstant( ), "and keeps the instant" )
+    check( d.Hour = 12 andalso d.Minute = 20 andalso d.Second = 0, "so the reading moves by 28 s" )
+    '' rounding: 29 s down, 30 s up, both signs
+    check( ZonedDateTime.FromInstant( at( 2025, 1, 1 ), TimeZone.FixedOffset( 60 + 29 ) ).ToDateTime( ).OffsetMinutes = 1, "+00:01:29 -> +00:01" )
+    check( ZonedDateTime.FromInstant( at( 2025, 1, 1 ), TimeZone.FixedOffset( 60 + 30 ) ).ToDateTime( ).OffsetMinutes = 2, "+00:01:30 -> +00:02" )
+    check( ZonedDateTime.FromInstant( at( 2025, 1, 1 ), TimeZone.FixedOffset( -( 60 + 30 ) ) ).ToDateTime( ).OffsetMinutes = -2, "-00:01:30 -> -00:02" )
+end scope
+
+'' ---------------------------------------------------------------- 3. arithmetic
+scope
+    '' noon the day before spring forward
+    dim as ZonedDateTime n = ZonedDateTime.FromLocal( wl( 2025, 3, 8, 12 ), sj )
+    dim as ZonedDateTime c = n.AddCalendarDays( 1 ), e = n.Add( chrono.TimeSpan.FromHours( 24 ) )
+    check( c.Hour = 12 andalso c.OffsetSeconds = -9000, "calendar: 12:00 NDT next day" )
+    check( ( c.ToInstant( ) - n.ToInstant( ) ).TotalHours = 23, "which is 23 hours on" )
+    check( e.Hour = 13 andalso e.Day = 9, "exact 24 h: 13:00 NDT" )
+    check( n.Subtract( chrono.TimeSpan.FromHours( 24 ) ).Hour = 12, "exact back 24 h, no change" )
+    '' calendar steps INTO the fall-back overlap keep the offset they had
+    dim as ZonedDateTime pre = ZonedDateTime.FromLocal( wl( 2025, 11, 1, 1, 30 ), sj )      '' NDT
+    dim as ZonedDateTime post = ZonedDateTime.FromLocal( wl( 2025, 11, 3, 1, 30 ), sj )     '' NST
+    check( pre.AddCalendarDays( 1 ).OffsetSeconds = -9000 andalso pre.AddCalendarDays( 1 ).ToInstant( ) = at( 2025, 11, 2, 4 ), "into the overlap from NDT: the NDT one" )
+    check( post.AddCalendarDays( -1 ).OffsetSeconds = -12600 andalso post.AddCalendarDays( -1 ).ToInstant( ) = at( 2025, 11, 2, 5 ), "into the overlap from NST: the NST one" )
+    '' into the gap: forward
+    dim as ZonedDateTime g = ZonedDateTime.FromLocal( wl( 2025, 3, 8, 2, 30 ), sj ).AddCalendarDays( 1 )
+    check( g.Hour = 3 andalso g.Minute = 30 andalso g.OffsetSeconds = -9000, "into the gap: 03:30 NDT" )
+    '' months clamp; years
+    check( ZonedDateTime.FromLocal( wl( 2025, 1, 31, 9 ), ny ).AddCalendarMonths( 1 ).Day = 28, "Jan 31 + 1 month = Feb 28" )
+    check( ZonedDateTime.FromLocal( wl( 2024, 2, 29, 9 ), ny ).AddCalendarYears( 1 ).Day = 28, "Feb 29 + 1 year = Feb 28" )
+    check( ZonedDateTime.FromLocal( wl( 2025, 1, 15, 9 ), ny ).AddCalendarMonths( 6 ).ToDateTime( ).ToIsoString( ) = "2025-07-15T09:00:00-04:00", "winter + 6 months is EDT" )
+end scope
+
+'' ---------------------------------------------------------------- 4. zone changes
+scope
+    dim as ZonedDateTime n = ZonedDateTime.FromLocal( wl( 2025, 6, 1, 9 ), ny )
+    dim as ZonedDateTime l1 = n.WithZoneSameInstant( ld ), l2 = n.WithZoneSameLocal( ld )
+    check( l1.ToInstant( ) = n.ToInstant( ) andalso l1.Hour = 14 andalso l1.Zone = ld, "SameInstant converts: 14:00 BST" )
+    check( l2.Hour = 9 andalso l2.ToInstant( ) = at( 2025, 6, 1, 8 ) andalso l2.Zone = ld, "SameLocal reinterprets: 09:00 BST" )
+    check( l1 <> n andalso l1.CompareTo( n ) = 0, "one instant, two zones: not equal, compare 0" )
+end scope
+
+'' ---------------------------------------------------------------- 5. StartOfDay
+scope
+    check( ZonedDateTime.FromLocal( wl( 2025, 6, 1, 15 ), ny ).StartOfDay( ).ToInstant( ) = at( 2025, 6, 1, 4 ), "plain day: 00:00 EDT" )
+    check( ZonedDateTime.FromLocal( wl( 2025, 11, 2, 15 ), sj ).StartOfDay( ).ToInstant( ) = at( 2025, 11, 2, 2, 30 ), "fall-back day: 00:00 NDT" )
+    dim as TimeZone sp = TimeZone.FindById( "America/Sao_Paulo" )
+    dim as ZonedDateTime s = ZonedDateTime.FromLocal( wl( 2018, 11, 4, 15 ), sp ).StartOfDay( )
+    check( s.ToInstant( ) = at( 2018, 11, 4, 3 ) andalso s.Hour = 1 andalso s.Day = 4, "Sao_Paulo 2018-11-04 starts at 01:00" )
+    dim as TimeZone ap = TimeZone.FindById( "Pacific/Apia" )
+    dim as ZonedDateTime a = ZonedDateTime.FromLocal( wl( 2011, 12, 31, 15 ), ap ).StartOfDay( )
+    check( a.ToInstant( ) = at( 2011, 12, 30, 10 ) andalso a.Day = 31 andalso a.Hour = 0, "Apia 2011-12-31 starts at its transition" )
+end scope
+
+'' ---------------------------------------------------------------- 6. order, equality, Invalid
+scope
+    dim as ZonedDateTime a = ZonedDateTime.FromInstant( at( 2025, 1, 1 ), ny ), b = ZonedDateTime.FromInstant( at( 2025, 1, 2 ), ny )
+    check( a < b andalso b > a andalso a <= a andalso a >= a andalso a = a andalso a <> b, "order" )
+    check( a = ZonedDateTime.FromInstant( at( 2025, 1, 1 ), TimeZone.FindById( "america/new_york" ) ), "equal: same instant, same zone" )
+    dim as ZonedDateTime top = ZonedDateTime.FromLocal( wl( 9999, 12, 30, 12 ), TimeZone.Utc( ) )
+    check( top.AddCalendarDays( 5 ).IsValid = false, "past 9999 is Invalid" )
+    check( top.Add( chrono.TimeSpan.FromDays( 5 ) ).IsValid = false, "exact past 9999 is Invalid" )
+    dim as ZonedDateTime iv
+    check( iv.AddCalendarDays( 1 ).IsValid = false andalso iv.ToInstant( ).IsValid = false _
+           andalso iv.ToDateTime( ).IsValid = false andalso iv.WithZoneSameInstant( ny ).IsValid = false, "Invalid carries" )
+end scope
+
+'' ---------------------------------------------------------------- 7. round trips
+scope
+    dim as ulongint sd = 99991ull
+    for k as long = 1 to 3000
+        sd xor= sd shl 13 : sd xor= sd shr 7 : sd xor= sd shl 17
+        dim as TimeZone tz_
+        select case k mod 5
+        case 0 : tz_ = sj
+        case 1 : tz_ = ny
+        case 2 : tz_ = ld
+        case 3 : tz_ = TimeZone.FindById( "Australia/Lord_Howe" )
+        case else : tz_ = TimeZone.Local( )
+        end select
+        dim as longint t = TZ_MIN_UNIX + 86400 * 2 + cast( longint, sd mod culngint( TZ_MAX_UNIX - TZ_MIN_UNIX - 86400 * 4 ) )
+        dim as chrono.Instant i = chrono.Instant.FromUnixSeconds( t )
+        dim as ZonedDateTime zz = ZonedDateTime.FromInstant( i, tz_ )
+        check( zz.ToInstant( ) = i andalso zz.ToDateTime( ).ToInstant( ) = i, "instant round trip " & i.ToIsoString( ) )
+        dim as ZonedDateTime e, l
+        check( ZonedDateTime.TryFromLocal( zz.ToWall( ), tz_, dzEarlier, e ) andalso ZonedDateTime.TryFromLocal( zz.ToWall( ), tz_, dzLater, l ), "wall resolves" )
+        check( e.ToInstant( ) = i orelse l.ToInstant( ) = i, "the wall names the instant " & i.ToIsoString( ) )
+    next
+end scope
+
+if failures = 0 then print "ok" else print failures; " failures"

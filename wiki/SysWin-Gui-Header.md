@@ -205,14 +205,12 @@ Microsoft Learn: [HDM_GETITEMCOUNT](https://learn.microsoft.com/en-us/windows/wi
 ```freebasic
 function GetItem overload( byval hHeader as HWND, byval i as long, byval phdi as HDITEMW ptr ) as boolean
 function GetItem overload( byval hHeader as HWND, byval i as long, byref hdi as HDITEMW ) as boolean
-function GetItem overload( byval hHeader as HWND, byval i as long ) as HDITEMW
 ```
 
 Reads the attributes of item `i` that `mask` asks for. For the text, point `pszText` at a buffer
-and set `cchTextMax`. The third form sends an `HDITEMW` whose `mask` is 0, so the control fills
-in nothing and the structure comes back all zero; use one of the first two.
+and set `cchTextMax`.
 
-**Returns** `true` on success; the third form returns the (empty) structure.
+**Returns** `true` on success, or `false`otherwise.
 
 **Example**
 
@@ -489,16 +487,13 @@ Microsoft Learn: [HDM_GETOVERFLOWRECT](https://learn.microsoft.com/en-us/windows
 ```freebasic
 function HitTest overload( byval hHeader as HWND, byval phdhti as HDHITTESTINFO ptr ) as long
 function HitTest overload( byval hHeader as HWND, byref hdhti as HDHITTESTINFO ) as long
-function HitTest overload( byval hHeader as HWND ) as HDHITTESTINFO
 ```
 
 Finds what is at the point `pt` of an `HDHITTESTINFO`, in client coordinates. On return `flags`
 says which part is there (`HHT_ONHEADER`, `HHT_ONDIVIDER`, `HHT_ONFILTER`, `HHT_NOWHERE` …) and
 `iItem` holds the item.
 
-The first form returns 0 for a `NULL` pointer, the same value as for item 0. The third form has
-no point to pass, so it tests (0, 0), the top-left corner, and returns the filled structure with
-`GetLastError()` set to the control's reply.
+The first form returns 0 for a `NULL` pointer, the same value as for item 0.
 
 **Returns** the index of the item at the point, or -1 when there is none.
 
@@ -518,17 +513,12 @@ Microsoft Learn: [HDM_HITTEST](https://learn.microsoft.com/en-us/windows/win32/c
 ```freebasic
 function Layout overload( byval hHeader as HWND, byval phdl as HDLAYOUT ptr ) as boolean
 function Layout overload( byval hHeader as HWND, byref hdl as HDLAYOUT ) as boolean
-function Layout overload( byval hHeader as HWND ) as HDLAYOUT
 ```
 
 Works out the size and position of the header inside a rectangle. `prc` points to the
 rectangle, usually the parent's client area, and `pwpos` to a `WINDOWPOS` that receives the
 header's position, size and flags, ready for `SetWindowPos`; the rectangle is shrunk to the part
 left below the header.
-
-The third form sends an `HDLAYOUT` whose pointers are `NULL`, so the control has nothing to
-work on: it fails, sets `GetLastError()` to 0 and returns an empty structure. Use one of the
-first two.
 
 **Returns** `true` on success.
 

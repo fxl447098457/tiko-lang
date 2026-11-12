@@ -8,6 +8,16 @@
 '
 ' Dropped as Win32-only: PsTheme_ApplyTitleBar / ApplyCaptionOf (DWM caption colour). SDL has
 ' no title-bar colour; the OS draws the caption in its own theme. See PORT.md.
+'
+' Added for the Form Designer's themes (docs/tkDesigner/THEMES.md):
+'   * roles by index (TKROLE_*), WCAG contrast, tkTheme_Derive (a theme from a base + one accent);
+'   * STYLES: a remap of roles ("Primary": Surface reads Accent), so one style serves every control;
+'   * SHAPE: corner radius and border width a theme may set (-1 = each control's own);
+'   * SCOPES: a theme for one widget subtree (tkTheme_ApplyTo / tkTheme_Of), so a form on the
+'     designer canvas wears the project's theme inside tkEdit's;
+'   * RECIPES: per-field colour overrides on one widget -- a role link, a fixed colour (one, or one
+'     per variant) or a rule deriving it from another field -- resolved on every theme change, so
+'     an override no longer pins the control out of the theme.
 #module "tkTheme"
 
 #import "../tkHost" public
@@ -136,9 +146,565 @@ end function
 ' re-themes itself unless its colours are pinned. The surfaces' own backgrounds follow
 ' t.Window. Applying an EQUAL theme does nothing, so a settings change that touched no
 ' colour costs no repaint.
+' The Window role is forced opaque: a see-through form needs a transparent OS window, which no
+' platform here gives reliably.
 public sub tkTheme_Apply( byref t as TKTHEME_COLORS )
-    if gThemeSet andalso tkTheme_Equal( gTheme, t ) then exit sub
-    gTheme = t
+    dim as TKTHEME_COLORS u = t
+    u.Window = tkColor_WithAlpha( u.Window, 255 )
+    if gThemeSet andalso tkTheme_Equal( gTheme, u ) then exit sub
+    gTheme = u
     gThemeSet = true
-    tkHost_BroadcastAll( TKM_THEMECHANGED, t.Window )
+    tkHost_BroadcastAll( TKM_THEMECHANGED, u.Window )
+end sub
+
+
+' ==========================================================================================
+' Roles by index: the 23 ulongs of TKTHEME_COLORS, Window to Error, in field order (Equal
+' already relies on them being contiguous).
+public enum
+    TKROLE_WINDOW = 0
+    TKROLE_SURFACE
+    TKROLE_SURFACEHOT
+    TKROLE_SURFACEDISABLED
+    TKROLE_TEXT
+    TKROLE_TEXTHOT
+    TKROLE_TEXTSTRONG
+    TKROLE_TEXTDIM
+    TKROLE_TEXTDISABLED
+    TKROLE_ACCENT
+    TKROLE_ACCENTHOT
+    TKROLE_FOCUSRING
+    TKROLE_BORDER
+    TKROLE_BORDERDISABLED
+    TKROLE_DIVIDER
+    TKROLE_SELECTED
+    TKROLE_SELECTEDTEXT
+    TKROLE_POPUP
+    TKROLE_POPUPTEXT
+    TKROLE_TRACK
+    TKROLE_SUCCESS
+    TKROLE_WARNING
+    TKROLE_ERROR
+end enum
+public const TKROLE_COUNT = 23
+
+' The roles' names as a theme file spells them ("SurfaceHot"), in index order.
+public function tkTheme_RoleName( byval role as long ) as string
+    select case role
+    case TKROLE_WINDOW : return "Window"
+    case TKROLE_SURFACE : return "Surface"
+    case TKROLE_SURFACEHOT : return "SurfaceHot"
+    case TKROLE_SURFACEDISABLED : return "SurfaceDisabled"
+    case TKROLE_TEXT : return "Text"
+    case TKROLE_TEXTHOT : return "TextHot"
+    case TKROLE_TEXTSTRONG : return "TextStrong"
+    case TKROLE_TEXTDIM : return "TextDim"
+    case TKROLE_TEXTDISABLED : return "TextDisabled"
+    case TKROLE_ACCENT : return "Accent"
+    case TKROLE_ACCENTHOT : return "AccentHot"
+    case TKROLE_FOCUSRING : return "FocusRing"
+    case TKROLE_BORDER : return "Border"
+    case TKROLE_BORDERDISABLED : return "BorderDisabled"
+    case TKROLE_DIVIDER : return "Divider"
+    case TKROLE_SELECTED : return "Selected"
+    case TKROLE_SELECTEDTEXT : return "SelectedText"
+    case TKROLE_POPUP : return "Popup"
+    case TKROLE_POPUPTEXT : return "PopupText"
+    case TKROLE_TRACK : return "Track"
+    case TKROLE_SUCCESS : return "Success"
+    case TKROLE_WARNING : return "Warning"
+    case TKROLE_ERROR : return "Error"
+    end select
+    return ""
+end function
+
+' -1 for a name that is no role. Exact case, as the file spells it.
+public function tkTheme_RoleByName( byref name_ as const string ) as long
+    for r as long = 0 to TKROLE_COUNT - 1
+        if tkTheme_RoleName( r ) = name_ then return r
+    next
+    return -1
+end function
+
+public function tkTheme_Role( byref t as TKTHEME_COLORS, byval role as long ) as ulong
+    if (role < 0) orelse (role >= TKROLE_COUNT) then return 0
+    dim as ulong ptr p = @t.Window
+    return p[role]
+end function
+
+public sub tkTheme_SetRole( byref t as TKTHEME_COLORS, byval role as long, byval c as ulong )
+    if (role < 0) orelse (role >= TKROLE_COUNT) then exit sub
+    dim as ulong ptr p = @t.Window
+    p[role] = c
+end sub
+
+
+' ---- contrast (WCAG 2) ---------------------------------------------------------------------
+' fg drawn over an opaque bg: what a translucent colour ends up as on screen.
+public function tkTheme_Over( byval fg as ulong, byval bg as ulong ) as ulong
+    dim as long a = (fg shr 24) and 255
+    if a = 255 then return fg
+    return tkColor_WithAlpha( tkColor_Lerp( bg, fg, a / 255.0 ), 255 )
+end function
+
+private function Linear( byval c as long ) as double
+    dim as double v = c / 255.0
+    if v <= 0.03928 then return v / 12.92
+    return ((v + 0.055) / 1.055) ^ 2.4
+end function
+
+' Relative luminance, 0 (black) to 1 (white); alpha ignored.
+public function tkTheme_Luminance( byval c as ulong ) as double
+    return 0.2126 * Linear( (c shr 16) and 255 ) + 0.7152 * Linear( (c shr 8) and 255 ) + 0.0722 * Linear( c and 255 )
+end function
+
+' The contrast ratio, 1 to 21, of fg over bg -- blended first when fg is translucent. AA asks 4.5
+' for text and 3 for large text and UI parts.
+public function tkTheme_Contrast( byval fg as ulong, byval bg as ulong ) as double
+    dim as double a = tkTheme_Luminance( tkTheme_Over( fg, bg ) )
+    dim as double b = tkTheme_Luminance( bg )
+    if a < b then swap a, b
+    return (a + 0.05) / (b + 0.05)
+end function
+
+
+' ---- derivation ----------------------------------------------------------------------------
+' Quick theme: bas (a Dark or Light variant) with the accent-bearing roles recomputed from one
+' colour. Every other role is bas's. An accent with under 3:1 against Window is moved away from
+' it in 10% steps (toward white on dark, black on light), at most ten times.
+public const TKTHEME_MIN_ACCENT_CONTRAST = 3.0
+
+public function tkTheme_Derive( byref bas as TKTHEME_COLORS, byval accent as ulong ) as TKTHEME_COLORS
+    dim as TKTHEME_COLORS t = bas
+    accent = tkColor_WithAlpha( accent, 255 )
+    dim as ulong away = iif( bas.IsDark, &hFFFFFFFFul, &hFF000000ul )
+    dim as long steps = 0
+    while (steps < 10) andalso (tkTheme_Contrast( accent, bas.Window ) < TKTHEME_MIN_ACCENT_CONTRAST)
+        accent = tkColor_Lerp( accent, away, 0.1 )
+        steps += 1
+    wend
+    t.Accent    = accent
+    t.AccentHot = tkColor_Lerp( accent, bas.TextStrong, 0.2 )
+    t.FocusRing = accent
+    if bas.IsDark then t.Selected = tkColor_Lerp( accent, bas.Window, 0.55 ) else t.Selected = accent
+    if tkTheme_Contrast( &hFFFFFFFFul, t.Selected ) >= tkTheme_Contrast( &hFF000000ul, t.Selected ) then
+        t.SelectedText = &hFFFFFFFFul
+    else
+        t.SelectedText = &hFF000000ul
+    end if
+    return t
+end function
+
+' The simple-mode rules: a part whose Normal colour is set gets its other states from it. The
+' result keeps the source's alpha.
+public enum
+    TKDERIVE_SAME = 0       ' the source colour
+    TKDERIVE_HOT            ' a face under the mouse: 12% toward Text
+    TKDERIVE_PRESSED        ' a pressed face: 25% toward Text
+    TKDERIVE_DISABLED       ' half way to Window
+end enum
+
+public function tkTheme_DeriveColor( byval rule as long, byval src as ulong, byref t as TKTHEME_COLORS ) as ulong
+    dim as ulong c = src
+    select case rule
+    case TKDERIVE_HOT      : c = tkColor_Lerp( src, t.Text, 0.12 )
+    case TKDERIVE_PRESSED  : c = tkColor_Lerp( src, t.Text, 0.25 )
+    case TKDERIVE_DISABLED : c = tkColor_Lerp( src, t.Window, 0.5 )
+    end select
+    return tkColor_WithAlpha( c, (src shr 24) and 255 )
+end function
+
+
+' ---- colour sources --------------------------------------------------------------------------
+' Where one colour comes from. In a recipe, slot is the field's ulong index in the control's
+' colour struct; in a style, the entry's position is the role and slot is unused.
+public enum
+    TKSRC_NONE = 0          ' unchanged
+    TKSRC_ROLE              ' arg = TKROLE_*, read from the theme in force
+    TKSRC_FIXED             ' value, in both variants
+    TKSRC_FIXED2            ' value in a dark theme, value2 in a light one
+    TKSRC_DERIVE            ' arg = TKDERIVE_*, value = the slot (style: role) it derives from
+end enum
+
+public type TKCOLOR_SRC
+    slot   as short
+    kind   as ubyte
+    arg    as ubyte
+    value  as ulong
+    value2 as ulong
+end type
+
+public function tkTheme_SrcRole( byval slot as long, byval role as long ) as TKCOLOR_SRC
+    dim as TKCOLOR_SRC s
+    s.slot = slot : s.kind = TKSRC_ROLE : s.arg = role
+    return s
+end function
+
+public function tkTheme_SrcFixed( byval slot as long, byval c as ulong ) as TKCOLOR_SRC
+    dim as TKCOLOR_SRC s
+    s.slot = slot : s.kind = TKSRC_FIXED : s.value = c
+    return s
+end function
+
+public function tkTheme_SrcFixed2( byval slot as long, byval cDark as ulong, byval cLight as ulong ) as TKCOLOR_SRC
+    dim as TKCOLOR_SRC s
+    s.slot = slot : s.kind = TKSRC_FIXED2 : s.value = cDark : s.value2 = cLight
+    return s
+end function
+
+public function tkTheme_SrcDerive( byval slot as long, byval rule as long, byval fromSlot as long ) as TKCOLOR_SRC
+    dim as TKCOLOR_SRC s
+    s.slot = slot : s.kind = TKSRC_DERIVE : s.arg = rule : s.value = fromSlot
+    return s
+end function
+
+' A ROLE / FIXED / FIXED2 source's colour under t.
+private function SrcColor( byref s as TKCOLOR_SRC, byref t as TKTHEME_COLORS ) as ulong
+    select case s.kind
+    case TKSRC_ROLE   : return tkTheme_Role( t, s.arg )
+    case TKSRC_FIXED  : return s.value
+    case TKSRC_FIXED2 : return iif( t.IsDark, s.value, s.value2 )
+    end select
+    return 0
+end function
+
+' Two passes: every ROLE / FIXED / FIXED2 entry, then every DERIVE entry in order, reading what
+' the first pass (or an earlier derive) left. Several entries for one slot: the last one wins.
+private sub ResolveList( byval p as TKCOLOR_SRC ptr, byval n as long, byref t as TKTHEME_COLORS, _
+                         byval pOut as ulong ptr, byval nOut as long )
+    for i as long = 0 to n - 1
+        if (p[i].kind = TKSRC_NONE) orelse (p[i].kind = TKSRC_DERIVE) then continue for
+        if (p[i].slot < 0) orelse (p[i].slot >= nOut) then continue for
+        pOut[p[i].slot] = SrcColor( p[i], t )
+    next
+    for i as long = 0 to n - 1
+        if p[i].kind <> TKSRC_DERIVE then continue for
+        if (p[i].slot < 0) orelse (p[i].slot >= nOut) then continue for
+        if p[i].value >= culng( nOut ) then continue for
+        dim as boolean later = false
+        for j as long = i + 1 to n - 1
+            if (p[j].slot = p[i].slot) andalso (p[j].kind <> TKSRC_NONE) then
+                later = true
+                exit for
+            end if
+        next
+        if later then continue for
+        pOut[p[i].slot] = tkTheme_DeriveColor( p[i].arg, pOut[p[i].value], t )
+    next
+end sub
+
+
+' ---- styles ------------------------------------------------------------------------------------
+' A style remaps ROLES, so it serves every control type: "Primary" makes Surface read Accent and
+' every control's face follows. remap(r) is role r's source; TKSRC_NONE leaves it. A ROLE source
+' reads the theme BEFORE the remap (so roles can swap); a DERIVE source reads after it.
+public type TKTHEME_STYLE
+    remap(0 to TKROLE_COUNT - 1) as TKCOLOR_SRC
+    Name as zstring * 32                  ' what a recipe names it by (tkTheme_SetRecipeNamed)
+end type
+
+public function tkTheme_Remap( byref t as TKTHEME_COLORS, byref s as TKTHEME_STYLE ) as TKTHEME_COLORS
+    dim as TKTHEME_COLORS o = t
+    for r as long = 0 to TKROLE_COUNT - 1
+        dim as long k = s.remap(r).kind
+        if (k <> TKSRC_NONE) andalso (k <> TKSRC_DERIVE) then tkTheme_SetRole( o, r, SrcColor( s.remap(r), t ) )
+    next
+    for r as long = 0 to TKROLE_COUNT - 1
+        if s.remap(r).kind <> TKSRC_DERIVE then continue for
+        tkTheme_SetRole( o, r, tkTheme_DeriveColor( s.remap(r).arg, tkTheme_Role( o, s.remap(r).value ), o ) )
+    next
+    o.Window = tkColor_WithAlpha( o.Window, 255 )
+    return o
+end function
+
+
+' ---- per-type recipes ------------------------------------------------------------------------------
+' Entries a theme gives every control of one type ("Button": tkMeta's name for it), before the
+' control's own. StyleName "" is the type's defaults; a style's name is that style's exception for
+' the type, used by controls wearing the style. Tables are BORROWED, as styles are.
+public type TKTHEME_TYPERECIPE
+    TypeName  as zstring * 32
+    StyleName as zstring * 32
+    pSrc      as TKCOLOR_SRC ptr
+    n         as long
+end type
+
+
+' ---- shape -------------------------------------------------------------------------------------
+' Design units. -1 = each control's own default; a control's own setter beats the theme.
+public type TKTHEME_SHAPE
+    CornerRadius as long = -1
+    BorderWidth  as long = -1
+end type
+
+
+' ---- the app's shape, styles and type recipes (its colours are tkTheme_Apply's) -------------------
+dim shared as TKTHEME_SHAPE gShape
+dim shared as TKTHEME_STYLE ptr gpStyles
+dim shared as long gnStyles
+dim shared as TKTHEME_TYPERECIPE ptr gpTypes
+dim shared as long gnTypes
+
+public function tkTheme_GetShape( ) as TKTHEME_SHAPE
+    return gShape
+end function
+
+public sub tkTheme_SetShape( byref s as TKTHEME_SHAPE )
+    if (s.CornerRadius = gShape.CornerRadius) andalso (s.BorderWidth = gShape.BorderWidth) then exit sub
+    gShape = s
+    tkHost_BroadcastAll( TKM_THEMECHANGED )
+end sub
+
+' The app's styles: style id k (k >= 1) is pStyles[k - 1], and each answers to its Name. The table
+' is BORROWED -- generated code passes static data -- and must outlive its use.
+public sub tkTheme_SetStyles( byval pStyles as TKTHEME_STYLE ptr, byval nStyles as long )
+    if pStyles = 0 then nStyles = 0
+    gpStyles = pStyles
+    gnStyles = nStyles
+    tkHost_BroadcastAll( TKM_THEMECHANGED )
+end sub
+
+' The app's per-type recipes (borrowed).
+public sub tkTheme_SetTypeRecipes( byval pTypes as TKTHEME_TYPERECIPE ptr, byval nTypes as long )
+    if pTypes = 0 then nTypes = 0
+    gpTypes = pTypes
+    gnTypes = nTypes
+    tkHost_BroadcastAll( TKM_THEMECHANGED )
+end sub
+
+' The tables tkTheme_SetStyles / tkTheme_SetTypeRecipes were given (0 and n = 0: none).
+public function tkTheme_GetStyles( byref n as long ) as TKTHEME_STYLE ptr
+    n = gnStyles
+    return gpStyles
+end function
+
+public function tkTheme_GetTypeRecipes( byref n as long ) as TKTHEME_TYPERECIPE ptr
+    n = gnTypes
+    return gpTypes
+end function
+
+
+' ---- scopes: a theme for one subtree -------------------------------------------------------------
+private type TKTHEME_SCOPE
+    colors  as TKTHEME_COLORS
+    shape   as TKTHEME_SHAPE
+    pStyles as TKTHEME_STYLE ptr          ' borrowed, as tkTheme_SetStyles
+    nStyles as long
+    pTypes  as TKTHEME_TYPERECIPE ptr     ' borrowed, as tkTheme_SetTypeRecipes
+    nTypes  as long
+end type
+
+private function ScopeOf( byval w as TK_WIDGET ptr ) as TKTHEME_SCOPE ptr
+    while w
+        if w->pThemeScope then return w->pThemeScope
+        w = w->pParent
+    wend
+    return 0
+end function
+
+' w and everything under it wear t (plus shape, styles and type recipes) instead of the app's
+' theme, until tkTheme_ClearScope. The app's theme changes no longer reach the subtree; a nested
+' scope keeps its own. Sends TKM_THEMECHANGED to w and the subtree. A control created inside it
+' reads it at create.
+public sub tkTheme_ApplyTo( byval w as TK_WIDGET ptr, byref t as TKTHEME_COLORS, _
+                            byval pShape as TKTHEME_SHAPE ptr = 0, _
+                            byval pStyles as TKTHEME_STYLE ptr = 0, byval nStyles as long = 0, _
+                            byval pTypes as TKTHEME_TYPERECIPE ptr = 0, byval nTypes as long = 0 )
+    if w = 0 then exit sub
+    dim as TKTHEME_SCOPE ptr s = w->pThemeScope
+    if s = 0 then
+        s = callocate( sizeof( TKTHEME_SCOPE ) )
+        w->pThemeScope = s
+    end if
+    s->colors = t
+    s->colors.Window = tkColor_WithAlpha( t.Window, 255 )
+    dim as TKTHEME_SHAPE noShape
+    if pShape then s->shape = *pShape else s->shape = noShape
+    s->pStyles = pStyles
+    s->nStyles = iif( pStyles <> 0, nStyles, 0 )
+    s->pTypes = pTypes
+    s->nTypes = iif( pTypes <> 0, nTypes, 0 )
+    tkWidget_Broadcast( w, TKM_THEMECHANGED )
+end sub
+
+' Hands w's subtree back to the app's theme (or an enclosing scope's).
+public sub tkTheme_ClearScope( byval w as TK_WIDGET ptr )
+    if (w = 0) orelse (w->pThemeScope = 0) then exit sub
+    deallocate( w->pThemeScope )
+    w->pThemeScope = 0
+    tkWidget_Broadcast( w, TKM_THEMECHANGED )
+end sub
+
+public function tkTheme_HasScope( byval w as TK_WIDGET ptr ) as boolean
+    return (w <> 0) andalso (w->pThemeScope <> 0)
+end function
+
+' The theme w wears: its nearest scope's, else the app's. What a control reads where it read
+' tkTheme_Get().
+public function tkTheme_Of( byval w as TK_WIDGET ptr ) as TKTHEME_COLORS
+    dim as TKTHEME_SCOPE ptr s = ScopeOf( w )
+    if s then return s->colors
+    return tkTheme_Get()
+end function
+
+public function tkTheme_ShapeOf( byval w as TK_WIDGET ptr ) as TKTHEME_SHAPE
+    dim as TKTHEME_SCOPE ptr s = ScopeOf( w )
+    if s then return s->shape
+    return gShape
+end function
+
+
+' ---- recipes: per-field overrides on one widget ----------------------------------------------------
+private type TKRECIPE
+    styleId   as long                     ' 1-based into the styles in force; 0 = by styleName
+    styleName as zstring * 32             ' "" = no style
+    n         as long                     ' TKCOLOR_SRC entries that follow
+end type
+
+private sub PutRecipe_( byval w as TK_WIDGET ptr, byval styleId as long, byref styleName as const string, _
+                        byval pSrc as TKCOLOR_SRC ptr, byval n as long )
+    if w = 0 then exit sub
+    if w->pColorRecipe then
+        deallocate( w->pColorRecipe )
+        w->pColorRecipe = 0
+    end if
+    if (pSrc = 0) orelse (n < 0) then n = 0
+    if (styleId <> 0) orelse (len( styleName ) > 0) orelse (n > 0) then
+        dim as TKRECIPE ptr r = callocate( sizeof( TKRECIPE ) + n * sizeof( TKCOLOR_SRC ) )
+        r->styleId = styleId
+        r->styleName = left( styleName, 31 )
+        r->n = n
+        dim as TKCOLOR_SRC ptr d = cast( TKCOLOR_SRC ptr, r + 1 )
+        for i as long = 0 to n - 1
+            d[i] = pSrc[i]
+        next
+        w->pColorRecipe = r
+    end if
+    dim as TK_MSG m
+    m.msg = TKM_THEMECHANGED
+    tkWidget_Send( w, @m )
+end sub
+
+' w's style and per-field sources, COPIED. Its colours then come from the theme, through the
+' style, with these entries on top -- and stay that way across every theme change. Sends w
+' TKM_THEMECHANGED so it restyles now. styleId 0 and n 0 clear it.
+public sub tkTheme_SetRecipe( byval w as TK_WIDGET ptr, byval styleId as long, _
+                              byval pSrc as TKCOLOR_SRC ptr, byval n as long )
+    PutRecipe_( w, styleId, "", pSrc, n )
+end sub
+
+' The same, with the style named: it is looked up among the styles in force whenever w restyles, so
+' a theme that adds, drops or reorders styles never leaves w pointing at the wrong one. An unknown
+' name is no style. What generated form code calls.
+public sub tkTheme_SetRecipeNamed( byval w as TK_WIDGET ptr, byref styleName as const string, _
+                                   byval pSrc as TKCOLOR_SRC ptr, byval n as long )
+    PutRecipe_( w, 0, styleName, pSrc, n )
+end sub
+
+public sub tkTheme_ClearRecipe( byval w as TK_WIDGET ptr )
+    PutRecipe_( w, 0, "", 0, 0 )
+end sub
+
+public function tkTheme_RecipeStyle( byval w as TK_WIDGET ptr ) as long
+    if (w = 0) orelse (w->pColorRecipe = 0) then return 0
+    return cast( TKRECIPE ptr, w->pColorRecipe )->styleId
+end function
+
+public function tkTheme_RecipeCount( byval w as TK_WIDGET ptr ) as long
+    if (w = 0) orelse (w->pColorRecipe = 0) then return 0
+    return cast( TKRECIPE ptr, w->pColorRecipe )->n
+end function
+
+' The style w wears among the styles in force for it (its scope's, else the app's); 0 = none.
+private function StyleOf_( byval w as TK_WIDGET ptr ) as TKTHEME_STYLE ptr
+    if (w = 0) orelse (w->pColorRecipe = 0) then return 0
+    dim as TKRECIPE ptr r = w->pColorRecipe
+    if (r->styleId < 1) andalso (len( r->styleName ) = 0) then return 0
+    dim as TKTHEME_SCOPE ptr s = ScopeOf( w )
+    dim as TKTHEME_STYLE ptr ps = gpStyles
+    dim as long ns = gnStyles
+    if s then
+        ps = s->pStyles
+        ns = s->nStyles
+    end if
+    if ps = 0 then return 0
+    if r->styleId >= 1 then
+        if r->styleId <= ns then return @ps[r->styleId - 1]
+        return 0
+    end if
+    for i as long = 0 to ns - 1
+        if ps[i].Name = r->styleName then return @ps[i]
+    next
+    return 0
+end function
+
+' The name of the style w wears ("" = none).
+public function tkTheme_StyleNameOf( byval w as TK_WIDGET ptr ) as string
+    dim as TKTHEME_STYLE ptr st = StyleOf_( w )
+    if st = 0 then return ""
+    return st->Name
+end function
+
+' t remapped by w's recipe style, when it names one of the styles in force for w (its scope's,
+' else the app's). A control's ApplyTheme( w, t ) passes its t through this.
+public function tkTheme_Styled( byval w as TK_WIDGET ptr, byref t as TKTHEME_COLORS ) as TKTHEME_COLORS
+    dim as TKTHEME_STYLE ptr st = StyleOf_( w )
+    if st = 0 then return t
+    return tkTheme_Remap( t, *st )
+end function
+
+' The roles w's colours are built from: its scope's theme (else the app's), remapped by its
+' recipe's style when it names one that exists.
+public function tkTheme_RolesFor( byval w as TK_WIDGET ptr ) as TKTHEME_COLORS
+    return tkTheme_Styled( w, tkTheme_Of( w ) )
+end function
+
+' Appends the n entries at p to list().
+private sub AddEntries_( list() as TKCOLOR_SRC, byref count as long, byval p as TKCOLOR_SRC ptr, byval n as long )
+    if (p = 0) orelse (n <= 0) then exit sub
+    redim preserve list( 0 to count + n - 1 )
+    for i as long = 0 to n - 1
+        list( count + i ) = p[i]
+    next
+    count += n
+end sub
+
+' Lays the theme's entries for w's type (typeName: tkMeta's name, "Button"), then those for its type
+' within its style, then w's own recipe, over its colour struct (nSlots ulongs from pColors),
+' resolving roles against t (what tkTheme_RolesFor gave); the last entry for a slot wins. A control
+' calls it right after filling the struct from its ThemeColors:
+'     dim as TKTHEME_COLORS t = tkTheme_RolesFor( w )
+'     p->colors = tkButton_ThemeColors( t )
+'     tkTheme_ResolveInto( w, t, cast( ulong ptr, @p->colors ), sizeof( TKBUTTON_COLORS ) \ 4, "Button" )
+public sub tkTheme_ResolveInto( byval w as TK_WIDGET ptr, byref t as TKTHEME_COLORS, _
+                                byval pColors as ulong ptr, byval nSlots as long, _
+                                byref typeName as const string = "" )
+    if (w = 0) orelse (pColors = 0) then exit sub
+    dim as TKCOLOR_SRC list( any )
+    dim as long count = 0
+    if len( typeName ) then
+        dim as TKTHEME_SCOPE ptr s = ScopeOf( w )
+        dim as TKTHEME_TYPERECIPE ptr pt = gpTypes
+        dim as long nt = gnTypes
+        if s then
+            pt = s->pTypes
+            nt = s->nTypes
+        end if
+        if pt then
+            dim as string styleName = tkTheme_StyleNameOf( w )
+            for i as long = 0 to nt - 1
+                if (pt[i].TypeName = typeName) andalso (len( pt[i].StyleName ) = 0) then AddEntries_( list(), count, pt[i].pSrc, pt[i].n )
+            next
+            if len( styleName ) then
+                for i as long = 0 to nt - 1
+                    if (pt[i].TypeName = typeName) andalso (pt[i].StyleName = styleName) then AddEntries_( list(), count, pt[i].pSrc, pt[i].n )
+                next
+            end if
+        end if
+    end if
+    if w->pColorRecipe then
+        dim as TKRECIPE ptr r = w->pColorRecipe
+        AddEntries_( list(), count, cast( TKCOLOR_SRC ptr, r + 1 ), r->n )
+    end if
+    if count > 0 then ResolveList( @list( 0 ), count, t, pColors, nSlots )
 end sub

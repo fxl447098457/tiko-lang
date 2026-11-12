@@ -95,8 +95,8 @@ a 400-unit-wide window is 700 pixels wide
 | [IsDPIResolutionAtLeast](#isdpiresolutionatleast) | Tests whether the screen is at least a given size in 96-DPI units. |
 | [GetMonitorLogicalWidth](#getmonitorlogicalwidth) | Returns the width of the monitor a window is on, as the program sees it. |
 | [GetMonitorLogicalHeight](#getmonitorlogicalheight) | Returns the height of the monitor a window is on, as the program sees it. |
-| [GetMonitorHorizontalScaling](#getmonitorhorizontalscaling) | Returns how much Windows stretches the program horizontally, as a whole number. |
-| [GetMonitorVerticalScaling](#getmonitorverticalscaling) | Returns how much Windows stretches the program vertically, as a whole number. |
+| [GetMonitorHorizontalScaling](#getmonitorhorizontalscaling) | Returns how much Windows stretches the program horizontally. |
+| [GetMonitorVerticalScaling](#getmonitorverticalscaling) | Returns how much Windows stretches the program vertically. |
 
 ## Reference
 
@@ -575,16 +575,14 @@ print "this monitor is"; GetMonitorLogicalHeight( hwnd ); " pixels high"
 ### GetMonitorHorizontalScaling
 
 ```freebasic
-function GetMonitorHorizontalScaling( byval hWin as HWND = NULL ) as DWORD
+function GetMonitorHorizontalScaling( byval hWin as HWND = NULL ) as SINGLE
 ```
 
 Returns how far Windows stretches the program across the monitor a window is on: the monitor's
 real width divided by the width the program sees. It is 1 in a DPI-aware program. In one that is
-not, it is the scaling ratio, **rounded to a whole number**: 2 at 175 % and at 200 %, 1 at 125 %.
-For the exact ratio divide [GetDisplayPixelsWidth](#getdisplaypixelswidth) by
-[GetMonitorLogicalWidth](#getmonitorlogicalwidth) yourself.
+not, it is the scaling ratio.
 
-**Returns** the rounded ratio.
+**Returns** the ratio.
 
 **Example**
 
@@ -597,14 +595,13 @@ Microsoft Learn: [EnumDisplaySettingsW](https://learn.microsoft.com/en-us/window
 ### GetMonitorVerticalScaling
 
 ```freebasic
-function GetMonitorVerticalScaling( byval hWin as HWND = NULL ) as DWORD
+function GetMonitorVerticalScaling( byval hWin as HWND = NULL ) as SINGLE
 ```
 
 Returns how far Windows stretches the program down the monitor a window is on: the real height
-divided by the height the program sees, rounded to a whole number as for
-[GetMonitorHorizontalScaling](#getmonitorhorizontalscaling).
+divided by the height the program sees.
 
-**Returns** the rounded ratio.
+**Returns** the ratio.
 
 **Example**
 

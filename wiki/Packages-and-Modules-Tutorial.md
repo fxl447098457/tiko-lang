@@ -418,8 +418,8 @@ sqlite3_exec( db, "create table todo( id integer primary key, task text )", null
 dim as ustring tasks(0 to 2) = { "buy milk", "call Ada", "write the tutorial" }
 dim as sqlite3_stmt ptr st
 sqlite3_prepare_v2( db, "insert into todo( task ) values( ? )", -1, @st, nullptr )
-for i as int32 = 0 to 2
-    sqlite3_bind_text( st, 1, tasks(i), -1, SQLITE_TRANSIENT )
+for each t in tasks
+    sqlite3_bind_text( st, 1, t, -1, SQLITE_TRANSIENT )
     sqlite3_step( st )
     sqlite3_reset( st )
 next
@@ -454,7 +454,7 @@ Look at what is **different** from `std`:
   on the web reads the same in tiko.
 - **The functions are C functions.** They take and return C types: a `zstring ptr` for text, which
   you read with `*` (`*sqlite3_libversion( )`), and pointers to handles (`sqlite3 ptr`). Passing a
-  `ustring` where SQLite wants text works, as `sqlite3_bind_text( st, 1, tasks(i), … )` shows.
+  `ustring` where SQLite wants text works, as `sqlite3_bind_text( st, 1, t, … )` shows.
 - **The import has a `link` clause**, which decides how the library becomes part of your program.
   That is the next section.
 

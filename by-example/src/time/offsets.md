@@ -37,8 +37,8 @@ The machine's own zone comes from the operating system.
 `TimeZoneInfo.LocalOffsetAt( instant )` is its offset **at that instant**, since
 January and July can differ; `DateTime.FromInstant( instant, offset )` gives the
 local reading. The example prints only facts that hold in every zone, because
-the offset itself depends on where the program runs. There is no database of
-named zones: carry an `Instant`, store it in UTC, and convert for display.
+the offset itself depends on where the program runs. For any other zone, by
+its name, see [Named time zones](zones.md).
 
 ### Activities
 

@@ -206,15 +206,15 @@ hmutexready = MutexCreate()
 
 '' for waiting for all threads to be completed
 
-    For i As Integer = 1 To threadnumber
+    For Each t As Any Ptr In threads
 
-        If threads(i) <> 0 Then
+        If t <> 0 Then
 
-            ThreadWait threads(i)
+            ThreadWait t
 
         End If
 
-    Next i
+    Next
 
 '' for visualizing main code status
 

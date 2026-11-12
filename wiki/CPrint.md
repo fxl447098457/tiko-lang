@@ -238,17 +238,20 @@ Microsoft Learn: [PRINTDLGW](https://learn.microsoft.com/en-us/windows/win32/api
 ### PageSetup
 
 ```freebasic
-function PageSetup( byval hwndOwner as HWND = NULL ) as boolean
+function PageSetup (BYVAL hwndOwner AS HWND, BYREF psd AS PAGESETUPDLGW) AS BOOLEAN
 ```
 
-Shows the Page Setup dialog, where the user picks paper, source, orientation and margins. The
-choices are not kept: the settings the dialog returns are freed straight away and neither the
-attached printer nor its stored settings change. Use the return value to learn whether the user
-confirmed, and set what you need through the properties.
+Shows the Page Setup dialog, where the user picks paper, source, orientation and margins. The caller is responsible of freeing the `hDevMode` and `hDevNames` members of the `PAGESETUPDLGW` structure:
+
+```freebasic
+IF psd.hDevMode THEN GlobalFree(psd.hDevMode)
+IF psd.hDevNames THEN GlobalFree(psd.hDevNames)
+```
 
 | Parameter | Meaning |
 | --- | --- |
 | `hwndOwner` | The window that owns the dialog, or `NULL` for none. |
+| `psd` | A `PAGESETUPDLGW` structure. |
 
 **Returns** `true` when the user clicked **OK**, `false` otherwise.
 

@@ -262,11 +262,10 @@ Microsoft Learn: [PBM_GETRANGE](https://learn.microsoft.com/en-us/windows/win32/
 ### GetPos
 
 ```freebasic
-function GetPos( byval hProgBar as HWND ) as DWORD
+function GetPos( byval hProgBar as HWND ) as LONG
 ```
 
-Returns the position of the bar. The result is unsigned: with a negative range a position of
--20 comes back as 4,294,967,276, so cast it to `long` when the range can go below 0.
+Returns the position of the bar.
 
 **Returns** the position.
 

@@ -22,11 +22,6 @@ bands move, and an **identifier** (`wID`) you choose, which does not; [IdToIndex
 converts. When a band is given a child window, the rebar makes itself that window's parent and
 sizes it; deleting the band hides the child but does not destroy it.
 
-**Band labels.** [InsertBand](#insertband), [SetBandInfo](#setbandinfo) and
-[GetBandInfo](#getbandinfo) send the ANSI forms of their messages, so the rebar reads `lpText`
-as an ANSI string: a `wstring` label shows only its first letter. For a band with a label, send
-`RB_INSERTBANDW` or `RB_SETBANDINFOW` yourself, as the Example does.
-
 ## Importing
 
 ```freebasic
@@ -184,9 +179,6 @@ the band needs and name them in `fMask`; `cbSize` is set for you. For a band hol
 styles such as `RBBS_CHILDEDGE`, `RBBS_GRIPPERALWAYS`, `RBBS_NOGRIPPER`, `RBBS_BREAK` (start a
 new row), `RBBS_FIXEDSIZE` and `RBBS_USECHEVRON`.
 
-The band's label is read as ANSI text; see **Band labels** at the top of the page. The first
-form returns `false` for a `NULL` pointer.
-
 **Returns** `true` on success.
 
 **Example**
@@ -241,15 +233,12 @@ Microsoft Learn: [RB_GETBANDCOUNT](https://learn.microsoft.com/en-us/windows/win
 ```freebasic
 function GetBandInfo overload( byval hRebar as HWND, byval uBand as DWORD, byval prbbi as REBARBANDINFOW ptr ) as boolean
 function GetBandInfo overload( byval hRebar as HWND, byval uBand as DWORD, byref rbbi as REBARBANDINFOW ) as boolean
-function GetBandInfo overload( byval hRebar as HWND, byval uBand as DWORD ) as REBARBANDINFOW
 ```
 
 Reads the attributes that `fMask` asks for of the band at index `uBand`; `cbSize` is set for you.
-For the text, point `lpText` at a buffer and set `cch`; it comes back as ANSI text (see **Band
-labels**). The third form sends a structure whose `fMask` is 0, so the rebar fills in nothing and
-it comes back empty; use one of the first two.
+For the text, point `lpText` at a buffer and set `cch`.
 
-**Returns** `true` on success (first two forms); the (empty) structure (third form).
+**Returns** `true` on success.
 
 **Example**
 
@@ -269,8 +258,7 @@ function SetBandInfo overload( byval hRebar as HWND, byval uBand as DWORD, byref
 ```
 
 Changes the attributes that `fMask` names of the band at index `uBand`; the others stay as they
-are. `cbSize` is set for you. A label set this way is read as ANSI text; to change a label, send
-`RB_SETBANDINFOW` yourself, as in the example.
+are. `cbSize` is set for you.
 
 **Returns** `true` on success.
 
@@ -521,14 +509,10 @@ Microsoft Learn: [RB_GETROWHEIGHT](https://learn.microsoft.com/en-us/windows/win
 ```freebasic
 function SizeToRect overload( byval hRebar as HWND, byval prc as RECT ptr ) as boolean
 function SizeToRect overload( byval hRebar as HWND, byref rc as RECT ) as boolean
-function SizeToRect overload( byval hRebar as HWND ) as ( long, long, long, long )
 ```
 
 Lays the bands out, wrapping them onto rows as needed, to fit as closely as it can the rectangle
-given, in client coordinates of the parent. The third form passes an empty rectangle
-(0, 0, 0, 0), returns it as `( left, top, right, bottom )` and leaves the message's result in
-`GetLastError()`; with one band it was observed to change nothing and leave 0. Use one of the
-first two.
+given, in client coordinates of the parent.
 
 **Returns** `true` when the layout changed (first two forms); the rectangle (third form).
 
@@ -689,11 +673,9 @@ function GetColorScheme overload( byval hRebar as HWND ) as COLORSCHEME
 ```
 
 Reads the colours the rebar draws highlights and shadows with (`clrBtnHighlight`,
-`clrBtnShadow`); `dwSize` is set for you. `CLR_DEFAULT` means the system colour. The second
-form, taking the structure by reference, returns `false` at once and sends nothing: the
-structure is left as it was. Use the first form with `@cs`, or the third.
+`clrBtnShadow`); `dwSize` is set for you. `CLR_DEFAULT` means the system colour.
 
-**Returns** `true` on success (first form; the second always returns `false`); the colours (third
+**Returns** `true` on success (first form); the colours (third
 form).
 
 **Example**
@@ -713,9 +695,7 @@ sub SetColorScheme overload( byval hRebar as HWND, byval pcs as COLORSCHEME ptr 
 sub SetColorScheme overload( byval hRebar as HWND, byref cs as COLORSCHEME )
 ```
 
-Sets the highlight and shadow colours; `dwSize` is set for you. The second form, taking the
-structure by reference, returns at once and sends nothing, so the colours do not change; pass
-`@cs` to the first form.
+Sets the highlight and shadow colours; `dwSize` is set for you.
 
 **Example**
 

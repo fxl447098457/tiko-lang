@@ -340,10 +340,6 @@ end extern
 '' struct tm and LC_TIME_MASK are the posix binding's (inc/sysbind.ti), measured on
 '' the target.
 
-type TZNAME_T
-	as zstring ptr v( 0 to 1 )
-end type
-
 extern "c"   '' NON-FBCALL: libc, not rtlib entry points.
 	declare function u_localtime_r alias "localtime_r" ( byval t as time_t ptr, byval result as struct_tm ptr ) as struct_tm ptr
 	declare function u_time alias "time" ( byval t as time_t ptr ) as time_t
@@ -355,11 +351,6 @@ extern "c"   '' NON-FBCALL: libc, not rtlib entry points.
 	declare function u_newlocale alias "newlocale" _
 		( byval mask as int32, byval lname as zstring ptr, byval base_ as any ptr ) as any ptr
 	declare sub u_freelocale alias "freelocale" ( byval l as any ptr )
-	'' tzname is DATA, not a function: two char pointers set by tzset.
-	'' Wrapped in a one-member TYPE because an EXTERN declaration cannot
-	'' carry array bounds -- the same restriction that made utf/core.tiko wrap
-	'' its tables. A struct of just the array has the array's layout.
-	extern u_tzname alias "tzname" as TZNAME_T
 end extern
 
 private function hTicksToTimeT( byval utcTicks as int64 ) as time_t
@@ -436,14 +427,52 @@ function tkort_DtZoneSupportsDst alias "fb_DtZoneSupportsDst" ( ) as int32
 	return 0
 end function
 
-function tkort_DtZoneStandardName alias "fb_DtZoneStandardName" ( byval buf as zstring ptr, byval buflen as int32 ) as int32
+'' THE NAMES COME FROM localtime_r's tm_zone, NOT FROM tzname. tzname is two
+'' process-global pointers that any tzset may rewrite while they are read;
+'' tm_zone belongs to this call's own struct tm. Midwinter and midsummer of the
+'' current year are asked, as SupportsDst does: the one with tm_isdst > 0 names
+'' daylight time, the other standard time. A zone with no DST this year names
+'' its standard time for both -- tzname[1] there was whatever DST name the zone
+'' last had, decades ago (Asia/Kolkata: "+0630", from 1945).
+'' These are abbreviations ("NST"), where Windows gives display names
+'' ("Newfoundland Standard Time"): OS display text, not a portable value.
+private function hZoneName( byval wantDst as int32, byval buf as zstring ptr, byval buflen as int32 ) as int32
+	dim as time_t now_ = any, t = any
+	dim as struct_tm tmv = any
+	dim as int32 year_ = any, k = any
+	dim as int64 ticks = any
+	dim as zstring ptr stdName = nullptr
+
+	if( buf = nullptr ) then return 0
+	if( buflen < 2 ) then return 0
+	buf[0] = 0
+	'' tzset re-reads TZ, so a changed TZ is followed; glibc serialises it.
 	u_tzset( )
-	return hCopyStr( u_tzname.v(0), buf, buflen )
+	now_ = u_time( nullptr )
+	if( u_localtime_r( @now_, @tmv ) = nullptr ) then return 0
+	year_ = tmv.tm_year + 1900
+	if( (year_ < FB_DT_MIN_YEAR) orelse (year_ > FB_DT_MAX_YEAR) ) then return 0
+
+	for k = 0 to 1
+		if( tkrt_DtFromCivil( year_, iif( k = 0, 1, 7 ), 15, 12, 0, 0, 0, @ticks ) ) then return 0
+		t = hTicksToTimeT( ticks )
+		if( u_localtime_r( @t, @tmv ) = nullptr ) then return 0
+		if( tmv.tm_isdst > 0 ) then
+			if( wantDst <> 0 ) then return hCopyStr( tmv.tm_zone, buf, buflen )
+		elseif( stdName = nullptr ) then
+			stdName = tmv.tm_zone
+			if( wantDst = 0 ) then return hCopyStr( stdName, buf, buflen )
+		end if
+	next
+	return hCopyStr( stdName, buf, buflen )
+end function
+
+function tkort_DtZoneStandardName alias "fb_DtZoneStandardName" ( byval buf as zstring ptr, byval buflen as int32 ) as int32
+	return hZoneName( 0, buf, buflen )
 end function
 
 function tkort_DtZoneDaylightName alias "fb_DtZoneDaylightName" ( byval buf as zstring ptr, byval buflen as int32 ) as int32
-	u_tzset( )
-	return hCopyStr( u_tzname.v(1), buf, buflen )
+	return hZoneName( 1, buf, buflen )
 end function
 
 private sub hFillTm( byval ticks as int64, byval tmv as struct_tm ptr )

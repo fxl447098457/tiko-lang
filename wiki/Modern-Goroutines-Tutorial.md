@@ -1193,8 +1193,8 @@ sub Main( )
 	dim res as Channel( of ParseResult ) = Channel( of ParseResult )( 4 )
 	dim as ustring inputs(0 to 2) = { "1234", "12x4", "" }
 
-	for i as int32 = 0 to 2
-		spawn ParseNumber( inputs(i), res )
+	for each text in inputs
+		spawn ParseNumber( text, res )
 	next
 
 	dim as ParseResult r
@@ -1250,9 +1250,9 @@ using tasks
 
 sub Stage1_Read( byval out_ as SendChan( of ustring ) )
 	dim as ustring src(0 to 4) = { "  Hello ", "WORLD", "", " Fbc  ", "Modern" }
-	for i as int32 = 0 to 4
+	for each s in src
 		sleep 40, 1
-		out_.Send( src(i) )
+		out_.Send( s )
 	next
 	out_.Close( )                       '' each stage closes ONLY its own output
 end sub

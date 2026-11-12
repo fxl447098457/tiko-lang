@@ -22,7 +22,7 @@ the program needs no lock.
 
 `threadwait` is the **join**: once it returns, the thread has finished and
 everything it wrote is visible, so the main program can read
-`slices( i ).result` safely. Every thread you create should be waited for
+each slice's `result` safely. Every thread you create should be waited for
 before the data it uses goes away.
 
 The `#cmdline "-mt"` line is optional here. Without `std/tasks`, the call to

@@ -176,6 +176,7 @@
   - [ISO 8601 text](time/iso.md)
   - [Custom formats](time/patterns.md)
   - [Offsets and time zones](time/offsets.md)
+  - [Named time zones](time/zones.md)
   - [Measuring elapsed time](time/stopwatch.md)
 - [Numbers](numbers/index.md)
   - [The numeric library](numbers/library.md)

@@ -98,7 +98,7 @@ verify_live() {
     ctype=$(curl -fsSL -m 60 -A 'Mozilla/5.0' -o "$tmp/live.bin" -w '%{content_type}' "$url" || echo FETCH-FAILED)
     got=""
     [[ -f "$tmp/live.bin" ]] && got=$(sha_of "$tmp/live.bin")
-    if [[ "$got" == "$want" && ( -z "$want_type" || "$ctype" == "$want_type"* ) ]]; then
+    if [[ "$got" == "$want" && ( -z "$want_type" || "${ctype,,}" == "${want_type,,}"* ) ]]; then
       say "live OK: $url"
       return 0
     fi
@@ -125,6 +125,7 @@ publish_docs() {
   check_tree book "$wt/book/src" "$wt/book/book"
   check_tree by-example "$wt/by-example/src" "$wt/by-example/book"
   check_pdf "$wt/book/book/$PDF_NAME"
+  make_agent_files "$wt" "$tmp/agent"
 
   if (( dry )); then say "dry run: docs built and checked, nothing uploaded"; return 0; fi
 
@@ -158,6 +159,34 @@ REMOTE
   verify_live "$SITE_URL/book/$PDF_NAME" "$wt/book/book/$PDF_NAME" application/pdf
   verify_live "$SITE_URL/book/index.html" "$wt/book/book/index.html"
   verify_live "$SITE_URL/by-example/index.html" "$wt/by-example/book/index.html"
+
+  # Two plain files at the web root, overwritten in place like the landing page's.
+  say "uploading ai-cheatsheet.md, llms.txt and .htaccess"
+  tar -czf - -C "$tmp/agent" ai-cheatsheet.md llms.txt .htaccess | ssh "$SSH_HOST" "set -e; mkdir -p $STAGE; rm -rf $STAGE/agent.new; mkdir $STAGE/agent.new; tar -xzf - -C $STAGE/agent.new; chmod -R u=rwX,go=rX $STAGE/agent.new; cp -f $STAGE/agent.new/ai-cheatsheet.md $STAGE/agent.new/llms.txt $STAGE/agent.new/.htaccess $DOMAIN_DIR/public_html/; rm -rf $STAGE/agent.new"
+  verify_live "$SITE_URL/ai-cheatsheet.md" "$tmp/agent/ai-cheatsheet.md" "text/plain; charset=utf-8"
+  verify_live "$SITE_URL/llms.txt" "$tmp/agent/llms.txt" "text/plain; charset=utf-8"
+}
+
+# ---------------------------------------------------------------- files for AI agents
+# ai-cheatsheet.md is wiki/AI-Cheatsheet.md without its wiki breadcrumb, its wiki links made
+# absolute so they work from tiko-lang.net. llms.txt (llmstxt.org) points agents at it. The
+# root .htaccess makes the server send both as UTF-8.
+make_agent_files() {
+  local wt="$1" out="$2" src="$1/wiki/AI-Cheatsheet.md" left
+  [[ -s "$src" ]] || die "no wiki/AI-Cheatsheet.md in the build"
+  [[ -s "$wt/build/site/llms.txt" ]] || die "no build/site/llms.txt in the build"
+  [[ -s "$wt/build/site/.htaccess" ]] || die "no build/site/.htaccess in the build"
+  mkdir -p "$out"
+  sed -n '/^# /,$p' "$src" \
+    | sed -E 's#\]\(([A-Za-z0-9_-]+)(\#[^)]*)?\)#](https://github.com/PaulSquires/tiko-lang/wiki/\1\2)#g' \
+    > "$out/ai-cheatsheet.md"
+  cp "$wt/build/site/llms.txt" "$wt/build/site/.htaccess" "$out/"
+  [[ "$(head -1 "$out/ai-cheatsheet.md")" == "# "* ]] || die "ai-cheatsheet.md does not start with its title"
+  # A wiki link is ](Page) or ](Page#anchor); code such as sub[ byref x ]( ) is not.
+  left=$(grep -oE '\]\([A-Za-z0-9_-]+(#[^)]*)?\)' "$out/ai-cheatsheet.md" || true)
+  [[ -z "$left" ]] || die "ai-cheatsheet.md still has relative links: $left"
+  grep -q 'https://tiko-lang.net/ai-cheatsheet.md' "$out/llms.txt" || die "llms.txt does not link the cheatsheet"
+  say "agent files: ai-cheatsheet.md $(wc -c < "$out/ai-cheatsheet.md") bytes, llms.txt $(wc -c < "$out/llms.txt") bytes"
 }
 
 # ---------------------------------------------------------------- the landing page

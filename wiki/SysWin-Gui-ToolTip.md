@@ -303,15 +303,12 @@ Microsoft Learn: [TTM_ENUMTOOLS](https://learn.microsoft.com/en-us/windows/win32
 ```freebasic
 function GetToolInfo overload( byval hTooltip as HWND, byval lpti as TOOLINFOW ptr ) as boolean
 function GetToolInfo overload( byval hTooltip as HWND, byref ti as TOOLINFOW ) as boolean
-function GetToolInfo overload( byval hTooltip as HWND ) as TOOLINFOW
 ```
 
 Reads what the control keeps about the tool named by `hwnd` and `uId` (flags, rectangle,
-instance and, with a buffer in `lpszText`, the text). The third form asks for the tool whose
-`hwnd` and `uId` are both 0, so it finds nothing for tools made by [AddTooltip](#addtooltip)
-and returns a structure of zeros; use one of the first two.
+instance and, with a buffer in `lpszText`, the text).
 
-**Returns** `true` when the tool exists; the third form returns the structure.
+**Returns** `true` when the tool exists.
 
 **Example**
 

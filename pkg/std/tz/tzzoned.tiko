@@ -1,0 +1,414 @@
+#module "tz"
+#import "std/chrono"
+'' std/tz: ZonedDateTime -- an instant in a zone.
+''
+''     #import "std/tz"
+''     dim as tz.TimeZone ny = tz.TimeZone.FindById( "America/New_York" )
+''     dim as tz.ZonedDateTime m = tz.ZonedDateTime.FromLocal( chrono.DateTime( 2025, 3, 8, 9, 0, 0, 0 ), ny )
+''     m = m.AddCalendarDays( 1 )          '' 09:00 the next day, though the clocks changed overnight
+''     print m.ToDateTime( ).ToIsoString( ) '' 2025-03-09T09:00:00-04:00
+''
+'' THE INSTANT IS THE IDENTITY and the wall reading is derived from it. The other
+'' way round -- a wall reading plus a zone -- cannot name the second 01:30 of a
+'' fall-back night. The offset in force is cached beside the instant.
+''
+'' TWO KINDS OF ARITHMETIC, named apart as in std/chrono:
+''     Add( span )            exact: elapsed time, whatever the clocks did
+''     AddCalendarDays( n )   the same wall reading n days on, re-resolved in the
+''     AddCalendarMonths( n ) zone. Where it lands twice, the offset the value
+''     AddCalendarYears( n )  already had is kept (java.time's plusDays); where it
+''                            does not exist, it moves forward by the gap.
+'' And two ways to change zone, named for what they keep:
+''     WithZoneSameInstant    converts: same instant, another wall reading
+''     WithZoneSameLocal      reinterprets: same wall reading, another instant
+''
+'' THE OFFSET IS IN SECONDS, which a chrono.DateTime cannot carry: it holds whole
+'' minutes. ToDateTime rounds the offset to the nearest minute and KEEPS THE
+'' INSTANT, so the wall reading it shows moves by under 30 seconds. That only
+'' happens before standard time arrived (Europe/Amsterdam was +00:19:32 until
+'' 1937), and ToDateTime( ).ToInstant( ) is always ToInstant( ).
+''
+'' INVALID: a dim'd ZonedDateTime is Invalid, and so is the result of arithmetic
+'' that leaves years 1..9999; an Invalid value carries through the arithmetic
+'' and the conversions (ToInstant gives Instant.Invalid). Asking an Invalid one
+'' for a field, or making one from an Invalid instant or zone, is runtime error 1.
+
+'' When text carries BOTH an offset and a zone and they disagree for that wall
+'' reading -- the zone's rules changed after it was written, or it is wrong --
+'' what TryParseIso does (Temporal's "offset" option):
+''     opReject   refuse it (the default)
+''     opUse      the offset decides the instant; the zone gives its reading
+''     opPrefer   the offset when the zone allows it there, else the wall reading
+''     opIgnore   the wall reading, resolved in the zone
+'' A "Z" names the instant whatever the policy: RFC 9557 reads it as "the
+'' instant is known, the local offset is not".
+public enum OffsetPolicy
+    opReject
+    opUse
+    opPrefer
+    opIgnore
+end enum
+
+public type ZonedDateTime
+    declare static function FromInstant( byref i as chrono.Instant, byref z as TimeZone ) as ZonedDateTime
+    '' False when the policy refuses the reading or it is out of range.
+    declare static function TryFromLocal( byref wall as chrono.DateTime, byref z as TimeZone, _
+                                          byval policy as Disambiguation, byref result as ZonedDateTime ) as boolean
+    '' TryFromLocal's plain form: runtime error 1 where it is false.
+    declare static function FromLocal( byref wall as chrono.DateTime, byref z as TimeZone, _
+                                       byval policy as Disambiguation = dzCompatible ) as ZonedDateTime
+    declare static function Now( byref z as TimeZone ) as ZonedDateTime
+    declare static function Invalid( ) as ZonedDateTime
+
+    declare property IsValid      ( ) as boolean
+    declare property Zone         ( ) as TimeZone
+    declare property OffsetSeconds( ) as long
+    declare property Offset       ( ) as chrono.TimeSpan
+    declare property IsDaylightSavingTime( ) as boolean
+    declare property Abbreviation ( ) as ustring
+
+    '' the wall reading's fields
+    declare property Year       ( ) as long
+    declare property Month      ( ) as long
+    declare property Day        ( ) as long
+    declare property Hour       ( ) as long
+    declare property Minute     ( ) as long
+    declare property Second     ( ) as long
+    declare property Millisecond( ) as long
+    declare property DayOfWeek  ( ) as long     '' 1 = Monday .. 7 = Sunday
+    declare property DayOfYear  ( ) as long
+
+    declare function ToInstant   ( ) as chrono.Instant
+    '' The wall reading with the offset rounded to whole minutes; see above.
+    declare function ToDateTime  ( ) as chrono.DateTime
+    '' The wall reading alone, offset unspecified.
+    declare function ToWall      ( ) as chrono.DateTime
+    declare function GetDate     ( ) as chrono.LocalDate
+    declare function GetTimeOfDay( ) as chrono.LocalTime
+
+    declare function WithZoneSameInstant( byref z as TimeZone ) as ZonedDateTime
+    '' runtime error 1 where the policy refuses the reading in Z
+    declare function WithZoneSameLocal  ( byref z as TimeZone, _
+                                          byval policy as Disambiguation = dzCompatible ) as ZonedDateTime
+
+    declare function Add              ( byref s as chrono.TimeSpan ) as ZonedDateTime
+    declare function Subtract         ( byref s as chrono.TimeSpan ) as ZonedDateTime
+    declare function AddCalendarDays  ( byval n as long ) as ZonedDateTime
+    declare function AddCalendarMonths( byval n as long ) as ZonedDateTime
+    declare function AddCalendarYears ( byval n as long ) as ZonedDateTime
+    '' The FIRST INSTANT of the wall date -- not "midnight", which a DST change
+    '' at 00:00 skips (America/Sao_Paulo until 2019: the day began at 01:00).
+    declare function StartOfDay( ) as ZonedDateTime
+
+    '' By instant: -1, 0, 1. Two values naming one instant in two zones compare 0
+    '' but are not equal (=), which also asks for the same zone.
+    declare function CompareTo( byref o as ZonedDateTime ) as long
+
+    '' TEXT (RFC 9557). "2025-03-04T14:30:00+01:00[Europe/Paris]": chrono's ISO
+    '' reading, the offset -- with seconds only when they are not zero, as
+    '' +00:19:32 -- and the zone id in brackets. A zone with no id (Local on a
+    '' machine whose IANA id is unknown) writes no brackets, and that text does not
+    '' parse back as a ZonedDateTime.
+    declare function ToIsoString( ) as ustring
+    declare function ToString   ( ) as ustring           '' ToIsoString
+    '' std/chrono's patterns plus VV (the zone id) and v (the abbreviation then).
+    '' The fields are the wall reading; z, zz, zzz and K are the offset rounded to
+    '' whole minutes, as in ToDateTime.
+    declare function TryFormat( byref pattern as const ustring, byref result as ustring ) as boolean
+    declare function ToString ( byref pattern as const ustring ) as ustring    '' runtime error 1 on a bad pattern
+
+    '' A zone annotation is required: "2025-03-04T14:30[Europe/Paris]", with an
+    '' offset or "Z" optional before it, and "[+05:30]" for a fixed zone. A date
+    '' alone is the start of that day. "[!...]" (critical) is accepted for the
+    '' zone; any other annotation is ignored unless critical, and "u-ca" may only
+    '' be gregory or iso8601. OFFSETS says what to do when offset and zone
+    '' disagree; POLICY resolves a wall reading that names two instants or none.
+    declare static function TryParseIso( byref s as const ustring, byref result as ZonedDateTime, _
+                                         byval offsets as OffsetPolicy = opReject, _
+                                         byval policy as Disambiguation = dzCompatible ) as boolean
+    declare static function ParseIso   ( byref s as const ustring, byval offsets as OffsetPolicy = opReject, _
+                                         byval policy as Disambiguation = dzCompatible ) as ZonedDateTime
+    '' A pattern that ENDS in VV, with no v: the zone id is matched at the end of
+    '' the text and the rest parsed with std/chrono's TryParseExact.
+    declare static function TryParseExact( byref s as const ustring, byref pattern as const ustring, _
+                                           byref result as ZonedDateTime, _
+                                           byval offsets as OffsetPolicy = opReject, _
+                                           byval policy as Disambiguation = dzCompatible ) as boolean
+    declare static function ParseExact   ( byref s as const ustring, byref pattern as const ustring, _
+                                           byval offsets as OffsetPolicy = opReject, _
+                                           byval policy as Disambiguation = dzCompatible ) as ZonedDateTime
+
+private:
+    as longint m_ticks              '' the UTC instant
+    as long m_offset                '' seconds east of UTC, in force at m_ticks
+    as TimeZone m_zone
+    declare function Wall_( ) as chrono.DateTime
+    declare function Check_( ) as boolean
+    declare function Relocal_( byref wall as chrono.DateTime ) as ZonedDateTime
+end type
+
+public declare operator =  ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+public declare operator <> ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+public declare operator <  ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+public declare operator >  ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+public declare operator <= ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+public declare operator >= ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+
+'' ------------------------------------------------------------ construction
+
+function ZonedDateTime.Invalid( ) as ZonedDateTime
+    dim as ZonedDateTime r
+    return r
+end function
+
+function ZonedDateTime.FromInstant( byref i as chrono.Instant, byref z as TimeZone ) as ZonedDateTime
+    dim as ZonedDateTime r
+    if i.IsValid = false orelse z.IsValid = false then
+        error 1
+        return r
+    end if
+    r.m_ticks = i.Ticks
+    r.m_offset = z.OffsetSecondsAt( i )
+    r.m_zone = z
+    return r
+end function
+
+function ZonedDateTime.TryFromLocal( byref wall as chrono.DateTime, byref z as TimeZone, _
+                                     byval policy as Disambiguation, byref result as ZonedDateTime ) as boolean
+    dim as chrono.Instant i
+    if z.TryResolve( wall, policy, i ) = false then return false
+    result = ZonedDateTime.FromInstant( i, z )
+    return true
+end function
+
+function ZonedDateTime.FromLocal( byref wall as chrono.DateTime, byref z as TimeZone, _
+                                  byval policy as Disambiguation ) as ZonedDateTime
+    dim as ZonedDateTime r
+    if ZonedDateTime.TryFromLocal( wall, z, policy, r ) = false then error 1
+    return r
+end function
+
+function ZonedDateTime.Now( byref z as TimeZone ) as ZonedDateTime
+    return ZonedDateTime.FromInstant( chrono.WallClock.UtcNow( ), z )
+end function
+
+'' ------------------------------------------------------------ fields
+
+property ZonedDateTime.IsValid( ) as boolean
+    return this.m_zone.IsValid
+end property
+
+'' True when valid; runtime error 1 when not -- for the field reads.
+function ZonedDateTime.Check_( ) as boolean
+    if this.m_zone.IsValid = false then
+        error 1
+        return false
+    end if
+    return true
+end function
+
+function ZonedDateTime.Wall_( ) as chrono.DateTime
+    return chrono.DateTime.FromTicks( this.m_ticks + clngint( this.m_offset ) * chrono.DT_TICKS_PER_SECOND, _
+                                      chrono.DT_OFFSET_UNSPECIFIED )
+end function
+
+property ZonedDateTime.Zone( ) as TimeZone
+    return this.m_zone
+end property
+
+property ZonedDateTime.OffsetSeconds( ) as long
+    if this.Check_( ) = false then return 0
+    return this.m_offset
+end property
+
+property ZonedDateTime.Offset( ) as chrono.TimeSpan
+    if this.Check_( ) = false then return chrono.TimeSpan.Invalid( )
+    return chrono.TimeSpan( clngint( this.m_offset ) * chrono.DT_TICKS_PER_SECOND )
+end property
+
+property ZonedDateTime.IsDaylightSavingTime( ) as boolean
+    if this.Check_( ) = false then return false
+    return this.m_zone.IsDaylightSavingTime( this.ToInstant( ) )
+end property
+
+property ZonedDateTime.Abbreviation( ) as ustring
+    if this.Check_( ) = false then return ""
+    return this.m_zone.AbbreviationAt( this.ToInstant( ) )
+end property
+
+property ZonedDateTime.Year( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).Year
+end property
+property ZonedDateTime.Month( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).Month
+end property
+property ZonedDateTime.Day( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).Day
+end property
+property ZonedDateTime.Hour( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).Hour
+end property
+property ZonedDateTime.Minute( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).Minute
+end property
+property ZonedDateTime.Second( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).Second
+end property
+property ZonedDateTime.Millisecond( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).Millisecond
+end property
+property ZonedDateTime.DayOfWeek( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).DayOfWeek
+end property
+property ZonedDateTime.DayOfYear( ) as long
+    if this.Check_( ) = false then return 0
+    return this.Wall_( ).DayOfYear
+end property
+
+'' ------------------------------------------------------------ conversions
+
+function ZonedDateTime.ToInstant( ) as chrono.Instant
+    if this.m_zone.IsValid = false then return chrono.Instant.Invalid( )
+    return chrono.Instant.FromTicks( this.m_ticks )
+end function
+
+'' Half a minute rounds away from zero; the instant is kept, so the wall reading
+'' is recomputed under the rounded offset.
+function ZonedDateTime.ToDateTime( ) as chrono.DateTime
+    if this.m_zone.IsValid = false then return chrono.DateTime.Invalid( )
+    dim as long a = abs( this.m_offset )
+    dim as long m = ( a + 30 ) \ 60
+    if this.m_offset < 0 then m = -m
+    if m < chrono.DT_OFFSET_MIN orelse m > chrono.DT_OFFSET_MAX then return chrono.DateTime.Invalid( )
+    return chrono.DateTime.FromInstant( chrono.Instant.FromTicks( this.m_ticks ), cshort( m ) )
+end function
+
+function ZonedDateTime.ToWall( ) as chrono.DateTime
+    if this.m_zone.IsValid = false then return chrono.DateTime.Invalid( )
+    return this.Wall_( )
+end function
+
+function ZonedDateTime.GetDate( ) as chrono.LocalDate
+    if this.m_zone.IsValid = false then return chrono.LocalDate.Invalid( )
+    return this.Wall_( ).GetDate( )
+end function
+
+function ZonedDateTime.GetTimeOfDay( ) as chrono.LocalTime
+    if this.m_zone.IsValid = false then return chrono.LocalTime.Invalid( )
+    return this.Wall_( ).GetTimeOfDay( )
+end function
+
+function ZonedDateTime.WithZoneSameInstant( byref z as TimeZone ) as ZonedDateTime
+    if this.m_zone.IsValid = false then return ZonedDateTime.Invalid( )
+    return ZonedDateTime.FromInstant( this.ToInstant( ), z )
+end function
+
+function ZonedDateTime.WithZoneSameLocal( byref z as TimeZone, byval policy as Disambiguation ) as ZonedDateTime
+    if this.m_zone.IsValid = false then return ZonedDateTime.Invalid( )
+    return ZonedDateTime.FromLocal( this.Wall_( ), z, policy )
+end function
+
+'' ------------------------------------------------------------ arithmetic
+
+function ZonedDateTime.Add( byref s as chrono.TimeSpan ) as ZonedDateTime
+    if this.m_zone.IsValid = false then return ZonedDateTime.Invalid( )
+    dim as chrono.Instant i = this.ToInstant( ).Add( s )
+    if i.IsValid = false then return ZonedDateTime.Invalid( )
+    return ZonedDateTime.FromInstant( i, this.m_zone )
+end function
+
+function ZonedDateTime.Subtract( byref s as chrono.TimeSpan ) as ZonedDateTime
+    if this.m_zone.IsValid = false then return ZonedDateTime.Invalid( )
+    dim as chrono.Instant i = this.ToInstant( ).Subtract( s )
+    if i.IsValid = false then return ZonedDateTime.Invalid( )
+    return ZonedDateTime.FromInstant( i, this.m_zone )
+end function
+
+'' WALL re-resolved in this value's zone, keeping this value's offset where the
+'' reading happens twice and moving forward where it does not happen.
+function ZonedDateTime.Relocal_( byref wall as chrono.DateTime ) as ZonedDateTime
+    if wall.IsValid = false then return ZonedDateTime.Invalid( )
+    dim as chrono.Instant a, b
+    select case this.m_zone.MapLocal( wall, a, b )
+    case 1
+        return ZonedDateTime.FromInstant( a, this.m_zone )
+    case 2
+        if this.m_zone.OffsetSecondsAt( b ) = this.m_offset then return ZonedDateTime.FromInstant( b, this.m_zone )
+        return ZonedDateTime.FromInstant( a, this.m_zone )
+    case else
+        dim as chrono.Instant r
+        if this.m_zone.TryResolve( wall, dzCompatible, r ) = false then return ZonedDateTime.Invalid( )
+        return ZonedDateTime.FromInstant( r, this.m_zone )
+    end select
+end function
+
+function ZonedDateTime.AddCalendarDays( byval n as long ) as ZonedDateTime
+    if this.m_zone.IsValid = false then return ZonedDateTime.Invalid( )
+    '' an unspecified offset makes chrono's step purely civil
+    return this.Relocal_( this.Wall_( ).AddCalendarDays( n ) )
+end function
+
+function ZonedDateTime.AddCalendarMonths( byval n as long ) as ZonedDateTime
+    if this.m_zone.IsValid = false then return ZonedDateTime.Invalid( )
+    return this.Relocal_( this.Wall_( ).AddMonths( n ) )
+end function
+
+function ZonedDateTime.AddCalendarYears( byval n as long ) as ZonedDateTime
+    if this.m_zone.IsValid = false then return ZonedDateTime.Invalid( )
+    return this.Relocal_( this.Wall_( ).AddYears( n ) )
+end function
+
+function ZonedDateTime.StartOfDay( ) as ZonedDateTime
+    if this.m_zone.IsValid = false then return ZonedDateTime.Invalid( )
+    dim as chrono.DateTime midnight = this.Wall_( ).StartOfDay( )
+    dim as chrono.Instant a, b
+    if this.m_zone.MapLocal( midnight, a, b ) > 0 then return ZonedDateTime.FromInstant( a, this.m_zone )
+    '' midnight is in a gap: the day starts at the transition that made it,
+    '' unless that transition's own reading is still the day before
+    dim as chrono.Instant e, t
+    if this.m_zone.TryResolve( midnight, dzEarlier, e ) andalso this.m_zone.TryNextTransition( e, t ) then
+        dim as ZonedDateTime z = ZonedDateTime.FromInstant( t, this.m_zone )
+        if z.Wall_( ).GetDate( ) = midnight.GetDate( ) then return z
+    end if
+    return this.Relocal_( midnight )
+end function
+
+function ZonedDateTime.CompareTo( byref o as ZonedDateTime ) as long
+    if this.m_ticks < o.m_ticks then return -1
+    if this.m_ticks > o.m_ticks then return 1
+    return 0
+end function
+
+operator = ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+    if a.IsValid <> b.IsValid then return false
+    if a.IsValid = false then return true
+    return a.CompareTo( b ) = 0 andalso a.Zone = b.Zone
+end operator
+
+operator <> ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+    return not ( a = b )
+end operator
+
+operator < ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+    return a.CompareTo( b ) < 0
+end operator
+
+operator > ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+    return a.CompareTo( b ) > 0
+end operator
+
+operator <= ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+    return a.CompareTo( b ) <= 0
+end operator
+
+operator >= ( byref a as ZonedDateTime, byref b as ZonedDateTime ) as boolean
+    return a.CompareTo( b ) >= 0
+end operator

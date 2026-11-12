@@ -221,7 +221,7 @@ under `CDialog Examples`.
 | [ControlCenterHoriz](#controlcenterhoriz) | Centres a control horizontally in its parent. |
 | [ControlCenterVert](#controlcentervert) | Centres a control vertically in its parent. |
 | [ControlGetCheck, ControlSetCheck](#controlgetcheck-controlsetcheck) | Reads or sets the check state of a check box or radio button. |
-| [ControlSetOption](#controlsetoption) | Meant to check one radio button of a group. |
+| [ControlSetOption](#controlsetoption) | Checks one radio button of a group. |
 | [ControlGetUser, ControlSetUser](#controlgetuser-controlsetuser) | Reads or sets one of ten user values kept for a control. |
 | [GetUserDataItem](#getuserdataitem) | Returns where a control's user values are kept. |
 | [MenuContext](#menucontext) | Shows a shortcut menu and returns the command chosen. |
@@ -544,7 +544,7 @@ and Enter then reports that control: call [SetDefId](#getdefid-setdefid) after t
 For `ImgButton`, `wszTitle` is `"#"` plus a resource number, a resource name, or a `.bmp` file
 name. Whether the button shows an icon or a bitmap is taken from the program's resources, so for
 a file pass `BS_BITMAP` in `dwStyle`. The image is loaded at its own size, or stretched to the
-button when the name is passed as upper-case `"IMGBUTTONX"` (that test is case-sensitive).
+button when the name is passed as `IMGBUTTONX`.
 
 `lpParam` is passed to `CreateWindowExW` as the creation parameter. `pCallbackProc` is not used.
 
@@ -1739,8 +1739,7 @@ function ControlSetLoc( byval cId as long, byval nLeft as long, byval nTop as lo
 `ControlSetLoc` moves the control there without resizing it. Both are in dialog units, or
 physical pixels for a pixel dialog.
 
-**Returns** `true` on success. In pixel mode `ControlGetLoc` fills `nLeft` and `nTop` but
-returns `false`.
+**Returns** `true` on success.
 
 **Example**
 
@@ -1922,21 +1921,17 @@ Microsoft Learn: [BM_SETCHECK](https://learn.microsoft.com/en-us/windows/win32/c
 ### ControlSetOption
 
 ```freebasic
-function ControlSetOption( byval cId as long, byval minId as long, byval maxId as long ) as boolean
+function ControlSetOption (BYVAL minId AS LONG, BYVAL maxId AS LONG, BYVAL cId AS LONG) AS BOOLEAN
 ```
 
-Meant to check radio button `cId` and clear the others numbered `minId` to `maxId`. It passes the
-handle of control `cId`, not of the dialog, to Windows' `CheckRadioButton`, which then finds none
-of the buttons: no button changes and the function still returns `true`. Call
-`CheckRadioButton( pDlg->hDialog, minId, maxId, cId )` instead.
+Checks one radio button of a group. `minId`is the identifier of the first radio button in the group, `maxId`is the identifier of the last radio button in the group, and `cId` is the identifier of the radio button to select..
 
-**Returns** `true`.
+**Returns** `true`on success or `false`on failure.
 
 **Example**
 
 ```freebasic
-dim pDlg as CDialog ptr = CDialogPtr( hDlg )
-CheckRadioButton( pDlg->hDialog, 201, 203, 202 )   ' what ControlSetOption( 202, 201, 203 ) means
+ControlSetOption(hDlg, 201, 203, 202)
 ```
 
 Microsoft Learn: [CheckRadioButton](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-checkradiobutton)
@@ -2918,24 +2913,17 @@ Microsoft Learn: [WM_SIZE](https://learn.microsoft.com/en-us/windows/win32/winms
 
 | Function | Does |
 | --- | --- |
-| [CDialogPtr](#cdialogptr) | Returns the `CDialog` of a dialog, from its handle or a control's. |
+| [CDialogPtr](#cdialogptr) | Returns the `CDialog` of a dialog, from its handle. |
 | [DialogInputBox](#dialoginputbox) | Asks the user for a line of text in a modal dialog. |
 | [DialogInputBoxWindowProc](#dialoginputboxwindowproc) | The dialog procedure of the input box. |
 
 ### CDialogPtr
 
 ```freebasic
-function CDialogPtr( byval hwnd as HWND ) as CDialog ptr
+function CDialogPtr( byval hDlg as HWND ) as CDialog ptr
 ```
 
-Returns the `CDialog` object behind a dialog, given the dialog's handle or that of any control in
-it, so a dialog procedure needs no global or `static` pointer. It goes up to the root owner of
-`hwnd` and reads the pointer the dialog keeps.
-
-For a dialog that has an owner, the root owner is the **owner**, not the dialog: there,
-`CDialogPtr` returns the owner's `CDialog`, or whatever the owner window keeps in that slot if it
-is not a dialog. In an owned dialog, read the pointer from `WM_INITDIALOG`'s `lParam`, or with
-`GetWindowLongPtrW( hDlg, DWLP_USER )`.
+Returns the `CDialog` object behind a dialog, given the dialog's handle, so a dialog procedure needs no global or `static` pointer.
 
 **Returns** the object, or `NULL` for a `NULL` handle.
 

@@ -257,8 +257,7 @@ function Disable( byval hButton as HWND ) as boolean
 Disables the button: it is greyed out and ignores the mouse and the keyboard.
 
 **Returns** `true` when the button was already disabled before the call, `false` when it was
-enabled. This is the value Windows returns, so it is the opposite of `Label.Disable` and
-`ListBox.Disable`.
+enabled.
 
 **Example**
 

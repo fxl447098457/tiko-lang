@@ -41,6 +41,7 @@ from the PsControls control it ports.
 | `tkHost` | the widget core: surfaces, widget tree, focus, capture, timers, popups, bundled fonts |
 | `tkPaint` | the drawing surface (PsBufferPaint) on SDL_Renderer + SDL_ttf |
 | `tkTheme` | the shared light / dark theme |
+| `tkThemeFile` | a `.tktheme` read at run time: `tkTheme_Load( path )` installs a theme a user picks |
 | `tkKeys` | keyboard shortcuts and key maps |
 | `tkTest` | the self-test kit the examples use |
 | `tkButton`, `tkCheckBox`, `tkOptionButton`, `tkToggle` | buttons and switches |

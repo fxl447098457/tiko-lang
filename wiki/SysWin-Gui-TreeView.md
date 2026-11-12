@@ -631,18 +631,13 @@ Microsoft Learn: [TVM_GETITEMSTATE](https://learn.microsoft.com/en-us/windows/wi
 function IsItemChecked( byval hTreeView as HWND, byval hItem as HTREEITEM ) as boolean
 function GetCheck( byval hTreeView as HWND, byval hItem as HTREEITEM ) as boolean
 ```
-
-Return `true` when [GetCheckState](#getcheckstate) is 1. In a `TVS_CHECKBOXES` tree index 1 is
-the **unchecked** box, so both give `true` for an unchecked item and `false` for a checked one
-(and for an item with no check box). To test for a tick, compare `GetCheckState` with 2.
-
-**Returns** `true` when the state image index is 1.
+**Returns** `true` if the item is checked; false otherwise.
 
 **Example**
 
 ```freebasic
 dim hItem as HTREEITEM = TreeView.GetSelection( hCtrl )
-TreeView.SetCheck( hCtrl, hItem, false )
+TreeView.SetCheck( hCtrl, hItem, true )
 print TreeView.IsItemChecked( hCtrl, hItem ), TreeView.GetCheck( hCtrl, hItem )   ' true, true
 ```
 
@@ -1153,26 +1148,12 @@ TreeView.EnsureVisible( hCtrl, TreeView.GetLastVisible( hCtrl ) )
 ```freebasic
 function ItemExists( byval hTreeView as HWND, byval hNode as HTREEITEM, byval pwszText as wstring ptr ) as boolean
 ```
-
-Meant to report whether a direct child of `hNode` (a root item when `hNode` is `NULL`) has the
-text `pwszText`, case-sensitively. Each child's text is read into a buffer one character longer
-than `pwszText` and the whole buffer, its terminating null included, is compared with
-`pwszText`, so no child ever matches: the function returns `false` whatever the tree holds, and
-also for `NULL` or empty text. To look for a child by text, walk the children with
-[GetChild](#getchild) and [NextSibling](#nextsibling-getnext) and compare
-[GetItemText](#getitemtext), as below.
-
-**Returns** `false`.
+**Returns** `true` if the item exists; false otherwise.
 
 **Example**
 
 ```freebasic
-dim found as boolean = TreeView.ItemExists( hCtrl, NULL, "Fruit" )   ' false
-dim hItem as HTREEITEM = TreeView.GetChild( hCtrl, NULL )
-while hItem andalso TreeView.GetItemText( hCtrl, hItem ) <> "Fruit"
-    hItem = TreeView.NextSibling( hCtrl, hItem )
-wend
-found = ( hItem <> NULL )
+dim found as boolean = TreeView.ItemExists( hCtrl, NULL, "Fruit" )
 ```
 
 ### ItemExistsIgnoreCase
@@ -1181,20 +1162,14 @@ found = ( hItem <> NULL )
 function ItemExistsIgnoreCase( byval hTreeView as HWND, byval hNode as HTREEITEM, byval pwszText as wstring ptr ) as boolean
 ```
 
-[ItemExists](#itemexists) with both texts upper-cased before the comparison. The comparison has
-the same shape, so it also returns `false` whatever the tree holds; compare `ucase` of
-[GetItemText](#getitemtext) instead.
+[ItemExists](#itemexists) with both texts upper-cased before the comparison.
 
-**Returns** `false`.
+**Returns** `true` if the item exists; false otherwise.
 
 **Example**
 
 ```freebasic
-dim hItem as HTREEITEM = TreeView.GetChild( hCtrl, NULL )
-while hItem andalso ucase( TreeView.GetItemText( hCtrl, hItem ) ) <> "FRUIT"
-    hItem = TreeView.NextSibling( hCtrl, hItem )
-wend
-print TreeView.ItemExistsIgnoreCase( hCtrl, NULL, "fruit" )   ' false
+dim found as boolean = TreeView.ItemExists( hCtrl, NULL, "fruit" )
 ```
 
 ### GetCount
@@ -1495,8 +1470,7 @@ function GetISearchString overload( byval hTreeView as HWND ) as ustring
 ```
 
 The second form returns the incremental search string. The first copies it into a buffer, which
-must be large enough; it sends the message under its plain name, so in a program built without
-`UNICODE` the control writes 8-bit characters into the buffer. Prefer the `ustring` form.
+must be large enough.
 
 **Returns** the string, or `""` when no search is in progress; or, for the buffer form, the
 control's reply, nonzero when there is a search string.

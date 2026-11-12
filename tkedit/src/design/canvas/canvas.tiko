@@ -14,6 +14,7 @@
 #module "canvas"
 
 #import "std/containers"
+#import "std/fs"
 #import "vendor/tkControls/tkApp"
 #import "vendor/tkControls/tkMeta"
 #import "vendor/tkControls/tkLayout"
@@ -36,6 +37,8 @@
 #import "../edits"
 #import "../validate"
 #import "../codegen"
+#import "../colorval"
+#import "../themefile"
 using containers
 using tkApp
 using tkMeta
@@ -91,6 +94,12 @@ public type FormCanvas
     GridSize as long = 8
     SnapToGrid as boolean = true
     Live as boolean                     ' Test Form: the controls work, nothing is being designed
+    ' The project's theme the form wears (THEMES.md, TH7): its appTheme.tktheme; "" = tkEdit's own.
+    ' The variant is tkEdit's unless PreviewSet, then PreviewDark's (Form > Preview Light / Dark).
+    ThemePath as ustring
+    PreviewSet as boolean
+    PreviewDark as boolean
+    ThemeTables as themefile.ThemeTables
 
     Frame as TK_WIDGET ptr              ' fills the pane
     Glass as TK_WIDGET ptr              ' over everything in Frame
@@ -109,6 +118,7 @@ public type FormCanvas
     OnWire as CanvasWireSub             ' give an event a handler; jump: and go to it
     OnRenamed as CanvasRenameSub
     OnEditItems as CanvasWireSub        ' name_: the control whose entries to edit
+    OnEditColors as CanvasWireSub       ' name_: the control whose [control.colors] to edit
     OnHandlerGone as CanvasGoneFunc     ' true: the body has code, so keep its declaration
 
     Drag as long
@@ -123,6 +133,8 @@ public type FormCanvas
     DrawPage as long
 
     declare function Create( byval parent as TK_WIDGET ptr, byval id as long ) as boolean
+    declare sub ApplyProjectTheme( )
+    declare function ShowsDark( ) as boolean
     declare sub Destroy( )
     ' False when the text isn't a form this version can show; the canvas is left as it was.
     declare function LoadText( byref text as const ustring ) as boolean
@@ -368,6 +380,7 @@ sub FormCanvas.Rebuild( )
     this.Clear_( )
     Surface = tkWidget_CreateChild( Frame, 4, @SurfaceProc, @this )
     tkWidget_SendToBack( Surface )
+    this.ApplyProjectTheme( )               ' before the controls: they read their scope at create
 
     dim as TK_FORM ptr f = tkForm_FromWidget( Frame )
     dim as codegen.Sizes sz
@@ -409,6 +422,17 @@ sub FormCanvas.Rebuild( )
                 end if
             end if
         next
+        ' [control.colors]: the recipe the generated code gives it (the style takes effect once the
+        ' canvas wears the project theme)
+        if (len( c.StyleName ) > 0) orelse (c.Colors.Count( ) > 0) then
+            dim as Array( of TKCOLOR_SRC ) recipe
+            colorval.Entries( c.Colors, m, recipe )
+            if recipe.Count( ) then
+                tkTheme_SetRecipeNamed( w, c.StyleName, @recipe[0], recipe.Count( ) )
+            else
+                tkTheme_SetRecipeNamed( w, c.StyleName, 0, 0 )
+            end if
+        end if
         select case m->ContainerKind
         case TKMETA_NOT_CONTAINER
         case TKMETA_CONTAINER_PAGES
@@ -1168,11 +1192,12 @@ end sub
 sub FormCanvas.PaintSurface( byval b as TK_PAINT ptr )
     dim as TKRECT rc
     tkRect_Set( rc, 0, 0, Surface->cw, Surface->ch )
-    b->SetBackColor( tkTheme_Get( ).Window )
+    dim as TKTHEME_COLORS ft = tkTheme_Of( Surface )    ' the form's: the project theme when it has one
+    b->SetBackColor( ft.Window )
     b->PaintRect( @rc )
     dim as long stp = this.ToPixels( GridSize )
     if Live orelse (SnapToGrid = false) orelse (stp < 4) then exit sub
-    b->SetBackColor( tkTheme_Get( ).Divider )
+    b->SetBackColor( ft.Divider )
     dim as long y = stp
     while y < Surface->ch
         dim as long x = stp
@@ -1236,4 +1261,31 @@ sub FormCanvas.Paint( byval b as TK_PAINT ptr )
         b->SetPenColor( t.Accent )
         b->PaintRoundOutline( @band, 0, 1 )
     end if
+end sub
+
+' ---- the project's theme -----------------------------------------------------------------------------
+
+' The variant the form shows: tkEdit's own, unless Form > Preview Light / Dark chose one.
+function FormCanvas.ShowsDark( ) as boolean
+    if PreviewSet then return PreviewDark
+    return tkTheme_Get( ).IsDark
+end function
+
+' The form (Surface and every control on it) wears the project's theme -- its variant, shape,
+' styles and per-type colours -- as the program will; tkEdit's own theme stays on the rest. No
+' theme file, or one that doesn't read: the presets of the variant shown.
+sub FormCanvas.ApplyProjectTheme( )
+    if Surface = 0 then exit sub
+    dim as themefile.ThemeDoc d
+    if len( ThemePath ) then
+        dim as ustring none, e
+        dim as ustring text = fs.ReadAllText( ThemePath ).ValueOr( none )
+        if len( text ) then themefile.Parse( text, d, e )
+    end if
+    dim as TKTHEME_COLORS t = themefile.Resolve( d, this.ShowsDark( ) )
+    dim as TKTHEME_SHAPE sh = themefile.ShapeOf( d )
+    ThemeTables.Build( d )
+    tkTheme_ApplyTo( Surface, t, @sh, ThemeTables.StylePtr( ), ThemeTables.Styles.Count( ), _
+                     ThemeTables.TypePtr( ), ThemeTables.Types.Count( ) )
+    tkWidget_Invalidate( Surface )
 end sub

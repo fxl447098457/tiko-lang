@@ -459,14 +459,12 @@ Microsoft Learn: [TB_GETBUTTON](https://learn.microsoft.com/en-us/windows/win32/
 ```freebasic
 function GetButtonInfo overload( byval hToolbar as HWND, byval iID as long, byval ptbbi as TBBUTTONINFOW ptr ) as long
 function GetButtonInfo overload( byval hToolbar as HWND, byval iID as long, byref tbbi as TBBUTTONINFOW ) as long
-function GetButtonInfo overload( byval hToolbar as HWND, byval iID as long ) as TBBUTTONINFOW
 ```
 
 Reads the attributes that `dwMask` asks for (`TBIF_COMMAND`, `TBIF_IMAGE`, `TBIF_STATE`,
 `TBIF_STYLE`, `TBIF_TEXT`, `TBIF_SIZE`, `TBIF_LPARAM` …) of the button with command identifier
 `iID`, or of the button at index `iID` when the mask includes `TBIF_BYINDEX`. Set `cbSize` to
-`sizeof( TBBUTTONINFOW )` first. The third form sends a structure whose `cbSize` and `dwMask`
-are 0, so the control fills in nothing and it comes back all zero; use one of the first two.
+`sizeof( TBBUTTONINFOW )` first.
 
 **Returns** the index of the button, or -1 on failure.
 
@@ -797,8 +795,7 @@ function MapAccelerator overload( byval hToolbar as HWND, byval chAccel as DWORD
 ```
 
 Finds the button whose text has `chAccel` as its accelerator: the letter after `&`, or the
-first letter when the text has no `&`. Upper and lower case match alike. The character is sent
-with the ANSI form of the message, so letters outside ASCII may not be found.
+first letter when the text has no `&`. Upper and lower case match alike.
 
 **Returns** `true` when a button matches, with its command identifier stored in `pIDBtn` /
 `IDBtn` (first two forms); the command identifier, or 0 when no button matches (third form).
@@ -1299,13 +1296,11 @@ Microsoft Learn: [TB_SETPADDING](https://learn.microsoft.com/en-us/windows/win32
 ```freebasic
 sub GetMetrics overload( byval hToolbar as HWND, byval ptbMetrics as TBMETRICS ptr )
 sub GetMetrics overload( byval hToolbar as HWND, byref tbMet as TBMETRICS )
-function GetMetrics overload( byval hToolbar as HWND ) as TBMETRICS
 ```
 
 Reads the padding and spacing values that `dwMask` asks for (`TBMF_PAD`, `TBMF_BARPAD`,
 `TBMF_BUTTONSPACING`) into a `TBMETRICS`; `cbSize` is set for you. Needs version 6 of the
-common controls. The third form sends a structure whose `dwMask` is 0, so nothing is asked for
-and only `cbSize` comes back set; use one of the first two.
+common controls.
 
 **Example**
 
@@ -1415,13 +1410,9 @@ Microsoft Learn: [TB_SETROWS](https://learn.microsoft.com/en-us/windows/win32/co
 ```freebasic
 function HitTest overload( byval hToolbar as HWND, byval pptHitTest as POINT ptr ) as long
 function HitTest overload( byval hToolbar as HWND, byref ptHitTest as POINT ) as long
-function HitTest overload( byval hToolbar as HWND ) as POINT
 ```
 
 Finds the button under a point given in client coordinates of the toolbar.
-
-The third form tests the point (0, 0) and returns that point, not the result of the test; it is
-of no use, so pass a point to one of the first two.
 
 **Returns** the index of the button (not separator) under the point when it is 0 or more. A
 negative value means the point is on no button; its absolute value is then the index of the
@@ -1441,17 +1432,16 @@ Microsoft Learn: [TB_HITTEST](https://learn.microsoft.com/en-us/windows/win32/co
 ### GetHotItem
 
 ```freebasic
-function GetHotItem( byval hToolbar as HWND ) as DWORD
+function GetHotItem( byval hToolbar as HWND ) as LONG
 ```
 
 **Returns** the index of the hot button: the one under the mouse, or picked with the arrow keys.
-When no button is hot the message's -1 arrives as a `DWORD`, &hFFFFFFFF (4294967295): test for
-that, or convert with `cast( long, ... )` and test for -1.
+When no button is hot the result is -1.
 
 **Example**
 
 ```freebasic
-dim i as long = cast( long, ToolBar.GetHotItem( hCtrl ) )
+dim i as long = ToolBar.GetHotItem( hCtrl )
 if i <> -1 then print "hot button:"; i
 ```
 

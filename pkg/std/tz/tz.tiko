@@ -1,0 +1,342 @@
+#module "tz"
+'' std/tz -- named time zones: the IANA tz database's rules for any zone.
+''
+''     #import "std/tz"
+''
+''     dim as tz.TzRules r
+''     if tz.TzRules.TryParse( tzifBytes, r ) then
+''         print r.OffsetSecondsAt( 1735689600 )       '' seconds east of UTC then
+''         print r.AbbreviationAt( 1735689600 )        '' "NST"
+''     end if
+''
+''     tz.TzRules.TryParsePosix( "EST5EDT,M3.2.0,M11.1.0", r )
+''
+'' THIS IS THE ENGINE (phase Z1). TzRules is the rules of ONE zone, read from the
+'' compiled form zic writes (TZif, RFC 8536) or from a POSIX TZ string. It does
+'' not find files, know zone names or take Instants: the TimeZone type that does
+'' is built on it. Every time here is UNIX SECONDS (a longint), and every offset
+'' is SECONDS east of UTC -- not chrono's minutes, because local mean time before
+'' standard time had sub-minute offsets (Europe/Amsterdam was +00:19:32 until
+'' 1937).
+''
+'' A TZif file has explicit transitions up to some year and then a POSIX TZ
+'' string -- the FOOTER -- that gives the rule for every instant after the last
+'' one. Before the first transition the zone's FIRST local time type applies.
+'' Both are what RFC 8536 specifies, and both are what this engine does.
+''
+'' THE INPUT IS UNTRUSTED. A zone file comes from outside the program: every
+'' count is checked against the bytes that remain before anything is read,
+'' every index against its table, and a bad file is TryParse returning false --
+'' never a crash and never a partly filled result. Files counting leap seconds
+'' (the right/ zones) are refused: chrono's time scale has no leap seconds.
+
+'' One local time type: what the clock reads like for a stretch of time.
+type TzType_
+    as long offset                  '' seconds east of UTC
+    as boolean isDst
+    as string abbr
+end type
+
+'' One POSIX TZ rule date: Jn (1..365, February 29 never counted), n (0..365,
+'' counted), or Mm.w.d (day d of week w of month m; w = 5 is the last). TIME is
+'' seconds after local midnight, and may be negative or past 24 h (to 167 h).
+const TZ_RULE_JULIAN1 = 0
+const TZ_RULE_JULIAN0 = 1
+const TZ_RULE_MONTH   = 2
+
+type TzRule_
+    as long kind
+    as long day                     '' J and n forms
+    as long mon, week, wday         '' M form
+    as long time
+end type
+
+type TzPosix_
+    as string stdAbbr, dstAbbr
+    as long stdOff, dstOff          '' seconds east of UTC
+    as boolean hasDst
+    as TzRule_ startRule, endRule   '' into daylight time, out of it
+end type
+
+'' The rules of one zone.
+public type TzRules
+    '' False, with result left alone, for anything not a well-formed TZif file.
+    declare static function TryParse overload ( byval p as const ubyte ptr, byval n as longint, _
+                                                byref result as TzRules ) as boolean
+    declare static function TryParse overload ( byref bytes as string, byref result as TzRules ) as boolean
+    '' The rule alone: "EST5EDT,M3.2.0,M11.1.0", "<+0330>-3:30", "UTC0".
+    declare static function TryParsePosix( byref s as string, byref result as TzRules ) as boolean
+
+    declare property IsValid( ) as boolean
+    declare property Version( ) as long
+    declare property TransitionCount( ) as long     '' the explicit ones in the file
+    declare property PosixRule( ) as ustring        '' the footer, or "" when there is none
+
+    declare function OffsetSecondsAt( byval t as longint ) as long
+    declare function IsDstAt        ( byval t as longint ) as boolean
+    declare function AbbreviationAt ( byval t as longint ) as ustring
+    '' The standard offset in force at t: the offset itself outside daylight
+    '' time; inside it, the offset of the nearest standard-time stretch -- the
+    '' one before, else the one after. Past the table, the footer's.
+    declare function StandardOffsetSecondsAt( byval t as longint ) as long
+
+    '' Transitions are CHANGES OF OFFSET: an entry that changes only the
+    '' abbreviation or the DST flag is not one, because nothing on the clock
+    '' moved. Strictly after / strictly before the given time; false when there
+    '' is none within years 1..9999.
+    declare function TryNextTransition    ( byval after  as longint, byref result as longint ) as boolean
+    declare function TryPreviousTransition( byval before as longint, byref result as longint ) as boolean
+
+private:
+    as boolean m_valid
+    as long m_version               '' 1..4 for TZif; 0 for a POSIX string alone
+    as longint m_trans( any )       '' explicit transitions, unix seconds, ascending
+    as long m_idx( any )            '' the type in force from each one
+    as TzType_ m_types( any )
+    as boolean m_hasFooter
+    as TzPosix_ m_footer
+    as string m_footerText
+    declare function TypeAt_( byval t as longint ) as long
+    declare function OffsetOfType_( byval k as long ) as long
+end type
+
+'' The range the rest of std works in: 0001-01-01T00:00:00Z .. 9999-12-31T23:59:59Z.
+public const TZ_MIN_UNIX as longint = -62135596800ll
+public const TZ_MAX_UNIX as longint = 253402300799ll
+
+declare function tzParsePosix( byref s as string, byref p as TzPosix_ ) as boolean
+declare function tzPosixIsDst( byref p as TzPosix_, byval t as longint ) as boolean
+declare function tzPosixEvents( byref p as TzPosix_, byval y0 as longint, byval y1 as longint, _
+                                ev( ) as longint ) as long
+
+'' ------------------------------------------------------------ calendar
+''
+'' Civil dates over unix days, proleptic Gregorian (the algorithms of Howard
+'' Hinnant's "chrono-Compatible Low-Level Date Algorithms"). Kept here rather
+'' than taken from std/chrono so the engine stays pure arithmetic over seconds.
+
+function tzFloorDiv( byval a as longint, byval b as longint ) as longint
+    dim as longint q = a \ b
+    if ( a mod b ) <> 0 andalso ( ( a < 0 ) <> ( b < 0 ) ) then q -= 1
+    return q
+end function
+
+function tzDaysFromCivil( byval y as longint, byval m as long, byval d as long ) as longint
+    if m <= 2 then y -= 1
+    dim as longint era = iif( y >= 0, y, y - 399 ) \ 400
+    dim as longint yoe = y - era * 400
+    dim as longint mp = iif( m > 2, m - 3, m + 9 )
+    dim as longint doy = ( 153 * mp + 2 ) \ 5 + d - 1
+    dim as longint doe = yoe * 365 + yoe \ 4 - yoe \ 100 + doy
+    return era * 146097 + doe - 719468
+end function
+
+function tzYearFromDays( byval z as longint ) as longint
+    z += 719468
+    dim as longint era = iif( z >= 0, z, z - 146096 ) \ 146097
+    dim as longint doe = z - era * 146097
+    dim as longint yoe = ( doe - doe \ 1460 + doe \ 36524 - doe \ 146096 ) \ 365
+    dim as longint doy = doe - ( 365 * yoe + yoe \ 4 - yoe \ 100 )
+    dim as longint mp = ( 5 * doy + 2 ) \ 153
+    dim as longint y = yoe + era * 400
+    if mp >= 10 then y += 1           '' January and February belong to the next year
+    return y
+end function
+
+function tzIsLeap( byval y as longint ) as boolean
+    if ( y mod 4 ) <> 0 then return false
+    if ( y mod 100 ) <> 0 then return true
+    return ( y mod 400 ) = 0
+end function
+
+function tzDaysInMonth( byval y as longint, byval m as long ) as long
+    select case m
+    case 2
+        return iif( tzIsLeap( y ), 29, 28 )
+    case 4, 6, 9, 11
+        return 30
+    case else
+        return 31
+    end select
+end function
+
+'' 0 = Sunday, as POSIX's Mm.w.d counts. 1970-01-01 was a Thursday.
+function tzWeekday( byval days as longint ) as long
+    return clng( ( ( days + 4 ) mod 7 + 7 ) mod 7 )
+end function
+
+function tzClampUnix( byval t as longint ) as longint
+    if t < TZ_MIN_UNIX then return TZ_MIN_UNIX
+    if t > TZ_MAX_UNIX then return TZ_MAX_UNIX
+    return t
+end function
+
+'' ------------------------------------------------------------ lookup
+
+'' The type in force at t: an index into m_types, or -1 / -2 for the footer's
+'' standard / daylight time.
+function TzRules.TypeAt_( byval t as longint ) as long
+    dim as long n = ubound( this.m_trans ) + 1
+    if n = 0 orelse t >= this.m_trans( n - 1 ) then
+        if this.m_hasFooter then
+            return iif( tzPosixIsDst( this.m_footer, tzClampUnix( t ) ), -2, -1 )
+        end if
+        if n = 0 then return 0
+        return this.m_idx( n - 1 )
+    end if
+    if t < this.m_trans( 0 ) then return 0
+    '' the last transition at or before t
+    dim as long lo = 0, hi = n - 1
+    while lo < hi
+        dim as long md = ( lo + hi + 1 ) \ 2
+        if this.m_trans( md ) <= t then lo = md else hi = md - 1
+    wend
+    return this.m_idx( lo )
+end function
+
+function TzRules.OffsetOfType_( byval k as long ) as long
+    if k = -1 then return this.m_footer.stdOff
+    if k = -2 then return this.m_footer.dstOff
+    return this.m_types( k ).offset
+end function
+
+property TzRules.IsValid( ) as boolean
+    return this.m_valid
+end property
+
+property TzRules.Version( ) as long
+    return this.m_version
+end property
+
+property TzRules.TransitionCount( ) as long
+    return ubound( this.m_trans ) + 1
+end property
+
+property TzRules.PosixRule( ) as ustring
+    return this.m_footerText
+end property
+
+'' An invalid TzRules answers 0, false and "": it has no rules to give.
+function TzRules.OffsetSecondsAt( byval t as longint ) as long
+    if this.m_valid = false then return 0
+    return this.OffsetOfType_( this.TypeAt_( t ) )
+end function
+
+function TzRules.IsDstAt( byval t as longint ) as boolean
+    if this.m_valid = false then return false
+    dim as long k = this.TypeAt_( t )
+    if k = -1 then return false
+    if k = -2 then return true
+    return this.m_types( k ).isDst
+end function
+
+function TzRules.AbbreviationAt( byval t as longint ) as ustring
+    if this.m_valid = false then return ""
+    dim as long k = this.TypeAt_( t )
+    if k = -1 then return this.m_footer.stdAbbr
+    if k = -2 then return this.m_footer.dstAbbr
+    return this.m_types( k ).abbr
+end function
+
+function TzRules.StandardOffsetSecondsAt( byval t as longint ) as long
+    if this.m_valid = false then return 0
+    dim as long k = this.TypeAt_( t )
+    if k < 0 then return this.m_footer.stdOff
+    if this.m_types( k ).isDst = false then return this.m_types( k ).offset
+    '' the last transition at or before t; -1 when t is before them all
+    dim as long n = ubound( this.m_trans ) + 1
+    dim as long lo = -1, hi = n - 1
+    while lo < hi
+        dim as long md = ( lo + hi + 1 ) \ 2
+        if this.m_trans( md ) <= t then lo = md else hi = md - 1
+    wend
+    for i as long = lo to 0 step -1
+        if this.m_types( this.m_idx( i ) ).isDst = false then return this.m_types( this.m_idx( i ) ).offset
+    next
+    if this.m_types( 0 ).isDst = false then return this.m_types( 0 ).offset
+    for i as long = lo + 1 to n - 1
+        if this.m_types( this.m_idx( i ) ).isDst = false then return this.m_types( this.m_idx( i ) ).offset
+    next
+    if this.m_hasFooter then return this.m_footer.stdOff
+    return this.m_types( k ).offset
+end function
+
+function tzChangesAt( byref r as TzRules, byval c as longint ) as boolean
+    return r.OffsetSecondsAt( c ) <> r.OffsetSecondsAt( c - 1 )
+end function
+
+function TzRules.TryNextTransition( byval after as longint, byref result as longint ) as boolean
+    if this.m_valid = false then return false
+    if after >= TZ_MAX_UNIX then return false
+    dim as long n = ubound( this.m_trans ) + 1
+
+    '' the explicit table: the first entry after AFTER that moves the clock
+    dim as long lo = 0, hi = n
+    while lo < hi
+        dim as long md = ( lo + hi ) \ 2
+        if this.m_trans( md ) > after then hi = md else lo = md + 1
+    wend
+    for i as long = lo to n - 1
+        dim as longint c = this.m_trans( i )
+        if c > TZ_MAX_UNIX then return false
+        if c >= TZ_MIN_UNIX andalso tzChangesAt( this, c ) then
+            result = c
+            return true
+        end if
+    next
+
+    '' then the footer, past the table's end. Its rule repeats every year, so
+    '' a window of four years that holds no change holds none ever (DST all
+    '' year, or no DST).
+    if this.m_hasFooter = false orelse this.m_footer.hasDst = false then return false
+    dim as longint s = after
+    if n > 0 andalso this.m_trans( n - 1 ) > s then s = this.m_trans( n - 1 )
+    dim as longint y = tzYearFromDays( tzFloorDiv( tzClampUnix( s ), 86400 ) )
+    dim as longint ev( any )
+    dim as long m = tzPosixEvents( this.m_footer, y - 1, y + 2, ev( ) )
+    for i as long = 0 to m - 1
+        dim as longint c = ev( i )
+        if c > s andalso c <= TZ_MAX_UNIX andalso tzChangesAt( this, c ) then
+            result = c
+            return true
+        end if
+    next
+    return false
+end function
+
+function TzRules.TryPreviousTransition( byval before as longint, byref result as longint ) as boolean
+    if this.m_valid = false then return false
+    if before <= TZ_MIN_UNIX then return false
+    dim as long n = ubound( this.m_trans ) + 1
+    dim as longint lastT = iif( n > 0, this.m_trans( n - 1 ), TZ_MIN_UNIX - 1 )
+
+    '' the footer first, when BEFORE is past the table's end
+    if this.m_hasFooter andalso this.m_footer.hasDst andalso before > lastT + 1 then
+        dim as longint y = tzYearFromDays( tzFloorDiv( tzClampUnix( before ), 86400 ) )
+        dim as longint ev( any )
+        dim as long m = tzPosixEvents( this.m_footer, y - 2, y + 1, ev( ) )
+        for i as long = m - 1 to 0 step -1
+            dim as longint c = ev( i )
+            if c < before andalso c > lastT andalso c >= TZ_MIN_UNIX andalso tzChangesAt( this, c ) then
+                result = c
+                return true
+            end if
+        next
+    end if
+
+    '' then the table: the last entry before BEFORE that moves the clock
+    dim as long lo = 0, hi = n
+    while lo < hi
+        dim as long md = ( lo + hi ) \ 2
+        if this.m_trans( md ) < before then lo = md + 1 else hi = md
+    wend
+    for i as long = lo - 1 to 0 step -1
+        dim as longint c = this.m_trans( i )
+        if c < TZ_MIN_UNIX then return false
+        if c <= TZ_MAX_UNIX andalso tzChangesAt( this, c ) then
+            result = c
+            return true
+        end if
+    next
+    return false
+end function

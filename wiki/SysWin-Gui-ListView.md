@@ -319,16 +319,14 @@ Microsoft Learn: [LVM_INSERTCOLUMN](https://learn.microsoft.com/en-us/windows/wi
 ### InsertColumn
 
 ```freebasic
-function InsertColumn overload( byval hListView as HWND, byval iCol as long, byval pcol as LVCOLUMN ptr ) as long
-function InsertColumn overload( byval hListView as HWND, byval iCol as long, byref col as LVCOLUMN ) as long
+function InsertColumn overload( byval hListView as HWND, byval iCol as long, byval pcol as LVCOLUMNW ptr ) as long
+function InsertColumn overload( byval hListView as HWND, byval iCol as long, byref col as LVCOLUMNW ) as long
 function InsertColumn( byval hListView as HWND, byval iCol as long, byref wszText as wstring, byval nWidth as long, byval nFormat as long = LVCFMT_LEFT ) as long
 ```
 
 The form with a title is the same as [AddColumn](#addcolumn).
 
-The structure forms pass your column structure as it is. They take `LVCOLUMN`, which is the
-ANSI `LVCOLUMNA` structure, and send the ANSI message, so `pszText` must point to a `zstring`.
-They return -1 at once for a null structure.
+The structure forms pass your column structure as it is.
 
 **Returns** the index of the new column, or -1 on failure.
 
@@ -366,15 +364,12 @@ Microsoft Learn: [LVM_DELETECOLUMN](https://learn.microsoft.com/en-us/windows/wi
 ```freebasic
 function GetColumn overload( byval hListView as HWND, byval iCol as long, byval pcol as LVCOLUMNW ptr ) as boolean
 function GetColumn overload( byval hListView as HWND, byval iCol as long, byref col as LVCOLUMNW ) as boolean
-function GetColumn overload( byval hListView as HWND, byval iCol as long ) as LVCOLUMNW
 ```
 
 Reads the attributes of column `iCol` that the structure's `mask` asks for (`LVCF_WIDTH`,
-`LVCF_FMT`, `LVCF_TEXT` with a buffer in `pszText` and its size in `cchTextMax` …). The form
-that returns the structure sends it with an empty mask, so it reads nothing; fill a structure
-yourself and pass it.
+`LVCF_FMT`, `LVCF_TEXT` with a buffer in `pszText` and its size in `cchTextMax` …).
 
-**Returns** `true` on success, or the structure.
+**Returns** `true` on success, or `false`otherwise.
 
 **Example**
 
@@ -722,8 +717,7 @@ Microsoft Learn: [HDM_GETITEM](https://learn.microsoft.com/en-us/windows/win32/c
 sub MakeHeaderFlat( byval hListView as HWND )
 ```
 
-Toggles the header's `HDS_BUTTONS` style: a header with button-like titles becomes flat, and a
-flat one gets buttons, so a second call undoes the first. It then asks the list view's parent
+Removes the header's `HDS_BUTTONS` style: a header with button-like titles becomes flat. It then asks the list view's parent
 to redraw its frame.
 
 **Example**
@@ -800,9 +794,6 @@ Inserts an item with the text `wszText` at index `iItem`. An index past the end 
 the return value is the index it got. The item's other columns are empty until
 [SetItemText](#setitemtext) fills them.
 
-`iImage` is stored in the structure but not marked as set, so the item does not take that
-image; give it one afterwards with [SetItem](#setitem) and `LVIF_IMAGE`.
-
 | Parameter | Meaning |
 | --- | --- |
 | `iItem` | Where to insert the item, from 0. |
@@ -851,8 +842,7 @@ Microsoft Learn: [LVM_INSERTITEM](https://learn.microsoft.com/en-us/windows/win3
 function AppendItem( byval hListView as HWND, byval iImage as long, byval pwszText as wstring ptr ) as long
 ```
 
-Adds an item with the text `pwszText` after the last one. As with [AddItem](#additem), `iImage`
-is not applied.
+Adds an item with the text `pwszText` after the last one.
 
 **Returns** the index of the new item, or -1 on failure.
 
@@ -2041,14 +2031,12 @@ Microsoft Learn: [LVM_GETBKIMAGE](https://learn.microsoft.com/en-us/windows/win3
 ### SetBkImage
 
 ```freebasic
-function SetBkImage overload( byval hListView as HWND, byval pvbki as LVBKIMAGE ptr ) as boolean
-function SetBkImage overload( byval hListView as HWND, byref vbki as LVBKIMAGE ) as boolean
+function SetBkImage overload( byval hListView as HWND, byval pvbki as LVBKIMAGEW ptr ) as boolean
+function SetBkImage overload( byval hListView as HWND, byref vbki as LVBKIMAGEW ) as boolean
 ```
 
 Sets or removes the background image, from a bitmap (`LVBKIF_SOURCE_HBITMAP`) or from a file or
-URL. It takes `LVBKIMAGE`, the ANSI `LVBKIMAGEA` structure, and sends the ANSI message, so a
-file name in `pszImage` is a `zstring`. Set the background colour to `CLR_NONE` for the image to
-show.
+URL. Set the background colour to `CLR_NONE` for the image to show.
 
 **Returns** `true` on success.
 
@@ -2112,13 +2100,11 @@ Microsoft Learn: [LVM_SETIMAGELIST](https://learn.microsoft.com/en-us/windows/wi
 ```freebasic
 function CreateDragImage overload( byval hListView as HWND, byval i as long, byval lpptUpLeft as POINT ptr ) as HIMAGELIST
 function CreateDragImage overload( byval hListView as HWND, byval i as long, byref tUpLeft as POINT ) as HIMAGELIST
-function CreateDragImage overload( byval hListView as HWND, byval i as long, byval x as long, byval y as long ) as HIMAGELIST
 ```
 
 Creates an image list holding a picture of item `i`, for dragging it with the `ImageList_Drag*`
 functions. The control writes the image's upper-left corner, in view coordinates, into the
-`POINT` you pass. In the form with `x` and `y` those values are ignored: the corner is written
-to a local point and lost.
+`POINT` you pass.
 
 The image list is yours: destroy it with `ImageList_Destroy` when the drag ends.
 
@@ -2562,17 +2548,12 @@ Microsoft Learn: [LVM_SETWORKAREAS](https://learn.microsoft.com/en-us/windows/wi
 function GetNumberOfWorkAreas( byval hListView as HWND ) as DWORD
 ```
 
-Meant to return the number of working areas. The control writes the count into a variable and
-the message itself returns nothing; this function returns the message's result, so it gives 0
-however many areas there are. Read the count with the message directly, as below.
-
-**Returns** 0.
+**Returns** The number of working areas.
 
 **Example**
 
 ```freebasic
-dim nAreas as UINT
-SendMessageW( hCtrl, LVM_GETNUMBEROFWORKAREAS, 0, cast(LPARAM, @nAreas) )
+dim nAreas as UINT = ListView.GetNumberOfWorkAreas( hCtrl )
 print "work areas:"; nAreas
 ```
 
@@ -3173,17 +3154,13 @@ Microsoft Learn: [LVM_SETGROUPMETRICS](https://learn.microsoft.com/en-us/windows
 ### GetGroupRect
 
 ```freebasic
-function GetGroupRect overload( byval hListView as HWND, byval iGroupId as long, byval nType as long, byval prc as RECT ptr ) as boolean
-function GetGroupRect overload( byval hListView as HWND, byval iGroupId as long, byval nType as long, byref rc as RECT ) as boolean
+function GetGroupRect overload( byval hListView as HWND, byval iGroupId as long, byval prc as RECT ptr ) as boolean
+function GetGroupRect overload( byval hListView as HWND, byval iGroupId as long, byref rc as RECT ) as boolean
 function GetGroupRect overload( byval hListView as HWND, byval iGroupId as long, byval nType as long ) as ( long, long, long, long )
 ```
 
 Reads the rectangle of group `iGroupId`, in client coordinates. `nType` picks the part:
 `LVGGR_GROUP` (the whole group), `LVGGR_HEADER`, `LVGGR_LABEL` or `LVGGR_SUBSETLINK`.
-
-The tuple form and the `RECT` form pass `nType` to the control. The pointer form does not: it
-uses whatever `prc->top` holds, so set `top` to the part you want. The tuple form leaves
-`GetLastError()` nonzero on success.
 
 **Returns** `true` on success, or the four edges.
 
@@ -3302,12 +3279,10 @@ Microsoft Learn: [LVM_SETTILEINFO](https://learn.microsoft.com/en-us/windows/win
 ```freebasic
 sub GetTileViewInfo overload( byval hListView as HWND, byval ptvi as LVTILEVIEWINFO ptr )
 sub GetTileViewInfo overload( byval hListView as HWND, byref tvi as LVTILEVIEWINFO )
-function GetTileViewInfo overload( byval hListView as HWND ) as LVTILEVIEWINFO
 ```
 
 Reads the tile view settings (tile size, lines of text, margins) that the `LVTILEVIEWINFO`'s
-`dwMask` asks for. The function sets `cbSize` itself. The form that returns the structure sends
-an empty `dwMask`, so it asks for nothing.
+`dwMask` asks for. The function sets `cbSize` itself.
 
 **Example**
 
@@ -3347,14 +3322,12 @@ Microsoft Learn: [LVM_SETTILEVIEWINFO](https://learn.microsoft.com/en-us/windows
 ```freebasic
 function GetFooterInfo overload( byval hListView as HWND, byval pvfi as LVFOOTERINFO ptr ) as boolean
 function GetFooterInfo overload( byval hListView as HWND, byref vfi as LVFOOTERINFO ) as boolean
-function GetFooterInfo overload( byval hListView as HWND ) as LVFOOTERINFO
 ```
 
 Reads the attributes of the control's footer (the area below the items that a list view can
-show, with clickable items) that the `LVFOOTERINFO`'s `mask` asks for. The form that returns the
-structure sends an empty mask.
+show, with clickable items) that the `LVFOOTERINFO`'s `mask` asks for.
 
-**Returns** `true` on success, or the structure.
+**Returns** `true` on success, or `false`otherwise.
 
 **Example**
 
@@ -3371,13 +3344,11 @@ Microsoft Learn: [LVM_GETFOOTERINFO](https://learn.microsoft.com/en-us/windows/w
 ```freebasic
 function GetFooterItem overload( byval hListView as HWND, byval iItem as long, byval pfi as LVFOOTERITEM ptr ) as boolean
 function GetFooterItem overload( byval hListView as HWND, byval iItem as long, byref fi as LVFOOTERITEM ) as boolean
-function GetFooterItem overload( byval hListView as HWND, byval iItem as UINT ) as LVFOOTERITEM
 ```
 
-Reads footer item `iItem` into an `LVFOOTERITEM`, as its `mask` asks. The form that returns the
-structure sends an empty mask.
+Reads footer item `iItem` into an `LVFOOTERITEM`, as its `mask` asks.
 
-**Returns** `true` on success, or the structure.
+**Returns** `true` on success, or `false` otherwise.
 
 **Example**
 

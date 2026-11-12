@@ -318,11 +318,11 @@ End Sub
 
 Sub Parent.kinship()
 
-    For i As Integer = 0 To UBound(This.listChild)
+    For Each ByRef c As Child In This.listChild
 
-        This.listChild(i).kinship()
+        c.kinship()
 
-    Next i
+    Next
 
 End Sub
 

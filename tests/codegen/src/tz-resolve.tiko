@@ -1,0 +1,194 @@
+'' std/tz phase Z3: local -> instant. MapLocal and the four Disambiguation policies.
+'' Prints "ok", or the first failed check. $TZDIR is tests/codegen/tzdata (tzdata 2026f).
+''   1. anchors: St_Johns' spring gap and fall overlap, Lord_Howe's 30-minute ones,
+''      Pacific/Apia's skipped day, a plain reading, UTC and a fixed offset, a
+''      reading's fraction of a second, the ends of the range
+''   2. every transition 1970..2040 in every fixture zone: inside it MapLocal is 0
+''      (gap) or 2 (overlap), on either side of it 1, and every policy lands where
+''      its definition says
+''   3. every hour of 2000..2030: the reading of an instant names that instant
+''   4. the Local zone: the same sweep over its own transitions, and Resolve with
+''      dzCompatible agrees with std/chrono's DateTime.AssumeLocal
+#import "std/tz"
+#import "std/chrono"
+#import "std/os"
+using tz
+
+dim shared as long failures = 0
+sub check( byval ok as boolean, byref what as string )
+    if ok = false then
+        if failures = 0 then print "FAIL: "; what
+        failures += 1
+    end if
+end sub
+
+function at( byval y as long, byval mo as long, byval d as long, _
+             byval h as long = 0, byval mi as long = 0, byval s as long = 0 ) as chrono.Instant
+    return chrono.DateTime( y, mo, d, h, mi, s, 0 ).AssumeUtc( )
+end function
+
+function wl( byval y as long, byval mo as long, byval d as long, _
+             byval h as long = 0, byval mi as long = 0, byval s as long = 0 ) as chrono.DateTime
+    return chrono.DateTime( y, mo, d, h, mi, s, 0 )
+end function
+
+'' The wall reading of instant I in zone Z.
+function wallOf( byref z as TimeZone, byref i as chrono.Instant ) as chrono.DateTime
+    return chrono.DateTime.FromTicks( i.Ticks + clngint( z.OffsetSecondsAt( i ) ) * chrono.DT_TICKS_PER_SECOND, _
+                                      chrono.DT_OFFSET_UNSPECIFIED )
+end function
+
+function res( byref z as TimeZone, byref w as chrono.DateTime, byval p as Disambiguation ) as chrono.Instant
+    dim as chrono.Instant r
+    if z.TryResolve( w, p, r ) = false then return chrono.Instant.Invalid( )
+    return r
+end function
+
+os.SetEnv( "TZDIR", "tests/codegen/tzdata" )
+dim as chrono.Instant a, b
+
+'' ---------------------------------------------------------------- 1. anchors
+dim as TimeZone sj = TimeZone.FindById( "America/St_Johns" )
+'' spring 2025-03-09: 02:00 NST -> 03:00 NDT, so 02:30 never happens
+check( sj.MapLocal( wl( 2025, 3, 9, 2, 30 ), a, b ) = 0, "St_Johns gap is 0" )
+check( res( sj, wl( 2025, 3, 9, 2, 30 ), dzCompatible ) = at( 2025, 3, 9, 6, 0 ), "gap compatible: 03:30 NDT" )
+check( res( sj, wl( 2025, 3, 9, 2, 30 ), dzLater ) = at( 2025, 3, 9, 6, 0 ), "gap later = forward" )
+check( res( sj, wl( 2025, 3, 9, 2, 30 ), dzEarlier ) = at( 2025, 3, 9, 5, 0 ), "gap earlier: 01:30 NST" )
+check( res( sj, wl( 2025, 3, 9, 2, 30 ), dzReject ).IsValid = false, "gap reject" )
+'' fall 2025-11-02: 02:00 NDT -> 01:00 NST, so 01:30 happens twice
+check( sj.MapLocal( wl( 2025, 11, 2, 1, 30 ), a, b ) = 2 andalso a = at( 2025, 11, 2, 4, 0 ) andalso b = at( 2025, 11, 2, 5, 0 ), "St_Johns overlap" )
+check( res( sj, wl( 2025, 11, 2, 1, 30 ), dzCompatible ) = a andalso res( sj, wl( 2025, 11, 2, 1, 30 ), dzEarlier ) = a, "overlap earlier" )
+check( res( sj, wl( 2025, 11, 2, 1, 30 ), dzLater ) = b, "overlap later" )
+check( res( sj, wl( 2025, 11, 2, 1, 30 ), dzReject ).IsValid = false, "overlap reject" )
+'' a plain reading, every policy alike
+check( sj.MapLocal( wl( 2025, 6, 1, 12 ), a, b ) = 1 andalso a = at( 2025, 6, 1, 14, 30 ) andalso b = a, "plain" )
+check( res( sj, wl( 2025, 6, 1, 12 ), dzReject ) = at( 2025, 6, 1, 14, 30 ), "plain reject resolves" )
+'' the edges of the overlap and the gap
+check( sj.MapLocal( wl( 2025, 11, 2, 0, 59, 59 ), a, b ) = 1, "just before the overlap" )
+check( sj.MapLocal( wl( 2025, 11, 2, 1, 0, 0 ), a, b ) = 2, "the overlap's first second" )
+check( sj.MapLocal( wl( 2025, 11, 2, 1, 59, 59 ), a, b ) = 2, "the overlap's last second" )
+check( sj.MapLocal( wl( 2025, 11, 2, 2, 0, 0 ), a, b ) = 1, "just after the overlap" )
+check( sj.MapLocal( wl( 2025, 3, 9, 1, 59, 59 ), a, b ) = 1, "just before the gap" )
+check( sj.MapLocal( wl( 2025, 3, 9, 2, 0, 0 ), a, b ) = 0, "the gap's first second" )
+check( sj.MapLocal( wl( 2025, 3, 9, 2, 59, 59 ), a, b ) = 0, "the gap's last second" )
+check( sj.MapLocal( wl( 2025, 3, 9, 3, 0, 0 ), a, b ) = 1, "just after the gap" )
+'' a fraction of a second rides through
+scope
+    dim as chrono.DateTime w = wl( 2025, 11, 2, 1, 30 ).AddMilliseconds( 250 )
+    check( sj.MapLocal( w, a, b ) = 2 andalso a = at( 2025, 11, 2, 4, 0 ).Add( chrono.TimeSpan.FromMilliseconds( 250 ) ), "fraction kept" )
+    w = wl( 2025, 3, 9, 2, 30 ).AddMilliseconds( 250 )
+    check( res( sj, w, dzCompatible ) = at( 2025, 3, 9, 6, 0 ).Add( chrono.TimeSpan.FromMilliseconds( 250 ) ), "fraction kept in a gap" )
+end scope
+'' the reading's own offset is ignored
+check( res( sj, wl( 2025, 6, 1, 12 ).WithOffset( 330 ), dzCompatible ) = at( 2025, 6, 1, 14, 30 ), "offset ignored" )
+
+dim as TimeZone lh = TimeZone.FindById( "Australia/Lord_Howe" )
+'' 2025-04-06 02:00 +11 -> 01:30 +10:30: 01:30..02:00 twice
+check( lh.MapLocal( wl( 2025, 4, 6, 1, 45 ), a, b ) = 2 andalso a = at( 2025, 4, 5, 14, 45 ) andalso b = at( 2025, 4, 5, 15, 15 ), "Lord_Howe 30-minute overlap" )
+'' 2025-10-05 02:00 +10:30 -> 02:30 +11: 02:00..02:30 never
+check( lh.MapLocal( wl( 2025, 10, 5, 2, 15 ), a, b ) = 0, "Lord_Howe 30-minute gap" )
+check( res( lh, wl( 2025, 10, 5, 2, 15 ), dzCompatible ) = at( 2025, 10, 4, 15, 45 ), "Lord_Howe gap forward 30 min" )
+check( res( lh, wl( 2025, 10, 5, 2, 15 ), dzEarlier ) = at( 2025, 10, 4, 15, 15 ), "Lord_Howe gap backward 30 min" )
+
+dim as TimeZone ap = TimeZone.FindById( "Pacific/Apia" )
+'' 2011-12-30 did not happen: a 24-hour gap
+check( ap.MapLocal( wl( 2011, 12, 30, 12 ), a, b ) = 0, "Apia skipped day" )
+check( res( ap, wl( 2011, 12, 30, 12 ), dzCompatible ) = at( 2011, 12, 30, 22 ), "Apia forward: 2011-12-31 12:00" )
+check( res( ap, wl( 2011, 12, 30, 12 ), dzEarlier ) = at( 2011, 12, 29, 22 ), "Apia backward: 2011-12-29 12:00" )
+check( ap.MapLocal( wl( 2011, 12, 29, 23, 59, 59 ), a, b ) = 1 andalso ap.MapLocal( wl( 2011, 12, 31 ), a, b ) = 1, "Apia either side" )
+
+dim as TimeZone u = TimeZone.Utc( ), f = TimeZone.FixedOffset( 19800 )
+check( u.MapLocal( wl( 2025, 3, 9, 2, 30 ), a, b ) = 1 andalso a = at( 2025, 3, 9, 2, 30 ), "UTC" )
+check( f.MapLocal( wl( 2025, 3, 9, 2, 30 ), a, b ) = 1 andalso a = at( 2025, 3, 8, 21 ), "fixed +05:30" )
+'' the ends of the range: 0001-01-01 00:00 at +05:30 is before year 1
+check( f.MapLocal( wl( 1, 1, 1 ), a, b ) = 0 andalso f.TryResolve( wl( 1, 1, 1 ), dzCompatible, a ) = false, "before year 1" )
+check( TimeZone.FixedOffset( -19800 ).MapLocal( wl( 9999, 12, 31, 23 ), a, b ) = 0, "after 9999" )
+check( u.MapLocal( wl( 1, 1, 1 ), a, b ) = 1 andalso u.MapLocal( wl( 9999, 12, 31, 23, 59, 59 ), a, b ) = 1, "UTC ends" )
+
+'' ---------------------------------------------------------------- 2. every transition
+function zoneId( byval i as long ) as string
+    select case i
+    case 0 : return "Africa/Casablanca"
+    case 1 : return "America/New_York"
+    case 2 : return "America/Sao_Paulo"
+    case 3 : return "America/St_Johns"
+    case 4 : return "Asia/Kathmandu"
+    case 5 : return "Australia/Lord_Howe"
+    case 6 : return "Europe/Amsterdam"
+    case 7 : return "Europe/Dublin"
+    case 8 : return "Europe/London"
+    case else : return "Pacific/Apia"
+    end select
+end function
+
+'' Checks the transition at TR in zone Z: inside its overlap or gap and either side.
+sub checkTransition( byref z as TimeZone, byref tr as chrono.Instant, byref what as string )
+    dim as chrono.Instant a, b
+    dim as long oB = z.OffsetSecondsAt( tr.Subtract( chrono.TimeSpan.FromSeconds( 1 ) ) )
+    dim as long oA = z.OffsetSecondsAt( tr )
+    dim as long lo = iif( oA < oB, oA, oB ), hi = iif( oA < oB, oB, oA )
+    '' the span of wall readings the change affects: [tr + lo, tr + hi)
+    dim as chrono.DateTime w0 = chrono.DateTime.FromTicks( tr.Ticks + clngint( lo ) * chrono.DT_TICKS_PER_SECOND, chrono.DT_OFFSET_UNSPECIFIED )
+    dim as chrono.DateTime w1 = chrono.DateTime.FromTicks( tr.Ticks + clngint( hi ) * chrono.DT_TICKS_PER_SECOND, chrono.DT_OFFSET_UNSPECIFIED )
+    dim as chrono.DateTime mid_ = w0.AddSeconds( ( hi - lo ) \ 2 )
+    dim as long expect = iif( oA < oB, 2, 0 )
+    check( z.MapLocal( mid_, a, b ) = expect, what & " inside" )
+    check( z.MapLocal( w0, a, b ) = expect, what & " first second" )
+    check( z.MapLocal( w0.AddSeconds( -1 ), a, b ) = 1, what & " just before" )
+    check( z.MapLocal( w1, a, b ) = 1, what & " just after" )
+    dim as chrono.Instant c = res( z, mid_, dzCompatible ), e = res( z, mid_, dzEarlier ), l = res( z, mid_, dzLater )
+    check( res( z, mid_, dzReject ).IsValid = false, what & " reject" )
+    dim as longint width_ = clngint( hi - lo ) * chrono.DT_TICKS_PER_SECOND
+    if expect = 2 then
+        '' overlap: earlier is before the transition under the old offset, later after it
+        check( e < tr andalso l >= tr andalso c = e, what & " overlap policies" )
+        check( wallOf( z, e ).Ticks = mid_.Ticks andalso wallOf( z, l ).Ticks = mid_.Ticks, what & " overlap readings" )
+    else
+        '' gap: forward and backward by the gap's width
+        check( c = l andalso c >= tr andalso e < tr, what & " gap policies" )
+        check( wallOf( z, c ).Ticks - mid_.Ticks = width_, what & " gap forward by its width" )
+        check( mid_.Ticks - wallOf( z, e ).Ticks = width_, what & " gap backward by its width" )
+    end if
+end sub
+
+dim as long nTrans = 0
+for zi as long = 0 to 9
+    dim as TimeZone z = TimeZone.FindById( zoneId( zi ) )
+    dim as chrono.Instant cur = at( 1970, 1, 1 ), tr
+    while z.TryNextTransition( cur, tr ) andalso tr < at( 2040, 1, 1 )
+        checkTransition( z, tr, zoneId( zi ) & " " & tr.ToIsoString( ) )
+        nTrans += 1
+        cur = tr
+    wend
+next
+check( nTrans > 900, "transitions checked: " & nTrans )
+
+'' ---------------------------------------------------------------- 3. every hour
+for zi as long = 0 to 9
+    dim as TimeZone z = TimeZone.FindById( zoneId( zi ) )
+    for h as long = 0 to 30 * 365 * 24 step 7
+        dim as chrono.Instant i = at( 2000, 1, 1 ).Add( chrono.TimeSpan.FromHours( h ) )
+        dim as long n = z.MapLocal( wallOf( z, i ), a, b )
+        check( ( n = 1 andalso a = i ) orelse ( n = 2 andalso ( a = i orelse b = i ) ), "reading names its instant: " & zoneId( zi ) & " " & i.ToIsoString( ) )
+    next
+next
+
+'' ---------------------------------------------------------------- 4. Local
+scope
+    dim as TimeZone l = TimeZone.Local( )
+    dim as chrono.Instant cur = at( 2024, 1, 1 ), tr
+    dim as long n = 0
+    while l.TryNextTransition( cur, tr ) andalso tr < at( 2027, 1, 1 )
+        checkTransition( l, tr, "Local " & tr.ToIsoString( ) )
+        n += 1
+        cur = tr
+    wend
+    check( n > 0 orelse chrono.TimeZoneInfo.SupportsDaylightSavingTime( ) = false, "Local has its transitions" )
+    '' the same policy std/chrono's AssumeLocal applies
+    for h as long = 0 to 3 * 365 * 24 step 5
+        dim as chrono.DateTime w = wl( 2024, 1, 1 ).AddMinutes( h * 60 + ( h mod 4 ) * 15 )
+        check( res( l, w, dzCompatible ) = w.AssumeLocal( ), "Local Resolve = AssumeLocal at " & w.ToIsoString( ) )
+    next
+end scope
+
+if failures = 0 then print "ok" else print failures; " failures"

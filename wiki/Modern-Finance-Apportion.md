@@ -26,9 +26,9 @@ dim parts( 0 to 2 ) as Currency
 Apportion( total_, weights( ), parts( ) )
 
 dim as Currency sum_ = CurrencyFromInt( 0 )
-for i as int32 = 0 to 2
-    print parts( i ).ToString( )
-    sum_ = sum_ + parts( i )
+for each part in parts
+    print part.ToString( )
+    sum_ = sum_ + part
 next
 print sum_.ToString( )       '' 10.0000 -- exactly the input
 ```

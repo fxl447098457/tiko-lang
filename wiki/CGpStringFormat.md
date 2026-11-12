@@ -116,7 +116,7 @@ end main()
 | [SetFormatFlags](#setformatflags) | Sets the format flags. |
 | [GetFormatFlags](#getformatflags) | Returns the format flags. |
 | [SetAlignment](#setalignment) | Sets the alignment along each line. |
-| [GetAlignment](#getalignment) | Returns the format flags (see the entry). |
+| [GetAlignment](#getalignment) | Returns the alignment. |
 | [SetLineAlignment](#setlinealignment) | Sets the alignment of the lines in the rectangle. |
 | [GetLineAlignment](#getlinealignment) | Returns the line alignment. |
 | [SetHotkeyPrefix](#sethotkeyprefix) | Sets what an `&` in the text does. |
@@ -313,22 +313,14 @@ Microsoft Learn: [StringFormat::SetAlignment](https://learn.microsoft.com/en-us/
 function GetAlignment() as StringAlignment
 ```
 
-Meant to return the alignment set by [SetAlignment](#setalignment), but it reads the **format
-flags** instead: it returns the same value as [GetFormatFlags](#getformatflags), whatever the
-alignment is. Keep the alignment you set in a variable of your own, or call the GDI+ function
-directly, as the example does.
-
-**Returns** the format flags.
+**Returns** the alignment set by [SetAlignment](#setalignment).
 
 **Example**
 
 ```freebasic
 dim sf as CGpStringFormat
 sf.SetAlignment( StringAlignmentCenter )
-print sf.GetAlignment()                     ' 0: the format flags
-dim nAlign as StringAlignment
-GdipGetStringFormatAlign( sf.m_pStringFormat, @nAlign )
-print nAlign                                ' 1: StringAlignmentCenter
+print sf.GetAlignment()
 ```
 
 Microsoft Learn: [StringFormat::GetAlignment](https://learn.microsoft.com/en-us/windows/win32/api/gdiplusstringformat/nf-gdiplusstringformat-stringformat-getalignment)

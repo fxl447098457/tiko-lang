@@ -30,7 +30,7 @@ dim as Array( of int32 ) s = TuiSolve( 24, cs )
 print s[0], s[1], s[2]            '' 3 20 1
 
 dim as int32 total_ = 0
-for i as int32 = 0 to s.Count( ) - 1 : total_ += s[i] : next
+for each n in s : total_ += n : next
 print total_                      '' 24 -- always exactly the total
 ```
 

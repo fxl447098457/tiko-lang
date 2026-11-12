@@ -1,0 +1,65 @@
+'' std/tz: TimeZone.RegisterDatabase on hostile bytes. This program does NOT import
+'' std/tzdata: it embeds the same database file itself, so nothing is registered until
+'' it says so. Prints "ok", or the first failed check.
+''   1. every truncation of the database is refused, and so is anything not one
+''   2. the real one registers; a second is refused; its zones load
+''   3. every single-byte mutation of the header and index is parsed without a crash
+#import "std/tz"
+#import "std/chrono"
+#import "std/os"
+using tz
+
+dim shared as long failures = 0
+sub check( byval ok as boolean, byref what as string )
+    if ok = false then
+        if failures = 0 then print "FAIL: "; what
+        failures += 1
+    end if
+end sub
+
+#embed Db "../../../pkg/std/tzdata/tzdata.tzdb"
+os.SetEnv( "TZDIR", "" )
+dim as long n = ubound( Db ) + 1
+dim as string copy_ = space( n )
+for i as long = 0 to n - 1
+    copy_[i] = Db( i )
+next
+dim as const ubyte ptr cp = cptr( const ubyte ptr, strptr( copy_ ) )
+
+'' ---------------------------------------------------------------- 1. refusals
+check( TimeZone.RegisterDatabase( nullptr, n ) = false, "nullptr" )
+check( TimeZone.RegisterDatabase( cp, 0 ) = false, "no bytes" )
+dim as string junk = "TZif" & string( 100, 0 )
+check( TimeZone.RegisterDatabase( cptr( const ubyte ptr, strptr( junk ) ), len( junk ) ) = false, "not a database" )
+'' truncations, every 997th length and the last 64
+for k as long = 0 to n - 1
+    if ( k mod 997 ) = 0 orelse k > n - 64 then
+        check( TimeZone.RegisterDatabase( cp, k ) = false, "truncated to " & k & " accepted" )
+    end if
+next
+#ifndef __FB_WIN32__
+'' on Linux and macOS the system tree answers anyway
+#else
+dim as TimeZone z0
+check( TimeZone.TryFindById( "Europe/Paris", z0 ) = false, "nothing registered yet: no Paris on Windows" )
+#endif
+
+'' ---------------------------------------------------------------- 2. the real one
+check( TimeZone.RegisterDatabase( @Db( 0 ), n ), "registers" )
+check( TimeZone.RegisterDatabase( @Db( 0 ), n ) = false, "a second is refused" )
+dim as TimeZone z
+check( TimeZone.TryFindById( "Asia/Tokyo", z ) andalso z.OffsetSecondsAt( chrono.WallClock.UtcNow( ) ) = 32400, "Asia/Tokyo" )
+
+'' ---------------------------------------------------------------- 3. mutations
+'' the header and index end where the first file's "TZif" begins
+dim as long idxEnd = instr( copy_, "TZif" ) - 1
+check( idxEnd > 1000, "index found: " & idxEnd )
+for i as long = 0 to idxEnd - 1
+    dim as ubyte keep = copy_[i]
+    copy_[i] = keep xor &hFF
+    '' false either way (one is registered); this is about not crashing in the parse
+    check( TimeZone.RegisterDatabase( cp, n ) = false, "mutation at " & i )
+    copy_[i] = keep
+next
+
+if failures = 0 then print "ok" else print failures; " failures"

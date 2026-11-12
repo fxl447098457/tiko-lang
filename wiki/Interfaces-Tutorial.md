@@ -77,11 +77,11 @@ end sub
 dim as Shape ptr shapes( 0 to 1 )
 shapes( 0 ) = new Circle( 1 )
 shapes( 1 ) = new Rect( 2, 3 )
-for i as integer = 0 to 1
-    Report( shapes( i ) )
+for each s in shapes
+    Report( s )
 next
-for i as integer = 0 to 1
-    delete shapes( i )
+for each s in shapes
+    delete s
 next
 ```
 
@@ -145,8 +145,8 @@ dim as Rect   r = Rect( 2, 3 )
 dim as IShape shapes( 0 to 1 )
 shapes( 0 ) = c                     '' an object converts to an interface it implements
 shapes( 1 ) = @r                    '' ...and so does a pointer to one
-for i as integer = 0 to 1
-    Report( shapes( i ) )
+for each s in shapes
+    Report( s )
 next
 ```
 
@@ -842,12 +842,12 @@ end sub
 dim as string words( 0 to 3 ) = { "banana", "fig", "kiwi", "apple" }
 dim as ByLength bl
 SortWith( words( ), bl )
-for i as integer = 0 to 3 : print " "; words( i ); : next : print
+for each w in words : print " "; w; : next : print
 
 dim as double sizes( 0 to 3 ) = { 2.5, 9, 0.5, 4 }
 dim as Descending dsc
 SortWith( sizes( ), dsc )
-for i as integer = 0 to 3 : print sizes( i ); : next : print
+for each sz in sizes : print sz; : next : print
 ```
 
 ```
@@ -882,7 +882,7 @@ w.v = "hi"
 dim as IShow items( 0 to 1 )
 items( 0 ) = n
 items( 1 ) = w
-for i as integer = 0 to 1 : print items( i ).Show( ) : next
+for each it in items : print it.Show( ) : next
 ```
 
 ```

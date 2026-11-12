@@ -401,12 +401,10 @@ SetWindowText( pWindow->hWindow, "Saved" )
 
 ```freebasic
 property InstanceHandle() as HINSTANCE
-property InstanceHandle( byval hInst as HINSTANCE )
 ```
 
 Reads the module handle the window class is registered with and controls are created with:
-the program's own, `GetModuleHandleW( NULL )`. Setting it takes effect only while it is `NULL`,
-and since the constructor fills it in, the setter has no effect in practice.
+the program's own, `GetModuleHandleW( NULL )`.
 
 **Example**
 
@@ -1004,8 +1002,7 @@ sub Resize()
 ```
 
 Sends the window `WM_SIZE` with `SIZE_RESTORED`, so that anchored controls and the scroll bars of
-a scrollable window are laid out again and your `WM_SIZE` handler runs. The width and height in
-`lParam` are the client size in 96-DPI units, not in pixels as in a `WM_SIZE` from Windows.
+a scrollable window are laid out again and your `WM_SIZE` handler runs.
 
 **Example**
 
