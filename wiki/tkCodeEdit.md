@@ -56,7 +56,7 @@ end sub
 
 ## The scintk library
 
-The editor itself is **scintk**, a Scintilla and Lexilla build made for tkControls. It is a shared library loaded at run time, not linked: tiko copies it beside every program that imports tkCodeEdit, as `scintk.dll` on Windows and `libscintk.so` on Linux, and the first `tkCodeEdit_Create` loads it from the program's folder. A program that never creates an editor never loads it. When it cannot be loaded, `tkCodeEdit_Create` returns 0 and `tkCodeEdit_LibraryError` says why. Ship the library beside the program.
+The editor itself is **scintk**, a Scintilla and Lexilla build made for tkControls. It is a shared library loaded at run time, not linked: tiko copies it beside every program that imports tkCodeEdit, as `scintk.dll` on Windows, `libscintk.so` on Linux and `libscintk.dylib` on macOS, and the first `tkCodeEdit_Create` loads it from the program's folder. A program that never creates an editor never loads it. When it cannot be loaded, `tkCodeEdit_Create` returns 0 and `tkCodeEdit_LibraryError` says why. Ship the library beside the program.
 
 ## Things to know
 

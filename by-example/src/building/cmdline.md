@@ -41,7 +41,7 @@ exactly as written:
 `tiko named.tiko` writes `renamed.exe`, and so does
 `tiko named.tiko -o other.exe`: `-x` wins over `-o`, and the source wins over
 the command line. Like `-o`, `-x` uses the name exactly as written, so give
-the extension yourself; a program for Linux usually has none.
+the extension yourself; a program for Linux or macOS usually has none.
 
 ### Activities
 

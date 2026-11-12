@@ -10,7 +10,7 @@ Syntax
 
 Description
 
-The `-dll` compiler option creates a dynamic link library. This creates a DLL under Windows (including the import library), creates a .so under Linux, and a DXE under DOS.
+The `-dll` compiler option creates a dynamic link library. This creates a DLL under Windows (including the import library), creates a .so under Linux, a .dylib under macOS, and a DXE under DOS.
 
  **Note:** Same as `-dylib`
 
@@ -19,7 +19,7 @@ The `-dll` compiler option creates a dynamic link library. This creates a DLL un
 Platform Differences
 
 - On windows, dynamic link library is created with ".dll" file name extension and import library created as "lib\<name>.dll.a" file name
-  On Linux, dynamic link library is created with ".so" file name extension  
+  On Linux, dynamic link library is created with ".so" file name extension, and on macOS with ".dylib"  
   On DOS, dynamic link library is created with ".dxe" file name extension and import library created as "lib\<name>\_il.a" file name
 
 See also

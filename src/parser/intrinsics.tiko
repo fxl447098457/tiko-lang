@@ -374,6 +374,7 @@ end sub
 '' 'open( ... )' / 'open pipe( ... )' in EXPRESSION position. The cursor is on OPEN.
 function OpenExprCall( byref p as Tko.ParserState ) as Tko.NodeId
     dim as Tko.Token t = Cur( p )
+    dim as int32 tok0 = p.pos
     Advance( p )                                    '' OPEN
     '' 'pipe' is not a keyword -- it arrives as an identifier, the same way the
     '' statement form sees it.
@@ -403,7 +404,7 @@ function OpenExprCall( byref p as Tko.ParserState ) as Tko.NodeId
         sp.first = nf : sp.count += 1
         sp.a = devN
     end if
-    return MakeStmt( p, Tko.N_INTRINSIC, t.loc, sp )
+    return KeepIntrinsicTokens( p, MakeStmt( p, Tko.N_INTRINSIC, t.loc, sp ), tok0 )
 end function
 
 '' 'get( #f, 1, b )' IN EXPRESSION POSITION, which yields the error code and is how the
@@ -425,6 +426,7 @@ end function
 '' does not accept the comma form in an expression either.
 function CloseExprCall( byref p as Tko.ParserState ) as Tko.NodeId
     dim as Tko.Token t = Cur( p )
+    dim as int32 tok0 = p.pos
     Advance( p )                                    '' CLOSE
     if Accept( p, Tko.TK_LPAREN ) = false then
         return ErrorNode( p, Tko.TKO0401, "(" )
@@ -447,7 +449,7 @@ function CloseExprCall( byref p as Tko.ParserState ) as Tko.NodeId
     for i as int32 = 0 to items.Count - 1
         p.ast->PushChild( items[i] )
     next
-    return MakeStmt( p, Tko.N_INTRINSIC, t.loc, sp )
+    return KeepIntrinsicTokens( p, MakeStmt( p, Tko.N_INTRINSIC, t.loc, sp ), tok0 )
 end function
 
 '' WHETHER A LIST SPELLS get OR put is noted as the list grows (GetPutKnown_): each name's
@@ -506,6 +508,7 @@ end function
 function GetPutExprCall( byref p as Tko.ParserState ) as Tko.NodeId
     dim as Tko.Token t = Cur( p )
     dim as Tko.TokenKind k = Peek( p )
+    dim as int32 tok0 = p.pos
     Advance( p )                                    '' GET or PUT
     if Accept( p, Tko.TK_LPAREN ) = false then
         return ErrorNode( p, Tko.TKO0401, "(" )
@@ -542,7 +545,7 @@ function GetPutExprCall( byref p as Tko.ParserState ) as Tko.NodeId
     for i as int32 = 0 to items.Count - 1
         p.ast->PushChild( items[i] )
     next
-    return MakeStmt( p, Tko.N_INTRINSIC, t.loc, sp )
+    return KeepIntrinsicTokens( p, MakeStmt( p, Tko.N_INTRINSIC, t.loc, sp ), tok0 )
 end function
 
 '' LOCK AND UNLOCK TAKE A RANGE, and the 'to' half was being dropped in silence:
@@ -771,6 +774,70 @@ private function LegacyStatement_( byref p as Tko.ParserState ) as Tko.NodeId
     return n
 end function
 
+private function NextIsRParen_( byref p as Tko.ParserState ) as boolean
+    if HasTok( p, p.pos + 1 ) = false then return false
+    return cast( Tko.TokenKind, p.toks->At( p.pos + 1 ).kind ) = Tko.TK_RPAREN
+end function
+
+'' THE KEYWORD'S TOKENS, KEPT ON AN INTRINSIC IN EXPRESSION POSITION, so Resolve can read it
+'' again as a call of a procedure of that name -- RewriteShadowedIntrinsic_.
+function KeepIntrinsicTokens _
+    ( byref p as Tko.ParserState, byval n as Tko.NodeId, byval tok0 as int32 ) as Tko.NodeId
+    if (n <> Tko.NODE_NONE) andalso (p.pos > tok0) then
+        p.ast->RecordTokens( n, tok0, p.pos - 1 )
+        p.ast->OrFlags( n, Tko.NF_INTR_EXPR )
+    end if
+    return n
+end function
+
+'' A KEYWORD THIS PARSE ALREADY KNOWS AS A PROCEDURE: 'sub' anywhere, a method only inside a
+'' member body, where it is 'this.name'. IsLabelHere_'s rule and GetPutHasComma's.
+private function KeywordNamesProc_( byref p as Tko.ParserState, byval k as Tko.TokenKind ) as boolean
+    if Tko.IsKeywordKind( k ) = false then return false
+    dim as uint32 nm = cast( uint32, p.names->GetString( Tko.Text.LowerAscii( Tko.TokenKindText( k ) ) ) )
+    if KnownProc_( p, false, nm ) then return true
+    if p.memberDepth = 0 then return false
+    return KnownProc_( p, true, nm )
+end function
+
+'' A STATEMENT KEYWORD THAT NAMES A PROCEDURE, WHERE THE STATEMENT'S OWN GRAMMAR REFUSES THE LINE.
+'' fbc looks the name up before it tries the statement (cProcCallOrAssign, then cQuirkStmt), so
+'' a method called Get, Put, Line, Name, Swap ... is a plain call from a sibling. Measured on
+'' fbc-modern 1.20, 2026-11-09, forty keywords by six call shapes: every 'Get( )', 'Name 1' and
+'' 'Swap( 1 )' over a same-named own or inherited method calls it. Only Resolve can say which
+'' procedure a name means, so a line that does parse as the statement is left for
+'' RewriteShadowedIntrinsic_; this is the other half, the lines it would never see, because
+'' the statement's parser had already reported them. Nothing reported is kept, and the parse
+'' starts over as the call: a name that then binds to nothing is an undeclared name, at this line.
+function IntrinsicOrCall( byref p as Tko.ParserState ) as Tko.NodeId
+    dim as Tko.TokenKind k = Peek( p )
+    if KeywordNamesProc_( p, k ) = false then return ParseIntrinsic( p )
+
+    dim as int32 tok0 = p.pos, errors0 = p.errors
+    dim as boolean silent0 = p.silent
+    dim as int32 pendAt, errAt, warnAt, supAt
+    p.diags->Snapshot( pendAt, errAt, warnAt, supAt )
+    dim as int32 reported0 = p.diags->ErrorCount( )
+    dim as Tko.NodeId n = ParseIntrinsic( p )
+    '' 'Line 1' REPORTS NOTHING and stops before the 1, so the statement's own end check would.
+    dim as boolean atEnd_ = (Peek( p ) = Tko.TK_EOL) orelse (Peek( p ) = Tko.TK_COLON) orelse AtEnd( p ) orelse EndsSingleLineStmt( p )
+    if atEnd_ andalso (p.errors = errors0) andalso (p.diags->ErrorCount( ) = reported0) then return n
+
+    p.diags->RollBack( pendAt, errAt, warnAt, supAt )
+    p.errors = errors0
+    p.silent = silent0
+    p.pos = tok0
+    p.toks->At( tok0 ).literal = cast( uint32, p.names->GetString( Tko.Text.LowerAscii( Tko.TokenKindText( k ) ) ) )
+    p.toks->At( tok0 ).kind = cast( uint16, Tko.TK_IDENT )
+    dim as Tko.NodeId callN = CallStatement( p )
+    if (callN <> Tko.NODE_NONE) andalso (p.ast->Kind( callN ) = Tko.N_AMBIGUOUS) then
+        dim as Tko.NodeId callee = p.ast->StmtOf( callN )->a
+        if (callee <> Tko.NODE_NONE) andalso (p.ast->Kind( callee ) = Tko.N_CALL) then callee = p.ast->ListOf( callee )->target
+        if (callee <> Tko.NODE_NONE) andalso (p.ast->Kind( callee ) = Tko.N_IDENT) then p.ast->OrFlags( callee, Tko.NF_KW_CALLEE )
+    end if
+    return callN
+end function
+
 '' The entry point: dispatch on the registry.
 function ParseIntrinsic( byref p as Tko.ParserState ) as Tko.NodeId
     dim as Tko.Token t = Cur( p )
@@ -886,6 +953,14 @@ function ParseIntrinsic( byref p as Tko.ParserState ) as Tko.NodeId
                 return MakeStmt( p, Tko.N_INTRINSIC, t.loc, sp )
             end if
         end select
+
+        '' 'color( )' IS 'color', measured: fb_Color( 0, 0, 3 ) for both, and the cva statements report
+        '' a wrong count themselves (TKO0988). For the rest '( )' reports itself in Primary.
+        dim as boolean emptyOk = (k = Tko.KW_COLOR) orelse (k = Tko.KW_CVA_START) orelse (k = Tko.KW_CVA_END) orelse (k = Tko.KW_CVA_COPY)
+        if emptyOk andalso (Peek( p ) = Tko.TK_LPAREN) andalso NextIsRParen_( p ) then
+            Advance( p ) : Advance( p )
+            return MakeStmt( p, Tko.N_INTRINSIC, t.loc, sp )
+        end if
 
         dim as Tko.NodeIdVec items
         IntrArgList( p, items )

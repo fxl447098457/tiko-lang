@@ -60,12 +60,12 @@ ch36/
     textfile/textfile.tiko  the document: load, save, find, line and column
     pad/pad.tiko            the window: controls, menus, commands
     tpad.tiko               the program, and its self-test
-    filetest.tiko           textfile on its own, on both targets
+    filetest.tiko           textfile on its own, on every target
 ```
 
 The rule is the one from Chapter 33: **the part that does not need a window does not import one.**
 Everything `tpad` knows about text files is in `textfile`, which imports `std/fs` and
-`std/strings` and nothing from Windows. It can be tested on both targets, by a program that prints,
+`std/strings` and nothing from Windows. It can be tested on every target, by a program that prints,
 and it could serve a Linux editor unchanged. `pad` is the window, and `tpad.tiko` starts it.
 
 ## The document
@@ -172,7 +172,7 @@ searches the copies; that keeps the offsets right, because `lcase` changes no st
 {{#include ../examples/ch36/textfile/textfile.tiko:linecol}}
 ```
 
-### Testing it on both targets
+### Testing it on every target
 
 ```tiko
 {{#include ../examples/ch36/filetest.tiko}}
@@ -495,7 +495,7 @@ debugger's information (Chapter 31). Ship the release build.
 ## Summary
 
 - Keep the part of a program that needs no window in a module that imports none. `textfile` is
-  tested on Linux and Windows by a program that prints; only `pad` needs Windows.
+  tested on Windows, Linux and macOS by a program that prints; only `pad` needs Windows.
 - Give text one line-break convention inside the program — one LF, counted as one character — and
   convert at the edges: `ToLf` on the way in from the file and from the control, the file's own
   ending on the way out.
@@ -523,9 +523,9 @@ debugger's information (Chapter 31). Ship the release build.
 1. Add Find Previous (Shift+F3) to `textfile` and to the Edit menu: the last match that ends at or
    before the start of the selection, wrapping around to the bottom. {solution="ex36-01"}
 2. Show a word count in a fourth status-bar panel. Write the counting function in `textfile`, so
-   that it can be tested on both targets. {solution="ex36-02"}
+   that it can be tested on every target. {solution="ex36-02"}
 3. Add Replace (Ctrl+H): a modal box with *Find what*, *Replace with*, Replace and Replace All.
-   Do the replacing in `textfile`, so that it can be tested on both targets.
+   Do the replacing in `textfile`, so that it can be tested on every target.
 4. Add Time/Date (F5), which inserts the local date and time at the caret, with `std/chrono`.
 5. Open a file dropped on the window from Explorer. `DragAcceptFiles` turns dropping on, the form
    receives `WM_DROPFILES` (`OnMessage`), and `DragQueryFileW` gives the path. Ask `MayDiscard`

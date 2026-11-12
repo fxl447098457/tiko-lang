@@ -26,6 +26,7 @@
 - [Defer](Category-Defer)
 - [Lambdas](Category-Lambdas)
 - [Block Strings](Category-Block-Strings)
+- [Partial Types](Category-Partial-Types)
 - [String Slices](Category-String-Slices)
 - [Embed](Category-Embed)
 - [Typed Variadics](Category-Typed-Variadics)

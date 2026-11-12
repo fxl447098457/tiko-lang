@@ -38,7 +38,7 @@ destructor closes the handle, and the `TextWriter` declared after it is destroye
 is left unwritten. A `File` cannot be copied — pass it `byref`.
 
 `WriteLine` ends each line the way the platform does: carriage return and line feed on Windows,
-line feed alone on Linux. Set the writer's `NewLine` to `chr( 10 )` for files that must be the
+line feed alone on Linux and macOS. Set the writer's `NewLine` to `chr( 10 )` for files that must be the
 same bytes everywhere. `ReadLines` accepts either ending, removes it, and yields one
 `Result( of ustring, FsError )` per line — `ln.Value( )` is the text. It holds one line in memory at
 a time, whatever the size of the file, and leaving the loop early closes the file.
@@ -248,7 +248,7 @@ On Windows:
 {{#include ../examples/ch25/paths.windows-x86_64.out}}
 ```
 
-On Linux:
+On Linux and macOS:
 
 ```text
 {{#include ../examples/ch25/paths.out}}
@@ -281,7 +281,7 @@ On Windows:
 {{#include ../examples/ch25/pathescape.windows-x86_64.out}}
 ```
 
-On Linux:
+On Linux and macOS:
 
 ```text
 {{#include ../examples/ch25/pathescape.out}}
@@ -289,7 +289,7 @@ On Linux:
 
 Joining `"uploads"` with a name a user supplied looks like it keeps the file inside `uploads`. It
 does not: an absolute name replaces the folder, and the program reads or writes wherever the name
-points. Which names count as absolute differs by platform — on Linux the Windows-style name is a
+points. Which names count as absolute differs by platform — on Linux and macOS the Windows-style name is a
 harmless file called `C:\Windows\win.ini` inside `uploads`; on Windows it escapes. Check
 containment after joining, with `PathStartsWith` on the normalized result, before using a path
 built from somebody else's input.
@@ -350,7 +350,7 @@ runs cannot send it outside the tree. Given a path that is itself a link, it ref
 ```
 
 `ReadAllText` reads a file into one `ustring`; `ReadAllLines` splits it into an `Array`, removing
-the line endings of either platform; `WriteAllText` writes one. Text is UTF-8 unless the file
+either kind of line ending; `WriteAllText` writes one. Text is UTF-8 unless the file
 starts with a byte-order mark that says otherwise.
 
 `WriteAtomic` writes the new content to a temporary file **in the same directory** and then
@@ -375,7 +375,7 @@ a raw pointer — invalid after `Close( )`, and a fault if another program short
 is mapped.
 
 A `FileLock` keeps other cooperating programs away from a file while it is held. It is **advisory**:
-on Linux it binds only programs that also ask for the lock, and the library promises no more than
+on Linux and macOS it binds only programs that also ask for the lock, and the library promises no more than
 that on Windows either. `CreateTempFile` creates a file under a fresh name and returns the path;
 nothing deletes it for you.
 
@@ -661,7 +661,7 @@ Run as `osenv alpha "two words" ""`:
 ```
 
 `os.Args( )` is every argument in an `Array( of ustring )`, the program's own path first, Unicode
-on both systems. `os.GetEnv` returns an `Optional`: empty when the variable is not set, holding
+on every system. `os.GetEnv` returns an `Optional`: empty when the variable is not set, holding
 `""` when it is set to nothing. `SetEnv` and `UnsetEnv` return a `Result`, and refuse a name that
 is empty or contains `=` with an `OsError` rather than passing it to the system. `ExpandEnv`
 replaces `$NAME` and `${NAME}` — and on Windows `%NAME%` — with their values. `Environment( )` is
@@ -928,7 +928,7 @@ followed for you, up to ten.
    record `record` by `n` and refuses, returning `false`, if there are not enough.
    {solution="ex25-02"}
 3. Make `pathescape.tiko` refuse any name that would leave `uploads`, and print which names were
-   refused, on both platforms.
+   refused, on every platform.
 4. Rewrite `textfile.tiko` with `fs.WriteAllText` and `fs.ReadAllLines`. Which version would you
    want for a file of a few lines, and which for a log of a few gigabytes?
 5. Write a program that runs `exitcode.tiko`'s executable with `exec` and prints a different message

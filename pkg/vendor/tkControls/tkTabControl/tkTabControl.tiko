@@ -1,0 +1,217 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkTabControl -- a tkTabBar and one page per tab, of which one shows. A page is a tkPanel: parent a
+' tab's controls to tkTabControl_GetPage( h, i ). The control is never a tab stop itself; its bar is.
+' tkTabControl_SetCurSel is silent, and the callback runs only when the user changes the tab.
+#module "tkTabControl"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTabBar" public
+#import "../tkPanel" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTabBar
+using tkPanel
+
+' Design units, scaled when used.
+public const as long TKTABCONTROL_DEFAULT_TABHEIGHT = 30
+
+public type TC_SelChangeCallbackSub as sub( byval hTabControl as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+
+public type TKTABCONTROL_STATE
+    hWin          as TK_WIDGET ptr
+    hBar          as TK_WIDGET ptr
+    pages( any )  as TK_WIDGET ptr
+    nPages        as long
+    nTabHeight    as long = TKTABCONTROL_DEFAULT_TABHEIGHT
+    SelChange     as TC_SelChangeCallbackSub
+    declare function BarHeight() as long
+    declare sub Layout()
+    declare sub ShowOnly( byval idx as long )
+end type
+
+private function GetTabControlPointer( byval h as TK_WIDGET ptr ) as TKTABCONTROL_STATE ptr
+    if h = 0 then return 0
+    return cast( TKTABCONTROL_STATE ptr, h->pData )
+end function
+
+function TKTABCONTROL_STATE.BarHeight() as long
+    return tkHost_Scale( this.hWin->pHost, this.nTabHeight )
+end function
+
+sub TKTABCONTROL_STATE.Layout()
+    dim as long cw = this.hWin->cw, ch = this.hWin->ch, barH = this.BarHeight()
+    if barH > ch then barH = ch
+    tkWidget_SetPos( this.hBar, 0, 0, cw, barH )
+    for i as long = 0 to this.nPages - 1
+        tkWidget_SetPos( this.pages(i), 0, barH, cw, ch - barH )
+    next
+end sub
+
+sub TKTABCONTROL_STATE.ShowOnly( byval idx as long )
+    for i as long = 0 to this.nPages - 1
+        if i <> idx then tkWidget_Show( this.pages(i), false )
+    next
+    if (idx >= 0) andalso (idx < this.nPages) then tkWidget_Show( this.pages(idx), true )
+    tkWidget_Invalidate( this.hWin )
+end sub
+
+' The bar's child callback: its parent is the control.
+private sub OnBarSelChange( byval hBar as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( tkWidget_Parent( hBar ) )
+    if p = 0 then exit sub
+    p->ShowOnly( idxNew )
+    if p->SelChange then p->SelChange( p->hWin, idxOld, idxNew )
+end sub
+
+private function tkTabControl_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        dim as TK_PAINT ptr b = m->pPaint
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        b->SetBackColor( tkTheme_Get().Window )
+        b->PaintRect( @rc )
+        return true
+    case TKM_SIZE
+        p->Layout( )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_SCALECHANGED
+        p->Layout( )
+        return true
+    case TKM_THEMECHANGED
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_DESTROY
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+public function tkTabControl_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKTABCONTROL_STATE ptr p = new TKTABCONTROL_STATE
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @tkTabControl_Proc, p )
+    p->hWin = w
+    p->hBar = tkTabBar_Create( w, 1 )
+    tkTabBar_SetSelChangeCallback( p->hBar, @OnBarSelChange )
+    return w
+end function
+
+' The tab strip, for its own styling: fonts, colours, glyphs, closable tabs.
+public function tkTabControl_GetTabBar( byval h as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    return iif( p <> 0, p->hBar, cast( TK_WIDGET ptr, 0 ) )
+end function
+
+' Inserts a tab and its empty page. idx = -1 appends. Returns the new tab's index. The first page
+' added is selected; adding later ones leaves the selection where it is.
+public function tkTabControl_InsertPage( byval h as TK_WIDGET ptr, byval idx as long, byref text as const ustring ) as long
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if p = 0 then return -1
+    if (idx < 0) orelse (idx > p->nPages) then idx = p->nPages
+    dim as long sel = tkTabBar_GetCurSel( p->hBar )
+    dim as long got = tkTabBar_InsertTab( p->hBar, idx, text )
+    if got < 0 then return -1
+    redim preserve p->pages( 0 to p->nPages )
+    for i as long = p->nPages to got + 1 step -1
+        p->pages(i) = p->pages(i - 1)
+    next
+    p->pages(got) = tkPanel_Create( h, 100 + p->nPages )
+    p->nPages += 1
+    if sel < 0 then
+        tkTabBar_SetCurSel( p->hBar, 0 )
+        sel = 0
+    elseif got <= sel then
+        sel += 1
+    end if
+    p->Layout( )
+    p->ShowOnly( tkTabBar_GetCurSel( p->hBar ) )
+    return got
+end function
+
+public function tkTabControl_AddPage( byval h as TK_WIDGET ptr, byref text as const ustring ) as long
+    return tkTabControl_InsertPage( h, -1, text )
+end function
+
+' The tab and its page and everything on it. Not from inside that page's own callback.
+public function tkTabControl_DeletePage( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return false
+    if tkTabBar_DeleteTab( p->hBar, idx ) = false then return false
+    tkWidget_Destroy( p->pages(idx) )
+    for i as long = idx to p->nPages - 2
+        p->pages(i) = p->pages(i + 1)
+    next
+    p->nPages -= 1
+    p->ShowOnly( tkTabBar_GetCurSel( p->hBar ) )
+    return true
+end function
+
+public function tkTabControl_GetPageCount( byval h as TK_WIDGET ptr ) as long
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    return iif( p <> 0, p->nPages, 0 )
+end function
+
+' The parent for this tab's controls.
+public function tkTabControl_GetPage( byval h as TK_WIDGET ptr, byval idx as long ) as TK_WIDGET ptr
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return 0
+    return p->pages(idx)
+end function
+
+public function tkTabControl_GetPageText( byval h as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if p = 0 then return ""
+    return tkTabBar_GetText( p->hBar, idx )
+end function
+
+public function tkTabControl_SetPageText( byval h as TK_WIDGET ptr, byval idx as long, byref text as const ustring ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if p = 0 then return false
+    return tkTabBar_SetText( p->hBar, idx, text )
+end function
+
+public function tkTabControl_GetCurSel( byval h as TK_WIDGET ptr ) as long
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    return iif( p <> 0, tkTabBar_GetCurSel( p->hBar ), -1 )
+end function
+
+' SILENT: the callback runs only when the user changes the tab.
+public function tkTabControl_SetCurSel( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return false
+    if tkTabBar_SetCurSel( p->hBar, idx ) = false then return false
+    p->ShowOnly( idx )
+    return true
+end function
+
+public function tkTabControl_GetTabHeight( byval h as TK_WIDGET ptr ) as long
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    return iif( p <> 0, p->nTabHeight, 0 )
+end function
+
+' Design units.
+public sub tkTabControl_SetTabHeight( byval h as TK_WIDGET ptr, byval nHeight as long )
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if (p = 0) orelse (nHeight < 0) then exit sub
+    p->nTabHeight = nHeight
+    p->Layout( )
+    tkWidget_Invalidate( h )
+end sub
+
+public sub tkTabControl_SetSelChangeCallback( byval h as TK_WIDGET ptr, byval usersub as TC_SelChangeCallbackSub )
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if p then p->SelChange = usersub
+end sub

@@ -9,7 +9,7 @@ Text inputs, a checkbox, a radio group and a select, wired into a TuiFocusRing w
 ## Build and run
 
 ```freebasic
-tiko form.tiko        ' windows-x86_64 on Windows, linux-x86_64 on Linux
+tiko form.tiko        ' windows-x86_64 on Windows, linux-x86_64 on Linux, macos-arm64 on macOS
 ```
 
 Run it from a REAL TERMINAL. Redirected output is rejected with an honest error rather than a dashboard drawn into a pipe. tiko builds it with no diagnostics for windows-x86_64 and win64, and compiles it for linux-x86_64 with `-c` (built, not run: it is interactive).
@@ -29,7 +29,7 @@ Run it from a REAL TERMINAL. Redirected output is rejected with an honest error 
 '' This is the example that exercises the library's closure-carrying design:
 '' a widget that carries a closure.
 ''
-'' Build (windows-x86_64 or linux-x86_64):
+'' Build (windows-x86_64, linux-x86_64 or macos-arm64):
 ''     tiko form.tiko
 
 #import "std/numeric"

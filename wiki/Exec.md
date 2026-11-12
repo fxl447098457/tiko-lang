@@ -31,9 +31,9 @@ The exit status of the program, or negative one (-1) if the program could not be
 
 ### Platform Differences
 
-- On Windows *program* is not searched for on the `PATH`: `Exec( "cmd.exe", "/c dir" )` returns -1. Give the full path -- for the command interpreter, `Environ( "COMSPEC" )`. On Linux a bare name is searched for on the `PATH`.
-- Linux requires the *program* case matches the real name of the file. Windows and DOS are case insensitive. The program being executed may be case sensitive for its command line parameters.
-  Path separators in Linux are forward slashes / . Windows uses backward slashes \\ but it allows for forward slashes . DOS uses backward \\ slashes.  
+- On Windows *program* is not searched for on the `PATH`: `Exec( "cmd.exe", "/c dir" )` returns -1. Give the full path -- for the command interpreter, `Environ( "COMSPEC" )`. On Linux and macOS a bare name is searched for on the `PATH`.
+- Linux requires the *program* case matches the real name of the file. Windows, DOS and a default macOS volume are case insensitive. The program being executed may be case sensitive for its command line parameters.
+  Path separators in Linux and macOS are forward slashes / . Windows uses backward slashes \\ but it allows for forward slashes . DOS uses backward \\ slashes.  
   Exit code is limited to 8 bits in DOS.
 
 ### Dialect Differences

@@ -75,6 +75,8 @@ print DedupBy( words, sameLetter )     ' 3 removed: "a", "b" remain
 
 Every move is a `SWAP`, so rearranging an `Array( of ustring )` copies no strings.
 
+To put an `Array` in random order, `ShuffleArray( r, a )` from `std/numeric` takes an `Rng` and gives every order an equal chance; see [Shuffle](Modern-Math-Shuffle#containers).
+
 ## See Also
 
 [Sorting](Category-Sorting) · [Array](Category-Array) · [PriorityQueue](Category-PriorityQueue)

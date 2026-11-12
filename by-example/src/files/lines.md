@@ -20,7 +20,7 @@ is there and writes at the end. Each `scope` is where its `File` ends: the
 closes its handle.
 
 `WriteLine` ends a line the way the platform does: carriage return and line
-feed on Windows, line feed on Linux. Set the writer's `NewLine` to `chr( 10 )`
+feed on Windows, line feed on Linux and macOS. Set the writer's `NewLine` to `chr( 10 )`
 to write the same bytes everywhere.
 
 `for each ln in fs.ReadLines( p )` opens the file, yields one

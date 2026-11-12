@@ -200,7 +200,7 @@ public #cinclude once "../../vendor/raylib/raylib.h"
 #endif
 ```
 
-A program then needs one line, `#import "raylib"`. Install the module for every program by putting its folder in a directory named in **`TIKO_PATH`** (`;`-separated on Windows, `:` on Linux). A module may not use `#cmdline`, so a library whose headers need `-cinclude` (SDL3's do) is still best kept as a binding header. The [raylib tutorial](Raylib-Tutorial#8-a-binding-module) has the whole project.
+A program then needs one line, `#import "raylib"`. Install the module for every program by putting its folder in a directory named in **`TIKO_PATH`** (`;`-separated on Windows, `:` on Linux and macOS). A module may not use `#cmdline`, so a library whose headers need `-cinclude` (SDL3's do) is still best kept as a binding header. The [raylib tutorial](Raylib-Tutorial#8-a-binding-module) has the whole project.
 
 ## 6. When it goes wrong
 

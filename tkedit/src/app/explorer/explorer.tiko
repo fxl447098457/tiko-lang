@@ -1,0 +1,328 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' explorer -- the side panel ([ui] explorer, explorer_side; author 2026-11-10): a header saying
+' "Explorer" and the project's name, over one list. With no project the list is the open buffers;
+' with one, every text file under the project's folder as a tree, but out/ and dot-folders. A click on a
+' row opens it, as the pickers' and the Search tab's do; a click on a folder folds it.
+#module "explorer"
+
+#import "std/containers"
+#import "std/fs"
+#import "tkc/docencoding"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+using containers
+using tkApp
+using tkHost
+using tkPaint
+using tkTheme
+using tkListTree
+
+public const PANEL_CX = 220              ' the panel's width, unscaled
+public const MIN_CX = 120                ' unscaled
+const HEADER_CY = 28                     ' unscaled
+const HEADER_PAD = 8                     ' unscaled: left and right of the header's text
+const ID_LIST = 1
+const MAX_DEPTH = 12                     ' as far down as Find in Project looks
+const MAX_ENTRIES = 5000
+
+' One row.
+public type Entry
+    Path  as ustring                     ' full; "" = a buffer never saved
+    Name  as ustring                     ' what the row says
+    Level as long                        ' folders above it, under the project's
+    IsDir as boolean
+    Doc   as any ptr                     ' the buffer it shows; 0 = a file or a folder on disk
+end type
+
+public type OpenFileSub as sub( byval owner as any ptr, byref path as const ustring )
+public type ShowBufferSub as sub( byval owner as any ptr, byval doc as any ptr )
+
+public type Panel
+    owner as any ptr
+    OnOpenFile as OpenFileSub
+    OnShowBuffer as ShowBufferSub
+    frame as TK_WIDGET ptr
+    rows as TK_WIDGET ptr
+    Caption as ustring
+    ProjectName as ustring               ' "" = no project
+    Root as ustring                      ' the folder listed; "" = the buffers are
+    Entries as Array( of Entry )         ' row i is Entries[i]
+    Picked as ustring                    ' the file SelectFile last looked for
+    pressed as long = -1                 ' the button went down on this row
+
+    declare sub Create( byval parent as TK_WIDGET ptr, byval id as long, byval owner_ as any ptr )
+    declare sub Layout( )
+    declare sub Paint( byval b as TK_PAINT ptr )
+    declare sub Relabel( )                                ' the caption in the interface's language
+    declare sub SetProject( byref name_ as const ustring )
+    declare function HeaderProject( ) as ustring
+    declare sub ShowBuffers( byref wanted as const Array( of Entry ), byval active as any ptr )
+    declare sub ShowFolder( byref dir_ as const ustring )  ' walks it only when it is a new one
+    declare sub Rescan( )                                  ' the folder's files may have changed
+    declare sub SelectFile( byref path as const ustring )
+    declare sub Forget( )                                  ' hidden: the next ShowFolder walks again
+    declare sub Open( byval row as long )
+  private:
+    declare sub FillRows( byref folded as const Array( of ustring ) )
+    declare function FoldedNow( ) as Array( of ustring )
+end type
+
+private function FrameProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    select case m->msg
+    case TKM_PAINT
+        cast( Panel ptr, w->pData )->Paint( m->pPaint )
+        return true
+    case TKM_SIZE
+        cast( Panel ptr, w->pData )->Layout( )
+        return true
+    case TKM_THEMECHANGED
+        tkWidget_Invalidate( w )
+        return true
+    end select
+    return false
+end function
+
+private function OverTwisty( byval h as TK_WIDGET ptr, byval row as long, byval x as long ) as boolean
+    dim as long tx = tkHost_Scale( h->pHost, tkListTree_GetLevel( h, row ) * CLISTTREE_DEFAULT_INDENT )
+    return (x >= tx) andalso (x < tx + tkHost_Scale( h->pHost, CLISTTREE_DEFAULT_TWISTY ))
+end function
+
+' One click opens a row: a press on it, then its release there. The twisty folds by itself at the
+' press, and the second press of a double click is ignored: the first already did it.
+private function ListMessage( byval mi as TKLISTTREE_MESSAGEINFO ptr ) as boolean
+    dim as Panel ptr p = tkWidget_Parent( mi->hList )->pData
+    if p = 0 then return false
+    if mi->msg = TKM_LBUTTONDOWN then
+        p->pressed = -1
+        if mi->clicks >= 2 then return true
+        if mi->idx < 0 then return false
+        if (p->Entries[mi->idx].IsDir = false) orelse (OverTwisty( mi->hList, mi->idx, mi->x ) = false) then p->pressed = mi->idx
+        return false
+    end if
+    if mi->msg <> TKM_LBUTTONUP then return false
+    dim as long was = p->pressed
+    p->pressed = -1
+    if (mi->idx < 0) orelse (mi->idx <> was) then return false
+    p->Open( was )
+    return true
+end function
+
+sub Panel.Create( byval parent as TK_WIDGET ptr, byval id as long, byval owner_ as any ptr )
+    owner = owner_
+    frame = tkWidget_CreateChild( parent, id, @FrameProc, @this )
+    rows = tkListTree_Create( frame, ID_LIST )
+    tkListTree_SetTreeIndent( rows, true )
+    tkListTree_SetPaintCallback( rows, @tkListTree_PaintRowDefault )   ' a tkListTree draws no row by itself
+    tkListTree_SetMessageCallback( rows, @ListMessage )
+    tkListTree_SetActivateCallback( rows, sub( byval h as TK_WIDGET ptr, byval row as integer )
+        dim as Panel ptr p = tkWidget_Parent( h )->pData
+        if p then p->Open( row )                 ' Enter
+    end sub )
+    tkListTree_SetTooltipCallback( rows, function( byval h as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ustring
+        dim as Panel ptr p = tkWidget_Parent( h )->pData
+        if (p = 0) orelse (row < 0) orelse (row >= p->Entries.Count( )) then return ""
+        return p->Entries[row].Path
+    end function )
+    this.Relabel( )
+    tkWidget_Show( frame, false )
+end sub
+
+sub Panel.Layout( )
+    if frame = 0 then exit sub
+    dim as long hh = tkHost_Scale( frame->pHost, HEADER_CY )
+    tkWidget_SetPos( rows, 0, hh, frame->cw, frame->ch - hh )
+end sub
+
+sub Panel.Paint( byval b as TK_PAINT ptr )
+    dim as TKTHEME_COLORS t = tkTheme_Get( )
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, frame->cw, frame->ch )
+    b->SetBackColor( t.Surface )
+    b->PaintRect( @rc )
+    dim as TK_FORM ptr f = tkForm_FromWidget( frame )
+    if f = 0 then exit sub
+    dim as long pad = tkHost_Scale( frame->pHost, HEADER_PAD ), hh = tkHost_Scale( frame->pHost, HEADER_CY )
+    dim as TTF_Font ptr bold = tkForm_Font( f, TKFONT_UI_BOLD )
+    tkRect_Set( rc, pad, 0, frame->cw - pad, hh )
+    b->SetFont( bold )
+    b->SetForeColor( t.TextStrong )
+    b->PaintText( Caption, @rc, TK_DT_LEFT or TK_DT_ELLIPSIS )
+    if len( ProjectName ) = 0 then exit sub
+    rc.left += tkText_Width( bold, Caption ) + pad
+    b->SetFont( tkForm_Font( f, TKFONT_UI ) )
+    b->SetForeColor( t.Text )
+    b->PaintText( this.HeaderProject( ), @rc, TK_DT_LEFT or TK_DT_ELLIPSIS )
+end sub
+
+' The project's name as the header shows it: "[subfolder]".
+function Panel.HeaderProject( ) as ustring
+    return "[" & ProjectName & "]"
+end function
+
+sub Panel.Relabel( )
+    Caption = i18n.Tr( "explorer.caption", "Explorer" )
+    if frame then tkWidget_Invalidate( frame )
+end sub
+
+sub Panel.SetProject( byref name_ as const ustring )
+    if ProjectName = name_ then exit sub
+    ProjectName = name_
+    tkWidget_Invalidate( frame )
+end sub
+
+' The folders folded now, to fold again once the rows are rebuilt.
+function Panel.FoldedNow( ) as Array( of ustring )
+    dim as Array( of ustring ) folded
+    for i as long = 0 to Entries.Count( ) - 1
+        if Entries[i].IsDir andalso tkListTree_IsCollapsed( rows, i ) then folded.Push( Entries[i].Path )
+    next
+    return folded
+end function
+
+' The rows from Entries: a parent comes before its children, so the row of Entries[i] is i.
+sub Panel.FillRows( byref folded as const Array( of ustring ) )
+    dim as long top = tkListTree_GetTopIndex( rows )
+    tkListTree_BeginUpdate( rows )
+    tkListTree_Clear( rows )
+    tkListTree_ShowTwisty( rows, len( Root ) > 0 )
+    dim as long parent( 0 to MAX_DEPTH )
+    for i as long = 0 to Entries.Count( ) - 1
+        dim as long lv = Entries[i].Level
+        parent( lv ) = tkListTree_AddNode( rows, iif( lv = 0, -1, parent( lv - 1 ) ), Entries[i].Name )
+    next
+    if folded.Count( ) > 0 then
+        for i as long = 0 to Entries.Count( ) - 1
+            if Entries[i].IsDir = false then continue for
+            for each p as ustring in folded
+                if p = Entries[i].Path then tkListTree_SetNodeCollapsed( rows, i, true )
+            next
+        next
+    end if
+    tkListTree_EndUpdate( rows )
+    tkListTree_SetTopIndex( rows, top )
+    Picked = ""                                  ' whichever file is active is found again
+end sub
+
+private function SameEntries( byref a as const Array( of Entry ), byref b as const Array( of Entry ) ) as boolean
+    if a.Count( ) <> b.Count( ) then return false
+    for i as long = 0 to a.Count( ) - 1
+        if (a[i].Doc <> b[i].Doc) orelse (a[i].IsDir <> b[i].IsDir) orelse (a[i].Level <> b[i].Level) orelse _
+           (a[i].Name <> b[i].Name) orelse (a[i].Path <> b[i].Path) then return false
+    next
+    return true
+end function
+
+sub Panel.ShowBuffers( byref wanted as const Array( of Entry ), byval active as any ptr )
+    dim as boolean same = (len( Root ) = 0) andalso SameEntries( Entries, wanted )
+    Root = ""
+    if same = false then
+        Entries = wanted
+        dim as Array( of ustring ) none_
+        this.FillRows( none_ )
+    end if
+    dim as long sel = -1
+    for i as long = 0 to Entries.Count( ) - 1
+        if Entries[i].Doc = active then sel = i
+    next
+    if tkListTree_GetCurSel( rows ) <> sel then tkListTree_SetCurSel( rows, sel )
+end sub
+
+private sub SortNames( byref names as Array( of ustring ) )
+    dim as function( byref as ustring, byref as ustring ) as boolean less = _
+        function( byref x as ustring, byref y as ustring ) as boolean
+            return lcase( x ) < lcase( y )
+        end function
+    SortBy( names, less )
+end sub
+
+' dir_'s folders then its files, each by name and each folder followed by what is in it.
+private sub Collect( byref dir_ as const ustring, byval level as long, byref out_ as Array( of Entry ) )
+    if (level > MAX_DEPTH) orelse (out_.Count( ) >= MAX_ENTRIES) then exit sub
+    dim as Array( of ustring ) dirs, files
+    for each r in fs.ReadDir( dir_ )
+        if r.IsOk( ) = false then continue for
+        dim as fs.DirEntry e = r.Value( )
+        dim as ustring nm = e.Name( )
+        if e.IsDirectory( ) then
+            if (left( nm, 1 ) <> ".") andalso (lcase( nm ) <> "out") then dirs.Push( nm )
+        elseif e.IsFile( ) andalso docencoding.LooksLikeText( fs.PathJoin( dir_, nm ) ) then
+            files.Push( nm )
+        end if
+    next
+    SortNames( dirs )
+    SortNames( files )
+    for each nm as ustring in dirs
+        if out_.Count( ) >= MAX_ENTRIES then exit sub
+        dim as Entry e
+        e.Name = nm
+        e.Path = fs.PathJoin( dir_, nm )
+        e.Level = level
+        e.IsDir = true
+        out_.Push( e )
+        Collect( e.Path, level + 1, out_ )
+    next
+    for each nm as ustring in files
+        if out_.Count( ) >= MAX_ENTRIES then exit sub
+        dim as Entry e
+        e.Name = nm
+        e.Path = fs.PathJoin( dir_, nm )
+        e.Level = level
+        out_.Push( e )
+    next
+end sub
+
+sub Panel.ShowFolder( byref dir_ as const ustring )
+    if (len( Root ) > 0) andalso fs.PathEquals( Root, dir_ ) then exit sub
+    Root = dir_
+    this.Rescan( )
+end sub
+
+sub Panel.Rescan( )
+    if len( Root ) = 0 then exit sub
+    dim as Array( of Entry ) found
+    Collect( Root, 0, found )
+    if SameEntries( Entries, found ) then exit sub
+    dim as Array( of ustring ) folded = this.FoldedNow( )
+    Entries = found
+    this.FillRows( folded )
+end sub
+
+' The active buffer's row, when it has one. Looked for only when the active file changed: this runs
+' at every caret move.
+sub Panel.SelectFile( byref path as const ustring )
+    if Picked = path then exit sub
+    Picked = path
+    dim as long sel = -1
+    if len( path ) then
+        for i as long = 0 to Entries.Count( ) - 1
+            if (Entries[i].IsDir = false) andalso fs.PathEquals( Entries[i].Path, path ) then
+                sel = i
+                exit for
+            end if
+        next
+    end if
+    if tkListTree_GetCurSel( rows ) <> sel then tkListTree_SetCurSel( rows, sel )
+end sub
+
+sub Panel.Forget( )
+    Root = ""
+end sub
+
+sub Panel.Open( byval row as long )
+    if (row < 0) orelse (row >= Entries.Count( )) then exit sub
+    if Entries[row].IsDir then
+        tkListTree_ToggleRow( rows, row )
+    elseif Entries[row].Doc then
+        if OnShowBuffer then OnShowBuffer( owner, Entries[row].Doc )
+    elseif OnOpenFile then
+        dim as ustring path = Entries[row].Path  ' a copy: opening a file may rebuild Entries
+        OnOpenFile( owner, path )
+    end if
+end sub

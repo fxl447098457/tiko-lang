@@ -1,0 +1,619 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' designwire -- the Form Designer's joins to the code: handlers made and jumped to, renames carried
+' through, the generated file written. Every change to code goes through its open buffer, never the
+' disk: the disk watcher reloads with SetText, and that would take the person's undo with it.
+#module "mainwin"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
+#import "tkc/i18n"
+#import "tkc/docencoding"
+#import "tkc/project"
+#import "tka/documents"
+#import "tks/parser"
+#import "tkd/canvas"
+#import "tkd/catalog"
+#import "tkd/model"
+#import "tkd/edits"
+#import "tkd/validate"
+#import "tkd/formfile"
+#import "tkd/codegen"
+#import "tkd/reconcile"
+#import "tkd/itemsdlg"
+#import "vendor/tkControls/tkMeta"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkLayout"
+#import "vendor/tkControls/tkFileDialog"
+using containers
+using tkMeta
+using tkApp
+using tkHost
+using tkLayout
+using tkFileDialog
+using model
+
+private function CodePathOf_( byref formPath as const ustring ) as ustring
+    return left( formPath, len( formPath ) - 7 ) & ".tiko"
+end function
+
+private function DesignPathOf_( byref formPath as const ustring ) as ustring
+    return left( formPath, len( formPath ) - 7 ) & ".design.tiko"
+end function
+
+function Window.DocOfCanvas( byval c as canvas.FormCanvas ptr ) as DocRef
+    for each d as DocRef in Docs
+        if d->Designer = c then return d
+    next
+    return 0
+end function
+
+' Opens path in a buffer without showing it, or finds the one it's in.
+function Window.OpenQuietly( byref path as const ustring ) as DocRef
+    dim as DocRef have = this.FindOpen( path )
+    if have then return have
+    dim as DocRef d = this.NewDocument( )
+    if d = 0 then return 0
+    untitled -= 1
+    dim as documents.TextResult r = d->Load( path )
+    if r.IsOk( ) = false then
+        Docs.Pop( )
+        d->DestroyViews( )
+        delete d
+        return 0
+    end if
+    this.LayoutTabs( )
+    this.Layout( )
+    return d
+end function
+
+' The form's file of code, in a buffer; created if there's none yet.
+function Window.CodeDocOf( byval formDoc as DocRef ) as DocRef
+    dim as ustring path = CodePathOf_( formDoc->Path )
+    if (this.FindOpen( path ) = 0) andalso (fs.IsFile( path ) = false) then
+        if fs.WriteAllText( path, reconcile.NewCodeFile( fs.PathStem( formDoc->Path ) ) ).IsOk( ) = false then
+            this.SetMessage( fs.PathFileName( path ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+            return 0
+        end if
+        ' the module is the two files together; the scanner and the compiler need both from here on
+        this.WriteGenerated( formDoc )
+    end if
+    return this.OpenQuietly( path )
+end function
+
+' One undoable edit of a buffer.
+sub Window.PutCodeText( byval d as DocRef, byref newText as const ustring )
+    d->ApplyFormText( newText )
+end sub
+
+' Makes sure `event_` of control name_ ("" is the form) has a handler with a body; jump: and go there.
+sub Window.WireHandler( byval c as canvas.FormCanvas ptr, byref name_ as const ustring, byref event_ as const ustring, byval jump as boolean )
+    dim as DocRef d = this.DocOfCanvas( c )
+    if d = 0 then exit sub
+    dim as long i = -1
+    if len( name_ ) then i = FindControl( c->Doc, name_ )
+    if (len( name_ ) > 0) andalso (i < 0) then exit sub
+
+    dim as ustring ev = event_, handler, params, moduleName
+    if i >= 0 then
+        dim as TKMETA_CONTROL ptr m = catalog.Find( c->Doc.Controls[i].TypeName )
+        if len( ev ) = 0 then ev = m->DefaultEvent
+        if len( ev ) = 0 then
+            this.SetMessage( strings.Format( i18n.Tr( "message.no_default_event", "{} has no default event" ), m->Name ) )
+            exit sub
+        end if
+        dim as TKMETA_EVENT ptr e = tkMeta_FindEvent( m, ev )
+        if e = 0 then exit sub
+        params = e->Params
+        moduleName = m->Module_
+        handler = SettingOr( c->Doc.Controls[i].Events, ev )
+        if len( handler ) = 0 then handler = c->Doc.Controls[i].Name & "_" & ev
+    else
+        if len( ev ) = 0 then ev = "Load"
+        if ev = "Close" then params = "byref Cancel as boolean"
+        handler = SettingOr( c->Doc.Events, ev )
+        if len( handler ) = 0 then handler = "Form_" & ev
+    end if
+
+    ' bind it first: the form may refuse the name
+    dim as boolean isBound
+    if i >= 0 then
+        isBound = (FindSetting( c->Doc.Controls[i].Events, ev ) >= 0)
+    else
+        isBound = (FindSetting( c->Doc.Events, ev ) >= 0)
+    end if
+    if isBound = false then
+        dim as FormDoc trial = c->Doc
+        if i >= 0 then
+            PutSetting( trial.Controls[i].Events, ev, handler )
+        else
+            PutSetting( trial.Events, ev, handler )
+        end if
+        dim as ustring fault = c->ApplyEdit( trial, false, "" )
+        if len( fault ) then
+            this.SetMessage( fault )
+            exit sub
+        end if
+    end if
+
+    dim as DocRef code = this.CodeDocOf( d )
+    if code = 0 then exit sub
+    dim as ustring text = code->Text( )
+    dim as long a, b, bodyLine
+    if reconcile.FindBody( text, handler, a, b ) then
+        bodyLine = a + 1
+    else
+        dim as ustring t2 = text
+        ' a parameter that isn't a plain tiko type comes from the control's own module
+        for each mo as ustring in reconcile.ImportsFor( params, moduleName )
+            t2 = reconcile.EnsureImport( t2, mo )
+        next
+        dim as ustring withStub = reconcile.AddStub( t2, handler, params, bodyLine )
+        this.PutCodeText( code, withStub )
+    end if
+    if jump then
+        this.ShowDoc( code )
+        code->Main.GoToLine( bodyLine, 4 )
+        code->Main.Focus( )
+    end if
+end sub
+
+' The editor for control name_'s entries, in its window. It's the caller's to run or drive.
+sub Window.OpenItems( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
+    dim as long i = FindControl( c->Doc, name_ )
+    if i < 0 then exit sub
+    dim as long kind_ = catalog.ItemsKindOf( c->Doc.Controls[i].TypeName )
+    if kind_ = catalog.ItemsKind.ItemsNone then exit sub
+    dim as Array( of FormItem ) items
+    if kind_ = catalog.ItemsKind.ItemsPages then
+        for p as long = 0 to c->Doc.Controls[i].Pages.Count( ) - 1
+            dim as FormItem it
+            it.Text = c->Doc.Controls[i].Pages[p]
+            it.Origin = p
+            items.Push( it )
+        next
+    else
+        items = c->Doc.Controls[i].Items
+    end if
+    ItemsDlg = new itemsdlg.ItemsEditor
+    ItemsOf = c
+    ItemsName = name_
+    ItemsDlg->Open( form, kind_, items, name_ )
+end sub
+
+' The editor's OK or Cancel: its entries into the form, as one change, and bodies for new handlers.
+sub Window.FinishItems( byval apply_ as boolean )
+    if ItemsDlg = 0 then exit sub
+    dim as itemsdlg.ItemsEditor ptr dlg = ItemsDlg
+    dim as canvas.FormCanvas ptr c = ItemsOf
+    ItemsDlg = 0
+    dim as Array( of FormItem ) items = dlg->Items
+    dim as long kind_ = dlg->Kind
+    dlg->Close( )
+    delete dlg
+    ' the keyboard goes back to the form: Undo from here undoes this
+    if c->Glass then tkHost_SetFocus( c->Glass->pHost, c->Glass )
+    if apply_ = false then exit sub
+    dim as long i = FindControl( c->Doc, ItemsName )
+    if i < 0 then exit sub
+    dim as FormDoc trial = c->Doc
+    if kind_ = catalog.ItemsKind.ItemsPages then
+        dim as ustring why = edits.ApplyPages( trial, i, items )
+        if len( why ) then
+            this.SetMessage( ItemsName & ": " & why )
+            exit sub
+        end if
+    else
+        trial.Controls[i].Items = items
+    end if
+    dim as ustring fault = c->ApplyEdit( trial, true, "" )
+    if len( fault ) then
+        this.SetMessage( fault )
+        exit sub
+    end if
+    dim as DocRef d = this.DocOfCanvas( c )
+    if (d = 0) orelse (kind_ = catalog.ItemsKind.ItemsPages) then exit sub
+    for each it as FormItem in items
+        if len( it.Handler ) then
+            dim as DocRef code = this.CodeDocOf( d )
+            if code = 0 then exit for
+            dim as long a, b, bodyLine
+            if reconcile.FindBody( code->Text( ), it.Handler, a, b ) = false then
+                this.PutCodeText( code, reconcile.AddStub( code->Text( ), it.Handler, "", bodyLine ) )
+            end if
+        end if
+    next
+end sub
+
+sub Window.EditItems( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
+    this.OpenItems( c, name_ )
+    if ItemsDlg then this.FinishItems( ItemsDlg->RunModal( ) )
+end sub
+
+' ---- Test Form: the form as it is now, in a window of its own, working but wired to nothing ----
+
+sub Window.CloseTestForm( )
+    if PreviewForm then tkForm_Destroy( PreviewForm )   ' TestFormGone runs from its OnDestroy
+end sub
+
+sub Window.TestFormGone( )
+    if Preview then
+        ' its widgets went with the window
+        if Preview->Layout then tkLayout_Destroy( Preview->Layout )
+        Preview->Layout = 0
+        Preview->Frame = 0
+        delete Preview
+    end if
+    Preview = 0
+    PreviewForm = 0
+end sub
+
+sub Window.TestForm( )
+    dim as DocRef d = this.Active( )
+    if (d = 0) orelse (d->Designer = 0) then exit sub
+    this.CloseTestForm( )
+    dim as FormDoc ref_ = d->Designer->Doc
+    dim as ustring title = ref_.Caption
+    PreviewForm = tkApp_NewForm( title, ref_.ClientW, ref_.ClientH, form, tkForm_Host( form )->fScaleForced )
+    if PreviewForm = 0 then exit sub
+    PreviewForm->Tag = @this
+    Preview = new canvas.FormCanvas
+    Preview->Live = true
+    Preview->Create( tkForm_Widget( PreviewForm ), 1 )
+    dim as TK_WIDGET ptr r = tkForm_Widget( PreviewForm )
+    tkWidget_SetPos( Preview->Frame, 0, 0, r->cw, r->ch )
+    Preview->LoadText( d->Text( ) )
+    tkForm_OnSize( PreviewForm, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        dim as Window ptr mw = f->Tag
+        if mw->Preview then tkWidget_SetPos( mw->Preview->Frame, 0, 0, cx, cy )
+    end sub )
+    tkForm_OnDestroy( PreviewForm, sub( byval f as TK_FORM ptr )
+        cast( Window ptr, f->Tag )->TestFormGone( )
+    end sub )
+    tkForm_Host( PreviewForm )->OnPreKey = function( byval h as TK_HOST ptr, byval m as TK_MSG ptr ) as boolean
+        if m->key <> SDLK_ESCAPE then return false
+        tkForm_Close( tkForm_FromHost( h ) )
+        return true
+    end function
+    tkForm_Show( PreviewForm )
+end sub
+
+' ---- new forms and projects ---------------------------------------------------------------------
+
+private function IsFormName_( byref s as const ustring ) as boolean
+    return validate.IsIdentifier( s ) andalso (validate.IsReserved( s ) = false) andalso (lcase( s ) <> "form")
+end function
+
+private function WriteNew_( byref path as const ustring, byref text as const ustring ) as boolean
+    return fs.WriteAllText( path, text ).IsOk( )
+end function
+
+' A form's three files in their own folder: <folder>/<name>/<name>.tkform and the rest.
+private function CreateFormFiles_( byref folder as const ustring, byref name_ as const ustring ) as ustring
+    dim as ustring dir_ = fs.PathJoin( folder, name_ )
+    fs.CreateDirAll( dir_ )
+    dim as ustring formPath = fs.PathJoin( dir_, name_ & ".tkform" )
+    dim as FormDoc doc
+    doc.Caption = name_
+    doc.ClientW = 480
+    doc.ClientH = 320
+    dim as ustring text = formfile.Render( doc )
+    if WriteNew_( formPath, text ) = false then return ""
+    if WriteNew_( fs.PathJoin( dir_, name_ & ".tiko" ), reconcile.NewCodeFile( name_ ) ) = false then return ""
+    if WriteNew_( fs.PathJoin( dir_, name_ & ".design.tiko" ), codegen.Generate( doc, name_, name_ & ".tkform", text ) ) = false then return ""
+    return formPath
+end function
+
+' wanted: the new form's .tkform path, or "" to ask. The form gets a folder of its own, named for it.
+function Window.NewForm( byref wanted as const ustring ) as boolean
+    dim as ustring picked = wanted
+    if len( picked ) = 0 then
+        dim as ustring where = "frmNew.tkform"
+        if len( this.ActivePath( ) ) then where = fs.PathJoin( fs.PathParent( this.ActivePath( ) ), "frmNew.tkform" )
+        picked = Pick( form, TKFD_SAVE, where )
+        if len( picked ) = 0 then return false
+    end if
+    dim as ustring name_ = fs.PathStem( picked )
+    if IsFormName_( name_ ) = false then
+        this.SetMessage( strings.Format( i18n.Tr( "message.bad_form_name", "{}: a form's name has to be an identifier" ), name_ ) )
+        return false
+    end if
+    dim as ustring folder = fs.PathParent( picked )
+    ' already being saved into a folder of that name: use it
+    if lcase( fs.PathFileName( folder ) ) = lcase( name_ ) then folder = fs.PathParent( folder )
+    if fs.IsFile( fs.PathJoin( folder, name_, name_ & ".tkform" ) ) then
+        this.SetMessage( strings.Format( i18n.Tr( "message.form_exists", "{} already exists" ), name_ ) )
+        return false
+    end if
+    dim as ustring formPath = CreateFormFiles_( folder, name_ )
+    if len( formPath ) = 0 then
+        this.SetMessage( name_ & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    return this.OpenFile( formPath )
+end function
+
+' The form itself, its code or its generated half: none of them is a program of its own.
+function Window.IsFormFile( byref path as const ustring ) as boolean
+    dim as ustring lp = lcase( path )
+    if (right( lp, 7 ) = ".tkform") orelse (right( lp, 12 ) = ".design.tiko") then return true
+    if right( lp, 5 ) <> ".tiko" then return false
+    return fs.IsFile( left( path, len( path ) - 5 ) & ".tkform" )
+end function
+
+' The .tkform of the form in front, by way of its code too; "" when what's in front isn't one.
+function Window.FormInFront( ) as ustring
+    dim as ustring p = this.ActivePath( )
+    if this.IsFormFile( p ) = false then
+        dim as DocRef d = this.SourceDoc( )
+        if d = 0 then return ""
+        p = d->Path
+        if this.IsFormFile( p ) = false then return ""
+    end if
+    dim as ustring lp = lcase( p )
+    if right( lp, 12 ) = ".design.tiko" then
+        p = left( p, len( p ) - 12 ) & ".tkform"
+    elseif right( lp, 5 ) = ".tiko" then
+        p = left( p, len( p ) - 5 ) & ".tkform"
+    end if
+    if fs.IsFile( p ) then return p
+    return ""
+end function
+
+' A package name that works for local modules: letters, digits and _ only.
+private function PackageName_( byref s as const ustring ) as ustring
+    dim as ustring o
+    for i as long = 1 to len( s )
+        dim as ustring c = mid( s, i, 1 )
+        dim as long a = asc( c )
+        if ((a >= 48) andalso (a <= 57)) orelse ((a >= 65) andalso (a <= 90)) orelse ((a >= 97) andalso (a <= 122)) orelse (a = 95) then
+            o &= c
+        else
+            o &= "_"
+        end if
+    next
+    return o
+end function
+
+private function GuiManifest_( byref pkg as const ustring ) as ustring
+    return strings.Replace( project.NewManifestText( pkg, pkg, "main.tiko" ), "# subsystem = 'console'", "subsystem = 'gui'     " )
+end function
+
+' The main that shows one form.
+private function FormMain_( byref pkg as const ustring, byref formName as const ustring ) as ustring
+    dim as ustring nl = wchr( 10 )
+    return "' " & pkg & ": starts the program and shows its first form." & nl _
+        & "#import ""vendor/tkControls/tkApp""" & nl _
+        & "#import ""./" & formName & """" & nl _
+        & "using tkApp" & nl & nl _
+        & "dim as TKAPP_OPTIONS options" & nl _
+        & "if tkApp_Init( options ) = false then end 1" & nl _
+        & "dim as " & formName & ".Form mainForm" & nl _
+        & "mainForm.Build( )" & nl _
+        & "end tkApp_Run( mainForm.Wnd )" & nl
+end function
+
+' A project around a form that has none: tiko.toml and a main beside the form's folder, because that
+' folder is a module. A tiko.toml already there is opened as it stands.
+function Window.NewProjectForForm( byref formPath as const ustring ) as boolean
+    dim as ustring formDir = fs.PathParent( formPath ), formName = fs.PathStem( formPath )
+    if lcase( fs.PathFileName( formDir ) ) <> lcase( formName ) then
+        this.SetMessage( formName & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    dim as ustring dir_ = fs.PathParent( formDir )
+    dim as ustring manifest = fs.PathJoin( dir_, project.MANIFEST_FILE )
+    dim as ustring mainPath = fs.PathJoin( dir_, "main.tiko" )
+    if fs.IsFile( manifest ) = false then
+        if fs.Exists( mainPath ) then
+            this.SetMessage( strings.Format( i18n.Tr( "message.form_exists", "{} already exists" ), mainPath ) )
+            return false
+        end if
+        dim as ustring pkg = PackageName_( fs.PathFileName( dir_ ) )
+        if (WriteNew_( manifest, GuiManifest_( pkg ) ) = false) orelse (WriteNew_( mainPath, FormMain_( pkg, formName ) ) = false) then
+            this.SetMessage( pkg & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+            return false
+        end if
+    end if
+    if this.OpenProject( manifest ) = false then return false
+    return this.OpenFile( formPath )
+end function
+
+' The folder a new project goes in, made. folder: that folder, or "" to ask. False: cancelled, or
+' there's a project there already.
+function Window.NewProjectFolder( byref folder as const ustring, byref dir_ as ustring, byref manifest as ustring ) as boolean
+    dir_ = folder
+    if len( dir_ ) = 0 then
+        dir_ = Pick( form, TKFD_SAVE, "myapp" )
+        if len( dir_ ) = 0 then return false
+    end if
+    manifest = fs.PathJoin( dir_, project.MANIFEST_FILE )
+    if fs.Exists( manifest ) then
+        this.SetMessage( strings.Format( i18n.Tr( "message.form_exists", "{} already exists" ), manifest ) )
+        return false
+    end if
+    fs.CreateDirAll( dir_ )
+    return true
+end function
+
+' File > New > Console Project: a manifest and the Console Program starter as main.tiko.
+function Window.NewConsoleProject( byref folder as const ustring ) as boolean
+    dim as ustring dir_, manifest
+    if this.NewProjectFolder( folder, dir_, manifest ) = false then return false
+    dim as ustring pkg = fs.PathFileName( dir_ )
+    dim as ustring mainPath = fs.PathJoin( dir_, "main.tiko" )
+    dim as boolean ok = WriteNew_( manifest, project.NewManifestText( pkg, pkg, "main.tiko" ) )
+    ok = ok andalso WriteNew_( mainPath, StarterText( NEWITEM_CONSOLE ) )
+    if ok = false then
+        this.SetMessage( pkg & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    if this.OpenProject( manifest ) = false then return false
+    return this.OpenFile( mainPath )
+end function
+
+' File > New > GUI Application. folder: the new project's folder, or "" to ask. A program with
+' one form, ready to build and run.
+function Window.NewFormProject( byref folder as const ustring ) as boolean
+    dim as ustring dir_, manifest
+    if this.NewProjectFolder( folder, dir_, manifest ) = false then return false
+    dim as ustring pkg = fs.PathFileName( dir_ )
+    dim as boolean ok = WriteNew_( manifest, GuiManifest_( pkg ) )
+    ok = ok andalso WriteNew_( fs.PathJoin( dir_, "main.tiko" ), FormMain_( pkg, "frmMain" ) )
+    dim as ustring formPath = CreateFormFiles_( dir_, "frmMain" )
+    if (ok = false) orelse (len( formPath ) = 0) then
+        this.SetMessage( pkg & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    if this.OpenProject( manifest ) = false then return false
+    return this.OpenFile( formPath )
+end function
+
+' A control went and took these handlers with it. An empty body goes too; one with code in it stays,
+' and the answer true keeps its declaration so that the file still compiles.
+function Window.HandlerGone( byval c as canvas.FormCanvas ptr, byref handler as const ustring ) as boolean
+    dim as DocRef d = this.DocOfCanvas( c )
+    if d = 0 then return false
+    dim as ustring path = CodePathOf_( d->Path )
+    if (this.FindOpen( path ) = 0) andalso (fs.IsFile( path ) = false) then return false
+    dim as DocRef code = this.OpenQuietly( path )
+    if code = 0 then return false
+    dim as ustring text = code->Text( )
+    dim as long a, b
+    if reconcile.FindBody( text, handler, a, b ) = false then return false
+    if reconcile.IsEmptyBody( text, a, b ) = false then return true
+    this.PutCodeText( code, reconcile.RemoveLines( text, a, b ) )
+    return false
+end function
+
+sub Window.ControlRenamed( byval c as canvas.FormCanvas ptr, byref oldName as const ustring, byref newName as const ustring )
+    dim as DocRef d = this.DocOfCanvas( c )
+    if d = 0 then exit sub
+    dim as ustring path = CodePathOf_( d->Path )
+    if (this.FindOpen( path ) = 0) andalso (fs.IsFile( path ) = false) then exit sub
+    dim as DocRef code = this.OpenQuietly( path )
+    if code then this.PutCodeText( code, reconcile.RenameInCode( code->Text( ), oldName, newName, c->Doc ) )
+end sub
+
+' Handlers whose bodies were deleted by hand come off the form, and the person is told.
+sub Window.ReconcileDesigner( byval d as DocRef )
+    if (d = 0) orelse (d->Designer = 0) then exit sub
+    dim as ustring path = CodePathOf_( d->Path )
+    dim as DocRef code = this.FindOpen( path )
+    if (code = 0) andalso (fs.IsFile( path ) = false) then exit sub
+    dim as ustring text
+    if code then
+        text = code->Text( )
+    else
+        dim as ustring none
+        text = fs.ReadAllText( path ).ValueOr( none )
+    end if
+    dim as FormDoc trial = d->Designer->Doc
+    dim as Array( of ustring ) unbound
+    if reconcile.ReconcileForm( trial, text, unbound ) then
+        dim as ustring fault = d->Designer->ApplyEdit( trial, false, "" )
+        if len( fault ) then
+            this.SetMessage( fault )
+        elseif unbound.Count( ) then
+            SaveNote = strings.Format( i18n.Tr( "message.handler_unbound", "no code for {}: unbound" ), strings.Join( unbound, ", " ) )
+        end if
+    end if
+end sub
+
+' frmX.design.tiko from the form as it stands. False, with a message, when the form has a problem.
+function Window.WriteGenerated( byval d as DocRef ) as boolean
+    if (d = 0) orelse (d->Designer = 0) orelse (len( d->Path ) = 0) then return true
+    dim as ustring moduleName = fs.PathStem( d->Path )
+    dim as Array( of ustring ) problems
+    validate.Check( d->Designer->Doc, moduleName, problems )
+    if problems.Count( ) then
+        this.SetMessage( fs.PathFileName( d->Path ) & ": " & problems[0] )
+        return false
+    end if
+    dim as ustring generated = codegen.Generate( d->Designer->Doc, moduleName, fs.PathFileName( d->Path ), d->Text( ) )
+    dim as ustring target = DesignPathOf_( d->Path ), none
+    if fs.IsFile( target ) then
+        if codegen.WithoutCr( fs.ReadAllText( target ).ValueOr( none ) ) = generated then return true
+    end if
+    ' atomically, so a failure leaves the old file whole
+    if fs.WriteAtomic( target, generated ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( target ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    return true
+end function
+
+' Before a build: every open form's code matches, and its generated file is current.
+function Window.PrepareForms( ) as boolean
+    dim as boolean ok = true
+    for each d as DocRef in Docs
+        if d->Designer then
+            this.ReconcileDesigner( d )
+            if Prefs.SaveBeforeBuild andalso d->IsModified( ) then
+                if this.SaveDoc( d, false ) = false then ok = false
+            elseif this.WriteGenerated( d ) = false then
+                ok = false
+            end if
+        end if
+    next
+    if len( SaveNote ) then
+        this.SetMessage( SaveNote )
+        SaveNote = ""
+    end if
+    return ok
+end function
+
+' Between a form and its code. From a form to frmX.tiko; from frmX.tiko or frmX.design.tiko to the form.
+sub Window.ToggleFormView( )
+    dim as DocRef d = this.Active( )
+    if d = 0 then exit sub
+    if d->Designer then
+        dim as DocRef code = this.CodeDocOf( d )
+        if code then
+            this.ShowDoc( code )
+            this.QueueScan( code )
+        end if
+        exit sub
+    end if
+    if len( d->Path ) = 0 then exit sub
+    dim as ustring base_ = d->Path
+    if lcase( right( base_, 12 ) ) = ".design.tiko" then
+        base_ = left( base_, len( base_ ) - 12 )
+    elseif lcase( right( base_, 5 ) ) = ".tiko" then
+        base_ = left( base_, len( base_ ) - 5 )
+    else
+        exit sub
+    end if
+    dim as ustring formPath = base_ & ".tkform"
+    if fs.IsFile( formPath ) then
+        this.OpenFile( formPath )
+    else
+        this.SetMessage( i18n.Tr( "message.no_form", "no form goes with this file" ) )
+    end if
+end sub
+
+' A form's code file sees its generated half, unsaved changes included.
+sub Window.AddFormOverlay( byval d as DocRef, byref o as parser.ScanOptions )
+    dim as ustring p = d->Path
+    if lcase( right( p, 5 ) ) <> ".tiko" then exit sub
+    dim as ustring base_ = left( p, len( p ) - 5 )
+    if lcase( right( base_, 7 ) ) = ".design" then base_ = left( base_, len( base_ ) - 7 )
+    dim as ustring formPath = base_ & ".tkform"
+    if fs.IsFile( formPath ) = false then exit sub
+    o.ModuleRoot = true
+    dim as DocRef f = this.FindOpen( formPath )
+    if f = 0 then exit sub
+    if f->Designer = 0 then exit sub
+    dim as ustring moduleName = fs.PathStem( formPath )
+    dim as Array( of ustring ) problems
+    validate.Check( f->Designer->Doc, moduleName, problems )
+    if problems.Count( ) then exit sub
+    o.OverlayPaths.Push( base_ & ".design.tiko" )
+    o.OverlayTexts.Push( codegen.Generate( f->Designer->Doc, moduleName, fs.PathFileName( formPath ), f->Text( ) ) )
+end sub

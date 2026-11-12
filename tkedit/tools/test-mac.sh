@@ -57,6 +57,7 @@ parserlib() {
 }
 
 build src/core && run coreall "$SRC/src/core" ./tests/bin/coreall.exe
+build src/design && run designall "$SRC/src/design" ./tests/bin/designall.exe
 if [ "${1:-}" != core ] && parserlib && build src/app; then
     # the self-test builds sample programs with this tiko (P4)
     export TKEDIT_TIKO=$TIKO

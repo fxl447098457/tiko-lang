@@ -469,13 +469,19 @@ function FormCloseRequest( byval h as TK_HOST ptr ) as boolean
         tkHost_EndModal( h, TKAPP_IDCANCEL )
         return true
     end if
+    ' AN OWNED MODELESS FORM is a dialog surface, and a dialog's close button only ends a modal
+    ' loop. This one is closed like a main window: flagged, and destroyed between events.
+    if f->pOwner then
+        h->bQuit = true
+        return true
+    end if
     return false
 end function
 
 ' A form, hidden. cx / cy are DIPs (scaled by the form's scale). With an owner it is a dialog
 ' surface owned by it (ShowModal it); without, a top-level window.
 public function tkApp_NewForm( byref title as ustring, byval cx as long, byval cy as long, _
-                               byval pOwner as TK_FORM ptr = 0, byval forcedScale as single = 0 ) as TK_FORM ptr
+                               byval pOwner as TK_FORM ptr = nullptr, byval forcedScale as single = 0 ) as TK_FORM ptr
     if (gInit = false) orelse (gnForms > ubound( gForms )) then return 0
     dim as TK_HOST ptr h
     if pOwner then
@@ -573,17 +579,32 @@ public sub tkForm_Show( byval f as TK_FORM ptr )
     end if
 end sub
 
-' Pumps until EndModal, Esc or the close button; then destroys the form and returns the code.
-public function tkForm_ShowModal( byval f as TK_FORM ptr ) as long
-    if f = 0 then return 0
+private function RunFormModal_( byval f as TK_FORM ptr ) as long
     f->bModal = true
     if f->bShown = false then
         f->bShown = true
         FormHostSize( f->host )
         if f->OnSize_ then f->OnSize_( f, f->wForm->cw, f->wForm->ch )
     end if
-    dim as long r = tkHost_RunModal( f->host )
+    return tkHost_RunModal( f->host )
+end function
+
+' Pumps until EndModal, Esc or the close button; then destroys the form and returns the code.
+public function tkForm_ShowModal( byval f as TK_FORM ptr ) as long
+    if f = 0 then return 0
+    dim as long r = RunFormModal_( f )
     tkForm_Destroy( f )
+    return r
+end function
+
+' As tkForm_ShowModal, but the form is only HIDDEN afterwards: its controls can still be read, and
+' it can be shown again. Destroy it with tkForm_Destroy.
+public function tkForm_ShowModalKeep( byval f as TK_FORM ptr ) as long
+    if f = 0 then return 0
+    dim as long r = RunFormModal_( f )
+    if f->host->pOwner then SDL_SetWindowModal( f->host->win, false )
+    tkHost_Hide( f->host )
+    f->bModal = false
     return r
 end function
 
@@ -617,6 +638,9 @@ public sub tkForm_Destroy( byval f as TK_FORM ptr )
     if (f = 0) orelse f->bDestroyed then exit sub
     f->bDestroyed = true
     if f->OnDestroy_ then f->OnDestroy_( f )
+    ' THE HOST GOES FIRST, while the form is still listed: a control's callback during teardown
+    ' can still find its form through tkForm_FromWidget.
+    tkHost_Destroy( f->host )
     for i as long = 0 to gnForms - 1
         if gForms(i) = f then
             for j as long = i to gnForms - 2
@@ -627,7 +651,6 @@ public sub tkForm_Destroy( byval f as TK_FORM ptr )
         end if
     next
     if gMainForm = f then gMainForm = 0
-    tkHost_Destroy( f->host )
     delete f
 end sub
 
@@ -659,12 +682,16 @@ end sub
 ' The loop
 ' ==========================================================================================
 ' Destroy every modeless form whose window was closed; TRUE when the main form went.
-private function ReapClosedForms() as boolean
+private function ReapClosedForms( byval bOwnedOnly as boolean = false ) as boolean
     dim as boolean bMainGone = false
     dim as long i = gnForms - 1
     while i >= 0
         if i < gnForms then
             dim as TK_FORM ptr f = gForms(i)
+            if bOwnedOnly andalso (f->pOwner = 0) then
+                i -= 1
+                continue while
+            end if
             if (f->bModal = false) andalso f->host->bQuit then
                 if f = gMainForm then bMainGone = true
                 tkForm_Destroy( f )
@@ -678,6 +705,7 @@ end function
 ' One turn of the loop without blocking (the self-tests drive tkApp with this).
 public sub tkApp_Pump()
     if gMainForm then tkHost_Pump( gMainForm->host )
+    ReapClosedForms( true )
 end sub
 
 ' Shows the main form and pumps until it closes (or Quit), then destroys the rest and undoes

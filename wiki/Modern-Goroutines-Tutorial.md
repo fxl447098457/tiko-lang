@@ -11,7 +11,7 @@ of those you *shouldn't* write.
 **What you need:**
 
 * A tiko toolchain: `toolchains\tiko-windows\tiko.exe` on Windows,
-  `toolchains/tiko-linux/bin/tiko` on Linux.
+  `toolchains/tiko-linux/bin/tiko` on Linux, `toolchains/tiko-macos/bin/tiko` on macOS.
 * The `-mt` flag on **every** build. `std/tasks` refuses to compile without it
   (TKO0309, its `#error`) rather than link a single-threaded runtime and misbehave quietly.
 

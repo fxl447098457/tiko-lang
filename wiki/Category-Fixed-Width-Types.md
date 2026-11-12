@@ -23,7 +23,7 @@ The sizes are the same on every target.
 
 ## Why they exist
 
-The names in the second column don't say how wide they are, and the same names mean different widths in C. `long` is 32 bits in tiko on every target, but in C it is 32 bits on Windows and 64 on Linux. The names above follow Go, Nim and C's `<stdint.h>` (`int32_t`), so the width is in the name.
+The names in the second column don't say how wide they are, and the same names mean different widths in C. `long` is 32 bits in tiko on every target, but in C it is 32 bits on Windows and 64 on Linux and macOS. The names above follow Go, Nim and C's `<stdint.h>` (`int32_t`), so the width is in the name.
 
 ```freebasic
 dim as uint8 red = 255

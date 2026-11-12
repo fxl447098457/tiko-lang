@@ -291,6 +291,11 @@ end function
 '' statement whose tokens the parser kept is considered, and the keyword token is
 '' RETAGGED as an identifier before it is re-read, so the call parser takes it as a
 '' name; a generic body re-parsed later sees the same identifier.
+''
+'' ...AND A METHOD'S NAME COMES FROM ITS OWN TYPE OR WHAT IT INHERITS (off the scope chain). Measured,
+'' fbc-modern 1.20, 2026-11-09: 'Close( )' in a method of 'type D extends B' calls B.Close, and
+'' 'Close #1' there is error 3, not the file statement, so the re-read REPORTS. Silent, that
+'' 'Close #1' was TKO0994. EXPRESSION position ('r = Close( )') asks the same: it was fb_FileCloseAll.
 function RewriteShadowedIntrinsic_ _
     ( byref c as Ctx, byval id as Tko.NodeId, byval scope_ as Tko.ScopeId ) as boolean
 
@@ -310,7 +315,13 @@ function RewriteShadowedIntrinsic_ _
     '' -- the uppercase spelling is a different InternId, and an identifier carrying it
     '' bound to nothing: the rewrite fired and every call came out 'unresolved: LINE'.
     dim as Tko.InternId raw = c.names->GetString( Tko.Text.LowerAscii( spell ) )
-    dim as Tko.Symbol ptr s = c.syms->SymbolAt( c.syms->Lookup( scope_, c.names->Fold( raw ) ) )
+    dim as Tko.InternId fold_ = c.names->Fold( raw )
+    dim as Tko.SymbolId sid = c.syms->Lookup( scope_, fold_ )
+    if (sid = Tko.SYMBOL_NONE) orelse SymbolIsOuterName_( c, sid ) then
+        dim as Tko.SymbolId inh = Tko.SYMBOL_NONE
+        if InheritedMember_( c, scope_, fold_, inh ) then sid = inh
+    end if
+    dim as Tko.Symbol ptr s = c.syms->SymbolAt( sid )
     if s = nullptr then return false
     if s->kind <> cast( uint8, Tko.SYM_PROC ) then return false
     dim as Tko.NodeId decl = cast( Tko.NodeId, s->payload )
@@ -334,14 +345,18 @@ function RewriteShadowedIntrinsic_ _
     q.names = c.names
     q.diags = c.diags
     q.pos = t0
-    q.silent = true
     q.lambdaSeq = p0->lambdaSeq
     q.procNames = p0->procNames           '' 'name :' is a label only if no procedure
     q.memberProcNames = p0->memberProcNames
-    dim as Tko.NodeId fresh = Tko.Parse.CallStatement( q )
+    dim as Tko.NodeId fresh
+    if (c.ast->Flags( id ) and Tko.NF_INTR_EXPR) <> 0 then
+        fresh = Tko.Parse.Expression( q, Tko.PREC_POSTFIX )
+    else
+        fresh = Tko.Parse.CallStatement( q )
+    end if
     p0->lambdaSeq = q.lambdaSeq
 
-    dim as boolean ok = (fresh <> Tko.NODE_NONE)
+    dim as boolean ok = (fresh <> Tko.NODE_NONE) andalso (q.errors = 0)   '' already reported, once
     if ok then ok = (c.ast->Kind( fresh ) <> Tko.N_ERROR)
     if ok = false then
         p0->toks->At( t0 ).kind = oldKind

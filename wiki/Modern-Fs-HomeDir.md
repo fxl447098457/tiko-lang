@@ -13,7 +13,7 @@ HomeDir( )
 ## Notes
 
 - Windows: the Profile known folder (C:\Users\name), falling back to %USERPROFILE%.
-- Linux: $HOME when it is set and absolute, otherwise the home directory in the user's passwd entry.
+- Linux and macOS: $HOME when it is set and absolute, otherwise the home directory in the user's passwd entry.
 - Fails with FS_NOT_FOUND when there is no answer at all.
 
 ## Examples

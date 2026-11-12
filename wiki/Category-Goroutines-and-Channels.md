@@ -359,6 +359,7 @@ Build a program that uses this module with a packaged toolchain -- no `-i`, no `
 ```text
 toolchains\tiko-windows\tiko.exe -mt yourprogram.tiko
 toolchains/tiko-linux/bin/tiko   -mt yourprogram.tiko
+toolchains/tiko-macos/bin/tiko   -mt yourprogram.tiko
 ```
 
 <!-- finder:start -->

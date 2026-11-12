@@ -96,7 +96,7 @@ sh seed/fetch-seed.sh
 bash build/package.sh --verify
 ```
 
-tiko builds tiko: the build compiles it with a **seed**, the earlier tiko release that `seed/seed.lock` pins. `sh seed/fetch-seed.sh` downloads it (through `gh` while the repository is private) and checks its SHA-256 before unpacking it into `seed/cache/`. `package.sh` then builds the compiler, the runtime and the graphics library, and assembles `toolchains/tiko-windows/` or `toolchains/tiko-linux/`. It compiles **and runs** a program per target and records the result in `MANIFEST.txt`.
+tiko builds tiko: the build compiles it with a **seed**, the earlier tiko release that `seed/seed.lock` pins. `sh seed/fetch-seed.sh` downloads it (through `gh` while the repository is private) and checks its SHA-256 before unpacking it into `seed/cache/`. `package.sh` then builds the compiler, the runtime and the graphics library, and assembles `toolchains/tiko-windows/`, `toolchains/tiko-linux/` or `toolchains/tiko-macos/`. It compiles **and runs** a program per target and records the result in `MANIFEST.txt`.
 
 ## Next
 

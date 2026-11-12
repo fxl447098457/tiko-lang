@@ -153,7 +153,7 @@ An encoding is a `TextEncoding` value, made by one of these functions:
 
 ### Code Pages
 
-On Windows, every code page the system has installed is available. On Linux, a fixed set is built in: 1250–1258, 28591 (ISO-8859-1), 28605 (ISO-8859-15), 437 and 850. They decode and encode exactly as Windows does. On Linux, `Ansi( )` and every other code page fail with `ENC_UNSUPPORTED`.
+On Windows, every code page the system has installed is available. On Linux and macOS, a fixed set is built in: 1250–1258, 28591 (ISO-8859-1), 28605 (ISO-8859-15), 437 and 850. They decode and encode exactly as Windows does. On Linux, `Ansi( )` and every other code page fail with `ENC_UNSUPPORTED`.
 
 These code pages fail with `ENC_UNSUPPORTED` on every platform:
 

@@ -1,0 +1,351 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' formfile -- the .tkform file: TOML in, one canonical text out. Written by hand rather than through
+' std/config so that one form always has one spelling: properties and events in the control table's
+' order, nothing that is a default, LF line ends. Diffs then show only what was changed.
+#module "formfile"
+
+#import "std/config"
+#import "std/containers"
+#import "std/outcome"
+#import "vendor/tkControls/tkMeta"
+#import "vendor/tkControls/tkLayout"
+#import "../model"
+#import "../catalog"
+using containers
+using outcome
+using tkMeta
+using tkLayout
+using model
+
+const as string NL = chr( 10 )
+
+private function Str_( byref t as config.TomlValue ) as ustring
+    dim as ustring none = ""
+    return t.AsString( ).ValueOr( none )
+end function
+
+private function IntOf_( byref t as config.TomlValue, byref k as const ustring, byval dflt as long ) as long
+    dim as config.TomlValue ptr p = t.Find( k )
+    if p = 0 then return dflt
+    dim as longint d = dflt
+    return clng( p->AsInt( ).ValueOr( d ) )
+end function
+
+private function StrOf_( byref t as config.TomlValue, byref k as const ustring ) as ustring
+    dim as config.TomlValue ptr p = t.Find( k )
+    if p = 0 then return ""
+    return Str_( *p )
+end function
+
+' Anything in the file that the model has no place for would be lost on the next save, so it's
+' reported rather than dropped.
+private sub OnlyKeys_( byref t as config.TomlValue, byref allowed as const ustring, byref where as const ustring, byref doc as FormDoc )
+    for i as long = 0 to t.Count( ) - 1
+        dim as ustring k = t.KeyAt( i )
+        if instr( " " & allowed & " ", " " & k & " " ) = 0 then
+            doc.Problems.Push( where & ": unknown key '" & k & "'" )
+        end if
+    next
+end sub
+
+private sub ReadSettings_( byref t as config.TomlValue, byref list as Array( of Setting ), byref where as const ustring, byref doc as FormDoc )
+    for i as long = 0 to t.Count( ) - 1
+        dim as Setting s
+        s.Key = t.KeyAt( i )
+        dim as config.TomlValue v = t.Item( i )
+        dim as boolean noBool = false
+        dim as longint noInt = 0
+        dim as double noFloat = 0
+        select case v.Kind( )
+        case config.TOML_STRING
+            s.Value = Str_( v )
+            s.Kind = VALUE_TEXT
+        case config.TOML_BOOL
+            if v.AsBool( ).ValueOr( noBool ) then s.Value = "true" else s.Value = "false"
+            s.Kind = VALUE_BOOL
+        case config.TOML_INT
+            s.Value = str( v.AsInt( ).ValueOr( noInt ) )
+            s.Kind = VALUE_INT
+        case config.TOML_FLOAT
+            s.Value = str( v.AsFloat( ).ValueOr( noFloat ) )
+            s.Kind = VALUE_FLOAT
+        case else
+            doc.Problems.Push( where & ": '" & s.Key & "' is not a string, number or boolean" )
+            continue for
+        end select
+        list.Push( s )
+    next
+end sub
+
+private sub ReadControl_( byref t as config.TomlValue, byref doc as FormDoc )
+    dim as FormControl c
+    c.Name = StrOf_( t, "name" )
+    c.TypeName = StrOf_( t, "type" )
+    c.Parent = StrOf_( t, "parent" )
+    c.Page = IntOf_( t, "page", -1 )
+    c.CustomType = StrOf_( t, "custom_type" )
+    c.CustomModule = StrOf_( t, "custom_module" )
+    c.X = IntOf_( t, "x", 0 )
+    c.Y = IntOf_( t, "y", 0 )
+    c.W = IntOf_( t, "w", 0 )
+    c.H = IntOf_( t, "h", 0 )
+    dim as ustring where = "control '" & c.Name & "'"
+    OnlyKeys_( t, "name type parent page x y w h anchor dock pages custom_type custom_module props events items", where, doc )
+    dim as config.TomlValue ptr p = t.Find( "anchor" )
+    if p then
+        if AnchorFromWords( Str_( *p ), c.Anchor ) = false then
+            doc.Problems.Push( where & ": bad anchor '" & Str_( *p ) & "'" )
+        end if
+    end if
+    p = t.Find( "dock" )
+    if p then
+        if DockFromWord( Str_( *p ), c.Dock ) = false then
+            doc.Problems.Push( where & ": bad dock '" & Str_( *p ) & "'" )
+        end if
+    end if
+    p = t.Find( "pages" )
+    if p then
+        for i as long = 0 to p->Count( ) - 1
+            c.Pages.Push( Str_( p->Item( i ) ) )
+        next
+    end if
+    p = t.Find( "items" )
+    if p then
+        for i as long = 0 to p->Count( ) - 1
+            dim byref as config.TomlValue it = p->Item( i )
+            OnlyKeys_( it, "text key glyph handler kind level width", where & " item", doc )
+            dim as FormItem x
+            x.Text = StrOf_( it, "text" )
+            x.Key = StrOf_( it, "key" )
+            x.Glyph = StrOf_( it, "glyph" )
+            x.Handler = StrOf_( it, "handler" )
+            x.Kind = StrOf_( it, "kind" )
+            x.Level = IntOf_( it, "level", 0 )
+            x.Width = IntOf_( it, "width", 0 )
+            c.Items.Push( x )
+        next
+    end if
+    p = t.Find( "props" )
+    if p then ReadSettings_( *p, c.Props, where, doc )
+    p = t.Find( "events" )
+    if p then ReadSettings_( *p, c.Events, where, doc )
+    doc.Controls.Push( c )
+end sub
+
+' False when the text isn't TOML, or is a format this version can't read; errText says why. A file
+' that reads but has wrong content answers true with doc.Problems filled in.
+public function Parse( byref text as const ustring, byref doc as FormDoc, byref errText as ustring ) as boolean
+    dim as config.ConfigResultToml r = config.ParseToml( text )
+    if r.IsOk( ) = false then
+        errText = r.Failure( ).Message( )
+        return false
+    end if
+    dim as config.TomlValue root = r.Value( )
+    dim as long fmt = IntOf_( root, "format", 0 )
+    if fmt <> FORM_FORMAT then
+        errText = "format " & fmt & " is not one this version reads (expected " & FORM_FORMAT & ")"
+        return false
+    end if
+    OnlyKeys_( root, "format form control orphan", "file", doc )
+    dim as config.TomlValue ptr f = root.Find( "form" )
+    if f then
+        OnlyKeys_( *f, "caption width height translate events", "form", doc )
+        doc.Caption = StrOf_( *f, "caption" )
+        dim as config.TomlValue ptr tr_ = f->Find( "translate" )
+        if tr_ then
+            dim as boolean noFlag = false
+            doc.Translate = tr_->AsBool( ).ValueOr( noFlag )
+        end if
+        doc.ClientW = IntOf_( *f, "width", doc.ClientW )
+        doc.ClientH = IntOf_( *f, "height", doc.ClientH )
+        dim as config.TomlValue ptr e = f->Find( "events" )
+        if e then ReadSettings_( *e, doc.Events, "form", doc )
+    end if
+    dim as config.TomlValue ptr list = root.Find( "control" )
+    if list then
+        for i as long = 0 to list->Count( ) - 1
+            ReadControl_( list->Item( i ), doc )
+        next
+    end if
+    list = root.Find( "orphan" )
+    if list then
+        for i as long = 0 to list->Count( ) - 1
+            dim as FormOrphan o
+            o.Handler = StrOf_( list->Item( i ), "handler" )
+            o.Params = StrOf_( list->Item( i ), "params" )
+            doc.Orphans.Push( o )
+        next
+    end if
+    return true
+end function
+
+' ---- writing ----------------------------------------------------------------------------------
+
+' Always the basic string form, so every file escapes the same way.
+private function Quote_( byref s as const ustring ) as ustring
+    dim as ustring o = """"
+    for i as long = 1 to len( s )
+        dim as ustring ch = mid( s, i, 1 )
+        dim as ulong code = asc( ch )
+        select case code
+        case 34 : o &= "\"""
+        case 92 : o &= "\\"
+        case 9  : o &= "\t"
+        case 10 : o &= "\n"
+        case 13 : o &= "\r"
+        case 0 to 31, 127
+            o &= "\u" & hex( code, 4 )
+        case else
+            o &= ch
+        end select
+    next
+    return o & """"
+end function
+
+private function IsBareKey_( byref k as const ustring ) as boolean
+    if len( k ) = 0 then return false
+    for i as long = 1 to len( k )
+        select case asc( mid( k, i, 1 ) )
+        case 48 to 57, 65 to 90, 97 to 122, 45, 95
+        case else
+            return false
+        end select
+    next
+    return true
+end function
+
+private function SettingLine_( byref s as Setting ) as ustring
+    dim as ustring k = s.Key
+    if IsBareKey_( k ) = false then k = Quote_( k )
+    select case s.Kind
+    case VALUE_BOOL, VALUE_INT
+        return k & " = " & s.Value & NL
+    case VALUE_FLOAT
+        if (instr( s.Value, "." ) = 0) andalso (instr( lcase( s.Value ), "e" ) = 0) then return k & " = " & s.Value & ".0" & NL
+        return k & " = " & s.Value & NL
+    end select
+    return k & " = " & Quote_( s.Value ) & NL
+end function
+
+' Known keys in the control table's order, then whatever the table doesn't know, as found.
+private sub WriteProps_( byref o as ustring, byref c as FormControl, byval m as TKMETA_CONTROL ptr )
+    if c.Props.Count( ) = 0 then exit sub
+    o &= NL & "[control.props]" & NL
+    dim as long i
+    dim as Array( of boolean ) done
+    done.Reserve( c.Props.Count( ) )
+    done.SetCount( c.Props.Count( ) )
+    if m then
+        if len( m->CreateArg ) then
+            i = FindSetting( c.Props, m->CreateArg )
+            if i >= 0 then o &= SettingLine_( c.Props[i] ) : done[i] = true
+        end if
+    end if
+    for each k as ustring in CommonProps( )
+        i = FindSetting( c.Props, k )
+        if i >= 0 then o &= SettingLine_( c.Props[i] ) : done[i] = true
+    next
+    if m then
+        for p as long = 0 to m->NumProps - 1
+            i = FindSetting( c.Props, m->Props( p ).Name )
+            if (i >= 0) andalso (done[i] = false) then o &= SettingLine_( c.Props[i] ) : done[i] = true
+        next
+    end if
+    for j as long = 0 to c.Props.Count( ) - 1
+        if done[j] = false then o &= SettingLine_( c.Props[j] )
+    next
+end sub
+
+private sub WriteEvents_( byref o as ustring, byref c as FormControl, byval m as TKMETA_CONTROL ptr )
+    if c.Events.Count( ) = 0 then exit sub
+    o &= NL & "[control.events]" & NL
+    dim as Array( of boolean ) done
+    done.Reserve( c.Events.Count( ) )
+    done.SetCount( c.Events.Count( ) )
+    if m then
+        for e as long = 0 to m->NumEvents - 1
+            dim as long i = FindSetting( c.Events, m->Events( e ).Name )
+            if i >= 0 then o &= SettingLine_( c.Events[i] ) : done[i] = true
+        next
+    end if
+    for j as long = 0 to c.Events.Count( ) - 1
+        if done[j] = false then o &= SettingLine_( c.Events[j] )
+    next
+end sub
+
+' The properties every control has, which the control table doesn't repeat for each one.
+public function CommonProps( ) as Array( of ustring )
+    dim as Array( of ustring ) a
+    a.Push( "Enabled" )
+    a.Push( "Visible" )
+    return a
+end function
+
+' The one canonical text of this form.
+public function Render( byref doc as FormDoc ) as ustring
+    dim as ustring o = "format = " & FORM_FORMAT & NL & NL
+    o &= "[form]" & NL
+    o &= "caption = " & Quote_( doc.Caption ) & NL
+    o &= "width = " & doc.ClientW & NL
+    o &= "height = " & doc.ClientH & NL
+    if doc.Translate then o &= "translate = true" & NL
+    if doc.Events.Count( ) then
+        o &= NL & "[form.events]" & NL
+        dim as long i = FindSetting( doc.Events, "Load" )
+        if i >= 0 then o &= SettingLine_( doc.Events[i] )
+        i = FindSetting( doc.Events, "Close" )
+        if i >= 0 then o &= SettingLine_( doc.Events[i] )
+        for j as long = 0 to doc.Events.Count( ) - 1
+            if (doc.Events[j].Key <> "Load") andalso (doc.Events[j].Key <> "Close") then o &= SettingLine_( doc.Events[j] )
+        next
+    end if
+    for i as long = 0 to doc.Controls.Count( ) - 1
+        dim as FormControl c = doc.Controls[i]
+        o &= NL & "[[control]]" & NL
+        o &= "name = " & Quote_( c.Name ) & NL
+        o &= "type = " & Quote_( c.TypeName ) & NL
+        o &= "parent = " & Quote_( c.Parent ) & NL
+        if c.Page >= 0 then o &= "page = " & c.Page & NL
+        o &= "x = " & c.X & NL
+        o &= "y = " & c.Y & NL
+        o &= "w = " & c.W & NL
+        o &= "h = " & c.H & NL
+        if c.Anchor <> TK_ANCHOR_DEFAULT then o &= "anchor = " & Quote_( AnchorWords( c.Anchor ) ) & NL
+        if c.Dock <> TK_DOCK_NONE then o &= "dock = " & Quote_( DockWord( c.Dock ) ) & NL
+        if len( c.CustomType ) then o &= "custom_type = " & Quote_( c.CustomType ) & NL
+        if len( c.CustomModule ) then o &= "custom_module = " & Quote_( c.CustomModule ) & NL
+        if c.Pages.Count( ) then
+            o &= "pages = ["
+            for p as long = 0 to c.Pages.Count( ) - 1
+                if p then o &= ", "
+                o &= Quote_( c.Pages[p] )
+            next
+            o &= "]" & NL
+        end if
+        dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
+        WriteProps_( o, c, m )
+        WriteEvents_( o, c, m )
+        for each it as FormItem in c.Items
+            o &= NL & "[[control.items]]" & NL
+            o &= "text = " & Quote_( it.Text ) & NL
+            if len( it.Kind ) then o &= "kind = " & Quote_( it.Kind ) & NL
+            if it.Level then o &= "level = " & it.Level & NL
+            if len( it.Key ) then o &= "key = " & Quote_( it.Key ) & NL
+            if len( it.Glyph ) then o &= "glyph = " & Quote_( it.Glyph ) & NL
+            if it.Width then o &= "width = " & it.Width & NL
+            if len( it.Handler ) then o &= "handler = " & Quote_( it.Handler ) & NL
+        next
+    next
+    for i as long = 0 to doc.Orphans.Count( ) - 1
+        o &= NL & "[[orphan]]" & NL
+        o &= "handler = " & Quote_( doc.Orphans[i].Handler ) & NL
+        o &= "params = " & Quote_( doc.Orphans[i].Params ) & NL
+    next
+    return o
+end function

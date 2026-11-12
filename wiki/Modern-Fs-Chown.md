@@ -2,7 +2,7 @@
 
 # Chown
 
-Changes a file's owner and group on Linux, -1 keeping one; unsupported on Windows.
+Changes a file's owner and group on Linux and macOS, -1 keeping one; fails on Windows.
 
 ## Syntax
 

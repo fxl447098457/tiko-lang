@@ -31,7 +31,7 @@ code a shell shows for a program stopped by Ctrl-C.
 is stuck in a long step can still be stopped. `os.CatchInterrupt( false )`
 keeps counting instead.
 
-`INT_TERMINATE` is `SIGTERM` on Linux — what a service manager sends to stop a
+`INT_TERMINATE` is `SIGTERM` on Linux and macOS — what a service manager sends to stop a
 program — and on Windows the console window closing, the user logging off or
 the machine shutting down. Windows then allows about five seconds before it
 ends the program regardless.

@@ -2,7 +2,7 @@
 
 # SetWin32Attributes
 
-Replaces a file's whole Windows attribute word; fails as unsupported on Linux.
+Replaces a file's whole Windows attribute word; fails as unsupported on Linux and macOS.
 
 ## Syntax
 

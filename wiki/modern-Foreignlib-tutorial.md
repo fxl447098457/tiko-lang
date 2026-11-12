@@ -20,8 +20,8 @@ A library can be linked in two ways:
 | | Static | Dynamic (shared) |
 |---|---|---|
 | the library's code is | **copied into** your program | kept in a separate file, loaded when the program starts |
-| the file the linker reads | Windows: `.lib` · Linux: `.a` | Windows: an *import library* `.lib`, or the `.dll` · Linux: `.so` |
-| the file the program needs when it runs | nothing extra | Windows: the `.dll` · Linux: the `.so` |
+| the file the linker reads | Windows: `.lib` · Linux and macOS: `.a` | Windows: an *import library* `.lib`, or the `.dll` · Linux: `.so` · macOS: `.dylib` |
+| the file the program needs when it runs | nothing extra | Windows: the `.dll` · Linux: the `.so` · macOS: the `.dylib` |
 | your program is | one file | the program **plus** the library file |
 
 On Windows, the linker does not read a DLL directly. It reads a small **import library** that lists what the DLL contains. Libraries you download usually come with one, and tiko can make one when they do not (section 11).
@@ -68,7 +68,7 @@ Three rules carry the whole directive:
 
 1. **The path is relative to the source file**, so the project builds from any folder.
 2. **You state the kind.** If no file of that kind is found, you get an error that lists every file tiko tried. tiko never falls back to the other kind.
-3. **You never write the platform.** For `"vendor/greet/greet"`, tiko looks for `greet_windows_x86_64.lib` on Windows and `greet_linux_x86_64.so` on Linux, among others (section 9). One line works on both.
+3. **You never write the platform.** For `"vendor/greet/greet"`, tiko looks for `greet_windows_x86_64.lib` on Windows , `greet_linux_x86_64.so` on Linux and `greet_macos_arm64.dylib` on macOS, among others (section 9). One line works on all three.
 
 ## 4. Build a tiny C library
 
@@ -358,7 +358,7 @@ Libraries that are part of the operating system, or installed for every program 
 #foreignlib WINMM dynamic "system:winmm"
 ```
 
-`"system:winmm"` hands the name to the linker, which searches its usual folders, exactly as `#inclib "winmm"` does. On Linux, `"system:m"` links the maths library, and a library installed by your package manager, such as `"system:sqlite3"`, is found the same way.
+`"system:winmm"` hands the name to the linker, which searches its usual folders, exactly as `#inclib "winmm"` does. On Linux and macOS, `"system:m"` links the maths library, and a library installed by your package manager, such as `"system:sqlite3"`, is found the same way.
 
 > ⚠️ **The kind is not checked for `system:`.** tiko does not look for the file itself, so it cannot check that it is the kind you asked for. The linker takes whatever it finds.
 

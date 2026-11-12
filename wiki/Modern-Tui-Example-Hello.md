@@ -19,14 +19,14 @@ Run it from a REAL TERMINAL. Redirected output is rejected with an honest error 
 - `Init` returns `TuiNone( )` -- this application wants no timer.
 - `View` builds its widgets as LOCALS. That is correct here because nothing points at them afterwards; a focusable widget could not be a local.
 - `TuiCenter` is recomputed every frame, so the box follows a resize with no resize handling beyond returning `TuiRedraw( )`.
-- PRINT appears only AFTER `TuiRun` returns. Inside a session it is banned -- on Linux a stray PRINT can emit CSI 6n and block.
+- PRINT appears only AFTER `TuiRun` returns. Inside a session it is banned -- on Linux and macOS a stray PRINT can emit CSI 6n and block.
 
 ## Source
 
 ```freebasic
 '' examples/hello.tiko -- the smallest complete TUI program.
 ''
-'' Build (windows-x86_64 or linux-x86_64):
+'' Build (windows-x86_64, linux-x86_64 or macos-arm64):
 ''     tiko hello.tiko
 ''
 '' Run it from a real terminal. Redirected output is rejected with an honest
@@ -108,7 +108,7 @@ dim as TuiRunResult r = TuiRun( app, opts )
 
 '' TuiRun has fully restored the terminal by the time it returns, so ordinary
 '' PRINT is safe again HERE and only here. Inside a session it is banned: on
-'' Linux a stray PRINT emits CSI 6n and can block.
+'' Linux and macOS a stray PRINT emits CSI 6n and can block.
 if( r.IsOk( ) = false ) then
 	print "hello: " & r.Failure( ).Message( )
 	end 1

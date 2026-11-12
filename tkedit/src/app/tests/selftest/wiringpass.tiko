@@ -1,0 +1,401 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' wiringpass -- the Form Designer joined to the code, end to end through the real window: draw a
+' control, double-click it, type the handler, build, run the program it made.
+#module "selftest"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/process"
+#import "std/strings"
+#import "tkp/platform"
+#import "tkc/cmdids"
+#import "tkc/build"
+#import "tkc/symboldb"
+#import "tka/documents"
+#import "tka/mainwin"
+#import "tkd/canvas"
+#import "tkd/model"
+#import "tkd/panels"
+#import "tkd/reconcile"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkPaint"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkScrollPanel"
+using containers
+using cmdids
+using tkApp
+using tkHost
+using tkTest
+using tkPaint
+using tkListTree
+using tkTextBox
+using tkScrollPanel
+using model
+
+dim shared as string gLinkEnv
+
+' Packaging runs this with LD_LIBRARY_PATH cleared and the SDL libraries named by TK_LINUX_LIB. The
+' linker needs them on that path for what SDL3_ttf itself depends on, and so does a built program.
+private function LinkPathForBuilds( ) as ustring
+    dim as string dir_ = environ( "TK_LINUX_LIB" )
+    if len( dir_ ) = 0 then return ""
+    gLinkEnv = "LD_LIBRARY_PATH=" & dir_
+    setenviron gLinkEnv
+    return dir_
+end function
+
+private sub DoubleClick( byval h as TK_HOST ptr, byval x as long, byval y as long )
+    tkTest_PushMotion( h, x, y )
+    tkTest_PumpFor( h, 15 )
+    tkTest_Click( h, x, y, SDL_BUTTON_LEFT, 1 )
+    tkTest_PumpFor( h, 15 )
+    tkTest_Click( h, x, y, SDL_BUTTON_LEFT, 2 )
+    tkTest_PumpFor( h, 50 )
+end sub
+
+private function CountOf( byref text as const ustring, byref what as const ustring ) as long
+    dim as long n = 0, at_ = instr( text, what )
+    while at_
+        n += 1
+        at_ = instr( at_ + 1, text, what )
+    wend
+    return n
+end function
+
+private sub Type_( byval h as TK_HOST ptr, byref pal as panels.DesignPanels, byref key_ as const ustring, byref text as ustring )
+    dim as long r = -1
+    for i as long = 0 to pal.Rows.Count( ) - 1
+        if pal.Rows[i].Key = key_ then r = i
+    next
+    if r < 0 then exit sub
+    dim as TK_WIDGET ptr e = pal.Rows[r].Edit
+    tkScrollPanel_SetPos( pal.Scroll, e->y - tkHost_Scale( h, 8 ) )
+    tkTest_PumpFor( h, 20 )
+    tkTest_Click( h, tkTest_CX( e ), tkTest_CY( e ) )
+    tkTest_PumpFor( h, 30 )
+    Chord( h, SDLK_A, SDL_SCANCODE_A, TK_KMOD_PRIMARY )
+    if len( text ) then
+        tkTest_PushText( h, text )
+    else
+        Chord( h, SDLK_DELETE, SDL_SCANCODE_DELETE, 0 )
+    end if
+    tkTest_PumpFor( h, 20 )
+    Chord( h, SDLK_RETURN, SDL_SCANCODE_RETURN, 0 )
+    tkTest_PumpFor( h, 40 )
+end sub
+
+public sub WiringPass( byref t as Tally, byval sc as single )
+    dim as ustring tk = TestCompiler( )
+    t.Check( len( tk ) > 0, P( sc, "wiring: a tiko compiler to build with ($TKEDIT_TIKO)" ) )
+    if len( tk ) = 0 then exit sub
+    dim as mainwin.Window mw
+    mw.ConfigDir = FreshConfig( )
+    mw.Ask = @ScriptedAsk
+    mw.Pick = @ScriptedPick
+    mw.Launch = @ScriptedLaunch
+    t.Check( mw.Create( sc ), P( sc, "wiring: main window created" ) )
+    if mw.form = 0 then exit sub
+    mw.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( mw.form )
+    tkTest_PumpFor( h, 150 )
+    mw.Prefs.Tiko = tk
+    ' Linux's SDL3 isn't in a system folder here: the program being built has to find it too
+    dim as ustring ldPath = environ( "LD_LIBRARY_PATH" )
+    if len( ldPath ) = 0 then ldPath = LinkPathForBuilds( )
+    if (platform.CurrentOs( ) = platform.Os.Linux) andalso (len( ldPath ) > 0) then
+        for i as long = 0 to mw.Prefs.Builds.Count( ) - 1
+            mw.Prefs.Builds[i].Options &= " -p " & ldPath
+        next
+    end if
+
+    dim as ustring dir_ = fs.PathJoin( Files( ), "wired" & cint( sc * 100 ) )
+    fs.RemoveDirAll( dir_ )
+    dim as ustring formDir = fs.PathJoin( dir_, "frmMain" )
+    fs.CreateDirAll( formDir )
+    fs.CreateDirAll( fs.PathJoin( dir_, "gauges" ) )
+    dim as ustring nl = wchr( 10 )
+    dim as ustring formPath = fs.PathJoin( formDir, "frmMain.tkform" )
+    dim as ustring codePath = fs.PathJoin( formDir, "frmMain.tiko" )
+    dim as ustring designPath = fs.PathJoin( formDir, "frmMain.design.tiko" )
+    fs.WriteAllText( formPath, "format = 1" & nl & nl & "[form]" & nl & "caption = ""W""" & nl & "width = 320" & nl & "height = 240" & nl )
+    dim as ustring mainPath = fs.PathJoin( dir_, "main.tiko" )
+    ' An X11 client that starts asks whoever owns the selection what it holds: this window, after the
+    ' passes before. If this process isn't answering until after the client is gone, SDL replies to a
+    ' window that no longer exists and Xlib ends us: so the program is run without blocking the pump.
+    fs.WriteAllText( mainPath, "#import ""vendor/tkControls/tkApp""" & nl & "#import ""./frmMain""" & nl & "using tkApp" & nl _
+        & "dim as TKAPP_OPTIONS o" & nl & "if tkApp_Init( o ) = false then end 98" & nl _
+        & "dim as frmMain.Form f" & nl & "f.Build( )" & nl & "f.btnGo_Click( )" & nl & "sleep 500" & nl & "end 0" & nl )
+    fs.WriteAllText( fs.PathJoin( dir_, "gauges", "gauges.tiko" ), "#module ""gauges""" & nl & "#import ""vendor/tkControls/tkHost""" & nl _
+        & "#import ""vendor/tkControls/tkLabel""" & nl & "using tkHost" & nl & "using tkLabel" & nl & "public type Gauge" & nl & "    Handle as TK_WIDGET ptr" & nl _
+        & "    declare sub Create( byval hParent as TK_WIDGET ptr, byval id as long )" & nl & "end type" & nl _
+        & "sub Gauge.Create( byval hParent as TK_WIDGET ptr, byval id as long )" & nl & "    Handle = tkLabel_Create( hParent, id )" & nl & "end sub" & nl )
+
+    mw.OpenFile( mainPath )
+    t.Check( mw.OpenFile( formPath ), P( sc, "the form opens" ) )
+    tkTest_PumpFor( h, 100 )
+    dim as DocRef d = mw.FindOpen( formPath )
+    dim as canvas.FormCanvas ptr c = d->Designer
+    if c = 0 then
+        t.Check( false, P( sc, "wiring: a design surface" ) )
+        mw.Destroy( )
+        exit sub
+    end if
+    dim as panels.DesignPanels ptr ps = @mw.Palettes
+
+    ' ---- draw a button
+    c->Tool = "Button"
+    dim as TKRECT rs = c->SurfaceRect( ), rg
+    tkWidget_AbsRect( c->Glass, rg )
+    dim as long ox = rg.left + rs.left, oy = rg.top + rs.top
+    tkTest_PushMotion( h, ox + tkHost_Scale( h, 40 ), oy + tkHost_Scale( h, 40 ) )
+    tkTest_PumpFor( h, 15 )
+    tkTest_Click( h, ox + tkHost_Scale( h, 40 ), oy + tkHost_Scale( h, 40 ) )
+    tkTest_PumpFor( h, 50 )
+    t.Check( FindControl( c->Doc, "Button1" ) >= 0, P( sc, "a button drawn" ) )
+    t.Check( fs.IsFile( codePath ) = false, P( sc, "no code file yet" ) )
+
+    ' ---- a double click writes the handler and goes there
+    dim as TK_WIDGET ptr b1 = c->WidgetOf( "Button1" )
+    DoubleClick( h, tkTest_CX( b1 ), tkTest_CY( b1 ) )
+    t.Check( fs.IsFile( codePath ), P( sc, "the code file is created" ) )
+    t.Check( fs.IsFile( designPath ), P( sc, "and the generated half with it, so the module is whole" ) )
+    dim as DocRef code = mw.FindOpen( codePath )
+    t.Check( (code <> 0) andalso (mw.Active( ) = code), P( sc, "and comes to the front" ) )
+    if code = 0 then
+        mw.Destroy( )
+        exit sub
+    end if
+    t.Check( instr( code->Text( ), "sub Form.Button1_Click( )" ) > 0, P( sc, "with the handler" ) )
+    t.Check( SettingOr( c->Doc.Controls[FindControl( c->Doc, "Button1" )].Events, "Click" ) = "Button1_Click", P( sc, "bound in the form" ) )
+    t.Check( mw.View( ).CaretLine( ) = code->Main.DisplayLines( ) - 2, P( sc, strings.Format( "the caret is in the body: line {} of {}", mw.View( ).CaretLine( ), code->Main.DisplayLines( ) ) ) )
+    t.Check( tkHost_GetFocus( h ) = code->Main.Widget( ), P( sc, "and the keyboard is there" ) )
+
+    ' typing goes into the body, as anywhere
+    dim as ustring body = "print 7 + 35"
+    tkTest_PushText( h, body )
+    tkTest_PumpFor( h, 60 )
+    t.Check( instr( code->Text( ), "    print 7 + 35" ) > 0, P( sc, "the handler is typed in" ) )
+
+    ' ---- back to the form, and again: no second stub
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+    t.Check( mw.Active( ) = d, P( sc, "Shift+F7 from the code goes to the form" ) )
+    b1 = c->WidgetOf( "Button1" )
+    DoubleClick( h, tkTest_CX( b1 ), tkTest_CY( b1 ) )
+    t.Check( CountOf( code->Text( ), "sub Form.Button1_Click" ) = 1, P( sc, "a second double click makes no second handler" ) )
+    t.Check( mw.Active( ) = code, P( sc, "and goes to the one there is" ) )
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+    t.Check( mw.Active( ) = code, P( sc, "Shift+F7 from the form goes to the code" ) )
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+
+    ' the form itself: Load
+    rs = c->SurfaceRect( )
+    DoubleClick( h, ox + tkHost_Scale( h, 280 ), oy + tkHost_Scale( h, 200 ) )
+    t.Check( instr( code->Text( ), "sub Form.Form_Load( )" ) > 0, P( sc, "a double click on the form writes Form_Load" ) )
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+
+    ' ---- the inspector's event rows
+    ClickOn( h, c->WidgetOf( "Button1" ) )
+    tkTest_PumpFor( h, 60 )
+    dim as long evRow = -1
+    for i as long = 0 to ps->Rows.Count( ) - 1
+        if ps->Rows[i].Key = "E:Click" then evRow = i
+    next
+    t.Check( evRow >= 0, P( sc, "an event row" ) )
+    if evRow >= 0 then t.Check( tkTextBox_GetText( ps->Rows[evRow].Edit ) = "Button1_Click", P( sc, "showing the handler" ) )
+
+    ' a name typed in gets a body, and the code isn't brought forward
+    dim as long dropIdx
+    c->Tool = "Label"
+    ClickPx( h, ox + tkHost_Scale( h, 160 ), oy + tkHost_Scale( h, 40 ) )
+    tkTest_PumpFor( h, 60 )
+    dim as ustring evName = "Clicked_Label"
+    Type_( h, *ps, "E:Click", evName )
+    t.Check( instr( code->Text( ), "sub Form.Clicked_Label( )" ) > 0, P( sc, "a typed handler name gets a body" ) )
+    t.Check( mw.Active( ) = d, P( sc, "and the form stays in front" ) )
+    ' the row's button goes to it
+    evRow = -1
+    for i as long = 0 to ps->Rows.Count( ) - 1
+        if ps->Rows[i].Key = "E:Click" then evRow = i
+    next
+    tkTest_Click( h, tkTest_CX( ps->Rows[evRow].Btn ), tkTest_CY( ps->Rows[evRow].Btn ) )
+    tkTest_PumpFor( h, 60 )
+    t.Check( mw.Active( ) = code, P( sc, "the row's button goes to the code" ) )
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+
+    ' ---- rename: the code follows, in tokens only
+    dim as ustring withUses = code->Text( ) & "' Button1 stays in a comment" & nl & "partial type Form" & nl & "    declare sub Extra( )" & nl & "end type" & nl & "sub Form.Extra( )" & nl & "    Button1.Text = ""Button1""" & nl & "    this.Button1.Enabled = true" & nl & "    other.Button1 = 1" & nl & "end sub" & nl
+    code->Main.ReplaceAllText( withUses )
+    ClickOn( h, c->WidgetOf( "Button1" ) )
+    tkTest_PumpFor( h, 60 )
+    dim as ustring before = code->Text( )
+    dim as ustring nm = "btnGo"
+    Type_( h, *ps, "@Name", nm )
+    dim as ustring after_ = code->Text( )
+    t.Check( SettingOr( c->Doc.Controls[FindControl( c->Doc, "btnGo" )].Events, "Click" ) = "btnGo_Click", P( sc, "the handler's name follows in the form" ) )
+    t.Check( instr( after_, "sub Form.btnGo_Click( )" ) > 0, P( sc, "and in the code" ) )
+    t.Check( instr( after_, "    btnGo.Text = ""Button1""" ) > 0, P( sc, "a use is renamed, its string isn't" ) )
+    t.Check( instr( after_, "this.btnGo.Enabled" ) > 0, P( sc, "this.name too" ) )
+    t.Check( instr( after_, "other.Button1" ) > 0, P( sc, "another object's field isn't" ) )
+    t.Check( instr( after_, "' Button1 stays in a comment" ) > 0, P( sc, "nor a comment" ) )
+    code->Main.Undo( )
+    t.Check( code->Text( ) = before, P( sc, "the rename is one undo in the code" ) )
+    code->Main.Redo( )
+    t.Check( code->Text( ) = after_, P( sc, "and one redo" ) )
+    ' put back what the build can't compile: "other" is only there to be left alone
+    code->Main.ReplaceAllText( strings.Replace( after_, "    other.Button1 = 1" & nl, "" ) )
+
+    ' ---- delete: an empty handler goes, one with code stays declared
+    tkTest_PumpFor( h, 30 )
+    ClickOn( h, c->WidgetOf( "Label1" ) )
+    tkTest_PumpFor( h, 40 )
+    Chord( h, SDLK_DELETE, SDL_SCANCODE_DELETE, 0 )
+    t.Check( instr( code->Text( ), "Clicked_Label" ) = 0, P( sc, "an empty handler goes with its control" ) )
+    t.Check( c->Doc.Orphans.Count( ) = 0, P( sc, "with nothing kept" ) )
+
+    ' a control whose handler has code
+    c->Tool = "CheckBox"
+    ClickPx( h, ox + tkHost_Scale( h, 160 ), oy + tkHost_Scale( h, 80 ) )
+    tkTest_PumpFor( h, 60 )
+    dim as TK_WIDGET ptr ck = c->WidgetOf( "CheckBox1" )
+    DoubleClick( h, tkTest_CX( ck ), tkTest_CY( ck ) )
+    t.Check( instr( code->Text( ), "sub Form.CheckBox1_CheckChanged( byval isChecked as boolean )" ) > 0, P( sc, "the default event, with its parameters" ) )
+    dim as ustring hasBody = strings.Replace( code->Text( ), "sub Form.CheckBox1_CheckChanged( byval isChecked as boolean )" & nl & "    ", "sub Form.CheckBox1_CheckChanged( byval isChecked as boolean )" & nl & "    print isChecked" )
+    code->Main.ReplaceAllText( hasBody )
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+    ClickOn( h, c->WidgetOf( "CheckBox1" ) )
+    tkTest_PumpFor( h, 40 )
+    Chord( h, SDLK_DELETE, SDL_SCANCODE_DELETE, 0 )
+    t.Check( instr( code->Text( ), "print isChecked" ) > 0, P( sc, "a handler with code stays" ) )
+    t.Check( (c->Doc.Orphans.Count( ) = 1) andalso (c->Doc.Orphans[0].Handler = "CheckBox1_CheckChanged"), P( sc, "and is kept as an orphan" ) )
+
+    ' ---- a custom control
+    dim as long customRow = -1
+    for r as long = 0 to tkListTree_GetCount( ps->ToolList ) - 1
+        if tkListTree_GetText( ps->ToolList, r ) = "Custom" then customRow = r
+    next
+    t.Check( customRow >= 0, P( sc, "the toolbox has Custom" ) )
+    c->Tool = "Custom"
+    ClickPx( h, ox + tkHost_Scale( h, 160 ), oy + tkHost_Scale( h, 120 ) )
+    tkTest_PumpFor( h, 60 )
+    t.Check( FindControl( c->Doc, "Custom1" ) >= 0, P( sc, "a stand-in is placed" ) )
+    t.Check( mw.WriteGenerated( d ) = false, P( sc, "with no type it can't be generated" ) )
+    t.Check( instr( mw.Message, "needs the name" ) > 0, P( sc, "and says so: " & mw.Message ) )
+    dim as ustring ct = "Gauge", cm = "../gauges"
+    Type_( h, *ps, "@CType", ct )
+    Type_( h, *ps, "@CModule", cm )
+    t.Check( c->Doc.Controls[FindControl( c->Doc, "Custom1" )].CustomType = "Gauge", P( sc, "promoted to a type" ) )
+
+    ' ---- the scanner sees the generated half before anything is saved
+    mw.ShowDoc( code )
+    tkTest_PumpFor( h, 40 )
+    if mw.Scanner.running then
+        dim as long seen = mw.ScansInstalled
+        mw.QueueScan( code )
+        WaitScans( mw, seen + 1 )
+        dim as boolean found = false
+        for each r as symboldb.SymRef in mw.Db.Definitions( )
+            dim byref as symboldb.Sym y = mw.Db.Item( r )
+            if lcase( y.Name ) = "form" then
+                for each f as symboldb.SymRef in mw.Db.Members( r )
+                    if lcase( mw.Db.Item( f ).Name ) = "custom1" then found = true
+                next
+            end if
+        next
+        t.Check( found, P( sc, "the code's scan sees a control that isn't saved yet" ) )
+    end if
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+
+    ' ---- save: the generated file appears, read-only
+    Chord( h, SDLK_S, SDL_SCANCODE_S, TK_KMOD_PRIMARY )
+    tkTest_PumpFor( h, 40 )
+    t.Check( fs.IsFile( designPath ), P( sc, "saving the form keeps the generated file" ) )
+    dim as ustring noText
+    dim as ustring gen = fs.ReadAllText( designPath ).ValueOr( noText )
+    t.Check( instr( gen, "btnGo as Button" ) > 0, P( sc, "with the control" ) )
+    t.Check( instr( gen, "Custom1 as Gauge" ) > 0, P( sc, "the promoted type" ) )
+    t.Check( instr( gen, "#import ""../gauges""" ) > 0, P( sc, "and its module" ) )
+    t.Check( instr( gen, "declare sub CheckBox1_CheckChanged( byval isChecked as boolean )" ) > 0, P( sc, "and the orphan's declaration" ) )
+    t.Check( mw.OpenFile( designPath ), P( sc, "the generated file opens" ) )
+    tkTest_PumpFor( h, 40 )
+    dim as DocRef gd = mw.Active( )
+    dim as ustring genBefore = gd->Text( )
+    Chord( h, SDLK_X, SDL_SCANCODE_X, 0 )
+    tkTest_PushText( h, body )
+    tkTest_PumpFor( h, 30 )
+    t.Check( gd->Text( ) = genBefore, P( sc, "and can't be typed in" ) )
+    mw.ShowDoc( d )
+    tkTest_PumpFor( h, 40 )
+
+    ' ---- build and run what was drawn
+    mw.ShowDoc( mw.FindOpen( mainPath ) )
+    tkTest_PumpFor( h, 40 )
+    mw.StartBuild( build.BuildAction.Compile, false )
+    t.Check( WaitBuild( mw ) andalso mw.BuildSucceeded, P( sc, "the program builds: " & right( mw.LogText, 600 ) ) )
+    t.Check( code->IsModified( ) = false, P( sc, "the build saved the code" ) )
+    dim as ustring exe = fs.PathJoin( dir_, "main" )
+    if platform.CurrentOs( ) = platform.Os.Windows then exe &= ".exe"
+    if fs.IsFile( exe ) = false then exe = fs.PathJoin( dir_, "main.exe" )
+    t.Check( fs.IsFile( exe ), P( sc, "and exists: " & exe ) )
+    if mw.BuildSucceeded then
+        ' This window goes on answering while it runs: see the note at main.tiko above.
+        dim as process.Command cmd_ = process.Command( exe )
+        cmd_.Cwd( dir_ ).StdoutTo( process.STDIO_PIPE ).StderrToStdout( )
+        dim as process.Child child
+        dim as boolean started = child.Spawn( cmd_ ).IsOk( )
+        t.Check( started, P( sc, "and runs" ) )
+        if started then
+            dim as double t0 = timer
+            do
+                dim as process.ProcResultMaybe m = child.TryWait( )
+                if m.IsOk( ) = false then exit do
+                if m.Value( ).HasValue( ) then exit do
+                tkApp_Pump( )
+                SDL_Delay( 10 )
+            loop while timer - t0 < 60
+            dim as ubyte bytes( 0 to 4095 )
+            dim as ustring got
+            dim as fs.FsResultI64 rd = child.hOut.Read( @bytes( 0 ), 4096 )
+            if rd.IsOk( ) then
+                dim as string narrow = space( rd.Value( ) )
+                for i as long = 0 to rd.Value( ) - 1
+                    narrow[i] = bytes( i )
+                next
+                got = narrow
+            end if
+            t.Check( instr( got, "42" ) > 0, P( sc, "the handler typed in the editor ran: " & got ) )
+        end if
+    end if
+
+    ' ---- a body deleted by hand: unbound at the next save, with a message
+    dim as ustring noBody = code->Text( )
+    dim as long a, b
+    if reconcile.FindBody( noBody, "btnGo_Click", a, b ) then code->Main.ReplaceAllText( reconcile.RemoveLines( noBody, a, b ) )
+    mw.ShowDoc( d )
+    tkTest_PumpFor( h, 40 )
+    Chord( h, SDLK_S, SDL_SCANCODE_S, TK_KMOD_PRIMARY )
+    tkTest_PumpFor( h, 40 )
+    t.Check( FindSetting( c->Doc.Controls[FindControl( c->Doc, "btnGo" )].Events, "Click" ) < 0, P( sc, "a deleted body unbinds its event" ) )
+    t.Check( instr( mw.Message, "btnGo_Click" ) > 0, P( sc, "and says so: " & mw.Message ) )
+
+    for each dd as DocRef in mw.Docs
+        dd->Main.SetSavePoint( )
+    next
+    mw.Destroy( )
+end sub

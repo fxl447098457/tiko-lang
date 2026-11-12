@@ -30,7 +30,7 @@ Used to exit the program, and return to the operating system. An optional intege
 
 ### Platform Differences
 
-- In Linux, the `retval` parameter is a [`Byte`](Byte).
+- In Linux and macOS, the `retval` parameter is a [`Byte`](Byte).
 
 ### Differences from QB
 

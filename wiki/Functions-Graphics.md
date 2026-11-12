@@ -2,7 +2,7 @@
 
 # Graphics and windows
 
-The functions to draw on a graphics screen, read the mouse, build GUI controls for Windows and Linux, grouped by what you want to do. The **From** column says what a program needs before it can call one:
+The functions to draw on a graphics screen, read the mouse, build GUI controls for Windows, Linux and macOS, grouped by what you want to do. The **From** column says what a program needs before it can call one:
 
 - **built-in**: nothing; it is always available.
 - `vendor/PsControls/<Name>`: `#import "vendor/PsControls/<Name>"`, then `using <Name>` to call it by its bare name.
@@ -126,6 +126,7 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [PsTheme](PsTheme) | Colours every control from one light or dark theme that can follow Windows. | `vendor/PsControls/PsTheme` |
 | [tkApp](tkApp) | Runs a tkControls program: start-up, the event loop, forms, fonts and the theme. | `vendor/tkControls/tkApp` |
 | [tkTheme](tkTheme) | Keeps the shared light and dark theme every tkControls control takes its colours from. | `vendor/tkControls/tkTheme` |
+| [tkForms](tkForms) | Provides the base a designed form extends: a window, its layout, show and close. | `vendor/tkControls/tkForms` |
 
 ## Take text, numbers and dates from the user
 
@@ -140,6 +141,7 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [tkDatePicker](tkDatePicker) | Shows an editable date field with a calendar icon that drops down a month calendar. | `vendor/tkControls/tkDatePicker` |
 | [tkCalendar](tkCalendar) | Draws a month calendar, one month or a grid of up to twelve, with drill-down to years. | `vendor/tkControls/tkCalendar` |
 | [tkCodeEdit](tkCodeEdit) | Embeds a Scintilla code editor as a tkControls widget, with lexing, folding and IME. | `vendor/tkControls/tkCodeEdit` |
+| [tkLabel](tkLabel) | Shows a line or block of text that the user can't edit. | `vendor/tkControls/tkLabel` |
 
 ## Add buttons and switches
 
@@ -192,6 +194,10 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [tkScrollPanel](tkScrollPanel) | Scrolls a page of ordinary child widgets that is taller than the space it is shown in. | `vendor/tkControls/tkScrollPanel` |
 | [tkVScrollBar](tkVScrollBar) | Draws a vertical scrollbar that you size, feed a range, and listen to. | `vendor/tkControls/tkVScrollBar` |
 | [tkHScrollBar](tkHScrollBar) | Draws a horizontal scrollbar that you size, feed a range, and listen to. | `vendor/tkControls/tkHScrollBar` |
+| [tkPanel](tkPanel) | Groups controls on a plain background, with an optional border. | `vendor/tkControls/tkPanel` |
+| [tkGroupBox](tkGroupBox) | Frames a set of controls under a caption. | `vendor/tkControls/tkGroupBox` |
+| [tkTabControl](tkTabControl) | Shows one page of controls at a time under a strip of tabs. | `vendor/tkControls/tkTabControl` |
+| [tkLayout](tkLayout) | Keeps controls placed as the window resizes, by Anchor or Dock. | `vendor/tkControls/tkLayout` |
 
 ## Show messages, colour pickers and tooltips
 
@@ -213,6 +219,7 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [PsChart](PsChart) | Draws a line, column, price or pie chart from the series you supply. | `vendor/PsControls/PsChart` |
 | [tkProgressBar](tkProgressBar) | Draws a horizontal or vertical progress bar, determinate or with a running marquee. | `vendor/tkControls/tkProgressBar` |
 | [tkChart](tkChart) | Draws line, column, HLOC and pie charts from series of labelled values. | `vendor/tkControls/tkChart` |
+| [tkPicture](tkPicture) | Shows an image, scaled or clipped to its area. | `vendor/tkControls/tkPicture` |
 
 ## Paint and support your own controls
 

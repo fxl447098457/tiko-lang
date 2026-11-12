@@ -38,8 +38,8 @@ result = FileLen(filename)
 
 ### Platform Differences
 
-- Linux requires the *filename* case matches the real name of the file. Windows and DOS are case insensitive.
-  Path separators in Linux are forward slashes / . Windows uses backward slashes \\ but it allows for forward slashes . DOS uses backward \\ slashes.
+- Linux requires the *filename* case matches the real name of the file. Windows, DOS and a default macOS volume are case insensitive.
+  Path separators in Linux and macOS are forward slashes / . Windows uses backward slashes \\ but it allows for forward slashes . DOS uses backward \\ slashes.
 
 ### Differences from QB
 

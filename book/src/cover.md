@@ -11,7 +11,7 @@
 **tiko is a compiled, statically typed programming language for building fast, self-contained
 programs.** This book teaches it to programmers who already know another language.
 
-Every program printed here was compiled and run — on Windows and on Linux — by the exact compiler
+Every program printed here was compiled and run — on Windows, Linux and macOS wherever it applies — by the exact compiler
 named in the [preface](preface.md), before the text around it was written.
 
 ---

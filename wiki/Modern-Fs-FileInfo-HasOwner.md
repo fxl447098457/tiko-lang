@@ -2,7 +2,7 @@
 
 # FileInfo.HasOwner
 
-Returns true if OwnerUid and OwnerGid are filled in: on Linux, not on Windows.
+Returns true if OwnerUid and OwnerGid are filled in: on Linux and macOS, not on Windows.
 
 ## Syntax
 

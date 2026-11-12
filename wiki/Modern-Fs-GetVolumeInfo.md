@@ -28,7 +28,7 @@ dim v as VolumeInfo = r.Value( )
 print len( v.RootPath ) > 0  '' -1 (true)
 print v.MaxComponentLen > 0  '' -1 (true)
 
-'' Name and FileSystem MAY BE EMPTY -- always on Linux, often for a
+'' Name and FileSystem MAY BE EMPTY -- always on Linux and macOS, often for a
 '' network share -- so never assert on them
 ```
 

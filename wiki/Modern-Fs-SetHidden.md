@@ -2,7 +2,7 @@
 
 # SetHidden
 
-Sets or clears a file's hidden flag on Windows; fails as unsupported on Linux.
+Sets or clears a file's hidden flag on Windows; fails as unsupported on Linux and macOS.
 
 ## Syntax
 
@@ -12,7 +12,7 @@ SetHidden( p, v )
 
 ## Notes
 
-- Portable in name only. On Windows it sets or clears FILE_ATTRIBUTE_HIDDEN. On Linux a hidden file is one whose name starts with a dot, and rather than rename the file behind your back it fails with FS_UNSUPPORTED.
+- Portable in name only. On Windows it sets or clears FILE_ATTRIBUTE_HIDDEN. On Linux and macOS a hidden file is one whose name starts with a dot, and rather than rename the file behind your back it fails with FS_UNSUPPORTED.
 
 ## Examples
 
@@ -28,7 +28,7 @@ WriteAllText( p, "hello" )
 print SetHidden( p, true ).IsOk( )         '' true
 print Stat( p ).Value( ).IsHidden( )       '' true
 
-'' PORTABLE IN NAME ONLY. On Windows it sets an attribute. On Linux
+'' PORTABLE IN NAME ONLY. On Windows it sets an attribute. On Linux and macOS
 '' hidden means a leading dot in the name, and renaming the file is a
 '' different operation, so there the call fails with FS_UNSUPPORTED
 '' and the file is left alone.

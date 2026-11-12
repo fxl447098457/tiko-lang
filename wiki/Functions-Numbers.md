@@ -168,8 +168,13 @@ Jump to: [Round a number](#round-a-number) · [Absolute value, sign, smaller and
 | [Rng.NextNormalP](Modern-Math-NextNormalP) | Returns a random value from a normal distribution with the given mean and deviation. | `std/numeric` |
 | [Rng.NextExponential](Modern-Math-NextExponential) | Returns a random waiting time between events at rate lambda; its mean is 1/lambda. | `std/numeric` |
 | [Rng.NextPoisson](Modern-Math-NextPoisson) | Returns a random count of events in one interval at rate lambda; its mean is lambda. | `std/numeric` |
-| [Shuffle](Modern-Math-Shuffle) | Shuffles an array in place so that every order is equally likely. | `std/numeric` |
-| [Choice](Modern-Math-Choice) | Returns one element of an array picked at random, by reference. | `std/numeric` |
+| [Shuffle](Modern-Math-Shuffle) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
+| [Choice](Modern-Math-Choice) | Returns one element of an array or container picked at random, by reference. | `std/numeric` |
+| [ShuffleArray](Modern-Math-Shuffle#containers) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
+| [ShuffleDeque](Modern-Math-Shuffle#containers) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
+| [ShuffleList](Modern-Math-Shuffle#containers) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
+| [ChoiceArray](Modern-Math-Choice#containers) | Returns one element of an array or container picked at random, by reference. | `std/numeric` |
+| [ChoiceDeque](Modern-Math-Choice#containers) | Returns one element of an array or container picked at random, by reference. | `std/numeric` |
 
 ## Secure random bytes
 

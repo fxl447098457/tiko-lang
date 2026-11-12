@@ -1,0 +1,362 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' itemsdlg -- the one editor behind a form's menus, toolbars, status bars, list columns, combo items
+' and tab pages: a list on the left, the selected item's fields on the right. What the fields are
+' depends on the control; everything else is the same.
+#module "itemsdlg"
+
+#import "std/containers"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkTheme"
+#import "../model"
+#import "../catalog"
+using containers
+using tkApp
+using tkListTree
+using tkButton
+using tkLabel
+using tkTextBox
+using tkComboBox
+using tkTheme
+using tkHost
+using tkPaint
+using model
+
+const as long ROW_CY = 32
+const as long LABEL_CX = 90
+const as long MAX_FIELDS = 5
+
+public type ItemField
+    Key as ustring          ' Text, Key, Glyph, Handler, Kind, Width
+    Label as TK_WIDGET ptr
+    Edit as TK_WIDGET ptr
+    IsCombo as boolean
+end type
+
+public type ItemsEditor
+    Kind as long
+    Win as TK_FORM ptr
+    Items as Array( of FormItem )
+    List as TK_WIDGET ptr
+    BtnAdd as TK_WIDGET ptr
+    BtnDel as TK_WIDGET ptr
+    BtnUp as TK_WIDGET ptr
+    BtnDown as TK_WIDGET ptr
+    BtnIn as TK_WIDGET ptr
+    BtnOut as TK_WIDGET ptr
+    BtnOk as TK_WIDGET ptr
+    BtnCancel as TK_WIDGET ptr
+    Fields as Array( of ItemField )
+    Current as long = -1
+    Accepted as boolean
+    IsModal as boolean
+    Loading as boolean
+
+    declare sub Open( byval owner as TK_FORM ptr, byval kind_ as long, byref items_ as Array( of FormItem ), byref title as const ustring )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub AddField( byref key_ as const ustring, byref caption as const ustring, byref options as const ustring = "" )
+    declare sub Layout( )
+    declare sub FillList( )
+    declare function RowText( byval i as long ) as ustring
+    declare sub ShowItem( byval i as long )
+    declare sub FieldChanged( byval w as TK_WIDGET ptr )
+    declare sub AddItem( )
+    declare sub DeleteItem( )
+    declare sub Move( byval delta as long )
+    declare sub Indent( byval delta as long )
+    declare sub Finish( byval ok as boolean )
+end type
+
+private function DlgOf( byval w as TK_WIDGET ptr ) as ItemsEditor ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub OnPick( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as ItemsEditor ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->ShowItem( row )
+end sub
+
+private sub OnTextChanged( byval h as TK_WIDGET ptr )
+    dim as ItemsEditor ptr d = DlgOf( h )
+    if d then d->FieldChanged( h )
+end sub
+
+private sub OnComboChanged( byval h as TK_WIDGET ptr, byval a as long, byval b as long )
+    dim as ItemsEditor ptr d = DlgOf( h )
+    if d then d->FieldChanged( h )
+end sub
+
+private sub OnButton( byval h as TK_WIDGET ptr, byval id as long )
+    dim as ItemsEditor ptr d = DlgOf( h )
+    if d = 0 then exit sub
+    select case h
+    case d->BtnAdd    : d->AddItem( )
+    case d->BtnDel    : d->DeleteItem( )
+    case d->BtnUp     : d->Move( -1 )
+    case d->BtnDown   : d->Move( 1 )
+    case d->BtnIn     : d->Indent( 1 )
+    case d->BtnOut    : d->Indent( -1 )
+    case d->BtnOk     : d->Finish( true )
+    case d->BtnCancel : d->Finish( false )
+    end select
+end sub
+
+private function MakeButton_( byval parent as TK_WIDGET ptr, byref text as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    dim as ustring t = text
+    tkButton_SetText( b, t )
+    tkButton_SetClickCallback( b, @OnButton )
+    return b
+end function
+
+sub ItemsEditor.AddField( byref key_ as const ustring, byref caption as const ustring, byref options as const ustring = "" )
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as ItemField f
+    f.Key = key_
+    f.Label = tkLabel_Create( root_, 1 )
+    tkLabel_SetText( f.Label, caption )
+    if len( options ) then
+        f.IsCombo = true
+        f.Edit = tkComboBox_Create( root_, Fields.Count( ) + 20 )
+        dim as ustring t = options & ","
+        dim as long a = 1, b = instr( a, t, "," )
+        while b > 0
+            tkComboBox_AddItem( f.Edit, mid( t, a, b - a ) )
+            a = b + 1
+            b = instr( a, t, "," )
+        wend
+        tkComboBox_SetSelChangeCallback( f.Edit, @OnComboChanged )
+    else
+        f.Edit = tkTextBox_Create( root_, Fields.Count( ) + 20, false )
+        tkTextBox_SetChangeCallback( f.Edit, @OnTextChanged )
+    end if
+    Fields.Push( f )
+end sub
+
+' A window of its own, not yet modal: the tests drive it this way, and RunModal adds the loop.
+sub ItemsEditor.Open( byval owner as TK_FORM ptr, byval kind_ as long, byref items_ as Array( of FormItem ), byref title as const ustring )
+    Kind = kind_
+    Items = items_
+    dim as ustring t = title
+    Win = tkApp_NewForm( t, 560, 420, owner, tkForm_Host( owner )->fScaleForced )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    List = tkListTree_Create( root_, 1 )
+    tkListTree_SetPaintCallback( List, @tkListTree_PaintRowDefault )   ' a tkListTree draws no row by itself
+    tkListTree_SetSelChangeCallback( List, @OnPick )
+    BtnAdd = MakeButton_( root_, i18n.Tr( "designer.item_add", "Add" ) )
+    BtnDel = MakeButton_( root_, i18n.Tr( "designer.item_remove", "Remove" ) )
+    BtnUp = MakeButton_( root_, i18n.Tr( "designer.item_up", "Up" ) )
+    BtnDown = MakeButton_( root_, i18n.Tr( "designer.item_down", "Down" ) )
+    BtnOk = MakeButton_( root_, i18n.Tr( "designer.ok", "OK" ) )
+    BtnCancel = MakeButton_( root_, i18n.Tr( "designer.cancel", "Cancel" ) )
+
+    dim as ustring textLabel = i18n.Tr( "designer.item_text", "Text" )
+    dim as ustring handlerLabel = i18n.Tr( "designer.item_handler", "Handler" )
+    dim as ustring widthLabel = i18n.Tr( "designer.width", "Width" )
+    select case kind_
+    case catalog.ItemsKind.ItemsMenu
+        BtnIn = MakeButton_( root_, i18n.Tr( "designer.item_in", "Indent" ) )
+        BtnOut = MakeButton_( root_, i18n.Tr( "designer.item_out", "Outdent" ) )
+        this.AddField( "Text", textLabel )
+        this.AddField( "Key", i18n.Tr( "designer.item_key", "Shortcut" ) )
+        this.AddField( "Handler", handlerLabel )
+    case catalog.ItemsKind.ItemsToolbar
+        this.AddField( "Kind", i18n.Tr( "designer.item_kind", "Kind" ), "command,toggle,separator,split,dropdown" )
+        this.AddField( "Text", textLabel )
+        this.AddField( "Glyph", i18n.Tr( "designer.item_glyph", "Glyph" ) )
+        this.AddField( "Handler", handlerLabel )
+    case catalog.ItemsKind.ItemsStatus, catalog.ItemsKind.ItemsColumns
+        this.AddField( "Text", textLabel )
+        this.AddField( "Width", widthLabel )
+    case else
+        this.AddField( "Text", textLabel )
+    end select
+
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        cast( ItemsEditor ptr, f->Tag )->Layout( )
+    end sub )
+    this.FillList( )
+    if Items.Count( ) then this.ShowItem( 0 ) else this.ShowItem( -1 )
+    tkForm_Show( Win )
+    this.Layout( )
+end sub
+
+function ItemsEditor.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub ItemsEditor.Close( )
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+end sub
+
+sub ItemsEditor.Finish( byval ok as boolean )
+    Accepted = ok
+    if IsModal then
+        tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+    end if
+end sub
+
+sub ItemsEditor.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long sc8 = tkForm_Scale( Win, 8 ), bw = tkForm_Scale( Win, 80 ), bh = tkForm_Scale( Win, 28 ), rh = tkForm_Scale( Win, ROW_CY )
+    dim as long cw = root_->cw, ch = root_->ch
+    dim as long listW = cw * 42 \ 100
+    dim as long bottom = ch - sc8 - bh
+    dim as long listB = bottom - sc8 - bh - sc8
+    tkWidget_SetPos( List, sc8, sc8, listW, listB - sc8 )
+    dim as long x = sc8, y = listB + sc8, gap = tkForm_Scale( Win, 4 ), bs = (listW - 3 * gap) \ 4
+    tkWidget_SetPos( BtnAdd, x, y, bs, bh )
+    tkWidget_SetPos( BtnDel, x + bs + gap, y, bs, bh )
+    tkWidget_SetPos( BtnUp, x + 2 * (bs + gap), y, bs, bh )
+    tkWidget_SetPos( BtnDown, x + 3 * (bs + gap), y, bs, bh )
+    tkWidget_SetPos( BtnOk, cw - 2 * bw - 2 * sc8, bottom, bw, bh )
+    tkWidget_SetPos( BtnCancel, cw - bw - sc8, bottom, bw, bh )
+    dim as long fx = sc8 * 2 + listW, lw = tkForm_Scale( Win, LABEL_CX ), fy = sc8
+    for each f as ItemField in Fields
+        tkWidget_SetPos( f.Label, fx, fy, lw, bh )
+        tkWidget_SetPos( f.Edit, fx + lw, fy, cw - fx - lw - sc8, bh )
+        fy += rh
+    next
+    if BtnIn then
+        tkWidget_SetPos( BtnIn, fx, fy, bw, bh )
+        tkWidget_SetPos( BtnOut, fx + bw + gap, fy, bw, bh )
+    end if
+end sub
+
+function ItemsEditor.RowText( byval i as long ) as ustring
+    dim as ustring s
+    for k as long = 1 to Items[i].Level
+        s &= "    "
+    next
+    if Items[i].Kind = "separator" then return s & "---"
+    if len( Items[i].Text ) = 0 then return s & "(" & i18n.Tr( "designer.item_empty", "empty" ) & ")"
+    return s & Items[i].Text
+end function
+
+sub ItemsEditor.FillList( )
+    Loading = true
+    tkListTree_BeginUpdate( List )
+    tkListTree_Clear( List )
+    for i as long = 0 to Items.Count( ) - 1
+        tkListTree_AddString( List, this.RowText( i ), i )
+    next
+    tkListTree_EndUpdate( List )
+    if (Current >= 0) andalso (Current < Items.Count( )) then tkListTree_SetCurSel( List, Current )
+    Loading = false
+end sub
+
+sub ItemsEditor.ShowItem( byval i as long )
+    Current = i
+    Loading = true
+    for each f as ItemField in Fields
+        dim as ustring v
+        if (i >= 0) andalso (i < Items.Count( )) then
+            select case f.Key
+            case "Text"    : v = Items[i].Text
+            case "Key"     : v = Items[i].Key
+            case "Glyph"   : v = Items[i].Glyph
+            case "Handler" : v = Items[i].Handler
+            case "Kind"    : v = Items[i].Kind
+            case "Width"
+                if Items[i].Width then v = str( Items[i].Width )
+            end select
+        end if
+        if f.IsCombo then
+            tkComboBox_SetCurSel( f.Edit, tkComboBox_FindItemByText( f.Edit, v ) )
+        else
+            tkTextBox_SetText( f.Edit, v )
+        end if
+    next
+    if (i >= 0) andalso (i < Items.Count( )) then tkListTree_SetCurSel( List, i )
+    Loading = false
+end sub
+
+sub ItemsEditor.FieldChanged( byval w as TK_WIDGET ptr )
+    if Loading orelse (Current < 0) orelse (Current >= Items.Count( )) then exit sub
+    for each f as ItemField in Fields
+        if f.Edit = w then
+            dim as ustring v
+            if f.IsCombo then v = tkComboBox_GetText( f.Edit ) else v = tkTextBox_GetText( f.Edit )
+            select case f.Key
+            case "Text"    : Items[Current].Text = v
+            case "Key"     : Items[Current].Key = v
+            case "Glyph"   : Items[Current].Glyph = v
+            case "Handler" : Items[Current].Handler = v
+            case "Kind"    : Items[Current].Kind = v
+            case "Width"   : Items[Current].Width = valint( v )
+            end select
+        end if
+    next
+    tkListTree_SetText( List, Current, this.RowText( Current ) )
+end sub
+
+sub ItemsEditor.AddItem( )
+    dim as FormItem it
+    it.Text = i18n.Tr( "designer.item_new", "New" )
+    it.Origin = -1
+    if Kind = catalog.ItemsKind.ItemsToolbar then it.Kind = "command"
+    dim as long at_ = Items.Count( )
+    if (Current >= 0) andalso (Current < Items.Count( )) then
+        at_ = Current + 1
+        it.Level = Items[Current].Level
+    end if
+    Items.Insert( at_, it )
+    Current = at_
+    this.FillList( )
+    this.ShowItem( at_ )
+end sub
+
+' A menu with items under it takes them along.
+sub ItemsEditor.DeleteItem( )
+    if (Current < 0) orelse (Current >= Items.Count( )) then exit sub
+    dim as long lvl = Items[Current].Level
+    Items.Remove( Current )
+    while (Current < Items.Count( ))
+        if Items[Current].Level <= lvl then exit while
+        Items.Remove( Current )
+    wend
+    if Current >= Items.Count( ) then Current = Items.Count( ) - 1
+    this.FillList( )
+    this.ShowItem( Current )
+end sub
+
+sub ItemsEditor.Move( byval delta as long )
+    dim as long j = Current + delta
+    if (Current < 0) orelse (j < 0) orelse (j >= Items.Count( )) then exit sub
+    dim as FormItem t = Items[Current]
+    Items[Current] = Items[j]
+    Items[j] = t
+    Current = j
+    this.FillList( )
+    this.ShowItem( j )
+end sub
+
+sub ItemsEditor.Indent( byval delta as long )
+    if (Current < 0) orelse (Current >= Items.Count( )) then exit sub
+    dim as long n = Items[Current].Level + delta
+    if n < 0 then n = 0
+    if n > 2 then n = 2
+    Items[Current].Level = n
+    tkListTree_SetText( List, Current, this.RowText( Current ) )
+end sub

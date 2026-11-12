@@ -98,7 +98,7 @@ leave it for the final command, as `main.tiko` is here.
 ```
 
 **`tiko -lib mathlib.tiko`** compiles the file and packs the result into a **static library**,
-`libmathlib.a`, on both targets. A program names it with `#inclib "mathlib"` (or `-l mathlib`),
+`libmathlib.a`, on every target. A program names it with `#inclib "mathlib"` (or `-l mathlib`),
 without the `lib` prefix or the extension, and the linker copies in the parts the program uses.
 The program then carries that code inside it, and runs with nothing more beside it.
 
@@ -151,7 +151,7 @@ go through the pointer Windows fills in when the DLL loads:
 `extern import MyDll_Data alias "MyDll_Data" as int32`.
 
 Against a C DLL exporting `int MyDll_Data = 0x1234`, that line reads `&h1234`, and a write or an `@`
-reaches the DLL's own copy. On Linux, `extern import` compiles as a plain `extern`.
+reaches the DLL's own copy. On Linux and macOS, `extern import` compiles as a plain `extern`.
 
 ## Windows programs
 
@@ -167,7 +167,7 @@ A Windows executable belongs to a **subsystem**. The **console** subsystem, the 
 console window when it is started from the desktop, and shares the one it was started from in a
 terminal. **`-s gui`** builds for the **GUI** subsystem instead: no console appears, which is
 what a program with windows of its own wants. Its `print` output goes nowhere unless something has
-redirected it, as the book's test harness does here. On Linux there is no such distinction, and
+redirected it, as the book's test harness does here. On Linux and macOS there is no such distinction, and
 `-s gui` is accepted and changes nothing.
 
 ### Resources
@@ -284,7 +284,7 @@ of the output are typed again for each build, and the compiler starts from nothi
 called `greeter` whose main file is `main.tiko`. **`tiko build`**, run in the directory that
 holds `tiko.toml`, builds every target the file declares. It takes no file names, because the
 target names them, and no `-o`: the program is written to `out/debug/greeter.exe` on Windows and
-`out/debug/greeter` on Linux, beside `tiko.toml`. The module that `main.tiko` imports is found
+`out/debug/greeter` on Linux and macOS, beside `tiko.toml`. The module that `main.tiko` imports is found
 and compiled as in Chapter 15. **`[target.greeter.defines]`** passes `TIMES` as though
 `-d TIMES=2` had been typed, which is why the greeting appears twice. `tiko build greeter` builds
 the one target by name.
@@ -424,7 +424,7 @@ and that licence's conditions apply.
    checking, with the thread-safe runtime, and against which C runtime. {solution="ex31-02"}
 3. Write `mathlib.ti`, a header with the two declarations, and change both clients to include it
    instead of declaring the functions themselves.
-4. Build `use-shared.tiko`, then delete `mathlib.dll` (or `libmathlib.so`) and run it. What does
+4. Build `use-shared.tiko`, then delete `mathlib.dll` (or `libmathlib.so`, or `libmathlib.dylib`) and run it. What does
    each platform say?
 5. Add an `ICON` line to `strings.rc` with an `.ico` file of your own, and check that Explorer
    shows it for the executable.

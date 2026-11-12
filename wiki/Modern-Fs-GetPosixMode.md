@@ -2,7 +2,7 @@
 
 # GetPosixMode
 
-Returns a file's Linux permission bits; fails as unsupported on Windows.
+Returns a file's permission bits on Linux and macOS; fails as unsupported on Windows.
 
 ## Syntax
 

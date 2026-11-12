@@ -2,7 +2,7 @@
 
 # SetReadOnly
 
-Sets or clears a file's read-only flag, or its write bits on Linux.
+Sets or clears a file's read-only flag, or its write bits on Linux and macOS.
 
 ## Syntax
 

@@ -1,14 +1,14 @@
 # tiko by Example
 
 tiko is a compiled, statically typed language for building fast, self-contained
-programs on Windows and Linux. This site teaches it the way you learn most
+programs on Windows, Linux and macOS. This site teaches it the way you learn most
 things in practice: by reading short, complete programs and watching what they
 do.
 
 Every page is built around one example. The example is a whole program, not a
 fragment, and the text under it is the output that program printed. Nothing
-here was typed in by hand: each example on the site is compiled and run on both
-**windows-x86_64** and **linux-x86_64** before a page is published, and the
+here was typed in by hand: each example on the site is compiled and run on
+**windows-x86_64**, **linux-x86_64** and **macos-arm64** before a page is published, and the
 output you see is the output the program produced.
 
 ## How to run an example
@@ -19,7 +19,7 @@ Save the program as `example.tiko` and compile it:
 tiko example.tiko
 ```
 
-The program takes the source file's name: `example` on Linux, `example.exe` on
+The program takes the source file's name: `example` on Linux and macOS, `example.exe` on
 Windows. Run it as `./example` or `example.exe`. Where an example
 needs a compiler flag, the flag is written inside the program itself, as a
 `#cmdline` line near the top, so the file alone reproduces the result.

@@ -2,7 +2,7 @@
 
 # SetPosixMode
 
-Sets a file's Linux permission bits; fails as unsupported on Windows.
+Sets a file's permission bits on Linux and macOS; fails as unsupported on Windows.
 
 ## Syntax
 

@@ -23,7 +23,7 @@ tpad/
     tpad.tiko               the program, and its self-test
 ```
 
-`textfile` imports nothing from Windows, so it can be tested on Linux as well. `pad` is the window, and `tpad.tiko` starts it.
+`textfile` imports nothing from Windows, so it can be tested on Linux and macOS as well. `pad` is the window, and `tpad.tiko` starts it.
 
 ```toml
 # tpad: `tiko build tpad` writes out/debug/tpad.exe

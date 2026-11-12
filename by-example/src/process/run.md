@@ -27,7 +27,7 @@ The child writes to the same output as the parent, which is why its line
 appears between the parent's.
 
 **`shell`** hands the command line to `cmd.exe` on Windows and `/bin/sh` on
-Linux, so the line is in that shell's language. `exit 3` happens to mean the
+Linux and macOS, so the line is in that shell's language. `exit 3` happens to mean the
 same in both.
 
 **`open pipe ... for input`** also goes through the shell, and reads the

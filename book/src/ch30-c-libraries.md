@@ -36,12 +36,12 @@ together.
 
 ```admonish info title="On macOS"
 The SQLite programs run on macOS too: `fetch-libs.sh` builds SQLite's static archive and its
-`.dylib` there. raylib, GLFW and SDL link Apple's frameworks — Cocoa, IOKit, OpenGL — and tiko
-cannot name a framework on its link line yet, so their programs in this chapter are for Windows
-and Linux. On a Mac, the toolchain's `vendor/SDL3` links Homebrew's SDL instead.
+`.dylib` there. This chapter's raylib, GLFW and SDL programs are for Windows and Linux. tiko can
+link Apple's frameworks (`#foreignlib ... "framework:Cocoa"`), but these listings have not been
+set up or run on a Mac. On a Mac, the toolchain's `vendor/SDL3` links Homebrew's SDL instead.
 ```
 
-Every listing in this chapter was compiled and run on both platforms, against exactly the
+Every listing in this chapter was compiled and run on Windows and Linux, against exactly the
 versions in the table.
 
 ## Before you start
@@ -57,9 +57,11 @@ Clang and Clang has to read every header it includes:
 - **The Linux headers, for the Linux pass.** On Linux they are already there, with the `-dev`
   package of any library a header includes. On Windows, the headers of a Linux installation in
   WSL serve, named with `--sysroot`.
+- **The macOS headers, for a macOS pass.** It is optional and runs on a Mac:
+  `--macos-sysroot $(xcrun --show-sdk-path)` names the SDK from Xcode's Command Line Tools.
 
 All of that is needed **only by whoever translates**. The `.ti` it writes is an ordinary tiko
-file: anyone who builds the program afterwards, on either platform, needs no Clang, no Visual
+file: anyone who builds the program afterwards, on any platform, needs no Clang, no Visual
 Studio and no C headers. This chapter translates on Windows, with Ubuntu in WSL for the Linux
 pass. On Linux, c2t translates a header that includes nothing beyond C's freestanding headers
 (`stddef.h`, `stdint.h`, `stdbool.h`, `stdarg.h`), as `sqlite3.h` and `raylib.h` do; one that
@@ -79,12 +81,12 @@ by default; add it to `PATH`, or write the full path.
 
 Open any C library's download and you find the same few kinds of file, under different names.
 
-| File | Windows | Linux | What it is for |
-|---|---|---|---|
-| header | `.h` | `.h` | the declarations: what `tiko c2t` translates |
-| static library | `.lib` | `.a` | the library's compiled code, copied into your program when it links |
-| shared library | `.dll` | `.so`, `.so.6`, `.so.6.0.0` | the compiled code as a separate file, loaded when your program starts |
-| import library | `.lib` | none | Windows only: a small file that tells the linker which DLL holds each function |
+| File | Windows | Linux | macOS | What it is for |
+|---|---|---|---|---|
+| header | `.h` | `.h` | `.h` | the declarations: what `tiko c2t` translates |
+| static library | `.lib` | `.a` | `.a` | the library's compiled code, copied into your program when it links |
+| shared library | `.dll` | `.so`, `.so.6`, `.so.6.0.0` | `.dylib` | the compiled code as a separate file, loaded when your program starts |
+| import library | `.lib` | none | none | Windows only: a small file that tells the linker which DLL holds each function |
 
 On Windows, `.lib` means two different things. A **static** `.lib` holds the library's code; an
 **import** `.lib` holds none, only the names of the functions and the name of the DLL they live
@@ -151,7 +153,8 @@ c2t parses the header twice, once as Clang would compile it for **windows-x86_64
 written under a guard the translation makes, `#if defined(TIKO_OS_WINDOWS)` … `#endif`, and the
 header's own `#if` lines are kept, with C's platform tests spelled as tiko's: `_WIN32` becomes
 `TIKO_OS_WINDOWS`, `__linux__` becomes `TIKO_OS_LINUX`. One `.ti` serves both platforms, which is
-why it can be committed and shared.
+why it can be committed and shared. Given `--macos-sysroot`, c2t adds a third pass, for
+**macos-arm64**, and `__APPLE__` becomes `TIKO_OS_MACOS`.
 
 A branch neither platform takes — an `#ifdef SQLITE_ENABLE_SESSION` for an optional feature, an
 `#elif` for macOS — is translated as well, inside its `#if`. Define the macro before including
@@ -1223,7 +1226,7 @@ module file is `TKO0369`.
 
 To install a binding module for every program, put its folder in one directory and name that
 directory in **`TIKO_PATH`**, the list of directories `#import` searches, separated by `;` on
-Windows and `:` on Linux. Because a translated library's headers include one another by relative
+Windows and `:` on Linux and macOS. Because a translated library's headers include one another by relative
 path, any library can be a module this way, SDL's fifty-nine headers included.
 
 ## When something goes wrong

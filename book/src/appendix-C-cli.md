@@ -8,7 +8,7 @@ Environment variables
 
 | Variable | What it does |
 |---|---|
-| `TIKO_CLANG` | Full path to `clang`. Without it tiko looks at `C:\Program Files\LLVM\bin\clang.exe` on Windows or `/usr/bin/clang` on Linux, and searches `PATH` only when that file is absent. `llvm-ar` and `llvm-rc` are taken from the same directory. |
+| `TIKO_CLANG` | Full path to `clang`. Without it tiko looks at `C:\Program Files\LLVM\bin\clang.exe` on Windows, `/usr/bin/clang` on Linux or Homebrew's `/opt/homebrew/opt/llvm/bin/clang` on macOS, and searches `PATH` only when that file is absent. `llvm-ar` and `llvm-rc` are taken from the same directory. |
 | `TIKO_INCLUDE` | Replaces the default include directory (`<exe>/inc`). `-i` paths are searched first either way. |
 | `TIKO_LIBPATH` | Replaces the bundled library directory (`<exe>/lib/<target>`). `-p` paths and `#libpath` are searched first either way. |
 
@@ -175,4 +175,4 @@ A subcommand is the first word on the command line. It builds a project from its
 | `--build-only-unit ‹n›` | internal to 'tiko build': compile root n alone into the cache, and link nothing |
 | `--bootstrap-subset-check` | reject constructs outside the self-hosting subset |
 
-<!-- 95 options, generated 2026-11-07 from src/driver/options.ti at ec6351fda -->
+<!-- 95 options, generated 2026-11-08 from src/driver/options.ti at ec6351fda -->

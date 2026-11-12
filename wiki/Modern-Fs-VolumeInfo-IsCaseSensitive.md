@@ -24,7 +24,7 @@ print v.IsCaseSensitive      '' false on a plain NTFS volume
 '' PathIsCaseSensitive( ), which is a compile-time per-platform
 '' constant. They disagree in two real cases: an NTFS directory with
 '' per-directory case sensitivity enabled -- WSL sets this -- and a
-'' case-insensitive filesystem mounted on Linux.
+'' case-insensitive filesystem mounted on Linux or, by default, on macOS.
 ''
 '' PathIsCaseSensitive for LEXICAL comparison, which must be
 '' deterministic and do no IO. This one for "will these two names

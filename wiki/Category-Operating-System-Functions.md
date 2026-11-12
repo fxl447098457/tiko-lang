@@ -64,10 +64,10 @@ Grouped by task. [Operating system](Functions-System) lists them beside the rest
 
 | Function | What it does | From |
 |---|---|---|
-| [ExitStatus](Category-Process#running-to-completion) | Holds how a program ended: its exit code and, on Linux, the signal that ended it. | `std/process` |
-| [ExitStatus.Code](Category-Process#running-to-completion) | Returns the program's exit code, or -1 on Linux when a signal ended it. | `std/process` |
+| [ExitStatus](Category-Process#running-to-completion) | Holds how a program ended: its exit code and, on Linux and macOS, the ending signal. | `std/process` |
+| [ExitStatus.Code](Category-Process#running-to-completion) | Returns the program's exit code, or -1 on Linux and macOS when a signal ended it. | `std/process` |
 | [ExitStatus.Success](Category-Process#running-to-completion) | Returns true if the exit code is 0. | `std/process` |
-| [ExitStatus.Signal](Category-Process#running-to-completion) | Returns the Linux signal that ended the program, or 0. | `std/process` |
+| [ExitStatus.Signal](Category-Process#running-to-completion) | Returns the signal that ended the program on Linux and macOS, or 0. | `std/process` |
 | [ProcessOutput](Category-Process#running-to-completion) | Holds a finished program's exit status and the bytes it wrote to stdout and stderr. | `std/process` |
 | [ProcessOutput.StdoutText / StderrText](Category-Process#running-to-completion) | Returns what the program wrote as UTF-8 text, with U+FFFD for any bad bytes. | `std/process` |
 
@@ -101,9 +101,9 @@ Grouped by task. [Operating system](Functions-System) lists them beside the rest
 
 | Function | What it does | From |
 |---|---|---|
-| [OS_NAME](Category-OS#host-facts) | Holds "windows" or "linux", the system the program was built for. | `std/os` |
+| [OS_NAME](Category-OS#host-facts) | Holds "windows", "linux" or "macos", the system the program was built for. | `std/os` |
 | [ARCH_NAME](Category-OS#host-facts) | Holds "x86_64", the processor the program was built for. | `std/os` |
-| [OsVersion](Category-OS#host-facts) | Returns the Windows version number, or the kernel release on Linux. | `std/os` |
+| [OsVersion](Category-OS#host-facts) | Returns the Windows version number, or the kernel release on Linux and macOS. | `std/os` |
 | [Hostname](Category-OS#host-facts) | Returns the computer's network name, or an error. | `std/os` |
 | [UserName](Category-OS#host-facts) | Returns the name of the user running the program, or an error. | `std/os` |
 | [ProcessId](Category-OS#host-facts) | Returns this program's process id. | `std/os` |

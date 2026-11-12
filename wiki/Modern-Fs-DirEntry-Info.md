@@ -2,7 +2,7 @@
 
 # DirEntry.Info
 
-Returns the entry's FileInfo: free on Windows, one extra system call on Linux.
+Returns the entry's FileInfo: free on Windows, one extra system call on Linux and macOS.
 
 ## Syntax
 

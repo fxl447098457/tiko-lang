@@ -26,7 +26,7 @@ tiko uselib.tiko
 ```
 
 - **`tiko -lib mathlib.tiko`** compiles the file and writes `libmathlib.a`,
-  on both targets.
+  on every target.
 - **`#inclib "mathlib"`** tells the linker to use it. The name has no `lib`
   prefix and no extension. `-l mathlib` on the command line does the same.
 - **The linker searched the current directory.** `-p dir` on the command line,

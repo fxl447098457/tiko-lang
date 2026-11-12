@@ -100,4 +100,13 @@ else
 fi
 rm -rf "$HOST"
 
+# v5: one unsaved buffer, and a '#module' file standing for its whole module.
+out=$(TKP_PKGDIR=$(cygpath -w "$ROOT/pkg") TKP_OVERLAY="tests/api/src/partialscan/frm/frm.design.tiko=tests/api/src/partialscan/unsaved/frm.design.tiko" \
+      $H $DLL tests/api/src/partialscan/frm/frm.tiko dump 2>&1)
+if echo "$out" | grep -qF "txtFresh as string" && echo "$out" | grep -qF "Count as long"; then
+    echo "ok    v5: overlay and module root through the DLL"
+else
+    echo "FAIL  v5: overlay and module root"; echo "$out" | sed 's/^/      /'; FAIL=1
+fi
+
 [ "$FAIL" = "0" ] && echo "apitest: ok" || { echo "apitest: FAILED"; exit 1; }

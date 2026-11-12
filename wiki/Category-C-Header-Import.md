@@ -108,7 +108,7 @@ A tool with its own parser — the [tiko language server](https://github.com/Pau
 
 | | |
 | --- | --- |
-| structs, unions | written `type T extern "c"`, so laid out by the target's C rules -- MSVC's bit-fields on Windows, System V's on Linux, `#pragma pack` as `field = n`; layout verified, bit-fields included, anonymous members flattened or nested as tiko requires |
+| structs, unions | written `type T extern "c"`, so laid out by the target's C rules -- MSVC's bit-fields on Windows, System V's on Linux and macOS, `#pragma pack` as `field = n`; layout verified, bit-fields included, anonymous members flattened or nested as tiko requires |
 | enums | as `type Color as uint32` plus a plain `Enum` block — never as a tiko `Enum`, which is 8 bytes where C says 4 |
 | typedefs | kept by name, so `LPCWSTR` stays `LPCWSTR` |
 | functions | including variadics, and the calling convention the header states **for the target being built** — see [Calling conventions](#calling-conventions) |

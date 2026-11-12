@@ -49,6 +49,7 @@ run() {      # run <name> <dir> <driver> <command...>
 if build src/core; then
     run coreall "$E/src/core" none ./tests/bin/coreall.exe
 fi
+build src/design && run designall "$E/src/design" none ./tests/bin/designall.exe
 # tkEdit LINKS IN the scanner (svc/parser): tiko-lang's bin/parser_linux_x86_64.a, which must be built by
 # THIS compiler (its std module objects are one copy at the link). Made in the checkout when it is missing
 # or older than the compiler, then copied to the build folder's bin/, where svc/parser's '#foreignlib'

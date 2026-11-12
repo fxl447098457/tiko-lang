@@ -51,8 +51,8 @@ In the first usage, `Open()` returns a 32 bit [`Long`](Long) value: zero (`0`) o
 
 ### Platform Differences
 
-- Linux requires the `filename` case matches the real name of the file. Windows and DOS are case insensitive.
-  Path separators in Linux are forward slashes `/`. Windows uses backward slashes `\` but it allows for forward slashes `/`. DOS uses backward slashes `\`.  
+- Linux requires the `filename` case matches the real name of the file. Windows, DOS and a default macOS volume are case insensitive.
+  Path separators in Linux and macOS are forward slashes `/`. Windows uses backward slashes `\` but it allows for forward slashes `/`. DOS uses backward slashes `\`.  
   On Windows, a file number used in a dynamic link library is not the same as an identical file number used in the main program. File numbers can not be passed or returned and then used between a DLL and an executable.  
   If you try to open a directory on Linux, the `Open` command will succeed.
 

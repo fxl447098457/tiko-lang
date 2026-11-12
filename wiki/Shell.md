@@ -30,8 +30,8 @@ If the command could not be executed, `-1` is returned. Otherwise, the command i
 
 ### Platform Differences
 
-- Linux requires the *command* case matches the real name of the command. Windows and DOS are case insensitive. The program being shelled may be case sensitive for its command line parameters.
-  Path separators in Linux are forward slashes / . Windows uses backward slashes \\ but it allows for forward slashes. DOS uses backward \\ slashes.  
+- Linux requires the *command* case matches the real name of the command. Windows, DOS and a default macOS volume are case insensitive. The program being shelled may be case sensitive for its command line parameters.
+  Path separators in Linux and macOS are forward slashes / . Windows uses backward slashes \\ but it allows for forward slashes. DOS uses backward \\ slashes.  
   If an empty *command* string is passed, DOS will open an interactive command prompt. On Windows, an error may be returned.
 
 ### Differences from QB

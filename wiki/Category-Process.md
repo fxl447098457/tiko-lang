@@ -34,7 +34,7 @@ A `Command` describes what to run. Every setter returns the `Command`, so calls 
 | `HideWindow( )` | on Windows, start a console program without a console window |
 | `ToString( )` | the command line, quoted as the system will see it — for logs |
 
-**There is no shell.** Each argument reaches the program exactly as given: spaces, quotes, backslashes, `*`, `$` and `&` are not interpreted. On Windows the arguments are quoted into a command line by the rules the C runtime and `CommandLineToArgvW` use to split it again; on Linux they are passed as the argument vector.
+**There is no shell.** Each argument reaches the program exactly as given: spaces, quotes, backslashes, `*`, `$` and `&` are not interpreted. On Windows the arguments are quoted into a command line by the rules the C runtime and `CommandLineToArgvW` use to split it again; on Linux and macOS they are passed as the argument vector.
 
 **Program lookup.** A name without a path separator is searched for on `PATH` — the child's `PATH` if `Env( "PATH", … )` changed it — and on Windows with each `PATHEXT` extension (`.COM`, `.EXE`, `.BAT`, `.CMD`). The current directory is **never** searched, so a program dropped into it cannot stand in for one on `PATH`. A relative path such as `tools/gen` is taken from this program's current directory, whatever `Cwd` says.
 
@@ -47,7 +47,7 @@ A `Command` describes what to run. Every setter returns the `Command`, so calls 
 | `Run( cmd )` | runs with the child's stdin, stdout and stderr inherited; `ProcResultStatus` |
 | `Capture( cmd )` | collects stdout and stderr, stdin is empty; `ProcResultOutput` |
 | `Capture( cmd, stdinData )` | the same, with `stdinData` (an `Array( of ubyte )`) fed to the child's stdin |
-| `Shell( commandLine )` | the one way to a shell: `cmd.exe /d /s /c` on Windows, `/bin/sh -c` on Linux |
+| `Shell( commandLine )` | the one way to a shell: `cmd.exe /d /s /c` on Windows, `/bin/sh -c` on Linux and macOS |
 | `CurrentId( )` | this process's id |
 
 ```freebasic
@@ -67,7 +67,7 @@ A `ProcessOutput` holds `Status` (an `ExitStatus`), `Stdout` and `Stderr` (each 
 
 `Capture` reads stdout and stderr **at the same time**, so a program that writes megabytes to both cannot stall waiting for one of them to be read.
 
-An `ExitStatus` has `Code( )`, `Success( )` (`Code( ) = 0`) and, on Linux, `Signal( )`: the signal that ended the program, with `Code( )` -1 then.
+An `ExitStatus` has `Code( )`, `Success( )` (`Code( ) = 0`) and, on Linux and macOS, `Signal( )`: the signal that ended the program, with `Code( )` -1 then.
 
 ## A Running Child
 
@@ -98,18 +98,18 @@ end if
 | `Stdin( )`, `Stdout( )`, `Stderr( )` | the pipe ends — a runtime error if that stream is not `STDIO_PIPE` |
 | `Wait( )` | closes our end of its stdin, waits, gives the `ExitStatus`; again gives the same one |
 | `WaitTimeout( ms )`, `TryWait( )` | an `Optional( of ExitStatus )`, empty while it is still running |
-| `Kill( )` | ends it at once (Windows: exit code 1; Linux: `SIGKILL`) |
-| `Terminate( )` | asks it to stop: `SIGTERM` on Linux, which a program can catch; the same as `Kill` on Windows |
+| `Kill( )` | ends it at once (Windows: exit code 1; Linux and macOS: `SIGKILL`) |
+| `Terminate( )` | asks it to stop: `SIGTERM` on Linux and macOS, which a program can catch; the same as `Kill` on Windows |
 
-A `Child` cannot be copied. Destroying one **does not stop the program**: it closes our ends of its pipes and lets it run on. On Linux a child that is never waited for stays a zombie until this program exits, so `Wait` for every child you start. After `Wait`, `Kill` and `Terminate` fail with `PROC_ALREADY_WAITED`, because the process id may already belong to another program.
+A `Child` cannot be copied. Destroying one **does not stop the program**: it closes our ends of its pipes and lets it run on. On Linux and macOS a child that is never waited for stays a zombie until this program exits, so `Wait` for every child you start. After `Wait`, `Kill` and `Terminate` fail with `PROC_ALREADY_WAITED`, because the process id may already belong to another program.
 
 On Windows a child started with `NewProcessGroup( )` can be sent Ctrl-Break, and a program using [std/os](Category-OS)'s `CatchInterrupt` sees it as `INT_BREAK`.
 
 ## What The Child Gets
 
-- **Only the three standard handles.** On Windows the child receives an explicit list of exactly those, so files and pipes this program has open do not leak into it. On Linux every pipe is opened close-on-exec; a file opened with the legacy `OPEN` statement is not, and is visible to the child.
-- **Default signal handling** on Linux, whatever this program set.
-- **On Linux the first spawn sets `SIGPIPE` to ignored in this program**, so writing to a pipe whose reader has gone is an `FS_BROKEN_PIPE` error rather than the end of the program.
+- **Only the three standard handles.** On Windows the child receives an explicit list of exactly those, so files and pipes this program has open do not leak into it. On Linux and macOS every pipe is opened close-on-exec; a file opened with the legacy `OPEN` statement is not, and is visible to the child.
+- **Default signal handling** on Linux and macOS, whatever this program set.
+- **On Linux and macOS the first spawn sets `SIGPIPE` to ignored in this program**, so writing to a pipe whose reader has gone is an `FS_BROKEN_PIPE` error rather than the end of the program.
 
 ## Errors
 

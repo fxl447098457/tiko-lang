@@ -124,11 +124,13 @@ never becomes part of your API, so you are free to change it later.
 The difference between the last two is what each one means to the linker. Measured on the object
 `tiko -c` writes for a module named `gen` with one procedure at each level:
 
-| Level | Name in the object | Linux (ELF) | Windows (COFF) |
-|---|---|---|---|
-| `public` | `_ZN4MAIN3GEN3APIEv` | global | external |
-| module-private | `_ZN4MAIN3GEN7SHARED_Ev` | global, **hidden** | external |
-| `private` | `_ZN4MAIN3GEN7SECRET_Ev` | local | local |
+| Level | Name in the object | Linux (ELF) | Windows (COFF) | macOS (Mach-O) |
+|---|---|---|---|---|
+| `public` | `_ZN4MAIN3GEN3APIEv` | global | external | external |
+| module-private | `_ZN4MAIN3GEN7SHARED_Ev` | global, **hidden** | external | **private external** |
+| `private` | `_ZN4MAIN3GEN7SECRET_Ev` | local | local | non-external |
+
+Mach-O puts one more `_` in front of each name.
 
 Every name is spelled from the chain, so two packages' `Parse` procedures can never collide in
 the linker either. A module-private procedure is still an external symbol, because code compiled
@@ -179,6 +181,78 @@ so each file says where its own names come from. A sibling file that writes `uti
 `#import "../util"` of its own gets `TKO0743: 'util' is not declared`, with a note pointing at the
 file that did import it: `'util' is imported by another file of this module; an import belongs to
 the file that writes it`.
+
+## One type across several files
+
+A module's files can share procedures, constants and types, but each type is still one block in
+one file. That stops working when a type has two authors. A form designer or a protocol compiler
+writes fields and method declarations; you write the data and methods of your own. If the two
+share a block, the tool has to edit text you own every time it runs, and one bad merge loses your
+work.
+
+`partial type` lets one type be written in several blocks. Here a tool owns one file of a module
+and you own the other:
+
+```tiko
+{{#include ../examples/ch15/orderform/orderform.gen.tiko}}
+```
+
+```tiko
+{{#include ../examples/ch15/orderform/orderform.tiko}}
+```
+
+```tiko
+{{#include ../examples/ch15/partialform.tiko}}
+```
+
+```text
+{{#include ../examples/ch15/partialform.out}}
+```
+
+The compiler combines the blocks into one `Form` before anything else reads them, so a program
+importing the module sees an ordinary type, and `sizeof` counts the fields of both parts.
+`Submit_Click` is declared by the tool's part and has its body in your file, where it uses `Total`
+from the tool's part and `Clicks` from yours. Because the tool writes only its own file, it can
+rewrite that file whenever it likes.
+
+The rules are short:
+
+- **Every block says `partial`.** A `partial type` and an ordinary `type` of one name are refused
+  with `TKO1063`.
+- **The parts live in one compilation unit**: one source file with its includes, or the files of
+  one module. They are at module or namespace level, in the same namespace.
+- **`public` on any part makes the type public.** The other parts need not repeat it, which is why
+  your file above says only `partial type`. `public` on one part and `private` on another is an
+  error.
+- **Each header clause is given once.** `extends`, `inherits`, `field` and `implements` may each
+  appear on one part, whichever part that is, and apply to the whole type.
+- **A part can be methods alone**, as long as the whole type has a field.
+- **A generic type cannot be partial.** A generic is re-read for each instantiation, from one place
+  in the source.
+
+`partial` is a keyword only directly before `type` or `class`. A variable or procedure can still be
+called `partial`.
+
+`partial class` does the same for a class. A class with no `inherits` line takes `object` as its
+base, so the parts that say nothing simply take whatever base another part names:
+
+```tiko
+{{#include ../examples/ch15/partialclass.tiko}}
+```
+
+```text
+{{#include ../examples/ch15/partialclass.out}}
+```
+
+The base's fields come first in the layout, wherever `inherits` was written.
+
+````admonish danger title="Pitfall"
+Fields are laid out part by part, and a module's files are read in sorted order of their names.
+`orderform.gen.tiko` sorts first, so its fields come first. Rename it `zform.gen.tiko` and `Clicks`
+moves to the front of `Form`. Nothing warns you, and every field still works by name. It matters
+only when something depends on the layout: a record you write to a file with `put`, or a `Form ptr`
+passed to C. When layout matters, keep every field in one part.
+````
 
 ## Importing
 
@@ -490,7 +564,7 @@ module acme.text.pad: miss (define ACME_COLUMNS=4)
 ```
 
 **The cache** is one directory shared by every project of yours: `%LOCALAPPDATA%\tiko\modcache`
-on Windows, `~/.cache/tiko/modcache` on Linux (or under `$XDG_CACHE_HOME`), and wherever
+on Windows, `~/.cache/tiko/modcache` on Linux and macOS (or under `$XDG_CACHE_HOME`), and wherever
 `TIKO_MODCACHE` names if you set it. Nothing is written into the project, so there is nothing to
 add to `.gitignore`, and a module two projects build the same way is compiled once for both. A
 build with different settings is a different entry, as the third build shows. The key is the
@@ -635,6 +709,8 @@ once.
   (`TKO0360`, `TKO0361`). `#import "./greet"` comes before any code (`TKO0362`) and binds `greet`.
 - **Module-private is the default.** `public` exports; `private` keeps a name inside the module's
   object. Names are spelled from the module's chain, so they never collide in the linker either.
+- **`partial type` and `partial class` write one type in several blocks**, usually two files of one
+  module, so a tool's half and yours never edit each other's text. Fields follow file-name order.
   Reaching a module-private name is `TKO0860`.
 - **Inside a module, declaration order does not matter**, across files or within one. Macros do
   not cross between its files.

@@ -15,7 +15,7 @@ STRING          var-len, heap, byte-oriented. Dynamic, but it has no encoding
 ZSTRING \[\* N\]   raw NUL-terminated bytes, for C interop. WSTRING \[\* N\]   raw wide characters, wchar_t-width: 2 bytes on Windows,
 
 ```freebasic
-4 on Linux, 1 on DOS. Fixed length only.
+4 on Linux and macOS, 1 on DOS. Fixed length only.
 ```
 
 So the same source builds a UTF-16 string on one target and a UTF-32 string on another, silently -- and whichever you pick, you cannot resize it. The width leaks into every byte offset, every pointer walk, and every file written.

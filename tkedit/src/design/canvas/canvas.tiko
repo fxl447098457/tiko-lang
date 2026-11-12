@@ -1,0 +1,1239 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' canvas -- the design surface: real controls, made through tkMeta, behind a transparent glass that
+' takes every mouse click and key. So what you see is the real thing, with no compile.
+'
+' The model in Doc is the form. A drag changes a working copy of it for feedback; only the end of the
+' gesture commits, as one change of the buffer's text through OnCommit. Undo goes through that
+' buffer, and LoadText rebuilds from whatever it then holds.
+#module "canvas"
+
+#import "std/containers"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkMeta"
+#import "vendor/tkControls/tkLayout"
+#import "vendor/tkControls/tkTabControl"
+#import "vendor/tkControls/tkTabBar"
+#import "vendor/tkControls/tkScrollPanel"
+#import "vendor/tkControls/tkGroupBox"
+#import "vendor/tkControls/tkScrollBar"
+#import "vendor/tkControls/tkTheme"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkMenuBar"
+#import "vendor/tkControls/tkPopupMenu"
+#import "vendor/tkControls/tkToolbar"
+#import "vendor/tkControls/tkStatusBar"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkComboBox"
+#import "../model"
+#import "../catalog"
+#import "../formfile"
+#import "../edits"
+#import "../validate"
+#import "../codegen"
+using containers
+using tkApp
+using tkMeta
+using tkLayout
+using tkTabControl
+using tkTabBar
+using tkScrollPanel
+using tkGroupBox
+using tkScrollBar
+using tkTheme
+using tkLabel
+using tkMenuBar
+using tkPopupMenu
+using tkToolbar
+using tkStatusBar
+using tkListTree
+using tkComboBox
+using tkHost
+using tkPaint
+using model
+
+public type CanvasCommitSub as sub( byval owner as any ptr, byref text as const ustring )
+public type CanvasChangedSub as sub( byval listener as any ptr )
+public type FormCanvas_ as FormCanvas
+public type CanvasWireSub as sub( byval host_ as any ptr, byval c as FormCanvas_ ptr, byref name_ as const ustring, byref event_ as const ustring, byval jump as boolean )
+public type CanvasRenameSub as sub( byval host_ as any ptr, byval c as FormCanvas_ ptr, byref oldName as const ustring, byref newName as const ustring )
+public type CanvasGoneFunc as function( byval host_ as any ptr, byval c as FormCanvas_ ptr, byref handler as const ustring ) as boolean
+
+const as long MARGIN = 16         ' design units of empty surface around the form
+const as long GRIP_SIZE = 7       ' a grip's size
+const as long BAR = 12            ' a scroll bar's thickness
+const as long DRAG_START = 4      ' pixels of travel before a press becomes a drag
+const as long MIN_SIZE = 4        ' the smallest a control can be dragged to
+const as long PLACE_STEP = 16     ' a Toolbox double click: the first control's offset, and each next one's
+
+enum DragKind
+    DragNone = 0
+    DragPressed     ' down on a control, not moved far enough yet
+    DragMove
+    DragResize
+    DragFormResize
+    DragRubber
+    DragDraw
+end enum
+
+' Bits of the edges a grip moves.
+const as long EDGE_L = 1, EDGE_T = 2, EDGE_R = 4, EDGE_B = 8
+
+public type FormCanvas
+    Doc as FormDoc
+    Selected as Array( of ustring )     ' the first is what Align lines the others up against
+    Tool as ustring                     ' the control type being placed, "" for the pointer
+    GridSize as long = 8
+    SnapToGrid as boolean = true
+    Live as boolean                     ' Test Form: the controls work, nothing is being designed
+
+    Frame as TK_WIDGET ptr              ' fills the pane
+    Glass as TK_WIDGET ptr              ' over everything in Frame
+    Surface as TK_WIDGET ptr            ' the form itself; its children are the real controls
+    HBar as TK_WIDGET ptr
+    VBar as TK_WIDGET ptr
+    Layout as TK_LAYOUT ptr
+    Widgets as Array( of TK_WIDGET ptr )    ' one for each of Doc.Controls
+    PagesShown as Array( of Setting )       ' lower-case tab control name: the page it's showing
+
+    Owner as any ptr
+    OnCommit as CanvasCommitSub
+    Listener as any ptr
+    OnChanged as CanvasChangedSub       ' the selection, the model or the tool changed
+    Host as any ptr                     ' for the joins to the code
+    OnWire as CanvasWireSub             ' give an event a handler; jump: and go to it
+    OnRenamed as CanvasRenameSub
+    OnEditItems as CanvasWireSub        ' name_: the control whose entries to edit
+    OnHandlerGone as CanvasGoneFunc     ' true: the body has code, so keep its declaration
+
+    Drag as long
+    Grip as long                        ' DragResize: EDGE_* bits
+    StartX as long                      ' where the press was, in Glass pixels
+    StartY as long
+    NowX as long
+    NowY as long
+    DragBase as FormDoc                 ' Doc as it was when the press came
+    Pressed as ustring                  ' the control a plain press landed on
+    DrawParent as ustring
+    DrawPage as long
+
+    declare function Create( byval parent as TK_WIDGET ptr, byval id as long ) as boolean
+    declare sub Destroy( )
+    ' False when the text isn't a form this version can show; the canvas is left as it was.
+    declare function LoadText( byref text as const ustring ) as boolean
+    declare sub Commit( )
+    declare sub Changed( )
+    declare function ApplyEdit( byref trial as FormDoc, byval rebuildAll as boolean, byref newName as const ustring ) as ustring
+    declare sub RevealAndSelect( byref name_ as const ustring )
+
+    declare sub Clear_( )
+    declare sub ApplyItems( byref c as FormControl, byval w as TK_WIDGET ptr )
+    declare sub Rebuild( )
+    declare sub SyncGeometry( )
+    declare sub PlaceSurface( )
+    declare sub ContainerClient( byval i as long, byval page as long, byref w as TK_WIDGET ptr )
+
+    declare function ToDesign( byval px as long ) as long
+    declare function ToPixels( byval v as long ) as long
+    declare function IsSelected( byref name_ as const ustring ) as boolean
+    declare function WidgetOf( byref name_ as const ustring ) as TK_WIDGET ptr
+    declare function RectOf( byval w as TK_WIDGET ptr ) as TKRECT
+    declare function SurfaceRect( ) as TKRECT
+    declare function Shows( byval w as TK_WIDGET ptr ) as boolean
+    declare function HitControl( byval x as long, byval y as long ) as long
+    declare function HitGrip( byval x as long, byval y as long ) as long
+    declare function HitFormGrip( byval x as long, byval y as long ) as long
+    declare function GripsOf( byval i as long ) as long
+    declare sub PlaceAt( byval x as long, byval y as long, byref parent as ustring, byref page as long, byref dx as long, byref dy as long )
+
+    declare sub OnPress( byval x as long, byval y as long, byval mods as long )
+    declare sub OnDragTo( byval x as long, byval y as long, byval mods as long )
+    declare sub OnRelease( byval x as long, byval y as long )
+    declare sub OnHover( byval x as long, byval y as long )
+    declare sub OnDoubleClick( byval x as long, byval y as long )
+    declare function PlaceDefault( byref typeName as const ustring ) as boolean
+    declare function OnKey( byval key as long, byval mods as long ) as boolean
+    declare sub Paint( byval b as TK_PAINT ptr )
+    declare sub PaintSurface( byval b as TK_PAINT ptr )
+
+    declare sub SelectOnly( byref name_ as const ustring )
+    declare sub SelectNone( )
+    declare sub SelectAll( )
+    declare sub SelectNext( byval forward as boolean )
+    declare sub Nudge( byval dx as long, byval dy as long, byval resize_ as boolean )
+    declare sub DeleteSelection( )
+    declare sub Copy( )
+    declare sub Cut( )
+    declare sub Paste( )
+    declare sub Align( byval mode as edits.AlignMode )
+    declare sub ToFront( )
+    declare sub ToBack( )
+    declare sub SetPageOf( byref name_ as const ustring, byval page as long )
+end type
+
+private function SurfaceProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg = TKM_PAINT then
+        cast( FormCanvas ptr, w->pData )->PaintSurface( m->pPaint )
+        return true
+    end if
+    return false
+end function
+
+private function GlassProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as FormCanvas ptr c = w->pData
+    select case m->msg
+    case TKM_PAINT
+        c->Paint( m->pPaint )
+        return true
+    case TKM_LBUTTONDOWN
+        tkHost_SetFocus( w->pHost, w )
+        if (m->clicks >= 2) andalso (len( c->Tool ) = 0) then
+            c->OnDoubleClick( m->x, m->y )
+            return true
+        end if
+        tkHost_SetCapture( w )
+        c->OnPress( m->x, m->y, SDL_GetModState( ) )
+        return true
+    case TKM_MOUSEMOVE
+        if c->Drag <> DragNone then
+            c->OnDragTo( m->x, m->y, SDL_GetModState( ) )
+        else
+            c->OnHover( m->x, m->y )
+        end if
+        return true
+    case TKM_LBUTTONUP
+        ' finished first: giving up the capture is what TKM_CAPTURECHANGED reads as an interrupted gesture
+        c->OnRelease( m->x, m->y )
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        return true
+    case TKM_CAPTURECHANGED
+        if c->Drag <> DragNone then
+            ' the gesture was taken away: nothing it did stands
+            c->Doc = c->DragBase
+            c->Drag = DragNone
+            c->SyncGeometry( )
+            tkWidget_Invalidate( w )
+            c->Changed( )
+        end if
+        return true
+    case TKM_MOUSEWHEEL
+        if c->VBar->isVisible then
+            tkScrollBar_SetPos( c->VBar, tkScrollBar_GetPos( c->VBar ) - cint( m->wheelY * c->ToPixels( 24 ) ) )
+            c->PlaceSurface( )
+        end if
+        return true
+    case TKM_KEYDOWN
+        return c->OnKey( m->key, m->mods )
+    case TKM_CHAR
+        return true
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        tkWidget_Invalidate( w )
+        return true
+    end select
+    return false
+end function
+
+private sub OnBarScroll( byval hSB as TK_WIDGET ptr, byval newPos as integer )
+    cast( FormCanvas ptr, tkWidget_Parent( hSB )->pData )->PlaceSurface( )
+end sub
+
+' What the form sits on: almost black, or almost white. The form itself keeps the theme's own colour.
+public function BackdropColor( ) as ulong
+    if tkTheme_Get( ).IsDark then return tkRGB( 18, 18, 20 )
+    return tkRGB( 250, 249, 246 )
+end function
+
+private function FrameProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as FormCanvas ptr c = w->pData
+    select case m->msg
+    case TKM_PAINT
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        m->pPaint->SetBackColor( BackdropColor( ) )
+        m->pPaint->PaintRect( @rc )
+        return true
+    case TKM_SIZE
+        c->PlaceSurface( )
+        return true
+    case TKM_SCALECHANGED
+        c->Rebuild( )
+        return true
+    case TKM_THEMECHANGED
+        tkWidget_Invalidate( w )
+        return false
+    end select
+    return false
+end function
+
+private function FontRole_( byref s as const ustring ) as long
+    select case s
+    case "UI_SMALL"    : return TKFONT_UI_SMALL
+    case "UI_BOLD"     : return TKFONT_UI_BOLD
+    case "UI_LARGE"    : return TKFONT_UI_LARGE
+    case "GLYPH"       : return TKFONT_GLYPH
+    case "GLYPH_LARGE" : return TKFONT_GLYPH_LARGE
+    case "MONO"        : return TKFONT_MONO
+    end select
+    return TKFONT_UI
+end function
+
+' Controls on the canvas never take the keyboard: Tab must not walk into them.
+private sub MakeInert_( byval w as TK_WIDGET ptr )
+    w->isFocusable = false
+    dim as TK_WIDGET ptr k = w->pFirst
+    while k
+        MakeInert_( k )
+        k = k->pNext
+    wend
+end sub
+
+function FormCanvas.Create( byval parent as TK_WIDGET ptr, byval id as long ) as boolean
+    Frame = tkWidget_CreateChild( parent, id, @FrameProc, @this )
+    if Frame = 0 then return false
+    Glass = tkWidget_CreateChild( Frame, 1, @GlassProc, @this )
+    Glass->isFocusable = true
+    HBar = tkScrollBar_Create( Frame, 2, false )
+    VBar = tkScrollBar_Create( Frame, 3, true )
+    tkScrollBar_SetScrollCallback( HBar, @OnBarScroll )
+    tkScrollBar_SetScrollCallback( VBar, @OnBarScroll )
+    Layout = tkLayout_Create( )
+    return true
+end function
+
+sub FormCanvas.Destroy( )
+    if Frame = 0 then exit sub
+    if Layout then tkLayout_Destroy( Layout )
+    Layout = 0
+    tkWidget_Destroy( Frame )
+    Frame = 0
+    Glass = 0
+    Surface = 0
+end sub
+
+function FormCanvas.ToPixels( byval v as long ) as long
+    return tkHost_Scale( Frame->pHost, v )
+end function
+
+' Pixels back to design units, rounded to the nearest.
+function FormCanvas.ToDesign( byval px as long ) as long
+    return cint( px / Frame->pHost->fScale )
+end function
+
+function FormCanvas.LoadText( byref text as const ustring ) as boolean
+    dim as FormDoc d
+    dim as ustring e
+    if formfile.Parse( text, d, e ) = false then return false
+    if d.Problems.Count( ) then return false
+    for each c as FormControl in d.Controls
+        if catalog.Find( c.TypeName ) = 0 then return false
+        if (len( c.Parent ) > 0) andalso (FindControl( d, c.Parent ) < 0) then return false
+    next
+    Doc = d
+    ' what was selected stays selected, if it's still there
+    dim as Array( of ustring ) kept
+    for each s as ustring in Selected
+        if FindControl( Doc, s ) >= 0 then kept.Push( s )
+    next
+    Selected = kept
+    this.Rebuild( )
+    return true
+end function
+
+sub FormCanvas.Clear_( )
+    if Surface then tkWidget_Destroy( Surface )
+    Surface = 0
+    Widgets.Clear( )
+    if Layout then tkLayout_Destroy( Layout )
+    Layout = tkLayout_Create( )
+end sub
+
+' The widget a child of control i goes on.
+sub FormCanvas.ContainerClient( byval i as long, byval page as long, byref w as TK_WIDGET ptr )
+    dim as TKMETA_CONTROL ptr m = catalog.Find( Doc.Controls[i].TypeName )
+    w = Widgets[i]
+    select case m->ContainerKind
+    case TKMETA_CONTAINER_PAGES       : w = tkTabControl_GetPage( Widgets[i], page )
+    case TKMETA_CONTAINER_SCROLLPANEL : w = tkScrollPanel_GetPanel( Widgets[i] )
+    end select
+end sub
+
+' Every control again, from the model. The tab each tab control was showing survives.
+sub FormCanvas.Rebuild( )
+    if Frame = 0 then exit sub
+    this.Clear_( )
+    Surface = tkWidget_CreateChild( Frame, 4, @SurfaceProc, @this )
+    tkWidget_SendToBack( Surface )
+
+    dim as TK_FORM ptr f = tkForm_FromWidget( Frame )
+    dim as codegen.Sizes sz
+    codegen.EffectiveSizes( Doc, sz )
+    tkLayout_AddContainer( Layout, Surface, Doc.ClientW, Doc.ClientH )
+    for i as long = 0 to Doc.Controls.Count( ) - 1
+        dim as FormControl c = Doc.Controls[i]
+        dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
+        dim as TK_WIDGET ptr parent_ = Surface
+        if len( c.Parent ) then this.ContainerClient( FindControl( Doc, c.Parent ), c.Page, parent_ )
+        dim as ustring arg = m->CreateArgDflt
+        if len( m->CreateArg ) then arg = SettingOr( c.Props, m->CreateArg, m->CreateArgDflt )
+        dim as TK_WIDGET ptr w = m->Create( parent_, i + 1, arg )
+        Widgets.Push( w )
+        if w = 0 then continue for
+        if m->Name = catalog.CUSTOM_TYPE then
+            ' a stand-in: what it's called and what it will be
+            dim as ustring shown = c.CustomType
+            if len( shown ) = 0 then shown = "?"
+            tkLabel_SetText( w, c.Name & " : " & shown )
+            tkLabel_SetTransparent( w, false )
+            tkLabel_SetBackColor( w, tkTheme_Get( ).Selected )
+            tkLabel_SetTextColor( w, tkTheme_Get( ).SelectedText )
+        end if
+        tkLayout_Add( Layout, w, c.X, c.Y, c.W, c.H, c.Anchor, c.Dock )
+        if m->ContainerKind = TKMETA_CONTAINER_PAGES then
+            for each t as ustring in c.Pages
+                tkTabControl_AddPage( w, t )
+            next
+        end if
+        this.ApplyItems( c, w )
+        for each s as Setting in c.Props
+            dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, s.Key )
+            if p then
+                if p->Kind = "font" then
+                    if p->ApplyFont then p->ApplyFont( w, tkForm_Font( f, FontRole_( s.Value ) ) )
+                elseif p->bDesign andalso (p->Apply <> 0) then
+                    p->Apply( w, s.Value )
+                end if
+            end if
+        next
+        select case m->ContainerKind
+        case TKMETA_NOT_CONTAINER
+        case TKMETA_CONTAINER_PAGES
+            dim as long th = valint( SettingOr( c.Props, "TabHeight", "30" ) )
+            for p as long = 0 to c.Pages.Count( ) - 1
+                tkLayout_AddContainer( Layout, tkTabControl_GetPage( w, p ), sz.W[i], sz.H[i] - th )
+            next
+            dim as long sel = valint( SettingOr( PagesShown, lcase( c.Name ), "0" ) )
+            if (sel > 0) andalso (sel < c.Pages.Count( )) then tkTabControl_SetCurSel( w, sel )
+        case TKMETA_CONTAINER_GROUPBOX
+            tkLayout_AddContainer( Layout, w, sz.W[i], sz.H[i], @tkGroupBox_GetClientRect )
+        case TKMETA_CONTAINER_SCROLLPANEL
+            tkLayout_AddContainer( Layout, tkScrollPanel_GetPanel( w ), sz.W[i], sz.H[i] )
+        case else
+            tkLayout_AddContainer( Layout, w, sz.W[i], sz.H[i] )
+        end select
+        if Live = false then MakeInert_( w )
+    next
+    this.PlaceSurface( )
+    this.Changed( )
+end sub
+
+' A control's entries on the real control. While designing, a menu bar only shows its bar.
+sub FormCanvas.ApplyItems( byref c as FormControl, byval w as TK_WIDGET ptr )
+    select case catalog.ItemsKindOf( c.TypeName )
+    case catalog.ItemsKind.ItemsMenu
+        dim as long n = 0
+        dim as TK_MENU ptr menus( 0 to 2 )
+        for i as long = 0 to c.Items.Count( ) - 1
+            dim as FormItem it = c.Items[i]
+            n += 1
+            dim as boolean hasKids = false
+            if i < c.Items.Count( ) - 1 then hasKids = (c.Items[i + 1].Level > it.Level)
+            if it.Level = 0 then
+                dim as long at_ = tkMenuBar_AddItem( w, it.Text, n )
+                if hasKids andalso Live then
+                    menus( 0 ) = tkPopupMenu_Create( w->pHost )
+                    tkMenuBar_SetDropDown( w, at_, menus( 0 ) )
+                end if
+            elseif Live then
+                if it.Text = "-" then
+                    tkPopupMenu_AddSeparator( menus( it.Level - 1 ) )
+                else
+                    tkPopupMenu_AddItem( menus( it.Level - 1 ), n, it.Text, it.Key )
+                    if hasKids then
+                        menus( it.Level ) = tkPopupMenu_Create( w->pHost )
+                        tkPopupMenu_SetItemSubMenu( menus( it.Level - 1 ), n, menus( it.Level ) )
+                    end if
+                end if
+            end if
+        next
+    case catalog.ItemsKind.ItemsToolbar
+        dim as long n = 0
+        for each it as FormItem in c.Items
+            n += 1
+            tkToolbar_AddItem( w, codegen.ToolbarKindValue( it.Kind ), it.Glyph, it.Text, n )
+        next
+    case catalog.ItemsKind.ItemsStatus
+        dim as long n = 0
+        for each it as FormItem in c.Items
+            tkStatusBar_AddPanel( w, it.Text )
+            if it.Width then tkStatusBar_SetPanelMinWidth( w, n, it.Width )
+            n += 1
+        next
+    case catalog.ItemsKind.ItemsColumns
+        for each it as FormItem in c.Items
+            tkListTree_AddColumn( w, it.Text, iif( it.Width > 0, it.Width, 100 ) )
+        next
+    case catalog.ItemsKind.ItemsList
+        for each it as FormItem in c.Items
+            tkComboBox_AddItem( w, it.Text )
+        next
+    end select
+end sub
+
+' The real controls to where the model says, without rebuilding them: the feedback during a drag.
+sub FormCanvas.SyncGeometry( )
+    if Surface = 0 then exit sub
+    dim as codegen.Sizes sz
+    codegen.EffectiveSizes( Doc, sz )
+    tkLayout_AddContainer( Layout, Surface, Doc.ClientW, Doc.ClientH )
+    for i as long = 0 to Doc.Controls.Count( ) - 1
+        if i >= Widgets.Count( ) then exit for
+        dim as TK_WIDGET ptr w = Widgets[i]
+        if w = 0 then continue for
+        dim as FormControl c = Doc.Controls[i]
+        tkLayout_SetDesignRect( Layout, w, c.X, c.Y, c.W, c.H )
+        tkLayout_SetAnchor( Layout, w, c.Anchor )
+        tkLayout_SetDock( Layout, w, c.Dock )
+        dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
+        select case m->ContainerKind
+        case TKMETA_NOT_CONTAINER
+        case TKMETA_CONTAINER_PAGES
+            dim as long th = valint( SettingOr( c.Props, "TabHeight", "30" ) )
+            for p as long = 0 to c.Pages.Count( ) - 1
+                tkLayout_AddContainer( Layout, tkTabControl_GetPage( w, p ), sz.W[i], sz.H[i] - th )
+            next
+        case TKMETA_CONTAINER_GROUPBOX
+            tkLayout_AddContainer( Layout, w, sz.W[i], sz.H[i], @tkGroupBox_GetClientRect )
+        case TKMETA_CONTAINER_SCROLLPANEL
+            tkLayout_AddContainer( Layout, tkScrollPanel_GetPanel( w ), sz.W[i], sz.H[i] )
+        case else
+            tkLayout_AddContainer( Layout, w, sz.W[i], sz.H[i] )
+        end select
+    next
+    this.PlaceSurface( )
+end sub
+
+' The form in the frame, the scroll bars for what doesn't fit, the glass over it all.
+sub FormCanvas.PlaceSurface( )
+    if (Frame = 0) orelse (Surface = 0) then exit sub
+    if Live then
+        tkWidget_Show( HBar, false )
+        tkWidget_Show( VBar, false )
+        tkWidget_Show( Glass, false )
+        tkWidget_SetPos( Surface, 0, 0, Frame->cw, Frame->ch )
+        tkLayout_Apply( Layout )
+        exit sub
+    end if
+    dim as long fw = this.ToPixels( Doc.ClientW ), fh = this.ToPixels( Doc.ClientH )
+    dim as long m = this.ToPixels( MARGIN ), bar_ = this.ToPixels( BAR )
+    dim as long needW = fw + 2 * m, needH = fh + 2 * m
+    dim as long cw = Frame->cw, ch = Frame->ch
+    dim as boolean showV = needH > ch
+    dim as boolean showH = needW > (cw - iif( showV, bar_, 0 ))
+    if showH andalso (needH > ch - bar_) then showV = true
+    dim as long vw = iif( showV, bar_, 0 ), hh = iif( showH, bar_, 0 )
+    dim as long inW = cw - vw, inH = ch - hh
+    tkWidget_Show( HBar, showH )
+    tkWidget_Show( VBar, showV )
+    tkWidget_SetPos( HBar, 0, inH, inW, hh )
+    tkWidget_SetPos( VBar, inW, 0, vw, inH )
+    tkScrollBar_SetRange( HBar, needW, inW, tkScrollBar_GetPos( HBar ) )
+    tkScrollBar_SetRange( VBar, needH, inH, tkScrollBar_GetPos( VBar ) )
+    dim as long ox = iif( showH, tkScrollBar_GetPos( HBar ), 0 ), oy = iif( showV, tkScrollBar_GetPos( VBar ), 0 )
+    tkWidget_SetPos( Surface, m - ox, m - oy, fw, fh )
+    tkWidget_SetPos( Glass, 0, 0, inW, inH )
+    tkLayout_Apply( Layout )
+    tkWidget_Invalidate( Frame )
+end sub
+
+function FormCanvas.IsSelected( byref name_ as const ustring ) as boolean
+    dim as ustring want = lcase( name_ )
+    for each s as ustring in Selected
+        if lcase( s ) = want then return true
+    next
+    return false
+end function
+
+function FormCanvas.WidgetOf( byref name_ as const ustring ) as TK_WIDGET ptr
+    dim as long i = FindControl( Doc, name_ )
+    if (i < 0) orelse (i >= Widgets.Count( )) then return 0
+    return Widgets[i]
+end function
+
+' w's rectangle in Glass pixels.
+function FormCanvas.RectOf( byval w as TK_WIDGET ptr ) as TKRECT
+    dim as TKRECT rc, g
+    tkWidget_AbsRect( w, rc )
+    tkWidget_AbsRect( Glass, g )
+    tkRect_Offset( rc, -g.left, -g.top )
+    return rc
+end function
+
+function FormCanvas.SurfaceRect( ) as TKRECT
+    return this.RectOf( Surface )
+end function
+
+' Is w really on screen, not on a hidden tab page?
+function FormCanvas.Shows( byval w as TK_WIDGET ptr ) as boolean
+    while (w <> 0) andalso (w <> Surface)
+        if w->isVisible = false then return false
+        w = w->pParent
+    wend
+    return w = Surface
+end function
+
+' The topmost control at a point in Glass pixels: children come after their parents in the list.
+function FormCanvas.HitControl( byval x as long, byval y as long ) as long
+    dim as long i = Doc.Controls.Count( ) - 1
+    while i >= 0
+        dim as TK_WIDGET ptr w = 0
+        if i < Widgets.Count( ) then w = Widgets[i]
+        if (w <> 0) andalso this.Shows( w ) then
+            dim as TKRECT rc = this.RectOf( w )
+            if (x >= rc.left) andalso (x < rc.right) andalso (y >= rc.top) andalso (y < rc.bottom) then return i
+        end if
+        i -= 1
+    wend
+    return -1
+end function
+
+' Which edges control i's grips may move. A docked control can only change its thickness.
+function FormCanvas.GripsOf( byval i as long ) as long
+    select case Doc.Controls[i].Dock
+    case TK_DOCK_TOP    : return EDGE_B
+    case TK_DOCK_BOTTOM : return EDGE_T
+    case TK_DOCK_LEFT   : return EDGE_R
+    case TK_DOCK_RIGHT  : return EDGE_L
+    case TK_DOCK_FILL   : return 0
+    end select
+    return EDGE_L or EDGE_T or EDGE_R or EDGE_B
+end function
+
+private function NearEdge_( byval v as long, byval a as long, byval b as long, byval tol as long, byval lowBit as long, byval highBit as long ) as long
+    if abs( v - a ) <= tol then return lowBit
+    if abs( v - b ) <= tol then return highBit
+    if abs( v - (a + b) \ 2 ) <= tol then return -1     ' the middle grip
+    return 0
+end function
+
+' The EDGE_* bits of the grip at this point on the one selected control, 0 for none.
+function FormCanvas.HitGrip( byval x as long, byval y as long ) as long
+    if Selected.Count( ) <> 1 then return 0
+    dim as long i = FindControl( Doc, Selected[0] )
+    if (i < 0) orelse (i >= Widgets.Count( )) then return 0
+    if (Widgets[i] = 0) orelse (this.Shows( Widgets[i] ) = false) then return 0
+    dim as TKRECT rc = this.RectOf( Widgets[i] )
+    dim as long tol = this.ToPixels( GRIP_SIZE ) \ 2 + 1
+    dim as long gx = NearEdge_( x, rc.left, rc.right, tol, EDGE_L, EDGE_R )
+    dim as long gy = NearEdge_( y, rc.top, rc.bottom, tol, EDGE_T, EDGE_B )
+    if (gx = 0) orelse (gy = 0) then return 0
+    if (gx = -1) andalso (gy = -1) then return 0        ' the centre is no grip
+    if gx = -1 then gx = 0
+    if gy = -1 then gy = 0
+    dim as long allowed = this.GripsOf( i )
+    ' every edge this grip wants has to be free to move, or it's no grip at all
+    if ((gx or gy) and allowed) <> (gx or gy) then return 0
+    return gx or gy
+end function
+
+' The form's own grips: right, bottom, and the corner.
+function FormCanvas.HitFormGrip( byval x as long, byval y as long ) as long
+    dim as TKRECT rc = this.SurfaceRect( )
+    dim as long tol = this.ToPixels( GRIP_SIZE ) \ 2 + 1
+    dim as boolean onR = (abs( x - rc.right ) <= tol), onB = (abs( y - rc.bottom ) <= tol)
+    dim as boolean midX = (abs( x - (rc.left + rc.right) \ 2 ) <= tol), midY = (abs( y - (rc.top + rc.bottom) \ 2 ) <= tol)
+    if onR andalso onB then return EDGE_R or EDGE_B
+    if onR andalso midY then return EDGE_R
+    if onB andalso midX then return EDGE_B
+    return 0
+end function
+
+' Where a control dropped at this point belongs: which parent, which page, and the point in that
+' parent's design units.
+sub FormCanvas.PlaceAt( byval x as long, byval y as long, byref parent as ustring, byref page as long, byref dx as long, byref dy as long )
+    parent = ""
+    page = -1
+    dim as TKRECT base_ = this.SurfaceRect( )
+    dim as long i = this.HitControl( x, y )
+    while i >= 0
+        dim as TKMETA_CONTROL ptr m = catalog.Find( Doc.Controls[i].TypeName )
+        if m->ContainerKind <> TKMETA_NOT_CONTAINER then
+            parent = Doc.Controls[i].Name
+            dim as long pg = -1
+            if m->ContainerKind = TKMETA_CONTAINER_PAGES then
+                pg = tkTabControl_GetCurSel( Widgets[i] )
+                if pg < 0 then pg = 0
+                page = pg
+            end if
+            dim as TK_WIDGET ptr cw_
+            this.ContainerClient( i, iif( pg < 0, 0, pg ), cw_ )
+            base_ = this.RectOf( cw_ )
+            exit while
+        end if
+        i = FindControl( Doc, Doc.Controls[i].Parent )
+    wend
+    dx = this.ToDesign( x - base_.left )
+    dy = this.ToDesign( y - base_.top )
+end sub
+
+' ---- the mouse --------------------------------------------------------------------------------
+
+sub FormCanvas.OnPress( byval x as long, byval y as long, byval mods as long )
+    StartX = x : StartY = y : NowX = x : NowY = y
+    DragBase = Doc
+    if len( Tool ) then
+        Drag = DragDraw
+        dim as long dx, dy
+        this.PlaceAt( x, y, DrawParent, DrawPage, dx, dy )
+        tkWidget_Invalidate( Glass )
+        exit sub
+    end if
+    Grip = this.HitGrip( x, y )
+    if Grip then
+        Drag = DragResize
+        exit sub
+    end if
+    Grip = this.HitFormGrip( x, y )
+    if Grip then
+        Drag = DragFormResize
+        exit sub
+    end if
+    dim as long i = this.HitControl( x, y )
+    if i < 0 then
+        this.SelectNone( )
+        Drag = DragRubber
+        exit sub
+    end if
+    ' a click on another tab shows that page; the tab control is selected as well
+    dim as TKMETA_CONTROL ptr m = catalog.Find( Doc.Controls[i].TypeName )
+    if m->ContainerKind = TKMETA_CONTAINER_PAGES then
+        dim as TK_WIDGET ptr bar_ = tkTabControl_GetTabBar( Widgets[i] )
+        dim as TKRECT rc = this.RectOf( bar_ )
+        if (y >= rc.top) andalso (y < rc.bottom) then
+            dim as long t = tkTabBar_HitTest( bar_, x - rc.left, y - rc.top )
+            if (t >= 0) andalso (t <> tkTabControl_GetCurSel( Widgets[i] )) then this.SetPageOf( Doc.Controls[i].Name, t )
+        end if
+    end if
+    dim as ustring nm = Doc.Controls[i].Name
+    if mods and (SDL_KMOD_CTRL or SDL_KMOD_SHIFT or SDL_KMOD_GUI) then
+        if this.IsSelected( nm ) then
+            for k as long = 0 to Selected.Count( ) - 1
+                if lcase( Selected[k] ) = lcase( nm ) then
+                    Selected.Remove( k )
+                    exit for
+                end if
+            next
+            tkWidget_Invalidate( Glass )
+            this.Changed( )
+            exit sub                    ' what was just dropped from the selection doesn't drag
+        end if
+        Selected.Push( nm )
+        Pressed = ""
+        this.Changed( )
+    else
+        if this.IsSelected( nm ) = false then this.SelectOnly( nm )
+        Pressed = nm
+    end if
+    Drag = DragPressed
+    tkWidget_Invalidate( Glass )
+end sub
+
+sub FormCanvas.OnDragTo( byval x as long, byval y as long, byval mods as long )
+    NowX = x : NowY = y
+    dim as boolean noSnap = (mods and SDL_KMOD_ALT) <> 0
+    dim as long g = iif( SnapToGrid andalso (noSnap = false), GridSize, 1 )
+    dim as long dx = this.ToDesign( x - StartX ), dy = this.ToDesign( y - StartY )
+    select case Drag
+    case DragPressed
+        if (abs( x - StartX ) < DRAG_START) andalso (abs( y - StartY ) < DRAG_START) then exit sub
+        Drag = DragMove
+        this.OnDragTo( x, y, mods )
+    case DragMove
+        Doc = DragBase
+        dim as Array( of ustring ) tops = edits.TopLevelOf( Doc, Selected )
+        ' the first control lands on the grid; the rest keep their distance from it
+        dim as long ax = dx, ay = dy
+        if tops.Count( ) then
+            dim as long r = FindControl( Doc, tops[0] )
+            ax = edits.Snap( Doc.Controls[r].X + dx, g ) - Doc.Controls[r].X
+            ay = edits.Snap( Doc.Controls[r].Y + dy, g ) - Doc.Controls[r].Y
+        end if
+        for each s as ustring in tops
+            dim as long i = FindControl( Doc, s )
+            if Doc.Controls[i].Dock = TK_DOCK_NONE then
+                Doc.Controls[i].X += ax
+                Doc.Controls[i].Y += ay
+            end if
+        next
+        this.SyncGeometry( )
+        this.Changed( )                 ' the inspector's rows follow the mouse
+    case DragResize
+        Doc = DragBase
+        dim as long i = FindControl( Doc, Selected[0] )
+        dim as long l = Doc.Controls[i].X, t = Doc.Controls[i].Y
+        dim as long r = l + Doc.Controls[i].W, b = t + Doc.Controls[i].H
+        if Grip and EDGE_L then l = edits.Snap( l + dx, g )
+        if Grip and EDGE_R then r = edits.Snap( r + dx, g )
+        if Grip and EDGE_T then t = edits.Snap( t + dy, g )
+        if Grip and EDGE_B then b = edits.Snap( b + dy, g )
+        if r - l < MIN_SIZE then
+            if Grip and EDGE_L then l = r - MIN_SIZE else r = l + MIN_SIZE
+        end if
+        if b - t < MIN_SIZE then
+            if Grip and EDGE_T then t = b - MIN_SIZE else b = t + MIN_SIZE
+        end if
+        edits.ResizeControl( Doc, i, l, t, r - l, b - t )
+        this.SyncGeometry( )
+        this.Changed( )
+    case DragFormResize
+        Doc = DragBase
+        dim as long w = Doc.ClientW, h = Doc.ClientH
+        if Grip and EDGE_R then w = edits.Snap( w + dx, g )
+        if Grip and EDGE_B then h = edits.Snap( h + dy, g )
+        if w < 80 then w = 80
+        if h < 60 then h = 60
+        edits.ResizeForm( Doc, w, h )
+        this.SyncGeometry( )
+        this.Changed( )
+    case DragRubber, DragDraw
+        tkWidget_Invalidate( Glass )
+    end select
+end sub
+
+sub FormCanvas.OnRelease( byval x as long, byval y as long )
+    dim as long d_ = Drag
+    Drag = DragNone
+    select case d_
+    case DragPressed
+        ' pressed on one of several without dragging: the click was for that one
+        if (len( Pressed ) > 0) andalso (Selected.Count( ) > 1) then this.SelectOnly( Pressed )
+    case DragMove, DragResize, DragFormResize
+        this.Commit( )
+    case DragRubber
+        dim as long l = iif( x < StartX, x, StartX ), r = iif( x < StartX, StartX, x )
+        dim as long t = iif( y < StartY, y, StartY ), b = iif( y < StartY, StartY, y )
+        ' the top level of whatever the band started in
+        Selected.Clear( )
+        for i as long = 0 to Doc.Controls.Count( ) - 1
+            if (len( Doc.Controls[i].Parent ) = 0) andalso (i < Widgets.Count( )) then
+                if Widgets[i] then
+                    dim as TKRECT rc = this.RectOf( Widgets[i] )
+                    if (rc.left < r) andalso (rc.right > l) andalso (rc.top < b) andalso (rc.bottom > t) then Selected.Push( Doc.Controls[i].Name )
+                end if
+            end if
+        next
+        this.Changed( )
+    case DragDraw
+        dim as TKMETA_CONTROL ptr m = catalog.Find( Tool )
+        if m then
+            dim as ustring parent_
+            dim as long page_, px, py
+            this.PlaceAt( StartX, StartY, parent_, page_, px, py )
+            dim as long w = this.ToDesign( abs( x - StartX ) ), h = this.ToDesign( abs( y - StartY ) )
+            dim as long g = iif( SnapToGrid, GridSize, 1 )
+            ' a plain click gives the type's own size; a drag gives what was drawn
+            if (abs( x - StartX ) < DRAG_START) andalso (abs( y - StartY ) < DRAG_START) then
+                w = m->Width_
+                h = m->Height_
+                px = edits.Snap( px, g )
+                py = edits.Snap( py, g )
+            else
+                if x < StartX then px -= w
+                if y < StartY then py -= h
+                dim as long x2 = edits.Snap( px + w, g ), y2 = edits.Snap( py + h, g )
+                px = edits.Snap( px, g )
+                py = edits.Snap( py, g )
+                w = x2 - px
+                h = y2 - py
+                if w < MIN_SIZE then w = MIN_SIZE
+                if h < MIN_SIZE then h = MIN_SIZE
+            end if
+            dim as long i = edits.AddControl( Doc, Tool, parent_, page_, px, py, w, h )
+            if i >= 0 then
+                Tool = ""
+                this.SelectOnly( Doc.Controls[i].Name )
+                this.Rebuild( )
+                this.Commit( )
+            end if
+        end if
+    end select
+    tkWidget_Invalidate( Glass )
+end sub
+
+' A tool double-clicked in the Toolbox: one of its default size on the form, clear of any already
+' at the same spot. Each next one steps down and right, back to the corner once it would leave the form.
+function FormCanvas.PlaceDefault( byref typeName as const ustring ) as boolean
+    dim as TKMETA_CONTROL ptr m = catalog.Find( typeName )
+    if m = 0 then return false
+    dim as long stp = edits.Snap( PLACE_STEP, iif( SnapToGrid, GridSize, 1 ) )
+    dim as long px = stp, py = stp
+    dim as boolean taken = true
+    while taken
+        taken = false
+        for k as long = 0 to Doc.Controls.Count( ) - 1
+            if (len( Doc.Controls[k].Parent ) = 0) andalso (Doc.Controls[k].X = px) andalso (Doc.Controls[k].Y = py) then taken = true
+        next
+        if taken then
+            px += stp
+            py += stp
+            if (px + m->Width_ > Doc.ClientW) orelse (py + m->Height_ > Doc.ClientH) then
+                px = stp
+                py = stp
+                exit while
+            end if
+        end if
+    wend
+    dim as long i = edits.AddControl( Doc, typeName, "", -1, px, py, m->Width_, m->Height_ )
+    if i < 0 then return false
+    Tool = ""
+    this.SelectOnly( Doc.Controls[i].Name )
+    this.Rebuild( )
+    this.Commit( )
+    return true
+end function
+
+' A double click wires the default event: of the control under it, or of the form.
+sub FormCanvas.OnDoubleClick( byval x as long, byval y as long )
+    if OnWire = 0 then exit sub
+    dim as long i = this.HitControl( x, y )
+    if i >= 0 then
+        dim as ustring nm = Doc.Controls[i].Name
+        OnWire( Host, @this, nm, "", true )
+        exit sub
+    end if
+    dim as TKRECT rc = this.SurfaceRect( )
+    if (x >= rc.left) andalso (x < rc.right) andalso (y >= rc.top) andalso (y < rc.bottom) then OnWire( Host, @this, "", "", true )
+end sub
+
+sub FormCanvas.OnHover( byval x as long, byval y as long )
+    dim as long g = this.HitGrip( x, y )
+    if g = 0 then g = this.HitFormGrip( x, y )
+    dim as long c = TK_CURSOR_ARROW
+    select case g
+    case EDGE_L, EDGE_R : c = TK_CURSOR_SIZEWE
+    case EDGE_T, EDGE_B : c = TK_CURSOR_SIZENS
+    case EDGE_L or EDGE_T, EDGE_R or EDGE_B : c = TK_CURSOR_SIZENWSE
+    case EDGE_R or EDGE_T, EDGE_L or EDGE_B : c = TK_CURSOR_SIZENESW
+    end select
+    tkWidget_SetCursor( Glass, c )
+end sub
+
+' ---- the keyboard -----------------------------------------------------------------------------
+
+function FormCanvas.OnKey( byval key as long, byval mods as long ) as boolean
+    dim as boolean shift_ = (mods and SDL_KMOD_SHIFT) <> 0
+    dim as boolean ctrl_ = (mods and TK_KMOD_PRIMARY) <> 0
+    dim as long stp = iif( ctrl_, 1, GridSize )
+    select case key
+    case SDLK_LEFT  : this.Nudge( -stp, 0, shift_ )
+    case SDLK_RIGHT : this.Nudge( stp, 0, shift_ )
+    case SDLK_UP    : this.Nudge( 0, -stp, shift_ )
+    case SDLK_DOWN  : this.Nudge( 0, stp, shift_ )
+    case SDLK_DELETE, SDLK_BACKSPACE
+        this.DeleteSelection( )
+    case SDLK_TAB
+        this.SelectNext( shift_ = false )
+    case SDLK_ESCAPE
+        if len( Tool ) then
+            Tool = ""
+            this.Changed( )
+        else
+            this.SelectNone( )
+        end if
+        tkWidget_Invalidate( Glass )
+    case else
+        return false
+    end select
+    return true
+end function
+
+' ---- commands ---------------------------------------------------------------------------------
+
+sub FormCanvas.Commit( )
+    if OnCommit then OnCommit( Owner, formfile.Render( Doc ) )
+    this.Changed( )
+end sub
+
+sub FormCanvas.Changed( )
+    if OnChanged then OnChanged( Listener )
+end sub
+
+' An edit from the inspector, on a copy of the model. It stands if it leaves the form no worse;
+' otherwise the answer says what's wrong and nothing changes. newName: the selected control's, on a rename.
+function FormCanvas.ApplyEdit( byref trial as FormDoc, byval rebuildAll as boolean, byref newName as const ustring ) as ustring
+    dim as ustring fault = validate.FirstNewProblem( Doc, trial )
+    if len( fault ) then return fault
+    Doc = trial
+    if len( newName ) then Selected[0] = newName
+    if rebuildAll then
+        this.Rebuild( )
+    else
+        this.SyncGeometry( )
+    end if
+    this.Commit( )
+    tkWidget_Invalidate( Glass )
+    return ""
+end function
+
+' Selects a control, turning any tab page it's on to the front first.
+sub FormCanvas.RevealAndSelect( byref name_ as const ustring )
+    dim as long i = FindControl( Doc, name_ )
+    while i >= 0
+        dim as ustring parent_ = Doc.Controls[i].Parent
+        if len( parent_ ) = 0 then exit while
+        dim as long p = FindControl( Doc, parent_ )
+        if p < 0 then exit while
+        if Doc.Controls[i].Page >= 0 then this.SetPageOf( Doc.Controls[p].Name, Doc.Controls[i].Page )
+        i = p
+    wend
+    this.SelectOnly( name_ )
+end sub
+
+sub FormCanvas.SelectOnly( byref name_ as const ustring )
+    Selected.Clear( )
+    dim as ustring only_ = name_
+    Selected.Push( only_ )
+    tkWidget_Invalidate( Glass )
+    this.Changed( )
+end sub
+
+sub FormCanvas.SelectNone( )
+    Selected.Clear( )
+    tkWidget_Invalidate( Glass )
+    this.Changed( )
+end sub
+
+sub FormCanvas.SelectAll( )
+    Selected.Clear( )
+    for i as long = 0 to Doc.Controls.Count( ) - 1
+        if len( Doc.Controls[i].Parent ) = 0 then Selected.Push( Doc.Controls[i].Name )
+    next
+    tkWidget_Invalidate( Glass )
+    this.Changed( )
+end sub
+
+' Tab order is list order.
+sub FormCanvas.SelectNext( byval forward as boolean )
+    dim as long n = Doc.Controls.Count( )
+    if n = 0 then exit sub
+    dim as long i = -1
+    if Selected.Count( ) then i = FindControl( Doc, Selected[Selected.Count( ) - 1] )
+    if forward then i = (i + 1) mod n else i = iif( i <= 0, n - 1, i - 1 )
+    this.SelectOnly( Doc.Controls[i].Name )
+end sub
+
+sub FormCanvas.Nudge( byval dx as long, byval dy as long, byval resize_ as boolean )
+    if Selected.Count( ) = 0 then exit sub
+    for each s as ustring in edits.TopLevelOf( Doc, Selected )
+        dim as long i = FindControl( Doc, s )
+        if resize_ then
+            dim as long allowed = this.GripsOf( i )
+            dim as long w = Doc.Controls[i].W, h = Doc.Controls[i].H
+            if allowed and EDGE_R then w += dx
+            if allowed and EDGE_B then h += dy
+            if w < MIN_SIZE then w = MIN_SIZE
+            if h < MIN_SIZE then h = MIN_SIZE
+            edits.ResizeControl( Doc, i, Doc.Controls[i].X, Doc.Controls[i].Y, w, h )
+        elseif Doc.Controls[i].Dock = TK_DOCK_NONE then
+            Doc.Controls[i].X += dx
+            Doc.Controls[i].Y += dy
+        end if
+    next
+    this.SyncGeometry( )
+    this.Commit( )
+end sub
+
+sub FormCanvas.DeleteSelection( )
+    if Selected.Count( ) = 0 then exit sub
+    ' what the deleted controls' events call, with the parameters they'd have passed
+    dim as Array( of Setting ) gone
+    for i as long = 0 to Doc.Controls.Count( ) - 1
+        dim as boolean going = this.IsSelected( Doc.Controls[i].Name )
+        if going = false then
+            dim as ustring up = Doc.Controls[i].Parent
+            while (len( up ) > 0) andalso (going = false)
+                if this.IsSelected( up ) then going = true
+                dim as long p = FindControl( Doc, up )
+                if p < 0 then exit while
+                up = Doc.Controls[p].Parent
+            wend
+        end if
+        if going then
+            dim as TKMETA_CONTROL ptr m = catalog.Find( Doc.Controls[i].TypeName )
+            for each s as Setting in Doc.Controls[i].Events
+                dim as TKMETA_EVENT ptr e = tkMeta_FindEvent( m, s.Key )
+                if e then PutSetting( gone, s.Value, e->Params )
+            next
+            for each it as FormItem in Doc.Controls[i].Items
+                if len( it.Handler ) then PutSetting( gone, it.Handler, "" )
+            next
+        end if
+    next
+    edits.DeleteControls( Doc, Selected )
+    Selected.Clear( )
+    for each s as Setting in gone
+        ' one a surviving control still calls isn't gone at all
+        dim as boolean inUse = false
+        for each ev as Setting in Doc.Events
+            if lcase( ev.Value ) = lcase( s.Key ) then inUse = true
+        next
+        for each k as FormControl in Doc.Controls
+            for each ev as Setting in k.Events
+                if lcase( ev.Value ) = lcase( s.Key ) then inUse = true
+            next
+            for each it as FormItem in k.Items
+                if lcase( it.Handler ) = lcase( s.Key ) then inUse = true
+            next
+        next
+        if (inUse = false) andalso (OnHandlerGone <> 0) then
+            if OnHandlerGone( Host, @this, s.Key ) then
+                dim as FormOrphan o
+                o.Handler = s.Key
+                o.Params = s.Value
+                Doc.Orphans.Push( o )
+            end if
+        end if
+    next
+    this.Rebuild( )
+    this.Commit( )
+end sub
+
+sub FormCanvas.Copy( )
+    dim as ustring t = edits.CopyText( Doc, Selected )
+    if len( t ) then tkHost_SetClipboardText( t )
+end sub
+
+sub FormCanvas.Cut( )
+    this.Copy( )
+    this.DeleteSelection( )
+end sub
+
+' Into the one selected container, else beside what's selected on the form, a grid step along.
+sub FormCanvas.Paste( )
+    dim as ustring parent_
+    dim as long page_ = -1
+    if Selected.Count( ) = 1 then
+        dim as long i = FindControl( Doc, Selected[0] )
+        dim as TKMETA_CONTROL ptr m = catalog.Find( Doc.Controls[i].TypeName )
+        if m->ContainerKind <> TKMETA_NOT_CONTAINER then
+            parent_ = Doc.Controls[i].Name
+            if m->ContainerKind = TKMETA_CONTAINER_PAGES then page_ = tkTabControl_GetCurSel( Widgets[i] )
+        else
+            parent_ = Doc.Controls[i].Parent
+            page_ = Doc.Controls[i].Page
+        end if
+    end if
+    dim as Array( of ustring ) added
+    if edits.PasteText( Doc, tkHost_GetClipboardText( ), parent_, page_, GridSize, GridSize, added ) = false then exit sub
+    Selected = added
+    this.Rebuild( )
+    this.Commit( )
+end sub
+
+sub FormCanvas.Align( byval mode as edits.AlignMode )
+    edits.AlignControls( Doc, Selected, mode )
+    this.SyncGeometry( )
+    this.Commit( )
+end sub
+
+sub FormCanvas.ToFront( )
+    if Selected.Count( ) = 0 then exit sub
+    edits.BringToFront( Doc, Selected )
+    this.Rebuild( )
+    this.Commit( )
+end sub
+
+sub FormCanvas.ToBack( )
+    if Selected.Count( ) = 0 then exit sub
+    edits.SendToBack( Doc, Selected )
+    this.Rebuild( )
+    this.Commit( )
+end sub
+
+' Shows one page of a tab control on the canvas.
+sub FormCanvas.SetPageOf( byref name_ as const ustring, byval page as long )
+    dim as TK_WIDGET ptr w = this.WidgetOf( name_ )
+    if w then tkTabControl_SetCurSel( w, page )
+    PutSetting( PagesShown, lcase( name_ ), str( page ) )
+    tkLayout_Apply( Layout )
+    tkWidget_Invalidate( Glass )
+end sub
+
+' ---- painting ---------------------------------------------------------------------------------
+
+sub FormCanvas.PaintSurface( byval b as TK_PAINT ptr )
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, Surface->cw, Surface->ch )
+    b->SetBackColor( tkTheme_Get( ).Window )
+    b->PaintRect( @rc )
+    dim as long stp = this.ToPixels( GridSize )
+    if Live orelse (SnapToGrid = false) orelse (stp < 4) then exit sub
+    b->SetBackColor( tkTheme_Get( ).Divider )
+    dim as long y = stp
+    while y < Surface->ch
+        dim as long x = stp
+        while x < Surface->cw
+            dim as TKRECT d
+            tkRect_Set( d, x, y, x + 1, y + 1 )
+            b->PaintRect( @d )
+            x += stp
+        wend
+        y += stp
+    wend
+end sub
+
+private sub PaintGrip_( byval b as TK_PAINT ptr, byval x as long, byval y as long, byval sz as long, byval fill_ as ulong, byval edge_ as ulong )
+    dim as TKRECT g
+    tkRect_Set( g, x - sz \ 2, y - sz \ 2, x - sz \ 2 + sz, y - sz \ 2 + sz )
+    b->SetBackColor( fill_ )
+    b->PaintRect( @g )
+    b->SetPenColor( edge_ )
+    b->PaintBorderRect( @g )
+end sub
+
+sub FormCanvas.Paint( byval b as TK_PAINT ptr )
+    if Surface = 0 then exit sub
+    dim as TKTHEME_COLORS t = tkTheme_Get( )
+    dim as long sz = this.ToPixels( GRIP_SIZE )
+
+    ' the form's grips, and a line around it
+    dim as TKRECT sr = this.SurfaceRect( )
+    b->SetPenColor( t.Border )
+    b->PaintRoundOutline( @sr, 0, 1 )     ' an outline: PaintBorderRect would fill the form
+    PaintGrip_( b, sr.right, (sr.top + sr.bottom) \ 2, sz, t.Surface, t.Border )
+    PaintGrip_( b, (sr.left + sr.right) \ 2, sr.bottom, sz, t.Surface, t.Border )
+    PaintGrip_( b, sr.right, sr.bottom, sz, t.Surface, t.Border )
+
+    for k as long = 0 to Selected.Count( ) - 1
+        dim as long i = FindControl( Doc, Selected[k] )
+        if (i < 0) orelse (i >= Widgets.Count( )) then continue for
+        if (Widgets[i] = 0) orelse (this.Shows( Widgets[i] ) = false) then continue for
+        dim as TKRECT rc = this.RectOf( Widgets[i] )
+        ' the control others line up against is the solid one
+        dim as ulong fill_ = iif( k = 0, t.Accent, t.Window )
+        b->SetPenColor( t.Accent )
+        b->PaintRoundOutline( @rc, 0, 1 )
+        dim as long allowed = this.GripsOf( i )
+        dim as long mx = (rc.left + rc.right) \ 2, my = (rc.top + rc.bottom) \ 2
+        if (allowed and EDGE_L) andalso (allowed and EDGE_T) then PaintGrip_( b, rc.left, rc.top, sz, fill_, t.Accent )
+        if allowed and EDGE_T then PaintGrip_( b, mx, rc.top, sz, fill_, t.Accent )
+        if (allowed and EDGE_R) andalso (allowed and EDGE_T) then PaintGrip_( b, rc.right, rc.top, sz, fill_, t.Accent )
+        if allowed and EDGE_L then PaintGrip_( b, rc.left, my, sz, fill_, t.Accent )
+        if allowed and EDGE_R then PaintGrip_( b, rc.right, my, sz, fill_, t.Accent )
+        if (allowed and EDGE_L) andalso (allowed and EDGE_B) then PaintGrip_( b, rc.left, rc.bottom, sz, fill_, t.Accent )
+        if allowed and EDGE_B then PaintGrip_( b, mx, rc.bottom, sz, fill_, t.Accent )
+        if (allowed and EDGE_R) andalso (allowed and EDGE_B) then PaintGrip_( b, rc.right, rc.bottom, sz, fill_, t.Accent )
+    next
+
+    if (Drag = DragRubber) orelse (Drag = DragDraw) then
+        dim as TKRECT band
+        tkRect_Set( band, iif( NowX < StartX, NowX, StartX ), iif( NowY < StartY, NowY, StartY ), _
+                    iif( NowX < StartX, StartX, NowX ), iif( NowY < StartY, StartY, NowY ) )
+        b->SetPenColor( t.Accent )
+        b->PaintRoundOutline( @band, 0, 1 )
+    end if
+end sub

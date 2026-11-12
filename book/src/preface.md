@@ -15,7 +15,7 @@ would surprise someone who knows it, a sidebar says so.
 
 ## The version this book describes
 
-Every program in this book was compiled and run, on Windows and on Linux, with one pinned
+Every program in this book was compiled and run, on Windows, Linux and macOS wherever it applies, with one pinned
 version of the compiler. The pin, and the exact toolchains, are recorded in the book's
 repository.
 

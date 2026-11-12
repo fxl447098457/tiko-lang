@@ -187,5 +187,5 @@ source never uses, which is why the last check runs the suite.
   established by compiling a program with fbc and with tiko and comparing the results. The source
   carries the measurement beside the code that depends on it, so a later change has to argue with
   it.
-- **This book's listings**, compiled and run on both targets against the pinned toolchain before
+- **This book's listings**, compiled and run on every target against the pinned toolchain before
   each release of the book.

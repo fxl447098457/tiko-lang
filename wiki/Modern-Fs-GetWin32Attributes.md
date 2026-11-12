@@ -2,7 +2,7 @@
 
 # GetWin32Attributes
 
-Returns a file's raw Windows attribute flags; fails as unsupported on Linux.
+Returns a file's raw Windows attribute flags; fails as unsupported on Linux and macOS.
 
 ## Syntax
 

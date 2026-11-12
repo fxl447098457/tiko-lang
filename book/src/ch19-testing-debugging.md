@@ -84,7 +84,7 @@ summary the other way round:
 ```
 
 Each `SUITE` registers itself with a module constructor, and module constructors run in the order
-each platform's start-up code walks them — declaration order on Linux, the reverse on Windows,
+each platform's start-up code walks them — declaration order on Linux and macOS, the reverse on Windows,
 exactly as fbc does it. Nothing is wrong while every test stands alone. A test that quietly relies
 on state an earlier suite left behind — a file it wrote, a global it set — passes on one platform
 and fails on the other. Give every test its own setup.

@@ -117,8 +117,8 @@ to one name.
 
 `NameMatches` passes `fs.MatchPattern` a grammar, **`fs.FB_PATH_POSIX`**, rather than leaving it
 the default. The default is the platform's own grammar, which ignores case on Windows and respects
-it on Linux, so `-g "*.TXT"` would find `todo.txt` on one and not on the other. With the POSIX
-grammar named, case matters on both, and the same glob gives the same answer.
+it on Linux and macOS, so `-g "*.TXT"` would find `todo.txt` on one and not on another. With the POSIX
+grammar named, case matters on every platform, and the same glob gives the same answer.
 
 A failed entry — a directory that cannot be opened, or a root that does not exist — becomes a
 message in `problems`, so the program can report it and still search everything else. The message
@@ -131,7 +131,7 @@ system lists a directory in whatever order it likes, and that order differs betw
 Linux; a tool whose output changes between runs on the same files is a tool whose output cannot be
 compared. Sorting the native paths would not be enough, because `\` sorts after the capital
 letters and `/` before the digits: `d\f.txt` comes after `dA\f.txt`, but `d/f.txt` before it. So
-each path goes through `DisplayPath` first, and the sort sees the same strings on both platforms.
+each path goes through `DisplayPath` first, and the sort sees the same strings on every platform.
 Windows accepts `/` as a separator, so the display path is also the one the program opens.
 
 `FindFiles` appends what it finds to `files`, in that order, and returns how many it appended,
@@ -153,7 +153,7 @@ no error number to check separately and no runtime error to trap.
 ```
 
 `DisplayPath` is the last piece of the "same output everywhere" promise: Windows writes `\` between
-path components, and the tool prints `/` on both. It converts only on Windows. On Linux `\` is an
+path components, and the tool prints `/` everywhere. It converts only on Windows. On Linux and macOS `\` is an
 ordinary character a file name may contain — `a\b.txt` is one file — and printing it as `a/b.txt`
 would name a different one. It is not `public`: `FindFiles` applies it, and nothing outside the
 module needs to.
@@ -175,7 +175,7 @@ The program colours only when it is false, so `tsearch fox > hits.txt` writes pl
 person at a terminal sees the file names in magenta, in `-l` output as well. The colour itself is
 an ANSI escape sequence, `ESC [35m` to start and `ESC [0m` to stop.
 
-A Linux terminal draws those sequences as they arrive. A Windows console draws them only once it
+A Linux or macOS terminal draws those sequences as they arrive. A Windows console draws them only once it
 has been asked to, and the runtime does not ask on the program's behalf, so `ColourWanted` does:
 it switches on the console's virtual-terminal mode through **`windows.bi`**, the Windows API
 header, and gives up colour if the console refuses. `windows.bi` does not name the
@@ -197,7 +197,7 @@ Run from the chapter's directory as `tsearch -n -i fox sample`:
 {{#include ../examples/ch33/tsearch.out}}
 ```
 
-A few more runs, on either platform, with the exit code after each:
+A few more runs, on any platform, with the exit code after each:
 
 ```text
 $ tsearch -l -g "*.txt" fox sample
@@ -247,7 +247,7 @@ On Windows:
 {{#include ../examples/ch33/searchtests.windows-x86_64.out}}
 ```
 
-On Linux the same suites run in another order (Chapter 19):
+On Linux and macOS the same suites run in another order (Chapter 19):
 
 ```text
 {{#include ../examples/ch33/searchtests.out}}
@@ -281,14 +281,14 @@ comparing its output and exit code with what they should be.
 - Parse arguments from an array into an options record, counting to `__FB_ARGC__`, and report
   problems as messages; refuse unknown options and empty arguments.
 - `fs.WalkDir` and `fs.MatchPattern` find the files; name the POSIX grammar for the same glob
-  answer on both platforms, and sort the paths as printed for the same order. `fs.ReadAllLines`
+  answer on every platform, and sort the paths as printed for the same order. `fs.ReadAllLines`
   returns a `Result` whose `FsError` says why a file could not be read, and `Path( )` which file.
 - `lcase` lowers letters beyond ASCII one character at a time; it is not full case folding.
 - On Windows the runtime expands `*` and `?` in arguments even inside quotes; write one character
   of a glob as a class, `*.tx[t]`, to get it through.
 - Diagnostics go to stderr; `IsRedirected( )` decides about colour, and a Windows console needs
   its virtual-terminal mode switched on first; the exit code — 0, 1 or 2 — says what happened.
-- fbcunit tests the module's procedures one by one, on both platforms.
+- fbcunit tests the module's procedures one by one, on every platform.
 
 ## Exercises
 

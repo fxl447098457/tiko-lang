@@ -61,30 +61,30 @@ More powerful filtering can be done by checking the returned `out_attrib` for sp
 
 *The item cannot be written to or deleted.*
  **DOS & Windows**: The item has the "read-only" attribute set.
- **Linux**:The item has no write permissions associated with the current user or group, nor is it globally writable. (Whether or not the user has root permissions is ignored.)
+ **Linux and macOS**:The item has no write permissions associated with the current user or group, nor is it globally writable. (Whether or not the user has root permissions is ignored.)
 
 `# define fbHidden &h02`
 
 *The item is hidden in ordinary directory listings.*
  **DOS & Windows**: The item has the "hidden" attribute set.
- **Linux**: The item's name has a period (`.`) as the first character.
+ **Linux and macOS**: The item's name has a period (`.`) as the first character.
 
 `# define fbSystem &h04`
 
 *The item is used almost exclusively by the system.*
  **DOS & Windows**: The item has the "system" attribute set.
- **Linux**: The item is either a character device, block device, named pipe (FIFO) or Unix socket.
+ **Linux and macOS**: The item is either a character device, block device, named pipe (FIFO) or Unix socket.
 
 `# define fbDirectory &h10`
 
 *The item is a directory. Includes the current (`.`) and parent (`..`) directories as well.*
- **DOS & Windows & Linux**: The item is a directory.
+ **DOS & Windows & Linux & macOS**: The item is a directory.
 
 `# define fbArchive &h20`
 
 *The item may be backed up after some automated operations.*
  **DOS & Windows**: The item has the "archive" attribute set (automatically set after every write access to a file).
- **Linux**: The item is not a directory; typical filesystems do not support this metadata.
+ **Linux and macOS**: The item is not a directory; typical filesystems do not support this metadata.
 
 `# define fbNormal (fbReadOnly or fbArchive)`
 
@@ -118,8 +118,8 @@ result = Dir( [ p_out_attrib ] )
 
 ### Platform Differences
 
-- Linux requires the `filename` case to match the real name of the file. Windows and DOS are case insensitive.
-  Path separators in Linux are forward slashes `/`. Windows uses backslashes `\` but it allows for forward slashes. DOS uses backslashes.  
+- Linux requires the `filename` case to match the real name of the file. Windows, DOS and a default macOS volume are case insensitive.
+  Path separators in Linux and macOS are forward slashes `/`. Windows uses backslashes `\` but it allows for forward slashes. DOS uses backslashes.  
   In DOS, the attrib mask value of `&h37` (`&h3F` usually works also, but `&h37` is safer) returns all files and directories, including "." and "..", but no Volume: the value `8` returns the Volume, even if current directory is not the main directory.
 
 ### Dialect Differences

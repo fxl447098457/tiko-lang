@@ -1,0 +1,326 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkLabel -- static text. One line (cut with an ellipsis when it does not fit, if asked) or wrapped
+' to the control's width. Never a tab stop. A click is reported when a callback is set; without one
+' the label takes no mouse input of its own.
+#module "tkLabel"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+using tkHost
+using tkPaint
+using tkTheme
+
+public enum
+    LBL_ALIGN_LEFT = 0
+    LBL_ALIGN_CENTER
+    LBL_ALIGN_RIGHT
+end enum
+
+public enum
+    LBL_VALIGN_TOP = 0
+    LBL_VALIGN_CENTER
+    LBL_VALIGN_BOTTOM
+end enum
+
+public type TKLABEL_COLORS
+    TextColor         as ulong
+    TextColorDisabled as ulong
+    BackColor         as ulong
+end type
+
+public type LBL_ClickCallbackSub as sub( byval hLabel as TK_WIDGET ptr, byval id as long )
+
+public type TKLABEL_STATE
+    hWin          as TK_WIDGET ptr
+    id            as long
+    text          as ustring
+    pFont         as TTF_Font ptr
+    colors        as TKLABEL_COLORS
+    bColorsPinned as boolean
+    bTransparent  as boolean = true
+    bWrap         as boolean
+    bEllipsis     as boolean
+    bAutoSize     as boolean
+    bPressed      as boolean
+    nAlign        as long = LBL_ALIGN_LEFT
+    nVAlign       as long = LBL_VALIGN_CENTER
+    ClickCallback as LBL_ClickCallbackSub
+    declare function Font() as TTF_Font ptr
+    declare sub Ideal( byref nW as long, byref nH as long )
+    declare sub Changed()
+end type
+
+public declare function tkLabel_ThemeColors( byref t as TKTHEME_COLORS ) as TKLABEL_COLORS
+public declare sub tkLabel_ApplyTheme( byval hLabel as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+private function GetLabelPointer( byval h as TK_WIDGET ptr ) as TKLABEL_STATE ptr
+    if h = 0 then return 0
+    return cast( TKLABEL_STATE ptr, h->pData )
+end function
+
+function TKLABEL_STATE.Font() as TTF_Font ptr
+    if this.pFont then return this.pFont
+    if this.hWin andalso this.hWin->pHost then return this.hWin->pHost->pDefaultFont
+    return 0
+end function
+
+' A wrapped label's ideal width is its current one: only the height depends on the text.
+sub TKLABEL_STATE.Ideal( byref nW as long, byref nH as long )
+    dim as TTF_Font ptr f = this.Font()
+    nW = 0 : nH = 0
+    if f = 0 then exit sub
+    if this.bWrap then
+        nW = this.hWin->cw
+        nH = iif( len( this.text ) > 0, tkText_MeasureWrapped( f, this.text, nW ), TTF_GetFontHeight( f ) )
+    else
+        nW = tkText_Width( f, this.text )
+        nH = TTF_GetFontHeight( f )
+    end if
+end sub
+
+sub TKLABEL_STATE.Changed()
+    if this.bAutoSize then
+        dim as long nW, nH
+        this.Ideal( nW, nH )
+        tkWidget_SetPos( this.hWin, this.hWin->x, this.hWin->y, nW, nH )
+    end if
+    tkWidget_Invalidate( this.hWin )
+end sub
+
+private sub tkLabel_OnPaint( byval p as TKLABEL_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, p->hWin->cw, p->hWin->ch )
+    if p->bTransparent = false then
+        b->SetBackColor( p->colors.BackColor )
+        b->PaintRect( @rc )
+    end if
+    dim as TTF_Font ptr f = p->Font()
+    if (f = 0) orelse (len( p->text ) = 0) then exit sub
+    b->SetFont( f )
+    b->SetForeColor( iif( tkWidget_IsEnabled( p->hWin ), p->colors.TextColor, p->colors.TextColorDisabled ) )
+    dim as long flags = p->nAlign
+    select case p->nVAlign
+    case LBL_VALIGN_TOP    : flags or= TK_DT_TOP
+    case LBL_VALIGN_BOTTOM : flags or= TK_DT_BOTTOM
+    case else              : flags or= TK_DT_VCENTER
+    end select
+    if p->bWrap then
+        b->PaintTextEx( p->text, @rc, flags or TK_DT_WORDBREAK )
+    else
+        if p->bEllipsis then flags or= TK_DT_ELLIPSIS
+        b->PaintText( p->text, @rc, flags )
+    end if
+end sub
+
+private function tkLabel_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        tkLabel_OnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_THEMECHANGED
+        tkLabel_ApplyTheme( w, tkTheme_Get() )
+        return true
+    case TKM_LBUTTONDOWN
+        if p->ClickCallback = 0 then return false
+        tkHost_SetCapture( w )
+        p->bPressed = true
+        return true
+    case TKM_LBUTTONUP
+        if p->bPressed = false then return false
+        p->bPressed = false
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        if (m->x >= 0) andalso (m->x < w->cw) andalso (m->y >= 0) andalso (m->y < w->ch) then
+            if p->ClickCallback then p->ClickCallback( w, p->id )
+        end if
+        return true
+    case TKM_CAPTURECHANGED
+        p->bPressed = false
+        return true
+    case TKM_DESTROY
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+public function tkLabel_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKLABEL_STATE ptr p = new TKLABEL_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @tkLabel_Proc, p )
+    p->hWin = w
+    p->colors = tkLabel_ThemeColors( tkTheme_Get() )
+    return w
+end function
+
+public function tkLabel_GetText( byval h as TK_WIDGET ptr ) as ustring
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then return ""
+    return p->text
+end function
+
+public sub tkLabel_SetText( byval h as TK_WIDGET ptr, byref s as const ustring )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->text = s
+    p->Changed()
+end sub
+
+' Borrowed: the font must outlive the label. 0 returns to the surface's default.
+public sub tkLabel_SetFont( byval h as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->pFont = f
+    p->Changed()
+end sub
+
+public function tkLabel_GetFont( byval h as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->pFont, cast( TTF_Font ptr, 0 ) )
+end function
+
+public function tkLabel_GetAlign( byval h as TK_WIDGET ptr ) as long
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->nAlign, LBL_ALIGN_LEFT )
+end function
+
+public sub tkLabel_SetAlign( byval h as TK_WIDGET ptr, byval nAlign as long )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if (p = 0) orelse (nAlign < LBL_ALIGN_LEFT) orelse (nAlign > LBL_ALIGN_RIGHT) then exit sub
+    p->nAlign = nAlign
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkLabel_GetVAlign( byval h as TK_WIDGET ptr ) as long
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->nVAlign, LBL_VALIGN_CENTER )
+end function
+
+public sub tkLabel_SetVAlign( byval h as TK_WIDGET ptr, byval nVAlign as long )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if (p = 0) orelse (nVAlign < LBL_VALIGN_TOP) orelse (nVAlign > LBL_VALIGN_BOTTOM) then exit sub
+    p->nVAlign = nVAlign
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkLabel_GetWordWrap( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->bWrap, false )
+end function
+
+public sub tkLabel_SetWordWrap( byval h as TK_WIDGET ptr, byval bWrap as boolean )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->bWrap = bWrap
+    p->Changed()
+end sub
+
+public function tkLabel_GetEllipsis( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->bEllipsis, false )
+end function
+
+public sub tkLabel_SetEllipsis( byval h as TK_WIDGET ptr, byval bEllipsis as boolean )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->bEllipsis = bEllipsis
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkLabel_GetAutoSize( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->bAutoSize, false )
+end function
+
+' When on, the control resizes to its text whenever the text, font or wrapping changes.
+public sub tkLabel_SetAutoSize( byval h as TK_WIDGET ptr, byval bAutoSize as boolean )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->bAutoSize = bAutoSize
+    p->Changed()
+end sub
+
+public sub tkLabel_GetIdealSize( byval h as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    nWidth = 0 : nHeight = 0
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p then p->Ideal( nWidth, nHeight )
+end sub
+
+public function tkLabel_GetTextColor( byval h as TK_WIDGET ptr ) as ulong
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->colors.TextColor, 0ul )
+end function
+
+' A host-chosen colour survives a theme change; tkLabel_UnpinColors hands it back.
+public sub tkLabel_SetTextColor( byval h as TK_WIDGET ptr, byval clr as ulong )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->colors.TextColor = clr
+    p->bColorsPinned = true
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkLabel_GetBackColor( byval h as TK_WIDGET ptr ) as ulong
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->colors.BackColor, 0ul )
+end function
+
+' Also turns the background on.
+public sub tkLabel_SetBackColor( byval h as TK_WIDGET ptr, byval clr as ulong )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->colors.BackColor = clr
+    p->bColorsPinned = true
+    p->bTransparent = false
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkLabel_GetTransparent( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    return iif( p <> 0, p->bTransparent, true )
+end function
+
+public sub tkLabel_SetTransparent( byval h as TK_WIDGET ptr, byval bTransparent as boolean )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->bTransparent = bTransparent
+    tkWidget_Invalidate( h )
+end sub
+
+public sub tkLabel_SetClickCallback( byval h as TK_WIDGET ptr, byval usersub as LBL_ClickCallbackSub )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p then p->ClickCallback = usersub
+end sub
+
+public function tkLabel_ThemeColors( byref t as TKTHEME_COLORS ) as TKLABEL_COLORS
+    dim as TKLABEL_COLORS c
+    c.TextColor = t.Text
+    c.TextColorDisabled = t.TextDisabled
+    c.BackColor = t.Window
+    return c
+end function
+
+public sub tkLabel_ApplyTheme( byval h as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    p->colors = tkLabel_ThemeColors( t )
+    tkWidget_Invalidate( h )
+end sub
+
+public sub tkLabel_UnpinColors( byval h as TK_WIDGET ptr )
+    dim as TKLABEL_STATE ptr p = GetLabelPointer( h )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkLabel_ApplyTheme( h, tkTheme_Get() )
+end sub

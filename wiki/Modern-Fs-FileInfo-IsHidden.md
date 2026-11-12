@@ -2,7 +2,7 @@
 
 # FileInfo.IsHidden
 
-Returns true if the file is hidden: the hidden flag on Windows, a leading dot on Linux.
+Returns true if hidden: the hidden flag on Windows, a leading dot on Linux and macOS.
 
 ## Syntax
 

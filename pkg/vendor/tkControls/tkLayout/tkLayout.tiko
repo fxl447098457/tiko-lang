@@ -1,0 +1,369 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkLayout -- automatic position and size for the controls of a form: an Anchor or a Dock each.
+' Positions are DESIGN UNITS, scaled at apply time, so one layout serves every DPI. The arithmetic
+' is one pure procedure (tkLayout_Compute), which a form designer's canvas and a running program
+' share, so they cannot disagree.
+'
+' Coordinates are relative to the parent widget's origin. An ANCHOR keeps an edge's distance from
+' the matching edge of the parent: left and top by default, right and bottom when named, both of
+' an axis to stretch, neither to stay centred as the parent grows. A DOCK takes a slice off the
+' parent's remaining client area, in list order; FILL takes what is left after every other dock.
+#module "tkLayout"
+
+#import "../tkHost" public
+#import "../tkSplitter" public
+using tkHost
+using tkPaint
+using tkSplitter
+
+public const as long TK_ANCHOR_NONE   = 0
+public const as long TK_ANCHOR_LEFT   = 1
+public const as long TK_ANCHOR_TOP    = 2
+public const as long TK_ANCHOR_RIGHT  = 4
+public const as long TK_ANCHOR_BOTTOM = 8
+public const as long TK_ANCHOR_DEFAULT = TK_ANCHOR_LEFT or TK_ANCHOR_TOP
+
+public enum
+    TK_DOCK_NONE = 0
+    TK_DOCK_TOP
+    TK_DOCK_BOTTOM
+    TK_DOCK_LEFT
+    TK_DOCK_RIGHT
+    TK_DOCK_FILL
+end enum
+
+' One control: its design rectangle and how it follows its parent.
+public type TKLAYOUT_ITEM
+    x      as long
+    y      as long
+    cx     as long
+    cy     as long
+    anchor as long = TK_ANCHOR_DEFAULT
+    dock   as long = TK_DOCK_NONE
+end type
+
+' A container whose docks use less than its whole area (a group box's frame). Answers the client
+' rectangle in the container's own pixels. tkGroupBox_GetClientRect has this shape.
+public type TKLAYOUT_ClientFunc as function( byval w as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+
+public type TKLAYOUT_ENTRY
+    w      as TK_WIDGET ptr
+    item   as TKLAYOUT_ITEM
+end type
+
+public type TKLAYOUT_CONTAINER
+    w        as TK_WIDGET ptr
+    designW  as long
+    designH  as long
+    clientFn as TKLAYOUT_ClientFunc
+end type
+
+public type TK_LAYOUT
+    entries( any )    as TKLAYOUT_ENTRY
+    nEntries          as long
+    containers( any ) as TKLAYOUT_CONTAINER
+    nContainers       as long
+end type
+
+type TKLAYOUT_BIND
+    l     as TK_LAYOUT ptr
+    split as TK_WIDGET ptr
+    pane  as TK_WIDGET ptr
+end type
+
+dim shared as TKLAYOUT_BIND gBinds( any )
+dim shared as long gnBinds
+
+private function Sc_( byval v as long, byval s as single ) as long
+    return cint( v * s )
+end function
+
+private sub Axis_( byval pos_ as long, byval size as long, byval bNear as boolean, byval bFar as boolean, _
+                   byval delta as long, byval s as single, byref a as long, byref b as long )
+    a = Sc_( pos_, s )
+    b = Sc_( pos_ + size, s )
+    if bNear andalso bFar then
+        b += delta
+    elseif bFar then
+        a += delta
+        b += delta
+    elseif bNear = false then
+        a += delta \ 2
+        b += delta \ 2
+    end if
+    if b < a then b = a
+end sub
+
+' The whole layout rule. rcDock is the area docks may take, in the parent's pixels; designW/H are
+' the parent's size the design rectangles were laid out against; cw/ch its size now.
+public sub tkLayout_Compute( byval items as TKLAYOUT_ITEM ptr, byval n as long, _
+                             byval designW as long, byval designH as long, _
+                             byval cw as long, byval ch as long, byref rcDock as TKRECT, _
+                             byval fScale as single, byval rcOut as TKRECT ptr )
+    if (items = 0) orelse (rcOut = 0) then exit sub
+    dim as long dx = cw - Sc_( designW, fScale )
+    dim as long dy = ch - Sc_( designH, fScale )
+    dim as TKRECT rem_ = rcDock
+
+    for i as long = 0 to n - 1
+        with items[i]
+            select case .dock
+            case TK_DOCK_TOP
+                dim as long b = rem_.top + Sc_( .cy, fScale )
+                if b > rem_.bottom then b = rem_.bottom
+                tkRect_Set( rcOut[i], rem_.left, rem_.top, rem_.right, b )
+                rem_.top = b
+            case TK_DOCK_BOTTOM
+                dim as long t = rem_.bottom - Sc_( .cy, fScale )
+                if t < rem_.top then t = rem_.top
+                tkRect_Set( rcOut[i], rem_.left, t, rem_.right, rem_.bottom )
+                rem_.bottom = t
+            case TK_DOCK_LEFT
+                dim as long r = rem_.left + Sc_( .cx, fScale )
+                if r > rem_.right then r = rem_.right
+                tkRect_Set( rcOut[i], rem_.left, rem_.top, r, rem_.bottom )
+                rem_.left = r
+            case TK_DOCK_RIGHT
+                dim as long l = rem_.right - Sc_( .cx, fScale )
+                if l < rem_.left then l = rem_.left
+                tkRect_Set( rcOut[i], l, rem_.top, rem_.right, rem_.bottom )
+                rem_.right = l
+            case TK_DOCK_FILL
+                ' placed below, once every other dock has taken its slice
+            case else
+                dim as long l, t, r, b
+                Axis_( .x, .cx, (.anchor and TK_ANCHOR_LEFT) <> 0, (.anchor and TK_ANCHOR_RIGHT) <> 0, dx, fScale, l, r )
+                Axis_( .y, .cy, (.anchor and TK_ANCHOR_TOP) <> 0, (.anchor and TK_ANCHOR_BOTTOM) <> 0, dy, fScale, t, b )
+                tkRect_Set( rcOut[i], l, t, r, b )
+            end select
+        end with
+    next
+    for i as long = 0 to n - 1
+        if items[i].dock = TK_DOCK_FILL then rcOut[i] = rem_
+    next
+end sub
+
+public function tkLayout_Create( ) as TK_LAYOUT ptr
+    return new TK_LAYOUT
+end function
+
+public sub tkLayout_Destroy( byval l as TK_LAYOUT ptr )
+    if l = 0 then exit sub
+    dim as long k = 0
+    for i as long = 0 to gnBinds - 1
+        if gBinds(i).l <> l then
+            gBinds(k) = gBinds(i)
+            k += 1
+        end if
+    next
+    gnBinds = k
+    delete l
+end sub
+
+private function FindContainer_( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr ) as long
+    for i as long = 0 to l->nContainers - 1
+        if l->containers(i).w = w then return i
+    next
+    return -1
+end function
+
+private function FindEntry_( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr ) as long
+    for i as long = 0 to l->nEntries - 1
+        if l->entries(i).w = w then return i
+    next
+    return -1
+end function
+
+' Declares a parent and the size its children were designed against. Add a parent before anything
+' inside it: tkLayout_Apply works through containers in the order they were added.
+public sub tkLayout_AddContainer( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr, byval designW as long, _
+                                  byval designH as long, byval clientFn as TKLAYOUT_ClientFunc = 0 )
+    if (l = 0) orelse (w = 0) then exit sub
+    dim as long i = FindContainer_( l, w )
+    if i < 0 then
+        i = l->nContainers
+        redim preserve l->containers( 0 to i )
+        l->nContainers = i + 1
+        l->containers(i).w = w
+    end if
+    l->containers(i).designW = designW
+    l->containers(i).designH = designH
+    l->containers(i).clientFn = clientFn
+end sub
+
+' Adds a control. Its parent must be a declared container, or nothing moves it.
+public sub tkLayout_Add( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr, byval x as long, byval y as long, _
+                         byval cx as long, byval cy as long, byval anchor as long = TK_ANCHOR_DEFAULT, _
+                         byval dock as long = TK_DOCK_NONE )
+    if (l = 0) orelse (w = 0) then exit sub
+    dim as long i = FindEntry_( l, w )
+    if i < 0 then
+        i = l->nEntries
+        redim preserve l->entries( 0 to i )
+        l->nEntries = i + 1
+        l->entries(i).w = w
+    end if
+    with l->entries(i).item
+        .x = x : .y = y : .cx = cx : .cy = cy : .anchor = anchor : .dock = dock
+    end with
+end sub
+
+public sub tkLayout_Remove( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr )
+    if l = 0 then exit sub
+    dim as long i = FindEntry_( l, w )
+    if i < 0 then exit sub
+    for j as long = i to l->nEntries - 2
+        l->entries(j) = l->entries(j + 1)
+    next
+    l->nEntries -= 1
+end sub
+
+public sub tkLayout_SetAnchor( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr, byval anchor as long )
+    if l = 0 then exit sub
+    dim as long i = FindEntry_( l, w )
+    if i >= 0 then l->entries(i).item.anchor = anchor
+end sub
+
+public function tkLayout_GetAnchor( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr ) as long
+    if l = 0 then return TK_ANCHOR_NONE
+    dim as long i = FindEntry_( l, w )
+    return iif( i >= 0, l->entries(i).item.anchor, TK_ANCHOR_NONE )
+end function
+
+public sub tkLayout_SetDock( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr, byval dock as long )
+    if l = 0 then exit sub
+    dim as long i = FindEntry_( l, w )
+    if i >= 0 then l->entries(i).item.dock = dock
+end sub
+
+public function tkLayout_GetDock( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr ) as long
+    if l = 0 then return TK_DOCK_NONE
+    dim as long i = FindEntry_( l, w )
+    return iif( i >= 0, l->entries(i).item.dock, TK_DOCK_NONE )
+end function
+
+public sub tkLayout_SetDesignRect( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr, byval x as long, byval y as long, _
+                                   byval cx as long, byval cy as long )
+    if l = 0 then exit sub
+    dim as long i = FindEntry_( l, w )
+    if i < 0 then exit sub
+    with l->entries(i).item
+        .x = x : .y = y : .cx = cx : .cy = cy
+    end with
+end sub
+
+public function tkLayout_GetDesignRect( byval l as TK_LAYOUT ptr, byval w as TK_WIDGET ptr, byref item as TKLAYOUT_ITEM ) as boolean
+    if l = 0 then return false
+    dim as long i = FindEntry_( l, w )
+    if i < 0 then return false
+    item = l->entries(i).item
+    return true
+end function
+
+' Places every control. Call it from the form's size and scale-changed handlers.
+public sub tkLayout_Apply( byval l as TK_LAYOUT ptr )
+    if l = 0 then exit sub
+    for c as long = 0 to l->nContainers - 1
+        dim as TK_WIDGET ptr parent = l->containers(c).w
+        if (parent = 0) orelse (parent->pHost = 0) then continue for
+        dim as long n = 0
+        for i as long = 0 to l->nEntries - 1
+            if l->entries(i).w->pParent = parent then n += 1
+        next
+        if n = 0 then continue for
+        dim as TKLAYOUT_ITEM items( 0 to n - 1 )
+        dim as TK_WIDGET ptr who( 0 to n - 1 )
+        dim as TKRECT rects( 0 to n - 1 )
+        dim as long k = 0
+        for i as long = 0 to l->nEntries - 1
+            if l->entries(i).w->pParent = parent then
+                items(k) = l->entries(i).item
+                who(k) = l->entries(i).w
+                k += 1
+            end if
+        next
+        dim as TKRECT rcDock
+        tkRect_Set( rcDock, 0, 0, parent->cw, parent->ch )
+        if l->containers(c).clientFn then l->containers(c).clientFn( parent, rcDock )
+        tkLayout_Compute( @items(0), n, l->containers(c).designW, l->containers(c).designH, _
+                          parent->cw, parent->ch, rcDock, parent->pHost->fScale, @rects(0) )
+        for i as long = 0 to n - 1
+            tkWidget_SetPos( who(i), rects(i).left, rects(i).top, _
+                             rects(i).right - rects(i).left, rects(i).bottom - rects(i).top )
+        next
+    next
+end sub
+
+' ---- a splitter between docked panes -----------------------------------------------------
+' Dragging the bar resizes the docked pane it is bound to, and the docks reflow around it.
+private sub ResizePane_( byval l as TK_LAYOUT ptr, byval split as TK_WIDGET ptr, byval pane as TK_WIDGET ptr, _
+                         byval newPos as long )
+    dim as long i = FindEntry_( l, pane )
+    if (i < 0) orelse (split->pHost = 0) then exit sub
+    dim as single s = split->pHost->fScale
+    if s <= 0 then exit sub
+    dim as long px = 0
+    with l->entries(i).item
+        select case .dock
+        case TK_DOCK_LEFT
+            px = newPos - pane->x
+            if px < 0 then px = 0
+            .cx = cint( px / s )
+        case TK_DOCK_RIGHT
+            px = (pane->x + pane->cw) - (newPos + split->cw)
+            if px < 0 then px = 0
+            .cx = cint( px / s )
+        case TK_DOCK_TOP
+            px = newPos - pane->y
+            if px < 0 then px = 0
+            .cy = cint( px / s )
+        case TK_DOCK_BOTTOM
+            px = (pane->y + pane->ch) - (newPos + split->ch)
+            if px < 0 then px = 0
+            .cy = cint( px / s )
+        case else
+            exit sub
+        end select
+    end with
+    tkLayout_Apply( l )
+end sub
+
+private sub SyncBar_( byval split as TK_WIDGET ptr )
+    if split = 0 then exit sub
+    tkSplitter_SetPos( split, iif( tkSplitter_GetOrientation( split ) = TKSPLITTER_VERTICAL, split->x, split->y ) )
+end sub
+
+private sub OnSplitterMoved( byval split as TK_WIDGET ptr, byval newPos as long, byval nPhase as long )
+    if nPhase <> TKSPLITTER_PHASE_MOVE then exit sub
+    for i as long = 0 to gnBinds - 1
+        if gBinds(i).split = split then
+            ResizePane_( gBinds(i).l, split, gBinds(i).pane, newPos )
+            SyncBar_( split )
+            exit sub
+        end if
+    next
+end sub
+
+' Both are controls of this layout, docked on the same side, the bar straight after the pane. The
+' bar's position-changed callback belongs to the layout from here on.
+public sub tkLayout_BindSplitter( byval l as TK_LAYOUT ptr, byval split as TK_WIDGET ptr, byval pane as TK_WIDGET ptr )
+    if (l = 0) orelse (split = 0) orelse (pane = 0) then exit sub
+    dim as long i = gnBinds
+    for k as long = 0 to gnBinds - 1
+        if gBinds(k).split = split then i = k
+    next
+    if i = gnBinds then
+        redim preserve gBinds( 0 to i )
+        gnBinds = i + 1
+    end if
+    gBinds(i).l = l
+    gBinds(i).split = split
+    gBinds(i).pane = pane
+    tkSplitter_SetPosChangedCallback( split, @OnSplitterMoved )
+    SyncBar_( split )
+end sub

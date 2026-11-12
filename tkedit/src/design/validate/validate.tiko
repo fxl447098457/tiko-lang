@@ -1,0 +1,288 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' validate -- everything a form can get wrong that would otherwise surface as a compile error in a
+' generated file the user never wrote. Each problem is one line naming the control.
+#module "validate"
+
+#import "std/containers"
+#import "vendor/tkControls/tkMeta"
+#import "vendor/tkControls/tkKeys"
+#import "../model"
+#import "../catalog"
+#import "../formfile"
+using containers
+using tkMeta
+using tkKeys
+using model
+
+public function IsIdentifier( byref s as const ustring ) as boolean
+    if len( s ) = 0 then return false
+    for i as long = 1 to len( s )
+        select case asc( mid( s, i, 1 ) )
+        case 65 to 90, 97 to 122, 95
+        case 48 to 57
+            if i = 1 then return false
+        case else
+            return false
+        end select
+    next
+    return true
+end function
+
+public function IsReserved( byref s as const ustring ) as boolean
+    return instr( ReservedList( ), " " & ucase( s ) & " " ) > 0
+end function
+
+' What FormBase and the generated Form already use, and the names a field must not hide.
+private function IsFormMember_( byref s as const ustring ) as boolean
+    const as string MEMBERS = " wnd layout build show showmodal endmodal close isopen openwindow form this base "
+    return instr( MEMBERS, " " & lcase( s ) & " " ) > 0
+end function
+
+' A wrapper type or a control module: a field named like one hides it from the rest of the form.
+private function IsControlWord_( byref s as const ustring ) as boolean
+    dim as ustring want = lcase( s )
+    if want = "custom" then return true
+    if (want = "tkforms") orelse (want = "tkapp") orelse (want = "tklayout") orelse (want = "tkhost") _
+       orelse (want = "tkpaint") orelse (want = "tktheme") orelse (want = "formbase") then return true
+    for i as long = 0 to tkMeta_Count( ) - 1
+        dim as TKMETA_CONTROL ptr m = tkMeta_At( i )
+        if (lcase( m->Name ) = want) orelse (lcase( m->Module_ ) = want) then return true
+    next
+    return false
+end function
+
+' Why this name can't be a field or handler of a form, or "" when it can.
+private function NameFault_( byref s as const ustring ) as ustring
+    if IsIdentifier( s ) = false then return "is not an identifier"
+    if IsReserved( s ) then return "is a reserved word"
+    ' Not a keyword: a field by this name would hide the prelude constant the generated Build uses.
+    if lcase( s ) = "nullptr" then return "is tiko's null pointer constant"
+    if IsFormMember_( s ) then return "is already a member of every form"
+    if IsControlWord_( s ) then return "is the name of a control type or module"
+    return ""
+end function
+
+' The Shown part of a "Shown=CONSTANT,..." list.
+private function EnumHas_( byref pairs as const ustring, byref shown as const ustring ) as boolean
+    return instr( "," & pairs, "," & shown & "=" ) > 0
+end function
+
+private function IsColor_( byref s as const ustring ) as boolean
+    if lcase( left( s, 2 ) ) <> "&h" then return false
+    if (len( s ) < 3) orelse (len( s ) > 10) then return false
+    for i as long = 3 to len( s )
+        select case asc( mid( s, i, 1 ) )
+        case 48 to 57, 65 to 70, 97 to 102
+        case else
+            return false
+        end select
+    next
+    return true
+end function
+
+public function IsFontRole( byref s as const ustring ) as boolean
+    return instr( " UI UI_SMALL UI_BOLD UI_LARGE GLYPH GLYPH_LARGE MONO ", " " & s & " " ) > 0
+end function
+
+' "" when this value suits the kind, or what's wrong with it.
+private function ValueFault_( byref s as Setting, byref kind_ as const ustring, byref pairs as const ustring ) as ustring
+    select case kind_
+    case "bool"
+        if s.Kind <> VALUE_BOOL then return "must be true or false"
+    case "int"
+        if s.Kind <> VALUE_INT then return "must be a whole number"
+    case "float"
+        if (s.Kind <> VALUE_INT) andalso (s.Kind <> VALUE_FLOAT) then return "must be a number"
+    case "enum"
+        if (s.Kind <> VALUE_TEXT) orelse (EnumHas_( pairs, s.Value ) = false) then return "must be one of " & pairs
+    case "color"
+        if (s.Kind <> VALUE_TEXT) orelse (IsColor_( s.Value ) = false) then return "must be a colour such as &hFF336699"
+    case "font"
+        if (s.Kind <> VALUE_TEXT) orelse (IsFontRole( s.Value ) = false) then return "must be a font role (UI, UI_BOLD, MONO, ...)"
+    case "list"
+        if s.Kind <> VALUE_TEXT then return "must be a string"
+        return tkMeta_ListFault( s.Value, pairs )
+    case else
+        if s.Kind <> VALUE_TEXT then return "must be a string"
+    end select
+    return ""
+end function
+
+private sub CheckProps_( byref c as FormControl, byval m as TKMETA_CONTROL ptr, byref out_ as Array( of ustring ) )
+    for each s as Setting in c.Props
+        dim as ustring fault
+        if (s.Key = "Enabled") orelse (s.Key = "Visible") then
+            fault = ValueFault_( s, "bool", "" )
+        elseif s.Key = m->CreateArg then
+            fault = ValueFault_( s, m->CreateArgKind, m->CreateArgEnum )
+        else
+            dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, s.Key )
+            if p = 0 then
+                out_.Push( c.Name & ": " & m->Name & " has no property '" & s.Key & "'" )
+                continue for
+            end if
+            fault = ValueFault_( s, p->Kind, p->EnumPairs )
+        end if
+        if len( fault ) then out_.Push( c.Name & ": property " & s.Key & " " & fault )
+    next
+end sub
+
+private sub AddHandler_( byref handlers as Array( of Setting ), byref owner as const ustring, byref handler as const ustring, _
+                         byref params as const ustring, byref doc as FormDoc, byref out_ as Array( of ustring ) )
+    dim as ustring fault = NameFault_( handler )
+    if len( fault ) then
+        out_.Push( owner & ": handler '" & handler & "' " & fault )
+    elseif FindControl( doc, handler ) >= 0 then
+        out_.Push( owner & ": handler '" & handler & "' has the same name as a control" )
+    end if
+    ' One handler may serve several events, when they all pass it the same things.
+    for each h as Setting in handlers
+        if lcase( h.Key ) = lcase( handler ) then
+            if h.Value <> params then out_.Push( owner & ": handler '" & handler & "' is already used by an event with different parameters" )
+            exit sub
+        end if
+    next
+    dim as Setting s
+    s.Key = handler
+    s.Value = params
+    handlers.Push( s )
+end sub
+
+' The first problem `after` has that `before` didn't, or "".
+public function FirstNewProblem( byref before as FormDoc, byref after as FormDoc ) as ustring
+    dim as Array( of ustring ) a, b
+    Check( before, "frmForm", a )
+    Check( after, "frmForm", b )
+    for each s as ustring in b
+        dim as boolean known = false
+        for each o as ustring in a
+            if o = s then known = true
+        next
+        if known = false then return s
+    next
+    return ""
+end function
+
+' Every problem in `doc`, as one line each, for a form in module `moduleName`. Includes what reading
+' the file reported.
+public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref out_ as Array( of ustring ) )
+    for each s as ustring in doc.Problems
+        out_.Push( s )
+    next
+    if IsIdentifier( moduleName ) = false then
+        out_.Push( "form file name '" & moduleName & "' is not an identifier" )
+    elseif IsReserved( moduleName ) orelse (lcase( moduleName ) = "form") then
+        out_.Push( "form file name '" & moduleName & "' can't be a module name" )
+    end if
+    if (doc.ClientW <= 0) orelse (doc.ClientH <= 0) then out_.Push( "form: width and height must be positive" )
+
+    dim as Array( of Setting ) handlers
+    for each s as Setting in doc.Events
+        select case s.Key
+        case "Load"  : AddHandler_( handlers, "form", s.Value, "", doc, out_ )
+        case "Close" : AddHandler_( handlers, "form", s.Value, "byref Cancel as boolean", doc, out_ )
+        case else    : out_.Push( "form: no event '" & s.Key & "'" )
+        end select
+    next
+
+    for i as long = 0 to doc.Controls.Count( ) - 1
+        dim as FormControl c = doc.Controls[i]
+        dim as ustring fault = NameFault_( c.Name )
+        if len( fault ) then out_.Push( "control '" & c.Name & "' " & fault )
+        if lcase( c.Name ) = lcase( moduleName ) then out_.Push( "control '" & c.Name & "' has the same name as its form" )
+        if FindControl( doc, c.Name ) <> i then out_.Push( "control '" & c.Name & "' is a duplicate name (case doesn't count)" )
+        if (c.W < 0) orelse (c.H < 0) then out_.Push( c.Name & ": width and height can't be negative" )
+
+        dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
+        if m = 0 then
+            out_.Push( c.Name & ": unknown control type '" & c.TypeName & "'" )
+            continue for
+        end if
+
+        if len( c.Parent ) then
+            dim as long pi_ = FindControl( doc, c.Parent )
+            if pi_ < 0 then
+                out_.Push( c.Name & ": parent '" & c.Parent & "' doesn't exist" )
+            elseif pi_ >= i then
+                out_.Push( c.Name & ": parent '" & c.Parent & "' must come before it in the list" )
+            else
+                dim as FormControl pc = doc.Controls[pi_]
+                dim as TKMETA_CONTROL ptr pm = catalog.Find( pc.TypeName )
+                if pm then
+                    if pm->ContainerKind = TKMETA_NOT_CONTAINER then
+                        out_.Push( c.Name & ": parent '" & c.Parent & "' can't hold controls" )
+                    elseif pm->ContainerKind = TKMETA_CONTAINER_PAGES then
+                        if (c.Page < 0) orelse (c.Page >= pc.Pages.Count( )) then
+                            out_.Push( c.Name & ": page " & c.Page & " doesn't exist on '" & c.Parent & "'" )
+                        end if
+                    elseif c.Page >= 0 then
+                        out_.Push( c.Name & ": 'page' only applies inside a tab control" )
+                    end if
+                end if
+            end if
+        elseif c.Page >= 0 then
+            out_.Push( c.Name & ": 'page' only applies inside a tab control" )
+        end if
+        if (c.Pages.Count( ) > 0) andalso (m->ContainerKind <> TKMETA_CONTAINER_PAGES) then
+            out_.Push( c.Name & ": 'pages' only applies to a tab control" )
+        end if
+
+        if m->Name = catalog.CUSTOM_TYPE then
+            ' one message for either: the two are filled in one at a time, and the first mustn't be refused
+            if (IsIdentifier( c.CustomType ) = false) orelse (len( c.CustomModule ) = 0) then
+                out_.Push( c.Name & ": a custom control needs the name of its type and the module it's in" )
+            end if
+        end if
+
+        CheckProps_( c, m, out_ )
+
+        for each s as Setting in c.Events
+            dim as TKMETA_EVENT ptr e = tkMeta_FindEvent( m, s.Key )
+            if e = 0 then
+                out_.Push( c.Name & ": " & m->Name & " has no event '" & s.Key & "'" )
+            else
+                AddHandler_( handlers, c.Name, s.Value, e->Params, doc, out_ )
+            end if
+        next
+    next
+
+    for each c as FormControl in doc.Controls
+        dim as long kind_ = catalog.ItemsKindOf( c.TypeName )
+        if (c.Items.Count( ) > 0) andalso ((kind_ = catalog.ItemsKind.ItemsNone) orelse (kind_ = catalog.ItemsKind.ItemsPages)) then
+            out_.Push( c.Name & ": can't have items" )
+            continue for
+        end if
+        dim as long prev = -1
+        for each it as FormItem in c.Items
+            if kind_ = catalog.ItemsKind.ItemsMenu then
+                if (prev < 0) andalso (it.Level <> 0) then out_.Push( c.Name & ": the first menu item must be on the bar" )
+                if (it.Level > prev + 1) orelse (it.Level > 2) then out_.Push( c.Name & ": '" & it.Text & "' is indented too far" )
+                if (it.Level = 0) andalso (it.Text = "-") then out_.Push( c.Name & ": a separator can't be on the bar" )
+                prev = it.Level
+                if len( it.Key ) then
+                    dim as TK_CHORD ch
+                    dim as string k8 = it.Key
+                    if tkKeys_Parse( k8, ch ) = false then out_.Push( c.Name & ": '" & it.Key & "' isn't a shortcut" )
+                end if
+            end if
+            if kind_ = catalog.ItemsKind.ItemsToolbar then
+                select case it.Kind
+                case "", "command", "toggle", "separator", "split", "dropdown"
+                case else
+                    out_.Push( c.Name & ": no toolbar item kind '" & it.Kind & "'" )
+                end select
+            end if
+            if len( it.Handler ) then AddHandler_( handlers, c.Name, it.Handler, "", doc, out_ )
+        next
+    next
+
+    for each o as FormOrphan in doc.Orphans
+        AddHandler_( handlers, "orphan", o.Handler, o.Params, doc, out_ )
+    next
+end sub

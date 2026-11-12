@@ -12,7 +12,7 @@ TuiTerminal.TakeResize( ) as boolean
 
 ## Description
 
-Consumes the pending-resize flag: true once per resize, false afterwards. On Linux SIGWINCH sets it; on Windows the resize arrives as an input record instead. Taking it is what stops one resize being handled twice.
+Consumes the pending-resize flag: true once per resize, false afterwards. On Linux and macOS SIGWINCH sets it; on Windows the resize arrives as an input record instead. Taking it is what stops one resize being handled twice.
 
 ## Example
 

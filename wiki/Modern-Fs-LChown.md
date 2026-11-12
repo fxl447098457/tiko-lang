@@ -2,7 +2,7 @@
 
 # LChown
 
-Changes a symbolic link's own owner and group, on Linux only.
+Changes a symbolic link's own owner and group, on Linux and macOS only.
 
 ## Syntax
 

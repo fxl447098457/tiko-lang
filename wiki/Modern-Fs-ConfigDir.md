@@ -14,6 +14,7 @@ ConfigDir( )
 
 - Windows: the RoamingAppData known folder (C:\Users\name\AppData\Roaming), falling back to %APPDATA%.
 - Linux: $XDG_CONFIG_HOME when it is set and absolute, otherwise ~/.config. A relative XDG value is ignored, as the XDG specification requires.
+- macOS: $XDG_CONFIG_HOME when it is set and absolute, otherwise ~/Library/Application Support.
 - Nothing is created and no application name is added: it says where the directory SHOULD be, and the caller joins its own name and creates what it needs with CreateDirAll.
 
 ## Examples

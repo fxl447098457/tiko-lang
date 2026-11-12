@@ -42,7 +42,7 @@ This page covers the filesystem and its paths. Reading and writing what is insid
 
 **Errors you cannot ignore by accident.** Every call that can fail returns a Result( of T, FsError ) carrying a code, a message and the path involved, and a default-constructed Result is a failure. Calls that cannot fail return their value directly, so the signature alone says which is which.
 
-**Unicode paths everywhere.** Every entry point takes a USTRING, and STRING, ZSTRING and WSTRING convert to it, so names in any language work on both platforms.
+**Unicode paths everywhere.** Every entry point takes a USTRING, and STRING, ZSTRING and WSTRING convert to it, so names in any language work on every platform.
 
 And beyond those: copying, moving and removing files and whole trees (CopyFile, CopyDir, MoveFile, CreateDirAll, RemoveDirAll), temporary files and directories created safely, glob patterns, links and permissions, volumes, advisory file locks, memory-mapped files and directory watching.
 
@@ -144,7 +144,7 @@ They are concrete typedefs rather than one generic alias because tiko has no gen
 
 **The kernel is USTRING.** Every entry point takes USTRING, and all four string types reach it: STRING, ZSTRING and WSTRING convert implicitly.
 
-**The conversion is UTF-8, both ways, on both platforms, and it is lossy:**
+**The conversion is UTF-8, both ways, on every platform, and it is lossy:**
 
 ```text
 STRING  -> USTRING    decoded as UTF-8; invalid bytes become U+FFFD
@@ -409,7 +409,7 @@ next
 .Info( )          FsResultInfo -- MAY cost a stat
 ```
 
-The kind predicates are free and LStat-shaped: a symlink reports IsSymlink, not the kind of its target. Info( ) is free on Windows, where the enumeration record already carries size, times and attributes, and costs one lstat on Linux, where dirent carries neither.
+The kind predicates are free and LStat-shaped: a symlink reports IsSymlink, not the kind of its target. Info( ) is free on Windows, where the enumeration record already carries size, times and attributes, and costs one lstat on Linux and macOS, where dirent carries neither.
 
 ### WalkOptions
 
@@ -548,9 +548,9 @@ CopyOptions          default
 
 ### MoveFile
 
-**Without overwrite, MoveFile refuses an existing destination atomically** wherever the system can: Windows refuses in the rename itself, and Linux uses renameat2 with RENAME_NOREPLACE, or link-then-unlink on a filesystem without it. Only on a filesystem that supports neither (vfat, exFAT) does it fall back to checking first and renaming after, which is not atomic.
+**Without overwrite, MoveFile refuses an existing destination atomically** wherever the system can: Windows refuses in the rename itself, Linux uses renameat2 with RENAME_NOREPLACE and macOS renamex_np with RENAME_EXCL, or link-then-unlink on a filesystem without it. Only on a filesystem that supports neither (vfat, exFAT) does it fall back to checking first and renaming after, which is not atomic.
 
-**MoveFile handles FS_CROSS_DEVICE.** On a cross-volume rename it copies, then deletes. If the delete then fails, the copy is not rolled back: the call reports the delete's error and the destination exists. Losing the destination to tidy up after a partial failure is worse than leaving both. The fallback is not atomic, and no API on either platform can make it so.
+**MoveFile handles FS_CROSS_DEVICE.** On a cross-volume rename it copies, then deletes. If the delete then fails, the copy is not rolled back: the call reports the delete's error and the destination exists. Losing the destination to tidy up after a partial failure is worse than leaving both. The fallback is not atomic, and no API on any platform can make it so.
 
 ### CreateTempFile And CreateTempDir
 
@@ -647,7 +647,7 @@ ExecutablePath( )     the running program's full path
 ExpandHome( p )       a leading ~ replaced by HomeDir( )
 ```
 
-Each returns an FsResultUStr without a trailing separator. **Nothing is created and no application name is added**: join your own name and CreateDirAll it before writing there. On Windows the answers come from the shell's known folders, falling back to the environment; on Linux an XDG variable is honoured only when it is an absolute path, and $HOME falls back to the passwd entry.
+Each returns an FsResultUStr without a trailing separator. **Nothing is created and no application name is added**: join your own name and CreateDirAll it before writing there. On Windows the answers come from the shell's known folders, falling back to the environment; on Linux and macOS an XDG variable is honoured only when it is an absolute path, and $HOME falls back to the passwd entry.
 
 ```freebasic
 #import "std/fs"
@@ -676,7 +676,7 @@ p is any path on the volume, not a volume name. The path must exist.
 .AvailableBytes    free TO THIS USER -- the one to branch on
 ```
 
-**AvailableBytes is the one to use.** FreeBytes counts space you may not be permitted to consume: reserved blocks on ext4, a per-user quota on either platform. Where there is no quota the two are equal, which is why the distinction is invisible on a developer machine and bites in production.
+**AvailableBytes is the one to use.** FreeBytes counts space you may not be permitted to consume: reserved blocks on ext4, a per-user quota on any platform. Where there is no quota the two are equal, which is why the distinction is invisible on a developer machine and bites in production.
 
 All three are snapshots and are stale on return. A program that checks free space and then writes is racing every other process on the machine; the write's FS_NO_SPACE is the real answer.
 
@@ -684,7 +684,7 @@ All three are snapshots and are stale on return. A program that checks free spac
 
 ```text
 .RootPath          "C:\", "/", "\\srv\share\"
-.Name              the label. MAY BE EMPTY -- always is on Linux
+.Name              the label. MAY BE EMPTY -- always is on Linux and macOS
 .FileSystem        "NTFS", "ext4", "exFAT". May be empty.
 .MaxComponentLen
 .IsReadOnly
@@ -692,11 +692,11 @@ All three are snapshots and are stale on return. A program that checks free spac
 .SupportsLinks
 ```
 
-**IsCaseSensitive is per-volume** and is not the same question as PathIsCaseSensitive( ), which is a compile-time per-platform constant. They disagree in two real cases: an NTFS directory with per-directory case sensitivity enabled (WSL sets this), and a case-insensitive filesystem mounted on Linux. Use PathIsCaseSensitive for lexical comparison, which must be deterministic and must not do IO; use this one for "will these two names collide on this disk".
+**IsCaseSensitive is per-volume** and is not the same question as PathIsCaseSensitive( ), which is a compile-time per-platform constant. They disagree in two real cases: an NTFS directory with per-directory case sensitivity enabled (WSL sets this), and a case-insensitive filesystem mounted on Linux or, by default, on macOS. Use PathIsCaseSensitive for lexical comparison, which must be deterministic and must not do IO; use this one for "will these two names collide on this disk".
 
-**SupportsLinks is asymmetric:** a FALSE is reliable, a TRUE is best-effort. Windows reports the filesystem's own flag; Linux has no portable probe, so everything but the FAT family and ISO 9660 is assumed able.
+**SupportsLinks is asymmetric:** a FALSE is reliable, a TRUE is best-effort. Windows reports the filesystem's own flag; Linux and macOS have no portable probe, so everything but the FAT family and ISO 9660 is assumed able.
 
-GetVolumes on Windows is the logical drives, skipping any reporting no media. On Linux there are no drives, only mount points, so it reads /proc/self/mountinfo and reports only filesystems backed by a real block device -- which filters proc, sysfs, cgroup and tmpfs. That is a judgement call: it will occasionally omit something you wanted, such as a network mount.
+GetVolumes on Windows is the logical drives, skipping any reporting no media. On Linux there are no drives, only mount points, so it reads /proc/self/mountinfo and reports only filesystems backed by a real block device -- which filters proc, sysfs, cgroup and tmpfs. macOS has no drives either: it reads getmntinfo and applies the same rule. That is a judgement call: it will occasionally omit something you wanted, such as a network mount.
 
 ## Locking, Mapping And Watching
 
@@ -733,7 +733,7 @@ end if
 
 FileLock holds a whole file against other processes. It is a different tool from the LOCK and UNLOCK statements, which lock byte ranges of a file already open on a file number.
 
-**It is advisory everywhere, and that is the contract.** Windows LockFileEx is mandatory -- the kernel enforces it against every process. POSIX flock is advisory -- it binds only processes that also ask. The only promise both platforms can keep is the weaker one, so **all participants must use this API**. Code written against the Windows behaviour silently protects nothing on Linux.
+**It is advisory everywhere, and that is the contract.** Windows LockFileEx is mandatory -- the kernel enforces it against every process. POSIX flock is advisory -- it binds only processes that also ask. The only promise every platform can keep is the weaker one, so **all participants must use this API**. Code written against the Windows behaviour silently protects nothing on Linux and macOS.
 
 ### MemoryMappedFile
 
@@ -770,7 +770,7 @@ Data( ) is a raw pointer, which is the point -- the alternative is a copy, and a
 - **another process truncating the file turns reads into a fault** -- SIGBUS on POSIX, a structured exception on Windows -- not an error return, which is why mapping is not a drop-in replacement for reading;
 - mapping a file on a network share is permitted, and is a good way to hang.
 
-**A zero-length file cannot be mapped** and reports FS_INVALID_PATH on both platforms, rather than handing back a pointer that cannot be dereferenced.
+**A zero-length file cannot be mapped** and reports FS_INVALID_PATH on every platform, rather than handing back a pointer that cannot be dereferenced.
 
 ### FileWatcher
 
@@ -893,7 +893,7 @@ The runtime side, in tiko-rt's lib/rt/src/fs/:
 | dirent.tiko | record-to-USTRING accessors, ABI size hooks |
 | error, stat, dir, ops, link, volume, lock, mmap, watch (.tiko) | each split by platform with `#if` |
 
-**The unit is FB_UCHAR (UTF-16), not FB_WCHAR**, which is 4 bytes on Linux -- building the kernel on it would silently change the path encoding depending on the host. Every struct crossing the C/tiko boundary uses fixed-width fields for the same reason: `unsigned long` is 4 bytes on Windows and 8 on Linux while tiko's ULONG is 32-bit everywhere, and getting that wrong shifts every field after it.
+**The unit is FB_UCHAR (UTF-16), not FB_WCHAR**, which is 4 bytes on Linux and macOS -- building the kernel on it would silently change the path encoding depending on the host. Every struct crossing the C/tiko boundary uses fixed-width fields for the same reason: `unsigned long` is 4 bytes on Windows and 8 on Linux and macOS while tiko's ULONG is 32-bit everywhere, and getting that wrong shifts every field after it.
 
 **The glob matcher is iterative, not recursive.** A recursive matcher on a hostile pattern such as `a*a*a*a*a*b` is exponential and will blow the stack.
 
@@ -957,7 +957,7 @@ Every entry, grouped by task. [Files and folders](Functions-Files) lists them be
 | [PathNextComponent](Modern-Fs-PathNextComponent) | Finds the next part of a path from an offset; returns a negative number when none is left. | `std/fs` |
 | [PathRoot](Modern-Fs-PathRoot) | Returns the root of a path, such as C:\ or /, or an empty string for a relative path. | `std/fs` |
 | [PathRootLen](Modern-Fs-PathRootLen) | Returns the length of a path's root, in characters. | `std/fs` |
-| [PathSeparator](Modern-Fs-PathSeparator) | Returns the platform's path separator: a backslash on Windows, a slash on Linux. | `std/fs` |
+| [PathSeparator](Modern-Fs-PathSeparator) | Returns the platform's path separator: a backslash on Windows, a slash on Linux and macOS. | `std/fs` |
 
 ### Clean up, compare and resolve paths
 
@@ -972,7 +972,7 @@ Every entry, grouped by task. [Files and folders](Functions-Files) lists them be
 | [PathIsRoot](Modern-Fs-PathIsRoot) | Returns true if the whole path is just a root, such as C:\ or /. | `std/fs` |
 | [PathIsLocal](Modern-Fs-PathIsLocal) | Returns true if a relative path stays inside the folder it is joined to. | `std/fs` |
 | [PathIsReserved](Modern-Fs-PathIsReserved) | Returns true if a part of the path is a Windows device name such as CON or NUL. | `std/fs` |
-| [PathIsCaseSensitive](Modern-Fs-PathIsCaseSensitive) | Returns true if paths compare case-sensitively on this platform: on Linux, not Windows. | `std/fs` |
+| [PathIsCaseSensitive](Modern-Fs-PathIsCaseSensitive) | Returns true if paths compare case-sensitively here: on Linux and macOS, not Windows. | `std/fs` |
 | [AbsolutePath](Modern-Fs-FileInfo-AbsolutePath) | Returns the full form of a path against the current folder; the path need not exist. | `std/fs` |
 | [CanonicalPath](Modern-Fs-FileInfo-CanonicalPath) | Returns the real path with links resolved; it must exist unless allowMissing is true. | `std/fs` |
 
@@ -990,7 +990,7 @@ Every entry, grouped by task. [Files and folders](Functions-Files) lists them be
 | [DirEntry.IsDirectory](Modern-Fs-DirEntry-IsDirectory) | Returns true if the entry is a folder; a link to a folder reports as a link. | `std/fs` |
 | [DirEntry.IsSymlink](Modern-Fs-DirEntry-IsSymlink) | Returns true if the entry is a symbolic link. | `std/fs` |
 | [DirEntry.IsOther](Modern-Fs-DirEntry-IsOther) | Returns true if the entry is a device, pipe or socket rather than a file, folder or link. | `std/fs` |
-| [DirEntry.Info](Modern-Fs-DirEntry-Info) | Returns the entry's FileInfo: free on Windows, one extra system call on Linux. | `std/fs` |
+| [DirEntry.Info](Modern-Fs-DirEntry-Info) | Returns the entry's FileInfo: free on Windows, one extra system call on Linux and macOS. | `std/fs` |
 
 ### Copy, move and delete files
 
@@ -1052,11 +1052,11 @@ Every entry, grouped by task. [Files and folders](Functions-Files) lists them be
 | [FileInfo.AccessedUtc](Modern-Fs-FileInfo-AccessedUtc) | Returns the last-access time in ticks, or 0 when HasAccessed is false. | `std/fs` |
 | [FileInfo.HasCreated](Modern-Fs-FileInfo-HasCreated) | Returns true if the platform records creation times, so Created means something. | `std/fs` |
 | [FileInfo.HasAccessed](Modern-Fs-FileInfo-HasAccessed) | Returns true if the platform records access times, so Accessed means something. | `std/fs` |
-| [FileInfo.IsReadOnly](Modern-Fs-FileInfo-IsReadOnly) | Returns true if the file cannot be written: the read-only flag, or no write bit on Linux. | `std/fs` |
-| [FileInfo.IsHidden](Modern-Fs-FileInfo-IsHidden) | Returns true if the file is hidden: the hidden flag on Windows, a leading dot on Linux. | `std/fs` |
-| [FileInfo.NativeAttributes](Modern-Fs-FileInfo-NativeAttributes) | Returns the raw attribute word: file attributes on Windows, the mode bits on Linux. | `std/fs` |
-| [NativeAttributes](Modern-Fs-NativeAttributes) | Returns the raw attribute word: file attributes on Windows, the mode bits on Linux. | `std/fs` |
-| [FileInfo.HasOwner](Modern-Fs-FileInfo-HasOwner) | Returns true if OwnerUid and OwnerGid are filled in: on Linux, not on Windows. | `std/fs` |
+| [FileInfo.IsReadOnly](Modern-Fs-FileInfo-IsReadOnly) | Returns true if unwritable: the read-only flag, or no write bit on Linux and macOS. | `std/fs` |
+| [FileInfo.IsHidden](Modern-Fs-FileInfo-IsHidden) | Returns true if hidden: the hidden flag on Windows, a leading dot on Linux and macOS. | `std/fs` |
+| [FileInfo.NativeAttributes](Modern-Fs-FileInfo-NativeAttributes) | Returns the raw attribute word: attributes on Windows, mode bits on Linux and macOS. | `std/fs` |
+| [NativeAttributes](Modern-Fs-NativeAttributes) | Returns the raw attribute word: attributes on Windows, mode bits on Linux and macOS. | `std/fs` |
+| [FileInfo.HasOwner](Modern-Fs-FileInfo-HasOwner) | Returns true if OwnerUid and OwnerGid are filled in: on Linux and macOS, not on Windows. | `std/fs` |
 | [FileInfo.OwnerUid](Modern-Fs-FileInfo-OwnerUid) | Returns the owner's user id, or 0 unless HasOwner is true. | `std/fs` |
 | [FileInfo.OwnerGid](Modern-Fs-FileInfo-OwnerGid) | Returns the owner's group id, or 0 unless HasOwner is true. | `std/fs` |
 
@@ -1114,16 +1114,16 @@ Every entry, grouped by task. [Files and folders](Functions-Files) lists them be
 | [GetFileId](Modern-Fs-GetFileId) | Returns the FileId of a path, which tells whether two paths are the same file. | `std/fs` |
 | [SameFile](Modern-Fs-SameFile) | Returns whether two paths name the same file; fails if either is missing. | `std/fs` |
 | [FileId](Modern-Fs-FileId) | Holds a volume and file number that are equal for every name of one file. | `std/fs` |
-| [SetReadOnly](Modern-Fs-SetReadOnly) | Sets or clears a file's read-only flag, or its write bits on Linux. | `std/fs` |
-| [SetHidden](Modern-Fs-SetHidden) | Sets or clears a file's hidden flag on Windows; fails as unsupported on Linux. | `std/fs` |
-| [GetPosixMode](Modern-Fs-GetPosixMode) | Returns a file's Linux permission bits; fails as unsupported on Windows. | `std/fs` |
-| [SetPosixMode](Modern-Fs-SetPosixMode) | Sets a file's Linux permission bits; fails as unsupported on Windows. | `std/fs` |
-| [GetWin32Attributes](Modern-Fs-GetWin32Attributes) | Returns a file's raw Windows attribute flags; fails as unsupported on Linux. | `std/fs` |
-| [SetWin32Attributes](Modern-Fs-SetWin32Attributes) | Replaces a file's whole Windows attribute word; fails as unsupported on Linux. | `std/fs` |
+| [SetReadOnly](Modern-Fs-SetReadOnly) | Sets or clears a file's read-only flag, or its write bits on Linux and macOS. | `std/fs` |
+| [SetHidden](Modern-Fs-SetHidden) | Sets or clears a file's hidden flag on Windows; fails as unsupported on Linux and macOS. | `std/fs` |
+| [GetPosixMode](Modern-Fs-GetPosixMode) | Returns a file's permission bits on Linux and macOS; fails as unsupported on Windows. | `std/fs` |
+| [SetPosixMode](Modern-Fs-SetPosixMode) | Sets a file's permission bits on Linux and macOS; fails as unsupported on Windows. | `std/fs` |
+| [GetWin32Attributes](Modern-Fs-GetWin32Attributes) | Returns a file's raw Windows attribute flags; fails as unsupported on Linux and macOS. | `std/fs` |
+| [SetWin32Attributes](Modern-Fs-SetWin32Attributes) | Replaces a file's whole Windows attribute word; fails as unsupported on Linux and macOS. | `std/fs` |
 | [SetTimes](Modern-Fs-SetTimes) | Sets a file's modified and accessed times; a time of 0 leaves that one alone. | `std/fs` |
 | [SetTimesNoFollow](Modern-Fs-SetTimesNoFollow) | Sets a symbolic link's own times, leaving its target alone. | `std/fs` |
-| [Chown](Modern-Fs-Chown) | Changes a file's owner and group on Linux, -1 keeping one; unsupported on Windows. | `std/fs` |
-| [LChown](Modern-Fs-LChown) | Changes a symbolic link's own owner and group, on Linux only. | `std/fs` |
+| [Chown](Modern-Fs-Chown) | Changes a file's owner and group on Linux and macOS, -1 keeping one; fails on Windows. | `std/fs` |
+| [LChown](Modern-Fs-LChown) | Changes a symbolic link's own owner and group, on Linux and macOS only. | `std/fs` |
 
 ### Disk space and volumes
 
@@ -1136,7 +1136,7 @@ Every entry, grouped by task. [Files and folders](Functions-Files) lists them be
 | [GetVolumeInfo](Modern-Fs-GetVolumeInfo) | Returns the VolumeInfo of the volume a path is on: its root, label and file system. | `std/fs` |
 | [GetVolumes](Modern-Fs-GetVolumes) | Fills an Array with a VolumeInfo for each drive or mounted disk; returns the count. | `std/fs` |
 | [VolumeInfo.RootPath](Modern-Fs-VolumeInfo-RootPath) | Returns where the volume is mounted, such as C:\ or /. | `std/fs` |
-| [VolumeInfo.Name](Modern-Fs-VolumeInfo-Name) | Returns the volume's label, which may be empty and always is on Linux. | `std/fs` |
+| [VolumeInfo.Name](Modern-Fs-VolumeInfo-Name) | Returns the volume's label, which may be empty and always is on Linux and macOS. | `std/fs` |
 | [VolumeInfo.FileSystem](Modern-Fs-VolumeInfo-FileSystem) | Returns the file system's name, such as NTFS or ext4, or an empty string. | `std/fs` |
 | [VolumeInfo.MaxComponentLen](Modern-Fs-VolumeInfo-MaxComponentLen) | Returns the longest file or folder name the volume allows, not the longest path. | `std/fs` |
 | [VolumeInfo.IsReadOnly](Modern-Fs-VolumeInfo-IsReadOnly) | Returns true if the whole volume is read-only. | `std/fs` |

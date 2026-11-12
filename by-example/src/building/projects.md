@@ -29,7 +29,7 @@ name typed again for each build. A **project** writes them down once, in a
 - **`tiko build`**, run in the directory that holds `tiko.toml`, builds every
   target it declares. It takes no file names and no `-o`: the program is
   written to `out/debug/greeter.exe` on Windows and `out/debug/greeter` on
-  Linux. `tiko build greeter` builds the one target by name.
+  Linux and macOS. `tiko build greeter` builds the one target by name.
 - **`[target.greeter.defines]`** passes `TIMES` as though `-d TIMES=2` had been
   typed, which is why the greeting appears twice.
 - **`tiko run`** builds the project's executable and runs it. Everything after

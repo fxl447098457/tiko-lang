@@ -23,6 +23,7 @@ Define without a value created at compile time if compiling for the DOS target. 
 ### See also
 
 - [`__FB_LINUX__`](Fb-Linux)
+- [`__FB_DARWIN__`](Fb-Darwin)
 - [`__FB_WIN32__`](Fb-Win32)
 - [`__FB_PCOS__`](Fb-Pcos)
 - [Compiler Option: -target](Compiler-Option-Target)

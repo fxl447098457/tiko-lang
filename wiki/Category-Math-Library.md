@@ -340,12 +340,16 @@ NextBoolean NextBooleanP( p )
 NextNormal NextNormalP( mean, sd ) NextExponential( lambda )
 NextPoisson( lambda )
 Shuffle( r, a( ) )   Choice( r, a( ) )
+ShuffleArray( r, a )  ShuffleDeque( r, d )  ShuffleList( r, l )
+ChoiceArray( r, a )   ChoiceDeque( r, d )
 CryptoBytes( ptr, n )  CryptoULongInt( )  RngFromEntropy( )
 ```
 
 NextInt is unbiased by Lemire's multiply-and-reject: one multiply, no division in the common case. NextDouble is `[0,1)` with 53 bits of entropy; 1.0 is never returned.
 
 Shuffle is Fisher-Yates **descending** with an inclusive bound -- the form that produces every permutation with equal probability. The other forms are subtly wrong and are what a hand-rolled shuffle usually is.
+
+`ShuffleArray`, `ShuffleDeque` and `ShuffleList` do the same for the containers, with any element type, and make the same draws, so one seed gives a plain array and each container the same order. `ShuffleList` relinks nodes and copies no element. `ChoiceArray` and `ChoiceDeque` pick one element by reference, and raise out of bounds on an empty container. See [Shuffle](Modern-Math-Shuffle#containers) and [Choice](Modern-Math-Choice#containers).
 
 **CryptoBytes is a separate surface and not an Rng.** No seed, no reproducibility, no state. One type with two contradictory contracts would invite exactly the mistake this separation prevents. `RngFromEntropy( )` is the bridge.
 
@@ -701,8 +705,13 @@ Every entry, grouped by task. [Numbers and math](Functions-Numbers) lists them b
 | [Rng.NextNormalP](Modern-Math-NextNormalP) | Returns a random value from a normal distribution with the given mean and deviation. | `std/numeric` |
 | [Rng.NextExponential](Modern-Math-NextExponential) | Returns a random waiting time between events at rate lambda; its mean is 1/lambda. | `std/numeric` |
 | [Rng.NextPoisson](Modern-Math-NextPoisson) | Returns a random count of events in one interval at rate lambda; its mean is lambda. | `std/numeric` |
-| [Shuffle](Modern-Math-Shuffle) | Shuffles an array in place so that every order is equally likely. | `std/numeric` |
-| [Choice](Modern-Math-Choice) | Returns one element of an array picked at random, by reference. | `std/numeric` |
+| [Shuffle](Modern-Math-Shuffle) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
+| [Choice](Modern-Math-Choice) | Returns one element of an array or container picked at random, by reference. | `std/numeric` |
+| [ShuffleArray](Modern-Math-Shuffle#containers) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
+| [ShuffleDeque](Modern-Math-Shuffle#containers) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
+| [ShuffleList](Modern-Math-Shuffle#containers) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
+| [ChoiceArray](Modern-Math-Choice#containers) | Returns one element of an array or container picked at random, by reference. | `std/numeric` |
+| [ChoiceDeque](Modern-Math-Choice#containers) | Returns one element of an array or container picked at random, by reference. | `std/numeric` |
 
 ### Secure random bytes
 

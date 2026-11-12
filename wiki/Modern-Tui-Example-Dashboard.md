@@ -9,7 +9,7 @@ Two columns, braille history plots, gradient meters per core, a scrolling proces
 ## Build and run
 
 ```freebasic
-tiko dashboard.tiko        ' windows-x86_64 on Windows, linux-x86_64 on Linux
+tiko dashboard.tiko        ' windows-x86_64 on Windows, linux-x86_64 on Linux, macos-arm64 on macOS
 ```
 
 Run it from a REAL TERMINAL. Redirected output is rejected with an honest error rather than a dashboard drawn into a pipe. tiko builds it with no diagnostics for windows-x86_64 and win64, and compiles it for linux-x86_64 with `-c` (built, not run: it is interactive).
@@ -31,7 +31,7 @@ Run it from a REAL TERMINAL. Redirected output is rejected with an honest error 
 '' braille history plots, gradient meters, a scrolling process table with a
 '' scrollbar, and a status bar.
 ''
-'' Build (windows-x86_64 or linux-x86_64):
+'' Build (windows-x86_64, linux-x86_64 or macos-arm64):
 ''     tiko dashboard.tiko
 ''
 '' Keys: up/down move the process selection, q or Esc quits. The data is

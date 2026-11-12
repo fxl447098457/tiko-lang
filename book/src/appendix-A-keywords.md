@@ -110,6 +110,7 @@ FBC-Modern's extensions added these words without reserving them, so existing co
 | `in` | `for each x in …` |
 | `of` | type arguments: `Array( of int32 )` (Chapter 17) |
 | `override` | after a method's declaration: `declare sub M( ) override` (Chapter 14) |
+| `partial` | `partial type` and `partial class`, one type in several blocks (Chapter 15) |
 | `receive` | `case receive` in `select channel` |
 | `send` | `case send v to ch` in `select channel` |
 | `spawn` | `spawn Proc( args )` (Chapter 23) |
@@ -169,4 +170,4 @@ not 0 and 3           3     ...and tighter than and: (not 0) and 3
 
 `&` binds looser than `+` and `-`, so `"a" & 1 + 2` means `"a" & (1 + 2)`, and both compilers print `a3`.
 
-<!-- 247 reserved words, 104 runtime names, generated 2026-11-07 from src/lexer/keywords.ti, src/symbols/resolvertl.tiko and src/parser/prectable.ti at ec6351fda -->
+<!-- 247 reserved words, 104 runtime names, generated 2026-11-08 from src/lexer/keywords.ti, src/symbols/resolvertl.tiko and src/parser/prectable.ti at ec6351fda -->

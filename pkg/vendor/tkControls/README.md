@@ -47,6 +47,8 @@ from the PsControls control it ports.
 | `tkTextBox`, `tkNumericUpDown`, `tkDatePicker`, `tkCalendar`, `tkCodeEdit` | text, numbers, dates, code |
 | `tkListTree`, `tkComboBox`, `tkSelectBar`, `tkTabBar`, `tkColumnHeader` | lists and selection |
 | `tkMenuBar`, `tkPopupMenu`, `tkToolbar`, `tkIconPanel`, `tkStatusBar` | command surfaces |
+| `tkLayout` | automatic position and size: Anchor and Dock, in design units |
+| `tkLabel`, `tkPanel`, `tkGroupBox`, `tkPicture`, `tkTabControl` | text, containers, images and tabbed pages |
 | `tkSplitter`, `tkScrollPanel`, `tkScrollBar`, `tkVScrollBar`, `tkHScrollBar` | layout and scrolling |
 | `tkMessageBox`, `tkColorPicker`, `tkTooltip`, `tkProgressBar`, `tkFileDialog` | popups and feedback |
 | `tkChart` | line, column, HLOC and pie charts |

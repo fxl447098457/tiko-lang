@@ -46,9 +46,9 @@ fixed-width file and gets compared against text that was not padded. `"hello   "
 false. Wrap it in `rtrim( )` at the boundary, once, rather than at every comparison.
 ```
 
-```admonish info title="On Windows and Linux"
-A `wstring` character is **2 bytes on Windows and 4 bytes on Linux**, because it follows the
-platform's `wchar_t`. `len` counts characters on both, so code that uses `len` is portable and code
+```admonish info title="On Windows, Linux and macOS"
+A `wstring` character is **2 bytes on Windows and 4 bytes on Linux and macOS**, because it follows the
+platform's `wchar_t`. `len` counts characters on all three, so code that uses `len` is portable and code
 that assumes a byte width is not.
 
 `ustring` is UTF-16 on every target, which is one reason to prefer it: its storage does not change
@@ -685,7 +685,7 @@ form`. Give the type an `operator cast( ) as ustring` — Chapter 13 — and it 
 
 - Five types: **`ustring` for text**, `string` for bytes, `zstring`/`wstring` for C, `string * n`
   fixed and **space-padded**.
-- `wstring` is 2 bytes per character on Windows and 4 on Linux; `ustring` is UTF-16 everywhere.
+- `wstring` is 2 bytes per character on Windows and 4 on Linux and macOS; `ustring` is UTF-16 everywhere.
 - **A block string** opens with `"""` at the end of a line and closes at the first line starting
   with `"""`; **that closing line's indentation is the margin** removed from every line.
   `!"""` reads escapes, and every line break inside is `chr( 10 )`.

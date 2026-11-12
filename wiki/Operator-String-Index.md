@@ -24,7 +24,7 @@ This operator returns a reference to the numeric value of a specific character i
 
 a [`UByte`](Ubyte) (containing the ASCII value of the character).
 
-a numeric type depending on platform, for example [`UShort`](Ushort) for Windows or [`ULong`](Ulong) for Linux (containing the numeric value of the character).
+a numeric type depending on platform, for example [`UShort`](Ushort) for Windows or [`ULong`](Ulong) for Linux and macOS (containing the numeric value of the character).
 
 This operator must not be used in case of empty string because reference is undefined (inducing runtime error).  
  Otherwise, the user must ensure that the index does not exceed the range "\[0, `Len(lhs) - 1`\]". Outside this range, results are undefined.

@@ -26,6 +26,7 @@ Define without a value created at compile time if compiling to the Win (32-bit o
 
 - [`__FB_DOS__`](Fb-Dos)
 - [`__FB_LINUX__`](Fb-Linux)
+- [`__FB_DARWIN__`](Fb-Darwin)
 - [`__FB_PCOS__`](Fb-Pcos)
 - [Compiler Option: -target](Compiler-Option-Target)
 

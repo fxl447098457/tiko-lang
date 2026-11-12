@@ -4,7 +4,7 @@
 
 Shows the system open, save and folder dialogs and returns the chosen paths.
 
-tkFileDialog wraps the OS's own file dialogs (the Windows file dialog, the desktop portal or zenity on Linux) for a tkControls program. SDL's dialogs are asynchronous and may answer on another thread; tkFileDialog brings the answer back to the UI thread, so you can take it two ways:
+tkFileDialog wraps the OS's own file dialogs (the Windows file dialog, the desktop portal or zenity on Linux, the system's panels on macOS) for a tkControls program. SDL's dialogs are asynchronous and may answer on another thread; tkFileDialog brings the answer back to the UI thread, so you can take it two ways:
 
 - **Callback:** `tkFileDialog_Show` returns at once, and your callback runs on the UI thread when the user answers, from whichever loop is pumping (a modal form's included).
 - **Waiting:** `tkFileDialog_Wait` keeps the program's loop running until the user answers, then returns the paths. `tkFileDialog_OpenFile`, `SaveFile` and `PickFolder` are its one-path shorthands, returning `""` when cancelled.

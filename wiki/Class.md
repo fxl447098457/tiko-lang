@@ -93,6 +93,7 @@ A class and a `type` mix freely: a class may inherit a `type` that extends `obje
 - [`Implements`](Implements)
 - [`Interface`](Interface)
 - [`Object`](Object)
+- [`Partial`](Partial)
 - [`Virtual`](Virtual)
 - [Interfaces Tutorial](Interfaces-Tutorial)
 

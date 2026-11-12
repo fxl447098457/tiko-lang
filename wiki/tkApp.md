@@ -162,7 +162,7 @@ function tkApp_FormCount() as long
 sub tkApp_Shutdown()
 function tkForm_FromWidget( byval w as TK_WIDGET ptr ) as TK_FORM ptr
 function tkForm_FromHost( byval h as TK_HOST ptr ) as TK_FORM ptr
-function tkApp_NewForm( byref title as ustring, byval cx as long, byval cy as long, byval pOwner as TK_FORM ptr = 0, byval forcedScale as single = 0 ) as TK_FORM ptr
+function tkApp_NewForm( byref title as ustring, byval cx as long, byval cy as long, byval pOwner as TK_FORM ptr = nullptr, byval forcedScale as single = 0 ) as TK_FORM ptr
 function tkForm_Widget( byval f as TK_FORM ptr ) as TK_WIDGET ptr
 function tkForm_Host( byval f as TK_FORM ptr ) as TK_HOST ptr
 function tkForm_Scale( byval f as TK_FORM ptr, byval v as long ) as long

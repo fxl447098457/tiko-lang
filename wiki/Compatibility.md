@@ -40,6 +40,8 @@ Each of these is a diagnostic, not a silent difference:
 
 **`#embed` at the start of a line is a [directive](Category-Embed) in tiko.** In fbc it is `error 17: Syntax error`. Nothing else changes meaning: `embed` is an ordinary name in both compilers, and `#embed` in the middle of a line is a file number in both, so `print #embed, "x"` writes to file number `embed`.
 
+**`partial type` or `partial class` followed by a name declares part of a [partial type](Category-Partial-Types) in tiko.** In fbc the same line is `error 42: Variable not declared, partial`. `partial` stays an ordinary name in both compilers.
+
 **tiko accepts some programs that fbc rejects.** What was confirmed:
 
 | Program | fbc 1.20 | tiko |

@@ -16,9 +16,11 @@
 ''   N_MEMBER and its right-hand identifier, and counting both would count one use twice.
 
 #import "std/containers"
+#import "std/fs"
 #include once "driver/scan.ti"
 #include once "driver/unit.ti"
 #include once "driver/modiface.ti"
+#include once "driver/modbuild.ti"
 #include once "symbols/modsym.ti"
 #include once "symbols/check.ti"
 #include once "support/text.ti"
@@ -681,6 +683,100 @@ sub RunUnit _
         Tko.Modules.PublishInterface( ctx, pr, ast, syms, info )
     end if
     Harvest_Unit( ctx, ast, syms, info, macros, pr )
+end sub
+
+'' DOES THIS SOURCE OPEN WITH '#module'? Past a BOM, blank lines and comments.
+private function OpensAsModule_( byref s as string ) as boolean
+    dim as int32 i = 0, n = len( s )
+    if (n >= 3) andalso (s[0] = &hEF) andalso (s[1] = &hBB) andalso (s[2] = &hBF) then i = 3
+    while i < n
+        select case s[i]
+        case 32, 9, 13, 10
+            i += 1
+        case asc( "'" )
+            while (i < n) andalso (s[i] <> 10)
+                i += 1
+            wend
+        case asc( "/" )
+            if (i + 1 >= n) orelse (s[i + 1] <> asc( "'" )) then return false
+            dim as long e = instr( i + 3, s, "'/" )
+            if e = 0 then return false
+            i = e + 1
+        case else
+            return lcase( mid( s, i + 1, 7 ) ) = "#module"
+        end select
+    wend
+    return false
+end function
+
+'' Before the inputs are loaded: the unsaved buffers go to the source manager, and a root that
+'' opens '#module' becomes its directory -- a module file alone cannot see its other files.
+sub PrepareInputs( byref ctx as Tko.CompilerContext, byref srcInputs as Tko.StrVec, byref modDirs as Tko.StrVec )
+    dim as ScanResult ptr r = cast( ScanResult ptr, ctx.scan )
+    if r = nullptr then return
+    for each ov as string in ctx.options.scanOverlays
+        dim as long eq = instr( ov, "=" )
+        if eq > 1 then
+            dim as ByteBuf raw
+            if fs.ReadAllBytes( mid( ov, eq + 1 ), raw ).IsOk( ) then
+                dim as string t = space( raw.Count )
+                for i as int32 = 0 to raw.Count - 1
+                    t[i] = raw[i]
+                next
+                r->overlayPath.Push( left( ov, eq - 1 ) )
+                r->overlayText.Push( t )
+            end if
+        end if
+    next
+    if ctx.options.scanModuleRoot then r->moduleRoot = true
+    for i as int32 = 0 to r->overlayPath.Count - 1
+        ctx.sources.AddOverlay( r->overlayPath[i], r->overlayText[i] )
+    next
+    if (r->moduleRoot = false) orelse (srcInputs.Count <> 1) orelse (modDirs.Count <> 0) then return
+
+    '' The root's text: its own buffer, then an overlay, then the file. A file that can't be read
+    '' stays the input, and the load reports it.
+    dim as string root = srcInputs[0], text_ = r->rootText
+    dim as boolean have = r->hasRootText
+    if have = false then
+        dim as string rootAbs = Tko.Text.UStringToUtf8( fs.PathNormalize( fs.AbsolutePath( root ).Value( ) ) )
+        for i as int32 = 0 to r->overlayPath.Count - 1
+            dim as string oAbs = Tko.Text.UStringToUtf8( fs.PathNormalize( fs.AbsolutePath( r->overlayPath[i] ).Value( ) ) )
+            if Tko.Text.LowerAscii( oAbs ) = Tko.Text.LowerAscii( rootAbs ) then
+                text_ = r->overlayText[i]
+                have = true
+                exit for
+            end if
+        next
+    end if
+    if have = false then
+        dim as ByteBuf raw
+        if fs.ReadAllBytes( root, raw ).IsOk( ) = false then return
+        text_ = space( raw.Count )
+        for i as int32 = 0 to raw.Count - 1
+            text_[i] = raw[i]
+        next
+    end if
+    if OpensAsModule_( text_ ) = false then return
+    if r->hasRootText then
+        ctx.sources.AddOverlay( root, r->rootText )
+        r->hasRootText = false
+    end if
+    dim as long cut = instrrev( root, any "/\" )
+    modDirs.Push( iif( cut > 0, left( root, cut - 1 ), "." ) )
+    srcInputs.Clear( )
+end sub
+
+'' Each module the root imports is harvested, and its interface lets the root's '#import' bind.
+'' A module-directory root keeps its unit: building the imports ends with no current module.
+sub ScanImports( byref ctx as Tko.CompilerContext, byval srcCount as int32, byref linkObjs as Tko.StrVec, _
+                 byref tempObjs as Tko.StrVec, byref toolExit as int32 )
+    dim as ScanResult ptr r = cast( ScanResult ptr, ctx.scan )
+    dim as Tko.UnitState saved = ctx.unit
+    r->importing = true
+    Tko.Modules.BuildImports( ctx, srcCount, linkObjs, tempObjs, toolExit, true )
+    r->importing = false
+    if saved.modFileCount > 0 then ctx.unit = saved
 end sub
 
 sub Finish( byref ctx as Tko.CompilerContext )

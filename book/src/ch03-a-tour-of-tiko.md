@@ -63,6 +63,12 @@ Two library calls do the work. `strings.Replace` flattens the newlines into spac
 `strings.Split` cuts the result on spaces and hands back an array. `words.Count` is how many it
 found.
 
+`strings.Replace` runs twice because a text file can end its lines two ways: Windows writes CR LF
+(`!"\r\n"`), Linux and macOS write LF alone. The first call turns every CR LF into a plain LF, so
+the second sees one kind of line ending whichever system wrote the file. Skip the first call and a
+CR stays stuck to the last word of every line, and the console prints that CR as a return to the
+start of the line.
+
 `for each w in words` walks the array without an index, without a bound, and without the
 off-by-one that an index loop invites. The loop variable's type comes from the array, so `w` is a
 `ustring` — tiko's string type, which holds text rather than bytes and is the same on every

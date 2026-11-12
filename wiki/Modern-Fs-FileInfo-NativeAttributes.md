@@ -2,7 +2,7 @@
 
 # FileInfo.NativeAttributes
 
-Returns the raw attribute word: file attributes on Windows, the mode bits on Linux.
+Returns the raw attribute word: attributes on Windows, mode bits on Linux and macOS.
 
 ## Syntax
 

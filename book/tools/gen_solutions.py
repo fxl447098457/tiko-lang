@@ -101,7 +101,7 @@ def main() -> int:
         f"{len(rows)} of the book's {total} exercises have a worked solution. Each is a program in "
         "the companion examples, beside the chapter's listings, under `examples/chNN/solutions/`, "
         "with its expected output in a `.out` file next to it. The solutions are not printed "
-        "here: the listing harness compiles and runs every one of them on both targets, exactly "
+        "here: the listing harness compiles and runs every one of them on every target, exactly "
         "as it does the chapters' listings, so the files are the version that is known to work.",
         "",
         "A solution is one way to do the exercise, not the only one. Several build on a chapter's "

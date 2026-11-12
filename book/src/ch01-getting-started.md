@@ -158,12 +158,13 @@ every target — no guessing whether `int` is 32 or 64 bits today. Chapter 4 lis
 
 ## Choosing a target
 
-tiko builds for two targets, and the default is the machine you are on.
+tiko builds for three targets, and the default is the machine you are on.
 
 | Target | What it is | Default on |
 |---|---|---|
 | `windows-x86_64` | Microsoft's ABI, linked against `ucrtbase.dll` | Windows |
 | `linux-x86_64` | The System V ABI, linked against the system's C library | Linux |
+| `macos-arm64` | Apple's arm64 ABI, linked by Apple's linker against the macOS SDK | macOS |
 
 Name one explicitly with `-target`:
 
@@ -277,8 +278,9 @@ toolchain from source, which this chapter does not.
 - Source files are `.tiko`; headers you write are `.ti`.
 - `tiko hello.tiko -o hello` compiles and links in one step; `-c` stops at the object file and `-v`
   shows every command.
-- Two targets: `windows-x86_64` (the Windows default, and no Visual Studio needed) and
-  `linux-x86_64` (the Linux default). Objects from different targets do not link together.
+- Three targets: `windows-x86_64` (the Windows default, and no Visual Studio needed),
+  `linux-x86_64` (the Linux default) and `macos-arm64` (the macOS default). Objects from different
+  targets do not link together.
 - Diagnostics carry stable `TKOnnnn` identifiers; `--diagnostics-format gnu` suits tools, and
   `-Werror` suits discipline.
 - Build with `-exx` while you learn, and let a listing carry its own options with `#cmdline`.

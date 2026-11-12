@@ -10,7 +10,7 @@ Syntax
 
 Description
 
-The `-dylib` compiler option creates a dynamic link library. This creates a DLL under Windows (including the import library), creates a .so under Linux, and a DXE under DOS.
+The `-dylib` compiler option creates a dynamic link library. This creates a DLL under Windows (including the import library), creates a .so under Linux, a .dylib under macOS, and a DXE under DOS.
 
  **Note:** Same as `-dll`.
 

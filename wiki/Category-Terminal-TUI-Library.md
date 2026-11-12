@@ -60,7 +60,7 @@ The module is a library and nothing else: every line of it is tiko, with no comp
 - **A cell grid that is double-buffered and diffed**, so an unchanged frame costs zero bytes and a changed one costs only what changed.
 - **24-bit colour with an automatic downgrade ladder** -- truecolour, 256, ANSI-16 or mono, chosen from what the terminal actually reports.
 - **Real key events**: named keys, Ctrl/Alt/Shift modifiers, function keys, and a VT parser that does not confuse Esc with the start of a sequence.
-- **A mouse, on both platforms**, including the wheel.
+- **A mouse, on every platform**, including the wheel.
 - **Resize as an event** rather than a poll.
 - **Correct column widths** for CJK, combining marks and zero-width characters, from a generated Unicode 17.0.0 East Asian Width table.
 - **A constraint layout solver** -- Length, Percent, Ratio, Min, Max, Fill -- that splits a rectangle deterministically.
@@ -256,7 +256,7 @@ Mouse and focus events are off by default because a program that does not use th
 
 The module also installs a last-resort restore -- SetConsoleCtrlHandler on Windows, a signal handler on Linux and macOS -- so a crash or a Ctrl+Break does not leave the user's shell in raw mode with the cursor hidden. The leave sequence is pre-rendered into a fixed async-signal-safe buffer for exactly that path.
 
-**Do not PRINT inside a session.** On Linux a stray PRINT can emit CSI 6n and block. Ordinary PRINT is safe only after TuiRun returns, which it does with the terminal fully restored.
+**Do not PRINT inside a session.** On Linux and macOS a stray PRINT can emit CSI 6n and block. Ordinary PRINT is safe only after TuiRun returns, which it does with the terminal fully restored.
 
 **Capabilities** are detected once, from TERM, COLORTERM, WT_SESSION, the Windows build number and GetConsoleMode:
 

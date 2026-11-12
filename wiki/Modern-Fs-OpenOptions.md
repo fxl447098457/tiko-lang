@@ -18,7 +18,7 @@ end type
 
 ## Notes
 
-- Everything defaults FALSE except the three share flags, which default TRUE so a file open in one program can still be read, written, renamed and deleted by others, as on Linux.
+- Everything defaults FALSE except the three share flags, which default TRUE so a file open in one program can still be read, written, renamed and deleted by others, as on Linux and macOS.
 - Append implies Write and puts every write at the end. Truncate requires Write and cannot be combined with Append. Create and CreateNew need Write or Append. CreateNew fails FS_ALREADY_EXISTS if the file is there, atomically, and ignores Create and Truncate. Read alone, Write alone or both is the access mode. A combination outside these rules is FS_INVALID_ARGUMENT, before anything is opened.
 - Inheritable FALSE means a child process started later does not get the handle.
 - NoFollow fails with FS_LOOP when the last component of the path is a symbolic link.

@@ -1,0 +1,97 @@
+'' semcva.tiko -- THE OPERANDS of cva_start, cva_copy, cva_end and cva_arg.
+''
+'' Lowering (mir/lowercva.tiko) declines whatever is not a real list, because those opcodes
+'' write through the pointer they are given. A decline is TKO0994, an internal compiler error,
+'' for what is only a mistake in the program. Measured on fbc-modern 1.20:
+''
+''     cva_start( )  cva_end( )           error 14   Expected identifier
+''     cva_start( a )  cva_copy( a )      error 16   Expected ','
+''     cva_start( a, n, n )               error 7    Expected ')'
+''     a list that is a long, a long ptr  error 24   Invalid data types
+''
+'' 'ANY PTR' IS THE ONE PLACE THIS LEAVES fbc. fbc takes one as a list and emits a raw walk up
+'' the stack from the last named parameter ('P = &N + 8'): the shape it refuses in
+'' va_first/va_next (TKO0981), and not a va_list on linux-x86_64, where integer varargs arrive
+'' in registers. Refused on every target rather than being right on one.
+
+#import "std/containers"
+#include once "symbols/sem.ti"
+#include once "diag/diagids.ti"
+#include once "symbols/check.ti"
+#include once "symbols/modsym.ti"
+#include once "types/udtlayout.ti"
+
+namespace Tko.Sem
+
+#include once "symbols/visctx.ti"
+#include once "symbols/semcalls.ti"
+
+'' Reports and answers true when 'e' has a type and it is not a cva_list. The same test as
+'' lowercva.tiko's CvaAddr_: a byref parameter of one is one. No type means another
+'' diagnostic already spoke, so nothing is added to it.
+private function CvaNotList_ ( byref c as Ctx, byval e as NodeId, byref nm as string ) as boolean
+    if e = NODE_NONE then return false
+    dim as TypeId t = c.info->TypeOf_( e )
+    if t = TYPE_NONE then return false
+    dim as TypeId u = c.types->Unqualify( t )
+    if c.types->Kind( u ) = TK_REFERENCE then u = c.types->Inner( u )
+    if (c.types->Kind( u ) = TK_BUILTIN) andalso (c.types->BuiltinOf( u ) = TY_CVA_LIST) then return false
+    c.diags->Report( TKO0989, PointRange( c.ast->Loc( e ) ), nm, c.types->Name( u ) )
+    return true
+end function
+
+'' The operands of a statement form. 'cva_start( a, n )' arrives as ONE child, an N_TUPLE of
+'' the two, and 'cva_end( a )' as one N_PAREN: see CvaOperands_ in lowercva.tiko.
+private function CvaStmtOperands_ ( byref c as Ctx, byval sp as StmtPayload ptr, byref first_ as int32 ) as int32
+    first_ = sp->first
+    if sp->count <> 1 then return sp->count
+    dim as NodeId only_ = c.ast->ChildAt( sp->first, 0 )
+    dim as NodeKind k = c.ast->Kind( only_ )
+    if (k <> N_TUPLE) andalso (k <> N_PAREN) then return 1
+    dim as ListPayload ptr lp = _
+        c.ast->ListOf( only_ )
+    first_ = lp->first
+    return lp->count
+end function
+
+'' 'cva_arg' is a call in an expression and an intrinsic as a statement; the parser gives it
+'' its two operands either way, so only the list's type is left to judge.
+private sub CheckCvaArgCall_ ( byref c as Ctx, byval id as NodeId )
+    dim as ListPayload ptr lp = _
+        c.ast->ListOf( id )
+    if (lp->count <> 2) orelse (lp->target = NODE_NONE) then return
+    if c.ast->Kind( lp->target ) <> N_IDENT then return
+    dim as InternId fn = c.names->Fold( c.ast->IdentOf( lp->target )->name )
+    if cast( int32, fn ) > TKO_KEYWORD_COUNT then return    '' keywords are the low ids
+    if lcase( c.names->Spelling( fn ) ) <> "cva_arg" then return
+    CvaNotList_( c, c.ast->ChildAt( lp->first, 0 ), "cva_arg" )
+end sub
+
+sub CheckCvaUse_ ( byref c as Ctx, byval id as NodeId, byval k as NodeKind )
+    if k = N_CALL then CheckCvaArgCall_( c, id ) : return
+
+    dim as StmtPayload ptr sp = _
+        c.ast->StmtOf( id )
+    dim as string nm, usage
+    dim as int32 want = 2, lists = 1
+    select case cast( TokenKind, sp->op )
+    case KW_CVA_ARG
+        CvaNotList_( c, sp->a, "cva_arg" )
+        return
+    case KW_CVA_START : nm = "cva_start" : usage = "cva_start( list, lastParam )"
+    case KW_CVA_COPY  : nm = "cva_copy"  : usage = "cva_copy( dest, source )" : lists = 2
+    case KW_CVA_END   : nm = "cva_end"   : usage = "cva_end( list )" : want = 1
+    case else : return
+    end select
+
+    dim as int32 first_
+    if CvaStmtOperands_( c, sp, first_ ) <> want then
+        c.diags->Report( TKO0988, PointRange( c.ast->Loc( id ) ), nm, usage )
+        return
+    end if
+    for i as int32 = 0 to lists - 1
+        if CvaNotList_( c, c.ast->ChildAt( first_, i ), nm ) then return
+    next
+end sub
+
+end namespace

@@ -12,7 +12,7 @@ MoneyLocaleName( ) as ustring
 
 ## Notes
 
-- Windows reports an NLS name such as `en-CA`. Linux reports whatever `setlocale` returned for `LC_MONETARY`.
+- Windows reports an NLS name such as `en-CA`. Linux and macOS report whatever `setlocale` returned for `LC_MONETARY`.
 - Empty, or a C-locale name, when the system rejected the locale. Check [MoneyLocaleIsValid](Modern-String-MoneyLocaleIsValid) rather than reading anything into the name.
 - Reads the snapshot, loading it on first use.
 

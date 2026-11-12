@@ -18,6 +18,7 @@ Looking for a function by what it does? The [Function Finder](Function-Finder) g
 - [Defer](Category-Defer) — 1 pages
 - [Lambdas](Category-Lambdas) — 1 pages
 - [Block Strings](Category-Block-Strings) — 1 pages
+- [Partial Types](Category-Partial-Types) — 1 pages
 - [String Slices](Category-String-Slices) — 9 pages
 - [Embed](Category-Embed) — 1 pages
 - [Typed Variadics](Category-Typed-Variadics) — 1 pages

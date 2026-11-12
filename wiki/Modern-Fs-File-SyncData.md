@@ -12,7 +12,7 @@ File.SyncData( )
 
 ## Notes
 
-- The data only (fdatasync), which can be cheaper on POSIX. The same as Sync on Windows.
+- The data only (fdatasync), which can be cheaper on POSIX. The same as Sync on Windows. On macOS it is F_FULLFSYNC, which also flushes the drive's own cache.
 
 ## Examples
 

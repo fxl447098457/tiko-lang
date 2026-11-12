@@ -12,7 +12,7 @@ CurrentLocaleFormat( ) as NumFormat
 
 ## Notes
 
-- Fills a `NumFormat` from the OS: `decimalSep` and `groupSep`, from the user's Region settings on Windows and from `LC_ALL` / `LC_NUMERIC` / `LANG` on Linux. A separator the OS does not supply keeps its default.
+- Fills a `NumFormat` from the OS: `decimalSep` and `groupSep`, from the user's Region settings on Windows and from `LC_ALL` / `LC_NUMERIC` / `LANG` on Linux and macOS. A separator the OS does not supply keeps its default.
 - Grouping stays off; set `grouping = true` to use `groupSep`.
 - The process locale is not changed, so `ToString` and `str` are unaffected.
 - **Its result depends on the machine**, so it must not be written to a file or asserted on -- it is for presenting a number to the person at the keyboard.

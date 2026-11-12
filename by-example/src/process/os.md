@@ -35,7 +35,7 @@ program may use, which is fewer than the machine has inside a container. The
 example prints only facts that are the same everywhere.
 
 ```admonish info title="Threads"
-Set the environment before starting threads. On Linux, changing a variable
+Set the environment before starting threads. On Linux and macOS, changing a variable
 while another thread reads the environment is not safe.
 ```
 

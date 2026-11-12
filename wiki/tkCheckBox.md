@@ -11,7 +11,7 @@ check-changed callback reports the new state after it has been applied.
 
 By default the box is drawn as vectors (`CHK_BOXSTYLE_VECTOR`): a rounded square when unchecked,
 the square filled with a knocked-out tick when checked. It needs no font, so it looks the same on
-Windows and Linux. `CHK_BOXSTYLE_GLYPH` draws one font glyph per state instead.
+Windows, Linux and macOS. `CHK_BOXSTYLE_GLYPH` draws one font glyph per state instead.
 
 ## Importing
 

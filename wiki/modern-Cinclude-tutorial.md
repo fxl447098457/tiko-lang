@@ -30,10 +30,10 @@ and every function, type and constant in `shapes.h` is ready to use.
 
 ## 2. What you need
 
-| | Windows | Linux |
-|---|---|---|
-| tiko and LLVM | as for any tiko program | as for any tiko program |
-| C headers | **Visual Studio Build Tools**, with *Desktop development with C++* and the Windows SDK | your distribution's C compiler (`build-essential` on Ubuntu) |
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| tiko and LLVM | as for any tiko program | as for any tiko program | as for any tiko program |
+| C headers | **Visual Studio Build Tools**, with *Desktop development with C++* and the Windows SDK | your distribution's C compiler (`build-essential` on Ubuntu) | Xcode's **Command Line Tools** |
 
 `#cinclude` uses **libclang**, which comes with the LLVM install that tiko already needs. tiko loads it only when a program has a `#cinclude`, so programs without one never need it.
 
@@ -299,7 +299,7 @@ warning TKO0833: passing different pointer types: a 'sub( as shape ptr, as int32
 
 The `void *user` parameter is how a callback gets at your data. `shapes-demo.tiko` passes `@total`, and the callback turns it back into a `float64 ptr`.
 
-About calling conventions: on 64-bit Windows and Linux there is only one way C calls a function, so you can write `cdecl` or leave the convention out. Both match. Do not write `pascal`: it reverses the order of the arguments, and tiko warns about it.
+About calling conventions: on Windows, Linux and macOS there is only one way C calls a function, so you can write `cdecl` or leave the convention out. Both match. Do not write `pascal`: it reverses the order of the arguments, and tiko warns about it.
 
 ## 7. Where tiko looks for a header
 

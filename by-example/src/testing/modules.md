@@ -31,13 +31,13 @@ library goes after them.
 
 ````admonish danger title="Pitfall"
 **Tests do not run in the same order on every platform.** Each `TEST` and each
-`SUITE` registers itself when the program starts, and the two platforms walk
+`SUITE` registers itself when the program starts, and platforms walk
 those registrations in opposite orders: a program with two suites lists them
-in declaration order on Linux and in reverse on Windows, and run verbosely,
+in declaration order on Linux and macOS and in reverse on Windows, and run verbosely,
 with `fbcu.run_tests( true, true )`, it lists the tests of one suite the same
 way. Nothing goes wrong while every test
 stands alone. A test that relies on something an earlier test did passes on one
-platform and fails on the other. Give every test its own setup.
+platform and fails on another. Give every test its own setup.
 ````
 
 ### Activities

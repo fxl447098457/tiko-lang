@@ -6,6 +6,7 @@ The functions to keep lists, lookups and sets of values; sort and search them, g
 
 - **built-in**: nothing; it is always available.
 - `std/containers`: `#import "std/containers"`, then `using containers` to call it by its bare name.
+- `std/numeric`: `#import "std/numeric"`, then `using numeric` to call it by its bare name.
 - `fbc-int/array.bi`: `#include "fbc-int/array.bi"`, then `using FB`.
 
 Jump to: [Choose a container](#choose-a-container) · [Array: add and remove](#array-add-and-remove) · [Array: read, count and visit](#array-read-count-and-visit) · [Array: find a value](#array-find-a-value) · [Sort an Array or a LinkedList](#sort-an-array-or-a-linkedlist) · [Map: add and change](#map-add-and-change) · [Map: look up](#map-look-up) · [Map: list keys and values](#map-list-keys-and-values) · [Set: add, remove and test](#set-add-remove-and-test) · [Built-in arrays: bounds and size](#built-in-arrays-bounds-and-size) · [Built-in arrays: resize and erase](#built-in-arrays-resize-and-erase) · [Queues and stacks: LinkedList and Deque](#queues-and-stacks-linkedlist-and-deque) · [PriorityQueue: take the smallest first](#priorityqueue-take-the-smallest-first) · [Combine sets](#combine-sets) · [Find the first, last or nearest key](#find-the-first-last-or-nearest-key) · [BitSet: flags by number](#bitset-flags-by-number) · [Rearrange an Array](#rearrange-an-array) · [Walk a container step by step](#walk-a-container-step-by-step) · [Reserve room ahead of time](#reserve-room-ahead-of-time) · [Check a container's internals](#check-a-containers-internals)
@@ -257,6 +258,7 @@ Jump to: [Choose a container](#choose-a-container) · [Array: add and remove](#a
 | [PartialSort](Category-Searching#rearranging-in-place) | Puts the k smallest elements, sorted, at the front; the rest are left in no order. | `std/containers` |
 | [PartialSortBy](Category-Searching#rearranging-in-place) | Puts the k first elements by your comparer, sorted, at the front. | `std/containers` |
 | [NthElement](Category-Searching#rearranging-in-place) | Puts at index k the element a full sort would put there, without sorting the rest. | `std/containers` |
+| [ShuffleArray](Modern-Math-Shuffle#containers) | Shuffles an array or container in place so that every order is equally likely. | `std/numeric` |
 | [NthElementBy](Category-Searching#rearranging-in-place) | Puts at index k the element a sort by your comparer would put there. | `std/containers` |
 
 ## Walk a container step by step

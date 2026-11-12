@@ -150,7 +150,7 @@ Every option is part of the cache key, so one header imported with different opt
 
 An opaque handle, `typedef struct sqlite3 sqlite3;` with no definition, becomes `type sqlite3 as any`: you only ever hold a `sqlite3 ptr`.
 
-C's `int` arrives as `long` (32 bits, the same type as `int32`), `long long` as `longint`, `double` as `double`, `char *` as `zstring ptr`, `void *` as `any ptr`, and `char name[16]` as `zstring * 16`. Where C's types differ by platform, so does the binding: C's `long` is 32 bits on Windows and 64 on Linux, and a binding that uses it includes `crt/long.bi`.
+C's `int` arrives as `long` (32 bits, the same type as `int32`), `long long` as `longint`, `double` as `double`, `char *` as `zstring ptr`, `void *` as `any ptr`, and `char name[16]` as `zstring * 16`. Where C's types differ by platform, so does the binding: C's `long` is 32 bits on Windows and 64 on Linux and macOS, and a binding that uses it includes `crt/long.bi`.
 
 ## Calling conventions
 

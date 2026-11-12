@@ -15,7 +15,7 @@ print os.OS_NAME, os.CpuCount( ), os.Hostname( ).ValueOr( "?" )
 
 ## Arguments
 
-`os.Args( )` returns an `Array( of ustring )` with the program itself first. Arguments are Unicode on both Windows and Linux, and an empty argument (`""` on the command line) is kept as an empty element.
+`os.Args( )` returns an `Array( of ustring )` with the program itself first. Arguments are Unicode on Windows, Linux and macOS, and an empty argument (`""` on the command line) is kept as an empty element.
 
 On Windows the command line is split by the standard Windows rules: double quotes group words, `\"` is a literal quote, and backslashes are literal everywhere else.
 
@@ -46,17 +46,17 @@ os.UnsetEnv( "APP_MODE" )
 | `Environment( )` | a sorted snapshot, `OrderedMap( of ustring, ustring )` |
 | `ExpandEnv( s )` | `$NAME` and `${NAME}` become the value, or nothing when unset; on Windows `%NAME%` too, left as written when unset |
 
-A name may not be empty or contain `=`; `SetEnv` and `UnsetEnv` fail with `OS_INVALID_ARGUMENT` and `GetEnv` returns an empty `Optional`. Names are case-insensitive on Windows and case-sensitive on Linux, as each system treats them.
+A name may not be empty or contain `=`; `SetEnv` and `UnsetEnv` fail with `OS_INVALID_ARGUMENT` and `GetEnv` returns an empty `Optional`. Names are case-insensitive on Windows and case-sensitive on Linux and macOS, as each system treats them.
 
-**Set the environment before starting threads.** On Linux, changing the environment while another thread reads it is not safe.
+**Set the environment before starting threads.** On Linux and macOS, changing the environment while another thread reads it is not safe.
 
 ## Host Facts
 
 | Name | Gives |
 |---|---|
-| `OS_NAME` | `"windows"` or `"linux"` (a constant) |
+| `OS_NAME` | `"windows"`, `"linux"` or `"macos"` (a constant) |
 | `ARCH_NAME` | `"x86_64"` (a constant) |
-| `OsVersion( )` | `"10.0.26100"` on Windows, the kernel release on Linux |
+| `OsVersion( )` | `"10.0.26100"` on Windows, the kernel release on Linux and macOS |
 | `Hostname( )`, `UserName( )` | `Result( of ustring, OsError )` |
 | `ProcessId( )` | this process's id |
 | `CpuCount( )` | the processors **this process may run on** — fewer than the machine has under a container limit or an affinity mask |
@@ -101,7 +101,7 @@ if os.Interrupted( ) then print "stopping cleanly after "; n; " steps"
 
 None of your code runs inside the signal handler; it only records what happened. When Windows closes the console, logs the user off or shuts down, the program has about five seconds after the interrupt before Windows ends it regardless.
 
-| Kind | Windows | Linux |
+| Kind | Windows | Linux and macOS |
 |---|---|---|
 | `INT_CTRL_C` | Ctrl-C | `SIGINT` |
 | `INT_BREAK` | Ctrl-Break | — |

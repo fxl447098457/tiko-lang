@@ -20,7 +20,7 @@ tiko c2t <in.h> [-o <out.ti>|-] [-I <dir>] [-D <name>[=<value>]] [-U <name>]
 tiko c2t raylib.h -o raylib.ti
 ```
 
-The header is parsed by Clang twice, once for **windows-x86_64** and once for **linux-x86_64**, and the two translations are merged into one file. Text that is the same on both targets is written once; text that differs is written under a guard the translation synthesises (`#if defined(TIKO_OS_WINDOWS)` … `#elseif defined(TIKO_OS_LINUX)` … `#endif`). The header's own `#if` lines are kept and translated, with C's platform macros spelled as tiko's own (`_WIN32` → `TIKO_OS_WINDOWS`, `__linux__` → `TIKO_OS_LINUX`, `__x86_64__` → `TIKO_ARCH_X86_64`). A test of the compiler (`_MSC_VER`, `__GNUC__`, `__clang__`) is kept as written -- tiko defines none of them, so the program including the file decides -- and every branch of such a group is translated for both targets.
+The header is parsed by Clang twice, once for **windows-x86_64** and once for **linux-x86_64**, and the two translations are merged into one file. With `--macos-sysroot`, a third pass adds **macos-arm64**. Text that is the same on both targets is written once; text that differs is written under a guard the translation synthesises (`#if defined(TIKO_OS_WINDOWS)` … `#elseif defined(TIKO_OS_LINUX)` … `#endif`). The header's own `#if` lines are kept and translated, with C's platform macros spelled as tiko's own (`_WIN32` → `TIKO_OS_WINDOWS`, `__linux__` → `TIKO_OS_LINUX`, `__x86_64__` → `TIKO_ARCH_X86_64`). A test of the compiler (`_MSC_VER`, `__GNUC__`, `__clang__`) is kept as written -- tiko defines none of them, so the program including the file decides -- and every branch of such a group is translated for both targets.
 
 A branch neither target takes -- `#ifdef SQLITE_ENABLE_SESSION`, an `#elif` for another platform -- is translated as well: the header is parsed once more per target with that branch switched on, and what it holds is written inside the translated `#if`, so defining the macro in tiko gives the same API C would. A header the branch includes that this machine does not have is left out of that parse, and its `#include` translated by name. `#error` is kept as tiko's `#error`.
 
@@ -166,7 +166,7 @@ After a mapped include the translation may name the types that header declares a
 
 Types are written by their fixed width, the same on both targets: `int` → `int32`, `unsigned` → `uint32`, `long long` → `int64`, `float` → `float32`, `double` → `float64`, `_Bool` → `boolean`, `size_t` → `uinteger`, `char` → `byte`, `void *` → `any ptr`. C's `long` is 4 bytes on Windows and 8 on Linux, and is written `clong` (from `crt/long.bi`). A typedef is kept by name.
 
-A record with a bit-field, or a packed one (`field = N`), is written `type X extern "c"`, so tiko lays it out by the target's C rule: MSVC's on windows-x86_64, SysV's on linux-x86_64. Any other record's layout is C's already, and is written plainly.
+A record with a bit-field, or a packed one (`field = N`), is written `type X extern "c"`, so tiko lays it out by the target's C rule: MSVC's on windows-x86_64, SysV's on linux-x86_64 and macos-arm64. Any other record's layout is C's already, and is written plainly.
 
 A record used before it is defined is named through a hidden alias, `type Foo__fwd as Foo`, written where C declares it forward: `Foo__fwd ptr` above the definition, `Foo ptr` after it and for a record that is never defined (an opaque handle).
 

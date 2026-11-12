@@ -17,7 +17,7 @@ union is as large as its largest field.
 `Bits32` is four bytes, whichever field you use. Writing `asFloat` and
 reading `asInt` shows the bit pattern of the `float32` value 1.0, and the
 `bytes` array shows the same four bytes one at a time. The lowest address
-holds the lowest byte, because both targets are little-endian.
+holds the lowest byte, because every target is little-endian.
 
 A `union ... end union` without a name, inside a `type`, gives one slot of the
 record two meanings: `Value` stores either an `int64` or a `float64` in the

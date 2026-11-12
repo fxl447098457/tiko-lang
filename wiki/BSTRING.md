@@ -13,19 +13,10 @@ The model to keep in mind:
 
 - **It owns its handle.** The destructor calls `SysFreeString` on `m_bstr`. Anything you store in
   `m_bstr` yourself becomes the `BSTRING`'s to free.
-- **A new `BSTRING` is empty and has no handle.** `dim bs as BSTRING` leaves `m_bstr` at `NULL`:
-  `len( bs )` is 0 and it converts to an empty `ustring`, but a COM method that requires a valid
-  `BSTR` gets a null one. [Append](#append) and [Let](#let) give it a handle.
-- **Text in, by encoding.** A wide string (`wstr( "…" )`, a `wstring` buffer, another
+- **Text in, by encoding.** A wide string (`wstr( "…" )`, a USTRING, another
   `BSTRING`) is copied as it is, and so is text assigned with `=` ([Let](#let)), narrow or wide.
-  A narrow string, literal or `ustring` given when the variable is created goes through the
-  code-page [Constructor](#constructor), which reads it as ANSI unless you pass `CP_UTF8`: start a
-  `BSTRING` that holds characters outside ASCII from `wstr()`.
 - **Text out.** Assign to a `ustring` (`dim u as ustring = bs`) or read [Utf8](#utf8). A
   function that reads a `BSTR` takes the `BSTRING` itself; `*bs` is the handle.
-- **Copy with care.** `dim b2 as BSTRING = b1` copies the text into a new `BSTR`, but the
-  assignment `b2 = b1` between two existing variables copies the handle: both variables then free
-  the same string. Assign `b2 = *b1` to copy the text.
 
 ## Importing
 
@@ -46,7 +37,8 @@ one fill a `BSTRING`:
 using win, com
 
 dim bs as BSTRING = wstr( "Café" )
-bs.Append( " au lait" )
+bs  += " au lait"
+print bs
 print "length:"; len( bs )
 
 bs[0] = asc( "c" )
@@ -80,7 +72,6 @@ same text
 | [Destructor](#destructor) | Frees the `BSTR`. |
 | [Append](#append) | Adds text to the end. |
 | [Clear](#clear) | Frees the `BSTR` and leaves the variable empty. |
-| [IsUtf8](#isutf8) | Tells whether a narrow string is valid UTF-8. |
 | [Utf8](#utf8) | Reads the text as UTF-8, or replaces it with UTF-8 text. |
 | [wchar](#wchar) | Returns a copy of the text in memory from `CoTaskMemAlloc`. |
 | [Let](#let) | Replaces the text with a copy of a wide string. |
@@ -94,39 +85,21 @@ same text
 
 ```freebasic
 constructor
-constructor( byval pwszStr as const wstring ptr )
-constructor( byref ansiStr as string = "", byval nCodePage as UINT = 0 )
-constructor( byval nChars as long, byref wszFill as const wstring )
+constructor( byref bs as BSTRING )
+constructor( byref ustr AS USTRING )
 ```
-
-- With no argument the `BSTRING` is empty and `m_bstr` is `NULL`.
-- With a wide-string pointer it holds a copy of that text; `NULL` gives an empty string with a
-  handle.
-- With a narrow string it converts the text from code page `nCodePage`: 0 (`CP_ACP`, the default)
-  is the system ANSI code page. With `CP_UTF8` the text is first checked with
-  [IsUtf8](#isutf8) and read as ANSI if it is not valid UTF-8. The UTF-8 conversion keeps the
-  terminating null as a last character, so the length is one more than the number of characters
-  (`BSTRING( "año", CP_UTF8 )` has a length of 4); text appended after it is hidden from anything
-  that stops at the first null. A narrow literal with only ASCII characters is the simple case:
-  `dim bs as BSTRING = "Hello"`.
-- With a count and a fill string it holds `nChars` copies of the first character of `wszFill`,
-  or of a space when `wszFill` is empty. A count below 1 gives one character.
 
 | Parameter | Meaning |
 | --- | --- |
-| `pwszStr` | The text to copy. |
-| `ansiStr` | Narrow text to convert. |
-| `nCodePage` | The code page of `ansiStr`: `CP_ACP` (0) or `CP_UTF8`. |
-| `nChars` | The number of characters. |
-| `wszFill` | A string whose first character is repeated. |
+| `bs` | The BSTRING to copy. |
+| `ustr` | Wide text to convert. |
 
 **Example**
 
 ```freebasic
 dim b1 as BSTRING = "Hello"
-dim b2 as BSTRING = wstr( "año" )
-dim b3 as BSTRING = BSTRING( 5, "*" )
-print len( b1 ), len( b2 ), len( b3 )   ' 5  3  5
+DIM b2 AS BSTRING = "Серге́й"
+print b1 & " " & b2
 ```
 
 Microsoft Learn: [SysAllocString](https://learn.microsoft.com/en-us/windows/win32/api/oleauto/nf-oleauto-sysallocstring)
@@ -153,12 +126,10 @@ Microsoft Learn: [SysFreeString](https://learn.microsoft.com/en-us/windows/win32
 ### Append
 
 ```freebasic
-sub Append( byval pwszStr as const wstring ptr )
+sub Append( byref ustr as USTRING )
 ```
 
-Adds a copy of `pwszStr` to the end, in a new `BSTR` that replaces the old one. Appending an
-empty string does nothing; appending to an empty `BSTRING` gives it a handle. `pwszStr` must not
-be `NULL`.
+Adds a copy of `ustr` to the end, in a new `BSTR` that replaces the old one.
 
 **Example**
 
@@ -188,26 +159,6 @@ bs.Clear()
 VarBstrFromI4( 42, LOCALE_USER_DEFAULT, 0, @bs.m_bstr )
 ```
 
-### IsUtf8
-
-```freebasic
-function IsUtf8( byref s as string ) as boolean
-```
-
-Tells whether the bytes of `s` are valid UTF-8. A string that starts with the UTF-8 byte-order
-mark counts as UTF-8 whatever follows; an empty string does not. Plain ASCII is valid UTF-8.
-
-**Returns** `true` when `s` is valid UTF-8.
-
-**Example**
-
-```freebasic
-dim bs as BSTRING
-print bs.IsUtf8( "abc" ), bs.IsUtf8( chr( &hC3 ) )   ' true  false
-```
-
-Microsoft Learn: [MultiByteToWideChar](https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-multibytetowidechar)
-
 ### Utf8
 
 ```freebasic
@@ -215,13 +166,9 @@ property Utf8() as string
 property Utf8( byref utf8String as string )
 ```
 
-Reading `Utf8` returns the text converted to UTF-8, or `""` for an empty `BSTRING`. Every
-character the `BSTR` holds is converted, including a terminating null that the code-page
-constructor or the setter stored.
+Reading `Utf8` returns the text converted to UTF-8, or `""` for an empty `BSTRING`.
 
-Setting `Utf8` frees the current text and stores `utf8String` converted from UTF-8. Like the
-`CP_UTF8` constructor, it keeps the terminating null as a last character: setting `"año"` gives a
-length of 4.
+Setting `Utf8` frees the current text and stores `utf8String` converted from UTF-8.
 
 **Returns** the text as UTF-8 (the getter).
 
@@ -263,23 +210,18 @@ Microsoft Learn: [CoTaskMemAlloc](https://learn.microsoft.com/en-us/windows/win3
 ### Let
 
 ```freebasic
-operator let( byval pwsz as const wstring ptr )
+operator let( byref bs as BSTRING )
+operator let( byref ustr as USTRING )
 ```
 
-Frees the current text and stores a copy of `pwsz`. A narrow literal, `string` or `ustring`
-assigned this way is read as UTF-8: after `bs = "año"` the length is 3, where
-`dim bs as BSTRING = "año"` reads the bytes as ANSI.
-
-Assigning one `BSTRING` variable to another (`b2 = b1`) does not come here: it copies the
-`m_bstr` handle itself, so both variables free the same `BSTR` and the old text of `b2` leaks.
-Write `b2 = *b1` to copy the text.
+Frees the current text and stores a copy of `bs` or `ustr`.
 
 **Example**
 
 ```freebasic
 dim b1 as BSTRING = "first"
 dim b2 as BSTRING = "second"
-b2 = *b1   ' b2 now holds its own copy of "first"
+b2 = b1   ' b2 now holds its own copy of "first"
 ```
 
 ### Cast
@@ -331,17 +273,12 @@ Frees the current text, stores a new empty `BSTR` and returns the address of `m_
 function with an output `BSTR` parameter writes its result into the `BSTRING`. A function that
 overwrites the parameter without freeing it leaves that empty string behind.
 
-Applying `@` to a `BSTRING` currently stops the build with an internal compiler error. Until it
-builds, call [Clear](#clear) and pass `@bs.m_bstr`, which does the same without the empty
-string.
-
 **Returns** the address of `m_bstr`.
 
 **Example**
 
 ```freebasic
 dim bs as BSTRING = "old"
-bs.Clear()
 VarBstrFromI4( 7, LOCALE_USER_DEFAULT, 0, @bs.m_bstr )   ' the form that builds today
 ```
 
@@ -351,7 +288,6 @@ VarBstrFromI4( 7, LOCALE_USER_DEFAULT, 0, @bs.m_bstr )   ' the form that builds 
 | --- | --- |
 | [Len](#len) | Returns the length in characters. |
 | [Operator * (handle)](#operator--handle) | Returns the `BSTR` handle. |
-| [BstrMsg](#bstrmsg) | Shows the text in a message box. |
 
 ### Len
 
@@ -380,8 +316,7 @@ operator *( byref bs as BSTRING ) as wstring ptr
 ```
 
 Returns the `BSTR` handle, `m_bstr`, typed as a `wstring ptr`. `**bs` is the text. Use it to
-pass the string where a `BSTR` is wanted and to copy the text into another `BSTRING`
-(`b2 = *b1`). The handle still belongs to the `BSTRING`: do not free it.
+pass the string where a `BSTR` is wanted.
 
 **Returns** `m_bstr`.
 
@@ -391,40 +326,9 @@ pass the string where a `BSTR` is wanted and to copy the text into another `BSTR
 dim bs as BSTRING = "Hello"
 print SysStringByteLen( *bs )   ' 10
 ```
-
-### BstrMsg
-
-```freebasic
-function BstrMsg overload( byref bs as BSTRING, byval pwszCaption as const wstring ptr = NULL, byval uType as DWORD = 0 ) as long
-function BstrMsg overload( byval hWin as HWND, byref bs as BSTRING, byval pwszCaption as const wstring ptr = NULL, byval uType as DWORD = 0 ) as long
-```
-
-Shows the text of `bs` in a message box, application-modal, owned by `hWin` or, in the first
-form, by the active window of the calling thread. `uType` takes the usual `MB_*` button and icon
-flags; `MB_APPLMODAL` is always added.
-
-| Parameter | Meaning |
-| --- | --- |
-| `hWin` | The owner window, or `NULL`. |
-| `bs` | The text to show. |
-| `pwszCaption` | The title, or `NULL` for the default ("Error"). |
-| `uType` | `MB_*` flags. |
-
-**Returns** the button the user pressed (`IDOK`, `IDYES` …), or 0 on failure.
-
-**Example**
-
-```freebasic
-dim bs as BSTRING = "Saved."
-BstrMsg( hwnd, bs, "Notice", MB_ICONINFORMATION )
-```
-
-Microsoft Learn: [MessageBoxW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-messageboxw)
-
 ## See also
 
 - [sys/win/com](SysWin-Com)
 - [DVARIANT](DVARIANT), which converts to and from `BSTRING`
 - [DSafeArray](DSafeArray) for arrays of `BSTR`
 - [COM procedures](SysWin-Com-Procedures)
-- [Strings](SysWin-Strings) for code pages and UTF-8 in `sys/win`

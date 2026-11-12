@@ -23,6 +23,7 @@ Define without a value created at compile time when the *[-target xbox](Compiler
 ### See also
 
 - [`__FB_LINUX__`](Fb-Linux)
+- [`__FB_DARWIN__`](Fb-Darwin)
 - [`__FB_WIN32__`](Fb-Win32)
 - [Compiler Option: -target](Compiler-Option-Target)
 

@@ -2,7 +2,7 @@
 
 # FileInfo.IsReadOnly
 
-Returns true if the file cannot be written: the read-only flag, or no write bit on Linux.
+Returns true if unwritable: the read-only flag, or no write bit on Linux and macOS.
 
 ## Syntax
 

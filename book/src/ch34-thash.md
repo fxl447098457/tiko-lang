@@ -232,7 +232,7 @@ The paths being sorted are the ones that are printed. The collector stores each 
 `DisplayPath` gives it, so the order cannot depend on the target. Sorting the raw paths would let
 it: `/` sorts before the digits and `\` after them, so on Windows `s2\a0.txt` would come before
 `s2\a\z.txt`, and on Linux `s2/a/z.txt` before `s2/a0.txt`. `DisplayPath` is the same as Chapter
-32's. It turns `\` into `/` only on Windows, because on Linux `\` is an ordinary character in a
+32's. It turns `\` into `/` only on Windows, because on Linux and macOS `\` is an ordinary character in a
 file name:
 
 ```tiko
@@ -257,8 +257,8 @@ Run from the chapter's directory as `thash -j 4 sample`:
 {{#include ../examples/ch34/thash.out}}
 ```
 
-The output is the same with `-j 1` and with `-j 8`, on Windows and on Linux: the harness runs it on
-both, and it was also run 30 times with 1 to 8 workers. With `-v` on Windows, the log lines go to
+The output is the same with `-j 1` and with `-j 8`, on Windows, Linux and macOS: the harness runs it on
+all three, and it was also run 30 times with 1 to 8 workers. With `-v` on Windows, the log lines go to
 stderr in the order the files were hashed, which changes between runs:
 
 ```text

@@ -23,6 +23,7 @@ Define without a value created at compile time in the NetBSD version of the comp
 ### See also
 
 - [`__FB_LINUX__`](Fb-Linux)
+- [`__FB_DARWIN__`](Fb-Darwin)
 - [`__FB_WIN32__`](Fb-Win32)
 - [`__FB_UNIX__`](Fb-Unix)
 - [Compiler Option: -target](Compiler-Option-Target)

@@ -14,6 +14,7 @@ DataDir( )
 
 - Windows: the LocalAppData known folder (C:\Users\name\AppData\Local), falling back to %LOCALAPPDATA%.
 - Linux: $XDG_DATA_HOME when it is set and absolute, otherwise ~/.local/share.
+- macOS: $XDG_DATA_HOME when it is set and absolute, otherwise ~/Library/Application Support.
 - Nothing is created and no application name is added: it says where the directory SHOULD be, and the caller joins its own name and creates what it needs with CreateDirAll.
 
 ## Examples

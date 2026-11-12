@@ -141,6 +141,8 @@ public enum
     TK_CURSOR_SIZENS
     TK_CURSOR_SIZEALL
     TK_CURSOR_WAIT
+    TK_CURSOR_SIZENWSE     ' a diagonal resize: top-left to bottom-right
+    TK_CURSOR_SIZENESW     ' a diagonal resize: top-right to bottom-left
     TK_CURSOR_COUNT
 end enum
 
@@ -283,6 +285,7 @@ dim shared as SDL_Cursor ptr gCursors(0 to TK_CURSOR_COUNT - 1)
 dim shared as long gCursorNow = -1
 dim shared as long gTrace = -1
 dim shared as ulong gPressSerial          ' +1 per mouse press, BEFORE the dismissal rule runs
+dim shared as long gDispatching           ' >0: an event is being delivered, so a surface is on the stack
 
 ' Called with each renderer just before it is destroyed, so caches of textures that belong to
 ' it (tkImage) can drop them. One hook: the only client is tkImage.
@@ -584,6 +587,13 @@ public sub tkHost_Show( byval h as TK_HOST ptr )
     h->bDirty = true
 end sub
 
+' Hides the window and keeps everything in it. tkHost_Show brings it back.
+public sub tkHost_Hide( byval h as TK_HOST ptr )
+    if h = 0 then exit sub
+    SDL_HideWindow( h->win )
+    if h->pOwner then h->pOwner->bDirty = true
+end sub
+
 public sub tkHost_PixelSize( byval h as TK_HOST ptr, byref w as long, byref hgt as long )
     w = 0 : hgt = 0
     if h then SDL_GetRenderOutputSize( h->renderer, @w, @hgt )
@@ -709,6 +719,31 @@ public sub tkWidget_BringToTop( byval w as TK_WIDGET ptr )
     Unlink( w )
     AppendChild( parent, w )
     w->pHost->bDirty = true
+end sub
+
+' Move before `before` in the sibling z-order: below it, and ahead of it in the Tab order. `before`
+' = 0 moves to the top. A `before` that is not a sibling leaves the order alone.
+public sub tkWidget_MoveBefore( byval w as TK_WIDGET ptr, byval before as TK_WIDGET ptr )
+    if (w = 0) orelse (w->pParent = 0) orelse (w = before) then exit sub
+    dim as TK_WIDGET ptr parent = w->pParent
+    if before = 0 then
+        tkWidget_BringToTop( w )
+        exit sub
+    end if
+    if before->pParent <> parent then exit sub
+    Unlink( w )
+    w->pParent = parent
+    w->pNext = before
+    w->pPrev = before->pPrev
+    if before->pPrev then before->pPrev->pNext = w else parent->pFirst = w
+    before->pPrev = w
+    w->pHost->bDirty = true
+end sub
+
+' Move to the bottom of the sibling z-order, and first in the Tab order.
+public sub tkWidget_SendToBack( byval w as TK_WIDGET ptr )
+    if (w = 0) orelse (w->pParent = 0) then exit sub
+    tkWidget_MoveBefore( w, w->pParent->pFirst )
 end sub
 
 public sub tkWidget_Invalidate( byval w as TK_WIDGET ptr )
@@ -1006,8 +1041,11 @@ public function tkHost_IsOpen( byval h as TK_HOST ptr ) as boolean
     return false
 end function
 
-' Destroy every surface that was closed. Called by the pump between events.
+' Destroy every surface that was closed. Called by the pump between events. A pump nested inside a
+' delivery (a menu command waiting on a file dialog) leaves them to the outermost one: the surface
+' that delivery came through is still in use when the handler returns.
 public sub tkHost_Reap()
+    if gDispatching > 0 then exit sub
     dim as long i = 0
     while i < gnHosts
         if gHosts(i)->bClosed then
@@ -1172,6 +1210,8 @@ private sub SyncCursor( byval h as TK_HOST ptr )
         case TK_CURSOR_SIZENS  : sc = SDL_SYSTEM_CURSOR_NS_RESIZE
         case TK_CURSOR_SIZEALL : sc = SDL_SYSTEM_CURSOR_MOVE
         case TK_CURSOR_WAIT    : sc = SDL_SYSTEM_CURSOR_WAIT
+        case TK_CURSOR_SIZENWSE : sc = SDL_SYSTEM_CURSOR_NWSE_RESIZE
+        case TK_CURSOR_SIZENESW : sc = SDL_SYSTEM_CURSOR_NESW_RESIZE
         end select
         gCursors(c) = SDL_CreateSystemCursor( sc )
     end if
@@ -1598,12 +1638,18 @@ public sub tkHost_Dispatch( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
             dim as TK_MSG m
             m.msg = TKM_TIMER
             m.timerId = t->id
+            gDispatching += 1
             tkWidget_Send( t->pW, @m )
+            gDispatching -= 1
         end if
         exit sub
     end if
 
-    if (target <> 0) andalso (target->bClosed = false) then DispatchTo( target, e )
+    if (target <> 0) andalso (target->bClosed = false) then
+        gDispatching += 1
+        DispatchTo( target, e )
+        gDispatching -= 1
+    end if
 end sub
 
 private sub RenderDirty()

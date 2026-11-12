@@ -25,6 +25,7 @@ Define without a value created at compile time when compiling to the Linux targe
 - [`__FB_DOS__`](Fb-Dos)
 - [`__FB_WIN32__`](Fb-Win32)
 - [`__FB_UNIX__`](Fb-Unix)
+- [`__FB_DARWIN__`](Fb-Darwin)
 - [Compiler Option: -target](Compiler-Option-Target)
 
 ## Examples

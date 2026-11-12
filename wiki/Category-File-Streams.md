@@ -75,14 +75,14 @@ Each text call also takes a text encoding: see [Choosing An Encoding](#choosing-
 With no encoding named, five rules:
 
 1. **A BOM is honoured and consumed** -- UTF-8, UTF-16LE and UTF-16BE. It is not part of the returned text.
-2. **No BOM means UTF-8.** Not the ANSI codepage, not the console codepage, on either platform -- a codepage default would make the same file read differently on two machines.
+2. **No BOM means UTF-8.** Not the ANSI codepage, not the console codepage, on any platform -- a codepage default would make the same file read differently on two machines.
 3. **Invalid input is replaced, not rejected.** ReadAllText on a binary file succeeds and returns mojibake. If you need to know, read bytes.
 4. **WriteAllText writes UTF-8 with no BOM.** Name `Utf8( true )` if you need one.
 5. **ReadAllLines splits on `\n` and strips a preceding `\r`**, so CRLF, LF and a mixed file give the same lines. A final newline does not produce a trailing empty line; an empty file gives zero lines. A lone `\r` is not a terminator -- classic Mac endings are not supported.
 
 A file that starts with a UTF-32 byte-order mark (FF FE 00 00 or 00 00 FE FF) is refused with FS_UNSUPPORTED by every call that chooses the encoding itself -- ReadAllText, ReadAllLines, ReadLines and a TextReader -- rather than read as UTF-16 or UTF-8. A call given an encoding believes it.
 
-Reading a directory is FS_IS_A_DIRECTORY on both platforms. A file too large to allocate is FS_NO_SPACE, not a truncation.
+Reading a directory is FS_IS_A_DIRECTORY on every platform. A file too large to allocate is FS_NO_SPACE, not a truncation.
 
 ### Choosing An Encoding
 
@@ -123,7 +123,7 @@ The encodings are `Utf8( [bom] )`, `Utf16LE( [bom] )`, `Utf16BE( [bom] )`, `Ansi
 - **BOMs.** `Utf16LE( )` and `Utf16BE( )` write one unless you pass `false`. `Utf8( )` writes one only as `Utf8( true )`. A code page and `BinaryMode( )` never do.
 - **AppendAllText checks the BOM.** If the file starts with a BOM for a different UTF encoding, the call fails with FS_INVALID_DATA and the file is not changed. A new or empty file gets the encoding's BOM. A file that already has text never gets a second one.
 - **`BinaryMode( )`** reads each byte as the character with the same number, U+0000 to U+00FF. The text writes back to exactly the same bytes, so any file round-trips.
-- **`Ansi( )`** is the system's ANSI code page, and exists only on Windows. On Linux, use `CodePage( 1252 )` or another built-in code page.
+- **`Ansi( )`** is the system's ANSI code page, and exists only on Windows. On Linux and macOS, use `CodePage( 1252 )` or another built-in code page.
 - A call with no encoding behaves as before. `WriteAllText( p, s, Utf8( ) )` writes exactly the bytes `WriteAllText( p, s )` does.
 
 ### WriteAtomic
@@ -160,9 +160,9 @@ OpenOptionsRead( ) / OpenOptionsWrite( ) / OpenOptionsAppend( )
 
 **It is unbuffered.** Every Read and Write is one system call, so wrap many small ones in a buffer, or build the output in a MemoryStream and write it once.
 
-**Sharing is permissive by default**, on Windows as on Linux: a file you have open can still be read, written, renamed and deleted by other programs. ShareRead, ShareWrite and ShareDelete narrow that on Windows. **Handles are not inherited** by child processes unless Inheritable is set.
+**Sharing is permissive by default**, on Windows as on Linux and macOS: a file you have open can still be read, written, renamed and deleted by other programs. ShareRead, ShareWrite and ShareDelete narrow that on Windows. **Handles are not inherited** by child processes unless Inheritable is set.
 
-**Positional IO does not move the position.** ReadAt and WriteAt work at an offset and leave Position( ) where it was, on both platforms, and may be called from several threads on one File. WriteAt is refused on an Append File.
+**Positional IO does not move the position.** ReadAt and WriteAt work at an offset and leave Position( ) where it was, on every platform, and may be called from several threads on one File. WriteAt is refused on an Append File.
 
 **Locks are whole-file and belong to the handle.** Lock waits, TryLock fails with FS_WOULD_BLOCK, and closing the File releases its lock. They use the same mechanism as FileLock, so the two exclude each other.
 

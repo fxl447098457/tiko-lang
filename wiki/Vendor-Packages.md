@@ -2,7 +2,7 @@
 
 # Vendor Packages
 
-> **In tiko.** A C library the toolchain ships, reached with one `#import` and nothing on the command line: `#import "vendor/sqlite3" link dynamic`. Its header comes across whole and unqualified, its library is linked, and a dynamic library is copied beside the program so the program starts. Measured on windows-x86_64 and linux-x86_64.
+> **In tiko.** A C library the toolchain ships, reached with one `#import` and nothing on the command line: `#import "vendor/sqlite3" link dynamic`. Its header comes across whole and unqualified, its library is linked, and a dynamic library is copied beside the program so the program starts. Measured on windows-x86_64, linux-x86_64 and macos-arm64.
 
 ## Syntax
 
@@ -124,7 +124,7 @@ runtime = ["fonts/ui.ttf", "fonts/ui-mono.ttf", "lib/editcore"]
 ```
 
 - Each entry is a path relative to the **module's** directory, as `#foreignlib "lib/x"` is. It may climb out of it with `..`; an absolute path is `TKO0144`.
-- An entry whose file name has **no extension** is a shared library, spelled as the target spells one: `lib/editcore` is `lib/editcore.dll` for windows-x86_64 and `lib/libeditcore.so` for linux-x86_64.
+- An entry whose file name has **no extension** is a shared library, spelled as the target spells one: `lib/editcore` is `lib/editcore.dll` for windows-x86_64, `lib/libeditcore.so` for linux-x86_64 and `lib/libeditcore.dylib` for macos-arm64.
 - After a link that succeeds, each listed file of **each module the program imports** is copied into the output's directory, flat, under its own file name. A copy already there with the same size and no older is left alone. A module of the package that the program does not import brings nothing.
 - A listed file that is not there is `TKO0176`, before anything is compiled: `module 'vendor.ui' needs 'lib/editcore' at run time, and there is no '.../pkg/vendor/ui/lib/libeditcore.so'`.
 - A module the module cache supplies brings its files too: they are read from the manifest, not from the compile.
@@ -144,7 +144,7 @@ A public header is read twice: once in the module, and again in every program th
 | Option | Effect |
 | --- | --- |
 | `-nocopylibs` | do not copy a vendor package's dynamic library, or a module's runtime files, beside the output |
-| `-norpath` | no `$ORIGIN` run path on a linux-x86_64 link that takes a shared library |
+| `-norpath` | no `$ORIGIN` run path on a linux-x86_64 link, and no `@loader_path` one on a macos-arm64 link, that takes a shared library |
 
 ## Diagnostics
 

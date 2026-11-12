@@ -38,7 +38,7 @@ An amount held in a `DOUBLE` is one rounding away from a penny that does not rec
 
 **Neither is a new representation.** Both are shapes that Windows, COM and SQL Server have used for decades: `win\wtypes.bi` declares `tagCY` at line 326 and `tagDEC` at line 329. Each type here has the matching layout, so the interop boundary is a reinterpret rather than a conversion.
 
-**No arithmetic is delegated to OleAut32.** This compiler ships and gates on linux-x86_64, so the arithmetic is implemented in tiko and `VarCy*`, `VarDec*` and .NET itself are test oracles rather than dependencies. Both types behave identically on every target.
+**No arithmetic is delegated to OleAut32.** This compiler ships and gates on linux-x86_64 and macos-arm64, so the arithmetic is implemented in tiko and `VarCy*`, `VarDec*` and .NET itself are test oracles rather than dependencies. Both types behave identically on every target.
 
 **One set of rules, not two.** The two types deliberately agree on everything they can:
 

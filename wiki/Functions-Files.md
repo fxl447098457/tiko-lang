@@ -52,7 +52,7 @@ Jump to: [Read or write a whole file](#read-or-write-a-whole-file) · [Check tha
 | [PathNextComponent](Modern-Fs-PathNextComponent) | Finds the next part of a path from an offset; returns a negative number when none is left. | `std/fs` |
 | [PathRoot](Modern-Fs-PathRoot) | Returns the root of a path, such as C:\ or /, or an empty string for a relative path. | `std/fs` |
 | [PathRootLen](Modern-Fs-PathRootLen) | Returns the length of a path's root, in characters. | `std/fs` |
-| [PathSeparator](Modern-Fs-PathSeparator) | Returns the platform's path separator: a backslash on Windows, a slash on Linux. | `std/fs` |
+| [PathSeparator](Modern-Fs-PathSeparator) | Returns the platform's path separator: a backslash on Windows, a slash on Linux and macOS. | `std/fs` |
 
 ## Clean up, compare and resolve paths
 
@@ -67,7 +67,7 @@ Jump to: [Read or write a whole file](#read-or-write-a-whole-file) · [Check tha
 | [PathIsRoot](Modern-Fs-PathIsRoot) | Returns true if the whole path is just a root, such as C:\ or /. | `std/fs` |
 | [PathIsLocal](Modern-Fs-PathIsLocal) | Returns true if a relative path stays inside the folder it is joined to. | `std/fs` |
 | [PathIsReserved](Modern-Fs-PathIsReserved) | Returns true if a part of the path is a Windows device name such as CON or NUL. | `std/fs` |
-| [PathIsCaseSensitive](Modern-Fs-PathIsCaseSensitive) | Returns true if paths compare case-sensitively on this platform: on Linux, not Windows. | `std/fs` |
+| [PathIsCaseSensitive](Modern-Fs-PathIsCaseSensitive) | Returns true if paths compare case-sensitively here: on Linux and macOS, not Windows. | `std/fs` |
 | [AbsolutePath](Modern-Fs-FileInfo-AbsolutePath) | Returns the full form of a path against the current folder; the path need not exist. | `std/fs` |
 | [CanonicalPath](Modern-Fs-FileInfo-CanonicalPath) | Returns the real path with links resolved; it must exist unless allowMissing is true. | `std/fs` |
 
@@ -85,7 +85,7 @@ Jump to: [Read or write a whole file](#read-or-write-a-whole-file) · [Check tha
 | [DirEntry.IsDirectory](Modern-Fs-DirEntry-IsDirectory) | Returns true if the entry is a folder; a link to a folder reports as a link. | `std/fs` |
 | [DirEntry.IsSymlink](Modern-Fs-DirEntry-IsSymlink) | Returns true if the entry is a symbolic link. | `std/fs` |
 | [DirEntry.IsOther](Modern-Fs-DirEntry-IsOther) | Returns true if the entry is a device, pipe or socket rather than a file, folder or link. | `std/fs` |
-| [DirEntry.Info](Modern-Fs-DirEntry-Info) | Returns the entry's FileInfo: free on Windows, one extra system call on Linux. | `std/fs` |
+| [DirEntry.Info](Modern-Fs-DirEntry-Info) | Returns the entry's FileInfo: free on Windows, one extra system call on Linux and macOS. | `std/fs` |
 
 ## Copy, move and delete files
 
@@ -147,11 +147,11 @@ Jump to: [Read or write a whole file](#read-or-write-a-whole-file) · [Check tha
 | [FileInfo.AccessedUtc](Modern-Fs-FileInfo-AccessedUtc) | Returns the last-access time in ticks, or 0 when HasAccessed is false. | `std/fs` |
 | [FileInfo.HasCreated](Modern-Fs-FileInfo-HasCreated) | Returns true if the platform records creation times, so Created means something. | `std/fs` |
 | [FileInfo.HasAccessed](Modern-Fs-FileInfo-HasAccessed) | Returns true if the platform records access times, so Accessed means something. | `std/fs` |
-| [FileInfo.IsReadOnly](Modern-Fs-FileInfo-IsReadOnly) | Returns true if the file cannot be written: the read-only flag, or no write bit on Linux. | `std/fs` |
-| [FileInfo.IsHidden](Modern-Fs-FileInfo-IsHidden) | Returns true if the file is hidden: the hidden flag on Windows, a leading dot on Linux. | `std/fs` |
-| [FileInfo.NativeAttributes](Modern-Fs-FileInfo-NativeAttributes) | Returns the raw attribute word: file attributes on Windows, the mode bits on Linux. | `std/fs` |
-| [NativeAttributes](Modern-Fs-NativeAttributes) | Returns the raw attribute word: file attributes on Windows, the mode bits on Linux. | `std/fs` |
-| [FileInfo.HasOwner](Modern-Fs-FileInfo-HasOwner) | Returns true if OwnerUid and OwnerGid are filled in: on Linux, not on Windows. | `std/fs` |
+| [FileInfo.IsReadOnly](Modern-Fs-FileInfo-IsReadOnly) | Returns true if unwritable: the read-only flag, or no write bit on Linux and macOS. | `std/fs` |
+| [FileInfo.IsHidden](Modern-Fs-FileInfo-IsHidden) | Returns true if hidden: the hidden flag on Windows, a leading dot on Linux and macOS. | `std/fs` |
+| [FileInfo.NativeAttributes](Modern-Fs-FileInfo-NativeAttributes) | Returns the raw attribute word: attributes on Windows, mode bits on Linux and macOS. | `std/fs` |
+| [NativeAttributes](Modern-Fs-NativeAttributes) | Returns the raw attribute word: attributes on Windows, mode bits on Linux and macOS. | `std/fs` |
+| [FileInfo.HasOwner](Modern-Fs-FileInfo-HasOwner) | Returns true if OwnerUid and OwnerGid are filled in: on Linux and macOS, not on Windows. | `std/fs` |
 | [FileInfo.OwnerUid](Modern-Fs-FileInfo-OwnerUid) | Returns the owner's user id, or 0 unless HasOwner is true. | `std/fs` |
 | [FileInfo.OwnerGid](Modern-Fs-FileInfo-OwnerGid) | Returns the owner's group id, or 0 unless HasOwner is true. | `std/fs` |
 
@@ -338,16 +338,16 @@ Jump to: [Read or write a whole file](#read-or-write-a-whole-file) · [Check tha
 | [GetFileId](Modern-Fs-GetFileId) | Returns the FileId of a path, which tells whether two paths are the same file. | `std/fs` |
 | [SameFile](Modern-Fs-SameFile) | Returns whether two paths name the same file; fails if either is missing. | `std/fs` |
 | [FileId](Modern-Fs-FileId) | Holds a volume and file number that are equal for every name of one file. | `std/fs` |
-| [SetReadOnly](Modern-Fs-SetReadOnly) | Sets or clears a file's read-only flag, or its write bits on Linux. | `std/fs` |
-| [SetHidden](Modern-Fs-SetHidden) | Sets or clears a file's hidden flag on Windows; fails as unsupported on Linux. | `std/fs` |
-| [GetPosixMode](Modern-Fs-GetPosixMode) | Returns a file's Linux permission bits; fails as unsupported on Windows. | `std/fs` |
-| [SetPosixMode](Modern-Fs-SetPosixMode) | Sets a file's Linux permission bits; fails as unsupported on Windows. | `std/fs` |
-| [GetWin32Attributes](Modern-Fs-GetWin32Attributes) | Returns a file's raw Windows attribute flags; fails as unsupported on Linux. | `std/fs` |
-| [SetWin32Attributes](Modern-Fs-SetWin32Attributes) | Replaces a file's whole Windows attribute word; fails as unsupported on Linux. | `std/fs` |
+| [SetReadOnly](Modern-Fs-SetReadOnly) | Sets or clears a file's read-only flag, or its write bits on Linux and macOS. | `std/fs` |
+| [SetHidden](Modern-Fs-SetHidden) | Sets or clears a file's hidden flag on Windows; fails as unsupported on Linux and macOS. | `std/fs` |
+| [GetPosixMode](Modern-Fs-GetPosixMode) | Returns a file's permission bits on Linux and macOS; fails as unsupported on Windows. | `std/fs` |
+| [SetPosixMode](Modern-Fs-SetPosixMode) | Sets a file's permission bits on Linux and macOS; fails as unsupported on Windows. | `std/fs` |
+| [GetWin32Attributes](Modern-Fs-GetWin32Attributes) | Returns a file's raw Windows attribute flags; fails as unsupported on Linux and macOS. | `std/fs` |
+| [SetWin32Attributes](Modern-Fs-SetWin32Attributes) | Replaces a file's whole Windows attribute word; fails as unsupported on Linux and macOS. | `std/fs` |
 | [SetTimes](Modern-Fs-SetTimes) | Sets a file's modified and accessed times; a time of 0 leaves that one alone. | `std/fs` |
 | [SetTimesNoFollow](Modern-Fs-SetTimesNoFollow) | Sets a symbolic link's own times, leaving its target alone. | `std/fs` |
-| [Chown](Modern-Fs-Chown) | Changes a file's owner and group on Linux, -1 keeping one; unsupported on Windows. | `std/fs` |
-| [LChown](Modern-Fs-LChown) | Changes a symbolic link's own owner and group, on Linux only. | `std/fs` |
+| [Chown](Modern-Fs-Chown) | Changes a file's owner and group on Linux and macOS, -1 keeping one; fails on Windows. | `std/fs` |
+| [LChown](Modern-Fs-LChown) | Changes a symbolic link's own owner and group, on Linux and macOS only. | `std/fs` |
 
 ## Disk space and volumes
 
@@ -360,7 +360,7 @@ Jump to: [Read or write a whole file](#read-or-write-a-whole-file) · [Check tha
 | [GetVolumeInfo](Modern-Fs-GetVolumeInfo) | Returns the VolumeInfo of the volume a path is on: its root, label and file system. | `std/fs` |
 | [GetVolumes](Modern-Fs-GetVolumes) | Fills an Array with a VolumeInfo for each drive or mounted disk; returns the count. | `std/fs` |
 | [VolumeInfo.RootPath](Modern-Fs-VolumeInfo-RootPath) | Returns where the volume is mounted, such as C:\ or /. | `std/fs` |
-| [VolumeInfo.Name](Modern-Fs-VolumeInfo-Name) | Returns the volume's label, which may be empty and always is on Linux. | `std/fs` |
+| [VolumeInfo.Name](Modern-Fs-VolumeInfo-Name) | Returns the volume's label, which may be empty and always is on Linux and macOS. | `std/fs` |
 | [VolumeInfo.FileSystem](Modern-Fs-VolumeInfo-FileSystem) | Returns the file system's name, such as NTFS or ext4, or an empty string. | `std/fs` |
 | [VolumeInfo.MaxComponentLen](Modern-Fs-VolumeInfo-MaxComponentLen) | Returns the longest file or folder name the volume allows, not the longest path. | `std/fs` |
 | [VolumeInfo.IsReadOnly](Modern-Fs-VolumeInfo-IsReadOnly) | Returns true if the whole volume is read-only. | `std/fs` |

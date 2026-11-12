@@ -154,7 +154,7 @@ The standard library's own errors work the same way. Reading a file that is not 
 ```
 
 `ReadAllText` returns a `Result` whose failure is an `fs.FsError`. `Code( )` is what the program
-branches on — `fs.FS_NOT_FOUND` here, the same on Windows and Linux — and the text is for the
+branches on — `fs.FS_NOT_FOUND` here, the same on Windows, Linux and macOS — and the text is for the
 person reading the output.
 
 ## Statements that return an error code

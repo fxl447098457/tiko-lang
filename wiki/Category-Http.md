@@ -156,7 +156,7 @@ A `TlsConfig` is a value:
 
 **Closing.** `Close` sends the TLS close message and, after `ConnectHost`, closes the connection too. The peer closing — with or without that message — reads as the end of the stream.
 
-**On each system.** Windows uses its own TLS (SChannel), on Windows 10 1809 or later; a server's private key is put into the user's key store for the life of the connection and deleted afterwards. Linux uses OpenSSL 3, loaded when the first handshake starts: a program that never uses TLS does not need it, and without `libssl.so.3` every handshake fails with `TLS_UNAVAILABLE`.
+**On each system.** Windows uses its own TLS (SChannel), on Windows 10 1809 or later; a server's private key is put into the user's key store for the life of the connection and deleted afterwards. Linux uses OpenSSL 3, loaded when the first handshake starts: a program that never uses TLS does not need it, and without `libssl.so.3` every handshake fails with `TLS_UNAVAILABLE`. macOS uses OpenSSL 3 the same way, from Homebrew's `openssl@3`.
 
 ## Blocking And Threads
 

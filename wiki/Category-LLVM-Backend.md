@@ -26,7 +26,6 @@ Each target has its own triple:
 | `windows-x86_64` (default on Windows) | `x86_64-pc-windows-msvc` |
 | `linux-x86_64` (default on Linux) | `x86_64-pc-linux-gnu` |
 | `macos-arm64` (default on macOS) | `arm64-apple-macosx13.0` |
-| `macos-arm64` (default on macOS) | `arm64-apple-macosx13.0` |
 
 ## What you need: clang
 

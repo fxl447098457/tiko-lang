@@ -2,7 +2,7 @@
 
 # Compiler Option: -Wl
 
-> **In tiko:** the value is split at commas, each piece reaches the linker as one argument after everything else on the link line, and repeated `-Wl` options accumulate. It works in `#cmdline` and in `tiko.toml`'s `options`. tiko links through clang, so each piece is passed as `-Xlinker <piece>`, and the linker is `lld-link` on windows-x86_64 (`-Wl /STACK:8388608`) and the system linker on linux-x86_64 (`-Wl -rpath,/opt/lib`; quote a `$` in a shell). A program that links a shared library from `#foreignlib` already gets `-rpath $ORIGIN`, so it finds the `.so` beside itself; an `-rpath` given here replaces it, and [`-norpath`](Compiler-Option-Norpath) turns it off. See [Using C Libraries](Using-C-Libraries-Tutorial).
+> **In tiko:** the value is split at commas, each piece reaches the linker as one argument after everything else on the link line, and repeated `-Wl` options accumulate. It works in `#cmdline` and in `tiko.toml`'s `options`. tiko links through clang, so each piece is passed as `-Xlinker <piece>`, and the linker is `lld-link` on windows-x86_64 (`-Wl /STACK:8388608`) and the system linker on linux-x86_64 (`-Wl -rpath,/opt/lib`; quote a `$` in a shell), and Apple's linker on macos-arm64. A program that links a shared library from `#foreignlib` already gets `-rpath $ORIGIN` (`@loader_path` on macOS), so it finds the library beside itself; an `-rpath` given here replaces it, and [`-norpath`](Compiler-Option-Norpath) turns it off. See [Using C Libraries](Using-C-Libraries-Tutorial).
 
 Pass options to linker
 

@@ -116,7 +116,7 @@ end if
 | `Accept( conn, timeoutMs )` | waits for the next connection and opens `conn` on it; `NET_TIMED_OUT` when the timeout ends first |
 | `LocalAddress( )`, `Close( )`, `IsOpen( )` | |
 
-A port another listener holds is `NET_ADDRESS_IN_USE`. On Windows a bound port cannot be taken over by another program; on Linux a restarted server can bind its port again at once, even while old connections are still closing.
+A port another listener holds is `NET_ADDRESS_IN_USE`. On Windows a bound port cannot be taken over by another program; on Linux and macOS a restarted server can bind its port again at once, even while old connections are still closing.
 
 ## UDP
 

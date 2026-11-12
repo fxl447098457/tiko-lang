@@ -14,6 +14,7 @@ CacheDir( )
 
 - Windows: the LocalAppData known folder, falling back to %LOCALAPPDATA%. Windows has no separate cache folder.
 - Linux: $XDG_CACHE_HOME when it is set and absolute, otherwise ~/.cache.
+- macOS: $XDG_CACHE_HOME when it is set and absolute, otherwise ~/Library/Caches.
 - Nothing is created and no application name is added: it says where the directory SHOULD be, and the caller joins its own name and creates what it needs with CreateDirAll.
 
 ## Examples

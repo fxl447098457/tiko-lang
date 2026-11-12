@@ -12,7 +12,7 @@ ExecutablePath( )
 
 ## Notes
 
-- Windows: GetModuleFileNameW of the program, however long. Linux: the target of /proc/self/exe.
+- Windows: GetModuleFileNameW of the program, however long. Linux: the target of /proc/self/exe. macOS: _NSGetExecutablePath, then realpath.
 - Unlike COMMAND( 0 ), it does not depend on how the program was started, so it is the way to find files installed next to the program.
 
 ## Examples

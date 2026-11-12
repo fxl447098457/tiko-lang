@@ -28,6 +28,7 @@ The pages in this section take each part in turn:
 - [Enums](enums.md): named integer constants.
 - [Unions](unions.md): several views of the same bytes.
 - [Constants](constants.md): `const`, with and without a type.
+- [Partial Types](partial.md): one type written in several blocks.
 
 Methods, constructors and operators on your own types are in
 [Objects](../objects/index.md).

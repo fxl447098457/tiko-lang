@@ -25,6 +25,7 @@ Substituted by a signature of the compiler where used.
 - [`__FB_VERSION__`](Fb-Version)
 - [`__FB_WIN32__`](Fb-Win32)
 - [`__FB_LINUX__`](Fb-Linux)
+- [`__FB_DARWIN__`](Fb-Darwin)
 - [`__FB_DOS__`](Fb-Dos)
 
 ## Examples

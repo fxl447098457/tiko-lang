@@ -8,7 +8,7 @@ that tell each file what the others provide, namespaces that keep their names ap
 **preprocessor**, which rewrites the source before the compiler reads a word of it.
 
 You need all of it anyway. Every binding to a C library is a header. Every program that must
-behave differently on Windows and Linux says so with the preprocessor. And a module is itself
+behave differently on Windows, Linux and macOS says so with the preprocessor. And a module is itself
 built from these parts, so the rules here are the ones that hold underneath Chapter 15.
 
 ## A program in several files
@@ -367,6 +367,7 @@ platform symbols tiko defines:
 |---|---|
 | `__FB_WIN32__` | Windows |
 | `__FB_LINUX__`, `__FB_UNIX__` | Linux |
+| `__FB_DARWIN__`, `__FB_UNIX__`, `__FB_ARM__` | macOS |
 | `__FB_64BIT__` | every 64-bit target |
 | `__FB_MSVC__` | the `windows-x86_64` target |
 | `__TIKO_VERSION__` | always: tiko's version, as a string |
@@ -509,7 +510,7 @@ never need to write it; any other is `TKO0317`.
 - Macros substitute text: parenthesise parameters and bodies, use `#` to quote, `##` to paste, and
   `#macro` for whole statements. Prefer a function unless the macro generates code.
 - `#if` tests a value and `#ifdef` tests a definition. Platform symbols include `__FB_WIN32__`,
-  `__FB_LINUX__`, `__FB_64BIT__` and `__FB_MSVC__`; `-d` defines your own.
+  `__FB_LINUX__`, `__FB_DARWIN__`, `__FB_64BIT__` and `__FB_MSVC__`; `-d` defines your own.
 - `defined( )`, `#if typeof`, `#assert` and `#error` check the program while it compiles. `#error`
   reports and the compiler reads on.
 - `__FILE__`, `__LINE__`, `__FUNCTION__` and `__DATE_ISO__` describe the source; `#line` renumbers
@@ -524,7 +525,7 @@ never need to write it; any other is `TKO0317`.
    3 … on successive calls, so that `DEFINE_COUNTER( Order )` gives `NextOrder( )`. Define two
    counters and show they count separately. {solution="ex16-02"}
 3. Write a program that prints the name of the environment variable that holds the temporary
-   directory: `TEMP` on Windows, `TMPDIR` on Linux. Make it refuse to build anywhere else.
+   directory: `TEMP` on Windows, `TMPDIR` on Linux and macOS. Make it refuse to build anywhere else.
    {solution="ex16-03"}
 4. Put a function `Area` in a namespace `Disc` (one radius) and another in a namespace `Rect`
    (width and height). Call the first without its prefix from a sub, and the second qualified.

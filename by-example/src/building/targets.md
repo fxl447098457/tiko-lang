@@ -45,6 +45,9 @@ errors about the files it could not find, and `TKO0116: link failed`. Build
 the finished program on each platform you ship for, or on a Linux system
 reached from Windows.
 
+`-target macos-arm64` with `-c` works the same way and writes a Mach-O object. A
+program for it links only on a Mac, where Apple's linker and SDK are.
+
 ### Activities
 
 1. Add a `type` with an `int32` field and a `float64` field, predict its

@@ -1,0 +1,556 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' edits -- what the designer does to a form, on the model alone: add, delete, reorder, align, resize,
+' copy and paste, and turning a changed form into the smallest edit of its text. The canvas calls
+' these; no window is involved, so every rule here is tested headless.
+#module "edits"
+
+#import "std/containers"
+#import "std/strings"
+#import "vendor/tkControls/tkMeta"
+#import "vendor/tkControls/tkLayout"
+#import "../model"
+#import "../catalog"
+#import "../formfile"
+#import "../codegen"
+using containers
+using tkMeta
+using tkLayout
+using tkHost
+using tkPaint
+using model
+
+const as string NL = chr( 10 )
+const as string CLIP_CAPTION = "tkEdit controls"
+
+public enum AlignMode
+    AlignLefts = 0
+    AlignCenters
+    AlignRights
+    AlignTops
+    AlignMiddles
+    AlignBottoms
+    SameWidth
+    SameHeight
+    SameSize
+end enum
+
+' The nearest multiple of grid.
+public function Snap( byval v as long, byval grid as long ) as long
+    if grid <= 1 then return v
+    if v >= 0 then return ((v + grid \ 2) \ grid) * grid
+    return -(((-v + grid \ 2) \ grid) * grid)
+end function
+
+' baseName followed by the lowest number no control uses yet: Button1, Button2.
+public function UniqueName( byref doc as FormDoc, byref baseName as const ustring ) as ustring
+    dim as long n = 1
+    do
+        dim as ustring s = baseName & n
+        if FindControl( doc, s ) < 0 then return s
+        n += 1
+    loop
+end function
+
+' Is control i inside the control named root, at any depth?
+private function IsInside_( byref doc as FormDoc, byval i as long, byref root as const ustring ) as boolean
+    dim as ustring want = lcase( root )
+    dim as ustring p = lcase( doc.Controls[i].Parent )
+    while len( p )
+        if p = want then return true
+        dim as long k = FindControl( doc, p )
+        if k < 0 then return false
+        p = lcase( doc.Controls[k].Parent )
+    wend
+    return false
+end function
+
+private function IsListed_( byref names as Array( of ustring ), byref s as const ustring ) as boolean
+    dim as ustring want = lcase( s )
+    for i as long = 0 to names.Count( ) - 1
+        if lcase( names[i] ) = want then return true
+    next
+    return false
+end function
+
+' Those of names with no ancestor also in names: dragging a panel and its child moves the child once.
+public function TopLevelOf( byref doc as FormDoc, byref names as Array( of ustring ) ) as Array( of ustring )
+    dim as Array( of ustring ) out_
+    for each s as ustring in names
+        dim as long i = FindControl( doc, s )
+        if i < 0 then continue for
+        dim as boolean inner = false
+        for each o as ustring in names
+            if (lcase( o ) <> lcase( s )) andalso IsInside_( doc, i, o ) then inner = true
+        next
+        if inner = false then out_.Push( s )
+    next
+    return out_
+end function
+
+' A new control at the top of its siblings, named after its type, its Text set to that name as VB
+' does. The answer is its index, or -1 for an unknown type.
+public function AddControl( byref doc as FormDoc, byref typeName as const ustring, byref parent as const ustring, _
+                            byval page as long, byval x as long, byval y as long, byval w as long, byval h as long ) as long
+    dim as TKMETA_CONTROL ptr m = catalog.Find( typeName )
+    if m = 0 then return -1
+    dim as FormControl c
+    c.Name = UniqueName( doc, m->Name )
+    c.TypeName = m->Name
+    c.Parent = parent
+    c.Page = page
+    c.X = x
+    c.Y = y
+    c.W = w
+    c.H = h
+    if m->ContainerKind = TKMETA_CONTAINER_PAGES then c.Pages.Push( "Page1" )
+    ' these belong along an edge
+    select case m->Name
+    case "MenuBar", "Toolbar" : c.Dock = TK_DOCK_TOP
+    case "StatusBar"          : c.Dock = TK_DOCK_BOTTOM
+    end select
+    dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, "Text" )
+    if (p <> 0) andalso (p->Kind = "text") then PutSetting( c.Props, "Text", c.Name )
+    doc.Controls.Push( c )
+    return doc.Controls.Count( ) - 1
+end function
+
+' Removes each named control and everything inside it.
+public sub DeleteControls( byref doc as FormDoc, byref names as Array( of ustring ) )
+    dim as long i = doc.Controls.Count( ) - 1
+    while i >= 0
+        dim as boolean gone = IsListed_( names, doc.Controls[i].Name )
+        if gone = false then
+            for each s as ustring in names
+                if IsInside_( doc, i, s ) then gone = true
+            next
+        end if
+        if gone then doc.Controls.Remove( i )
+        i -= 1
+    wend
+end sub
+
+' ---- z-order ----------------------------------------------------------------------------------
+
+' Takes control i and everything inside it out of the list, in order.
+private function CutBlock_( byref doc as FormDoc, byval i as long ) as Array( of FormControl )
+    dim as ustring root = doc.Controls[i].Name
+    dim as Array( of FormControl ) block
+    dim as long k = i
+    while k < doc.Controls.Count( )
+        if (k = i) orelse IsInside_( doc, k, root ) then block.Push( doc.Controls[k] )
+        k += 1
+    wend
+    ' from the end, so earlier indexes stay put; the root goes last, as the others are found through it
+    k = doc.Controls.Count( ) - 1
+    while k >= i
+        if (k = i) orelse IsInside_( doc, k, root ) then doc.Controls.Remove( k )
+        k -= 1
+    wend
+    return block
+end function
+
+' names as they stand in the list, first to last.
+private function InListOrder_( byref doc as FormDoc, byref names as Array( of ustring ) ) as Array( of ustring )
+    dim as Array( of ustring ) out_
+    for i as long = 0 to doc.Controls.Count( ) - 1
+        if IsListed_( names, doc.Controls[i].Name ) then out_.Push( doc.Controls[i].Name )
+    next
+    return out_
+end function
+
+' To the top of its siblings. The list's order is also the tab order; a control's children stay
+' right after it, and several controls keep their order among themselves.
+public sub BringToFront( byref doc as FormDoc, byref names as Array( of ustring ) )
+    for each nm as ustring in InListOrder_( doc, names )
+        dim as Array( of FormControl ) block = CutBlock_( doc, FindControl( doc, nm ) )
+        for each c as FormControl in block
+            doc.Controls.Push( c )
+        next
+    next
+end sub
+
+' To the bottom of its siblings.
+public sub SendToBack( byref doc as FormDoc, byref names as Array( of ustring ) )
+    dim as Array( of ustring ) order = InListOrder_( doc, names )
+    dim as long r = order.Count( ) - 1
+    while r >= 0
+        dim as long at_ = FindControl( doc, order[r] )
+        dim as ustring parent = lcase( doc.Controls[at_].Parent )
+        dim as long page = doc.Controls[at_].Page
+        dim as long first_ = at_
+        for i as long = 0 to at_ - 1
+            if (lcase( doc.Controls[i].Parent ) = parent) andalso (doc.Controls[i].Page = page) then
+                first_ = i
+                exit for
+            end if
+        next
+        if first_ < at_ then
+            dim as Array( of FormControl ) block = CutBlock_( doc, at_ )
+            for k as long = block.Count( ) - 1 to 0 step -1
+                doc.Controls.Insert( first_, block[k] )
+            next
+        end if
+        r -= 1
+    wend
+end sub
+
+' ---- geometry ---------------------------------------------------------------------------------
+
+' Lines up names against the first of them, which stays where it is. Docked controls are left out:
+' their dock decides where they go.
+public sub AlignControls( byref doc as FormDoc, byref names as Array( of ustring ), byval mode as AlignMode )
+    if names.Count( ) < 2 then exit sub
+    dim as long r = FindControl( doc, names[0] )
+    if r < 0 then exit sub
+    dim as FormControl ref_ = doc.Controls[r]
+    for k as long = 1 to names.Count( ) - 1
+        dim as long i = FindControl( doc, names[k] )
+        if i < 0 then continue for
+        if doc.Controls[i].Dock <> TK_DOCK_NONE then continue for
+        dim as long x0 = doc.Controls[i].X, y0 = doc.Controls[i].Y, w0 = doc.Controls[i].W, h0 = doc.Controls[i].H
+        select case mode
+        case AlignMode.AlignLefts   : doc.Controls[i].X = ref_.X
+        case AlignMode.AlignCenters : doc.Controls[i].X = ref_.X + (ref_.W - w0) \ 2
+        case AlignMode.AlignRights  : doc.Controls[i].X = ref_.X + ref_.W - w0
+        case AlignMode.AlignTops    : doc.Controls[i].Y = ref_.Y
+        case AlignMode.AlignMiddles : doc.Controls[i].Y = ref_.Y + (ref_.H - h0) \ 2
+        case AlignMode.AlignBottoms : doc.Controls[i].Y = ref_.Y + ref_.H - h0
+        case AlignMode.SameWidth    : ResizeControl( doc, i, x0, y0, ref_.W, h0 )
+        case AlignMode.SameHeight   : ResizeControl( doc, i, x0, y0, w0, ref_.H )
+        case AlignMode.SameSize     : ResizeControl( doc, i, x0, y0, ref_.W, ref_.H )
+        end select
+    next
+end sub
+
+' Where one control goes when its parent changes size, by the runtime's own arithmetic.
+private sub FollowParent_( byref c as FormControl, byval oldW as long, byval oldH as long, byval newW as long, byval newH as long )
+    dim as TKLAYOUT_ITEM it
+    it.x = c.X
+    it.y = c.Y
+    it.cx = c.W
+    it.cy = c.H
+    it.anchor = c.Anchor
+    it.dock = c.Dock
+    dim as TKRECT rc, area
+    tkRect_Set( area, 0, 0, newW, newH )
+    tkLayout_Compute( @it, 1, oldW, oldH, newW, newH, area, 1.0, @rc )
+    c.X = rc.left
+    c.Y = rc.top
+    c.W = rc.right - rc.left
+    c.H = rc.bottom - rc.top
+end sub
+
+' A size changed somewhere: `was` is what every control measured before. Each container that changed
+' takes its children with it, by their anchors, top down; a child's own children follow in turn.
+private sub Reflow_( byref doc as FormDoc, byref was as codegen.Sizes, byval oldW as long, byval oldH as long )
+    dim as long n = doc.Controls.Count( )
+    dim as codegen.Sizes now_
+    ' -1 is the form itself, then every control in list order: a parent always comes first
+    for i as long = -1 to n - 1
+        codegen.EffectiveSizes( doc, now_ )
+        dim as long w0 = oldW, h0 = oldH, w1 = doc.ClientW, h1 = doc.ClientH
+        dim as ustring me_
+        if i >= 0 then
+            w0 = was.W[i]
+            h0 = was.H[i]
+            w1 = now_.W[i]
+            h1 = now_.H[i]
+            me_ = lcase( doc.Controls[i].Name )
+        end if
+        if (w0 = w1) andalso (h0 = h1) then continue for
+        for k as long = 0 to n - 1
+            if (lcase( doc.Controls[k].Parent ) = me_) andalso (doc.Controls[k].Dock = TK_DOCK_NONE) then
+                FollowParent_( doc.Controls[k], w0, h0, w1, h1 )
+            end if
+        next
+    next
+end sub
+
+' Control i takes this rectangle; what's inside it follows by anchor.
+public sub ResizeControl( byref doc as FormDoc, byval i as long, byval x as long, byval y as long, byval w as long, byval h as long )
+    if (i < 0) orelse (i >= doc.Controls.Count( )) then exit sub
+    dim as codegen.Sizes was
+    codegen.EffectiveSizes( doc, was )
+    doc.Controls[i].X = x
+    doc.Controls[i].Y = y
+    doc.Controls[i].W = w
+    doc.Controls[i].H = h
+    Reflow_( doc, was, doc.ClientW, doc.ClientH )
+end sub
+
+public sub ResizeForm( byref doc as FormDoc, byval w as long, byval h as long )
+    dim as codegen.Sizes was
+    codegen.EffectiveSizes( doc, was )
+    dim as long oldW = doc.ClientW, oldH = doc.ClientH
+    doc.ClientW = w
+    doc.ClientH = h
+    Reflow_( doc, was, oldW, oldH )
+end sub
+
+' ---- one property ------------------------------------------------------------------------------
+
+' Renames a control, every child's reference to it, and the handlers named after it.
+public sub RenameControl( byref doc as FormDoc, byref oldName as const ustring, byref newName as const ustring )
+    dim as ustring was = lcase( oldName )
+    dim as ustring prefix = was & "_"
+    for i as long = 0 to doc.Controls.Count( ) - 1
+        if lcase( doc.Controls[i].Name ) = was then
+            doc.Controls[i].Name = newName
+            for e as long = 0 to doc.Controls[i].Events.Count( ) - 1
+                dim as ustring v = doc.Controls[i].Events[e].Value
+                if left( lcase( v ), len( prefix ) ) = prefix then doc.Controls[i].Events[e].Value = newName & mid( v, len( prefix ) )
+            next
+            for e as long = 0 to doc.Controls[i].Items.Count( ) - 1
+                dim as ustring v = doc.Controls[i].Items[e].Handler
+                if left( lcase( v ), len( prefix ) ) = prefix then doc.Controls[i].Items[e].Handler = newName & mid( v, len( prefix ) )
+            next
+        elseif lcase( doc.Controls[i].Parent ) = was then
+            doc.Controls[i].Parent = newName
+        end if
+    next
+end sub
+
+public sub SetDock( byref doc as FormDoc, byref names as Array( of ustring ), byval dock_ as long )
+    for each s as ustring in names
+        dim as long i = FindControl( doc, s )
+        if i >= 0 then doc.Controls[i].Dock = dock_
+    next
+end sub
+
+public sub SetAnchorBit( byref doc as FormDoc, byref names as Array( of ustring ), byval bit_ as long, byval onOff as boolean )
+    for each s as ustring in names
+        dim as long i = FindControl( doc, s )
+        if i >= 0 then
+            if onOff then
+                doc.Controls[i].Anchor or= bit_
+            else
+                doc.Controls[i].Anchor and= not bit_
+            end if
+        end if
+    next
+end sub
+
+private function IsWholeNumber_( byref t as const ustring ) as boolean
+    if len( t ) = 0 then return false
+    for i as long = 1 to len( t )
+        dim as long ch = asc( mid( t, i, 1 ) )
+        if (ch < 48) orelse (ch > 57) then
+            if (i > 1) orelse (ch <> 45) orelse (len( t ) = 1) then return false
+        end if
+    next
+    return true
+end function
+
+private function IsNumber_( byref t as const ustring ) as boolean
+    dim as long dots = 0
+    dim as ustring digits
+    for i as long = 1 to len( t )
+        dim as ustring ch = mid( t, i, 1 )
+        if ch = "." then
+            dots += 1
+        else
+            digits &= ch
+        end if
+    next
+    return (dots <= 1) andalso IsWholeNumber_( digits )
+end function
+
+' Sets property key on every named control from what the person typed. Nothing typed, or the
+' property's default, removes it: the file holds only what differs. "" = done, else why not.
+public function SetProperty( byref doc as FormDoc, byref names as Array( of ustring ), byref key_ as const ustring, byref text as const ustring ) as ustring
+    for each s as ustring in names
+        dim as long i = FindControl( doc, s )
+        if i < 0 then continue for
+        dim as TKMETA_CONTROL ptr m = catalog.Find( doc.Controls[i].TypeName )
+        dim as ustring kind_ = "text", dflt, pairs_, stored = text
+        if (key_ = "Enabled") orelse (key_ = "Visible") then
+            kind_ = "bool"
+            dflt = "true"
+        elseif key_ = m->CreateArg then
+            kind_ = m->CreateArgKind
+            dflt = m->CreateArgDflt
+        else
+            dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, key_ )
+            if p = 0 then return m->Name & " has no property " & key_
+            kind_ = p->Kind
+            dflt = p->DefaultValue
+            pairs_ = p->EnumPairs
+        end if
+        dim as long at_ = FindSetting( doc.Controls[i].Props, key_ )
+        if (len( text ) = 0) orelse (text = dflt) then
+            if at_ >= 0 then doc.Controls[i].Props.Remove( at_ )
+            continue for
+        end if
+        dim as long vk = VALUE_TEXT
+        select case kind_
+        case "bool"
+            vk = VALUE_BOOL
+        case "int"
+            if IsWholeNumber_( text ) = false then return key_ & " must be a whole number"
+            vk = VALUE_INT
+        case "float"
+            if IsNumber_( text ) = false then return key_ & " must be a number"
+            vk = VALUE_FLOAT
+        case "list"
+            dim as ustring bad = tkMeta_ListFault( text, pairs_ )
+            if len( bad ) then return key_ & " " & bad
+            stored = tkMeta_ListTidy( text )
+        end select
+        PutSetting( doc.Controls[i].Props, key_, stored, vk )
+    next
+    return ""
+end function
+
+' A tab control's pages after editing: each carries the page it was. Controls move with their page.
+' A page that goes must be empty. "" = done, else why not.
+public function ApplyPages( byref doc as FormDoc, byval i as long, byref edited as Array( of FormItem ) ) as ustring
+    dim as ustring me_ = lcase( doc.Controls[i].Name )
+    dim as long oldCount = doc.Controls[i].Pages.Count( )
+    for p as long = 0 to oldCount - 1
+        dim as boolean kept = false
+        for each it as FormItem in edited
+            if it.Origin = p then kept = true
+        next
+        if kept = false then
+            for each k as FormControl in doc.Controls
+                if (lcase( k.Parent ) = me_) andalso (k.Page = p) then
+                    return "page '" & doc.Controls[i].Pages[p] & "' still holds controls"
+                end if
+            next
+        end if
+    next
+    if edited.Count( ) = 0 then return "a tab control needs a page"
+    doc.Controls[i].Pages.Clear( )
+    for each it as FormItem in edited
+        doc.Controls[i].Pages.Push( it.Text )
+    next
+    for k as long = 0 to doc.Controls.Count( ) - 1
+        if lcase( doc.Controls[k].Parent ) = me_ then
+            for n as long = 0 to edited.Count( ) - 1
+                if edited[n].Origin = doc.Controls[k].Page then
+                    doc.Controls[k].Page = n
+                    exit for
+                end if
+            next
+        end if
+    next
+    return ""
+end function
+
+' ---- the clipboard ----------------------------------------------------------------------------
+
+' names and everything inside them, as the text of a form.
+public function CopyText( byref doc as FormDoc, byref names as Array( of ustring ) ) as ustring
+    dim as FormDoc clip
+    clip.Caption = CLIP_CAPTION
+    dim as Array( of ustring ) tops = TopLevelOf( doc, names )
+    for i as long = 0 to doc.Controls.Count( ) - 1
+        dim as boolean isTop = IsListed_( tops, doc.Controls[i].Name )
+        dim as boolean take_ = isTop
+        for each s as ustring in tops
+            if IsInside_( doc, i, s ) then take_ = true
+        next
+        if take_ then
+            dim as FormControl c = doc.Controls[i]
+            ' A pasted control has no handlers: two controls calling one body by accident is worse
+            ' than wiring the copy up again.
+            c.Events.Clear( )
+            for n as long = 0 to c.Items.Count( ) - 1
+                c.Items[n].Handler = ""
+            next
+            if isTop then
+                c.Parent = ""
+                c.Page = -1
+            end if
+            clip.Controls.Push( c )
+        end if
+    next
+    if clip.Controls.Count( ) = 0 then return ""
+    return formfile.Render( clip )
+end function
+
+' Adds what CopyText made under parent, offset by dx, dy, each with a fresh name. newNames gets the
+' top-level ones, in order. False when the text isn't controls.
+public function PasteText( byref doc as FormDoc, byref text as const ustring, byref parent as const ustring, byval page as long, _
+                           byval dx as long, byval dy as long, byref newNames as Array( of ustring ) ) as boolean
+    if instr( text, CLIP_CAPTION ) = 0 then return false
+    dim as FormDoc clip
+    dim as ustring e
+    if formfile.Parse( text, clip, e ) = false then return false
+    if clip.Caption <> CLIP_CAPTION then return false
+    ' first every new name, so a child's parent can be mapped wherever it sits
+    dim as Array( of Setting ) map_
+    dim as FormDoc taken = doc
+    for each c as FormControl in clip.Controls
+        dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
+        if m = 0 then return false
+        dim as FormControl mark
+        mark.Name = UniqueName( taken, m->Name )
+        taken.Controls.Push( mark )
+        PutSetting( map_, lcase( c.Name ), mark.Name )
+    next
+    for each c as FormControl in clip.Controls
+        dim as FormControl n = c
+        n.Name = SettingOr( map_, lcase( c.Name ) )
+        if len( c.Parent ) = 0 then
+            n.Parent = parent
+            n.Page = page
+            n.X += dx
+            n.Y += dy
+            newNames.Push( n.Name )
+        else
+            n.Parent = SettingOr( map_, lcase( c.Parent ) )
+        end if
+        ' a Text left at its own name follows the new one
+        dim as long t = FindSetting( n.Props, "Text" )
+        if t >= 0 then
+            if n.Props[t].Value = c.Name then n.Props[t].Value = n.Name
+        end if
+        doc.Controls.Push( n )
+    next
+    return true
+end function
+
+' ---- text -------------------------------------------------------------------------------------
+
+public type LineEdit
+    First as long          ' lines First .. Last (from 0) are replaced; Last = First - 1 inserts
+    Last as long
+    Text as ustring
+    IsNoOp as boolean
+end type
+
+' The smallest run of whole lines that turns oldText into newText. A commit is one edit of the buffer
+' however much of the form it touched, so undo takes back exactly one step. eol is the buffer's.
+public function DiffLines( byref oldText as const ustring, byref newText as const ustring, byref eol as const ustring ) as LineEdit
+    dim as LineEdit r
+    dim as Array( of ustring ) a = strings.Split( codegen.WithoutCr( oldText ), NL )
+    dim as Array( of ustring ) b = strings.Split( codegen.WithoutCr( newText ), NL )
+    dim as long na = a.Count( ), nb = b.Count( ), p = 0, s = 0
+    while (p < na) andalso (p < nb) andalso (a[p] = b[p])
+        p += 1
+    wend
+    if (p = na) andalso (p = nb) then
+        r.IsNoOp = true
+        return r
+    end if
+    while (s < na - p) andalso (s < nb - p) andalso (a[na - 1 - s] = b[nb - 1 - s])
+        s += 1
+    wend
+    ' Lines added after a last line that has no break: that line has to take one, so it's replaced.
+    if (p = na) andalso (s = 0) andalso (p > 0) then p -= 1
+    r.First = p
+    r.Last = na - 1 - s
+    for i as long = p to nb - 1 - s
+        r.Text &= b[i]
+        ' the very last line of the file has no break after it
+        if (i < nb - 1 - s) orelse (s > 0) then r.Text &= eol
+    next
+    return r
+end function

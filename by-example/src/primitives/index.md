@@ -16,7 +16,7 @@ for signed integers, `uint8` to `uint64` for unsigned ones, `float32` and
 ```
 
 `sizeof` gives the size of a value's type in bytes. Each width is the same on
-every target, so an `int32` is four bytes on Windows and on Linux alike.
+every target, so an `int32` is four bytes on Windows, on Linux and on macOS alike.
 
 | Type | Bytes | Holds |
 |---|---|---|

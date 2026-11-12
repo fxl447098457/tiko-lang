@@ -15,6 +15,8 @@
 #import "std/strings"
 #import "tkc/docencoding"
 #import "tka/editor"
+#import "tkd/canvas"
+#import "tkd/edits"
 #import "vendor/tkControls/tkHost"
 using outcome
 using tkHost
@@ -50,6 +52,7 @@ public type Document
     Main     as editor.CodeView          ' the first (or only) view
     Stamp    as DiskStamp                ' at the last load or save
     Ignored  as DiskStamp                ' a change the user chose to keep their text over
+    Designer as canvas.FormCanvas ptr        ' a .tkform on its design surface: Main is hidden, and holds the text
 
     declare function DisplayName( ) as ustring
     declare function IsNew( ) as boolean
@@ -58,11 +61,16 @@ public type Document
     declare function Load( byref path as const ustring ) as TextResult    ' into Main
     declare function Reload( ) as TextResult
     declare function Save( byref path as const ustring, byval acceptLoss as boolean ) as TextResult
+    declare function WriteCopy( byref path as const ustring, byval acceptLoss as boolean ) as TextResult   ' this buffer stays as it is
     declare function MustConfirmLoss( ) as boolean
     declare function ChangedOnDisk( ) as boolean
     declare function HasView( byval w as TK_WIDGET ptr ) as boolean
     declare sub DestroyViews( )
     declare sub ApplyHighlight( )                   ' coloured for a source file only
+    declare function ViewWidget( ) as TK_WIDGET ptr ' what a pane showing this buffer shows
+    declare function AttachDesigner( byval parent as TK_WIDGET ptr, byval id as long ) as boolean
+    declare sub DropDesigner( )
+    declare sub ApplyFormText( byref newText as const ustring )
 end type
 
 ' A tiko source file by its name: .tiko .ti .bas .bi (any case). An untitled buffer counts as one.
@@ -75,6 +83,15 @@ public function IsSourceFile( byref path as const ustring ) as boolean
     case "tiko", "ti", "bas", "bi" : return true
     end select
     return false
+end function
+
+' Written by the Form Designer: it's shown, never edited.
+public function IsGeneratedFile( byref path as const ustring ) as boolean
+    return lcase( right( path, 12 ) ) = ".design.tiko"
+end function
+
+public function IsFormFile( byref path as const ustring ) as boolean
+    return lcase( right( path, 7 ) ) = ".tkform"
 end function
 
 ' The tab's and title bar's name for it.
@@ -104,8 +121,10 @@ function Document.Load( byref path as const ustring ) as TextResult
     Enc.Encoding = t.Encoding
     Enc.LossyAccepted = false
     Enc.LineEnding = docencoding.ChooseLineEnd( t.Text, false, Enc.LineEnding, Enc.LineEnding )
+    Main.SetReadOnly( false )
     Main.SetText( t.Text )
     Main.SetLineEnding( Enc.LineEnding, false )
+    Main.SetReadOnly( IsGeneratedFile( path ) )
     this.Path = path
     this.ApplyHighlight( )
     Stamp = StampOf( path )
@@ -121,6 +140,10 @@ function Document.Reload( ) as TextResult
     if r.IsOk( ) then
         Main.SetPosition( pos_ )
         Main.SetFirstLine( first )
+        ' someone rewrote the form: show what they wrote, or the text if it no longer reads
+        if Designer then
+            if Designer->LoadText( Main.Text( ) ) = false then this.DropDesigner( )
+        end if
     end if
     return r
 end function
@@ -133,16 +156,22 @@ end function
 ' Writes the text, encoded as the document was found (or chosen); acceptLoss = the user agreed
 ' to characters the encoding cannot hold becoming its default character.
 function Document.Save( byref path as const ustring, byval acceptLoss as boolean ) as TextResult
-    if acceptLoss then Enc.AcceptLossy( )
-    dim as docencoding.SavePlan p = Enc.PlanSave( Main.Text( ) )
-    if p.MustConfirm then return Fail( of boolean, ustring )( "lossy" )
-    dim as fs.FsResultBool w = docencoding.WriteFile( path, p.Bytes )
-    if w.IsOk( ) = false then return Fail( of boolean, ustring )( w.Failure( ).Message( ) )
+    dim as TextResult r = this.WriteCopy( path, acceptLoss )
+    if r.IsOk( ) = false then return r
     this.Path = path
     this.ApplyHighlight( )
     Main.SetSavePoint( )
     Stamp = StampOf( path )
     Ignored = Stamp
+    return Ok( of boolean, ustring )( true )
+end function
+
+function Document.WriteCopy( byref path as const ustring, byval acceptLoss as boolean ) as TextResult
+    if acceptLoss then Enc.AcceptLossy( )
+    dim as docencoding.SavePlan p = Enc.PlanSave( Main.Text( ) )
+    if p.MustConfirm then return Fail( of boolean, ustring )( "lossy" )
+    dim as fs.FsResultBool w = docencoding.WriteFile( path, p.Bytes )
+    if w.IsOk( ) = false then return Fail( of boolean, ustring )( w.Failure( ).Message( ) )
     return Ok( of boolean, ustring )( true )
 end function
 
@@ -156,11 +185,56 @@ end function
 
 function Document.HasView( byval w as TK_WIDGET ptr ) as boolean
     if w = 0 then return false
+    if Designer then
+        if w = Designer->Glass then return true
+    end if
     return Main.Widget( ) = w
 end function
 
 sub Document.DestroyViews( )
+    this.DropDesigner( )
     Main.Destroy( )
+end sub
+
+function Document.ViewWidget( ) as TK_WIDGET ptr
+    if Designer then return Designer->Frame
+    return Main.Widget( )
+end function
+
+private sub OnDesignerCommit( byval owner as any ptr, byref text as const ustring )
+    cast( Document ptr, owner )->ApplyFormText( text )
+end sub
+
+' Puts the form on a design surface. False, with no surface, when the text isn't a form this version
+' can show: the buffer is then an ordinary text file, to be repaired by hand.
+function Document.AttachDesigner( byval parent as TK_WIDGET ptr, byval id as long ) as boolean
+    dim as canvas.FormCanvas ptr c = new canvas.FormCanvas
+    if c->Create( parent, id ) = false then
+        delete c
+        return false
+    end if
+    c->Owner = @this
+    c->OnCommit = @OnDesignerCommit
+    if c->LoadText( Main.Text( ) ) = false then
+        c->Destroy( )
+        delete c
+        return false
+    end if
+    Designer = c
+    return true
+end function
+
+sub Document.DropDesigner( )
+    if Designer = 0 then exit sub
+    Designer->Destroy( )
+    delete Designer
+    Designer = 0
+end sub
+
+' A gesture finished: one undoable change of the buffer, of the fewest lines that do it.
+sub Document.ApplyFormText( byref newText as const ustring )
+    dim as edits.LineEdit e = edits.DiffLines( Main.Text( ), newText, Main.EolText( ) )
+    if e.IsNoOp = false then Main.ReplaceLines( e.First, e.Last, e.Text )
 end sub
 
 sub Document.ApplyHighlight( )

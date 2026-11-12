@@ -1,0 +1,269 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' reconcile -- a form and the file of code that goes with it, kept in step. Everything here works on
+' text and returns text: the caller puts the result into the open buffer, as one undoable edit.
+#module "reconcile"
+
+#import "std/containers"
+#import "std/strings"
+#import "tkc/outline"
+#import "../model"
+#import "../codegen"
+using containers
+using model
+
+const as string NL = chr( 10 )
+
+private function SplitLines_( byref text as const ustring ) as Array( of ustring )
+    return strings.Split( codegen.WithoutCr( text ), NL )
+end function
+
+' Where `sub Form.<handler>` is: its header line and its `end sub` line, from 0.
+public function FindBody( byref text as const ustring, byref handler as const ustring, byref first_ as long, byref last_ as long ) as boolean
+    dim as ustring want = lcase( "Form." & handler )
+    for each s as outline.Symbol in outline.Scan( text )
+        if lcase( s.Name ) = want then
+            dim as Array( of ustring ) lines = SplitLines_( text )
+            for k as long = s.Line + 1 to lines.Count( ) - 1
+                if lcase( trim( lines[k] ) ) = "end sub" then
+                    first_ = s.Line
+                    last_ = k
+                    return true
+                end if
+            next
+        end if
+    next
+    return false
+end function
+
+' Nothing between the header and `end sub` but blank lines and comments?
+public function IsEmptyBody( byref text as const ustring, byval first_ as long, byval last_ as long ) as boolean
+    dim as Array( of ustring ) lines = SplitLines_( text )
+    for k as long = first_ + 1 to last_ - 1
+        dim as ustring t = trim( lines[k], any !" \t" )
+        if (len( t ) > 0) andalso (left( t, 1 ) <> "'") then return false
+    next
+    return true
+end function
+
+' The text with an empty handler added at the end. bodyLine gets the line inside it.
+public function AddStub( byref text as const ustring, byref handler as const ustring, byref params as const ustring, byref bodyLine as long ) as ustring
+    dim as ustring t = codegen.WithoutCr( text )
+    if (len( t ) > 0) andalso (right( t, 1 ) <> NL) then t &= NL
+    if len( t ) then t &= NL
+    dim as ustring args = "( )"
+    if len( params ) then args = "( " & params & " )"
+    bodyLine = 0
+    for i as long = 1 to len( t )
+        if mid( t, i, 1 ) = NL then bodyLine += 1
+    next
+    bodyLine += 1
+    return t & "sub Form." & handler & args & NL & "    " & NL & "end sub" & NL
+end function
+
+' The text without lines first_ .. last_, and without the blank line that set them off.
+public function RemoveLines( byref text as const ustring, byval first_ as long, byval last_ as long ) as ustring
+    dim as Array( of ustring ) lines = SplitLines_( text )
+    dim as long a = first_
+    if a > 0 then
+        if len( trim( lines[a - 1] ) ) = 0 then a -= 1
+    end if
+    dim as ustring o
+    for i as long = 0 to lines.Count( ) - 1
+        if (i < a) orelse (i > last_) then
+            o &= lines[i]
+            if i < lines.Count( ) - 1 then o &= NL
+        end if
+    next
+    return o
+end function
+
+' A handler's parameters can name types from the control's module, and imports are per file.
+public function EnsureImport( byref text as const ustring, byref moduleName as const ustring ) as ustring
+    dim as ustring importLine = "#import ""vendor/tkControls/" & moduleName & """"
+    if instr( lcase( text ), lcase( importLine ) ) then return text
+    dim as Array( of ustring ) lines = SplitLines_( text )
+    ' every #import has to come before any code, and a using counts as code
+    dim as long afterImports = 0, afterUsings = -1
+    for i as long = 0 to lines.Count( ) - 1
+        dim as ustring t = lcase( trim( lines[i] ) )
+        if (left( t, 7 ) = "#module") orelse (left( t, 7 ) = "#import") then afterImports = i + 1
+        if left( t, 6 ) = "using " then afterUsings = i + 1
+    next
+    if afterUsings < afterImports then afterUsings = afterImports
+    dim as ustring o
+    for i as long = 0 to lines.Count( ) - 1
+        if i = afterImports then o &= importLine & NL
+        if i = afterUsings then o &= "using " & moduleName & NL
+        o &= lines[i]
+        if i < lines.Count( ) - 1 then o &= NL
+    next
+    return o
+end function
+
+' Which tkControls modules a handler's parameter list needs imported in its own file.
+public function ImportsFor( byref params as const ustring, byref controlModule as const ustring ) as Array( of ustring )
+    dim as Array( of ustring ) out_
+    dim as ustring p = ucase( params )
+    if instr( p, "TK_HOST" ) orelse instr( p, "TK_WIDGET" ) then out_.Push( "tkHost" )
+    if instr( p, "TK_MENU" ) then out_.Push( "tkPopupMenu" )
+    if instr( p, " AS TKDATE" ) andalso (len( controlModule ) > 0) then
+        dim as ustring m = controlModule
+        out_.Push( m )
+    end if
+    return out_
+end function
+
+' A new file of code for a form.
+public function NewCodeFile( byref moduleName as const ustring ) as ustring
+    return "' The half of the form you write. The rest is " & moduleName & ".design.tiko, generated from" & NL _
+         & "' " & moduleName & ".tkform: don't edit that one." & NL _
+         & "#module """ & moduleName & """" & NL
+end function
+
+private function IsIdentChar_( byref ch as const ustring ) as boolean
+    dim as long c_ = asc( ch )
+    return ((c_ >= 48) andalso (c_ <= 57)) orelse ((c_ >= 65) andalso (c_ <= 90)) orelse ((c_ >= 97) andalso (c_ <= 122)) orelse (c_ = 95)
+end function
+
+' Is this handler name bound to some event of the form?
+private function IsBound_( byref doc as FormDoc, byref handler as const ustring ) as boolean
+    dim as ustring want = lcase( handler )
+    for each s as Setting in doc.Events
+        if lcase( s.Value ) = want then return true
+    next
+    for each c as FormControl in doc.Controls
+        for each s as Setting in c.Events
+            if lcase( s.Value ) = want then return true
+        next
+        for each it as FormItem in c.Items
+            if lcase( it.Handler ) = want then return true
+        next
+    next
+    return false
+end function
+
+' A control was renamed: its name and its handlers change in the code, wherever they're real tokens.
+' Not in strings or comments, and not after a dot naming something else (another form's field of
+' the same name is the compiler's to report). doc is the form after the rename.
+public function RenameInCode( byref text as const ustring, byref oldName as const ustring, byref newName as const ustring, byref doc as FormDoc ) as ustring
+    dim as ustring t = codegen.WithoutCr( text )
+    dim as ustring o
+    dim as ustring old_ = lcase( oldName ), prefix = lcase( oldName ) & "_"
+    dim as long i = 1, n = len( t )
+    dim as ustring prevIdent
+    dim as boolean afterDot = false
+    while i <= n
+        dim as ustring ch = mid( t, i, 1 )
+        if ch = "'" then
+            dim as long e = instr( i, t, NL )
+            if e = 0 then e = n + 1
+            o &= mid( t, i, e - i )
+            i = e
+        elseif (ch = "/") andalso (mid( t, i, 2 ) = "/'") then
+            dim as long e = instr( i, t, "'/" )
+            if e = 0 then e = n - 1
+            o &= mid( t, i, e + 2 - i )
+            i = e + 2
+        elseif ch = """" then
+            dim as boolean escapes = (i > 1) andalso (mid( t, i - 1, 1 ) = "!")
+            dim as long k = i + 1
+            while k <= n
+                dim as ustring q = mid( t, k, 1 )
+                if escapes andalso (q = "\") then
+                    k += 2
+                    continue while
+                end if
+                if q = """" then
+                    if mid( t, k + 1, 1 ) <> """" then exit while
+                    k += 1
+                end if
+                k += 1
+            wend
+            o &= mid( t, i, k + 1 - i )
+            i = k + 1
+            prevIdent = ""
+            afterDot = false
+        elseif IsIdentChar_( ch ) andalso ((asc( ch ) < 48) orelse (asc( ch ) > 57)) then
+            dim as long k = i
+            while (k <= n) andalso IsIdentChar_( mid( t, k, 1 ) )
+                k += 1
+            wend
+            dim as ustring word = mid( t, i, k - i ), low = lcase( word )
+            dim as boolean mayRename = (afterDot = false) orelse (lcase( prevIdent ) = "this") orelse (lcase( prevIdent ) = "form")
+            if mayRename andalso (low = old_) then
+                o &= newName
+            elseif mayRename andalso (left( low, len( prefix ) ) = prefix) andalso IsBound_( doc, newName & mid( word, len( prefix ) ) ) then
+                o &= newName & mid( word, len( prefix ) )
+            else
+                o &= word
+            end if
+            prevIdent = word
+            afterDot = false
+            i = k
+        else
+            o &= ch
+            if ch = "." then
+                afterDot = true
+            elseif ch <> " " then
+                afterDot = false
+                prevIdent = ""
+            end if
+            i += 1
+        end if
+    wend
+    return o
+end function
+
+' What the code says now, brought into the form: a handler whose body was deleted is unbound, and an
+' orphan whose body is gone is forgotten. True if doc changed; unbound gets each name it dropped.
+public function ReconcileForm( byref doc as FormDoc, byref codeText as const ustring, byref unbound as Array( of ustring ) ) as boolean
+    dim as long a, b
+    dim as boolean changed = false
+    dim as long i = doc.Events.Count( ) - 1
+    while i >= 0
+        if FindBody( codeText, doc.Events[i].Value, a, b ) = false then
+            unbound.Push( doc.Events[i].Value )
+            doc.Events.Remove( i )
+            changed = true
+        end if
+        i -= 1
+    wend
+    for c as long = 0 to doc.Controls.Count( ) - 1
+        i = doc.Controls[c].Events.Count( ) - 1
+        while i >= 0
+            if FindBody( codeText, doc.Controls[c].Events[i].Value, a, b ) = false then
+                unbound.Push( doc.Controls[c].Events[i].Value )
+                doc.Controls[c].Events.Remove( i )
+                changed = true
+            end if
+            i -= 1
+        wend
+    next
+    for c as long = 0 to doc.Controls.Count( ) - 1
+        for k as long = 0 to doc.Controls[c].Items.Count( ) - 1
+            dim as ustring h = doc.Controls[c].Items[k].Handler
+            if len( h ) then
+                if FindBody( codeText, h, a, b ) = false then
+                    unbound.Push( h )
+                    doc.Controls[c].Items[k].Handler = ""
+                    changed = true
+                end if
+            end if
+        next
+    next
+    i = doc.Orphans.Count( ) - 1
+    while i >= 0
+        if FindBody( codeText, doc.Orphans[i].Handler, a, b ) = false then
+            doc.Orphans.Remove( i )
+            changed = true
+        end if
+        i -= 1
+    wend
+    return changed
+end function

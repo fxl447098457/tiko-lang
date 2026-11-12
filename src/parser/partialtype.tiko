@@ -1,0 +1,190 @@
+'' partialtype.tiko -- 'partial type' and 'partial class': one type written in several blocks of
+'' one compilation unit.
+''
+'' A tool's generated half and a person's half share a type without either editing the other's
+'' block. The parts are pooled AFTER the parse and BEFORE Collect, so every later pass sees one
+'' N_TYPE. The first part keeps its place and takes the rest's members; the other parts leave the
+'' statement list. Their nodes and tokens stay, because '--emit-tki' writes every part verbatim
+'' and the importer's parser pools them again (an interface missing a part would be a smaller
+'' type with no error).
+''
+'' A module's files reach the parser as one namespace block each, so the walk goes into namespaces
+'' and matches a part by its namespace path as well as its name.
+
+#import "std/containers"
+#include once "parser/parser.ti"
+
+namespace Tko.Parse
+
+private function PartialKey_( byref p as Tko.ParserState, byref ns as string, byval name_ as Tko.InternId ) as string
+    return ns & "/" & str( cast( uint32, p.names->Fold( name_ ) ) )
+end function
+
+'' A CLASS WITH NO 'inherits' GOT 'object' FROM THE PARSER (AggPrologue), at the class's own
+'' location; a written base is on a later line. Only a written one counts as a part "giving" it.
+private function BaseIsImplicit_( byref p as Tko.ParserState, byval n as Tko.NodeId ) as boolean
+    dim as Tko.StmtPayload ptr sp = p.ast->StmtOf( n )
+    if (sp->extra and Tko.PF_CLASS) = 0 then return false
+    return p.ast->Loc( sp->c ) = p.ast->Loc( n )
+end function
+
+'' 'public' on either part makes the type public; only 'public' against 'private' is a conflict.
+private sub PartialAbsorb_( byref p as Tko.ParserState, byval f as Tko.NodeId, byval a as Tko.NodeId )
+    dim as Tko.StmtPayload ptr pf = p.ast->StmtOf( f )
+    dim as Tko.StmtPayload ptr pa = p.ast->StmtOf( a )
+    dim as Tko.SourceRange at_ = Tko.PointRange( p.ast->Loc( a ) )
+    dim as string shown = p.names->Spelling( iif( pf->rawName <> 0, pf->rawName, pf->name ) )
+
+    dim as boolean isClassF = (pf->extra and Tko.PF_CLASS) <> 0
+    if isClassF <> ((pa->extra and Tko.PF_CLASS) <> 0) then p.diags->Report( Tko.TKO1068, at_, shown )
+
+    '' A BASE PUTS A HIDDEN 'base' FIELD FIRST IN ITS PART (ParseAggregateBody). The merged type has
+    '' one, first: taken from the part that wrote a base, and every other part's left behind.
+    dim as boolean hasF = (pf->c <> Tko.NODE_NONE), hasA = (pa->c <> Tko.NODE_NONE)
+    dim as boolean autoBaseF = iif( hasF, BaseIsImplicit_( p, f ), false )
+    dim as boolean autoBaseA = iif( hasA, BaseIsImplicit_( p, a ), false )
+    if hasF andalso hasA andalso (autoBaseF = false) andalso (autoBaseA = false) then
+        p.diags->Report( Tko.TKO1066, at_, shown, iif( isClassF, "inherits", "extends" ) )
+    end if
+    dim as boolean baseFromA = hasA andalso ((hasF = false) orelse (autoBaseF andalso (autoBaseA = false)))
+    dim as int32 skipF = iif( baseFromA andalso hasF, 1, 0 )
+    dim as int32 skipA = iif( hasA, 1, 0 )
+    if baseFromA then pf->c = pa->c
+
+    dim as uint32 packA = pa->extra and &hFFFF
+    if packA <> 0 then
+        if (pf->extra and &hFFFF) <> 0 then
+            p.diags->Report( Tko.TKO1066, at_, shown, "field" )
+        else
+            pf->extra or= packA
+        end if
+    end if
+
+    if (pa->extra and Tko.PF_C_LAYOUT) <> 0 then
+        if (pf->extra and Tko.PF_C_LAYOUT) <> 0 then
+            p.diags->Report( Tko.TKO1066, at_, shown, "extern" )
+        else
+            pf->extra or= Tko.PF_C_LAYOUT
+        end if
+    end if
+
+    dim as Tko.NodeId implA = Tko.ImplementsOf( *p.ast, a )
+    if implA <> Tko.NODE_NONE then
+        if Tko.ImplementsOf( *p.ast, f ) <> Tko.NODE_NONE then
+            p.diags->Report( Tko.TKO1066, at_, shown, "implements" )
+        else
+            Tko.RecordImplements( *p.ast, f, implA )
+        end if
+    end if
+
+    const VIS_MASK = Tko.PF_VIS_PUBLIC or Tko.PF_VIS_PRIVATE
+    dim as uint32 visA = pa->extra and VIS_MASK, visF = pf->extra and VIS_MASK
+    if (visA <> 0) andalso (visF <> 0) andalso (visA <> visF) then
+        p.diags->Report( Tko.TKO1067, at_, shown )
+    elseif visF = 0 then
+        pf->extra or= visA
+    end if
+
+    dim as int32 first_ = p.ast->ChildPoolCount( )
+    dim as int32 total = pf->count - skipF + pa->count - skipA + iif( baseFromA, 1, 0 )
+    if baseFromA then p.ast->PushChild( cast( uint32, p.ast->ChildAt( pa->first, 0 ) ) )
+    for c as int32 = skipF to pf->count - 1
+        p.ast->PushChild( cast( uint32, p.ast->ChildAt( pf->first, c ) ) )
+    next
+    for c as int32 = skipA to pa->count - 1
+        p.ast->PushChild( cast( uint32, p.ast->ChildAt( pa->first, c ) ) )
+    next
+    pf->count = total
+    pf->first = first_
+end sub
+
+private sub PartialPlainWalk_( byref p as Tko.ParserState, byref ns as string, byref list as Tko.NodeIdVec, _
+                               byref plain as Tko.StrVec )
+    for i as int32 = 0 to list.Count - 1
+        dim as Tko.NodeId a = cast( Tko.NodeId, list[i] )
+        select case p.ast->Kind( a )
+        case Tko.N_NAMESPACE
+            dim as Tko.StmtPayload ptr nsp = p.ast->StmtOf( a )
+            dim as Tko.NodeIdVec kids
+            for c as int32 = 0 to nsp->count - 1
+                kids.Push( cast( uint32, p.ast->ChildAt( nsp->first, c ) ) )
+            next
+            PartialPlainWalk_( p, ns & "." & str( cast( uint32, p.names->Fold( nsp->name ) ) ), kids, plain )
+        case Tko.N_TYPE
+            dim as Tko.StmtPayload ptr sp = p.ast->StmtOf( a )
+            if (sp->name <> 0) andalso ((p.ast->Flags( a ) and Tko.NF_PARTIAL_TYPE) = 0) then
+                plain.Push( PartialKey_( p, ns, sp->name ) )
+            end if
+        end select
+    next
+end sub
+
+private sub PartialWalk_( byref p as Tko.ParserState, byref ns as string, byref list as Tko.NodeIdVec, _
+                          byref plain as Tko.StrVec, byref seen as Tko.NodeIdVec, byref seenKey as Tko.StrVec )
+    dim as Tko.NodeIdVec kept
+    for i as int32 = 0 to list.Count - 1
+        dim as Tko.NodeId a = cast( Tko.NodeId, list[i] )
+        dim as boolean gone = false
+        if p.ast->Kind( a ) = Tko.N_NAMESPACE then
+            dim as Tko.NodeIdVec kids
+            dim as Tko.StmtPayload ptr nsp = p.ast->StmtOf( a )
+            dim as string inner = ns & "." & str( cast( uint32, p.names->Fold( nsp->name ) ) )
+            for c as int32 = 0 to nsp->count - 1
+                kids.Push( cast( uint32, p.ast->ChildAt( nsp->first, c ) ) )
+            next
+            PartialWalk_( p, inner, kids, plain, seen, seenKey )
+            nsp = p.ast->StmtOf( a )
+            nsp->first = p.ast->ChildPoolCount( )
+            nsp->count = kids.Count
+            for c as int32 = 0 to kids.Count - 1
+                p.ast->PushChild( kids[c] )
+            next
+        elseif (p.ast->Kind( a ) = Tko.N_TYPE) andalso ((p.ast->Flags( a ) and Tko.NF_PARTIAL_TYPE) <> 0) then
+            dim as Tko.StmtPayload ptr pa = p.ast->StmtOf( a )
+            dim as string key = PartialKey_( p, ns, pa->name )
+            for k as int32 = 0 to plain.Count - 1
+                if plain[k] = key then
+                    p.diags->Report( Tko.TKO1063, Tko.PointRange( p.ast->Loc( a ) ), _
+                                     p.names->Spelling( iif( pa->rawName <> 0, pa->rawName, pa->name ) ) )
+                    gone = true
+                    exit for
+                end if
+            next
+            if gone = false then
+                for k as int32 = 0 to seen.Count - 1
+                    if seenKey[k] = key then
+                        PartialAbsorb_( p, cast( Tko.NodeId, seen[k] ), a )
+                        gone = true
+                        exit for
+                    end if
+                next
+            end if
+            if gone = false then
+                seen.Push( cast( uint32, a ) )
+                seenKey.Push( key )
+            end if
+        end if
+        if gone = false then kept.Push( list[i] )
+    next
+    list.Clear( )
+    for i as int32 = 0 to kept.Count - 1
+        list.Push( kept[i] )
+    next
+end sub
+
+sub MergePartialTypes( byref p as Tko.ParserState, byref items as Tko.NodeIdVec )
+    if p.sawPartial = false then return
+    dim as Tko.StrVec plain, seenKey
+    dim as Tko.NodeIdVec seen
+    PartialPlainWalk_( p, "", items, plain )
+    PartialWalk_( p, "", items, plain, seen, seenKey )
+    '' THE FIELD CHECK EACH PART SKIPPED: a part may be methods alone, the whole may not be empty.
+    for i as int32 = 0 to seen.Count - 1
+        dim as Tko.StmtPayload ptr sp = p.ast->StmtOf( cast( Tko.NodeId, seen[i] ) )
+        if AggHasField_( p, sp->first, sp->count ) = false then
+            p.diags->Report( Tko.TKO0876, Tko.PointRange( p.ast->Loc( cast( Tko.NodeId, seen[i] ) ) ), "TYPE" )
+        end if
+    next
+end sub
+
+end namespace

@@ -20,7 +20,7 @@ program, or a bare `end`, exits with 0. The caller reads the code as `$?` in a
 Unix shell, `%ERRORLEVEL%` in `cmd.exe`, or as the result of `exec` or `shell`
 in another tiko program.
 
-```admonish info title="On Linux"
+```admonish info title="On Linux and macOS"
 An exit code is one byte: only 0 to 255 reach the caller, so `end 300`
 arrives as 44. Keep exit codes in that range on every platform.
 ```

@@ -30,8 +30,8 @@ Returns the external program's exit code if executed successfully, or negative o
 
 ### Platform Differences
 
-- Linux requires the `program` name case matches the real name of the file. Windows and DOS are case insensitive. The program chained may be case sensitive for its command line parameters.
-  Path separators in Linux are forward slashes / . Windows uses backward slashes \\ but it allows for forward slashes . DOS uses backward \\ slashes.  
+- Linux requires the `program` name case matches the real name of the file. Windows, DOS and a default macOS volume are case insensitive. The program chained may be case sensitive for its command line parameters.
+  Path separators in Linux and macOS are forward slashes / . Windows uses backward slashes \\ but it allows for forward slashes . DOS uses backward \\ slashes.  
   Exit code is limited to 8 bits in DOS.
 
 ### Differences from QB

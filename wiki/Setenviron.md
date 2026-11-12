@@ -30,7 +30,7 @@ Return zero (0) if successful, non-zero otherwise.
 
 ### Platform Differences
 
-- In Linux, `varexpression` must be permanent (a literal, a variable declared in the main code or a static variable declared in a procedure), because Linux does not memorize the string but only a pointer to its data characters.
+- In Linux and macOS, `varexpression` must be permanent (a literal, a variable declared in the main code or a static variable declared in a procedure), because the system does not memorize the string but only a pointer to its data characters.
 
 ### Differences from QB
 

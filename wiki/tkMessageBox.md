@@ -8,7 +8,7 @@ tkMessageBox is an owner-drawn replacement for the system message box: a caption
 title and a close X, a body with an optional icon and a wrapped message, and a footer of one to
 three [tkButton](tkButton)s. It opens in its own borderless window, centred on its owner, sizes
 itself to the text, and blocks until it is dismissed. Because it is drawn by tkControls, it
-follows the theme and looks the same on Windows and Linux.
+follows the theme and looks the same on Windows, Linux and macOS.
 
 Build one with `tkMessageBox_Create`, configure it, and call `tkMessageBox_DoModal`, which shows
 it, runs a modal loop (the owner window ignores input meanwhile) and returns the dismissing id.

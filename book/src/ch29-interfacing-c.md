@@ -7,7 +7,7 @@ declaring C functions by hand and having the compiler read a C header instead, m
 types and layouts, passing strings and callbacks across, calling conventions, linking a library
 — including one shipped inside the project's own tree — and loading one while the program runs.
 
-Every listing here runs on both targets. Several print different answers on each, and those
+Every listing here runs on every target. Several print different answers on each, and those
 differences are the point.
 
 ## Declaring a C function
@@ -64,7 +64,7 @@ On macOS:
 {{#include ../examples/ch29/ctypes.macos-arm64.out}}
 ```
 
-Most C types have one tiko equivalent on both platforms:
+Most C types have one tiko equivalent on every platform:
 
 | C | tiko |
 |---|---|
@@ -141,7 +141,7 @@ who frees it, and the library's documentation says which; the C runtime's `free`
 memory from the C runtime's `malloc`.
 
 A `ustring` holds UTF-8, so `*p` from a C function that returns UTF-8 gives the right text. A C
-interface that takes `wchar_t *` takes a `wstring ptr` on both platforms; on Windows that is
+interface that takes `wchar_t *` takes a `wstring ptr` on every platform; on Windows that is
 UTF-16, which is what the `W` functions of the Windows API expect.
 
 ## Callbacks
@@ -196,7 +196,7 @@ last fixed parameter, `cva_arg( list, T )` takes the next one as type `T`, and `
 finishes. Nothing says how many arguments there are or what types they have; the fixed
 parameters must, as `count` does here and the format string does for `printf`.
 
-A `cva_list` is 8 bytes on Windows (a pointer) and 24 on Linux (a small record), so it is not
+A `cva_list` is 8 bytes on Windows and macOS (a pointer) and 24 on Linux (a small record), so it is not
 something to store or pass by value across platforms. Pass it to C's `v` functions — `vsnprintf`
 and the rest — which take a `va_list`.
 
@@ -207,7 +207,7 @@ and the rest — which take a `va_list`.
 On 32-bit x86, C had several calling conventions — `cdecl`, `stdcall`, `pascal`, `fastcall` and
 `thiscall` — that differed in which side cleaned up the stack and in what order the arguments
 went. x86-64 has **one** per platform: Microsoft's on Windows and the System V convention on
-Linux. tiko compiles only for x86-64, so `cdecl` and `stdcall` mean the same thing and can be used
+Linux. Apple's arm64, tiko's macOS target, has one too. So `cdecl` and `stdcall` mean the same thing and can be used
 interchangeably; a Windows header's `WINAPI` (which is `stdcall`) and a plain `cdecl` describe
 the same call.
 
@@ -249,7 +249,7 @@ A declaration says a function exists; the linker needs the library that contains
 three ways to name one:
 
 - **`#inclib "name"`** in the source links the library `name`: `libname.a` or `libname.so` on
-  Linux, `name.lib` on Windows. `#libpath "dir"` adds a directory to search.
+  Linux, `libname.a` or `libname.dylib` on macOS, `name.lib` on Windows. `#libpath "dir"` adds a directory to search.
 - **`-l name`** and **`-p dir`** on the command line do the same from outside.
 - **`lib "name"`** on a declaration, or on an `extern` block, links the library too, as if
   `#inclib` had been written.
@@ -278,6 +278,7 @@ geom/geom.c
 geom/build.sh
 geom/geom_windows_x86_64.lib
 geom/geom_linux_x86_64.a
+geom/geom_macos_arm64.a
 ```
 
 **`#foreignlib GEOM static "geom/geom"`** binds the name `GEOM` to that library. Three things set
@@ -298,7 +299,7 @@ The bound name then goes where a library name would: `extern "C" lib GEOM`. A `#
 library is linked whether or not anything names it, as `#inclib`'s is.
 
 A spec beginning **`system:`** names an installed library instead of a file: `"system:m"` links
-Linux's maths library, exactly as `#inclib "m"` would, and its `static` or `dynamic` is not
+the maths library on Linux and macOS, exactly as `#inclib "m"` would, and its `static` or `dynamic` is not
 checked.
 
 When nothing matches, the error lists every file that was tried. On Windows:
@@ -328,7 +329,7 @@ to different libraries.
 
 The geom listing passes a `geom_point` **by value** to `geom_distance`. That works because the
 `type` has C's layout, and tiko passes it by the platform's rules for a 16-byte struct — by hidden
-reference on Windows, in two floating-point registers on Linux — exactly as a C compiler would.
+reference on Windows, in two floating-point registers on Linux and macOS — exactly as a C compiler would.
 
 ## Reading the C header: #cinclude
 
@@ -452,7 +453,7 @@ A tiko program can be the library: `tiko -dll plugin.tiko` builds a DLL or share
 - `declare … cdecl alias "name"`, or an `extern "C"` … `end extern` block, declares a C
   function. `lib "name"` links its library.
 - `int` is `int32`, `long long` is `int64`, `double` is `float64`. **C's `long` is `clong`**: 4
-  bytes on Windows, 8 on Linux. `wchar_t` is 2 bytes on Windows, 4 on Linux, like `wstring`.
+  bytes on Windows, 8 on Linux and macOS. `wchar_t` is 2 bytes on Windows, 4 on Linux and macOS, like `wstring`.
 - A `type` has C's struct layout; `field = n` packs it. A `ustring` never belongs in a struct C
   reads.
 - `strptr` passes a string's bytes to C; `*p` copies C's back. Memory C allocates, C frees.

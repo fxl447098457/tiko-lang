@@ -1,0 +1,1170 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' panels -- the toolbox, the object tree and the inspector, for whichever form is showing. Each of the
+' two palettes (toolbox over tree; properties over events) sits beside the surface or floats in its
+' own window; going
+' from one to the other rebuilds it from the model, because a widget moved across windows would keep
+' the old window's fonts and scale.
+#module "panels"
+
+#import "std/containers"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkMeta"
+#import "vendor/tkControls/tkLayout"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkToolbar"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkCheckBox"
+#import "vendor/tkControls/tkScrollPanel"
+#import "vendor/tkControls/tkSplitter"
+#import "vendor/tkControls/tkTheme"
+#import "../model"
+#import "../catalog"
+#import "../edits"
+#import "../canvas"
+using containers
+using tkApp
+using tkMeta
+using tkLayout
+using tkListTree
+using tkLabel
+using tkButton
+using tkToolbar
+using tkTextBox
+using tkComboBox
+using tkCheckBox
+using tkScrollPanel
+using tkSplitter
+using tkTheme
+using tkHost
+using tkPaint
+using model
+
+public const as long TOOLBOX_CX = 170
+public const as long INSPECTOR_CX = 290
+public const as long HEADER_CY = 28
+public const as long SPLIT_CX = 5         ' a splitter's thickness, unscaled
+const as long MIN_PALETTE_CX = 100
+const as long MIN_SURFACE_CX = 200
+const as long MIN_PANE_CY = 60
+const as long TOOLBOX_SPLIT = 600         ' where a palette's own bar starts, in thousandths of its height
+const as long PROPS_SPLIT = 500
+const as long ROW_CY = 28
+const as long LABEL_CX = 140
+const as long PAD = 4
+
+public enum PaletteId
+    PaletteToolbox = 0
+    PaletteInspector = 1
+end enum
+
+const as long TIMER_ROWS = 1
+const as long TIMER_DOCK = 2
+
+' PsIcons (tools/add-psicons.py): Fluent's twins of the editor's Segoe undock / dock icons
+public const GLYPH_FLOAT = &hF582         ' open
+public const GLYPH_DOCK = &hF373          ' contract_down_left
+public const GLYPH_CODE = &hF3DD          ' edit: an event row's "go to the code"
+
+enum RowKind
+    RowText = 0
+    RowCombo
+    RowCheck
+    RowButton
+end enum
+
+public type FloatPlace
+    On_ as boolean
+    X as long
+    Y as long
+    W as long          ' 0: none kept
+    H as long
+end type
+
+public type PanelRow
+    Key as ustring
+    Kind as long
+    Text as ustring    ' what the editor holds, as last applied
+    Label as TK_WIDGET ptr
+    Edit as TK_WIDGET ptr
+    Btn as TK_WIDGET ptr      ' an event row's "go to the code"
+    CY as long
+end type
+
+public type Palette
+    Frame as TK_WIDGET ptr
+    Title as TK_WIDGET ptr
+    FloatBtn as TK_WIDGET ptr
+    Float as TK_FORM ptr
+    Place as FloatPlace
+    PendingDock as boolean
+    Split as TK_WIDGET ptr    ' the bar between the palette's two halves
+    SplitPm as long           ' the top half's share, in thousandths; 0 = the default
+end type
+
+public type PanelsNotifySub as sub( byval owner as any ptr )
+public type PanelsFloatSub as sub( byval owner as any ptr, byval f as TK_FORM ptr )
+public type PanelsMessageSub as sub( byval owner as any ptr, byref text as const ustring )
+
+public type DesignPanels
+    Host as TK_FORM ptr
+    Owner as any ptr
+    OnFloatMade as PanelsFloatSub       ' give a new float window its Tag, keys and close handling
+    OnLayout as PanelsNotifySub         ' the panes need placing again
+    OnMessage as PanelsMessageSub
+
+    C as canvas.FormCanvas ptr
+    Pal( 0 to 1 ) as Palette
+    Ticker as TK_WIDGET ptr             ' never shown: timers that outlive a float window
+    IsShown as boolean
+
+    ToolList as TK_WIDGET ptr
+    TreeTitle as TK_WIDGET ptr
+    Tree as TK_WIDGET ptr
+    Scroll as TK_WIDGET ptr             ' the property rows
+    EvTitle as TK_WIDGET ptr
+    EvScroll as TK_WIDGET ptr           ' the event rows
+    BarL as TK_WIDGET ptr               ' the bars either side of the surface
+    BarR as TK_WIDGET ptr
+    ToolCX as long                      ' the palettes' docked widths, unscaled; 0 = the default
+    InspCX as long
+    AreaX as long                       ' the rectangle PlaceDocked last shared out
+    AreaCX as long
+    Rows as Array( of PanelRow )
+    RowSig as ustring
+    TreeSig as ustring
+    Updating as boolean
+
+    declare sub Init( byval hostForm as TK_FORM ptr, byval owner_ as any ptr )
+    declare sub Destroy( )
+    declare sub Bind( byval canvas_ as canvas.FormCanvas ptr )
+    declare sub ShowAll( byval onOff as boolean )
+    ' Takes what the docked palettes need from this rectangle; what's left is the surface's.
+    declare sub PlaceDocked( byref x as long, byref y as long, byref cx as long, byref cy as long )
+    declare function IsFloating( byval which as long ) as boolean
+    declare sub SetFloat( byval which as long, byval onOff as boolean )
+    declare sub ToggleFloat( byval which as long )
+    declare sub CloseFloat( byval f as TK_FORM ptr )
+    declare sub SizeFloat( byval f as TK_FORM ptr )
+    declare sub KeepPlaces( )
+    declare sub Restore( byref tool as FloatPlace, byref insp as FloatPlace )
+    declare sub Refresh( )
+    declare sub RebuildContent( )
+    declare sub LayoutPalette( byval which as long )
+    declare sub LayoutRows( )
+    declare sub LayoutPane( byval sc as TK_WIDGET ptr, byval events as boolean )
+    declare function IsDocked( byval which as long ) as boolean
+    declare sub BuildPalette( byval which as long, byval parent as TK_WIDGET ptr )
+    declare sub BuildRows( )
+    declare sub BuildTree( )
+    declare sub FillToolbox( )
+    declare sub AddRow( byref key_ as const ustring, byref caption as const ustring, byval kind_ as long, byref items as const ustring = "" )
+    declare sub AddPropRow( byval p as TKMETA_PROP ptr )
+    declare sub AddEventRow( byref event_ as const ustring )
+    declare sub UpdateValues( )
+    declare function ValueOf( byref key_ as const ustring ) as ustring
+    declare function ControlValue( byval i as long, byref key_ as const ustring ) as ustring
+    declare function Apply( byref key_ as const ustring, byref text as const ustring ) as ustring
+    declare sub CommitRow( byval r as long )
+    declare function RowOf( byval w as TK_WIDGET ptr ) as long
+    declare sub OnTick( byval id as long )
+end type
+
+' ---- the widgets' procedures ------------------------------------------------------------------
+
+' The float icon's bar takes the palette header's colour, not a toolbar's. Pinned, so set again at
+' every theme.
+private sub ColorFloatBar( byval bar as TK_WIDGET ptr )
+    dim as TKTOOLBAR_COLORS c = tkToolbar_ThemeColors( tkTheme_Get( ) )
+    c.BackColor = tkTheme_Get( ).Surface
+    tkToolbar_SetColors( bar, @c )
+end sub
+
+' A list row's hint: halfway between the theme's dim text and its disabled text.
+private function HintColor_( ) as ulong
+    dim as TKTHEME_COLORS t = tkTheme_Get( )
+    return &hFF000000ul or (((t.TextDim and &hFEFEFEul) shr 1) + ((t.TextDisabled and &hFEFEFEul) shr 1))
+end function
+
+private function PaletteProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as DesignPanels ptr p = w->pData
+    select case m->msg
+    case TKM_PAINT
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        m->pPaint->SetBackColor( tkTheme_Get( ).Surface )
+        m->pPaint->PaintRect( @rc )
+        return true
+    case TKM_THEMECHANGED
+        if p->Pal( w->ctrlId ).FloatBtn then ColorFloatBar( p->Pal( w->ctrlId ).FloatBtn )
+        ' the rows' hints are coloured when they're made
+        if w->ctrlId = PaletteId.PaletteInspector then
+            p->RowSig = "?"
+            tkWidget_SetTimer( p->Ticker, TIMER_ROWS, 1 )
+        end if
+    case TKM_SIZE
+        p->LayoutPalette( w->ctrlId )
+        return true
+    end select
+    return false
+end function
+
+private function TickerProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg = TKM_TIMER then
+        tkWidget_KillTimer( w, m->timerId )
+        cast( DesignPanels ptr, w->pData )->OnTick( m->timerId )
+        return true
+    end if
+    return false
+end function
+
+private function PanelsOf( byval w as TK_WIDGET ptr ) as DesignPanels ptr
+    while w
+        if w->proc = @PaletteProc then return w->pData
+        w = w->pParent
+    wend
+    return 0
+end function
+
+' A bar beside the surface is a child of the form, where PanelsOf can't find us; the Ticker can.
+private function PanelsOfBar( byval bar as TK_WIDGET ptr ) as DesignPanels ptr
+    dim as TK_WIDGET ptr w = bar->pParent->pFirst
+    while w
+        if w->proc = @TickerProc then return w->pData
+        w = w->pNext
+    wend
+    return 0
+end function
+
+private sub OnSurfaceBarMoved( byval h as TK_WIDGET ptr, byval newPos as long, byval nPhase as long )
+    if nPhase = TKSPLITTER_PHASE_BEGIN then exit sub
+    dim as DesignPanels ptr p = PanelsOfBar( h )
+    if p = 0 then exit sub
+    dim as TK_HOST ptr hs = h->pHost
+    if h = p->BarL then
+        p->ToolCX = cint( (newPos - p->AreaX) / hs->fScale )
+    else
+        p->InspCX = cint( (p->AreaX + p->AreaCX - newPos - h->cw) / hs->fScale )
+    end if
+    if p->OnLayout then p->OnLayout( p->Owner )
+end sub
+
+private sub OnPaletteBarMoved( byval h as TK_WIDGET ptr, byval newPos as long, byval nPhase as long )
+    if nPhase = TKSPLITTER_PHASE_BEGIN then exit sub
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if p = 0 then exit sub
+    dim as long which = h->pParent->ctrlId
+    dim as long hh = tkHost_Scale( h->pHost, HEADER_CY )
+    dim as long avail = h->pParent->ch - hh - h->ch
+    if avail <= 0 then exit sub
+    p->Pal( which ).SplitPm = (newPos - hh) * 1000 \ avail
+    if p->Pal( which ).SplitPm < 1 then p->Pal( which ).SplitPm = 1
+    p->LayoutPalette( which )
+end sub
+
+private sub OnCanvasChanged( byval owner as any ptr )
+    cast( DesignPanels ptr, owner )->Refresh( )
+end sub
+
+' The control type a Toolbox row stands for; "" for the pointer.
+private function ToolAt_( byval hList as TK_WIDGET ptr, byval row as integer ) as ustring
+    dim as long i = tkListTree_GetItemData( hList, row )
+    if i > tkMeta_Count( ) then return catalog.CUSTOM_TYPE
+    if i > 0 then return tkMeta_At( i - 1 )->Name
+    return ""
+end function
+
+private sub OnToolPicked( byval hList as TK_WIDGET ptr, byval row as integer )
+    dim as DesignPanels ptr p = PanelsOf( hList )
+    if (p = 0) orelse p->Updating orelse (p->C = 0) then exit sub
+    p->C->Tool = ToolAt_( hList, row )
+    tkHost_SetFocus( p->C->Glass->pHost, p->C->Glass )
+end sub
+
+' A double click on a tool: a copy of its default size on the form, without drawing one.
+private sub OnToolActivated( byval hList as TK_WIDGET ptr, byval row as integer )
+    dim as DesignPanels ptr p = PanelsOf( hList )
+    if (p = 0) orelse (p->C = 0) then exit sub
+    dim as ustring tool_ = ToolAt_( hList, row )
+    if len( tool_ ) = 0 then exit sub
+    if p->C->PlaceDefault( tool_ ) then tkHost_SetFocus( p->C->Glass->pHost, p->C->Glass )
+end sub
+
+private sub OnTreePicked( byval hList as TK_WIDGET ptr, byval row as integer )
+    dim as DesignPanels ptr p = PanelsOf( hList )
+    if (p = 0) orelse p->Updating orelse (p->C = 0) then exit sub
+    dim as long i = tkListTree_GetItemData( hList, row )
+    if i <= 0 then
+        p->C->SelectNone( )
+    elseif i <= p->C->Doc.Controls.Count( ) then
+        p->C->RevealAndSelect( p->C->Doc.Controls[i - 1].Name )
+    end if
+end sub
+
+private sub OnTextEnter( byval h as TK_WIDGET ptr )
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if p then p->CommitRow( p->RowOf( h ) )
+end sub
+
+private sub OnTextFocus( byval h as TK_WIDGET ptr, byval bGotFocus as boolean )
+    if bGotFocus then exit sub
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if p then p->CommitRow( p->RowOf( h ) )
+end sub
+
+private sub OnComboPicked( byval h as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if p then p->CommitRow( p->RowOf( h ) )
+end sub
+
+private sub OnCheckToggled( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if p then p->CommitRow( p->RowOf( h ) )
+end sub
+
+' An event row's button: this event's handler, made if need be, and the code.
+private sub OnEventGo( byval h as TK_WIDGET ptr, byval idx as long, byval cid as long )
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if (p = 0) orelse (p->C = 0) orelse (p->C->OnWire = 0) then exit sub
+    dim as long r = -1
+    for i as long = 0 to p->Rows.Count( ) - 1
+        if p->Rows[i].Btn = h then r = i
+    next
+    if r < 0 then exit sub
+    dim as ustring ctl
+    if p->C->Selected.Count( ) then ctl = p->C->Selected[0]
+    p->C->OnWire( p->C->Host, p->C, ctl, mid( p->Rows[r].Key, 3 ), true )
+end sub
+
+' The row that opens a control's menu, column, item or page editor.
+private sub OnItemsClicked( byval h as TK_WIDGET ptr, byval id as long )
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if (p = 0) orelse (p->C = 0) orelse (p->C->OnEditItems = 0) then exit sub
+    if p->C->Selected.Count( ) <> 1 then exit sub
+    p->C->OnEditItems( p->C->Host, p->C, p->C->Selected[0], "", true )
+end sub
+
+private sub OnFloatClicked( byval h as TK_WIDGET ptr, byval idx as long, byval cid as long )
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if p then p->ToggleFloat( cid )
+end sub
+
+' ---- life ------------------------------------------------------------------------------------
+
+sub DesignPanels.Init( byval hostForm as TK_FORM ptr, byval owner_ as any ptr )
+    Host = hostForm
+    Owner = owner_
+    Ticker = tkWidget_CreateChild( tkForm_Widget( Host ), 9901, @TickerProc, @this )
+    tkWidget_Show( Ticker, false )
+    BarL = tkSplitter_Create( tkForm_Widget( Host ), 9902, TKSPLITTER_VERTICAL )
+    BarR = tkSplitter_Create( tkForm_Widget( Host ), 9903, TKSPLITTER_VERTICAL )
+    tkSplitter_SetPosChangedCallback( BarL, @OnSurfaceBarMoved )
+    tkSplitter_SetPosChangedCallback( BarR, @OnSurfaceBarMoved )
+    tkWidget_Show( BarL, false )
+    tkWidget_Show( BarR, false )
+end sub
+
+sub DesignPanels.Destroy( )
+    for i as long = 0 to 1
+        if Pal( i ).Float then tkForm_Destroy( Pal( i ).Float )
+        Pal( i ).Float = 0
+        Pal( i ).Frame = 0
+    next
+    C = 0
+end sub
+
+function DesignPanels.IsFloating( byval which as long ) as boolean
+    return Pal( which ).Float <> 0
+end function
+
+function DesignPanels.IsDocked( byval which as long ) as boolean
+    return (Pal( which ).Frame <> 0) andalso (Pal( which ).Float = 0)
+end function
+
+sub DesignPanels.Restore( byref tool as FloatPlace, byref insp as FloatPlace )
+    Pal( 0 ).Place = tool
+    Pal( 1 ).Place = insp
+end sub
+
+' The current size and place of what's floating, for session.toml.
+sub DesignPanels.KeepPlaces( )
+    for i as long = 0 to 1
+        if Pal( i ).Float then
+            dim as SDL_Window ptr win = tkForm_Host( Pal( i ).Float )->win
+            dim as long x, y, w, h
+            SDL_GetWindowPosition( win, @x, @y )
+            SDL_GetWindowSize( win, @w, @h )
+            Pal( i ).Place.X = x
+            Pal( i ).Place.Y = y
+            Pal( i ).Place.W = w
+            Pal( i ).Place.H = h
+        end if
+    next
+end sub
+
+sub DesignPanels.Bind( byval canvas_ as canvas.FormCanvas ptr )
+    dim as boolean changed = (C <> canvas_)
+    C = canvas_
+    if canvas_ then
+        canvas_->Listener = @this
+        canvas_->OnChanged = @OnCanvasChanged
+    end if
+    if changed then
+        RowSig = "?"
+        TreeSig = "?"
+    end if
+    for i as long = 0 to 1
+        if (canvas_ <> 0) andalso (Pal( i ).Frame = 0) then
+            if Pal( i ).Place.On_ then
+                this.SetFloat( i, true )
+            else
+                this.BuildPalette( i, tkForm_Widget( Host ) )
+            end if
+        end if
+    next
+    if changed andalso (canvas_ <> 0) then this.RebuildContent( )
+end sub
+
+sub DesignPanels.ShowAll( byval onOff as boolean )
+    IsShown = onOff
+    for i as long = 0 to 1
+        if Pal( i ).Float then
+            if onOff then
+                tkHost_Show( tkForm_Host( Pal( i ).Float ) )
+            else
+                tkHost_Hide( tkForm_Host( Pal( i ).Float ) )
+            end if
+        elseif Pal( i ).Frame then
+            tkWidget_Show( Pal( i ).Frame, onOff )
+        end if
+    next
+    tkWidget_Show( BarL, onOff andalso this.IsDocked( 0 ) )
+    tkWidget_Show( BarR, onOff andalso this.IsDocked( 1 ) )
+end sub
+
+sub DesignPanels.PlaceDocked( byref x as long, byref y as long, byref cx as long, byref cy as long )
+    dim as TK_HOST ptr h = tkForm_Host( Host )
+    dim as long bar = tkHost_Scale( h, SPLIT_CX ), minP = tkHost_Scale( h, MIN_PALETTE_CX ), minS = tkHost_Scale( h, MIN_SURFACE_CX )
+    dim as boolean dockL = this.IsDocked( 0 ), dockR = this.IsDocked( 1 )
+    AreaX = x
+    AreaCX = cx
+    dim as long wL = 0, wR = 0, over = minS - cx
+    if dockL then
+        wL = tkHost_Scale( h, iif( ToolCX > 0, ToolCX, TOOLBOX_CX ) )
+        if wL < minP then wL = minP
+        over += wL + bar
+    end if
+    if dockR then
+        wR = tkHost_Scale( h, iif( InspCX > 0, InspCX, INSPECTOR_CX ) )
+        if wR < minP then wR = minP
+        over += wR + bar
+    end if
+    ' a window too narrow for the widths asked for: the palettes give way before the surface does
+    if dockR andalso (over > 0) andalso (wR > minP) then
+        dim as long give = iif( over < wR - minP, over, wR - minP )
+        wR -= give
+        over -= give
+    end if
+    if dockL andalso (over > 0) andalso (wL > minP) then
+        wL -= iif( over < wL - minP, over, wL - minP )
+    end if
+    tkWidget_Show( BarL, dockL )
+    tkWidget_Show( BarR, dockR )
+    if dockL then
+        tkWidget_SetPos( Pal( 0 ).Frame, x, y, wL, cy )
+        tkSplitter_SetRange( BarL, x + minP, x + cx - iif( dockR, wR + bar, 0 ) - bar - minS )
+        tkWidget_SetPos( BarL, x + wL, y, bar, cy )
+        x += wL + bar
+        cx -= wL + bar
+    end if
+    if dockR then
+        tkWidget_SetPos( Pal( 1 ).Frame, x + cx - wR, y, wR, cy )
+        tkSplitter_SetRange( BarR, x + minS, x + cx - minP - bar )
+        tkWidget_SetPos( BarR, x + cx - wR - bar, y, bar, cy )
+        cx -= wR + bar
+    end if
+    if cx < 0 then cx = 0
+end sub
+
+sub DesignPanels.BuildPalette( byval which as long, byval parent as TK_WIDGET ptr )
+    with Pal( which )
+        .Frame = tkWidget_CreateChild( parent, which, @PaletteProc, @this )
+        .Title = tkLabel_Create( .Frame, 1 )
+        .FloatBtn = tkToolbar_Create( .Frame, 4 )
+        tkToolbar_SetGlyphFont( .FloatBtn, tkForm_Font( tkForm_FromWidget( parent ), TKFONT_GLYPH ) )
+        ColorFloatBar( .FloatBtn )
+        .Split = tkSplitter_Create( .Frame, 5, TKSPLITTER_HORIZONTAL )
+        tkSplitter_SetPosChangedCallback( .Split, @OnPaletteBarMoved )
+        tkToolbar_SetClickCallback( .FloatBtn, @OnFloatClicked )
+        if .Float then
+            tkToolbar_AddItem( .FloatBtn, TBR_KIND_COMMAND, wchr( GLYPH_DOCK ), "", which )
+            tkToolbar_SetTooltipText( .FloatBtn, 0, i18n.Tr( "designer.dock", "Dock" ) )
+        else
+            tkToolbar_AddItem( .FloatBtn, TBR_KIND_COMMAND, wchr( GLYPH_FLOAT ), "", which )
+            tkToolbar_SetTooltipText( .FloatBtn, 0, i18n.Tr( "designer.float", "Float" ) )
+        end if
+    end with
+    if which = PaletteId.PaletteToolbox then
+        tkLabel_SetText( Pal( which ).Title, i18n.Tr( "designer.toolbox", "Toolbox" ) )
+        ToolList = tkListTree_Create( Pal( which ).Frame, 2 )
+        tkListTree_SetPaintCallback( ToolList, @tkListTree_PaintRowDefault )   ' a tkListTree draws no row by itself
+        tkListTree_SetSelChangeCallback( ToolList, @OnToolPicked )
+        tkListTree_SetActivateCallback( ToolList, @OnToolActivated )
+        this.FillToolbox( )
+        TreeTitle = tkLabel_Create( Pal( which ).Frame, 6 )
+        tkLabel_SetText( TreeTitle, i18n.Tr( "designer.objects", "Object Tree" ) )
+        Tree = tkListTree_Create( Pal( which ).Frame, 3 )
+        tkListTree_SetPaintCallback( Tree, @tkListTree_PaintRowDefault )
+        tkListTree_SetSelChangeCallback( Tree, @OnTreePicked )
+        TreeSig = "?"
+    else
+        tkLabel_SetText( Pal( which ).Title, i18n.Tr( "designer.properties", "Properties" ) )
+        Scroll = tkScrollPanel_Create( Pal( which ).Frame, 3 )
+        EvTitle = tkLabel_Create( Pal( which ).Frame, 6 )
+        tkLabel_SetText( EvTitle, i18n.Tr( "designer.events", "Events" ) )
+        EvScroll = tkScrollPanel_Create( Pal( which ).Frame, 7 )
+        Rows.Clear( )
+        RowSig = "?"
+    end if
+    this.LayoutPalette( which )
+end sub
+
+sub DesignPanels.SetFloat( byval which as long, byval onOff as boolean )
+    with Pal( which )
+        if onOff = (.Float <> 0) andalso (.Frame <> 0) then exit sub
+        ' a focused editor gets its focus-loss commit before its window goes
+        if (which = PaletteId.PaletteInspector) andalso (.Frame <> 0) then
+            for r as long = 0 to Rows.Count( ) - 1
+                this.CommitRow( r )
+            next
+        end if
+        if .Float then
+            this.KeepPlaces( )
+            dim as TK_FORM ptr gone = .Float
+            .Float = 0
+            .Frame = 0
+            tkForm_Destroy( gone )
+        elseif .Frame then
+            tkWidget_Destroy( .Frame )
+            .Frame = 0
+        end if
+        .Place.On_ = onOff
+        if onOff then
+            dim as TK_HOST ptr h = tkForm_Host( Host )
+            dim as long w = TOOLBOX_CX, ht = 480
+            if which = PaletteId.PaletteInspector then w = INSPECTOR_CX
+            dim as ustring title = i18n.Tr( "designer.toolbox", "Toolbox" )
+            if which = PaletteId.PaletteInspector then title = i18n.Tr( "designer.properties", "Properties" )
+            .Float = tkApp_NewForm( title, w, ht, Host, h->fScaleForced )
+            if .Float then
+                if OnFloatMade then OnFloatMade( Owner, .Float )
+                if .Place.W > 0 then
+                    SDL_SetWindowSize( tkForm_Host( .Float )->win, .Place.W, .Place.H )
+                    SDL_SetWindowPosition( tkForm_Host( .Float )->win, .Place.X, .Place.Y )
+                end if
+                this.BuildPalette( which, tkForm_Widget( .Float ) )
+                tkForm_Show( .Float )
+                this.SizeFloat( .Float )
+            end if
+        else
+            this.BuildPalette( which, tkForm_Widget( Host ) )
+        end if
+    end with
+    RowSig = "?"
+    TreeSig = "?"
+    if C then this.RebuildContent( )
+    if OnLayout then OnLayout( Owner )
+end sub
+
+sub DesignPanels.ToggleFloat( byval which as long )
+    ' a button can't destroy the window it's in from its own click
+    Pal( which ).PendingDock = true
+    tkWidget_SetTimer( Ticker, TIMER_DOCK, 1 )
+end sub
+
+' The float's close button: back beside the surface. Not from inside the close handling.
+sub DesignPanels.CloseFloat( byval f as TK_FORM ptr )
+    for i as long = 0 to 1
+        if Pal( i ).Float = f then this.ToggleFloat( i )
+    next
+end sub
+
+sub DesignPanels.SizeFloat( byval f as TK_FORM ptr )
+    for i as long = 0 to 1
+        if (Pal( i ).Float = f) andalso (Pal( i ).Frame <> 0) then
+            dim as TK_WIDGET ptr r = tkForm_Widget( f )
+            tkWidget_SetPos( Pal( i ).Frame, 0, 0, r->cw, r->ch )
+        end if
+    next
+end sub
+
+sub DesignPanels.OnTick( byval id as long )
+    select case id
+    case TIMER_ROWS
+        this.RebuildContent( )
+    case TIMER_DOCK
+        for i as long = 0 to 1
+            if Pal( i ).PendingDock then
+                Pal( i ).PendingDock = false
+                this.SetFloat( i, Pal( i ).Float = 0 )
+            end if
+        next
+    end select
+end sub
+
+' ---- layout ----------------------------------------------------------------------------------
+
+sub DesignPanels.LayoutPalette( byval which as long )
+    dim as TK_WIDGET ptr f = Pal( which ).Frame
+    if f = 0 then exit sub
+    dim as TK_HOST ptr h = f->pHost
+    dim as long hh = tkHost_Scale( h, HEADER_CY ), p_ = tkHost_Scale( h, PAD ), bw, bh
+    tkToolbar_GetIdealSize( Pal( which ).FloatBtn, bw, bh )
+    if bh > hh then bh = hh
+    tkWidget_SetPos( Pal( which ).Title, p_, 0, f->cw - bw - 2 * p_, hh )
+    tkWidget_SetPos( Pal( which ).FloatBtn, f->cw - bw - p_, (hh - bh) \ 2, bw, bh )
+    ' the two halves, the bar between them; the lower half starts with its own heading
+    dim as long bar = tkHost_Scale( h, SPLIT_CX ), minH = tkHost_Scale( h, MIN_PANE_CY )
+    dim as boolean isTools = (which = PaletteId.PaletteToolbox)
+    dim as long avail = f->ch - hh - bar
+    if avail < 0 then avail = 0
+    dim as long pm = Pal( which ).SplitPm
+    if pm <= 0 then pm = iif( isTools, TOOLBOX_SPLIT, PROPS_SPLIT )
+    dim as long topH = avail * pm \ 1000
+    dim as long hi = avail - minH - hh
+    if hi < minH then hi = minH
+    if topH < minH then topH = minH
+    if topH > hi then topH = hi
+    dim as long barY = hh + topH, below = barY + bar, belowH = f->ch - below
+    if belowH < 0 then belowH = 0
+    dim as long listH = iif( belowH > hh, belowH - hh, 0 )
+    tkSplitter_SetRange( Pal( which ).Split, hh + minH, hh + hi )
+    tkWidget_SetPos( Pal( which ).Split, 0, barY, f->cw, bar )
+    if isTools then
+        if ToolList then tkWidget_SetPos( ToolList, 0, hh, f->cw, topH )
+        if TreeTitle then tkWidget_SetPos( TreeTitle, p_, below, f->cw - 2 * p_, hh )
+        if Tree then tkWidget_SetPos( Tree, 0, below + hh, f->cw, listH )
+    else
+        if Scroll then tkWidget_SetPos( Scroll, 0, hh, f->cw, topH )
+        if EvTitle then tkWidget_SetPos( EvTitle, p_, below, f->cw - 2 * p_, hh )
+        if EvScroll then tkWidget_SetPos( EvScroll, 0, below + hh, f->cw, listH )
+        this.LayoutRows( )
+    end if
+end sub
+
+sub DesignPanels.LayoutRows( )
+    this.LayoutPane( Scroll, false )
+    this.LayoutPane( EvScroll, true )
+end sub
+
+sub DesignPanels.LayoutPane( byval sc as TK_WIDGET ptr, byval events as boolean )
+    if sc = 0 then exit sub
+    dim as TK_HOST ptr h = sc->pHost
+    dim as long lw = tkHost_Scale( h, LABEL_CX ), p_ = tkHost_Scale( h, PAD )
+    dim as long w = tkScrollPanel_GetPanelWidth( sc )
+    if w <= 0 then w = sc->cw
+    dim as long y = p_
+    for each r as PanelRow in Rows
+        if (left( r.Key, 2 ) = "E:") <> events then continue for
+        dim as long rh = tkHost_Scale( h, r.CY )
+        tkWidget_SetPos( r.Label, p_, y, lw - p_, rh - p_ )
+        dim as long bw = 0
+        if r.Btn then
+            dim as long bh
+            tkToolbar_GetIdealSize( r.Btn, bw, bh )
+            if bh > rh - p_ then bh = rh - p_
+            tkWidget_SetPos( r.Btn, w - p_ - bw, y + ((rh - p_ - bh) \ 2), bw, bh )
+        end if
+        tkWidget_SetPos( r.Edit, lw, y, w - lw - p_ - bw, rh - p_ )
+        y += rh
+    next
+    tkScrollPanel_SetContentHeight( sc, y + p_ )
+end sub
+
+' ---- content ---------------------------------------------------------------------------------
+
+sub DesignPanels.FillToolbox( )
+    Updating = true
+    tkListTree_BeginUpdate( ToolList )
+    tkListTree_Clear( ToolList )
+    tkListTree_AddString( ToolList, i18n.Tr( "designer.pointer", "Pointer" ), 0 )
+    tkListTree_AddString( ToolList, catalog.CUSTOM_TYPE, tkMeta_Count( ) + 1 )
+    ' one flat list, by name
+    dim as Array( of long ) order
+    for i as long = 0 to tkMeta_Count( ) - 1
+        order.Push( i )
+        dim as long k = order.Count( ) - 1
+        while (k > 0) andalso (lcase( tkMeta_At( order[k - 1] )->Name ) > lcase( tkMeta_At( i )->Name ))
+            order[k] = order[k - 1]
+            k -= 1
+        wend
+        order[k] = i
+    next
+    for each i as long in order
+        tkListTree_AddString( ToolList, tkMeta_At( i )->Name, i + 1 )
+    next
+    tkListTree_EndUpdate( ToolList )
+    tkListTree_SetCurSel( ToolList, 0 )
+    Updating = false
+end sub
+
+private function RowSignature_( byval c as canvas.FormCanvas ptr ) as ustring
+    if c->Selected.Count( ) = 0 then return "form"
+    dim as ustring s = "n" & c->Selected.Count( )
+    for each n as ustring in c->Selected
+        dim as long i = FindControl( c->Doc, n )
+        if i >= 0 then s &= "|" & c->Doc.Controls[i].TypeName
+    next
+    return s
+end function
+
+private function TreeSignature_( byval c as canvas.FormCanvas ptr ) as ustring
+    dim as ustring s
+    for i as long = 0 to c->Doc.Controls.Count( ) - 1
+        s &= c->Doc.Controls[i].Name & "<" & c->Doc.Controls[i].Parent & ">"
+    next
+    return s
+end function
+
+' The canvas changed something. Rows and tree are rebuilt only when their shape did, and never from
+' inside the call that told us: that may be an editor's own callback.
+sub DesignPanels.Refresh( )
+    if C = 0 then exit sub
+    if (RowSignature_( C ) <> RowSig) orelse (TreeSignature_( C ) <> TreeSig) then
+        tkWidget_SetTimer( Ticker, TIMER_ROWS, 1 )
+    end if
+    this.UpdateValues( )
+end sub
+
+sub DesignPanels.RebuildContent( )
+    if C = 0 then exit sub
+    dim as ustring rs = RowSignature_( C )
+    if (Scroll <> 0) andalso (rs <> RowSig) then
+        RowSig = rs
+        this.BuildRows( )
+    end if
+    dim as ustring ts = TreeSignature_( C )
+    if (Tree <> 0) andalso (ts <> TreeSig) then
+        TreeSig = ts
+        this.BuildTree( )
+    end if
+    this.UpdateValues( )
+end sub
+
+sub DesignPanels.BuildTree( )
+    Updating = true
+    tkListTree_BeginUpdate( Tree )
+    tkListTree_Clear( Tree )
+    dim as integer root = tkListTree_AddNode( Tree, -1, i18n.Tr( "designer.form", "Form" ), 0 )
+    dim as Array( of integer ) rowOf_
+    for i as long = 0 to C->Doc.Controls.Count( ) - 1
+        dim as integer parent_ = root
+        if len( C->Doc.Controls[i].Parent ) then
+            dim as long p = FindControl( C->Doc, C->Doc.Controls[i].Parent )
+            if (p >= 0) andalso (p < rowOf_.Count( )) then parent_ = rowOf_[p]
+        end if
+        dim as integer n = tkListTree_AddNode( Tree, parent_, C->Doc.Controls[i].Name, i + 1 )
+        rowOf_.Push( n )
+    next
+    tkListTree_ExpandAll( Tree )
+    tkListTree_EndUpdate( Tree )
+    Updating = false
+end sub
+
+sub DesignPanels.AddRow( byref key_ as const ustring, byref caption as const ustring, byval kind_ as long, byref items as const ustring = "" )
+    dim as TK_WIDGET ptr panel_ = tkScrollPanel_GetPanel( iif( left( key_, 2 ) = "E:", EvScroll, Scroll ) )
+    dim as PanelRow r
+    r.Key = key_
+    r.Kind = kind_
+    r.CY = ROW_CY
+    r.Label = tkLabel_Create( panel_, 1 )
+    tkLabel_SetText( r.Label, caption )
+    select case kind_
+    case RowKind.RowText
+        r.Edit = tkTextBox_Create( panel_, Rows.Count( ) + 10, false )
+        tkTextBox_SetEnterPressedCallback( r.Edit, @OnTextEnter )
+        tkTextBox_SetFocusCallback( r.Edit, @OnTextFocus )
+    case RowKind.RowCombo
+        r.Edit = tkComboBox_Create( panel_, Rows.Count( ) + 10 )
+        dim as long a = 1
+        dim as ustring t = items & ","
+        dim as long b = instr( a, t, "," )
+        while b > 0
+            tkComboBox_AddItem( r.Edit, mid( t, a, b - a ) )
+            a = b + 1
+            b = instr( a, t, "," )
+        wend
+        tkComboBox_SetSelChangeCallback( r.Edit, @OnComboPicked )
+    case RowKind.RowButton
+        r.Edit = tkButton_Create( panel_, Rows.Count( ) + 10 )
+        tkButton_SetText( r.Edit, "..." )
+        tkButton_SetClickCallback( r.Edit, @OnItemsClicked )
+    case RowKind.RowCheck
+        r.Edit = tkCheckBox_Create( panel_, Rows.Count( ) + 10 )
+        tkCheckBox_SetCheckChangedCallback( r.Edit, @OnCheckToggled )
+    end select
+    Rows.Push( r )
+end sub
+
+' The Shown names of a "Shown=CONSTANT,..." list.
+private function EnumShown_( byref pairs as const ustring ) as ustring
+    dim as ustring o, t = pairs & ","
+    dim as long a = 1
+    dim as long b = instr( a, t, "," )
+    while b > 0
+        dim as ustring item = mid( t, a, b - a )
+        dim as long eq = instr( item, "=" )
+        if eq then item = left( item, eq - 1 )
+        if len( o ) then o &= ","
+        o &= item
+        a = b + 1
+        b = instr( a, t, "," )
+    wend
+    return o
+end function
+
+sub DesignPanels.AddEventRow( byref event_ as const ustring )
+    this.AddRow( "E:" & event_, event_, RowKind.RowText )
+    with Rows[Rows.Count( ) - 1]
+        .Btn = tkToolbar_Create( tkScrollPanel_GetPanel( EvScroll ), 1 )
+        tkToolbar_SetGlyphFont( .Btn, tkForm_Font( tkForm_FromWidget( EvScroll ), TKFONT_GLYPH ) )
+        tkToolbar_AddItem( .Btn, TBR_KIND_COMMAND, wchr( GLYPH_CODE ), "", 0 )
+        tkToolbar_SetTooltipText( .Btn, 0, i18n.Tr( "designer.open_code", "Open code" ) )
+        tkToolbar_SetClickCallback( .Btn, @OnEventGo )
+    end with
+end sub
+
+sub DesignPanels.AddPropRow( byval p as TKMETA_PROP ptr )
+    select case p->Kind
+    case "bool" : this.AddRow( p->Name, p->Name, RowKind.RowCheck )
+    case "enum" : this.AddRow( p->Name, p->Name, RowKind.RowCombo, EnumShown_( p->EnumPairs ) )
+    case "font" : this.AddRow( p->Name, p->Name, RowKind.RowCombo, ",UI,UI_SMALL,UI_BOLD,UI_LARGE,GLYPH,GLYPH_LARGE,MONO" )
+    case "list"
+        this.AddRow( p->Name, p->Name, RowKind.RowText )
+        tkTextBox_SetCueBannerText( Rows[Rows.Count( ) - 1].Edit, tkMeta_ListCue( p->EnumPairs ) )
+        tkTextBox_SetCueBannerColor( Rows[Rows.Count( ) - 1].Edit, HintColor_( ) )
+    case else   : this.AddRow( p->Name, p->Name, RowKind.RowText )
+    end select
+end sub
+
+sub DesignPanels.BuildRows( )
+    for each r as PanelRow in Rows
+        tkWidget_Destroy( r.Label )
+        tkWidget_Destroy( r.Edit )
+        if r.Btn then tkWidget_Destroy( r.Btn )
+    next
+    Rows.Clear( )
+    Updating = true
+    dim as long n = C->Selected.Count( )
+    if n = 0 then
+        this.AddRow( "@Caption", i18n.Tr( "designer.caption", "Caption" ), RowKind.RowText )
+        this.AddRow( "@FormW", i18n.Tr( "designer.width", "Width" ), RowKind.RowText )
+        this.AddRow( "@FormH", i18n.Tr( "designer.height", "Height" ), RowKind.RowText )
+        this.AddRow( "@Translate", i18n.Tr( "designer.translate", "Translatable" ), RowKind.RowCheck )
+        this.AddEventRow( "Load" )
+        this.AddEventRow( "Close" )
+    else
+        dim as long i0 = FindControl( C->Doc, C->Selected[0] )
+        if i0 < 0 then
+            Updating = false
+            exit sub
+        end if
+        dim as TKMETA_CONTROL ptr m0 = catalog.Find( C->Doc.Controls[i0].TypeName )
+        if n = 1 then
+            this.AddRow( "@Name", i18n.Tr( "designer.name", "Name" ), RowKind.RowText )
+            if catalog.ItemsKindOf( m0->Name ) <> catalog.ItemsKind.ItemsNone then
+                this.AddRow( "@Items", i18n.Tr( "designer.edit_items", "Edit items" ), RowKind.RowButton )
+            end if
+            this.AddRow( "@X", "X", RowKind.RowText )
+            this.AddRow( "@Y", "Y", RowKind.RowText )
+            this.AddRow( "@W", i18n.Tr( "designer.width", "Width" ), RowKind.RowText )
+            this.AddRow( "@H", i18n.Tr( "designer.height", "Height" ), RowKind.RowText )
+        end if
+        this.AddRow( "@AL", i18n.Tr( "designer.anchor_left", "Anchor left" ), RowKind.RowCheck )
+        this.AddRow( "@AT", i18n.Tr( "designer.anchor_top", "Anchor top" ), RowKind.RowCheck )
+        this.AddRow( "@AR", i18n.Tr( "designer.anchor_right", "Anchor right" ), RowKind.RowCheck )
+        this.AddRow( "@AB", i18n.Tr( "designer.anchor_bottom", "Anchor bottom" ), RowKind.RowCheck )
+        this.AddRow( "@Dock", i18n.Tr( "designer.dock_mode", "Dock" ), RowKind.RowCombo, "none,top,bottom,left,right,fill" )
+        dim as boolean anyCustom = false
+        for k as long = 0 to n - 1
+            dim as long ik = FindControl( C->Doc, C->Selected[k] )
+            if ik >= 0 then
+                if C->Doc.Controls[ik].TypeName = catalog.CUSTOM_TYPE then anyCustom = true
+            end if
+        next
+        if anyCustom = false then
+            this.AddRow( "Enabled", "Enabled", RowKind.RowCheck )
+            this.AddRow( "Visible", "Visible", RowKind.RowCheck )
+        end if
+        if (n = 1) andalso (m0->Name = catalog.CUSTOM_TYPE) then
+            this.AddRow( "@CType", i18n.Tr( "designer.custom_type", "Type" ), RowKind.RowText )
+            this.AddRow( "@CModule", i18n.Tr( "designer.custom_module", "Module" ), RowKind.RowText )
+        end if
+        ' properties every selected control has, with the same meaning
+        if n = 1 andalso (len( m0->CreateArg ) > 0) then
+            select case m0->CreateArgKind
+            case "bool" : this.AddRow( m0->CreateArg, m0->CreateArg, RowKind.RowCheck )
+            case "enum" : this.AddRow( m0->CreateArg, m0->CreateArg, RowKind.RowCombo, EnumShown_( m0->CreateArgEnum ) )
+            end select
+        end if
+        for p as long = 0 to m0->NumProps - 1
+            dim as boolean common_ = true
+            for k as long = 1 to n - 1
+                dim as long ik = FindControl( C->Doc, C->Selected[k] )
+                if ik < 0 then continue for
+                dim as TKMETA_PROP ptr other = tkMeta_FindProp( catalog.Find( C->Doc.Controls[ik].TypeName ), m0->Props( p ).Name )
+                if other = 0 then
+                    common_ = false
+                elseif other->Kind <> m0->Props( p ).Kind then
+                    common_ = false
+                end if
+            next
+            if common_ then this.AddPropRow( @m0->Props( p ) )
+        next
+        if n = 1 then
+            for e as long = 0 to m0->NumEvents - 1
+                this.AddEventRow( m0->Events( e ).Name )
+            next
+        end if
+    end if
+    Updating = false
+    this.LayoutRows( )
+end sub
+
+function DesignPanels.ControlValue( byval i as long, byref key_ as const ustring ) as ustring
+    dim as FormControl c_ = C->Doc.Controls[i]
+    dim as TKMETA_CONTROL ptr m = catalog.Find( c_.TypeName )
+    select case key_
+    case "@Name" : return c_.Name
+    case "@X"    : return str( c_.X )
+    case "@Y"    : return str( c_.Y )
+    case "@W"    : return str( c_.W )
+    case "@H"    : return str( c_.H )
+    case "@Dock" : return DockWord( c_.Dock )
+    case "@CType" : return c_.CustomType
+    case "@CModule" : return c_.CustomModule
+    case "@AL"   : if (c_.Anchor and TK_ANCHOR_LEFT) then return "true" else return "false"
+    case "@AT"   : if (c_.Anchor and TK_ANCHOR_TOP) then return "true" else return "false"
+    case "@AR"   : if (c_.Anchor and TK_ANCHOR_RIGHT) then return "true" else return "false"
+    case "@AB"   : if (c_.Anchor and TK_ANCHOR_BOTTOM) then return "true" else return "false"
+    case "Enabled", "Visible"
+        return SettingOr( c_.Props, key_, "true" )
+    end select
+    if left( key_, 2 ) = "E:" then return SettingOr( c_.Events, mid( key_, 3 ) )
+    if key_ = m->CreateArg then return SettingOr( c_.Props, key_, m->CreateArgDflt )
+    dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, key_ )
+    if p = 0 then return ""
+    dim as ustring dflt = p->DefaultValue
+    ' no default on record: for what shows a state rather than a blank, the control itself says
+    if (len( dflt ) = 0) andalso (p->Read_ <> 0) andalso ((p->Kind = "bool") orelse (p->Kind = "enum")) then
+        dim as TK_WIDGET ptr w_ = C->WidgetOf( c_.Name )
+        if w_ then dflt = p->Read_( w_ )
+    end if
+    return SettingOr( c_.Props, key_, dflt )
+end function
+
+' What a row should show: the value, or "" when the selected controls differ.
+function DesignPanels.ValueOf( byref key_ as const ustring ) as ustring
+    select case key_
+    case "@Caption" : return C->Doc.Caption
+    case "@FormW"   : return str( C->Doc.ClientW )
+    case "@FormH"   : return str( C->Doc.ClientH )
+    case "@Translate"
+        if C->Doc.Translate then return "true" else return "false"
+    end select
+    if (left( key_, 2 ) = "E:") andalso (C->Selected.Count( ) = 0) then return SettingOr( C->Doc.Events, mid( key_, 3 ) )
+    dim as ustring out_
+    dim as boolean first_ = true
+    for each n as ustring in C->Selected
+        dim as long i = FindControl( C->Doc, n )
+        if i < 0 then continue for
+        dim as ustring v = this.ControlValue( i, key_ )
+        if first_ then
+            out_ = v
+            first_ = false
+        elseif v <> out_ then
+            return ""
+        end if
+    next
+    return out_
+end function
+
+' The editors to what the model says; what's being typed in is left alone.
+sub DesignPanels.UpdateValues( )
+    if C = 0 then exit sub
+    Updating = true
+    for r as long = 0 to Rows.Count( ) - 1
+        dim as ustring v = this.ValueOf( Rows[r].Key )
+        dim as TK_WIDGET ptr ed = Rows[r].Edit
+        select case Rows[r].Kind
+        case RowKind.RowButton
+        case RowKind.RowText
+            if (tkHost_GetFocus( ed->pHost ) <> ed) andalso (tkTextBox_GetText( ed ) <> v) then tkTextBox_SetText( ed, v )
+        case RowKind.RowCombo
+            tkComboBox_SetCurSel( ed, tkComboBox_FindItemByText( ed, v ) )
+        case RowKind.RowCheck
+            tkCheckBox_SetChecked( ed, v = "true" )
+        end select
+        Rows[r].Text = v
+    next
+    ' the toolbox's row follows the tool, the tree's follows the selection
+    if (ToolList <> 0) andalso (len( C->Tool ) = 0) then
+        if tkListTree_GetCurSel( ToolList ) <> 0 then tkListTree_SetCurSel( ToolList, 0 )
+    end if
+    if Tree then
+        dim as long want = 0
+        if C->Selected.Count( ) then want = FindControl( C->Doc, C->Selected[0] ) + 1
+        for row as long = 0 to tkListTree_GetCount( Tree ) - 1
+            if tkListTree_GetItemData( Tree, row ) = want then
+                if tkListTree_GetCurSel( Tree ) <> row then tkListTree_SetCurSel( Tree, row )
+                exit for
+            end if
+        next
+    end if
+    Updating = false
+end sub
+
+function DesignPanels.RowOf( byval w as TK_WIDGET ptr ) as long
+    for i as long = 0 to Rows.Count( ) - 1
+        if Rows[i].Edit = w then return i
+    next
+    return -1
+end function
+
+' The person finished with an editor. A value the model refuses puts the old one back and says why.
+sub DesignPanels.CommitRow( byval r as long )
+    if (r < 0) orelse (r >= Rows.Count( )) orelse Updating orelse (C = 0) then exit sub
+    dim as ustring v
+    dim as TK_WIDGET ptr ed = Rows[r].Edit
+    select case Rows[r].Kind
+    case RowKind.RowText  : v = tkTextBox_GetText( ed )
+    case RowKind.RowCombo : v = tkComboBox_GetText( ed )
+    case RowKind.RowCheck : if tkCheckBox_GetChecked( ed ) then v = "true" else v = "false"
+    end select
+    if Rows[r].Kind = RowKind.RowButton then exit sub
+    if v = Rows[r].Text then exit sub
+    dim as ustring key_ = Rows[r].Key
+    dim as ustring fault = this.Apply( key_, v )
+    if len( fault ) then
+        if OnMessage then OnMessage( Owner, fault )
+        Updating = true
+        select case Rows[r].Kind
+        case RowKind.RowText  : tkTextBox_SetText( ed, Rows[r].Text )
+        case RowKind.RowCombo : tkComboBox_SetCurSel( ed, tkComboBox_FindItemByText( ed, Rows[r].Text ) )
+        case RowKind.RowCheck : tkCheckBox_SetChecked( ed, Rows[r].Text = "true" )
+        end select
+        Updating = false
+    elseif r < Rows.Count( ) then
+        Rows[r].Text = v
+    end if
+end sub
+
+private function ParseLong_( byref s as const ustring, byref v as long ) as boolean
+    dim as ustring t = trim( s )
+    if len( t ) = 0 then return false
+    for i as long = 1 to len( t )
+        dim as long ch = asc( mid( t, i, 1 ) )
+        if (ch < 48) orelse (ch > 57) then
+            if (i > 1) orelse (ch <> 45) orelse (len( t ) = 1) then return false
+        end if
+    next
+    v = valint( t )
+    return true
+end function
+
+' One change, on a copy of the model: the canvas takes it if it leaves the form valid. "" = done.
+function DesignPanels.Apply( byref key_ as const ustring, byref text as const ustring ) as ustring
+    dim as FormDoc trial = C->Doc
+    dim as long v
+    dim as boolean rebuild = true
+    dim as long i = -1
+    if C->Selected.Count( ) then i = FindControl( trial, C->Selected[0] )
+    dim as ustring badNumber = i18n.Tr( "designer.need_number", "a whole number, please" )
+    select case key_
+    case "@Caption"
+        trial.Caption = text
+    case "@Translate"
+        trial.Translate = (text = "true")
+        rebuild = false
+    case "@FormW", "@FormH"
+        if ParseLong_( text, v ) = false then return badNumber
+        if key_ = "@FormW" then
+            edits.ResizeForm( trial, v, trial.ClientH )
+        else
+            edits.ResizeForm( trial, trial.ClientW, v )
+        end if
+    case "@Name"
+        edits.RenameControl( trial, C->Selected[0], text )
+    case "@CType"
+        trial.Controls[i].CustomType = text
+    case "@CModule"
+        trial.Controls[i].CustomModule = text
+    case "@X", "@Y", "@W", "@H"
+        if ParseLong_( text, v ) = false then return badNumber
+        dim as long x = trial.Controls[i].X, y = trial.Controls[i].Y, w = trial.Controls[i].W, h = trial.Controls[i].H
+        select case key_
+        case "@X" : x = v
+        case "@Y" : y = v
+        case "@W" : w = v
+        case "@H" : h = v
+        end select
+        edits.ResizeControl( trial, i, x, y, w, h )
+        rebuild = false
+    case "@Dock"
+        dim as long d
+        DockFromWord( text, d )
+        edits.SetDock( trial, C->Selected, d )
+        rebuild = false
+    case "@AL" : edits.SetAnchorBit( trial, C->Selected, TK_ANCHOR_LEFT, text = "true" ) : rebuild = false
+    case "@AT" : edits.SetAnchorBit( trial, C->Selected, TK_ANCHOR_TOP, text = "true" ) : rebuild = false
+    case "@AR" : edits.SetAnchorBit( trial, C->Selected, TK_ANCHOR_RIGHT, text = "true" ) : rebuild = false
+    case "@AB" : edits.SetAnchorBit( trial, C->Selected, TK_ANCHOR_BOTTOM, text = "true" ) : rebuild = false
+    case else
+        if left( key_, 2 ) = "E:" then
+            dim as ustring ev = mid( key_, 3 )
+            if i >= 0 then
+                dim as long at_ = FindSetting( trial.Controls[i].Events, ev )
+                if len( text ) then
+                    PutSetting( trial.Controls[i].Events, ev, text )
+                elseif at_ >= 0 then
+                    trial.Controls[i].Events.Remove( at_ )
+                end if
+            else
+                dim as long at_ = FindSetting( trial.Events, ev )
+                if len( text ) then
+                    PutSetting( trial.Events, ev, text )
+                elseif at_ >= 0 then
+                    trial.Events.Remove( at_ )
+                end if
+            end if
+            rebuild = false
+        else
+            dim as ustring bad = edits.SetProperty( trial, C->Selected, key_, text )
+            if len( bad ) then return bad
+        end if
+    end select
+    dim as ustring newName, oldName
+    if key_ = "@Name" then
+        newName = text
+        oldName = C->Selected[0]
+    end if
+    dim as ustring fault = C->ApplyEdit( trial, rebuild, newName )
+    if len( fault ) then return fault
+    if len( newName ) andalso (C->OnRenamed <> 0) then C->OnRenamed( C->Host, C, oldName, newName )
+    ' a handler named by hand gets a body
+    if (left( key_, 2 ) = "E:") andalso (len( text ) > 0) andalso (C->OnWire <> 0) then
+        dim as ustring ctl
+        if C->Selected.Count( ) then ctl = C->Selected[0]
+        C->OnWire( C->Host, C, ctl, mid( key_, 3 ), false )
+    end if
+    return ""
+end function

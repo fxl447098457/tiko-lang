@@ -32,7 +32,7 @@ tiko-lang is its own compiler, written from scratch, and written in tiko. It is 
 **The packaged toolchains carry third-party components.**
 
 - `inc/` holds FreeBASIC's headers (`crt/`, `win/`, `fbgfx.bi` and the rest) beside tiko's own, a few third-party bindings (`GL/`, `clang-c.bi`, `llvm-c.bi`, `ffi.bi` and others) and, on Windows, AfxNova. FreeBASIC's headers keep FreeBASIC's terms. 146 of them carry a no-redistribution notice, and the FreeBASIC project has given its permission to ship them.
-- `lib/<target>/` holds no fbc binaries: tiko-rt (on Linux with its own startup object), on Windows libtkogfx, fbcunit (LGPL 2.1 or later) and SQLite, which is public domain. The Windows toolchain adds import libraries for the Windows DLLs, built from export lists derived from mingw-w64's import libraries (ZPL 2.1, with parts in the public domain).
+- `lib/<target>/` holds no fbc binaries: tiko-rt (on Linux and macOS with its own startup object), on Windows libtkogfx, fbcunit (LGPL 2.1 or later) and SQLite, which is public domain. The Windows toolchain adds import libraries for the Windows DLLs, built from export lists derived from mingw-w64's import libraries (ZPL 2.1, with parts in the public domain).
 - Each toolchain's `licences/` holds tiko's notices, FreeBASIC's and fbcunit's, and on Windows mingw-w64's (`COPYING.MinGW-w64-runtime.txt`).
 - clang is not bundled.
 

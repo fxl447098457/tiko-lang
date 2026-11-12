@@ -21,7 +21,7 @@ Declare Function Asc ( ByVal str As Const WString Ptr, ByVal position As Integer
 
 If `str` is a [`String`](String) or a [`ZString`](Zstring), the [`UByte`](Ubyte) value at that `position` is returned. This will be a 7-bit ASCII code, or even a 8-bit character value from some code-page, depending on the string data stored in `str`.
 
- If `str` is a [`WString`](Wstring), the [`UShort`](Ushort) (Windows) or [`ULong`](Ulong) (Linux) value at that `position` is returned. This will be a 16bit value on Windows (WStrings use UTF16 there), or a 32bit value on Linux (WStrings use UTF32 there).
+ If `str` is a [`WString`](Wstring), the [`UShort`](Ushort) (Windows) or [`ULong`](Ulong) (Linux and macOS) value at that `position` is returned. This will be a 16bit value on Windows (WStrings use UTF16 there), or a 32bit value on Linux and macOS (WStrings use UTF32 there).
 
  The function returns zero (`0`) if the string is a zero length string, `position` is less than one (`1`), or `position` is greater than the number of characters in `str`.
 

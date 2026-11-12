@@ -1,0 +1,102 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' formtree -- every form below a folder: regenerate their .design.tiko files, or report the ones
+' that no longer match. Behind tkEdit's --generate-forms and --check-forms.
+#module "formtree"
+
+#import "std/containers"
+#import "std/fs"
+#import "../model"
+#import "../formfile"
+#import "../validate"
+#import "../codegen"
+using containers
+using model
+
+' Line ends are the checkout's business, not a difference in the form.
+private function NoCr_( byref s as const ustring ) as ustring
+    return codegen.WithoutCr( s )
+end function
+
+' The generated text for one form file. False, with problems filled, when it can't be generated.
+public function GenerateFile( byref path as const ustring, byref outText as ustring, byref problems as Array( of ustring ) ) as boolean
+    dim as ustring none = ""
+    dim as fs.FsResultUStr r = fs.ReadAllText( path )
+    if r.IsOk( ) = false then
+        problems.Push( path & ": can't be read" )
+        return false
+    end if
+    dim as ustring text = r.Value( )
+    dim as FormDoc doc
+    dim as ustring errText
+    if formfile.Parse( text, doc, errText ) = false then
+        problems.Push( path & ": " & errText )
+        return false
+    end if
+    dim as ustring moduleName = fs.PathStem( path )
+    dim as Array( of ustring ) found
+    validate.Check( doc, moduleName, found )
+    if found.Count( ) then
+        for each s as ustring in found
+            problems.Push( path & ": " & s )
+        next
+        return false
+    end if
+    outText = codegen.Generate( doc, moduleName, fs.PathFileName( path ), text )
+    return true
+end function
+
+private function SkipDir_( byref name_ as const ustring ) as boolean
+    return (name_ = "out") orelse (name_ = "bin") orelse (left( name_, 1 ) = ".")
+end function
+
+private sub Collect_( byref dir_ as const ustring, byref files as Array( of ustring ) )
+    for each r as fs.DirEntryResult in fs.ReadDir( dir_ )
+        if r.IsOk( ) then
+            if r.Value( ).IsDirectory( ) then
+                if SkipDir_( r.Value( ).Name( ) ) = false then Collect_( r.Value( ).Path( ), files )
+            elseif r.Value( ).IsFile( ) andalso (lcase( right( r.Value( ).Name( ), 7 ) ) = ".tkform") then
+                files.Push( r.Value( ).Path( ) )
+            end if
+        end if
+    next
+end sub
+
+' Walks `root`. bWrite rewrites what differs; otherwise a difference is a problem. Answers the
+' number of problems; report has one line for each file changed and each problem.
+public function Process( byref root as const ustring, byval bWrite as boolean, byref report as Array( of ustring ) ) as long
+    dim as Array( of ustring ) files
+    Collect_( root, files )
+    dim as long nBad = 0
+    for each path as ustring in files
+        dim as ustring generated
+        dim as Array( of ustring ) problems
+        if GenerateFile( path, generated, problems ) = false then
+            for each s as ustring in problems
+                report.Push( s )
+                nBad += 1
+            next
+            continue for
+        end if
+        dim as ustring target = left( path, len( path ) - 7 ) & ".design.tiko"
+        dim as ustring existing
+        if fs.IsFile( target ) then existing = fs.ReadAllText( target ).ValueOr( existing )
+        if NoCr_( existing ) <> generated then
+            if bWrite = false then
+                report.Push( target & ": stale" )
+                nBad += 1
+            elseif fs.WriteAllText( target, generated ).IsOk( ) then
+                report.Push( target & ": written" )
+            else
+                report.Push( target & ": can't be written" )
+                nBad += 1
+            end if
+        end if
+    next
+    return nBad
+end function

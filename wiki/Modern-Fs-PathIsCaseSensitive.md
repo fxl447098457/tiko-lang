@@ -2,7 +2,7 @@
 
 # PathIsCaseSensitive
 
-Returns true if paths compare case-sensitively on this platform: on Linux, not Windows.
+Returns true if paths compare case-sensitively here: on Linux and macOS, not Windows.
 
 ## Syntax
 
@@ -28,7 +28,7 @@ print PathIsCaseSensitive( FB_PATH_POSIX )       '' true
 print PathIsCaseSensitive( FB_PATH_WIN32 )       '' false
 
 '' A case-sensitive volume mounted on Windows, or a case-insensitive one
-'' on Linux, is not visible here. VolumeInfo.IsCaseSensitive asks the
+'' on Linux or macOS, is not visible here. VolumeInfo.IsCaseSensitive asks the
 '' actual volume.
 ```
 

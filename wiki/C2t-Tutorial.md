@@ -16,7 +16,7 @@ library both dynamically and statically with `#include` and `#foreignlib`.
 - **libclang**, which comes with LLVM. tiko already needs LLVM, so if tiko builds programs, this is
   usually already there. `tiko c2t` uses it to read C the way a C compiler does.
 - **The C headers for your system**: the Visual Studio Build Tools (*Desktop development with
-  C++*) on Windows, `build-essential` or your distribution's equivalent on Linux.
+  C++*) on Windows, `build-essential` or your distribution's equivalent on Linux, Xcode's Command Line Tools on macOS.
 - A C compiler — `clang` or `gcc` — **only** because this tutorial builds its own small library. For a
   library that ships ready-built files, you need none.
 
@@ -272,7 +272,7 @@ and prints nothing. Check its **exit status**, because it tells you whether ther
 | **1** | An error, such as a header that does not exist. Nothing was written. |
 
 For `minigeo.h` it is **2**: one TODO. On Windows, `echo %errorlevel%` (cmd) or `$LASTEXITCODE`
-(PowerShell) shows the status; on Linux, `echo $?`.
+(PowerShell) shows the status; on Linux and macOS, `echo $?`.
 
 What happened behind that one command: Clang read the header **twice**, once as Windows reads it
 and once as Linux does, and `tiko c2t` merged the two readings into one file. Where they agree,
@@ -388,7 +388,7 @@ same header again gives the same bytes. Read the TODO list first: it is your to-
 | `struct mg_point { … }` | `type mg_point … end type` | Same fields, same order, same layout as C |
 | `typedef enum mg_turn { … } mg_turn` | `type mg_turn as int32`, then an `enum` of its constants | The type keeps C's size (4 bytes); the constants keep C's names and values |
 | `#ifdef _WIN32` | `#ifdef TIKO_OS_WINDOWS` | C's platform macros become tiko's |
-| `unsigned long` | `culong`, from `crt/long.bi` | C's `long` is 4 bytes on Windows and 8 on Linux; `culong` follows the system |
+| `unsigned long` | `culong`, from `crt/long.bi` | C's `long` is 4 bytes on Windows and 8 on Linux and macOS; `culong` follows the system |
 | `typedef struct mg_path mg_path` (never defined) | `type mg_path__fwd as mg_path`, and `mg_path ptr` | An opaque handle: you only ever hold a pointer to it |
 | `bool (*mg_visit_fn)(…)` | `type mg_visit_fn as function cdecl( … ) as boolean` | A pointer to a function C will call |
 | `const char *` | `const zstring ptr` | A C string |
@@ -480,11 +480,11 @@ minigeo/minigeo_<arch><ending>
 minigeo/minigeo<ending>
 ```
 
-| | windows-x86_64 | linux-x86_64 |
-|---|---|---|
-| `<os>_<arch>` | `windows_x86_64` | `linux_x86_64` |
-| endings for `static` | `.a`, `.lib` | `.a` |
-| endings for `dynamic` | `.dll.a`, `.lib`, `.dll` | `.so` |
+| | windows-x86_64 | linux-x86_64 | macos-arm64 |
+|---|---|---|---|
+| `<os>_<arch>` | `windows_x86_64` | `linux_x86_64` | `macos_arm64` |
+| endings for `static` | `.a`, `.lib` | `.a` | `.a` |
+| endings for `dynamic` | `.dll.a`, `.lib`, `.dll` | `.so` | `.dylib` |
 
 So on Windows, `dynamic` finds `minigeo_windows_x86_64.dll`, and `static` finds
 `minigeo_windows_x86_64.a`; on Linux, the two `linux` files. The path is relative to the file that

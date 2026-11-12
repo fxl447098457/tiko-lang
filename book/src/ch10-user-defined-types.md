@@ -176,7 +176,7 @@ and why the pitfall above happens. `object` is the built-in base type Chapter 14
 listed whether or not you use it.
 
 `--dump-udt` stops after printing, without building anything. This output was captured at the pin
-and is identical on both targets.
+and is identical on every target.
 
 ## Several views of the same bytes
 

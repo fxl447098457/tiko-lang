@@ -40,6 +40,7 @@ parserlib() {
 }
 
 build src/core && run coreall "$ROOT/src/core" ./tests/bin/coreall.exe
+build src/design && run designall "$ROOT/src/design" ./tests/bin/designall.exe
 if [ "${1:-}" != core ] && parserlib && build src/app; then
     # the self-test builds sample programs with this tiko (P4; a Windows path for the program)
     export TKEDIT_TIKO=$(cygpath -w "$TIKO")

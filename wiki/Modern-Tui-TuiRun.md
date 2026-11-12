@@ -25,7 +25,7 @@ dim as CounterApp app             '' see TuiApp for its definition
 dim as TuiRunResult r = TuiRun( app, TuiTermOptionsDefault( ) )
 
 '' PRINT is safe HERE and only here: TuiRun has fully restored the terminal
-'' by the time it returns. Inside a session it is banned -- on Linux a stray
+'' by the time it returns. Inside a session it is banned -- on Linux and macOS a stray
 '' PRINT can emit CSI 6n and block.
 if( r.IsOk( ) = false ) then
     print "myapp: " & r.Failure( ).Message( )

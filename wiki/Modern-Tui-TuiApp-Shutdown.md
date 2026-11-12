@@ -30,7 +30,7 @@ end type
 
 sub Closer.Shutdown( )
     '' flush your own state here. Do NOT print: the alternate screen is
-    '' still up and on Linux a stray PRINT can emit CSI 6n and block.
+    '' still up and on Linux and macOS a stray PRINT can emit CSI 6n and block.
 end sub
 ```
 

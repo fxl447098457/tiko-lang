@@ -12,7 +12,7 @@ File.ReadAt( pos, buf, n )
 
 ## Notes
 
-- Reads up to n bytes at pos without moving the position, on both platforms.
+- Reads up to n bytes at pos without moving the position, on every platform.
 - Past the end it reads 0 bytes. pos < 0 is FS_INVALID_ARGUMENT; a pipe is FS_NOT_SEEKABLE.
 - Safe to call from several threads on one File.
 
