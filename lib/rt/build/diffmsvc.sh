@@ -130,8 +130,8 @@ case "$(uname -s)" in
     *) rt_die "win64 host only -- there is no MSVC ABI to compare against here" ;;
 esac
 
-LIB="$RT_ROOT/lib/windows-x86_64/libfb.a"
-[ -f "$LIB" ] || rt_die "no archive at $LIB -- run build/build.sh $CFG windows-x86_64 first"
+RTLIB="$RT_ROOT/lib/windows-x86_64/libfb.a"
+[ -f "$RTLIB" ] || rt_die "no archive at $RTLIB -- run build/build.sh $CFG windows-x86_64 first"
 
 # AND IT MUST BE THE CONFIGURATION THIS RUN WAS ASKED FOR. lib/<target>/ holds
 # ONE archive that every configuration overwrites, so without this check
@@ -205,7 +205,7 @@ for src in $(ls "$RT_ROOT"/tests/abi/*.bas 2>/dev/null | sort); do
     # NEEDS-MT switches BOTH sides to -mt and the mt archive, exactly as diff.sh
     # does. Anything less compares two different libraries.
     MTOPT=""
-    THISLIB="$LIB"
+    THISLIB="$RTLIB"
     if grep -q 'NEEDS-MT' "$src"; then
         if [ ! -f "$MTLIB" ]; then
             skip=$((skip + 1))

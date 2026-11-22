@@ -1,4 +1,4 @@
-'' diagfile-directive.bas -- a '#cmdline' may redirect the diagnostics file: the
-'' source wins over the command line, as it does for every other option.
-#cmdline "--diagnostics-file build/.diagfile-inner.tsv"
+'' diagfile-directive.bas -- a '#cmdline' may NOT redirect the diagnostics file (TKO0178):
+'' where the compiler writes is the command line's to say.
+#cmdline "--diagnostics-file build/.diagfile-refused.tsv"
 #print inner

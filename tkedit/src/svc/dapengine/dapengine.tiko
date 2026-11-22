@@ -367,6 +367,59 @@ public function Engine_HasDwarf( byref exe as const string, byref why as string 
     return DBGP_OK
 end function
 
+' A PE RVA as a file offset, through the section table; -1 = in no section.
+private function PeRvaToOff_( byref f as fs.File, byval secBase as long, byval nSect as long, _
+                              byval rva as ulong ) as longint
+    for i as long = 0 to nSect - 1
+        dim as long s = secBase + i * 40
+        dim as ulong va = PeU32_( f, s + 12 )
+        dim as ulong sz = PeU32_( f, s + 8 )
+        dim as ulong rawSz = PeU32_( f, s + 16 )
+        if rawSz > sz then sz = rawSz
+        if (rva >= va) andalso (rva - va < sz) then return clngint( PeU32_( f, s + 20 ) ) + (rva - va)
+    next
+    return -1
+end function
+
+' Windows: the Python DLL lldb loads -- liblldb.dll's import (or delay import) whose name begins
+' 'python3', read from the DLL beside the adapter: python310.dll for LLVM 21, python3.dll (the
+' stable ABI, any Python 3) for LLVM 23. "" = no liblldb.dll there, or one that names no Python.
+public function Engine_PythonDll( byref adapter as const string ) as string
+    dim as ustring ua = adapter
+    dim as fs.File f
+    if f.OpenRead( fs.PathJoin( fs.PathParent( ua ), "liblldb.dll" ) ).IsOk( ) = false then return ""
+    dim as string r = ""
+    dim as long peOff = cast( long, PeU32_( f, &h3C ) )
+    if ((PeU32_( f, 0 ) and &hFFFF) = &h5A4D) andalso (PeU32_( f, peOff ) = &h4550) then
+        dim as long nSect = PeU16_( f, peOff + 6 )
+        dim as long opt = peOff + 24
+        dim as long secBase = opt + PeU16_( f, peOff + 20 )
+        dim as long dirs = opt + 96                              ' PE32's data directories
+        if PeU16_( f, opt ) = &h20B then dirs = opt + 112        ' PE32+
+        ' directory 1, the imports: 20-byte entries, the name's RVA at +12; directory 13, the
+        ' delay imports: 32-byte entries, the name's RVA at +4. Both end at a zero name.
+        for k as long = 0 to 1
+            dim as long ent = 20, nmAt = 12, dirIx = 1
+            if k = 1 then ent = 32 : nmAt = 4 : dirIx = 13
+            dim as ulong rva = PeU32_( f, dirs + dirIx * 8 )
+            if rva = 0 then continue for
+            dim as longint at_ = PeRvaToOff_( f, secBase, nSect, rva )
+            if at_ < 0 then continue for
+            for i as long = 0 to 4095
+                dim as ulong nmRva = PeU32_( f, at_ + i * ent + nmAt )
+                if nmRva = 0 then exit for
+                dim as longint nOff = PeRvaToOff_( f, secBase, nSect, nmRva )
+                if nOff < 0 then continue for
+                dim as string nm = lcase( PeName_( f, nOff, 63 ) )
+                if left( nm, 7 ) = "python3" then r = nm : exit for
+            next
+            if len( r ) then exit for
+        next
+    end if
+    f.Close( )
+    return r
+end function
+
 ' ------------------------------------------------------------------------ sources
 
 public function Engine_SourceIndex( byref path as const string ) as long

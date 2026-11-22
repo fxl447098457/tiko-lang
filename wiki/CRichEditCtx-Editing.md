@@ -23,13 +23,6 @@ is `0` to `32`.
 **Lines.** Line numbers are zero-based and count the lines as the control shows them: with word
 wrap on, one paragraph can be several lines.
 
-**Unicode.** The text members that take a `wstring` pass it to the control as UTF-16. Those
-that come in a `string` and a `wstring` form ([SetTextEx](#settextex),
-[InsertText](#inserttext), [ReplaceText](#replacetext)) choose by the argument: a narrow literal,
-a `string` and a `ustring` all pick the `string` form, which the control reads in the ANSI code
-page, so `"é"` from a `ustring` arrives as two characters. Pass a `wstring` for anything beyond
-ASCII.
-
 **Results.** Most members that return the control's answer to a message reset
 `GetLastResult()` to 0, and several of those that return nothing or a structure store the
 message's result there. The members that work through COM or a file (`Undo( Count )`,
@@ -898,8 +891,7 @@ Microsoft Learn: [EM_GETTEXTEX](https://learn.microsoft.com/en-us/windows/win32/
 function SaveRawText( byref wszFilename as wstring, byval Overwrite as boolean = false, byval dwFlagsAndAttributes as DWORD = FILE_ATTRIBUTE_NORMAL ) as boolean
 ```
 
-Writes the whole string [GetRawText](#getrawtext) returns to the file `wszFilename`, null byte
-and padding included: "abc" was saved as six bytes, `a`, `b`, `c`, a null and two spaces.
+Writes the whole string [GetRawText](#getrawtext) returns to the file `wszFilename`.
 
 | Parameter | Meaning |
 | --- | --- |
@@ -922,14 +914,10 @@ Microsoft Learn: [CreateFileW](https://learn.microsoft.com/en-us/windows/win32/a
 ### SetTextEx
 
 ```freebasic
-function SetTextEx( byref strText as string ) as DWORD
 function SetTextEx( byref wszText as wstring ) as DWORD
 function SetTextEx( byref stex as .SETTEXTEX, byval buffer as any ptr ) as DWORD
-function SetTextEx( byref stex as .SETTEXTEX, byref strText as string ) as DWORD
 function SetTextEx( byref stex as .SETTEXTEX, byref wszText as wstring ) as DWORD
-function SetTextEx( byval nStart as long, byval nEnd as long, byref strText as string ) as DWORD
 function SetTextEx( byval nStart as long, byval nEnd as long, byref wszText as wstring ) as DWORD
-function SetTextEx( byval nPos as long, byref strText as string ) as DWORD
 function SetTextEx( byval nPos as long, byref wszText as wstring ) as DWORD
 ```
 
@@ -945,8 +933,7 @@ Puts text into the control. The text may be plain or RTF (it is RTF when it star
   range.
 
 The forms without a `SETTEXTEX` replace a selection and keep the undo queue, so the edit can be
-undone; their `string` forms read the text in the ANSI code page (see **Unicode** above). The
-same calls are also named [InsertText](#inserttext) and [ReplaceText](#replacetext).
+undone.
 
 **Returns** the number of characters put in when a selection was replaced (3 for "def", 14 for
 the RTF below); 1 when all the text was set.
@@ -964,9 +951,7 @@ Microsoft Learn: [EM_SETTEXTEX](https://learn.microsoft.com/en-us/windows/win32/
 ### InsertText
 
 ```freebasic
-function InsertText( byref strText as string ) as DWORD
 function InsertText( byref wszText as wstring ) as DWORD
-function InsertText( byval nPos as long, byref strText as string ) as DWORD
 function InsertText( byval nPos as long, byref wszText as wstring ) as DWORD
 ```
 
@@ -989,7 +974,6 @@ Microsoft Learn: [EM_SETTEXTEX](https://learn.microsoft.com/en-us/windows/win32/
 ### ReplaceText
 
 ```freebasic
-function ReplaceText( byval nStart as long, byval nEnd as long, byref strText as string ) as DWORD
 function ReplaceText( byval nStart as long, byval nEnd as long, byref wszText as wstring ) as DWORD
 ```
 
@@ -1957,13 +1941,9 @@ Microsoft Learn: [EM_SETTARGETDEVICE](https://learn.microsoft.com/en-us/windows/
 ### DisableWordWrap
 
 ```freebasic
-function DisableWordWrap( byval LineWidth as long = 32767 ) as boolean
+function DisableWordWrap( byval LineWidth as long = -1 ) as boolean
 ```
-
-Formats lines for a fixed width of `LineWidth` twips on the screen, instead of the width of the
-control. The default, 32 767 twips, is about 22.75 inches: lines shorter than that no longer
-wrap, but a longer paragraph still does (5000 characters broke after 364). To stop wrapping
-altogether call `SetTargetDevice( NULL, 1 )`.
+Disables wrapping. If you specify a positive value, formats lines for a fixed width of `LineWidth` twips on the screen, instead of the width of the control.
 
 **Returns** `true` on success; on failure `false`, and `GetLastResult()` is `S_FALSE`, or
 `E_FAIL` when no device context could be had.

@@ -7,6 +7,7 @@
 #include once "driver/manifest.ti"
 #include once "support/text.ti"
 #include once "codegen/dllimplib.ti"
+#include once "codegen/toolchain.ti"
 #include once "codegen/target.ti"
 #include once "build/events.ti"
 
@@ -224,9 +225,9 @@ function CopyVendorLibs _
         '' A LIBRARY GOES BY THE NAME IT GIVES ITSELF, not by its file's. A DLL's is its export
         '' directory's, which is what the import library names and the loader looks for: SQLite's
         '' sqlite3.dll stored as sqlite3_windows_x86_64.dll is still loaded as sqlite3.dll. An ELF
-        '' library's is its soname, which the program records as NEEDED: raylib's release .so,
-        '' stored as raylib_linux_x86_64.so, is looked for as libraylib.so.620. (A library a
-        '' vendor package builds itself gets its file name as its soname, so it keeps that --
+        '' library's is its soname, which the program records as NEEDED: raylib's .so, made by
+        '' its own Makefile, stored as raylib_linux_x86_64.so, is looked for as libraylib.so.620.
+        '' (One a 'cbuild' entry links gets its file name as its soname, so it keeps that --
         '' and so does every '.dylib': vendorfetch.sh gives it '@rpath/' and its file name as
         '' its install name, the name dyld looks for.)
         dim as string nm = mid( run_, instrrev( run_, "/" ) + 1 )
@@ -251,6 +252,16 @@ function CopyVendorLibs _
         dim as string nm = mid( src, instrrev( src, "/" ) + 1 )
         if CopyBeside_( ctx, src, outDir, outSpelled, nm, failSrc, failDst ) = false then return false
     next
+    '' -fsanitize=address ON THE MSVC TRIPLE: the program imports clang's ASan runtime DLL, which
+    '' is beside clang, not on the loader's path -- measured, without it the program does not start.
+    if ctx.options.sanitizeAddress andalso Tko.TargetLayoutFor( ctx.options.target ).isMsvc then
+        dim as containers.Array( of string ) noLibs
+        dim as Tko.Codegen.ToolPaths at_ = Tko.Codegen.FindTools( "", noLibs )
+        if len( at_.asanRtDir ) > 0 then
+            if CopyBeside_( ctx, at_.asanRtDir & "clang_rt.asan_dynamic-x86_64.dll", outDir, outSpelled, _
+                            "clang_rt.asan_dynamic-x86_64.dll", failSrc, failDst ) = false then return false
+        end if
+    end if
     return true
 end function
 
@@ -369,6 +380,11 @@ function RootPackage _
         d = up_
         rel = JoinPath( rel, ".." )
     next
+    '' NO tiko.toml, AND A ROOT GIVEN (--package-root): 'tiko test''s main stands in out/test/, and
+    '' its relative imports reach the project's modules from there.
+    if (ctx.pkgRootName = ANON_PACKAGE) andalso (len( ctx.options.packageRoot ) > 0) then
+        ctx.pkgRootDir = NormPath( ctx.options.packageRoot )
+    end if
     name_ = ctx.pkgRootName
     root = ctx.pkgRootDir
     if ctx.pkgRootName = ANON_PACKAGE then return true
@@ -470,7 +486,30 @@ sub PackageDefines( byref ctx as Tko.CompilerContext, byref name_ as string, byr
     next
 end sub
 
-sub ModuleFiles( byref dir_ as string, byref files as Tko.StrVec )
+function IsTestFileName( byref nm as string ) as boolean
+    dim as string l = Tko.Text.LowerAscii( nm )
+    return (right( l, 10 ) = "_test.tiko") orelse (right( l, 9 ) = "_test.bas")
+end function
+
+function TestFilesWanted( byref ctx as Tko.CompilerContext, byref pkgName as string, byref dir_ as string ) as boolean
+    if (ctx.options.testMode = false) andalso (ctx.scan = nullptr) then return false
+    dim as string pk = PkgDir_( ctx )
+    if len( pk ) > 0 then
+        if IsWithin_( NormPath( AbsPath( dir_ ) ), NormPath( AbsPath( pk ) ) ) then return false
+    end if
+    if (len( pkgName ) = 0) orelse (ctx.pkgRootKnown = false) then return true
+    return Tko.Text.LowerAscii( pkgName ) = Tko.Text.LowerAscii( ctx.pkgRootName )
+end function
+
+function UnitTestMode( byref ctx as Tko.CompilerContext ) as boolean
+    if ctx.unit.modFileCount > 0 then
+        dim as string d = DirOfFile( ctx.sources.AbsPathOf( cast( Tko.FileId, ctx.unit.modFiles[0] ) ) )
+        return TestFilesWanted( ctx, ctx.unit.modPkgName, d )
+    end if
+    return ctx.options.testMode
+end function
+
+sub ModuleFiles( byref dir_ as string, byref files as Tko.StrVec, byval withTests as boolean = false )
     dim as containers.Array( of fs.DirEntry ) entries
     if fs.ListDir( dir_, entries ).IsOk( ) = false then return
     for k as int32 = 0 to entries.Count - 1
@@ -479,6 +518,8 @@ sub ModuleFiles( byref dir_ as string, byref files as Tko.StrVec )
         '' A MODULE'S SOURCES are '.tiko' files, and the legacy '.bas' (T14). A '.ti' is a header.
         dim as string lnm = Tko.Text.LowerAscii( nm )
         if (right( lnm, 4 ) <> ".bas") andalso (right( lnm, 5 ) <> ".tiko") then continue for
+        '' ...and '<x>_test.tiko' only in a test build: never part of the module itself.
+        if (withTests = false) andalso IsTestFileName( nm ) then continue for
         '' Insertion sort: a module is a handful of files.
         dim as string key = Tko.Text.LowerAscii( nm )
         dim as int32 at = files.Count

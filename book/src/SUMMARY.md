@@ -41,7 +41,7 @@
 - [25. Files, Processes and the Environment](ch25-files-processes.md)
 - [26. Dates and Times](ch26-dates-times.md)
 - [27. Numbers](ch27-numbers.md)
-- [28. Logging, Terminal UIs and SQLite](ch28-logging-tui-sqlite.md)
+- [28. Logging, Terminal UIs, SQLite and Regular Expressions](ch28-logging-tui-sqlite.md)
 
 # Systems Programming
 
@@ -58,8 +58,7 @@
 - [33. Capstone: a CLI Search Tool](ch33-tsearch.md)
 - [34. Capstone: a Concurrent Pipeline](ch34-thash.md)
 - [35. Capstone: a TUI Ledger](ch35-tledger.md)
-- [36. Capstone: a Notepad for Windows](ch36-tpad.md)
-- [37. Capstone: a Cross-Platform Notepad](ch37-tpad-tk.md)
+- [36. Capstone: a Cross-Platform Notepad](ch36-tpad-tk.md)
 
 # Appendices
 

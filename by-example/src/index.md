@@ -8,7 +8,7 @@ do.
 Every page is built around one example. The example is a whole program, not a
 fragment, and the text under it is the output that program printed. Nothing
 here was typed in by hand: each example on the site is compiled and run on
-**windows-x86_64**, **linux-x86_64** and **macos-arm64** before a page is published, and the
+**windows-x86_64**, **linux-x86_64**, **linux-arm64** and **macos-arm64** before a page is published, and the
 output you see is the output the program produced.
 
 ## How to run an example

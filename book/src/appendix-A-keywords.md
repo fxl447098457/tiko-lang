@@ -108,6 +108,7 @@ FBC-Modern's extensions added these words without reserving them, so existing co
 | `each` | `for each` (Chapter 20) |
 | `from` | `case receive v from ch` in `select channel` |
 | `in` | `for each x in …` |
+| `match` | `match x` followed by `case` arms or `pattern => value` arms, closed by `end match` (Chapter 6) |
 | `of` | type arguments: `Array( of int32 )` (Chapter 17) |
 | `override` | after a method's declaration: `declare sub M( ) override` (Chapter 14) |
 | `partial` | `partial type` and `partial class`, one type in several blocks (Chapter 15) |
@@ -118,7 +119,7 @@ FBC-Modern's extensions added these words without reserving them, so existing co
 
 ## Fixed-width type names {#app-kw-fixed}
 
-tiko predeclares ten type names that fbc does not have. They are typedefs, not reserved words (Chapter 4): a program's own declaration of one of them replaces tiko's without a diagnostic, so code that already declares `INT32` — as `win/basetsd.bi` does — compiles unchanged.
+tiko predeclares twelve type names that fbc does not have. Ten are typedefs for built-in types; `int128` and `uint128` are 128-bit integer types of tiko's own, C's `__int128` (Chapter 4). None is a reserved word: a program's own declaration of one of them replaces tiko's without a diagnostic, so code that already declares `INT32` — as `win/basetsd.bi` does — compiles unchanged.
 
 | Name | Same type as | Name | Same type as |
 |---|---|---|---|
@@ -127,6 +128,7 @@ tiko predeclares ten type names that fbc does not have. They are typedefs, not r
 | `int32` | `long` | `uint32` | `ulong` |
 | `int64` | `longint` | `uint64` | `ulongint` |
 | `float32` | `single` | `float64` | `double` |
+| `int128` | its own type | `uint128` | its own type |
 
 ## The predeclared constant {#app-kw-nullptr}
 
@@ -170,4 +172,4 @@ not 0 and 3           3     ...and tighter than and: (not 0) and 3
 
 `&` binds looser than `+` and `-`, so `"a" & 1 + 2` means `"a" & (1 + 2)`, and both compilers print `a3`.
 
-<!-- 247 reserved words, 104 runtime names, generated 2026-11-11 from src/lexer/keywords.ti, src/symbols/resolvertl.tiko and src/parser/prectable.ti at 3ca5ef67d -->
+<!-- 247 reserved words, 104 runtime names, generated 2026-11-21 from src/lexer/keywords.ti, src/symbols/resolvertl.tiko and src/parser/prectable.ti at e7f07a36b -->

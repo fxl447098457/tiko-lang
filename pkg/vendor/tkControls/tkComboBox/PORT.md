@@ -45,6 +45,9 @@
 **Added:** `SetListMaxRows` / `GetListMaxRows`, `GetListItemHeight`, `GetListItemRect`,
 `GetListHot`, `GetListTopIndex`, `GetListScrollBar`, `GetListColors`, `GetHot`, `GetID`; the
 wheel steps a FOCUSED, closed combo's selection (PsPlatform; the parent scrolls otherwise).
+For the form designer: a tooltip through tkTipHost (`SetTooltipText` / `GetTooltipText`,
+`GetTooltipHandle`, the three delays; opening the list hides it), the border following the theme's
+BorderWidth until `SetBorderThickness` (which now pins it), and `PaintDefault` for a paint callback.
 
 **Dropped (Win32-only):** `FilterMessage` and the reopen guard, `EnsureList` (no list exists
 between opens), `WM_GETDLGCODE` and the WM_CHAR swallow, the 100 ms hover poll and its timer id,

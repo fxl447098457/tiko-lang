@@ -12,12 +12,13 @@ Parameters
 
 `platform`
 
-The target platform. tiko recognizes three:
+The target platform. tiko recognizes four:
 
 | Target | |
 | --- | --- |
 | `windows-x86_64` | Windows on x86-64; the default on Windows |
-| `linux-x86_64` | Linux on x86-64; the default on Linux |
+| `linux-x86_64` | Linux on x86-64; the default on x86-64 Linux |
+| `linux-arm64` | Linux on arm64 (aarch64); the default on arm64 Linux |
 | `macos-arm64` | macOS on Apple Silicon; the default on macOS. A program for it links on a Mac, with Apple's linker and SDK |
 
 Any other name is refused with `TKO0103`.

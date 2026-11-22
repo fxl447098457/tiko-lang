@@ -26,6 +26,17 @@ goes WHOLE to the stack, and the next scalar follows it there), and varargs in b
 directions (Apple: every variadic argument on the stack). main checks that every expected
 call happened, so a call that was skipped cannot pass.
 
+THE LONG VARARG TAILS (t_va2, t_va3, t_va4; docs/tiko-linux-arm64 L1): generic AAPCS64 (linux-arm64)
+passes a variadic argument in registers while any are left and walks a 32-byte va_list record
+to read it back, so cva_arg is tiko's own sequence there. C hands tiko 12 longint/double pairs
+with an int128 in the middle -- past x0-x7 and v0-v7 both, the int128 arriving when one GP
+register is left (so it goes to the stack, 16-aligned, and every later integer follows it) --
+and 10 pairs whose list tiko cva_copy's and hands BYVAL to a C 'va_list' reader; and the other
+way, C's own va_list handed BYVAL to a tiko reader of 10 pairs (t_vread4). The same lane runs on
+the Mac, where all of it is on the stack, and on the linux-x86_64 control -- where SysV's va_list
+is an ARRAY, so a byval one is the caller's list by address both ways, and tiko's cva_arg through
+that pointer is clang's sequence (LLVM's va_arg is miscompiled there at -O0).
+
 NARROW INTEGERS: Apple packs a stack argument at its NATURAL size (bool at sp+0, a short
 after it at sp+2), where AAPCS64, SysV and Win64 give each one an 8-byte slot -- so the
 prefixes after eight pointers carry bool / char / short, signed and unsigned, with values
@@ -46,6 +57,9 @@ C_TYPE = {"c": "signed char", "s": "short", "i": "int", "l": "long long", "f": "
 T_TYPE = {"c": "byte", "s": "short", "i": "long", "l": "longint", "f": "single", "d": "double",
           "b": "boolean", "C": "ubyte", "S": "ushort", "p": "any ptr"}
 NARROW = "bcsCS"
+VA2_PAIRS = 12   # t_va2: longint/double pairs, the int128 after the first half
+VA3_PAIRS = 10   # t_va3: pairs read, then re-read in C through a cva_copy
+VA4_PAIRS = 10   # t_va4: C's va_list handed byval to tiko, which reads the pairs
 
 # name -> (kind, [(field, type, count)]); a type is a scalar code or an earlier shape's name
 SHAPES = {}
@@ -94,6 +108,10 @@ shape("MIX24", [("a", "d", 1), ("b", "f", 1), ("c", "i", 1), ("d", "l", 1)])
 PREFIXES = [
     ("hfa9", ["d", "d", "d", "d", "d", "d", "D3", "d"]),     # 6 V regs used, D3 needs 3: stack
     ("hfaf", ["f", "f", "f", "f", "f", "f", "f", "F2", "f"]),  # 7 used, F2 needs 2: stack
+    # float HFAs ON the stack, back to back: generic AAPCS64 starts each at an 8-byte boundary
+    # (the second F3 at sp+16, not sp+12), Apple packs them at natural alignment -- the case
+    # clang's alignstack(8) on aarch64-linux describes (docs/tiko-linux-arm64 L1)
+    ("p8hf", ["d"] * 8 + ["F3", "F3", "F1", "f", "F3"]),
     ("gpr7", ["l", "l", "l", "l", "l", "l", "l", "L2", "l"]),  # 7 GPRs used, L2 needs 2: stack
     ("mix", ["i"] * 8 + ["d"] * 8 + ["I3", "D2", "i", "d"]),   # everything after on the stack
     ("big", ["i"] * 7 + ["B33", "i", "MIX24"]),                # indirect ones: pointers in x7, stack
@@ -295,10 +313,39 @@ def gen_c():
     w("    ck_i( \"t_va\", \"ptr\", (long long)p, (long long)&marker );")
     w("}")
     w("long long t_va( int n, ... );")
+    w("void c_seen_va2( int k, long long i, double d ) {")
+    w("    calls++; ck_i( \"t_va2\", \"longint\", i, 1000 + k ); ck_d( \"t_va2\", \"double\", d, k + 0.5 );")
+    w("}")
+    w("void c_seen_va128( long long lo, long long hi ) {")
+    w("    calls++; ck_i( \"t_va2\", \"int128 lo\", lo, 0x1122334455667788LL ); ck_i( \"t_va2\", \"int128 hi\", hi, -2 );")
+    w("}")
+    w("long long t_va2( int n, ... );")
+    w("void c_seen_va3( int k, long long i, double d ) {")
+    w("    calls++; ck_i( \"t_va3\", \"longint\", i, 2000 + k ); ck_d( \"t_va3\", \"double\", d, k + 0.25 );")
+    w("}")
+    w("static void c_vread_( int n, va_list ap ) {")
+    w("    calls++;")
+    w("    for( int k = 0; k < n; k++ ) {")
+    w("        ck_i( \"t_va3 c_vread\", \"longint\", va_arg( ap, long long ), 2000 + k );")
+    w("        ck_d( \"t_va3 c_vread\", \"double\", va_arg( ap, double ), k + 0.25 );")
+    w("    }")
+    w("}")
+    w("void c_vread( int n, va_list ap ) { c_vread_( n, ap ); }")
+    w("void c_vreadp( int n, va_list *ap ) { c_vread_( n, *ap ); }")
+    w("long long t_va3( int n, ... );")
+    w("void c_seen_va4( int k, long long i, double d ) {")
+    w("    calls++; ck_i( \"t_va4\", \"longint\", i, 3000 + k ); ck_d( \"t_va4\", \"double\", d, k + 0.75 );")
+    w("}")
+    w("long long t_vread4( int n, va_list ap );")
+    w("static long long c_va4( int n, ... ) {")
+    w("    va_list ap; va_start( ap, n ); long long r = t_vread4( n, ap ); va_end( ap ); return r;")
+    w("}")
     w("")
     w("void trun_all( void );")
     expected = 7 * len(ORDER) + sum(3 if viaptr(p) else 2 for _, p in PREFIXES) + 2 * len(RETS) + 3
+    expected += VA2_PAIRS + 1 + VA3_PAIRS + 2 + VA4_PAIRS
     w("#define EXPECTED_CALLS %d" % expected)
+    w("#define VA2_Q ((__int128)-2 * ((__int128)1 << 64) + (__int128)0x1122334455667788LL)")
     w("int main( void ) {")
     w("    trun_all( );")
     for name in ORDER:
@@ -308,6 +355,14 @@ def gen_c():
     for t, wide, want in RETS:
         w("    ck_i( \"t_ret_%s\", \"result\", t_ret_%s( %d ), %d );" % (t, t, wide, want))
     w("    ck_i( \"t_va\", \"result\", t_va( 7, 11, 12LL, 13.5, &marker ), 99 );")
+    half = VA2_PAIRS // 2
+    a = ", ".join("%dLL, %d.5" % (1000 + k, k) for k in range(half))
+    b = ", ".join("%dLL, %d.5" % (1000 + k, k) for k in range(half, VA2_PAIRS))
+    w("    ck_i( \"t_va2\", \"result\", t_va2( %d, %s, VA2_Q, %s ), 77 );" % (VA2_PAIRS, a, b))
+    c = ", ".join("%dLL, %d.25" % (2000 + k, k) for k in range(VA3_PAIRS))
+    w("    ck_i( \"t_va3\", \"result\", t_va3( %d, %s ), 55 );" % (VA3_PAIRS, c))
+    c = ", ".join("%dLL, %d.75" % (3000 + k, k) for k in range(VA4_PAIRS))
+    w("    ck_i( \"t_va4\", \"result\", c_va4( %d, %s ), 44 );" % (VA4_PAIRS, c))
     w("    ck_i( \"main\", \"calls\", calls, EXPECTED_CALLS );")
     w("    printf( \"aapcs lane: %d shapes, %d checks, %d failed\\n\", " + str(len(ORDER)) + ", checks, fails );")
     w("    return fails ? 1 : 0;")
@@ -349,6 +404,12 @@ def gen_t():
     w("declare function c_va cdecl( byval n as long, ... ) as longint")
     w("declare sub c_va_ret( byval r as longint )")
     w("declare sub c_seen_va( byval n as long, byval a as long, byval b as longint, byval c as double, byval p as any ptr )")
+    w("declare sub c_seen_va2( byval k as long, byval i as longint, byval d as double )")
+    w("declare sub c_seen_va128( byval lo as longint, byval hi as longint )")
+    w("declare sub c_seen_va3( byval k as long, byval i as longint, byval d as double )")
+    w("declare sub c_vread( byval n as long, byval ap as cva_list )")
+    w("declare sub c_vreadp( byval n as long, byref ap as cva_list )")
+    w("declare sub c_seen_va4( byval k as long, byval i as longint, byval d as double )")
     w("")
     w("function tk_pb( byval p as long, byval k as long ) as longint")
     w("    dim as longint b = 10 * p + k + 1")
@@ -436,6 +497,56 @@ def gen_t():
     w("    cva_end( ap )")
     w("    c_seen_va( n, a, b, c, p )")
     w("    return 99")
+    w("end function")
+    w("")
+    w("function t_va2 cdecl( byval n as long, ... ) as longint")
+    w("    dim as cva_list ap")
+    w("    cva_start( ap, n )")
+    w("    for k as long = 0 to n - 1")
+    w("        if k = n \\ 2 then")
+    w("            dim as int128 q = cva_arg( ap, int128 )")
+    w("            c_seen_va128( clngint( q ), clngint( q shr 64 ) )")
+    w("        end if")
+    w("        dim as longint i = cva_arg( ap, longint )")
+    w("        dim as double d = cva_arg( ap, double )")
+    w("        c_seen_va2( k, i, d )")
+    w("    next")
+    w("    cva_end( ap )")
+    w("    return 77")
+    w("end function")
+    w("")
+    w("function t_va3 cdecl( byval n as long, ... ) as longint")
+    w("    dim as cva_list ap, cp, cp2")
+    w("    cva_start( ap, n )")
+    w("    cva_copy( cp, ap )")
+    w("    cva_copy( cp2, ap )")
+    w("    for k as long = 0 to n - 1")
+    w("        dim as longint i = cva_arg( ap, longint )")
+    w("        dim as double d = cva_arg( ap, double )")
+    w("        c_seen_va3( k, i, d )")
+    w("    next")
+    w("    cva_end( ap )")
+    # BYVAL TO A C va_list ON EVERY TARGET. linux-x86_64 passed the 24-byte record by value
+    # where C (SysV's va_list is an array) takes a pointer, and this lane segfaulted there,
+    # until the list became the caller's, by address (master 2c61ce1f5, 2026-11-19). The
+    # pointer form is called too, so both keep running.
+    w("    c_vread( n, cp )")
+    w("    c_vreadp( n, cp2 )")
+    w("    cva_end( cp )")
+    w("    cva_end( cp2 )")
+    w("    return 55")
+    w("end function")
+    w("")
+    # A BYVAL cva_list PARAMETER, C's list arriving: on linux-x86_64 a pointer to C's own record
+    # (SysV's va_list is an array), on linux-arm64 a pointer to a copy of the 32-byte struct, on
+    # the Mac the 'char *' itself. 10 pairs run past the registers on all three.
+    w("function t_vread4 cdecl( byval n as long, byval ap as cva_list ) as longint")
+    w("    for k as long = 0 to n - 1")
+    w("        dim as longint i = cva_arg( ap, longint )")
+    w("        dim as double d = cva_arg( ap, double )")
+    w("        c_seen_va4( k, i, d )")
+    w("    next")
+    w("    return 44")
     w("end function")
     w("")
     w("sub trun_all( )")

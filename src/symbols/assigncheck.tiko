@@ -143,13 +143,28 @@ private sub ConstFitWarn_ ( byref c as Ctx, byval lt as TypeId, byval v as NodeI
     case TY_INTEGER, TY_UINTEGER
         w = iif( c.types->target.pointerBits = 32, 32, 64 )
     case TY_LONGINT, TY_ULONGINT : w = 64                 '' only a float overflows these
+    case TY_INT128, TY_UINT128   : w = 128                '' tiko's; likewise
     end select
     if w = 0 then return
     dim as TypeId vu = c.types->Unqualify( c.info->TypeOf_( v ) )
     if (vu = TYPE_NONE) orelse (c.types->Kind( vu ) <> TK_BUILTIN) then return
     dim as boolean vUns = false
     dim as int32 vw = 64
+    '' AN int128 CONSTANT into anything narrower: past 64 bits it fits nothing narrower and is
+    '' said so, in full; inside them it is judged as the 64-bit value it is.
+    dim as boolean wideSrc = (c.types->BuiltinOf( vu ) = TY_INT128) orelse (c.types->BuiltinOf( vu ) = TY_UINT128)
+    if wideSrc andalso (w < 128) then
+        dim as Check.ConstVal cw = Check.ConstOf128( *c.ast, v, *c.srcMgr, *c.names, c.types->target.pointerBits, c.syms, c.info->ScopeOf( v ) )
+        if cw.known = false then return
+        dim as Check.I128 x128 = Check.Const128Wide( cw )
+        dim as boolean in64 = (x128.hi = 0) orelse ((x128.hi = &hFFFFFFFFFFFFFFFFull) andalso (cast( int64, x128.lo ) < 0))
+        if in64 = false then
+            c.diags->Report( TKO0984, PointRange( c.ast->Loc( v ) ), Tko.Text.Dec128( x128.hi, x128.lo, cw.uns = false ), c.types->Name( tu ) )
+            return
+        end if
+    end if
     select case c.types->BuiltinOf( vu )
+    case TY_INT128, TY_UINT128 : vUns = (c.types->BuiltinOf( vu ) = TY_UINT128)
     case TY_UBYTE   : vUns = true : vw = 8
     case TY_USHORT  : vUns = true : vw = 16
     case TY_ULONG   : vUns = true : vw = 32
@@ -434,7 +449,7 @@ sub CheckConstUdtField_ ( byref c as Ctx, byval id as NodeId )
         if (fs->flags and SYMF_STATIC) <> 0 then return
         '' A CONST FIELD of any object: 'as const integer k = 1' then 'x.k = 2' wrote it.
         '' ...BUT A 'const slice' FIELD views const text and may be rebound (docs/tiko-slices).
-        if c.types->IsConst( fs->type_ ) andalso (m = sp->a) andalso (Tko.Slices.SliceUnitOfType( *c.types, *c.names, fs->type_ ) = Tko.Slices.SU_NONE) then
+        if c.types->IsConst( fs->type_ ) andalso (m = sp->a) andalso (Tko.Slices.IsBorrowType( *c.types, *c.names, fs->type_ ) = false) then
             c.diags->Report( TKO0617, PointRange( c.ast->Loc( sp->a ) ), c.names->Spelling( fs->name ) )
             return
         end if
@@ -714,7 +729,8 @@ sub CheckArgConversions_ ( byref c as Ctx, byval id as NodeId )
             if strParam andalso (c.types->Kind( au ) = TK_BUILTIN) then
                 select case c.types->BuiltinOf( au )
                 case TY_BYTE, TY_UBYTE, TY_SHORT, TY_USHORT, TY_LONG, TY_ULONG, _
-                     TY_INTEGER, TY_UINTEGER, TY_LONGINT, TY_ULONGINT, TY_SINGLE, TY_DOUBLE
+                     TY_INTEGER, TY_UINTEGER, TY_LONGINT, TY_ULONGINT, TY_SINGLE, TY_DOUBLE, _
+                     TY_INT128, TY_UINT128
                     c.diags->Report( TKO0698, PointRange( c.ast->Loc( arg ) ) )
                     return
                 end select
@@ -872,7 +888,8 @@ private function StrNumMismatch_ _
     if rStr then num = lu
     select case c.types->BuiltinOf( num )
     case TY_BYTE, TY_UBYTE, TY_SHORT, TY_USHORT, TY_LONG, TY_ULONG, _
-         TY_INTEGER, TY_UINTEGER, TY_LONGINT, TY_ULONGINT, TY_SINGLE, TY_DOUBLE
+         TY_INTEGER, TY_UINTEGER, TY_LONGINT, TY_ULONGINT, TY_SINGLE, TY_DOUBLE, _
+         TY_INT128, TY_UINT128
     case else
         return false
     end select

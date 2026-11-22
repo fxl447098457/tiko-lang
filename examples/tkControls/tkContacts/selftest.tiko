@@ -1,53 +1,135 @@
-' tkContacts self-test: the sample program, driven through real events.
+' tkContacts self-test: the data module against a real SQLite file, and both forms built over it,
+' in a folder of its own (never the user's data folder). The modal dialogs and the file dialogs are
+' left to a person: their handlers are reached here through what they call.
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
 #import "vendor/tkControls/tkTest"
 #import "vendor/tkControls/tkApp"
 #import "vendor/tkControls/tkListTree"
-#import "vendor/tkControls/tkTextBox"
-#import "./frmContacts"
+#import "vendor/tkControls/tkPicture"
+#import "vendor/tkControls/tkStatusBar"
+#import "vendor/tkControls/tkMessageBox"
+#import "./appGlyphs"
+#import "./appResources"
+#import "./appTheme"
+#import "./askbox"
+#import "./contactdb"
+#import "./frmMain"
+#import "./frmContact"
+using containers
 using tkApp
 using tkListTree
-using tkTextBox
+using tkPicture
+using tkStatusBar
+using tkMessageBox
 using tkHost
 using tkTest
 
-sub ClickOn( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr )
-    tkTest_PushMotion( h, tkTest_CX( w ), tkTest_CY( w ) )
-    tkTest_PumpFor( h, 20 )
-    tkTest_Click( h, tkTest_CX( w ), tkTest_CY( w ) )
-    tkTest_PumpFor( h, 40 )
-end sub
+dim as ustring none
+dim as ustring dir_ = fs.CreateTempDir( "tkcontacts" ).ValueOr( none )
+dim as ustring photoSrc = fs.PathJoin( "appResources", "files", "nophoto.png" )
 
 dim as TKAPP_OPTIONS opts
+appResources.Register( )
+appTheme.ApplyOptions( opts )
+appGlyphs.ApplyOptions( opts )
 if tkApp_Init( opts ) = false then
     print "tkApp_Init failed"
     end 98
 end if
-dim as TK_FORM ptr owner = tkApp_NewForm( "owner", 200, 120, 0, 1.0 )
-tkForm_Show( owner )
-tkTest_PumpFor( tkForm_Host( owner ), 50 )
+appTheme.Install( )
 
-tkTest_Begin( "contacts" )
+tkTest_Begin( "contactdb" )
 scope
-    dim as frmContacts.Form f
-    f.Build( owner )
-    dim as TK_HOST ptr h = tkForm_Host( f.Wnd )
-    f.Show( )
-    tkTest_PumpFor( h, 100 )
-    tkTest_Check( "starts empty", tkListTree_GetCount( f.lstPeople.Handle ) = 0 )
-    ClickOn( h, f.btnAdd.Handle )
-    tkTest_Check( "nothing typed, nothing added", tkListTree_GetCount( f.lstPeople.Handle ) = 0 )
-    ClickOn( h, f.txtName.Handle )
-    dim as ustring who = "Ada"
-    tkTest_PushText( h, who )
-    tkTest_PumpFor( h, 30 )
-    ClickOn( h, f.btnAdd.Handle )
-    tkTest_Check( "a click adds the name", tkListTree_GetCount( f.lstPeople.Handle ) = 1, str( tkListTree_GetCount( f.lstPeople.Handle ) ) )
-    tkTest_Check( "the name is the row", tkListTree_GetText( f.lstPeople.Handle, 0 ) = "Ada" )
-    tkTest_Check( "the box is emptied", f.txtName.Text = "" )
-    tkTest_Check( "the title counts", f.Count = 1 )
-    f.Clear_Click( )
-    tkTest_Check( "Clear empties the list", tkListTree_GetCount( f.lstPeople.Handle ) = 0 )
+    tkTest_Check( "a temp folder", len( dir_ ) > 0 )
+    tkTest_Check( "opens (and makes) the database", contactdb.OpenData( dir_ ) = "" )
+    tkTest_Check( "the file is there", fs.IsFile( fs.PathJoin( dir_, "contacts.db" ) ) )
+    dim as contactdb.Contact a, b
+    a.FirstName = "Zoë" : a.LastName = "Young" : a.City = "Halifax" : a.Email = "zoe@example.org"
+    b.FirstName = "Ada" : b.LastName = "Byron" : b.Notes = "said ""hello"", twice"
+    dim as ustring se = contactdb.Save( a )
+    tkTest_Check( "inserts", se = "", se )
+    tkTest_Check( "an insert gets its id", a.Id > 0 )
+    tkTest_Check( "inserts a second", (contactdb.Save( b ) = "") andalso (b.Id > a.Id) )
+    dim as Array( of contactdb.Contact ) list
+    tkTest_Check( "loads them all", (contactdb.LoadAll( list ) = "") andalso (list.Count( ) = 2) )
+    tkTest_Check( "by last name", (list.Count( ) = 2) andalso (list[0].LastName = "Byron") )
+    dim as contactdb.Contact back
+    tkTest_Check( "loads one", contactdb.Load( a.Id, back ) )
+    tkTest_Check( "text survives as UTF-8", back.FirstName = "Zoë", back.FirstName )
+    a.City = "Truro"
+    tkTest_Check( "updates", (contactdb.Save( a ) = "") andalso contactdb.Load( a.Id, back ) andalso (back.City = "Truro") )
+    tkTest_Check( "a photo is copied in", (contactdb.SetPhoto( a, photoSrc ) = "") andalso (a.Photo = a.Id & ".png") )
+    tkTest_Check( "and is there", fs.IsFile( contactdb.PhotoPath( a ) ) )
+    contactdb.Save( a )
+    dim as ustring csv = fs.PathJoin( dir_, "out.csv" )
+    tkTest_Check( "exports CSV", contactdb.ExportCsv( csv ) = "" )
+    dim as ustring text = fs.ReadAllText( csv ).ValueOr( none )
+    tkTest_Check( "a header row", left( text, 21 ) = "First name,Last name,", left( text, 40 ) )
+    tkTest_Check( "a quote doubled, the field quoted", instr( text, """said """"hello"""", twice""" ) > 0, text )
+    dim as contactdb.Contact gone
+    gone.FirstName = "Temp"
+    contactdb.Save( gone )
+    contactdb.SetPhoto( gone, photoSrc )
+    contactdb.Save( gone )
+    dim as ustring gonePhoto = contactdb.PhotoPath( gone )
+    tkTest_Check( "removes", (contactdb.Remove( gone.Id ) = "") andalso (contactdb.Load( gone.Id, back ) = false) )
+    tkTest_Check( "and its photo", fs.IsFile( gonePhoto ) = false )
+    contactdb.CloseData( )
 end scope
+
+tkTest_Begin( "frmMain" )
+scope
+    dim as frmMain.Form f
+    f.DataFolder = dir_
+    f.Build( )
+    f.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( f.Handle )
+    tkTest_PumpFor( h, 100 )
+    dim as TK_WIDGET ptr lst = f.lstContacts.Handle
+    tkTest_Check( "the list holds the database", tkListTree_GetCount( lst ) = 2, str( tkListTree_GetCount( lst ) ) )
+    tkTest_Check( "columns filled", tkListTree_GetCellText( lst, 1, 2 ) = "zoe@example.org" )
+    tkTest_Check( "the status bar counts", tkStatusBar_GetText( f.sbMain.Handle, 0 ) = "2 contacts" )
+    tkTest_Check( "the first row selected and shown", (tkListTree_GetCurSel( lst ) = 0) andalso (f.lblName.Text = "Ada Byron") )
+    dim as TKLISTTREE_MESSAGEINFO mi
+    dim as boolean handled
+    mi.msg = TKM_RBUTTONDOWN : mi.idx = 1
+    f.lstContacts_Message( @mi, handled )
+    tkTest_Check( "a right click selects its row", (tkListTree_GetCurSel( lst ) = 1) andalso (f.lblName.Text = "Zoë Young") )
+    tkTest_Check( "its photo shown", tkPicture_GetFile( f.picPhoto.Handle ) = contactdb.PhotoPath( f.People[1] ) )
+    tkTest_Check( "its address beside it", instr( f.lblDetails.Text, "Truro" ) > 0, f.lblDetails.Text )
+    dim as ustring tip                     ' the form starts it empty, as here
+    f.lstContacts_Tooltip( 1, 0, tip )
+    tkTest_Check( "no tooltip for a row", tip = "" )
+    f.Reload( f.People[0].Id )
+    tkTest_Check( "Reload selects by id", tkListTree_GetCurSel( lst ) = 0 )
+    tkTest_Check( "a resource by name: no photo yet", (tkPicture_GetFile( f.picPhoto.Handle ) = "res:nophoto") andalso tkPicture_HasImage( f.picPhoto.Handle ) )
+    dim as TK_WIDGET ptr box = askbox.NewBox( f.Handle, "Delete?", "Contacts", MBX_ICON_QUESTION, MBX_BTN_YESNO )
+    dim as TTF_Font ptr gIcon = tkMessageBox_GetGlyphFont( box ), gClose = tkMessageBox_GetCloseGlyphFont( box )
+    tkTest_Check( "a message box draws its icon and close X in glyph fonts that have them", _
+        (gIcon <> 0) andalso (gClose <> 0) andalso TTF_FontHasGlyph( gIcon, TK_ICON_QUESTION ) andalso TTF_FontHasGlyph( gClose, TK_ICON_CLOSE ) )
+    tkMessageBox_Destroy( box )
+
+    dim as frmContact.Form d
+    d.Build( f.Handle )
+    d.Edit( f.People[1] )
+    tkTest_Check( "the dialog shows the contact", (d.txtFirstName.Text = "Zoë") andalso (d.txtCity.Text = "Truro") )
+    tkTest_Check( "on its first page", d.tabDetails.SelectedIndex = 0 )
+    tkTest_Check( "with its photo", tkPicture_HasImage( d.picPhoto.Handle ) andalso (d.PhotoChanged = false) )
+    d.txtCity.Text = "  Sydney "
+    tkTest_Check( "OK's collect reads the boxes, trimmed", d.Collect( ) andalso (d.Person.City = "Sydney") andalso (d.Person.Id = f.People[1].Id) )
+    d.btnClearPhoto_Click( )
+    tkTest_Check( "No photo: none, and changed", (d.PhotoFile = "") andalso d.PhotoChanged andalso (tkPicture_GetFile( d.picPhoto.Handle ) = "res:nophoto") )
+    d.txtFirstName.Text = "" : d.txtLastName.Text = " "
+    tkTest_Check( "no name, no OK", d.Collect( ) = false )
+    d.Close( )
+    f.Close( )
+    tkTest_PumpFor( h, 30 )
+end scope
+
+contactdb.CloseData( )
+fs.RemoveDirAll( dir_ )
 dim as long nFail = tkTest_Report( "tkContacts" )
 tkApp_Shutdown( )
 end nFail

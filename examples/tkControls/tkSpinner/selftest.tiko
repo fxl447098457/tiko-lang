@@ -1,0 +1,210 @@
+' tkSpinner self-test. Real windows, the real paint path read back through the probes; the clock
+' is driven by pushed TKM_TIMER ticks (deterministic) and by real pumping. Scale 1.0 and 1.75.
+#import "vendor/tkControls/tkSpinner"
+#import "vendor/tkControls/tkTest"
+using tkSpinner
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gPaints, gMsgs
+dim shared as boolean gSwallow
+
+' a frame drawn by hand: a full square in a known colour
+sub PaintOwn( byval p as TKSPINNER_PAINTINFO ptr )
+    gPaints += 1
+    p->b->SetBackColor( &hFF123456ul )
+    p->b->PaintRect( @p->rc )
+end sub
+
+' the stock frame, as a designer Paint handler that calls PaintDefault draws it
+sub PaintStock( byval p as TKSPINNER_PAINTINFO ptr )
+    tkSpinner_PaintDefault( p )
+end sub
+
+function OnMsg( byval m as TKSPINNER_MESSAGEINFO ptr ) as boolean
+    gMsgs += 1
+    return gSwallow andalso (m->msg = TKM_TIMER)
+end function
+
+sub Tick( byval s as TK_WIDGET ptr, byval n as long = 1 )
+    dim as TK_MSG m
+    m.msg = TKM_TIMER
+    m.timerId = TK_TIMER_MARQUEE
+    for i as long = 1 to n
+        tkWidget_Send( s, @m )
+    next
+end sub
+
+function Near_( byval a as single, byval b as single ) as boolean
+    return abs( a - b ) < 0.0005
+end function
+
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkSpinner selftest", 420, 300, tkHost_FontDir() & TK_FONT_UI, fScale )
+    tkHost_Show( h )
+    dim as long sz = tkHost_Scale( h, 48 )
+    dim as TK_WIDGET ptr s = tkSpinner_Create( tkHost_Root( h ), 1 )
+    tkWidget_SetPos( s, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), sz, sz )
+    tkTest_PumpFor( h, 40 )
+
+    tkTest_Check( "created stopped, RING, not a tab stop", (tkSpinner_IsRunning( s ) = false) andalso (tkSpinner_GetStyle( s ) = SPN_STYLE_RING) andalso (s->isFocusable = false) )
+    tkTest_Check( "defaults", (tkSpinner_GetPeriod( s ) = TKSPINNER_DEFAULT_PERIOD) andalso (tkSpinner_GetFrameMs( s ) = TKSPINNER_DEFAULT_FRAMEMS) andalso (tkSpinner_GetCount( s ) = TKSPINNER_DEFAULT_COUNT) andalso tkSpinner_GetTransparent( s ) )
+
+    ' ---- every style draws, moves, and is its own ------------------------------------------
+    dim as ulong hFrame0( 0 to SPN_STYLE_COUNT - 1 )
+    for st as long = 0 to SPN_STYLE_COUNT - 1
+        tkSpinner_SetStyle( s, st )
+        tkSpinner_SetPhase( s, 0 )
+        dim as long nt = tkSpinner_CountRenderedTones( s )
+        tkTest_Check( "style " & st & " draws (> 2 tones)", nt > 2, str( nt ) )
+        hFrame0( st ) = tkSpinner_HashRenderedPart( s )
+        tkSpinner_SetPhase( s, 0.37 )
+        tkTest_Check( "style " & st & " moves: a phase changes its pixels", tkSpinner_HashRenderedPart( s ) <> hFrame0( st ) )
+    next
+    dim as boolean bDistinct = true
+    for i as long = 0 to SPN_STYLE_COUNT - 1
+        for j as long = i + 1 to SPN_STYLE_COUNT - 1
+            if hFrame0( i ) = hFrame0( j ) then bDistinct = false
+        next
+    next
+    tkTest_Check( "each style's first frame is its own", bDistinct )
+    tkSpinner_SetStyle( s, 99 )
+    tkTest_Check( "a style out of range is refused", tkSpinner_GetStyle( s ) = SPN_STYLE_COUNT - 1 )
+    tkSpinner_SetStyle( s, SPN_STYLE_RING )
+
+    ' ---- the clock --------------------------------------------------------------------------
+    tkSpinner_SetPhase( s, 0 )
+    Tick( s )
+    tkTest_Check( "stopped: a stray tick still moves one frame (the clock is the tick)", Near_( tkSpinner_GetPhase( s ), 16 / 1000 ), str( tkSpinner_GetPhase( s ) ) )
+    tkSpinner_SetPhase( s, 0 )
+    tkTest_Check( "stopped: no timer", tkWidget_HasTimer( s, TK_TIMER_MARQUEE ) = false )
+    tkSpinner_Start( s )
+    tkTest_Check( "Start runs the timer", tkSpinner_IsRunning( s ) andalso tkWidget_HasTimer( s, TK_TIMER_MARQUEE ) )
+    Tick( s, 10 )
+    tkTest_Check( "ten ticks: ten frames of FrameMs / Period", Near_( tkSpinner_GetPhase( s ), 0.16 ), str( tkSpinner_GetPhase( s ) ) )
+    tkSpinner_SetPhase( s, 0.99 )
+    Tick( s, 2 )
+    tkTest_Check( "the phase wraps", Near_( tkSpinner_GetPhase( s ), 0.022 ), str( tkSpinner_GetPhase( s ) ) )
+    tkSpinner_SetPeriod( s, 400 )
+    tkSpinner_SetPhase( s, 0 )
+    Tick( s, 5 )
+    tkTest_Check( "a shorter period: bigger steps", Near_( tkSpinner_GetPhase( s ), 0.2 ), str( tkSpinner_GetPhase( s ) ) )
+    tkSpinner_SetPeriod( s, 10 )
+    tkTest_Check( "a period below 50 is 50", tkSpinner_GetPeriod( s ) = 50 )
+    tkSpinner_SetPeriod( s, TKSPINNER_DEFAULT_PERIOD )
+    tkSpinner_SetFrameMs( s, 1 )
+    tkTest_Check( "FrameMs is kept to 10..1000", tkSpinner_GetFrameMs( s ) = 10 )
+    tkSpinner_SetFrameMs( s, TKSPINNER_DEFAULT_FRAMEMS )
+    dim as single before = tkSpinner_GetPhase( s )
+    tkTest_PumpFor( h, 300 )
+    tkTest_Check( "pumped: the real timer moves it", tkSpinner_GetPhase( s ) <> before, before & " -> " & tkSpinner_GetPhase( s ) )
+    tkSpinner_Stop( s )
+    tkTest_Check( "Stop kills the timer", (tkSpinner_IsRunning( s ) = false) andalso (tkWidget_HasTimer( s, TK_TIMER_MARQUEE ) = false) )
+    tkTest_PumpFor( h, 30 )
+    before = tkSpinner_GetPhase( s )
+    tkTest_PumpFor( h, 150 )
+    tkTest_Check( "stopped: it stays where it was", tkSpinner_GetPhase( s ) = before )
+    tkSpinner_SetRunning( s, true )
+    tkTest_Check( "SetRunning( true ) is Start", tkSpinner_IsRunning( s ) )
+
+    ' ---- hidden, disabled ----------------------------------------------------------------------
+    tkWidget_Show( s, false )
+    tkTest_Check( "hidden: the timer pauses", tkWidget_HasTimer( s, TK_TIMER_MARQUEE ) = false )
+    tkWidget_Show( s, true )
+    tkTest_Check( "shown: it resumes", tkWidget_HasTimer( s, TK_TIMER_MARQUEE ) )
+    tkSpinner_SetPhase( s, 0.25 )
+    dim as ulong hEnabled = tkSpinner_HashRenderedPart( s )
+    tkWidget_Enable( s, false )
+    tkTest_Check( "disabled: the timer stops, still running", (tkWidget_HasTimer( s, TK_TIMER_MARQUEE ) = false) andalso tkSpinner_IsRunning( s ) )
+    tkTest_Check( "disabled: drawn in the disabled colour", tkSpinner_HashRenderedPart( s ) <> hEnabled )
+    tkWidget_Enable( s, true )
+    tkTest_Check( "enabled again: ticking again", tkWidget_HasTimer( s, TK_TIMER_MARQUEE ) )
+    tkSpinner_Stop( s )
+
+    ' ---- HideWhenStopped, Transparent, Count, Thickness --------------------------------------
+    tkSpinner_SetHideWhenStopped( s, true )
+    tkTest_Check( "HideWhenStopped: stopped, nothing drawn", tkSpinner_CountRenderedTones( s ) = 1, str( tkSpinner_CountRenderedTones( s ) ) )
+    tkSpinner_Start( s )
+    tkTest_Check( "...started, drawn", tkSpinner_CountRenderedTones( s ) > 2 )
+    tkSpinner_Stop( s )
+    tkSpinner_SetHideWhenStopped( s, false )
+
+    dim as TKSPINNER_COLORS cc
+    tkSpinner_GetColors( s, @cc )
+    tkTest_Check( "colours from the theme", (cc.ForeColor = tkTheme_Get( ).Accent) andalso (cc.TrackColor = tkTheme_Get( ).Track) )
+    dim as TKRECT a
+    tkWidget_AbsRect( s, a )
+    tkHost_RenderTo( h, false )
+    dim as ulong cCorner = tkTest_PixelAt( h, a.left + 1, a.top + 1 )
+    tkTest_Check( "transparent: the corner is what is behind", cCorner = tkTheme_Get( ).Window )
+    cc.BackColor = &hFF203040ul
+    tkSpinner_SetColors( s, @cc )
+    tkSpinner_SetTransparent( s, false )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "not transparent: BackColor fills the client", tkTest_PixelAt( h, a.left + 1, a.top + 1 ) = &hFF203040ul, hex( tkTest_PixelAt( h, a.left + 1, a.top + 1 ) ) )
+    tkSpinner_SetTransparent( s, true )
+
+    tkSpinner_SetStyle( s, SPN_STYLE_DOTS )
+    tkSpinner_SetPhase( s, 0 )
+    dim as ulong h8 = tkSpinner_HashRenderedPart( s )
+    tkSpinner_SetCount( s, 12 )
+    tkTest_Check( "Count changes the dots", tkSpinner_HashRenderedPart( s ) <> h8 )
+    tkSpinner_SetCount( s, 1 )
+    tkTest_Check( "Count is kept to 3..24", tkSpinner_GetCount( s ) = 3 )
+    tkSpinner_SetCount( s, TKSPINNER_DEFAULT_COUNT )
+    tkSpinner_SetStyle( s, SPN_STYLE_RING )
+    dim as ulong hThin = tkSpinner_HashRenderedPart( s )
+    tkSpinner_SetThickness( s, 8 )
+    tkTest_Check( "Thickness changes the ring", (tkSpinner_HashRenderedPart( s ) <> hThin) andalso (tkSpinner_GetThickness( s ) = 8) )
+    tkSpinner_SetThickness( s, 0 )
+
+    ' ---- theme and pinning -------------------------------------------------------------------
+    tkTheme_Apply( tkTheme_Light( ) )
+    tkSpinner_GetColors( s, @cc )
+    tkTest_Check( "pinned colours survive a theme change", cc.BackColor = &hFF203040ul )
+    tkSpinner_UnpinColors( s )
+    tkSpinner_GetColors( s, @cc )
+    tkTest_Check( "unpinned: the theme's", (cc.ForeColor = tkTheme_Light( ).Accent) andalso (cc.BackColor = tkTheme_Light( ).Window) )
+    tkTheme_Apply( tkTheme_Dark( ) )
+    tkSpinner_GetColors( s, @cc )
+    tkTest_Check( "and it follows the next one", cc.ForeColor = tkTheme_Dark( ).Accent )
+
+    ' ---- the paint and message callbacks -----------------------------------------------------
+    tkSpinner_SetPhase( s, 0.3 )
+    dim as ulong hStock = tkSpinner_HashRenderedPart( s )
+    gPaints = 0
+    tkSpinner_SetPaintCallback( s, @PaintOwn )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "a paint callback replaces the frame", (gPaints > 0) andalso (tkTest_PixelAt( h, (a.left + a.right) \ 2, (a.top + a.bottom) \ 2 ) = &hFF123456ul) )
+    tkSpinner_SetPaintCallback( s, @PaintStock )
+    tkTest_Check( "PaintDefault inside a painter = the stock frame", tkSpinner_HashRenderedPart( s ) = hStock )
+    tkSpinner_SetPaintCallback( s, 0 )
+    gMsgs = 0 : gSwallow = true
+    tkSpinner_SetMessageCallback( s, @OnMsg )
+    tkSpinner_SetPhase( s, 0 )
+    Tick( s )
+    tkTest_Check( "a message callback sees the tick, and answering TRUE swallows it", (gMsgs = 1) andalso (tkSpinner_GetPhase( s ) = 0) )
+    tkSpinner_SetMessageCallback( s, 0 )
+
+    ' ---- centred and square, whatever the client ----------------------------------------------
+    tkWidget_SetPos( s, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), sz * 3, sz )
+    tkTest_PumpFor( h, 30 )
+    tkWidget_AbsRect( s, a )
+    tkHost_RenderTo( h, false )
+    dim as ulong c0
+    dim as long nLeft = tkTest_TonesIn( h, a.left, a.top, sz - 2, sz, c0 )
+    tkTest_Check( "a wide client: the left third is empty (it's drawn centred)", nLeft = 1, str( nLeft ) )
+    tkTest_Check( "...and the middle third is drawn", tkTest_TonesIn( h, a.left + sz, a.top, sz, sz, c0 ) > 2 )
+
+    tkHost_Destroy( h )
+end sub
+
+if tkTest_Init() = false then end 99
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkSpinner" )
+tkTest_Quit()
+end nFail

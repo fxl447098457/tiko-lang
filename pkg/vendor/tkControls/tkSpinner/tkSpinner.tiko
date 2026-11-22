@@ -1,0 +1,607 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkSpinner -- a busy indicator: a small animation that says "working, wait" while something takes
+' its time. New to tkControls (no PsControls original; see PORT.md), built the way tkProgressBar's
+' marquee is: ONE widget timer whose ticks are the only clock, running only while the spinner is
+' started, enabled and shown; a colour struct the theme fills unless the host pins it; a paint
+' callback with tkSpinner_PaintDefault for the stock frame; a message callback that sees every
+' message but the destroy. Display-only: never a tab stop, no capture, no hot state.
+'
+' The animation is drawn in the largest square centred in the client, from the client's size at
+' every paint, so a resize or a scale change needs nothing but a repaint. A cycle is Period
+' milliseconds; each tick (every FrameMs) moves the phase on by FrameMs / Period of a cycle.
+#module "tkSpinner"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+using tkHost
+using tkPaint
+using tkTheme
+
+' The animations.
+public enum
+    SPN_STYLE_RING = 0    ' a quarter arc going round a faint track
+    SPN_STYLE_ARC         ' one arc growing and shrinking as it turns
+    SPN_STYLE_DOTS        ' Count dots on a circle: a bright head, a fading tail
+    SPN_STYLE_SPOKES      ' Count bars round a hub, fading in turn
+    SPN_STYLE_PULSE       ' a disc growing and fading out, twice a cycle
+    SPN_STYLE_BOUNCE      ' three dots in a row rising and falling in turn
+    SPN_STYLE_COUNT
+end enum
+
+' Defaults. Period and FrameMs are milliseconds; Thickness is in design units (0 = a tenth of the
+' spinner's size).
+public const TKSPINNER_DEFAULT_PERIOD  = 1000
+public const TKSPINNER_DEFAULT_FRAMEMS = 16
+public const TKSPINNER_DEFAULT_COUNT   = 8
+
+public type TKSPINNER_COLORS
+    BackColor         as ulong    ' the client, when not transparent
+    ForeColor         as ulong    ' what moves
+    TrackColor        as ulong    ' what stays: the ring's track
+    ForeColorDisabled as ulong    ' what moves, while disabled
+end type
+
+public type TKSPINNER_PAINTINFO
+    hSpinner   as TK_WIDGET ptr
+    b          as TK_PAINT ptr
+    rcClient   as TKRECT
+    rc         as TKRECT                ' the square the animation is drawn in
+    nStyle     as long
+    fPhase     as single                ' 0 up to 1: where in the cycle
+    nCount     as long
+    nThick     as long                  ' pixels
+    clrFore    as ulong                 ' ForeColor, or ForeColorDisabled while disabled
+    clrTrack   as ulong
+    isRunning  as boolean
+    isEnabled  as boolean
+end type
+
+public type TKSPINNER_MESSAGEINFO
+    hSpinner as TK_WIDGET ptr
+    msg      as long                    ' TKM_*
+    x        as single
+    y        as single
+    timerId  as long
+    bFlag    as boolean
+end type
+
+public type SPN_PaintCallbackSub as sub( byval p as TKSPINNER_PAINTINFO ptr )
+' TRUE: the message is handled, the spinner does nothing with it. Not offered TKM_DESTROY.
+public type SPN_MessageCallbackFunc as function( byval m as TKSPINNER_MESSAGEINFO ptr ) as boolean
+
+public type TKSPINNER_STATE
+    hWin            as TK_WIDGET ptr
+    nStyle          as long = SPN_STYLE_RING
+    bRunning        as boolean
+    nPeriod         as long = TKSPINNER_DEFAULT_PERIOD
+    nFrameMs        as long = TKSPINNER_DEFAULT_FRAMEMS
+    nCount          as long = TKSPINNER_DEFAULT_COUNT
+    nThickness      as long                ' design units; 0 = derived from the size
+    bHideWhenStopped as boolean
+    bTransparent    as boolean = true
+    fPhase          as single
+    colors          as TKSPINNER_COLORS
+    bColorsPinned   as boolean
+    bHidden         as boolean             ' from TKM_SHOW
+    bTimerOn        as boolean
+    PaintCallback   as SPN_PaintCallbackSub
+    MessageCallback as SPN_MessageCallbackFunc
+end type
+
+const PI_ = 3.14159265358979
+
+private function GetSpinnerPointer( byval h as TK_WIDGET ptr ) as TKSPINNER_STATE ptr
+    if h = 0 then return 0
+    return cast( TKSPINNER_STATE ptr, h->pData )
+end function
+
+' The colour c at alpha a (0..255), whatever c's own alpha was.
+private function WithAlpha_( byval c as ulong, byval a as long ) as ulong
+    if a < 0 then a = 0
+    if a > 255 then a = 255
+    return (c and &h00FFFFFFul) or (cast( ulong, a ) shl 24)
+end function
+
+private function Frac_( byval v as single ) as single
+    return v - int( v )
+end function
+
+' A disc of radius rad centred on (cx, cy), widget pixels.
+private sub Disc_( byval b as TK_PAINT ptr, byval cx as single, byval cy as single, byval rad as single, byval c as ulong )
+    if rad < 0.5 then exit sub
+    dim as TKRECT rc
+    tkRect_Set( rc, cint( cx - rad ), cint( cy - rad ), cint( cx + rad ), cint( cy + rad ) )
+    b->SetBackColor( c )
+    b->PaintEllipse( @rc )
+end sub
+
+' A bar of width w (pixels) from (x0, y0) to (x1, y1): ONE anti-aliased strip, so a translucent
+' colour is even all along it (a quad and two end discs would double up where they overlap).
+private sub Bar_( byval b as TK_PAINT ptr, byval x0 as single, byval y0 as single, byval x1 as single, byval y1 as single, _
+                  byval w as single, byval c as ulong )
+    b->SetPenColor( c )
+    b->PaintLine( iif( w < 1, 1, cint( w ) ), cint( x0 ), cint( y0 ), cint( x1 ), cint( y1 ) )
+end sub
+
+' An arc band of the circle in rc, thickness t, from startDeg sweeping sweepDeg, with round ends.
+private sub Arc_( byval b as TK_PAINT ptr, byref rc as TKRECT, byval t as single, byval startDeg as single, _
+                  byval sweepDeg as single, byval c as ulong, byval bCaps as boolean )
+    dim as single r = (rc.right - rc.left) / 2
+    if r <= t then exit sub
+    b->SetBackColor( c )
+    b->PaintPieRing( @rc, (r - t) / r, startDeg, sweepDeg )
+    if bCaps then
+        dim as single cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2, rm = r - t / 2
+        dim as single a0 = startDeg * PI_ / 180, a1 = (startDeg + sweepDeg) * PI_ / 180
+        Disc_( b, cx + rm * cos( a0 ), cy + rm * sin( a0 ), t / 2, c )
+        Disc_( b, cx + rm * cos( a1 ), cy + rm * sin( a1 ), t / 2, c )
+    end if
+end sub
+
+' The stock frame for p: what the spinner draws when no paint callback is set.
+private sub RenderDefault_( byval p as TKSPINNER_PAINTINFO ptr )
+    dim as TK_PAINT ptr b = p->b
+    dim as TKRECT rc = p->rc
+    dim as single sz = rc.right - rc.left
+    if sz < 2 then exit sub
+    dim as single cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2, r = sz / 2
+    dim as single t = p->nThick
+    dim as single ph = p->fPhase
+    dim as ulong fg = p->clrFore
+    dim as long n = p->nCount
+    if n < 2 then n = 2
+    select case p->nStyle
+    case SPN_STYLE_ARC
+        ' the head runs ahead twice a cycle; the arc stretches to 270 degrees and back
+        dim as single sweep = 20 + 250 * sin( PI_ * ph ) ^ 2
+        dim as single start = ph * 720 - 90 - sweep / 2
+        Arc_( b, rc, t, start, sweep, fg, true )
+    case SPN_STYLE_DOTS
+        dim as single rd = sz * 0.09
+        if rd < 1.5 then rd = 1.5
+        dim as single head = ph * n
+        for i as long = 0 to n - 1
+            dim as single behind = head - i
+            behind -= n * int( behind / n )               ' 0 up to n: how far behind the head
+            dim as long a = 255 - cint( 215 * behind / n )
+            dim as single ang = (i * 360 / n - 90) * PI_ / 180
+            Disc_( b, cx + (r - rd) * cos( ang ), cy + (r - rd) * sin( ang ), rd, WithAlpha_( fg, a ) )
+        next
+    case SPN_STYLE_SPOKES
+        dim as single head = ph * n
+        dim as single w = t
+        if w > r / 3 then w = r / 3
+        for i as long = 0 to n - 1
+            dim as single behind = head - i
+            behind -= n * int( behind / n )
+            dim as long a = 255 - cint( 215 * behind / n )
+            dim as single ang = (i * 360 / n - 90) * PI_ / 180
+            dim as single r0 = r * 0.45, r1 = r - 1
+            Bar_( b, cx + r0 * cos( ang ), cy + r0 * sin( ang ), cx + r1 * cos( ang ), cy + r1 * sin( ang ), w, WithAlpha_( fg, a ) )
+        next
+    case SPN_STYLE_PULSE
+        ' two rings of growth, half a cycle apart: each grows from nothing and fades as it does
+        for k as long = 0 to 1
+            dim as single f = Frac_( ph + k * 0.5 )
+            Disc_( b, cx, cy, r * f, WithAlpha_( fg, cint( 255 * (1 - f) ) ) )
+        next
+    case SPN_STYLE_BOUNCE
+        dim as single rd = sz * 0.11
+        if rd < 1.5 then rd = 1.5
+        dim as single gap = rd * 3, amp = sz * 0.22
+        for i as long = 0 to 2
+            dim as single f = Frac_( ph - i * 0.15 )
+            dim as single lift = 0
+            if f < 0.5 then lift = sin( f * 2 * PI_ )        ' up and down in the first half; rest in the second
+            if lift < 0 then lift = 0
+            Disc_( b, cx + (i - 1) * gap, cy + amp / 2 - lift * amp, rd, WithAlpha_( fg, 120 + cint( 135 * lift ) ) )
+        next
+    case else
+        ' SPN_STYLE_RING: the whole track, then a quarter arc going round it
+        Arc_( b, rc, t, 0, 360, p->clrTrack, false )
+        Arc_( b, rc, t, ph * 360 - 90, 90, fg, true )
+    end select
+end sub
+
+' The square the animation is drawn in, and the stroke it uses, for the client as it is now.
+private sub Geometry_( byval pSpn as TKSPINNER_STATE ptr, byref rc as TKRECT, byref nThick as long )
+    dim as TK_WIDGET ptr w = pSpn->hWin
+    dim as long sz = iif( w->cw < w->ch, w->cw, w->ch )
+    if sz < 0 then sz = 0
+    dim as long l = (w->cw - sz) \ 2, t = (w->ch - sz) \ 2
+    tkRect_Set( rc, l, t, l + sz, t + sz )
+    if pSpn->nThickness > 0 then
+        nThick = tkHost_Scale( w->pHost, pSpn->nThickness )
+    else
+        nThick = sz \ 10
+    end if
+    if nThick < 2 then nThick = 2
+    if nThick > sz \ 3 then nThick = sz \ 3
+    if nThick < 1 then nThick = 1
+end sub
+
+private sub Render_( byval pSpn as TKSPINNER_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TK_WIDGET ptr w = pSpn->hWin
+    dim as TKSPINNER_PAINTINFO p
+    p.hSpinner = w
+    p.b = b
+    tkRect_Set( p.rcClient, 0, 0, w->cw, w->ch )
+    if pSpn->bTransparent = false then
+        b->SetBackColor( pSpn->colors.BackColor )
+        b->PaintRect( @p.rcClient )
+    end if
+    if (pSpn->bRunning = false) andalso pSpn->bHideWhenStopped then exit sub
+    Geometry_( pSpn, p.rc, p.nThick )
+    p.nStyle = pSpn->nStyle
+    p.fPhase = pSpn->fPhase
+    p.nCount = pSpn->nCount
+    p.isEnabled = tkWidget_IsEnabled( w )
+    p.isRunning = pSpn->bRunning
+    p.clrFore = iif( p.isEnabled, pSpn->colors.ForeColor, pSpn->colors.ForeColorDisabled )
+    p.clrTrack = pSpn->colors.TrackColor
+    if pSpn->PaintCallback then
+        pSpn->PaintCallback( @p )
+    else
+        RenderDefault_( @p )
+    end if
+end sub
+
+' The timer runs while started, enabled and shown -- and nowhere else.
+private sub SyncTimer_( byval pSpn as TKSPINNER_STATE ptr )
+    dim as boolean bWant = pSpn->bRunning andalso pSpn->hWin->isEnabled andalso (pSpn->bHidden = false)
+    if bWant then
+        dim as long ms = pSpn->nFrameMs
+        if ms < 1 then ms = 1
+        tkWidget_SetTimer( pSpn->hWin, TK_TIMER_MARQUEE, ms )         ' (re)armed at the current rate
+        pSpn->bTimerOn = true
+    elseif pSpn->bTimerOn then
+        tkWidget_KillTimer( pSpn->hWin, TK_TIMER_MARQUEE )
+        pSpn->bTimerOn = false
+    end if
+end sub
+
+private function CallMessage_( byval pSpn as TKSPINNER_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if pSpn->MessageCallback = 0 then return false
+    dim as TKSPINNER_MESSAGEINFO mi
+    mi.hSpinner = pSpn->hWin
+    mi.msg = m->msg
+    mi.x = m->x
+    mi.y = m->y
+    mi.timerId = m->timerId
+    mi.bFlag = m->bFlag
+    return pSpn->MessageCallback( @mi )
+end function
+
+public declare sub tkSpinner_ApplyTheme( byval hSpinner as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+public declare function tkSpinner_ThemeColors( byref t as TKTHEME_COLORS ) as TKSPINNER_COLORS
+
+private function tkSpinner_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKSPINNER_STATE ptr pSpn = GetSpinnerPointer( w )
+    if pSpn = 0 then return false
+    if m->msg <> TKM_DESTROY then
+        if CallMessage_( pSpn, m ) then return true
+    end if
+    select case m->msg
+    case TKM_PAINT
+        Render_( pSpn, m->pPaint )
+        return true
+    case TKM_TIMER
+        if m->timerId <> TK_TIMER_MARQUEE then return false
+        dim as long per = iif( pSpn->nPeriod > 0, pSpn->nPeriod, 1 )
+        pSpn->fPhase = Frac_( pSpn->fPhase + pSpn->nFrameMs / per )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_SHOW
+        pSpn->bHidden = (m->bFlag = false)
+        SyncTimer_( pSpn )
+        return true
+    case TKM_ENABLE
+        SyncTimer_( pSpn )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_SIZE, TKM_SCALECHANGED
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_THEMECHANGED
+        tkSpinner_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_DESTROY
+        if pSpn->bTimerOn then tkWidget_KillTimer( w, TK_TIMER_MARQUEE )
+        delete pSpn
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+
+' ========================================================================================
+' Public API
+' ========================================================================================
+' A child of hParent -- a widget, or tkHost_Root( h ). Stopped: it shows its first frame, still.
+public function tkSpinner_Create( byval hParent as TK_WIDGET ptr, byval CtrlID as long, _
+                                  byval nStyle as long = SPN_STYLE_RING ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKSPINNER_STATE ptr pSpn = new TKSPINNER_STATE
+    if (nStyle >= 0) andalso (nStyle < SPN_STYLE_COUNT) then pSpn->nStyle = nStyle
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, CtrlID, @tkSpinner_Proc, pSpn )
+    w->isFocusable = false
+    pSpn->hWin = w
+    pSpn->colors = tkSpinner_ThemeColors( tkTheme_Of( w ) )
+    ' the theme's recipes for this type apply from the start, not just after a theme change
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @pSpn->colors ), sizeof( TKSPINNER_COLORS ) \ 4, "Spinner" )
+    return w
+end function
+
+public function tkSpinner_GetStyle( byval h as TK_WIDGET ptr ) as long
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return iif( p <> 0, p->nStyle, SPN_STYLE_RING )
+end function
+
+' Any SPN_STYLE_*; anything else is refused.
+public sub tkSpinner_SetStyle( byval h as TK_WIDGET ptr, byval nStyle as long )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if (p = 0) orelse (nStyle < 0) orelse (nStyle >= SPN_STYLE_COUNT) then exit sub
+    p->nStyle = nStyle
+    tkWidget_Invalidate( h )
+end sub
+
+public sub tkSpinner_Start( byval h as TK_WIDGET ptr )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if (p = 0) orelse p->bRunning then exit sub
+    p->bRunning = true
+    SyncTimer_( p )
+    tkWidget_Invalidate( h )
+end sub
+
+' Stops where it is (the phase is kept) -- or hides it, with HideWhenStopped.
+public sub tkSpinner_Stop( byval h as TK_WIDGET ptr )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if (p = 0) orelse (p->bRunning = false) then exit sub
+    p->bRunning = false
+    SyncTimer_( p )
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkSpinner_IsRunning( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return (p <> 0) andalso p->bRunning
+end function
+
+' Start or Stop, as a property.
+public sub tkSpinner_SetRunning( byval h as TK_WIDGET ptr, byval bRun as boolean )
+    if bRun then tkSpinner_Start( h ) else tkSpinner_Stop( h )
+end sub
+
+public function tkSpinner_GetPeriod( byval h as TK_WIDGET ptr ) as long
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return iif( p <> 0, p->nPeriod, 0 )
+end function
+
+' Milliseconds for one whole cycle; below 50 is 50.
+public sub tkSpinner_SetPeriod( byval h as TK_WIDGET ptr, byval ms as long )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    p->nPeriod = iif( ms < 50, 50, ms )
+end sub
+
+public function tkSpinner_GetFrameMs( byval h as TK_WIDGET ptr ) as long
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return iif( p <> 0, p->nFrameMs, 0 )
+end function
+
+' Milliseconds between frames, 10 to 1000.
+public sub tkSpinner_SetFrameMs( byval h as TK_WIDGET ptr, byval ms as long )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    if ms < 10 then ms = 10
+    if ms > 1000 then ms = 1000
+    p->nFrameMs = ms
+    if p->bTimerOn then SyncTimer_( p )
+end sub
+
+public function tkSpinner_GetCount( byval h as TK_WIDGET ptr ) as long
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return iif( p <> 0, p->nCount, 0 )
+end function
+
+' How many dots (DOTS) or bars (SPOKES), 3 to 24.
+public sub tkSpinner_SetCount( byval h as TK_WIDGET ptr, byval n as long )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    if n < 3 then n = 3
+    if n > 24 then n = 24
+    p->nCount = n
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkSpinner_GetThickness( byval h as TK_WIDGET ptr ) as long
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return iif( p <> 0, p->nThickness, 0 )
+end function
+
+' The stroke of RING, ARC and SPOKES, in design units; 0 (the default) is a tenth of the size.
+public sub tkSpinner_SetThickness( byval h as TK_WIDGET ptr, byval n as long )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    p->nThickness = iif( n > 0, n, 0 )
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkSpinner_GetHideWhenStopped( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return (p <> 0) andalso p->bHideWhenStopped
+end function
+
+' TRUE: stopped, it draws nothing (but the background, when not transparent).
+public sub tkSpinner_SetHideWhenStopped( byval h as TK_WIDGET ptr, byval bHide as boolean )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    p->bHideWhenStopped = bHide
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkSpinner_GetTransparent( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return (p = 0) orelse p->bTransparent
+end function
+
+' TRUE (the default): no background, what is behind shows through. FALSE: BackColor fills the client.
+public sub tkSpinner_SetTransparent( byval h as TK_WIDGET ptr, byval bTransparent as boolean )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    p->bTransparent = bTransparent
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkSpinner_GetPhase( byval h as TK_WIDGET ptr ) as single
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    return iif( p <> 0, p->fPhase, 0.0! )
+end function
+
+' Where in the cycle, 0 up to 1 (wrapped): a still frame, or where a started spinner goes on from.
+public sub tkSpinner_SetPhase( byval h as TK_WIDGET ptr, byval f as single )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    p->fPhase = Frac_( f )
+    tkWidget_Invalidate( h )
+end sub
+
+' ---- colours ----
+public sub tkSpinner_GetColors( byval h as TK_WIDGET ptr, byval pColors as TKSPINNER_COLORS ptr )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Copies the struct and PINS it: a theme change leaves this spinner alone until UnpinColors.
+public sub tkSpinner_SetColors( byval h as TK_WIDGET ptr, byval pColors as TKSPINNER_COLORS ptr )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkSpinner_ThemeColors( byref t as TKTHEME_COLORS ) as TKSPINNER_COLORS
+    dim as TKSPINNER_COLORS c
+    c.BackColor = t.Window
+    c.ForeColor = t.Accent
+    c.TrackColor = t.Track
+    c.ForeColorDisabled = t.TextDisabled
+    return c
+end function
+
+public sub tkSpinner_ApplyTheme( byval h as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( h, t )
+    p->colors = tkSpinner_ThemeColors( tr )
+    tkTheme_ResolveInto( h, tr, cast( ulong ptr, @p->colors ), sizeof( TKSPINNER_COLORS ) \ 4, "Spinner" )
+    tkWidget_Invalidate( h )
+end sub
+
+' Hands the spinner back to the theme, which is applied at once.
+public sub tkSpinner_UnpinColors( byval h as TK_WIDGET ptr )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkSpinner_ApplyTheme( h, tkTheme_Of( h ) )
+end sub
+
+' ---- callbacks (0 removes) ----
+' A paint callback's way to draw the frame the spinner would have drawn, then add to it.
+public sub tkSpinner_PaintDefault( byval p as TKSPINNER_PAINTINFO ptr )
+    if (p = 0) orelse (p->b = 0) then exit sub
+    RenderDefault_( p )
+end sub
+
+' Replaces the frame (the background, when not transparent, is already filled).
+public sub tkSpinner_SetPaintCallback( byval h as TK_WIDGET ptr, byval usersub as SPN_PaintCallbackSub )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p = 0 then exit sub
+    p->PaintCallback = usersub
+    tkWidget_Invalidate( h )
+end sub
+
+public sub tkSpinner_SetMessageCallback( byval h as TK_WIDGET ptr, byval userfunc as SPN_MessageCallbackFunc )
+    dim as TKSPINNER_STATE ptr p = GetSpinnerPointer( h )
+    if p then p->MessageCallback = userfunc
+end sub
+
+
+' ========================================================================================
+' Probes: the real paint path rendered into the back buffer, then read back. For tests.
+' ========================================================================================
+private function Probe_( byval h as TK_WIDGET ptr, byref nTones as long, byref nHash as ulong ) as boolean
+    nTones = 0 : nHash = 0
+    dim as TKSPINNER_STATE ptr pSpn = GetSpinnerPointer( h )
+    if (pSpn = 0) orelse (h->cw <= 0) orelse (h->ch <= 0) then return false
+    dim as TK_HOST ptr hh = h->pHost
+    dim as TKRECT a
+    tkWidget_AbsRect( h, a )
+    dim as TK_PAINT wp
+    wp.renderer = hh->renderer
+    wp.engine = hh->engine
+    wp.pFont = hh->pDefaultFont
+    wp.fScale = hh->fScale
+    wp.Begin( a.left, a.top, h->cw, h->ch )
+    ' a known ground under a transparent spinner, so what it draws is all that varies
+    dim as TKRECT rcAll
+    tkRect_Set( rcAll, 0, 0, h->cw, h->ch )
+    wp.SetBackColor( pSpn->colors.BackColor )
+    wp.PaintRect( @rcAll )
+    Render_( pSpn, @wp )
+    SDL_SetRenderClipRect( hh->renderer, 0 )
+    hh->bDirty = true
+    dim as SDL_Rect sr
+    sr.x = a.left : sr.y = a.top : sr.w = h->cw : sr.h = h->ch
+    dim as SDL_Surface ptr s0 = SDL_RenderReadPixels( hh->renderer, @sr )
+    if s0 = 0 then return false
+    dim as SDL_Surface ptr s = SDL_ConvertSurface( s0, SDL_PIXELFORMAT_ARGB8888 )
+    SDL_DestroySurface( s0 )
+    if s = 0 then return false
+    dim tones(0 to 63) as ulong
+    dim as long nSeen = 0
+    dim as ulong hv = &h811C9DC5ul
+    const FNV_PRIME as ulong = &h01000193ul
+    for y as long = 0 to s->h - 1
+        dim as ulong ptr row = cast( ulong ptr, cast( ubyte ptr, s->pixels ) + y * s->pitch )
+        for x as long = 0 to s->w - 1
+            dim as ulong c = row[x] and &h00FFFFFFul
+            dim as boolean bFound = false
+            for t as long = 0 to nSeen - 1
+                if tones(t) = c then bFound = true : exit for
+            next
+            if (bFound = false) andalso (nSeen < 64) then tones(nSeen) = c : nSeen += 1
+            hv = (hv xor (c and &hFFul)) * FNV_PRIME
+            hv = (hv xor ((c shr 8) and &hFFul)) * FNV_PRIME
+            hv = (hv xor ((c shr 16) and &hFFul)) * FNV_PRIME
+        next
+    next
+    SDL_DestroySurface( s )
+    nTones = nSeen
+    nHash = hv
+    return true
+end function
+
+' Distinct colours in the client as the spinner paints it over its BackColor; 1 = nothing drawn.
+public function tkSpinner_CountRenderedTones( byval h as TK_WIDGET ptr ) as long
+    dim as long nTones
+    dim as ulong nHash
+    if Probe_( h, nTones, nHash ) = false then return 0
+    return nTones
+end function
+
+' An FNV-1a hash of the same pixels: equal = the change never reached the surface.
+public function tkSpinner_HashRenderedPart( byval h as TK_WIDGET ptr ) as ulong
+    dim as long nTones
+    dim as ulong nHash
+    if Probe_( h, nTones, nHash ) = false then return 0
+    return nHash
+end function

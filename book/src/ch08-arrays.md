@@ -353,6 +353,84 @@ For a handful of rows that does not matter. For a file of them it does, and the 
 grow in chunks — double the size when it fills — or to use the container that already does exactly
 that, which is the next section.
 
+## Part of an array, without a copy
+
+A procedure that should work on *some* of an array has had two choices: take the whole array and
+a first and last index beside it, or copy the part it wants into a new array. A **span** is the
+third: it names a run of an array where the elements already are.
+
+```tiko
+{{#include ../examples/ch08/spans.tiko}}
+```
+
+```text
+{{#include ../examples/ch08/spans.out}}
+```
+
+`a( 2 to 4 )` is elements 2 to 4, **both ends included, in the array's own indices** — the same
+numbers `a( i )` takes. What comes back is a `span( of int32 )`, and a span counts from 0 whatever
+the array did: `v( 0 )` is `a( 2 )`, `lbound( v )` is always 0 and `ubound( v )` is
+`len( v ) - 1`. The parentheses are an array's, as `s[lo to hi]` uses a string's brackets.
+
+A span is a pointer and a length, never a copy, so **writing through it writes the array**:
+`v( 1 ) = 99` changed `a( 3 )`. A span of a span is a smaller view of the same elements, and
+`for each byref` over a span reaches the array's own elements. A span of a `const` array is a
+`const span`, and writing through it is refused.
+
+`a( 4 to 3 )` is empty, so `a( lbound( a ) to ubound( a ) )` is the whole array even when the
+array is. Anything else outside the bounds is runtime error 6 — checked whenever a span is made, in
+every build — and bounds the compiler can see are wrong, past the end of a fixed array, are
+`TKO1071` before the program runs. Reading `v( i )` past the end is checked under `-exx`, as any
+subscript is.
+
+Only a one-dimensional array can be sliced (`TKO1069`). Any element type works: numbers, strings,
+your own types.
+
+### Passing a span around
+
+```tiko
+{{#include ../examples/ch08/spanpass.tiko}}
+```
+
+```text
+{{#include ../examples/ch08/spanpass.out}}
+```
+
+A `byval v as span( of int32 )` parameter is three words, whatever the length of the run. `Sum`
+neither knows nor cares which array the elements belong to, and a function may hand back a span of
+a span it was given, as `Middle` does.
+
+**A span goes where `a( ) as int32` is wanted.** `DoubleAll` is an ordinary array procedure; given
+`d( 4 to 7 )` it sees a four-element array indexed 0 to 3, and its writes land in `d`. So the
+array procedures you already have work on part of an array with no change. The element type must
+match exactly (`TKO0687`). One thing the procedure cannot do is `redim` what it was given — that is
+runtime error 1, the same as for a fixed array — and an `erase` inside it clears those elements of
+`d`.
+
+### A span cannot outlive its array
+
+A span points into memory it does not own, so the compiler keeps it there. The rules are the ones
+Chapter 9 gives for string slices: a span lives in a local, a parameter or a result, never in a
+`shared` variable, an array or a field of an ordinary type; it is not kept past the block its array
+belongs to; and a function returns a span only of what its caller handed it.
+
+The one new rule is about **moving**. `redim` and `redim preserve` may move a dynamic array to new
+memory, and `erase` frees it:
+
+```tiko
+{{#include ../examples/ch08/spanlock.tiko}}
+```
+
+```text
+spanlock.tiko(5,1): error TKO1062: 'd' cannot be changed while slice 'v' borrows from it (last used at line 6)
+```
+
+While a span of `d` is still to be used, `redim`, `erase` and passing `d( )` to a procedure (which
+may `redim` it) are refused. Take the span again after the `redim` and the program compiles. A
+fixed array never moves, so it is never locked. What one procedure cannot see — a procedure
+given both the span and the array, which then `redim`s the array — is caught at run time under
+`-exx`.
+
 ## The descriptor
 
 ```tiko
@@ -416,6 +494,10 @@ is simpler, and stop as soon as it is not.
   moment. Without it, compare against `lbound` and
   `ubound` yourself when the index is not obviously safe.
 - **An array is not assigned or swapped whole** (`TKO0930`); copy it element by element.
+- **`a( lo to hi )` is a span**, `span( of T )`: part of a one-dimensional array, no copy, in the
+  array's indices; the span itself counts from 0. Writes go through to the array, a span passes
+  where `a( )` is wanted, and while one is in use its dynamic array cannot be `redim`med or
+  `erase`d (`TKO1062`).
 - The array variable is a descriptor; `fbc-int/array.bi` exposes `FB.ArrayLen`, `FB.ArraySize` and
   the record itself.
 - **Stop using a raw array when you start writing bookkeeping around it** — a live count, a doubling

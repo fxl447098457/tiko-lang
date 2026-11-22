@@ -62,6 +62,7 @@ constructor DriverOptions( )
     this.compileOnly = false
     this.debugInfo = false
     this.threadSafe = false
+    this.sanitizeAddress = false
     this.guiSubsystem = false
     this.stackSize = 2097152
     this.optLevel = 0
@@ -151,7 +152,10 @@ function HelpText( byval category as string = "" ) as string
         outp += "  tiko metadata print the project as JSON: targets, profiles, modules" & chr( 10 )
         outp += "  tiko run      build one exe target, then run it with the arguments after --" & chr( 10 )
         outp += "  tiko check    every diagnostic a build would give, through lowering; nothing written" & chr( 10 )
-        outp += "  (their options: --profile, --manifest, --options, -j, --message-format, --no-cache)" & chr( 10 )
+        outp += "  tiko test     build the project's tests into one program and run them" & chr( 10 )
+        outp += "  tiko doc      write the API documentation of the project's modules into out/doc" & chr( 10 )
+        outp += "  (their options: --profile, --manifest, --options, -j, --message-format, --no-cache;" & chr( 10 )
+        outp += "   test's: --timeout <s>, --filter <text>, --no-run, and the program's after --)" & chr( 10 )
         outp += "  tiko c2t      translate a C header into a tiko header: tiko c2t <in.h> [-o <out.ti>|-]" & chr( 10 ) & chr( 10 )
     end if
 
@@ -409,6 +413,150 @@ private function FbcWarnLevel_( byval d as Tko.DiagId ) as int32
     return -1
 end function
 
+'' ---------------------------------------------------------------- what a '#cmdline' may ask
+''
+'' A '#cmdline' IS THE SOURCE CHOOSING ITS OWN COMPILE, and compiling a file must not be
+'' running it. So a source may choose how its program is built -- fbc's options, which is
+'' every option the corpus writes in a '#cmdline' (-mt, -exx, -s, -w, -m, -g, -x, -d, -t,
+'' -O, -Wl -rpath, -z, -maxinstdepth, an '.rc') -- and nothing that only the person running
+'' the compiler should choose: where it writes besides the program (--diagnostics-file,
+'' -ccachedir, -cimport-out), what it reads its packages and clang arguments from
+'' (--pkg-dir, -copt, -csysroot), and the inspection modes. An ALLOW-list: an option added
+'' later is refused here until someone decides a source may have it.
+''
+'' Two of fbc's own are narrowed, because each names something outside the program. The
+'' output path ('-x', '-o') must be RELATIVE and may not climb ('..'): fbc lets a source
+'' put its program anywhere the user can write, and the corpus only ever names one beside
+'' the build. And '-Wl' pieces must be linker options from a short list of ones that
+'' change only the program -- '-Wl -plugin,./x.so' makes GNU ld load and RUN x.so, and a
+'' '@file' piece is a response file of anything at all. A piece that is not an option is
+'' an input file, named relative. fbc has neither check.
+
+private function SourcePathOk_( byref p as string ) as boolean
+    dim as string q = p
+    for k as int32 = 0 to len( q ) - 1
+        if q[k] = asc( "\" ) then q[k] = asc( "/" )
+    next
+    if len( q ) = 0 then return true
+    if q[0] = asc( "/" ) then return false
+    if (len( q ) >= 2) andalso (q[1] = asc( ":" )) then return false
+    return instr( "/" & q & "/", "/../" ) = 0
+end function
+
+'' A linker option that is followed by its value as the next piece ('-rpath,$ORIGIN'), or
+'' carries it after '=' ('--subsystem=windows').
+private function LinkValueFlag_( byref f as string ) as boolean
+    select case f
+    case "-rpath", "--rpath", "-rpath-link", "--rpath-link", "-z", "-L", _
+         "-soname", "--soname", "-h", "-install_name", "--subsystem", "--stack", "--heap", _
+         "--image-base", "--major-subsystem-version", _
+         "--minor-subsystem-version", "-compatibility_version", "-current_version"
+        return true
+    end select
+    return false
+end function
+
+private function LinkFlag_( byref f as string ) as boolean
+    select case f
+    case "-s", "-S", "--strip-all", "--strip-debug", "-E", "--export-dynamic", _
+         "--as-needed", "--no-as-needed", "--gc-sections", "--no-gc-sections", _
+         "-Bstatic", "-Bdynamic", "-Bsymbolic", "--whole-archive", "--no-whole-archive", _
+         "--start-group", "--end-group", "--enable-new-dtags", "--disable-new-dtags", _
+         "--large-address-aware", "--no-undefined", "--allow-shlib-undefined", _
+         "--no-insert-timestamp", "--build-id", "-O0", "-O1", "-O2", _
+         "-dead_strip", "-headerpad_max_install_names", "-no_pie", "-pie", "-no-pie"
+        return true
+    end select
+    return false
+end function
+
+'' lld-link's options that change only the program -- not /OUT, /PDB, /MAP or /IMPLIB, which
+'' write where they say, and not /MLLVM.
+private function LinkSlashFlag_( byref f as string ) as boolean
+    select case f
+    case "/STACK", "/HEAP", "/SUBSYSTEM", "/LARGEADDRESSAWARE", "/DYNAMICBASE", "/NXCOMPAT", _
+         "/HIGHENTROPYVA", "/CETCOMPAT", "/GUARD", "/FIXED", "/OPT", "/INCREMENTAL", "/RELEASE", _
+         "/ENTRY", "/NODEFAULTLIB", "/DEFAULTLIB", "/DELAYLOAD", "/EXPORT", "/ALIGN", _
+         "/FILEALIGN", "/VERSION", "/MERGE", "/SECTION", "/BASE", "/MANIFEST", "/MANIFESTUAC", _
+         "/MANIFESTDEPENDENCY", "/TSAWARE", "/STUB", "/IGNORE"
+        return true
+    end select
+    return false
+end function
+
+'' A VALUE NEVER STARTS WITH '-'. Were it allowed to, a flag the linker reads with an
+'' OPTIONAL value would let the next piece through unchecked: '--build-id,-plugin,x.so'.
+private function SourceLinkOk_( byref value as string, byref why as string ) as boolean
+    dim as boolean wantValue = false
+    dim as int32 st = 1
+    do
+        dim as int32 cm = instr( st, value, "," )
+        dim as string piece = iif( cm = 0, mid( value, st ), mid( value, st, cm - st ) )
+        if len( piece ) = 0 then
+        elseif wantValue then
+            if piece[0] = asc( "-" ) then
+                why = "the linker option before '" & piece & "' takes a value, not an option"
+                return false
+            end if
+            wantValue = false                   '' the value of the flag before it
+        elseif piece[0] = asc( "-" ) then
+            dim as int32 eq = instr( piece, "=" )
+            dim as string base_ = iif( eq > 0, left( piece, eq - 1 ), piece )
+            if (eq = 0) andalso LinkFlag_( piece ) then
+            elseif (eq = 0) andalso LinkValueFlag_( piece ) then
+                wantValue = true
+            elseif (eq > 0) andalso (LinkValueFlag_( base_ ) orelse (base_ = "--hash-style") orelse (base_ = "--build-id")) then
+            elseif (len( piece ) > 2) andalso ((left( piece, 2 ) = "-L") orelse (left( piece, 2 ) = "-l")) then
+            else
+                why = "the linker option '" & piece & "' is not one a source may pass"
+                return false
+            end if
+        elseif piece[0] = asc( "/" ) then
+            '' lld-link's own spelling ('-Wl /STACK:8388608'); on ELF an absolute input, which
+            '' a source names relative or through -l / -p instead.
+            dim as int32 co = instr( piece, ":" )
+            if LinkSlashFlag_( Tko.Text.UpperAscii( iif( co > 0, left( piece, co - 1 ), piece ) ) ) = false then
+                why = "the linker option '" & piece & "' is not one a source may pass"
+                return false
+            end if
+        elseif piece[0] = asc( "@" ) then
+            why = "'" & piece & "' would reach the linker as a response file"
+            return false
+        end if
+        if cm = 0 then exit do
+        st = cm + 1
+    loop
+    return true
+end function
+
+private function SourceOptionOk_ _
+    ( byval id as Tko.OptId, byref value as string, byref why as string ) as boolean
+
+    select case id
+    case Tko.OPT_OUTPUT, Tko.OPT_EXEOUT
+        if SourcePathOk_( value ) then return true
+        why = "a source may name its output only relative to the build, without '..'"
+        return false
+    case Tko.OPT_LINKOPT
+        return SourceLinkOk_( value, why )
+    case Tko.OPT_RESTART, Tko.OPT_EXTENDED, Tko.OPT_VERBOSE, _
+         Tko.OPT_INCLUDE, Tko.OPT_DEFINE, Tko.OPT_LIBPATH, Tko.OPT_LIB, _
+         Tko.OPT_NORPATH, Tko.OPT_NOCOPYLIBS, Tko.OPT_COMPILE, _
+         Tko.OPT_DLL, Tko.OPT_DYLIB, Tko.OPT_STATICLIB, _
+         Tko.OPT_ERRCHK, Tko.OPT_ERRCHKX, Tko.OPT_ERRCHKXX, Tko.OPT_DEBUG, _
+         Tko.OPT_EARRAY, Tko.OPT_ENULLPTR, Tko.OPT_ELOCATION, Tko.OPT_EARRAYDIMS, _
+         Tko.OPT_EASSERT, Tko.OPT_EDEBUG, Tko.OPT_EDEBUGINFO, Tko.OPT_EUNWIND, _
+         Tko.OPT_OPTLEVEL, Tko.OPT_MT, Tko.OPT_PIC, Tko.OPT_MAINMOD, Tko.OPT_SANITIZE, _
+         Tko.OPT_TARGET, Tko.OPT_M64, Tko.OPT_M32, Tko.OPT_SUBSYS, Tko.OPT_STACK, _
+         Tko.OPT_WERROR, Tko.OPT_WNO, Tko.OPT_WLEVEL, Tko.OPT_MAXERR, Tko.OPT_MAXINSTDEPTH, _
+         Tko.OPT_COLOR, Tko.OPT_DIAGFMT, _
+         Tko.OPT_CINCLUDE, Tko.OPT_CDEFINE, Tko.OPT_CNOMACROS, Tko.OPT_CNOVERIFY, Tko.OPT_CNOCACHE
+        return true
+    end select
+    why = "only the command line may set it"
+    return false
+end function
+
 function Parse _
     ( byref args as Tko.StrVec, byref opts as Tko.DriverOptions, _
       byref diags as Tko.DiagnosticEngine ) as boolean
@@ -417,11 +565,19 @@ function Parse _
 
     dim as boolean ok = true
     dim as boolean noMoreOptions = false
+    dim as boolean fromSource = false           '' past SOURCE_MARK: a '#cmdline''s words
     dim as int32 i = 0
     dim as int32 n = args.Count
 
     while i < n
         dim as string arg = args[i]
+
+        if arg = SOURCE_MARK then
+            fromSource = true
+            noMoreOptions = false               '' the user's '--' ended the user's options
+            i += 1
+            continue while
+        end if
 
         dim as boolean isOption = (len( arg ) > 1) andalso (arg[0] = asc( "-" ))
         if noMoreOptions orelse (isOption = false) then
@@ -492,6 +648,14 @@ function Parse _
             end if
         end if
 
+        dim as string why = ""
+        if fromSource andalso (SourceOptionOk_( id, value, why ) = false) then
+            diags.ReportGlobal( Tko.TKO0178, arg, why )
+            ok = false
+            i += 1
+            continue while
+        end if
+
         select case id
         case Tko.OPT_HELP
             opts.showHelp = true
@@ -499,10 +663,14 @@ function Parse _
         case Tko.OPT_VERSION  : opts.showVersion = true
         case Tko.OPT_VERBOSE  : opts.verbose = true
         case Tko.OPT_RESTART  : '' see options.ti: the restart is not a flag here
-        case Tko.OPT_EXTENDED : '' see options.ti: '-z <option>' is taken and dropped
+        case Tko.OPT_EXTENDED
+            '' see options.ti: '-z <option>' is taken and dropped, but for 'nocmdline'
+            if Tko.Text.LowerAscii( value ) = "nocmdline" then opts.noCmdline = true
 
         case Tko.OPT_INCLUDE  : opts.includePaths.Push( value )
         case Tko.OPT_PKGDIR   : opts.pkgDir = value
+        case Tko.OPT_PKGROOT  : opts.packageRoot = value
+        case Tko.OPT_EMITDOC  : opts.emitDoc = value
         case Tko.OPT_BUILDONLY : opts.buildOnlyUnit = valint( value )
         case Tko.OPT_DEFINE   : opts.defines.Push( value )
         case Tko.OPT_LIBPATH  : opts.libPaths.Push( value )
@@ -584,6 +752,15 @@ function Parse _
         '' subsystem 3, '-s gui' gives 2, and fbc hands ld '-subsystem windows'. Without
         '' it a GUI program -- tracks -- linked as a console one and opened a stray console
         '' window beside its own. Any other value is refused rather than guessed at.
+        '' -fsanitize=address, clang's spelling. 'address' alone: the others (thread, undefined,
+        '' memory) have no runtime measured here, so they are refused rather than passed on.
+        case Tko.OPT_SANITIZE
+            if Tko.Text.LowerAscii( value ) = "address" then
+                opts.sanitizeAddress = true
+            else
+                diags.ReportGlobal( Tko.TKO0106, value, "-fsanitize" )
+                ok = false
+            end if
         case Tko.OPT_SUBSYS
             select case Tko.Text.LowerAscii( value )
             case "gui"     : opts.guiSubsystem = true
@@ -721,6 +898,7 @@ function Parse _
         case Tko.OPT_PRINTGRAPH : opts.printGraph = true
         case Tko.OPT_PRINTCINC : opts.printCIncludes = true
         case Tko.OPT_EMITTKI   : opts.emitTki = true
+        case Tko.OPT_TEST      : opts.testMode = true
         case Tko.OPT_FRONTEND : opts.frontendOnly = true
         case Tko.OPT_NOMODCACHE : opts.noModuleCache = true
         case Tko.OPT_CLEANMODCACHE : opts.cleanModuleCache = true
@@ -801,6 +979,10 @@ function Parse _
 
     if opts.pic andalso Tko.TargetIsWindows( opts.target ) then
         diags.ReportGlobal( Tko.TKO0123, opts.targetName )
+        ok = false
+    end if
+    if opts.sanitizeAddress andalso Tko.TargetIsWindows( opts.target ) andalso (Tko.TargetLayoutFor( opts.target ).isMsvc = false) then
+        diags.ReportGlobal( Tko.TKO0179, opts.targetName )
         ok = false
     end if
 

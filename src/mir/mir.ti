@@ -42,8 +42,8 @@ namespace Tko.Mir
         '' the stack, as AAPCS64 C.3 / C.11 require: measured, a '[3 x double]' with two V
         '' registers left went on the stack whole and the double after it followed (NSRN =
         '' 8). Separate scalars would have split it. An HFA has one to four members, so these
-        '' are all of them; no 16-aligned aggregate exists in FreeBASIC, so clang's 'i128'
-        '' has no counterpart here.
+        '' are all of them. (A UDT holding tiko's int128 IS 16-aligned; clang passes it on
+        '' AAPCS64 as '[2 x i128]'/'i128', which these do not model -- see MT_I128 below.)
         MT_HFA_F32_1
         MT_HFA_F32_2
         MT_HFA_F32_3
@@ -53,6 +53,13 @@ namespace Tko.Mir
         MT_HFA_F64_3
         MT_HFA_F64_4
         MT_A2_I64
+        '' TIKO'S int128/uint128 (type.ti): LLVM's i128, 16-aligned. Last, so every older
+        '' type keeps its number.
+        MT_I128
+        '' WIN64'S int128 RETURN COERCION, '<2 x i64>' in XMM0, which only the ABI pass
+        '' writes: clang and gcc return __int128 there on win64 (probed 2026-11-19, clang
+        '' 23, msvc and mingw triples), where a raw IR 'i128' comes back in RAX:RDX.
+        MT_V2I64
     end enum
 
     '' MIR( opcode, mnemonic, operand count, has result )
@@ -215,6 +222,11 @@ namespace Tko.Mir
     const TKO_EB_INTEGER as uint32 = 1
     const TKO_EB_SSE     as uint32 = 2
     const TKO_EB_MEMORY  as uint32 = 3
+    '' Bit 4 on SysV: the aggregate is 16-ALIGNED (it holds an int128). Classes compare with it
+    '' masked off (TKO_EB_CLS); a by-value copy in memory is then 'byval ... align 16', as
+    '' clang's is -- an 8-aligned one put it in the wrong stack slot (2026-11-19, clang 23).
+    const TKO_EB_ALIGN16 as uint32 = 16
+    #define TKO_EB_CLS( p )        ((p) and 15)
     '' Eightbyte 0 in bits 0-1, eightbyte 1 in bits 2-3. MEMORY in eightbyte 0 means
     '' the whole aggregate, and nothing reads eightbyte 1 then.
     #define TKO_EB_PACK( c0, c1 )  ((c0) or ((c1) shl 2))
@@ -228,6 +240,10 @@ namespace Tko.Mir
     '' Everything else -- integer registers or memory -- follows from the size alone.
     const TKO_AA_MARK      as uint32 = &h80000000
     const TKO_AA_HFA_DBL   as uint32 = 8
+    '' Bit 4: the aggregate is 16-ALIGNED (it holds an int128). clang passes and returns one of
+    '' 9 to 16 bytes as 'i128', not '[2 x i64]', so it starts on an EVEN register pair or a
+    '' 16-aligned stack slot (probed 2026-11-19, clang 23, arm64-apple-macosx13.0).
+    const TKO_AA_ALIGN16   as uint32 = 16
     #define TKO_AA_IS( p )         (((p) and TKO_AA_MARK) <> 0)
     #define TKO_AA_HFAN( p )       ((p) and 7)
 
@@ -318,6 +334,9 @@ namespace Tko.Mir
         as int32     count
         as uint32    callee      '' M_CALL / M_CALL_RTL: index into functions/externs
         as int64  imm         '' M_CONST integer payload, M_ALLOCA slot index
+        '' THE HIGH HALF of an MT_I128 M_CONST (imm is the low): ConstInt sign-extends into it,
+        '' ConstInt128 sets it. Read for MT_I128 only.
+        as int64  immHi
         as float64   fimm        '' M_CONST float payload
         '' The SOURCE LINE of the statement it was lowered from, in the procedure's own
         '' file, 0 when unknown -- what '-g' writes as a DILocation. Not dumped.
@@ -611,6 +630,9 @@ namespace Tko.Mir
         as Tko.TypeId frontendType
         as int32     size
         as int64  initInt        '' compile-time initial value
+        '' THE HIGH HALF of an i128 global's initialiser (initInt is the low): int128's
+        '' 'dim shared g as uint128 = &hFFFFFFFFFFFFFFFFull' is 2^64-1, not -1.
+        as int64  initHi
         as float64   initFlt
         '' AN AGGREGATE'S initial value, as the raw bytes of its storage. fbc emits
         '' 'static struct $1G G$1 = { 1u, 2, 3 };' -- a static UDT is initialised where
@@ -647,6 +669,12 @@ namespace Tko.Mir
         '' Set by Codegen.LowerModule. The emitter refuses a module the ABI pass did not
         '' rewrite, rather than inferring it from the first MT_AGG it meets (review MIR-07).
         as boolean abiLowered
+        '' THE MODULE HOLDS A 16-ALIGNED TYPE -- int128, or a UDT with one in it (types/type.ti).
+        '' Then every aggregate slot of 16 bytes or more is ALLOCATED 16-aligned, the ABI pass's
+        '' copies and sret destinations included: those carry no type, and clang-compiled C
+        '' given one may use movaps on it. Set by the driver before the ABI pass (unit.tiko);
+        '' a module without one keeps every alignment it had.
+        as boolean align16
         as MirFunctionVec functions
         as MirGlobalVec globals
         '' The DATA blocks' entries, pooled: FB.Array by value inside a struct that

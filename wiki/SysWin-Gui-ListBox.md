@@ -251,12 +251,6 @@ Replaces item `index` with a new string and item data: it deletes the item, inse
 `pwszNewText` at the same index (a sorted list box is not re-sorted), sets its item data to
 `pNewData` (0 by default) and then selects it.
 
-The selection step depends on the style. A single-selection list box selects the new item. An
-`LBS_EXTENDEDSEL` list box keeps the new text but the selection step fails, and the function
-returns `LB_ERR`. An `LBS_MULTIPLESEL` list box gets `LB_SETSEL` with the index in the place of
-the select flag, so it selects item 0 (or, when `index` is 0, deselects it) and leaves the new
-item unselected.
-
 | Parameter | Meaning |
 | --- | --- |
 | `hListBox` | The list box. |
@@ -282,9 +276,7 @@ Microsoft Learn: [LB_INSERTSTRING](https://learn.microsoft.com/en-us/windows/win
 function SetText( byval hListBox as HWND, byval index as long, byval pwszNewText as wstring ptr ) as long
 ```
 
-Replaces the text of item `index`, like [ReplaceString](#replacestring) without the item-data
-step: the item is deleted and inserted again, so its item data becomes 0. The new item is then
-selected, with the same per-style behaviour as [ReplaceString](#replacestring).
+Replaces the text of item `index`.
 
 **Returns** as [ReplaceString](#replacestring).
 
@@ -637,9 +629,7 @@ function GetSelect( byval hListBox as HWND, byval startIndex as long = 0 ) as lo
 ```
 
 Returns the first selected item at or after `startIndex`, in an `LBS_EXTENDEDSEL` list box.
-Call it again from the index found plus one to walk the whole selection. Any other list box
-returns the same as [GetCurSel](#getcursel) and `startIndex` is ignored; in an
-`LBS_MULTIPLESEL` list box that is the caret item, which may not be selected.
+Call it again from the index found plus one to walk the whole selection.
 
 **Returns** the index, or -1 when no selected item is found. With items 1 to 3 selected,
 `GetSelect( h )` is 1, `GetSelect( h, 2 )` is 2 and `GetSelect( h, 4 )` is -1.
@@ -679,10 +669,7 @@ function SetSel( byval hListBox as HWND, byval fSelect as boolean, byval index a
 ```
 
 Selects (`fSelect` `true`) or deselects item `index` of an `LBS_EXTENDEDSEL` list box; -1, the
-default, means every item. Any other list box gets [SetCurSel](#setcursel) with `index`, and
-`fSelect` is ignored: a single-selection list box selects `index` even when `fSelect` is
-`false` (-1 clears its selection), and an `LBS_MULTIPLESEL` list box refuses the call and
-returns `LB_ERR`.
+default, means every item.
 
 | Parameter | Meaning |
 | --- | --- |
@@ -712,9 +699,7 @@ The first form finds the first item whose text begins with `pwszText`, ignoring 
 starting after item `start` (-1 for the top), and selects it, scrolling it into view.
 Single-selection list boxes only.
 
-The second form selects by index, not by text: in an `LBS_EXTENDEDSEL` list box it adds item
-`index` to the selection (-1, the default, selects every item); in any other it calls
-[SetCurSel](#setcursel) with `index`.
+The second form selects by index, not by text.
 
 **Returns** the index of the item selected, or `LB_ERR` (first form); 0 or `index`, or `LB_ERR`
 (second form).

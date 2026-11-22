@@ -54,6 +54,10 @@ Types that provide special capabilities to be used directly or to be extended by
 
 64-bit wide data types that store integer values.
 
+**[Int128 and UInt128](Category-Fixed-Width-Types#128-bit-integers)**
+
+ **tiko:** 128-bit wide data types that store integer values, the same as C's `__int128`.
+
 ***Floating-point types***
 
 **[Single](Single)**

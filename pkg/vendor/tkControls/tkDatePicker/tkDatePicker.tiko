@@ -230,6 +230,7 @@ public type TKDATEPICKER_STATE
     DropDownCallback     as DTP_DropDownCallbackSub
     PaintCallback        as DTP_PaintCallbackSub
     DayPaintCallback     as DTP_DayPaintCallbackSub
+    pDayCur              as TKCALENDAR_DAYPAINTINFO ptr  ' the calendar's day being painted, for PaintDayDefault
     MessageCallback      as DTP_MessageCallbackFunc
     TooltipCallback      as DTP_TooltipCallbackFunc
 end type
@@ -492,7 +493,9 @@ sub DtpCalDayPaint( byval ci as TKCALENDAR_DAYPAINTINFO ptr )
     d.isAdjacent = ci->isAdjacent : d.isWeekend = ci->isWeekend : d.isToday = ci->isToday
     d.isSelected = ci->isSelected : d.isHot = ci->isHot : d.isDisabled = ci->isDisabled
     d.isEnabled = ci->isEnabled
+    p->pDayCur = ci
     p->DayPaintCallback( @d )
+    p->pDayCur = 0
 end sub
 
 function DtpCalTooltip( byval ti as TKCALENDAR_TOOLTIPINFO ptr ) as boolean
@@ -1257,6 +1260,7 @@ public sub tkDatePicker_SetBorderThickness( byval hCtrl as TK_WIDGET ptr, byval 
     dim as TKDATEPICKER_STATE ptr p = GetDatePickerPointer( hCtrl )
     if p = 0 then exit sub
     p->nBorderThick = iif( nThickness < 0, 0, nThickness )
+    p->bShapePinned = true                      ' the theme's BorderWidth leaves it alone now
     DtpRefresh( p )
 end sub
 
@@ -1434,6 +1438,88 @@ public sub tkDatePicker_SetFormatCallback( byval hCtrl as TK_WIDGET ptr, byval u
     DtpFormatIntoField( p )
 end sub
 
+' The ISO text the control writes with no Format callback: yyyy-MM-dd.
+public function tkDatePicker_FormatIso( byval pDate as TKDATE ptr ) as ustring
+    if pDate = 0 then return ""
+    return DtpPad( pDate->wYear, 4 ) & "-" & DtpPad( pDate->wMonth, 2 ) & "-" & DtpPad( pDate->wDay, 2 )
+end function
+
+' Reads "yyyy-M-d" (- / or . between the parts, spaces around them ignored) into *pDate. FALSE for
+' anything else or a day the month doesn't have -- a Parse callback's fallback.
+public function tkDatePicker_ParseIso( byval sText as ustring, byval pDate as TKDATE ptr ) as boolean
+    if pDate = 0 then return false
+    dim as string t = trim( sText )
+    dim as long part( 0 to 2 ), n = 0, digits = 0
+    for i as long = 1 to len( t )
+        dim as long c = asc( mid( t, i, 1 ) )
+        if (c >= 48) andalso (c <= 57) then
+            if n > 2 then return false
+            part( n ) = part( n ) * 10 + (c - 48)
+            digits += 1
+            if digits > 4 then return false
+        elseif (c = 45) orelse (c = 47) orelse (c = 46) then
+            if (digits = 0) orelse (n >= 2) then return false
+            n += 1
+            digits = 0
+        elseif c <> 32 then
+            return false
+        end if
+    next
+    if (n <> 2) orelse (digits = 0) then return false
+    dim as long y = part( 0 ), m = part( 1 ), d = part( 2 )
+    if (y < 1) orelse (m < 1) orelse (m > 12) orelse (d < 1) then return false
+    if d > tkDatePicker_DaysInMonth( y, m ) then return false
+    *pDate = tkCalendar_MakeDate( y, m, d )
+    return true
+end function
+
+' The date from its parts, as SetDate. For a form designer, whose rows hold numbers, not a TKDATE.
+public sub tkDatePicker_SetDateParts( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+    if (y < 1) orelse (m < 1) orelse (m > 12) orelse (d < 1) then exit sub
+    if d > tkDatePicker_DaysInMonth( y, m ) then d = tkDatePicker_DaysInMonth( y, m )
+    dim as TKDATE st = tkCalendar_MakeDate( y, m, d )
+    tkDatePicker_SetDate( hCtrl, st )
+end sub
+
+' One end of the range from its parts, the other end kept; a year of 0 removes that end.
+public sub tkDatePicker_SetMinDate( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+    dim as TKDATE stMin, stMax
+    dim as boolean hasMin, hasMax
+    tkDatePicker_GetRange( hCtrl, stMin, stMax, hasMin, hasMax )
+    hasMin = (y >= 1) andalso (m >= 1) andalso (m <= 12) andalso (d >= 1)
+    if hasMin then
+        if d > tkDatePicker_DaysInMonth( y, m ) then d = tkDatePicker_DaysInMonth( y, m )
+        stMin = tkCalendar_MakeDate( y, m, d )
+    end if
+    tkDatePicker_SetRange( hCtrl, stMin, stMax, hasMin, hasMax )
+end sub
+
+public sub tkDatePicker_SetMaxDate( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+    dim as TKDATE stMin, stMax
+    dim as boolean hasMin, hasMax
+    tkDatePicker_GetRange( hCtrl, stMin, stMax, hasMin, hasMax )
+    hasMax = (y >= 1) andalso (m >= 1) andalso (m <= 12) andalso (d >= 1)
+    if hasMax then
+        if d > tkDatePicker_DaysInMonth( y, m ) then d = tkDatePicker_DaysInMonth( y, m )
+        stMax = tkCalendar_MakeDate( y, m, d )
+    end if
+    tkDatePicker_SetRange( hCtrl, stMin, stMax, hasMin, hasMax )
+end sub
+
+' Paint callbacks' ways to draw what would have been drawn, then add to it: the editing box, and a
+' calendar day (only inside a day-paint callback).
+public sub tkDatePicker_PaintDefault( byval pi as TKDATEPICKER_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKDATEPICKER_STATE ptr p = GetDatePickerPointer( pi->hCtrl )
+    if p then DtpRenderDefault( p, pi )
+end sub
+
+public sub tkDatePicker_PaintDayDefault( byval d as TKDATEPICKER_DAYPAINTINFO ptr )
+    if d = 0 then exit sub
+    dim as TKDATEPICKER_STATE ptr p = GetDatePickerPointer( d->hCtrl )
+    if (p <> 0) andalso (p->pDayCur <> 0) then tkCalendar_PaintDayDefault( p->pDayCur )
+end sub
+
 public sub tkDatePicker_SetDateChangedCallback( byval hCtrl as TK_WIDGET ptr, byval usersub as DTP_DateChangedCallbackSub )
     dim as TKDATEPICKER_STATE ptr p = GetDatePickerPointer( hCtrl )
     if p then p->DateChangedCallback = usersub
@@ -1548,5 +1634,7 @@ private sub ApplyThemeShape( byval w as TK_WIDGET ptr )
     dim as long v
     v = iif( sh.CornerRadius >= 0, tkHost_Scale( w->pHost, sh.CornerRadius ), tkHost_Scale( w->pHost, CDTP_DEFAULT_CORNERRADIUS ) )
     if p->nCornerRadius <> v then tkDatePicker_SetCornerRadius( w, v )
+    v = iif( sh.BorderWidth >= 0, sh.BorderWidth, CDTP_DEFAULT_BORDERTHICK )
+    if p->nBorderThick <> v then tkDatePicker_SetBorderThickness( w, v )
     p->bShapePinned = false
 end sub

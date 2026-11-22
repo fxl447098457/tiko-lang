@@ -90,11 +90,13 @@ EOF
 cat > "$W/linux/run.sh" <<'EOF'
 set -u
 cd "$1" || exit 2
+# Ubuntu names it clang-18 when no unversioned clang is installed.
+CC=clang; command -v clang > /dev/null 2>&1 || CC=clang-18
 LD=""
 command -v ld.lld > /dev/null 2>&1 && LD="-fuse-ld=lld"
 mkdir -p out run
 while read -r name lib; do
-    if ! clang -target x86_64-pc-linux-gnu $LD -s -Wl,--gc-sections lib/fbrt0.o obj/$name.o -o run/$name \
+    if ! $CC -target x86_64-pc-linux-gnu $LD -s -Wl,--gc-sections lib/fbrt0.o obj/$name.o -o run/$name \
             -Llib lib/lib$lib.a -lm -lpthread -ltinfo > out/$name.link 2>&1; then
         echo "LINKFAIL" > out/$name.out; continue
     fi

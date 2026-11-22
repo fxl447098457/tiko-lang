@@ -9,7 +9,9 @@
 ' its Dark and Light variants side by side through a switch, and a live preview of the controls
 ' wearing it (a theme scope, tkTheme_ApplyTo, so the rest of tkEdit keeps its own theme).
 '
-'   Start            a gallery of themes (shipped with tkEdit, and the user's library); one accent
+'   Theme            a gallery of themes (shipped with tkEdit, and the user's library): selecting one
+'                    makes it the theme being edited; Clone copies it into the library, Delete
+'                    removes a library one (never one tkEdit ships); one accent
 '   Colours          the 23 roles of the variant shown, each from the theme or set here
 '   Fonts and Shape  the font files and sizes, corner radius and border width
 '   Styles           named role remaps ("Primary": Surface = @Accent), one "Role = colour" a line
@@ -29,13 +31,16 @@
 #import "vendor/tkControls/tkLabel"
 #import "vendor/tkControls/tkTextBox"
 #import "vendor/tkControls/tkTabControl"
+#import "vendor/tkControls/tkTabBar"
 #import "vendor/tkControls/tkSelectBar"
 #import "vendor/tkControls/tkNumericUpDown"
 #import "vendor/tkControls/tkPanel"
+#import "vendor/tkControls/tkGroupBox"
 #import "vendor/tkControls/tkCheckBox"
 #import "vendor/tkControls/tkOptionButton"
 #import "vendor/tkControls/tkToggle"
 #import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkScrollPanel"
 #import "vendor/tkControls/tkProgressBar"
 #import "vendor/tkControls/tkColorPicker"
 #import "vendor/tkControls/tkTheme"
@@ -49,13 +54,16 @@ using tkButton
 using tkLabel
 using tkTextBox
 using tkTabControl
+using tkTabBar
 using tkSelectBar
 using tkNumericUpDown
 using tkPanel
+using tkGroupBox
 using tkCheckBox
 using tkOptionButton
 using tkToggle
 using tkComboBox
+using tkScrollPanel
 using tkProgressBar
 using tkColorPicker
 using tkTheme
@@ -63,14 +71,31 @@ using tkHost
 using tkPaint
 using model
 
-const as long WIN_CX = 900
-const as long WIN_CY = 600
+' 860 x 480: at 175 % that is 1505 x 840 pixels, inside a 1080-line laptop screen (980 x 600 was
+' 1050 lines tall there, author 2026-11-22); never more than the display's work area (Open)
+const as long WIN_CX = 860
+const as long WIN_CY = 480
 const as long ROW_CY = 28
 const as long GAP = 8
-const as long PREVIEW_CX = 340
+const as long PREVIEW_CX = 280
+const as long GLYPH_CX = 40                     ' a glyph button's width (the Resource Center's)
+const as ulong GLYPH_CLONE = &hF32B             ' copy (two sheets), the bundled icon font's
+const as ulong GLYPH_DELETE = &hF34C            ' a bin, as the Resource Center's Remove
+' the Styles page's rows: role combo item 0 = from the theme, 1 = a fixed colour, 2 + r = role r
+const as long STYLE_ITEM_THEME = 0
+const as long STYLE_ITEM_FIXED = 1
+const as long STYLE_ITEM_ROLE0 = 2
+const as long STYLE_MAIN_ROWS = 4      ' Face, Text, Border, Accent; the rest behind Show all roles
+const as long ID_STYLE_PICK = 200      ' + row: a row's Pick... button
+const as long ID_STYLE_RESET = 300     ' + row: a row's Reset button
 
 public type ThemeDialog as ThemeDialog_
 public type ThemeDialogSub as sub( byval tc as ThemeDialog ptr )
+' Delete's question: true to go ahead.
+public type ThemeAskFunc as function( byval tc as ThemeDialog ptr, byref text as const ustring ) as boolean
+' A font slot's "...": the Resource Center picks a font (a project's theme only). True on Select,
+' picked then "res:<name>" (or "" for none).
+public type ThemePickFunc as function( byval tc as ThemeDialog ptr, byref current as const ustring, byref picked as ustring ) as boolean
 
 public type ThemeDialog_
     Win as TK_FORM ptr
@@ -82,10 +107,18 @@ public type ThemeDialog_
     Loading as boolean
     SavingToLibrary as boolean          ' while OnSave writes the library copy (Path is the library's)
     OnSave as ThemeDialogSub
+    Saved as boolean                    ' the host's answer to the last OnSave: written without a problem
     Host as any ptr                     ' the host's, for its callbacks
     ForEditor as boolean                ' the host's: tkEdit's own theme, not a project's
     OnClose as ThemeDialogSub
+    OnPickFont as ThemePickFunc
     GalleryPaths as Array( of ustring )
+    GalleryShipped as Array( of boolean ) ' per gallery row: one tkEdit ships, not the user's library
+    ' where Doc came from (the file opened, or the gallery row picked) and the name it had: tkEdit's
+    ' own theme saved under another name is that file renamed
+    Source as ustring
+    SourceName as ustring
+    OnAsk as ThemeAskFunc               ' Delete asks first through it (none: no question)
 
     TxtName as TK_WIDGET ptr
     LblName as TK_WIDGET ptr
@@ -93,38 +126,52 @@ public type ThemeDialog_
     Tabs as TK_WIDGET ptr
     ' Start
     Gallery as TK_WIDGET ptr
-    BtnUse as TK_WIDGET ptr
+    BtnClone as TK_WIDGET ptr           ' a copy of the theme being edited, in the library
+    BtnDelete as TK_WIDGET ptr          ' the gallery's library theme, gone
     LblAccent as TK_WIDGET ptr
     TxtAccent as TK_WIDGET ptr
+    AccentSwatch as TK_WIDGET ptr       ' the accent in force, in the variant shown
     BtnAccentPick as TK_WIDGET ptr
     ' Colours
     Roles as TK_WIDGET ptr
     TxtRole as TK_WIDGET ptr
+    RoleSwatch as TK_WIDGET ptr         ' the selected role's colour in the variant shown
     BtnRolePick as TK_WIDGET ptr
     BtnRoleReset as TK_WIDGET ptr
     ' Fonts and Shape: labels and fields, in rows
-    FontLabels( 0 to 6 ) as TK_WIDGET ptr
+    FontLabels( 0 to 5 ) as TK_WIDGET ptr
     TxtUIFile as TK_WIDGET ptr
     TxtUIBold as TK_WIDGET ptr
-    NudUISize as TK_WIDGET ptr
-    TxtGlyph as TK_WIDGET ptr
+    ChkSizeSystem as TK_WIDGET ptr      ' checked = UISize 0: the OS's normal size at run time (GLYPHS.md GV2)
+    NudUISize as TK_WIDGET ptr          ' the size when System is not checked
     TxtMono as TK_WIDGET ptr
     NudRadius as TK_WIDGET ptr
     NudBorder as TK_WIDGET ptr
+    ChkEmbed as TK_WIDGET ptr           ' [fonts] embed: the fonts inside the program (a project's theme only)
+    BtnFontPick( 0 to 2 ) as TK_WIDGET ptr  ' "..." by the UI, Bold and Mono files: the Resource Center
     ' Styles
     StyleList as TK_WIDGET ptr
     BtnStyleAdd as TK_WIDGET ptr
     BtnStyleDel as TK_WIDGET ptr
     LblStyleName as TK_WIDGET ptr
     TxtStyleName as TK_WIDGET ptr
-    LblStyleLines as TK_WIDGET ptr
-    TxtStyleLines as TK_WIDGET ptr
-    LblStyleProblem as TK_WIDGET ptr
+    StyleFrame as TK_WIDGET ptr         ' a line border around StyleRows
+    StyleRows as TK_WIDGET ptr          ' a scroll panel: one row per role the style can change
+    SrRole( 0 to TKROLE_COUNT - 1 ) as long          ' by row: the role it edits (Face, Text, Border, Accent first)
+    SrLabel( 0 to TKROLE_COUNT - 1 ) as TK_WIDGET ptr
+    SrCombo( 0 to TKROLE_COUNT - 1 ) as TK_WIDGET ptr
+    SrSwatch( 0 to TKROLE_COUNT - 1 ) as TK_WIDGET ptr
+    SrPick( 0 to TKROLE_COUNT - 1 ) as TK_WIDGET ptr
+    SrReset( 0 to TKROLE_COUNT - 1 ) as TK_WIDGET ptr
+    ChkAllRoles as TK_WIDGET ptr
     ' the preview, wearing Doc through a scope
     Preview as TK_WIDGET ptr
     PvLabel as TK_WIDGET ptr
     PvButton as TK_WIDGET ptr
     PvStyled as TK_WIDGET ptr
+    PvStyledCheck as TK_WIDGET ptr      ' with PvStyled: the selected style on a check box and a toggle
+    PvStyledToggle as TK_WIDGET ptr
+    PvGroup as TK_WIDGET ptr            ' frames the check box, option and toggle
     PvCheck as TK_WIDGET ptr
     PvOption as TK_WIDGET ptr
     PvToggle as TK_WIDGET ptr
@@ -145,19 +192,36 @@ public type ThemeDialog_
     declare sub UseGallery( byval row as long )
     declare sub LoadFields( )
     declare sub LoadRole( )
+    declare sub ShowRoleSwatch( )
+    declare sub LoadAccent( )
+    declare sub ShowVariant( byval dark as boolean )
     declare sub LoadStyle( )
     declare sub Refresh( )
     declare function Theme( ) as TKTHEME_COLORS
     declare function RoleOfRow( byval row as long ) as long
     declare sub SetRoleText( byref text as const ustring )
     declare sub FieldChanged( byval w as TK_WIDGET ptr )
-    declare sub StyleLinesChanged( )
+    declare sub PickFont( byval slot as long )
+    declare function StyleValue( byval k as long ) as ustring
+    declare sub SetStyleValue( byval k as long, byref v as const ustring )
+    declare function StyleRowColour( byval k as long ) as ulong
+    declare sub StyleRowChanged( byval k as long )
+    declare sub PickStyleRow( byval k as long )
+    declare sub LoadStyleRows( )
+    declare sub LayoutStyleRows( )
     declare sub AddStyle( )
     declare sub DeleteStyle( )
     declare sub PickInto( byval box as TK_WIDGET ptr )
     declare function Problems( ) as Array( of ustring )
     declare function LibraryPath( ) as ustring
     declare sub SaveToLibrary( )
+    declare function NameTaken( byref nm as const ustring, byref libPath as const ustring ) as boolean
+    declare function InGallery( byref nm as const ustring ) as boolean
+    declare function SelectedShipped( ) as boolean
+    declare sub ShowThemeButtons( )
+    declare sub CloneTheme( )
+    declare sub DeleteTheme( )
+    declare function RenameRefused( ) as boolean
 end type
 
 ' ---- callbacks: the dialog is the form's Tag --------------------------------------------------------
@@ -183,6 +247,7 @@ private sub OnVariant( byval h as TK_WIDGET ptr, byval oldIdx as long, byval new
     if (d = 0) orelse d->Loading then exit sub
     d->IsDark = (newIdx = 0)
     d->LoadRole( )
+    d->LoadAccent( )
     d->Refresh( )
 end sub
 
@@ -190,6 +255,57 @@ private sub OnRolePick( byval h as TK_WIDGET ptr, byval row as integer )
     dim as ThemeDialog ptr d = DlgOf( h )
     if (d <> 0) andalso (d->Loading = false) then d->LoadRole( )
 end sub
+
+' Moving through the gallery takes the theme under the selection: it becomes the one being edited.
+private sub OnGalleryPick( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as ThemeDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->UseGallery( row )
+end sub
+
+' The form is going, by Close or by the window's own close button (tkApp destroys an owned modeless
+' form between events): the dialog forgets it, its controls' late callbacks find no dialog, and the
+' host hears OnClose -- which may delete the dialog, so nothing touches d after it.
+private sub OnFormGone( byval f as TK_FORM ptr )
+    dim as ThemeDialog ptr d = f->Tag
+    f->Tag = 0
+    if d = 0 then exit sub
+    d->Win = 0
+    if d->OnClose then d->OnClose( d )
+end sub
+
+' A Styles row's drop-down: the theme's own colour, a fixed one, or another role.
+private sub OnStyleCombo( byval h as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+    dim as ThemeDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->StyleRowChanged( h->ctrlId )
+end sub
+
+private sub OnEmbed( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as ThemeDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->Doc.EmbedFonts = isChecked
+end sub
+
+private sub OnSizeSystem( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as ThemeDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->FieldChanged( h )
+end sub
+
+private sub OnAllRoles( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as ThemeDialog ptr d = DlgOf( h )
+    if d then d->LayoutStyleRows( )
+end sub
+
+' The Colours page shown: its box catches up with what changed elsewhere (the Theme page's accent).
+private sub OnTabPick( byval h as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+    dim as ThemeDialog ptr d = DlgOf( h )
+    if (d = 0) orelse d->Loading then exit sub
+    if idxNew = 0 then d->LoadAccent( )
+    if idxNew = 1 then d->LoadRole( )
+end sub
+
+' The dialog's lists show no tooltip: an empty tip is never shown.
+private function NoTip( byval hList as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ustring
+    return ""
+end function
 
 private sub OnStylePick( byval h as TK_WIDGET ptr, byval row as integer )
     dim as ThemeDialog ptr d = DlgOf( h )
@@ -203,15 +319,36 @@ private sub OnButton( byval h as TK_WIDGET ptr, byval id as long )
     dim as ThemeDialog ptr d = DlgOf( h )
     if d = 0 then exit sub
     select case h
-    case d->BtnUse        : d->UseGallery( tkListTree_GetCurSel( d->Gallery ) )
     case d->BtnAccentPick : d->PickInto( d->TxtAccent )
     case d->BtnRolePick   : d->PickInto( d->TxtRole )
-    case d->BtnRoleReset  : d->SetRoleText( "" )
+    case d->BtnRoleReset
+        d->SetRoleText( "" )
+        d->LoadRole( )                  ' the box shows the theme's colour again
     case d->BtnStyleAdd   : d->AddStyle( )
+    case d->BtnFontPick( 0 ) : d->PickFont( 0 )
+    case d->BtnFontPick( 1 ) : d->PickFont( 1 )
+    case d->BtnFontPick( 2 ) : d->PickFont( 2 )
     case d->BtnStyleDel   : d->DeleteStyle( )
-    case d->BtnSave       : if d->OnSave then d->OnSave( d )
+    case d->BtnClone      : d->CloneTheme( )
+    case d->BtnDelete     : d->DeleteTheme( )
+    case d->BtnSave
+        if d->RenameRefused( ) then exit sub
+        ' Save writes the theme, then closes the dialog -- unless the host said it couldn't (its
+        ' message is up and the edits are still here to fix)
+        if d->OnSave then
+            d->Saved = false
+            d->OnSave( d )
+            if d->Saved andalso (d->OnClose <> 0) then d->OnClose( d )
+        end if
     case d->BtnLibrary    : d->SaveToLibrary( )
     case d->BtnClose      : if d->OnClose then d->OnClose( d )
+    case else
+        dim as long k = h->ctrlId
+        if (k >= ID_STYLE_PICK) andalso (k < ID_STYLE_PICK + TKROLE_COUNT) then
+            d->PickStyleRow( k - ID_STYLE_PICK )
+        elseif (k >= ID_STYLE_RESET) andalso (k < ID_STYLE_RESET + TKROLE_COUNT) then
+            d->SetStyleValue( k - ID_STYLE_RESET, "" )
+        end if
     end select
 end sub
 
@@ -243,6 +380,16 @@ private function MakeButton_( byval parent as TK_WIDGET ptr, byref text as const
     return b
 end function
 
+' A small button that is one glyph, as the Resource Center's; tip is its word, shown on hover.
+private function MakeGlyphButton_( byval parent as TK_WIDGET ptr, byval cp as ulong, byref tip as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    tkButton_SetGlyphFont( b, tkForm_Font( tkForm_FromWidget( parent ), TKFONT_GLYPH_LARGE ) )   ' else it draws in the text font
+    tkButton_SetGlyphLeft( b, wchr( cp ) )
+    tkButton_SetTooltipText( b, tip )
+    tkButton_SetClickCallback( b, @OnButton )
+    return b
+end function
+
 private function MakeText_( byval parent as TK_WIDGET ptr, byval multi as boolean = false ) as TK_WIDGET ptr
     dim as TK_WIDGET ptr t = tkTextBox_Create( parent, 1, multi )
     tkTextBox_SetChangeCallback( t, @OnText )
@@ -265,6 +412,7 @@ end function
 private function MakeList_( byval parent as TK_WIDGET ptr ) as TK_WIDGET ptr
     dim as TK_WIDGET ptr l = tkListTree_Create( parent, 1 )
     tkListTree_SetPaintCallback( l, @tkListTree_PaintRowDefault )
+    tkListTree_SetTooltipCallback( l, @NoTip )
     return l
 end function
 
@@ -283,8 +431,20 @@ sub ThemeDialog_.Open( byval owner as TK_FORM ptr, byref themePath as const ustr
     dim as ustring title = caption
     if len( title ) = 0 then title = i18n.Tr( "designer.theme_title", "Project Theme" )
     dim as single sc = 0
-    if owner then sc = tkForm_Host( owner )->fScaleForced
-    Win = tkApp_NewForm( title, WIN_CX, WIN_CY, owner, sc )
+    dim as long winCX = WIN_CX, winCY = WIN_CY
+    if owner then
+        dim as TK_HOST ptr oh = tkForm_Host( owner )
+        sc = oh->fScaleForced
+        ' no bigger than the work area of the owner's display, less room for the frame and title bar
+        dim as SDL_Rect rd
+        if (oh->fScale > 0) andalso SDL_GetDisplayUsableBounds( SDL_GetDisplayForWindow( oh->win ), @rd ) then
+            dim as long maxCX = cint( rd.w * oh->fDensity / oh->fScale ) - 16
+            dim as long maxCY = cint( rd.h * oh->fDensity / oh->fScale ) - 48
+            if (maxCX > 0) andalso (winCX > maxCX) then winCX = maxCX
+            if (maxCY > 0) andalso (winCY > maxCY) then winCY = maxCY
+        end if
+    end if
+    Win = tkApp_NewForm( title, winCX, winCY, owner, sc )
     if Win = 0 then exit sub
     Win->Tag = @this
     dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
@@ -299,64 +459,145 @@ sub ThemeDialog_.Open( byval owner as TK_FORM ptr, byref themePath as const ustr
     tkSelectBar_SetSelChangeCallback( SelVariant, @OnVariant )
 
     Tabs = tkTabControl_Create( root_, 1 )
-    dim as TK_WIDGET ptr pStart = tkTabControl_GetPage( Tabs, tkTabControl_AddPage( Tabs, i18n.Tr( "designer.theme_start", "Start" ) ) )
-    dim as TK_WIDGET ptr pColours = tkTabControl_GetPage( Tabs, tkTabControl_AddPage( Tabs, i18n.Tr( "designer.theme_colours", "Colours" ) ) )
+    dim as TK_WIDGET ptr pStart = tkTabControl_GetPage( Tabs, tkTabControl_AddPage( Tabs, i18n.Tr( "designer.theme_page", "Theme" ) ) )
+    dim as TK_WIDGET ptr pColours = tkTabControl_GetPage( Tabs, tkTabControl_AddPage( Tabs, i18n.Tr( "designer.theme_colours", "Colors" ) ) )
     dim as TK_WIDGET ptr pFonts = tkTabControl_GetPage( Tabs, tkTabControl_AddPage( Tabs, i18n.Tr( "designer.theme_fonts", "Fonts and Shape" ) ) )
     dim as TK_WIDGET ptr pStyles = tkTabControl_GetPage( Tabs, tkTabControl_AddPage( Tabs, i18n.Tr( "designer.theme_styles", "Styles" ) ) )
+    for k as long = 0 to 3
+        tkTabBar_SetClosable( tkTabControl_GetTabBar( Tabs ), k, false )      ' pages, not documents: no X
+    next
 
     Gallery = MakeList_( pStart )
-    BtnUse = MakeButton_( pStart, i18n.Tr( "designer.theme_use", "Use This Theme" ) )
+    tkListTree_SetSelChangeCallback( Gallery, @OnGalleryPick )
+    BtnClone = MakeGlyphButton_( pStart, GLYPH_CLONE, i18n.Tr( "designer.theme_clone", "Clone" ) )
+    BtnDelete = MakeGlyphButton_( pStart, GLYPH_DELETE, i18n.Tr( "designer.theme_delete", "Delete" ) )
+    tkTabControl_SetSelChangeCallback( Tabs, @OnTabPick )
     LblAccent = MakeLabel_( pStart, i18n.Tr( "designer.theme_accent", "Accent" ) )
     TxtAccent = MakeText_( pStart )
+    AccentSwatch = tkPanel_Create( pStart, 1 )
+    tkPanel_SetBorderStyle( AccentSwatch, PNL_BORDER_LINE )
     BtnAccentPick = MakeButton_( pStart, i18n.Tr( "designer.theme_pick", "Pick..." ) )
 
     Roles = tkListTree_Create( pColours, 1 )
     tkListTree_SetPaintCallback( Roles, @PaintRole )
+    tkListTree_SetTooltipCallback( Roles, @NoTip )
     tkListTree_SetSelChangeCallback( Roles, @OnRolePick )
     for r as long = 0 to TKROLE_COUNT - 1
         tkListTree_AddString( Roles, tkTheme_RoleName( r ), r )
     next
     TxtRole = MakeText_( pColours )
+    RoleSwatch = tkPanel_Create( pColours, 1 )
+    tkPanel_SetBorderStyle( RoleSwatch, PNL_BORDER_LINE )
     BtnRolePick = MakeButton_( pColours, i18n.Tr( "designer.theme_pick", "Pick..." ) )
     BtnRoleReset = MakeButton_( pColours, i18n.Tr( "designer.theme_reset", "Reset" ) )
 
     FontLabels( 0 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_ui_font", "UI font" ) )
     FontLabels( 1 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_bold_font", "Bold font" ) )
     FontLabels( 2 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_size", "Size" ) )
-    FontLabels( 3 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_glyph_font", "Glyph font" ) )
-    FontLabels( 4 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_mono_font", "Mono font" ) )
-    FontLabels( 5 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_corner", "Corner radius" ) )
-    FontLabels( 6 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_border", "Border width" ) )
+    FontLabels( 3 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_mono_font", "Mono font" ) )
+    FontLabels( 4 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_corner", "Corner radius" ) )
+    FontLabels( 5 ) = MakeLabel_( pFonts, i18n.Tr( "designer.theme_border", "Border width" ) )
+    ' an empty slot is the bundled font, shown greyed in it (GLYPHS.md GV1); an empty size the OS's (GV2).
+    ' Glyph fonts are the Glyph Picker's, not the theme's (GV3).
     TxtUIFile = MakeText_( pFonts )
+    tkTextBox_SetCueBannerText( TxtUIFile, TK_FONT_UI )
     TxtUIBold = MakeText_( pFonts )
-    NudUISize = MakeNumber_( pFonts, 0, 72 )
-    TxtGlyph = MakeText_( pFonts )
+    tkTextBox_SetCueBannerText( TxtUIBold, TK_FONT_UI_BOLD )
+    ChkSizeSystem = tkCheckBox_Create( pFonts, 1 )
+    tkCheckBox_SetText( ChkSizeSystem, i18n.Tr( "designer.theme_size_system", "System" ) )
+    tkCheckBox_SetCheckChangedCallback( ChkSizeSystem, @OnSizeSystem )
+    NudUISize = MakeNumber_( pFonts, 6, 72 )
     TxtMono = MakeText_( pFonts )
+    tkTextBox_SetCueBannerText( TxtMono, TK_FONT_MONO )
     NudRadius = MakeNumber_( pFonts, -1, 40 )
     NudBorder = MakeNumber_( pFonts, -1, 10 )
+    for i as long = 0 to 2
+        ' the ellipsis glyph as the button's text, centred over its whole width: a left glyph sits at
+        ' the padding (off centre), and text beside 12px side padding has too little room to draw
+        BtnFontPick( i ) = MakeButton_( pFonts, wchr( TK_ICON_MORE ) )
+        tkButton_SetFont( BtnFontPick( i ), tkForm_Font( tkForm_FromWidget( pFonts ), TKFONT_GLYPH ) )
+        tkButton_SetPadding( BtnFontPick( i ), 0, tkForm_Scale( Win, TKBUTTON_DEFAULT_PADTOP ), 0, tkForm_Scale( Win, TKBUTTON_DEFAULT_PADBOTTOM ) )
+    next
+    ChkEmbed = tkCheckBox_Create( pFonts, 1 )
+    tkCheckBox_SetText( ChkEmbed, i18n.Tr( "designer.theme_embed_fonts", "Build the fonts into the program" ) )
+    tkCheckBox_SetCheckChangedCallback( ChkEmbed, @OnEmbed )
 
     StyleList = MakeList_( pStyles )
+    tkListTree_SetBorderWidth( StyleList, 1 )
     tkListTree_SetSelChangeCallback( StyleList, @OnStylePick )
     BtnStyleAdd = MakeButton_( pStyles, i18n.Tr( "designer.item_add", "Add" ) )
     BtnStyleDel = MakeButton_( pStyles, i18n.Tr( "designer.item_remove", "Remove" ) )
     LblStyleName = MakeLabel_( pStyles, i18n.Tr( "designer.name", "Name" ) )
     TxtStyleName = MakeText_( pStyles )
-    LblStyleLines = MakeLabel_( pStyles, i18n.Tr( "designer.theme_style_roles", "One role a line: Surface = @Accent" ) )
-    TxtStyleLines = MakeText_( pStyles, true )
-    LblStyleProblem = MakeLabel_( pStyles, "" )
+    ' one row per role: Face, Text, Border and Accent first (what most styles change), then the rest
+    StyleFrame = tkPanel_Create( pStyles, 1 )
+    tkPanel_SetBorderStyle( StyleFrame, PNL_BORDER_LINE )
+    StyleRows = tkScrollPanel_Create( StyleFrame, 1 )
+    dim as TK_WIDGET ptr rows_ = tkScrollPanel_GetPanel( StyleRows )
+    dim as long mainRoles( 0 to STYLE_MAIN_ROWS - 1 ) = { TKROLE_SURFACE, TKROLE_TEXT, TKROLE_BORDER, TKROLE_ACCENT }
+    dim as long nRows = 0
+    for k as long = 0 to STYLE_MAIN_ROWS - 1
+        SrRole( nRows ) = mainRoles( k )
+        nRows += 1
+    next
+    for r as long = 0 to TKROLE_COUNT - 1
+        dim as boolean isMain = false
+        for k as long = 0 to STYLE_MAIN_ROWS - 1
+            if mainRoles( k ) = r then isMain = true
+        next
+        if isMain = false then
+            SrRole( nRows ) = r
+            nRows += 1
+        end if
+    next
+    dim as ustring mainNames( 0 to STYLE_MAIN_ROWS - 1 )
+    mainNames( 0 ) = i18n.Tr( "designer.theme_role_face", "Face" )
+    mainNames( 1 ) = i18n.Tr( "designer.theme_text", "Text" )
+    mainNames( 2 ) = i18n.Tr( "designer.theme_role_border", "Border" )
+    mainNames( 3 ) = i18n.Tr( "designer.theme_accent", "Accent" )
+    for k as long = 0 to TKROLE_COUNT - 1
+        dim as ustring rowName = tkTheme_RoleName( SrRole( k ) )
+        if k < STYLE_MAIN_ROWS then rowName = mainNames( k )
+        SrLabel( k ) = MakeLabel_( rows_, rowName )
+        SrCombo( k ) = tkComboBox_Create( rows_, k )
+        tkComboBox_AddItem( SrCombo( k ), i18n.Tr( "designer.theme_from_theme", "(theme)" ) )
+        tkComboBox_AddItem( SrCombo( k ), i18n.Tr( "designer.theme_fixed", "Color..." ) )
+        for r as long = 0 to TKROLE_COUNT - 1
+            tkComboBox_AddItem( SrCombo( k ), "@" & tkTheme_RoleName( r ) )
+        next
+        tkComboBox_SetSelChangeCallback( SrCombo( k ), @OnStyleCombo )
+        SrSwatch( k ) = tkPanel_Create( rows_, 1 )
+        tkPanel_SetBorderStyle( SrSwatch( k ), PNL_BORDER_LINE )
+        SrPick( k ) = tkButton_Create( rows_, ID_STYLE_PICK + k )
+        tkButton_SetText( SrPick( k ), i18n.Tr( "designer.theme_pick", "Pick..." ) )
+        tkButton_SetClickCallback( SrPick( k ), @OnButton )
+        SrReset( k ) = tkButton_Create( rows_, ID_STYLE_RESET + k )
+        tkButton_SetText( SrReset( k ), i18n.Tr( "designer.theme_reset", "Reset" ) )
+        tkButton_SetClickCallback( SrReset( k ), @OnButton )
+    next
+    ChkAllRoles = tkCheckBox_Create( pStyles, 1 )
+    tkCheckBox_SetText( ChkAllRoles, i18n.Tr( "designer.theme_all_roles", "Show all roles" ) )
+    tkCheckBox_SetCheckChangedCallback( ChkAllRoles, @OnAllRoles )
 
     Preview = tkPanel_Create( root_, 1 )
     PvLabel = MakeLabel_( Preview, i18n.Tr( "designer.theme_preview", "Preview" ) )
     PvButton = tkButton_Create( Preview, 1 )
     tkButton_SetText( PvButton, i18n.Tr( "designer.theme_button", "Button" ) )
     PvStyled = tkButton_Create( Preview, 1 )
-    PvCheck = tkCheckBox_Create( Preview, 1 )
+    PvStyledCheck = tkCheckBox_Create( Preview, 1 )
+    tkCheckBox_SetText( PvStyledCheck, i18n.Tr( "designer.theme_check", "Check box" ) )
+    tkCheckBox_SetChecked( PvStyledCheck, true )
+    PvStyledToggle = tkToggle_Create( Preview, 1 )
+    tkToggle_SetChecked( PvStyledToggle, true )
+    PvGroup = tkGroupBox_Create( Preview, 1 )
+    tkGroupBox_SetText( PvGroup, i18n.Tr( "designer.theme_group", "Options" ) )
+    PvCheck = tkCheckBox_Create( PvGroup, 1 )
     tkCheckBox_SetText( PvCheck, i18n.Tr( "designer.theme_check", "Check box" ) )
     tkCheckBox_SetChecked( PvCheck, true )
-    PvOption = tkOptionButton_Create( Preview, 1 )
+    PvOption = tkOptionButton_Create( PvGroup, 1 )
     tkOptionButton_SetText( PvOption, i18n.Tr( "designer.theme_option", "Option" ) )
     tkOptionButton_SetChecked( PvOption, true )
-    PvToggle = tkToggle_Create( Preview, 1 )
+    PvToggle = tkToggle_Create( PvGroup, 1 )
     tkToggle_SetChecked( PvToggle, true )
     PvText = tkTextBox_Create( Preview, 1 )
     tkTextBox_SetText( PvText, i18n.Tr( "designer.theme_text", "Text" ) )
@@ -370,12 +611,15 @@ sub ThemeDialog_.Open( byval owner as TK_FORM ptr, byref themePath as const ustr
     LblContrast = MakeLabel_( root_, "" )
     BtnLibrary = MakeButton_( root_, i18n.Tr( "designer.theme_save_library", "Save to Library" ) )
     BtnSave = MakeButton_( root_, i18n.Tr( "designer.theme_save", "Save" ) )
-    BtnClose = MakeButton_( root_, i18n.Tr( "designer.theme_close", "Close" ) )
+    BtnClose = MakeButton_( root_, i18n.Tr( "designer.cancel", "Cancel" ) )
 
+    tkForm_OnDestroy( Win, @OnFormGone )
     tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
-        cast( ThemeDialog ptr, f->Tag )->Layout( )
+        if f->Tag then cast( ThemeDialog ptr, f->Tag )->Layout( )      ' 0 while the form goes
     end sub )
     this.FillGallery( )
+    Source = Path
+    SourceName = Doc.Name
     Loading = false
     this.LoadFields( )
     tkForm_Show( Win )
@@ -393,6 +637,13 @@ sub ThemeDialog_.Layout( )
     dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
     dim as long g = tkForm_Scale( Win, GAP ), rh = tkForm_Scale( Win, ROW_CY ), cw = root_->cw, ch = root_->ch
     dim as long pvW = tkForm_Scale( Win, PREVIEW_CX ), bw = tkForm_Scale( Win, 120 )
+    ' the bottom buttons share one width: the widest word's (Save to Library) and some room
+    dim as TK_WIDGET ptr bottomBtns( 0 to 2 ) = { BtnLibrary, BtnSave, BtnClose }
+    for i as long = 0 to 2
+        dim as long iw, ih
+        tkButton_GetIdealSize( bottomBtns( i ), iw, ih )
+        if iw + 2 * tkForm_Scale( Win, GAP ) > bw then bw = iw + 2 * tkForm_Scale( Win, GAP )
+    next
     tkWidget_SetPos( LblName, g, g, tkForm_Scale( Win, 60 ), rh )
     tkWidget_SetPos( TxtName, g + tkForm_Scale( Win, 64 ), g, tkForm_Scale( Win, 220 ), rh )
     tkWidget_SetPos( SelVariant, g + tkForm_Scale( Win, 300 ), g, tkForm_Scale( Win, 180 ), rh )
@@ -407,45 +658,151 @@ sub ThemeDialog_.Layout( )
 
     ' the pages: their own coordinates, the tab control's size less its tabs
     dim as long pw = tabsW, ph = tabsH - tkTabControl_GetTabHeight( Tabs )
+    ' a page's own size, once the tab control has placed it: its frame can make it smaller than the
+    ' sum above, which clipped the bottom row
+    dim as TK_WIDGET ptr page_ = Gallery->pParent
+    if (page_ <> 0) andalso (page_->cw > 0) andalso (page_->ch > 0) then
+        if page_->cw < pw then pw = page_->cw
+        if page_->ch < ph then ph = page_->ch
+    end if
     dim as long sw = tkForm_Scale( Win, 100 )
-    tkWidget_SetPos( Gallery, g, g, pw - 2 * g, ph - 4 * g - 2 * rh )
-    tkWidget_SetPos( BtnUse, g, ph - 2 * g - 2 * rh - g \ 2, tkForm_Scale( Win, 160 ), rh )
-    tkWidget_SetPos( LblAccent, g, ph - g - rh, sw, rh )
-    tkWidget_SetPos( TxtAccent, g + sw, ph - g - rh, tkForm_Scale( Win, 120 ), rh )
-    tkWidget_SetPos( BtnAccentPick, 2 * g + sw + tkForm_Scale( Win, 120 ), ph - g - rh, sw, rh )
+    tkWidget_SetPos( Gallery, g, g, pw - 2 * g, ph - 3 * g - rh )
+    ' the accent: its value, a swatch of it, Pick...
+    dim as long accY = ph - g - rh, accW = tkForm_Scale( Win, 120 )
+    tkWidget_SetPos( LblAccent, g, accY, sw, rh )
+    tkWidget_SetPos( TxtAccent, g + sw, accY, accW, rh )
+    tkWidget_SetPos( AccentSwatch, 2 * g + sw + accW, accY + 2, rh, rh - 4 )
+    tkWidget_SetPos( BtnAccentPick, 3 * g + sw + accW + rh, accY, sw, rh )
+    dim as long gw = tkForm_Scale( Win, GLYPH_CX )
+    tkWidget_SetPos( BtnDelete, pw - g - gw, accY, gw, rh )
+    tkWidget_SetPos( BtnClone, pw - 2 * (g + gw), accY, gw, rh )
 
     tkWidget_SetPos( Roles, g, g, pw - 2 * g, ph - 3 * g - rh )
-    tkWidget_SetPos( TxtRole, g, ph - g - rh, tkForm_Scale( Win, 140 ), rh )
-    tkWidget_SetPos( BtnRolePick, 2 * g + tkForm_Scale( Win, 140 ), ph - g - rh, sw, rh )
-    tkWidget_SetPos( BtnRoleReset, 3 * g + tkForm_Scale( Win, 140 ) + sw, ph - g - rh, sw, rh )
+    ' the role's value, a swatch of it, Pick... and Reset
+    dim as long boxW = tkForm_Scale( Win, 140 ), roleY = ph - g - rh
+    tkWidget_SetPos( TxtRole, g, roleY, boxW, rh )
+    tkWidget_SetPos( RoleSwatch, 2 * g + boxW, roleY + 2, rh, rh - 4 )
+    tkWidget_SetPos( BtnRolePick, 3 * g + boxW + rh, roleY, sw, rh )
+    tkWidget_SetPos( BtnRoleReset, 4 * g + boxW + rh + sw, roleY, sw, rh )
 
     dim as long lw = tkForm_Scale( Win, 120 ), fw = pw - lw - 3 * g, nw = tkForm_Scale( Win, 90 )
-    dim as TK_WIDGET ptr fields( 0 to 6 ) = { TxtUIFile, TxtUIBold, NudUISize, TxtGlyph, TxtMono, NudRadius, NudBorder }
-    for i as long = 0 to 6
+    dim as TK_WIDGET ptr fields( 0 to 5 ) = { TxtUIFile, TxtUIBold, ChkSizeSystem, TxtMono, NudRadius, NudBorder }
+    ' the four font rows, Build the fonts into the program under them, then the two shape rows
+    for i as long = 0 to 5
         dim as long y = g + i * (rh + g)
+        if i >= 4 then y += rh + g
         tkWidget_SetPos( FontLabels( i ), g, y, lw, rh )
-        dim as boolean isNumber = (i = 2) orelse (i = 5) orelse (i = 6)
-        tkWidget_SetPos( fields( i ), 2 * g + lw, y, iif( isNumber, nw, fw ), rh )
+        dim as boolean isNumber = (i = 2) orelse (i = 4) orelse (i = 5)
+        ' a font file's row: its box, then "..." (the Resource Center)
+        dim as long slot = -1
+        select case i
+        case 0 : slot = 0
+        case 1 : slot = 1
+        case 3 : slot = 2
+        end select
+        if slot >= 0 then
+            tkWidget_SetPos( fields( i ), 2 * g + lw, y, fw - g - rh, rh )
+            tkWidget_SetPos( BtnFontPick( slot ), g + lw + fw - rh + g, y, rh, rh )
+        else
+            tkWidget_SetPos( fields( i ), 2 * g + lw, y, iif( isNumber, nw, fw ), rh )
+        end if
     next
+    ' Size: System, then the up-down beside it
+    dim as long sysW = tkForm_Scale( Win, 110 ), sizeY = g + 2 * (rh + g)
+    tkWidget_SetPos( ChkSizeSystem, 2 * g + lw, sizeY, sysW, rh )
+    tkWidget_SetPos( NudUISize, 3 * g + lw + sysW, sizeY, nw, rh )
+    tkWidget_SetPos( ChkEmbed, 2 * g + lw, g + 4 * (rh + g), fw, rh )
 
-    dim as long lsw = tkForm_Scale( Win, 160 ), rx = 2 * g + lsw, rw = pw - rx - g
-    tkWidget_SetPos( StyleList, g, g, lsw, ph - 3 * g - rh )
-    tkWidget_SetPos( BtnStyleAdd, g, ph - g - rh, (lsw - g) \ 2, rh )
-    tkWidget_SetPos( BtnStyleDel, g + (lsw - g) \ 2 + g, ph - g - rh, (lsw - g) \ 2, rh )
-    tkWidget_SetPos( LblStyleName, rx, g, tkForm_Scale( Win, 60 ), rh )
-    tkWidget_SetPos( TxtStyleName, rx + tkForm_Scale( Win, 64 ), g, rw - tkForm_Scale( Win, 64 ), rh )
-    tkWidget_SetPos( LblStyleLines, rx, 2 * g + rh, rw, rh )
-    tkWidget_SetPos( TxtStyleLines, rx, 3 * g + 2 * rh, rw, ph - 6 * g - 3 * rh )
-    tkWidget_SetPos( LblStyleProblem, rx, ph - g - rh, rw, rh )
+    ' Styles, master over detail. Master: Add, Remove and the selected style's Name on one line, the
+    ' styles' names in a short list under it. Detail: the role rows, full width, and Show all roles.
+    dim as long bw2 = tkForm_Scale( Win, 90 ), lblW = tkForm_Scale( Win, 56 ), fullW = pw - 2 * g
+    tkWidget_SetPos( BtnStyleAdd, g, g, bw2, rh )
+    tkWidget_SetPos( BtnStyleDel, 2 * g + bw2, g, bw2, rh )
+    dim as long nameX = 4 * g + 2 * bw2
+    tkWidget_SetPos( LblStyleName, nameX, g, lblW, rh )
+    tkWidget_SetPos( TxtStyleName, nameX + lblW, g, pw - g - nameX - lblW, rh )
+    dim as long listY = 2 * g + rh, listH = 3 * rh                          ' about three names
+    tkWidget_SetPos( StyleList, g, listY, fullW, listH )
+    dim as long rowsY = listY + listH + 2 * g, chkY = ph - g - rh
+    ' the rows inside their frame, clear of its line by a small gap
+    dim as long inset = tkForm_Scale( Win, 4 )
+    tkWidget_SetPos( StyleFrame, g, rowsY, fullW, chkY - g - rowsY )
+    tkWidget_SetPos( StyleRows, inset, inset, fullW - 2 * inset, chkY - g - rowsY - 2 * inset )
+    tkWidget_SetPos( ChkAllRoles, g, chkY, fullW, rh )
+    this.LayoutStyleRows( )
 
-    ' the preview: one control a row
-    dim as TK_WIDGET ptr pv( 0 to 8 ) = { PvLabel, PvButton, PvStyled, PvCheck, PvOption, PvToggle, PvText, PvCombo, PvProgress }
-    dim as long px = 2 * g, pwid = pvW - 4 * g
-    for i as long = 0 to 8
-        dim as long w_ = pwid
-        if pv( i ) = PvToggle then w_ = tkForm_Scale( Win, 48 )
-        tkWidget_SetPos( pv( i ), px, 2 * g + i * (rh + g + g \ 2), w_, rh )
+    ' the preview: one control a row, half a gap between; the check box, option and toggle in a
+    ' group box, one a row
+    dim as long px = 2 * g, pwid = pvW - 4 * g, stepY = rh + g \ 2, y = 2 * g
+    dim as TK_WIDGET ptr above( 0 to 2 ) = { PvLabel, PvButton, PvStyled }
+    for i as long = 0 to 2
+        tkWidget_SetPos( above( i ), px, y, pwid, rh )
+        y += stepY
     next
+    ' the selected style on a check box and a toggle, side by side under its button
+    tkWidget_SetPos( PvStyledCheck, px, y, pwid - tkForm_Scale( Win, 48 ) - g, rh )
+    tkWidget_SetPos( PvStyledToggle, px + pwid - tkForm_Scale( Win, 48 ), y, tkForm_Scale( Win, 48 ), rh )
+    y += stepY
+    ' the box: its frame and caption first (sized once to read them), then three rows inside
+    tkWidget_SetPos( PvGroup, px, y, pwid, 3 * stepY )
+    dim as TKRECT inner
+    tkGroupBox_GetClientRect( PvGroup, inner )
+    dim as long frameH = 3 * stepY - (inner.bottom - inner.top)       ' caption above + frame below
+    tkWidget_SetPos( PvGroup, px, y, pwid, frameH + 3 * rh + g )
+    tkGroupBox_GetClientRect( PvGroup, inner )
+    dim as TK_WIDGET ptr inside( 0 to 2 ) = { PvCheck, PvOption, PvToggle }
+    for i as long = 0 to 2
+        dim as long w_ = inner.right - inner.left
+        if inside( i ) = PvToggle then w_ = tkForm_Scale( Win, 48 )
+        tkWidget_SetPos( inside( i ), inner.left, inner.top + i * (rh + g \ 2), w_, rh )
+    next
+    y += PvGroup->ch + g
+    dim as TK_WIDGET ptr below( 0 to 2 ) = { PvText, PvCombo, PvProgress }
+    for i as long = 0 to 2
+        tkWidget_SetPos( below( i ), px, y, pwid, rh )
+        y += stepY
+    next
+end sub
+
+' The role rows in their scroll panel: four, or all of them with Show all roles. A row is its name,
+' the drop-down, a swatch of the colour it gives in the variant shown, Pick... and Reset.
+sub ThemeDialog_.LayoutStyleRows( )
+    if Win = 0 then exit sub
+    dim as long g = tkForm_Scale( Win, GAP ), rh = tkForm_Scale( Win, ROW_CY )
+    dim as long n = iif( tkCheckBox_GetChecked( ChkAllRoles ), TKROLE_COUNT, STYLE_MAIN_ROWS )
+    tkScrollPanel_SetContentHeight( StyleRows, n * (rh + g) )
+    tkScrollPanel_SetLineHeight( StyleRows, rh + g )
+    if n = STYLE_MAIN_ROWS then tkScrollPanel_SetPos( StyleRows, 0 )
+    dim as long w = tkScrollPanel_GetPanelWidth( StyleRows )
+    dim as long lblW = tkForm_Scale( Win, 70 ), sw = rh, bw = tkForm_Scale( Win, 70 )
+    ' the name column fits the widest name of all 23 (SurfaceDisabled), so it holds still on Show all roles
+    for k as long = 0 to TKROLE_COUNT - 1
+        dim as long iw, ih
+        tkLabel_GetIdealSize( SrLabel( k ), iw, ih )
+        if iw + g > lblW then lblW = iw + g
+    next
+    dim as long comboW = w - lblW - sw - 2 * bw - 4 * g
+    if comboW < tkForm_Scale( Win, 80 ) then comboW = tkForm_Scale( Win, 80 )
+    for k as long = 0 to TKROLE_COUNT - 1
+        dim as boolean shown = (k < n)
+        dim as long y = k * (rh + g), x = 0
+        tkWidget_SetPos( SrLabel( k ), x, y, lblW, rh )
+        x += lblW
+        tkWidget_SetPos( SrCombo( k ), x, y, comboW, rh )
+        x += comboW + g
+        tkWidget_SetPos( SrSwatch( k ), x, y + 2, sw, rh - 4 )
+        x += sw + g
+        tkWidget_SetPos( SrPick( k ), x, y, bw, rh )
+        x += bw + g
+        tkWidget_SetPos( SrReset( k ), x, y, bw, rh )
+        tkWidget_Show( SrLabel( k ), shown )
+        tkWidget_Show( SrCombo( k ), shown )
+        tkWidget_Show( SrSwatch( k ), shown )
+        tkWidget_Show( SrPick( k ), shown )
+        tkWidget_Show( SrReset( k ), shown )
+    next
+    tkScrollPanel_Recalc( StyleRows )
+    tkWidget_Invalidate( StyleRows )
 end sub
 
 ' ---- the gallery ------------------------------------------------------------------------------------
@@ -454,24 +811,43 @@ end sub
 sub ThemeDialog_.FillGallery( )
     tkListTree_Clear( Gallery )
     GalleryPaths.Clear( )
+    GalleryShipped.Clear( )
+    dim as long nShipped = 0
     dim as Array( of ustring ) paths
     for each nm as ustring in bundled.Names( "themes" )
         if lcase( right( nm, 8 ) ) = ".tktheme" then paths.Push( bundled.PREFIX & nm )
     next
+    nShipped = paths.Count( )
     if len( LibraryDir ) andalso fs.IsDir( LibraryDir ) then
         for each r as fs.DirEntryResult in fs.ReadDir( LibraryDir )
             if r.IsOk( ) andalso r.Value( ).IsFile( ) andalso (lcase( right( r.Value( ).Name( ), 8 ) ) = ".tktheme") then paths.Push( r.Value( ).Path( ) )
         next
     end if
-    for each p as ustring in paths
+    for k as long = 0 to paths.Count( ) - 1
         dim as ustring none, e
-        dim as ustring text = bundled.ReadAllText( p ).ValueOr( none )
+        dim as ustring text = bundled.ReadAllText( paths[k] ).ValueOr( none )
         dim as themefile.ThemeDoc d
         if (len( text ) = 0) orelse (themefile.Parse( text, d, e ) = false) then continue for
+        ' one row a name: a library file named like a theme already listed (tkEdit's own copy of a
+        ' shipped theme, made when its theme is edited) is not listed again
+        dim as boolean dup = false
+        for r as long = 0 to tkListTree_GetCount( Gallery ) - 1
+            if lcase( tkListTree_GetText( Gallery, r ) ) = lcase( d.Name ) then dup = true
+        next
+        if dup then continue for
         tkListTree_AddString( Gallery, d.Name, GalleryPaths.Count( ) )
-        GalleryPaths.Push( p )
+        GalleryPaths.Push( paths[k] )
+        GalleryShipped.Push( k < nShipped )
     next
-    if tkListTree_GetCount( Gallery ) then tkListTree_SetCurSel( Gallery, 0 )
+    ' the theme being edited, when the gallery has one of its name; else the first
+    dim as long sel = 0
+    for r as long = 0 to tkListTree_GetCount( Gallery ) - 1
+        if tkListTree_GetText( Gallery, r ) = Doc.Name then
+            sel = r
+            exit for
+        end if
+    next
+    if tkListTree_GetCount( Gallery ) then tkListTree_SetCurSel( Gallery, sel )
 end sub
 
 ' The gallery's theme becomes the one being edited (the file it is saved to stays the same).
@@ -482,6 +858,8 @@ sub ThemeDialog_.UseGallery( byval row as long )
     dim as themefile.ThemeDoc d
     if themefile.Parse( text, d, e ) = false then exit sub
     Doc = d
+    Source = GalleryPaths[row]
+    SourceName = d.Name
     this.LoadFields( )
     this.Refresh( )
 end sub
@@ -495,14 +873,23 @@ end function
 sub ThemeDialog_.LoadFields( )
     Loading = true
     tkTextBox_SetText( TxtName, Doc.Name )
-    tkTextBox_SetText( TxtAccent, Doc.Accent )
+    this.LoadAccent( )
     tkTextBox_SetText( TxtUIFile, Doc.UIFile )
     tkTextBox_SetText( TxtUIBold, Doc.UIBold )
-    tkNumericUpDown_SetValue( NudUISize, Doc.UISize )
-    tkTextBox_SetText( TxtGlyph, Doc.GlyphFile )
+    ' System: the up-down shows the OS's size, greyed, as a start for unchecking it
+    tkCheckBox_SetChecked( ChkSizeSystem, Doc.UISize <= 0 )
+    tkNumericUpDown_SetValue( NudUISize, iif( Doc.UISize > 0, Doc.UISize, clng( tkApp_SystemFontSize( ) + 0.5 ) ) )
+    tkWidget_Enable( NudUISize, Doc.UISize > 0 )
     tkTextBox_SetText( TxtMono, Doc.MonoFile )
     tkNumericUpDown_SetValue( NudRadius, Doc.CornerRadius )
     tkNumericUpDown_SetValue( NudBorder, Doc.BorderWidth )
+    tkCheckBox_SetChecked( ChkEmbed, Doc.EmbedFonts )
+    tkWidget_Show( ChkEmbed, ForEditor = false )        ' tkEdit's own theme builds into nothing
+    tkWidget_Show( BtnLibrary, ForEditor = false )      ' tkEdit's own Save already writes the library
+    this.ShowThemeButtons( )
+    for i as long = 0 to 2
+        tkWidget_Show( BtnFontPick( i ), (ForEditor = false) andalso (OnPickFont <> 0) )   ' resources are a project's
+    next
     tkListTree_Clear( StyleList )
     for i as long = 0 to Doc.Styles.Count( ) - 1
         tkListTree_AddString( StyleList, Doc.Styles[i].Name, i )
@@ -519,8 +906,11 @@ function ThemeDialog_.RoleOfRow( byval row as long ) as long
 end function
 
 ' The role's own value in the variant shown, or "" when the theme gives it.
+' The selected role into the box: its own value as written, else the colour the theme gives it as
+' #RRGGBB (shown only, never stored: Doc changes only when the box is typed in). The swatch follows.
 sub ThemeDialog_.LoadRole( )
     dim as long r = this.RoleOfRow( tkListTree_GetCurSel( Roles ) )
+    dim as boolean was = Loading
     Loading = true
     if r < 0 then
         tkTextBox_SetText( TxtRole, "" )
@@ -530,37 +920,144 @@ sub ThemeDialog_.LoadRole( )
         dim as ustring v
         if i >= 0 then
             if IsDark then v = Doc.Dark.Roles[i].Value else v = Doc.Light.Roles[i].Value
+        else
+            v = colorval.HexText( tkTheme_Role( this.Theme( ), r ) )
         end if
         tkTextBox_SetText( TxtRole, v )
     end if
-    Loading = false
+    this.ShowRoleSwatch( )
+    Loading = was
 end sub
 
-private function StyleText_( byref st as themefile.ThemeStyle ) as ustring
-    dim as ustring o
-    for r as long = 0 to TKROLE_COUNT - 1
-        dim as long i = FindSetting( st.Roles, tkTheme_RoleName( r ) )
-        if i < 0 then continue for
-        dim as ustring v = st.Roles[i].Value
-        dim as long bar = instr( v, "|" )
-        if bar then v = left( v, bar - 1 ) & " | " & mid( v, bar + 1 )
-        o &= st.Roles[i].Key & " = " & v & chr( 10 )
-    next
-    return o
-end function
+' The accent box: the theme's own accent as written, else the accent the variant shown has (the
+' presets') as #RRGGBB -- shown only, never stored: Doc changes only when the box is typed in.
+sub ThemeDialog_.LoadAccent( )
+    dim as boolean was = Loading
+    Loading = true
+    if len( Doc.Accent ) then
+        tkTextBox_SetText( TxtAccent, Doc.Accent )
+    else
+        tkTextBox_SetText( TxtAccent, colorval.HexText( this.Theme( ).Accent ) )
+    end if
+    tkPanel_SetBackColor( AccentSwatch, this.Theme( ).Accent or &hFF000000ul )
+    Loading = was
+end sub
+
+' The swatch beside the box: the selected role's colour in the variant shown, as the preview gets it.
+sub ThemeDialog_.ShowRoleSwatch( )
+    dim as long r = this.RoleOfRow( tkListTree_GetCurSel( Roles ) )
+    tkWidget_Show( RoleSwatch, r >= 0 )
+    if r >= 0 then tkPanel_SetBackColor( RoleSwatch, tkTheme_Role( this.Theme( ), r ) or &hFF000000ul )
+end sub
 
 sub ThemeDialog_.LoadStyle( )
     dim as long i = tkListTree_GetCurSel( StyleList )
+    dim as boolean has = (i >= 0) andalso (i < Doc.Styles.Count( ))
+    dim as boolean was = Loading
     Loading = true
-    if (i < 0) orelse (i >= Doc.Styles.Count( )) then
-        tkTextBox_SetText( TxtStyleName, "" )
-        tkTextBox_SetText( TxtStyleLines, "" )
+    if has then tkTextBox_SetText( TxtStyleName, Doc.Styles[i].Name ) else tkTextBox_SetText( TxtStyleName, "" )
+    tkWidget_Enable( TxtStyleName, has )
+    Loading = was
+    this.LoadStyleRows( )
+end sub
+
+' ---- the Styles page's role rows ---------------------------------------------------------------------
+
+' Row k's value in the selected style: "@Role", "#RRGGBB[AA]", "dark|light", or "" (the theme's own).
+function ThemeDialog_.StyleValue( byval k as long ) as ustring
+    dim as long si = tkListTree_GetCurSel( StyleList )
+    if (si < 0) orelse (si >= Doc.Styles.Count( )) then return ""
+    dim as long i = FindSetting( Doc.Styles[si].Roles, tkTheme_RoleName( SrRole( k ) ) )
+    if i < 0 then return ""
+    return Doc.Styles[si].Roles[i].Value
+end function
+
+' Row k's value into the selected style ("" gives the role back to the theme), then the page and the preview.
+sub ThemeDialog_.SetStyleValue( byval k as long, byref v as const ustring )
+    dim as long si = tkListTree_GetCurSel( StyleList )
+    if (si < 0) orelse (si >= Doc.Styles.Count( )) then exit sub
+    dim as ustring nm = tkTheme_RoleName( SrRole( k ) )
+    if len( v ) then
+        PutSetting( Doc.Styles[si].Roles, nm, v )
     else
-        tkTextBox_SetText( TxtStyleName, Doc.Styles[i].Name )
-        tkTextBox_SetText( TxtStyleLines, StyleText_( Doc.Styles[i] ) )
+        dim as long i = FindSetting( Doc.Styles[si].Roles, nm )
+        if i >= 0 then Doc.Styles[si].Roles.Remove( i )
     end if
-    tkLabel_SetText( LblStyleProblem, "" )
-    Loading = false
+    this.LoadStyleRows( )
+    this.Refresh( )
+end sub
+
+' The colour row k gives in the variant shown: its role's, the fixed one (a pair's half), or the theme's own.
+function ThemeDialog_.StyleRowColour( byval k as long ) as ulong
+    dim as TKTHEME_COLORS t = this.Theme( )
+    dim as ustring v = this.StyleValue( k )
+    if len( v ) = 0 then return tkTheme_Role( t, SrRole( k ) )
+    if left( v, 1 ) = "@" then
+        dim as long r = tkTheme_RoleByName( mid( v, 2 ) )
+        if r >= 0 then return tkTheme_Role( t, r )
+        return tkTheme_Role( t, SrRole( k ) )
+    end if
+    dim as long bar = instr( v, "|" )
+    if bar then
+        if IsDark then v = left( v, bar - 1 ) else v = mid( v, bar + 1 )
+    end if
+    dim as ulong c
+    if colorval.ParseHex( v, c ) then return c
+    return tkTheme_Role( t, SrRole( k ) )
+end function
+
+' Every row from the selected style: the drop-down's choice (a fixed colour shows its value), the swatch.
+sub ThemeDialog_.LoadStyleRows( )
+    dim as long si = tkListTree_GetCurSel( StyleList )
+    dim as boolean has = (si >= 0) andalso (si < Doc.Styles.Count( ))
+    dim as boolean was = Loading
+    Loading = true
+    for k as long = 0 to TKROLE_COUNT - 1
+        dim as ustring v = this.StyleValue( k )
+        dim as long sel = STYLE_ITEM_THEME
+        dim as ustring fixedText = i18n.Tr( "designer.theme_fixed", "Color..." )
+        if len( v ) = 0 then
+            sel = STYLE_ITEM_THEME
+        elseif left( v, 1 ) = "@" then
+            dim as long r = tkTheme_RoleByName( mid( v, 2 ) )
+            if r >= 0 then sel = STYLE_ITEM_ROLE0 + r
+        else
+            sel = STYLE_ITEM_FIXED
+            dim as long bar = instr( v, "|" )
+            if bar then fixedText = left( v, bar - 1 ) & " | " & mid( v, bar + 1 ) else fixedText = v
+        end if
+        tkComboBox_SetItemText( SrCombo( k ), STYLE_ITEM_FIXED, fixedText )
+        tkComboBox_SetCurSel( SrCombo( k ), sel )
+        tkPanel_SetBackColor( SrSwatch( k ), this.StyleRowColour( k ) or &hFF000000ul )
+        tkWidget_Enable( SrCombo( k ), has )
+        tkWidget_Enable( SrPick( k ), has )
+        tkWidget_Enable( SrReset( k ), has andalso (len( v ) > 0) )
+    next
+    Loading = was
+end sub
+
+' Row k's drop-down chosen: the theme's own, a fixed colour (the one it shows now, to Pick... from), a role.
+sub ThemeDialog_.StyleRowChanged( byval k as long )
+    if (k < 0) orelse (k >= TKROLE_COUNT) then exit sub
+    dim as long sel = tkComboBox_GetCurSel( SrCombo( k ) )
+    if sel = STYLE_ITEM_THEME then
+        this.SetStyleValue( k, "" )
+    elseif sel = STYLE_ITEM_FIXED then
+        dim as ustring v = this.StyleValue( k )
+        if (len( v ) = 0) orelse (left( v, 1 ) = "@") then this.SetStyleValue( k, colorval.HexText( this.StyleRowColour( k ) ) )
+    elseif sel >= STYLE_ITEM_ROLE0 then
+        this.SetStyleValue( k, "@" & tkTheme_RoleName( sel - STYLE_ITEM_ROLE0 ) )
+    end if
+end sub
+
+' Pick... on row k: the colour picker on what the row gives now; its choice becomes a fixed colour.
+sub ThemeDialog_.PickStyleRow( byval k as long )
+    if (k < 0) orelse (k >= TKROLE_COUNT) then exit sub
+    dim as ulong c = this.StyleRowColour( k )
+    dim as ubyte a = c shr 24
+    if tkColorPicker_DoModal( tkForm_Widget( Win ), c, a ) then
+        this.SetStyleValue( k, colorval.HexText( (c and &hFFFFFFul) or (culng( a ) shl 24) ) )
+    end if
 end sub
 
 ' The role text box's value into the variant shown: a colour sets the role, "" gives it back.
@@ -578,11 +1075,6 @@ sub ThemeDialog_.SetRoleText( byref text as const ustring )
             i = FindSetting( Doc.Light.Roles, nm )
             if i >= 0 then Doc.Light.Roles.Remove( i )
         end if
-        if len( tkTextBox_GetText( TxtRole ) ) then
-            Loading = true
-            tkTextBox_SetText( TxtRole, "" )
-            Loading = false
-        end if
     else
         dim as ustring c = colorval.Canonical( t, false, false )
         if len( c ) = 0 then exit sub                  ' not a colour yet: typing goes on
@@ -590,6 +1082,21 @@ sub ThemeDialog_.SetRoleText( byref text as const ustring )
         if IsDark then PutSetting( Doc.Dark.Roles, nm, c ) else PutSetting( Doc.Light.Roles, nm, c )
     end if
     this.Refresh( )
+end sub
+
+' A font slot's "...": the Resource Center's pick in its box, and in the theme as if typed.
+sub ThemeDialog_.PickFont( byval slot as long )
+    if OnPickFont = 0 then exit sub
+    dim as TK_WIDGET ptr box
+    select case slot
+    case 0 : box = TxtUIFile
+    case 1 : box = TxtUIBold
+    case else : box = TxtMono
+    end select
+    dim as ustring picked
+    if OnPickFont( @this, tkTextBox_GetText( box ), picked ) = false then exit sub
+    tkTextBox_SetText( box, picked )
+    this.FieldChanged( box )
 end sub
 
 private function FieldText_( byval w as TK_WIDGET ptr ) as ustring
@@ -611,9 +1118,12 @@ sub ThemeDialog_.FieldChanged( byval w as TK_WIDGET ptr )
     case TxtRole : this.SetRoleText( tkTextBox_GetText( TxtRole ) ) : exit sub
     case TxtUIFile : Doc.UIFile = FieldText_( TxtUIFile )
     case TxtUIBold : Doc.UIBold = FieldText_( TxtUIBold )
-    case TxtGlyph : Doc.GlyphFile = FieldText_( TxtGlyph )
     case TxtMono : Doc.MonoFile = FieldText_( TxtMono )
-    case NudUISize : Doc.UISize = clng( tkNumericUpDown_GetValue( NudUISize ) )
+    case ChkSizeSystem, NudUISize
+        ' System checked: 0, and the up-down greyed; else the up-down's size
+        dim as boolean sys_ = tkCheckBox_GetChecked( ChkSizeSystem )
+        tkWidget_Enable( NudUISize, sys_ = false )
+        if sys_ then Doc.UISize = 0 else Doc.UISize = clng( tkNumericUpDown_GetValue( NudUISize ) )
     case NudRadius : Doc.CornerRadius = clng( tkNumericUpDown_GetValue( NudRadius ) )
     case NudBorder : Doc.BorderWidth = clng( tkNumericUpDown_GetValue( NudBorder ) )
     case TxtStyleName
@@ -621,46 +1131,11 @@ sub ThemeDialog_.FieldChanged( byval w as TK_WIDGET ptr )
         if (i < 0) orelse (i >= Doc.Styles.Count( )) then exit sub
         Doc.Styles[i].Name = FieldText_( TxtStyleName )
         tkListTree_SetText( StyleList, i, Doc.Styles[i].Name )
-    case TxtStyleLines : this.StyleLinesChanged( ) : exit sub
     end select
     this.Refresh( )
 end sub
 
 ' "Role = colour" lines into the selected style. A line that isn't one is reported, not kept.
-sub ThemeDialog_.StyleLinesChanged( )
-    dim as long si = tkListTree_GetCurSel( StyleList )
-    if (si < 0) orelse (si >= Doc.Styles.Count( )) then exit sub
-    dim as ustring text = tkTextBox_GetText( TxtStyleLines ) & chr( 10 )
-    dim as Array( of Setting ) roles
-    dim as ustring problem
-    dim as long at = 1, n = 0
-    do
-        dim as long e = instr( at, text, chr( 10 ) )
-        if e = 0 then exit do
-        dim as ustring l = trim( mid( text, at, e - at ), any !" \t\r" )
-        at = e + 1
-        n += 1
-        if len( l ) = 0 then continue do
-        dim as long eq = instr( l, "=" )
-        dim as ustring k = trim( left( l, eq - 1 ) ), v = trim( mid( l, eq + 1 ) )
-        if (eq = 0) orelse (tkTheme_RoleByName( k ) < 0) then
-            if len( problem ) = 0 then problem = n & ": '" & k & "' " & i18n.Tr( "designer.theme_not_role", "is not a role" )
-            continue do
-        end if
-        dim as long bar = instr( v, "|" )
-        if bar then v = trim( left( v, bar - 1 ) ) & "|" & trim( mid( v, bar + 1 ) )
-        dim as ustring c = colorval.Canonical( v )
-        if len( c ) = 0 then
-            if len( problem ) = 0 then problem = n & ": " & colorval.Explain( v )
-            continue do
-        end if
-        PutSetting( roles, k, c )
-    loop
-    Doc.Styles[si].Roles = roles
-    tkLabel_SetText( LblStyleProblem, problem )
-    this.Refresh( )
-end sub
-
 sub ThemeDialog_.AddStyle( )
     dim as long k = Doc.Styles.Count( ) + 1
     dim as ustring nm
@@ -720,11 +1195,25 @@ sub ThemeDialog_.Refresh( )
     if (si >= 0) andalso (si < Doc.Styles.Count( )) then
         tkButton_SetText( PvStyled, Doc.Styles[si].Name )
         tkTheme_SetRecipeNamed( PvStyled, Doc.Styles[si].Name, 0, 0 )
+        tkTheme_SetRecipeNamed( PvStyledCheck, Doc.Styles[si].Name, 0, 0 )
+        tkTheme_SetRecipeNamed( PvStyledToggle, Doc.Styles[si].Name, 0, 0 )
+        tkWidget_Show( PvStyledCheck, true )
+        tkWidget_Show( PvStyledToggle, true )
         tkWidget_Show( PvStyled, true )
     else
         tkTheme_ClearRecipe( PvStyled )
+        tkTheme_ClearRecipe( PvStyledCheck )
+        tkTheme_ClearRecipe( PvStyledToggle )
         tkWidget_Show( PvStyled, false )
+        tkWidget_Show( PvStyledCheck, false )
+        tkWidget_Show( PvStyledToggle, false )
     end if
+    this.ShowRoleSwatch( )
+    tkPanel_SetBackColor( AccentSwatch, t.Accent or &hFF000000ul )
+    ' the Styles rows' swatches: what each gives in the variant shown
+    for k as long = 0 to TKROLE_COUNT - 1
+        tkPanel_SetBackColor( SrSwatch( k ), this.StyleRowColour( k ) or &hFF000000ul )
+    next
     dim as Array( of ustring ) faults
     themefile.ContrastFaults( t, faults )
     if faults.Count( ) = 0 then
@@ -745,6 +1234,117 @@ function ThemeDialog_.Problems( ) as Array( of ustring )
     return p
 end function
 
+' ---- Clone and Delete ---------------------------------------------------------------------------------
+
+' Whether the gallery lists a theme of this name.
+function ThemeDialog_.InGallery( byref nm as const ustring ) as boolean
+    for r as long = 0 to tkListTree_GetCount( Gallery ) - 1
+        if lcase( trim( tkListTree_GetText( Gallery, r ) ) ) = lcase( trim( nm ) ) then return true
+    next
+    return false
+end function
+
+' Whether the gallery's selected theme is one tkEdit ships.
+function ThemeDialog_.SelectedShipped( ) as boolean
+    dim as long sel = tkListTree_GetCurSel( Gallery )
+    if sel < 0 then return false
+    dim as long i = tkListTree_GetItemData( Gallery, sel )
+    return (i >= 0) andalso (i < GalleryShipped.Count( )) andalso GalleryShipped[i]
+end function
+
+' Delete for a library theme only; tkEdit's own theme, when it is one tkEdit ships, keeps its name
+' (Clone makes one of your own to name).
+sub ThemeDialog_.ShowThemeButtons( )
+    dim as boolean shipped = this.SelectedShipped( )
+    tkWidget_Enable( BtnDelete, (tkListTree_GetCurSel( Gallery ) >= 0) andalso (shipped = false) )
+    if ForEditor then tkWidget_Enable( TxtName, shipped = false )
+end sub
+
+' A copy of the theme being edited -- its edits too -- as a new theme in the library, "<name> Copy"
+' (then Copy 2, 3 ...), written at once; the dialog then edits the copy.
+sub ThemeDialog_.CloneTheme( )
+    if (OnSave = 0) orelse (len( LibraryDir ) = 0) then exit sub
+    dim as ustring base_ = trim( Doc.Name ), was = Doc.Name
+    if len( base_ ) = 0 then base_ = "Theme"
+    dim as ustring word_ = i18n.Tr( "designer.theme_copy", "Copy" )
+    dim as ustring nm = base_ & " " & word_
+    dim as long n = 2
+    Doc.Name = nm
+    while this.InGallery( nm ) orelse fs.IsFile( this.LibraryPath( ) )
+        nm = base_ & " " & word_ & " " & n
+        n += 1
+        Doc.Name = nm
+    wend
+    dim as ustring keep = Path
+    Path = this.LibraryPath( )
+    SavingToLibrary = true
+    Saved = false
+    OnSave( @this )
+    SavingToLibrary = false
+    dim as ustring made = Path
+    Path = keep
+    if Saved = false then
+        Doc.Name = was                  ' the host said why
+        exit sub
+    end if
+    Source = made
+    SourceName = nm
+    Loading = true
+    this.FillGallery( )                 ' selects the copy: the theme being edited
+    tkTextBox_SetText( TxtName, nm )
+    Loading = false
+    this.ShowThemeButtons( )
+    tkLabel_SetText( LblContrast, strings.Format( i18n.Tr( "designer.theme_cloned", "'{}' made: give it a name" ), nm ) )
+end sub
+
+' The gallery's selected library theme, asked first, gone from the library. tkEdit's own theme, when
+' that is the one, moves to the theme now selected; a project's theme stays as it is.
+sub ThemeDialog_.DeleteTheme( )
+    dim as long sel = tkListTree_GetCurSel( Gallery )
+    if (sel < 0) orelse this.SelectedShipped( ) then exit sub
+    dim as long i = tkListTree_GetItemData( Gallery, sel )
+    if (i < 0) orelse (i >= GalleryPaths.Count( )) then exit sub
+    dim as ustring nm = tkListTree_GetText( Gallery, sel ), gone = GalleryPaths[i]
+    if OnAsk then
+        if OnAsk( @this, strings.Format( i18n.Tr( "designer.theme_delete_ask", "Delete the theme '{}'? This cannot be undone." ), nm ) ) = false then exit sub
+    end if
+    if fs.RemoveFile( gone ).IsOk( ) = false then
+        tkLabel_SetText( LblContrast, strings.Format( i18n.Tr( "designer.theme_cannot_delete", "{} can't be deleted" ), fs.PathFileName( gone ) ) )
+        exit sub
+    end if
+    dim as boolean editing = ForEditor andalso (fs.PathEquals( gone, Source ) orelse fs.PathEquals( gone, Path ))
+    Loading = true
+    this.FillGallery( )
+    Loading = false
+    if editing andalso (tkListTree_GetCount( Gallery ) > 0) then
+        dim as long r = iif( sel < tkListTree_GetCount( Gallery ), sel, tkListTree_GetCount( Gallery ) - 1 )
+        tkListTree_SetCurSel( Gallery, r )
+        this.UseGallery( tkListTree_GetItemData( Gallery, r ) )
+    end if
+    this.ShowThemeButtons( )
+    tkLabel_SetText( LblContrast, strings.Format( i18n.Tr( "designer.theme_deleted", "'{}' deleted" ), nm ) )
+end sub
+
+' tkEdit's own theme saved under a new name is its file renamed: refused (and said) when another
+' theme has that name.
+function ThemeDialog_.RenameRefused( ) as boolean
+    if ForEditor = false then return false
+    if lcase( trim( Doc.Name ) ) = lcase( trim( SourceName ) ) then return false
+    if this.NameTaken( Doc.Name, this.LibraryPath( ) ) = false then return false
+    dim as ustring msg = i18n.Tr( "designer.theme_name_taken", "There is already a theme named '{}': give this one another name" )
+    tkLabel_SetText( LblContrast, strings.Format( msg, trim( Doc.Name ) ) )
+    return true
+end function
+
+' The variant shown and edited, as the Dark / Light switch would choose it.
+sub ThemeDialog_.ShowVariant( byval dark as boolean )
+    IsDark = dark
+    tkSelectBar_SetCurSel( SelVariant, iif( dark, 0, 1 ) )
+    this.LoadRole( )
+    this.LoadAccent( )
+    this.Refresh( )
+end sub
+
 ' <library>/<name>.tktheme, the name made a file name.
 function ThemeDialog_.LibraryPath( ) as ustring
     dim as ustring f
@@ -760,8 +1360,14 @@ end function
 ' gallery then lists it. The theme being edited is still saved where it came from.
 sub ThemeDialog_.SaveToLibrary( )
     if (OnSave = 0) orelse (len( LibraryDir ) = 0) then exit sub
+    dim as ustring lib_ = this.LibraryPath( )
+    if this.NameTaken( Doc.Name, lib_ ) then
+        dim as ustring msg = i18n.Tr( "designer.theme_name_taken", "There is already a theme named '{}': give this one another name" )
+        tkLabel_SetText( LblContrast, strings.Format( msg, trim( Doc.Name ) ) )
+        exit sub
+    end if
     dim as ustring keep = Path
-    Path = this.LibraryPath( )
+    Path = lib_
     SavingToLibrary = true
     OnSave( @this )
     SavingToLibrary = false
@@ -770,3 +1376,17 @@ sub ThemeDialog_.SaveToLibrary( )
     this.FillGallery( )
     if sel >= 0 then tkListTree_SetCurSel( Gallery, sel )
 end sub
+
+' Whether nm is the name of a theme in the gallery that libPath would not simply replace: a shipped
+' theme, or a library theme kept in another file. Saving over the same library file is an update.
+function ThemeDialog_.NameTaken( byref nm as const ustring, byref libPath as const ustring ) as boolean
+    dim as ustring want = lcase( trim( nm ) )
+    for r as long = 0 to tkListTree_GetCount( Gallery ) - 1
+        if lcase( trim( tkListTree_GetText( Gallery, r ) ) ) <> want then continue for
+        dim as long i = tkListTree_GetItemData( Gallery, r )
+        if (i < 0) orelse (i >= GalleryPaths.Count( )) then return true
+        if GalleryShipped[i] then return true
+        if lcase( fs.PathNormalize( GalleryPaths[i] ) ) <> lcase( fs.PathNormalize( libPath ) ) then return true
+    next
+    return false
+end function

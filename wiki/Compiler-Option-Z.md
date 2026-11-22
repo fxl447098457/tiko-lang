@@ -42,6 +42,8 @@ Instructs the compiler to link with the `libfbrt[mt].a` library instead of the `
 
 Instructs the compiler to ignore all `Cmdline` directives in source file and take control from the real compiler command line only.
 
+> **In tiko.** Each ignored `#cmdline` is warning `TKO0373`, as fbc's is its warning 46. It is the way to compile a source you do not trust: even without it a `#cmdline` cannot set the options listed under [#Cmdline](Preprocessor). tiko accepts every other `-z` value and ignores it.
+
 **-z retinflts**
 
 Instructs the compiler to enable returning some structures (types) in floating point registers.

@@ -8,12 +8,17 @@
 ' tkHost.
 '
 ' WHAT IS UNCHANGED, by design: the panel model (an array of text + itemData + nMinWidth, rects
-' derived), the width law  max( textWidth + 2*padding, nMinWidth ), the ONE spring that absorbs
-' the leftover (and nothing shrinks on overflow), the stored-index fix-ups on insert/delete,
+' derived), the width law  max( textWidth + 2*padding, nMinWidth ), the leftover absorbed by the
+' stretching panels (and nothing shrinks on overflow), the spring's fix-ups on insert/delete,
 ' lazy layout (GetPanelRect forces it, GetItemRect does not), single-valued hover, no capture,
 ' no focus, no keyboard, the message callback whose result is honoured uniformly, the tooltip
 ' resolved on demand per hot panel (callback, else the panel's own text), SetBackColor returning
 ' the previous colour without repainting.
+'
+' WHAT IS ADDED, tk only: SEVERAL springs. Each panel may stretch (SetPanelStretch); the leftover
+' is shared evenly among the visible stretching ones, the first ones taking a pixel each of any
+' remainder. SetExpandPanel / GetExpandPanel stay as the one-spring view: set makes that panel
+' the only stretching one (-1 none), get answers the first stretching panel.
 '
 ' WHAT IS ADDED, from PsPlatform's PsStatusBar: a BUILT-IN panel painter used when no paint
 ' callback is installed (text inset by the padding, a hot fill on clickable panels, a divider
@@ -50,6 +55,7 @@ public type TKSTATUSBAR_PANELINFO
     itemData  as integer
     nMinWidth as long            ' floor for this panel's width; 0 = auto-size to the text
     bHidden   as boolean         ' laid out at width 0: not painted, no divider, never hit (tk addition)
+    bStretch  as boolean         ' takes a share of the leftover width (tk addition: several springs)
     rc        as TKRECT          ' derived by LayoutPanels, read-only to the host
 end type
 
@@ -102,7 +108,6 @@ public type TKSTATUSBAR_STATE
     bColorsPinned   as boolean
     colors          as TKSTATUSBAR_COLORS
     pTextFont       as TTF_Font ptr      ' borrowed
-    expandPanel     as long = -1
     nPadding        as long
     nDividerInset   as long
     bLayoutDirty    as boolean = true
@@ -139,7 +144,8 @@ end sub
 
 ' Vendor's LayoutPanels with GetTextExtentPoint32W swapped for SDL_ttf:
 '   width(i) = max( textWidth(i) + 2*padding, nMinWidth(i) )
-'   leftover = clientW - sum(width); if leftover > 0 and the spring is valid, it takes it all
+'   leftover = clientW - sum(width); if leftover > 0 it is shared evenly by the visible
+'   stretching panels, the first ones taking one pixel each of what doesn't divide
 '   rects laid left to right, each the full client height; on overflow nothing shrinks.
 sub TKSTATUSBAR_STATE.LayoutPanels()
     this.bLayoutDirty = false
@@ -168,8 +174,23 @@ sub TKSTATUSBAR_STATE.LayoutPanels()
     next
 
     dim as long leftover = clientW - totalW
-    if (leftover > 0) andalso this.IsValidPanel( this.expandPanel ) then
-        panelW(this.expandPanel) += leftover
+    if leftover > 0 then
+        dim as long springs = 0
+        for i as long = 0 to this.panelCount - 1
+            if this.panels(i).bStretch andalso (this.panels(i).bHidden = false) then springs += 1
+        next
+        if springs > 0 then
+            dim as long share = leftover \ springs, extra = leftover mod springs
+            for i as long = 0 to this.panelCount - 1
+                if this.panels(i).bStretch andalso (this.panels(i).bHidden = false) then
+                    panelW(i) += share
+                    if extra > 0 then
+                        panelW(i) += 1
+                        extra -= 1
+                    end if
+                end if
+            next
+        end if
     end if
 
     dim as long xPos = 0
@@ -196,11 +217,11 @@ function TKSTATUSBAR_STATE.InsertPanelAt( byval idx as long ) as long
         .itemData = 0
         .nMinWidth = 0
         .bHidden = false
+        .bStretch = false
         tkRect_SetEmpty( .rc )
     end with
     this.panelCount += 1
-    ' The spring is a stored index: inserting at or before it shifts it up.
-    if (this.expandPanel <> -1) andalso (idx <= this.expandPanel) then this.expandPanel += 1
+    ' A spring is a flag on its panel, so it moves with the panel on an insert or a delete.
     ' The hot index would now name a different panel (vendor left it so): clear it; the next
     ' mouse move recomputes it against the new layout.
     this.nHotIdx = -1
@@ -215,14 +236,8 @@ function TKSTATUSBAR_STATE.DeletePanelAt( byval idx as long ) as boolean
         this.panels(i) = this.panels(i + 1)
     next
     this.panels(this.panelCount - 1).Text = ""
+    this.panels(this.panelCount - 1).bStretch = false
     this.panelCount -= 1
-    if this.expandPanel <> -1 then
-        if idx = this.expandPanel then
-            this.expandPanel = -1
-        elseif idx < this.expandPanel then
-            this.expandPanel -= 1
-        end if
-    end if
     this.nHotIdx = -1
     tkTipHost_SetToolIndex( @this.tip, -1 )
     this.Refresh()
@@ -233,8 +248,10 @@ sub TKSTATUSBAR_STATE.ClearPanels()
     for i as long = 0 to this.panelCount - 1
         this.panels(i).Text = ""
     next
+    for i as long = 0 to ubound( this.panels )
+        this.panels(i).bStretch = false
+    next
     this.panelCount = 0
-    this.expandPanel = -1
     this.nHotIdx = -1
     tkTipHost_SetToolIndex( @this.tip, -1 )
     this.Refresh()
@@ -597,21 +614,44 @@ public function tkStatusBar_SetPanelMinWidth( byval hStatusBar as TK_WIDGET ptr,
     return true
 end function
 
+' The first stretching panel, -1 for none (the one-spring view of SetPanelStretch).
 public function tkStatusBar_GetExpandPanel( byval hStatusBar as TK_WIDGET ptr ) as long
     dim as TKSTATUSBAR_STATE ptr pStatus = GetStatusBarPointer( hStatusBar )
     if pStatus = 0 then return -1
-    return pStatus->expandPanel
+    for i as long = 0 to pStatus->panelCount - 1
+        if pStatus->panels(i).bStretch then return i
+    next
+    return -1
 end function
 
-' The single spring. -1 clears it; an index neither valid nor -1 is refused and the current
-' spring is left alone.
+' One spring: idx becomes the only stretching panel; -1 clears them all. An index neither valid
+' nor -1 is refused and the springs are left alone.
 public function tkStatusBar_SetExpandPanel( byval hStatusBar as TK_WIDGET ptr, byval idx as long ) as boolean
     dim as TKSTATUSBAR_STATE ptr pStatus = GetStatusBarPointer( hStatusBar )
     if pStatus = 0 then return false
     if (idx <> -1) andalso (pStatus->IsValidPanel( idx ) = false) then return false
-    pStatus->expandPanel = idx
+    for i as long = 0 to pStatus->panelCount - 1
+        pStatus->panels(i).bStretch = (i = idx)
+    next
     pStatus->Refresh()
     return true
+end function
+
+' Whether panel idx takes a share of the leftover width; several may. FALSE for an invalid index.
+public function tkStatusBar_SetPanelStretch( byval hStatusBar as TK_WIDGET ptr, byval idx as long, byval bStretch as boolean ) as boolean
+    dim as TKSTATUSBAR_STATE ptr pStatus = GetStatusBarPointer( hStatusBar )
+    if pStatus = 0 then return false
+    if pStatus->IsValidPanel( idx ) = false then return false
+    pStatus->panels(idx).bStretch = bStretch
+    pStatus->Refresh()
+    return true
+end function
+
+public function tkStatusBar_GetPanelStretch( byval hStatusBar as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKSTATUSBAR_STATE ptr pStatus = GetStatusBarPointer( hStatusBar )
+    if pStatus = 0 then return false
+    if pStatus->IsValidPanel( idx ) = false then return false
+    return pStatus->panels(idx).bStretch
 end function
 
 public function tkStatusBar_GetPadding( byval hStatusBar as TK_WIDGET ptr ) as long
@@ -771,6 +811,13 @@ end sub
 
 ' ---- callbacks ---------------------------------------------------------------------------
 ' Does not itself repaint (vendor); call tkStatusBar_Refresh on a visible bar.
+' A paint callback's way to draw the panel as the built-in painter would have, then add to it.
+public sub tkStatusBar_PaintPanelDefault( byval p as TKSTATUSBAR_PAINTINFO ptr )
+    if p = 0 then exit sub
+    dim as TKSTATUSBAR_STATE ptr pStatus = GetStatusBarPointer( p->hStatusBar )
+    if pStatus then RenderPanelDefault( pStatus, p )
+end sub
+
 public sub tkStatusBar_SetPaintCallback( byval hStatusBar as TK_WIDGET ptr, byval usersub as SB_PaintCallbackSub )
     dim as TKSTATUSBAR_STATE ptr pStatus = GetStatusBarPointer( hStatusBar )
     if pStatus then pStatus->PaintCallback = usersub

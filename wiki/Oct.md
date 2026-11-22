@@ -36,6 +36,8 @@ Returns the unsigned octal string representation of `number`. Octal digits range
 
 A string containing the unsigned octal representation of `number`.
 
+ **tiko:** `Oct` also takes an [`Int128` or `UInt128`](Category-Fixed-Width-Types#128-bit-integers), at full width: up to 43 digits.
+
 ## Remarks
 
 ### Usage

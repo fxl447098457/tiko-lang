@@ -1,0 +1,118 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' keyspass -- the Keyboard Shortcuts and Assign Shortcut dialogs (tka/keysdlg) through real events:
+' open, filter, a chord pressed in the capture box, OK, OK; then the chord fires the command and
+' keybindings.toml has it. The dialogs are driven open, not modally, so this pass can go on.
+#module "selftest"
+
+#import "std/fs"
+#import "tkc/cmdids"
+#import "tka/mainwin"
+#import "tka/keysdlg"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkToggle"
+using cmdids
+using tkApp
+using tkHost
+using tkTest
+using tkListTree
+using tkLabel
+using tkToggle
+
+private sub KeysPress( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr )
+    tkTest_PushMotion( h, tkTest_CX( w ), tkTest_CY( w ) )
+    tkTest_PumpFor( h, 15 )
+    tkTest_Click( h, tkTest_CX( w ), tkTest_CY( w ) )
+    tkTest_PumpFor( h, 30 )
+end sub
+
+public sub KeysPass( byref t as Tally, byval sc as single )
+    dim as mainwin.Window mw
+    mw.ConfigDir = FreshConfig( )
+    mw.Ask = @ScriptedAsk
+    mw.Pick = @ScriptedPick
+    t.Check( mw.Create( sc ), P( sc, "keys: main window created" ) )
+    if mw.form = 0 then exit sub
+    mw.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( mw.form )
+    tkTest_PumpFor( h, 150 )
+
+    ' ---- Ctrl+K's dialog: every command, four columns, the search glyph in the font
+    mw.OpenKeys( )
+    tkTest_PumpFor( h, 60 )
+    dim as keysdlg.KeysDialog ptr d = mw.KeysDlg
+    t.Check( (d <> 0) andalso (tkListTree_GetCount( d->List ) = mw.Keys.Count( )) andalso (tkListTree_GetColumnCount( d->List ) = 4), _
+             P( sc, "keys: the dialog lists every command in four columns" ) )
+    if d = 0 then
+        mw.Destroy( )
+        exit sub
+    end if
+    dim as TK_HOST ptr dh = tkForm_Host( d->Win )
+    t.Check( TTF_FontHasGlyph( tkForm_Font( d->Win, TKFONT_GLYPH ), keysdlg.GLYPH_SEARCH ), P( sc, "keys: the search glyph is in the glyph font" ) )
+
+    ' ---- the filter, typed: "menu bar" leaves the Menu Bar command (ShowMenu)
+    KeysPress( dh, d->FilterBox )
+    dim as ustring typed = "menu bar"
+    tkTest_PushText( dh, typed )
+    tkTest_PumpFor( dh, 30 )
+    dim as long want = -1, row = -1
+    for i as long = 0 to d->Work.Count( ) - 1
+        if d->Work.Item( i ).Id = Cmd.ShowMenu then want = i
+    next
+    for r as long = 0 to tkListTree_GetCount( d->List ) - 1
+        if tkListTree_GetItemData( d->List, r ) = want then row = r
+    next
+    t.Check( (tkListTree_GetCount( d->List ) < mw.Keys.Count( )) andalso (row >= 0), _
+             P( sc, "keys: the filter narrows the list to Menu Bar: " & tkListTree_GetCount( d->List ) & " rows" ) )
+    if row < 0 then
+        mw.FinishKeys( false )
+        mw.Destroy( )
+        exit sub
+    end if
+    tkListTree_SetCurSel( d->List, row )
+
+    ' ---- Assign Shortcut on it: Primary+Alt+Shift+F12 pressed in the capture box
+    d->OpenAssign( )
+    tkTest_PumpFor( h, 60 )
+    dim as keysdlg.AssignDialog ptr a = d->Assign
+    t.Check( (a <> 0) andalso (tkLabel_GetText( a->LblDesc ) = "Menu Bar") andalso (tkLabel_GetText( a->LblPrimary ) = "Primary"), _
+             P( sc, "keys: Assign Shortcut opens on Menu Bar, a Primary toggle" ) )
+    if a = 0 then
+        mw.FinishKeys( false )
+        mw.Destroy( )
+        exit sub
+    end if
+    dim as TK_HOST ptr ah = tkForm_Host( a->Win )
+    dim as long mods = TK_KMOD_PRIMARY or SDL_KMOD_ALT or SDL_KMOD_SHIFT
+    Chord( ah, SDLK_F12, SDL_SCANCODE_F12, mods )
+    dim as long ks = tkListTree_GetCurSel( a->KeyList )
+    t.Check( (a->EditKeys = "Primary+Alt+Shift+F12") andalso tkToggle_GetChecked( a->TogPrimary ) andalso tkToggle_GetChecked( a->TogShift ) _
+             andalso (ks > 0) andalso (tkListTree_GetText( a->KeyList, ks ) = "F12"), _
+             P( sc, "keys: the chord is captured, toggles and key list follow: " & a->EditKeys ) )
+    KeysPress( ah, a->BtnOk )
+    t.Check( a->Accepted, P( sc, "keys: Assign's OK accepts" ) )
+    d->FinishAssign( true )
+    tkTest_PumpFor( h, 30 )
+    t.Check( tkListTree_GetCellText( d->List, row, 3 ) = "Primary+Alt+Shift+F12", P( sc, "keys: User Keys shows it" ) )
+
+    ' ---- OK: applied at once and saved
+    KeysPress( dh, d->BtnOk )
+    t.Check( d->Accepted, P( sc, "keys: OK accepts" ) )
+    mw.FinishKeys( true )
+    tkTest_PumpFor( h, 60 )
+    dim as boolean shown = mw.Prefs.ShowMenu
+    Chord( h, SDLK_F12, SDL_SCANCODE_F12, mods )
+    tkTest_PumpFor( h, 30 )
+    t.Check( mw.Prefs.ShowMenu <> shown, P( sc, "keys: the new chord toggles the menu bar" ) )
+    t.Check( instr( fs.ReadAllText( mw.KeysFile( ) ).ValueOr( "" ), "ShowMenu = 'Primary+Alt+Shift+F12'" ) > 0, _
+             P( sc, "keys: keybindings.toml has it" ) )
+    mw.Destroy( )
+end sub

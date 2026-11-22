@@ -1,0 +1,779 @@
+'' semoptcheck.tiko -- TKO1150: 'o.Value( )' (or a Result's 'Failure( )') where no check covers
+'' every path to it. The compile-time half of the empty-Optional abort (A/p10): reading a value
+'' that is not there is runtime error 1, and the runtime can only report it once it happens.
+'' clang-tidy's bugprone-unchecked-optional-access is the precedent.
+''
+'' WHAT IS TRACKED: a named local or parameter of the procedure being walked (or a module-level
+'' DIM, walked with the module's own statements) whose type is std/outcome's Optional( of T ) or
+'' Result( of T, E ). A call result ('Parse( s ).Value( )') and a field are not tracked: there is
+'' nothing to have checked, and warning on them would be most of the noise.
+''
+'' THE ANALYSIS is one walk in source order over the procedure's statements, with a state of
+'' FACTS -- "o has a value" (OK) and, for a Result, "r has failed" (FAILED) -- that a condition
+'' adds on the branch it guards and a write takes away:
+''   - 'if' / 'elseif' / 'else': each arm starts from the facts before the 'if', plus its own
+''     condition's true facts and every earlier condition's false facts; after the 'if', only
+''     the facts every arm that falls through agrees on. An arm that ends in 'return', 'exit',
+''     'continue', 'goto', 'end', 'stop', 'error' or a failed 'assert' does not fall through.
+''   - Conditions: 'o.HasValue( )' / 'r.IsOk( )'; 'not', '= false', '= 0', '<> true' and
+''     '<> 0' turn them round; 'andalso' and 'orelse' combine them and guard their right side.
+''   - Loops: whatever the body can change is dropped before the loop; a 'while' condition
+''     guards the body and, when the body has no 'exit', what follows.
+''   - 'select case': each case starts from the facts before it; nothing comes from the cases.
+''   - A label forgets everything (a 'goto' may arrive with anything), and code after a
+''     'return' is not judged until one does.
+''   - Writes: assigning the variable (a 'Some( ... )' / 'Ok( ... )' / 'Fail( ... )' sets the
+''     matching fact, anything else clears both), 'Clear( )', 'Assign*( )', '@o', and passing
+''     it to a byref parameter that is not const.
+'' Nested procedures, closures, 'defer' and 'spawn' bodies are not entered.
+''
+'' A WARNING, never an error: fbc has no such check and a program it accepts must still build.
+'' '-Wno-TKO1150' turns it off.
+
+#import "std/containers"
+#include once "symbols/sem.ti"
+#include once "diag/diagids.ti"
+#include once "symbols/check.ti"
+#include once "types/udtlayout.ti"
+
+namespace Tko.Sem
+
+#include once "symbols/visctx.ti"
+#include once "symbols/semcalls.ti"
+
+'' Which outcome type a variable's type is: 0 none, 1 Optional, 2 Result.
+const OPTK_NONE     = 0
+const OPTK_OPTIONAL = 1
+const OPTK_RESULT   = 2
+
+'' The facts at one point. 'dead' is the state after a jump: it agrees with everything, so it
+'' leaves a join alone and nothing is judged under it.
+type OptState
+    as boolean dead
+    as containers.Array( of uint32 ) ok
+    as containers.Array( of uint32 ) fl
+end type
+
+private sub OptCopy_( byref dst as OptState, byref src as OptState )
+    dst.dead = src.dead
+    dst.ok.Clear( ) : dst.fl.Clear( )
+    for i as int32 = 0 to src.ok.Count - 1 : dst.ok.Push( src.ok[i] ) : next
+    for i as int32 = 0 to src.fl.Count - 1 : dst.fl.Push( src.fl[i] ) : next
+end sub
+
+private function OptHas_( byref a as containers.Array( of uint32 ), byval v as uint32 ) as boolean
+    for i as int32 = 0 to a.Count - 1
+        if a[i] = v then return true
+    next
+    return false
+end function
+
+private sub OptAdd_( byref a as containers.Array( of uint32 ), byval v as uint32 )
+    if OptHas_( a, v ) = false then a.Push( v )
+end sub
+
+private sub OptDel_( byref a as containers.Array( of uint32 ), byval v as uint32 )
+    for i as int32 = a.Count - 1 to 0 step -1
+        if a[i] = v then a.RemoveSwap( i )
+    next
+end sub
+
+'' a := a OR b, for both kinds of fact.
+private sub OptUnion_( byref a as OptState, byref b as OptState )
+    for i as int32 = 0 to b.ok.Count - 1 : OptAdd_( a.ok, b.ok[i] ) : next
+    for i as int32 = 0 to b.fl.Count - 1 : OptAdd_( a.fl, b.fl[i] ) : next
+end sub
+
+'' a := a AND b: only what both hold.
+private sub OptIntersect_( byref a as OptState, byref b as OptState )
+    for i as int32 = a.ok.Count - 1 to 0 step -1
+        if OptHas_( b.ok, a.ok[i] ) = false then a.ok.RemoveSwap( i )
+    next
+    for i as int32 = a.fl.Count - 1 to 0 step -1
+        if OptHas_( b.fl, a.fl[i] ) = false then a.fl.RemoveSwap( i )
+    next
+end sub
+
+'' A join: a dead side contributes nothing, otherwise only the facts both sides hold survive.
+private sub OptJoin_( byref a as OptState, byref b as OptState )
+    if b.dead then return
+    if a.dead then OptCopy_( a, b ) : return
+    OptIntersect_( a, b )
+end sub
+
+private sub OptForget_( byref st as OptState, byval v as uint32 )
+    OptDel_( st.ok, v ) : OptDel_( st.fl, v )
+end sub
+
+private function OptUnparen_( byref c as Ctx, byval e as NodeId ) as NodeId
+    while (e <> NODE_NONE) andalso (c.ast->Kind( e ) = N_PAREN)
+        if c.ast->ListOf( e )->count <> 1 then exit while
+        e = c.ast->ChildAt( c.ast->ListOf( e )->first, 0 )
+    wend
+    return e
+end function
+
+'' The type's kind: an instance of 'optional' or 'result' whose home is std/outcome's
+'' interface namespace ('__tko_mod_std_outcome' in an importer). Inside std/outcome itself
+'' nothing is tracked -- its own members read the fields.
+private function OptKindOfType_( byref c as Ctx, byval t as TypeId ) as int32
+    if t = TYPE_NONE then return OPTK_NONE
+    '' A BYREF PARAMETER is a reference to the type; a typedef names it.
+    for guard as int32 = 1 to 8
+        t = c.types->Unqualify( t )
+        if (c.types->Kind( t ) <> TK_REFERENCE) andalso (c.types->Kind( t ) <> TK_TYPEDEF) then exit for
+        t = c.types->Inner( t )
+        if t = TYPE_NONE then return OPTK_NONE
+    next
+    if c.types->Kind( t ) <> TK_UDT then return OPTK_NONE
+    dim as string nm = lcase( c.names->Spelling( c.types->NameOf( t ) ) )
+    dim as int32 kind = OPTK_NONE
+    if left( nm, 9 ) = "optional<" then
+        kind = OPTK_OPTIONAL
+    elseif left( nm, 7 ) = "result<" then
+        kind = OPTK_RESULT
+    else
+        return OPTK_NONE
+    end if
+    dim as SymScope ptr hs = c.syms->ScopeAt( cast( ScopeId, c.types->DeclScopeOf( t ) ) )
+    if hs = nullptr then return OPTK_NONE
+    dim as Symbol ptr ho = c.syms->SymbolAt( hs->owner )
+    if ho = nullptr then return OPTK_NONE
+    if lcase( c.names->Spelling( ho->name ) ) <> "__tko_mod_std_outcome" then return OPTK_NONE
+    return kind
+end function
+
+'' The tracked variable an expression names, or 0: a local, a parameter or an unshared
+'' module-level variable of an outcome type.
+private function OptVar_( byref c as Ctx, byval e as NodeId ) as uint32
+    e = OptUnparen_( c, e )
+    if (e = NODE_NONE) orelse (c.ast->Kind( e ) <> N_IDENT) then return 0
+    dim as SymbolId sid = c.info->RefOf( e )
+    dim as Symbol ptr s = c.syms->SymbolAt( sid )
+    if s = nullptr then return 0
+    if (s->kind <> cast( uint8, SYM_VARIABLE )) andalso (s->kind <> cast( uint8, SYM_PARAMETER )) then return 0
+    if (s->flags and (SYMF_SHARED or SYMF_EXTERN or SYMF_COMMON)) <> 0 then return 0
+    if OptKindOfType_( c, s->type_ ) = OPTK_NONE then return 0
+    return cast( uint32, sid )
+end function
+
+'' A member call on a tracked variable: 'o.Name( ... )', or 'o.Name' without parentheses.
+'' Returns the variable and the member's folded name; 0 when it is not one.
+private function OptMemberCall_( byref c as Ctx, byval e as NodeId, byref member as string ) as uint32
+    e = OptUnparen_( c, e )
+    if e = NODE_NONE then return 0
+    dim as NodeId mem = NODE_NONE
+    select case c.ast->Kind( e )
+    case N_CALL
+        mem = OptUnparen_( c, c.ast->ListOf( e )->target )
+    case N_MEMBER
+        mem = e
+    case else
+        return 0
+    end select
+    if (mem = NODE_NONE) orelse (c.ast->Kind( mem ) <> N_MEMBER) then return 0
+    dim as BinaryPayload ptr mp = c.ast->BinaryOf( mem )
+    if cast( TokenKind, mp->op ) = TK_ARROW then return 0
+    dim as uint32 v = OptVar_( c, mp->lhs )
+    if v = 0 then return 0
+    if (mp->rhs = NODE_NONE) orelse (c.ast->Kind( mp->rhs ) <> N_IDENT) then return 0
+    member = lcase( c.names->Spelling( c.ast->IdentOf( mp->rhs )->name ) )
+    '' A bare 'o.value' is a call only when it binds to the member PROCEDURE.
+    if c.ast->Kind( e ) = N_MEMBER then
+        dim as Symbol ptr ms = c.syms->SymbolAt( c.info->RefOf( e ) )
+        if ms = nullptr then ms = c.syms->SymbolAt( c.info->RefOf( mp->rhs ) )
+        if (ms = nullptr) orelse (ms->kind <> cast( uint8, SYM_PROC )) then return 0
+    end if
+    return v
+end function
+
+'' The fact a value assigned to a tracked variable carries: 1 OK, 2 FAILED, 0 none.
+'' 'Some( x )', 'Ok( x )', 'Fail( e )' -- bare or qualified, as outcome's free procedures.
+private function OptCtorFact_( byref c as Ctx, byval e as NodeId ) as int32
+    e = OptUnparen_( c, e )
+    if (e = NODE_NONE) orelse (c.ast->Kind( e ) <> N_CALL) then return 0
+    dim as NodeId tg = OptUnparen_( c, c.ast->ListOf( e )->target )
+    if tg = NODE_NONE then return 0
+    if c.ast->Kind( tg ) = N_MEMBER then tg = c.ast->BinaryOf( tg )->rhs
+    if (tg = NODE_NONE) orelse (c.ast->Kind( tg ) <> N_IDENT) then return 0
+    '' outcome's own: by the call's type, or -- a DIM initialiser's call carries none -- by
+    '' the callee's home, which is the module's interface namespace.
+    if OptKindOfType_( c, c.info->TypeOf_( e ) ) = OPTK_NONE then
+        dim as Symbol ptr cs = c.syms->SymbolAt( c.info->RefOf( e ) )
+        if cs = nullptr then cs = c.syms->SymbolAt( c.info->RefOf( tg ) )
+        if cs = nullptr then return 0
+        if OptKindOfType_( c, cs->type_ ) = OPTK_NONE then
+            dim as SymScope ptr hs = c.syms->ScopeAt( cs->parent )
+            if hs = nullptr then return 0
+            dim as Symbol ptr ho = c.syms->SymbolAt( hs->owner )
+            if ho = nullptr then return 0
+            if lcase( c.names->Spelling( ho->name ) ) <> "__tko_mod_std_outcome" then return 0
+        end if
+    end if
+    select case lcase( c.names->Spelling( c.ast->IdentOf( tg )->name ) )
+    case "some", "ok" : return 1
+    case "fail"       : return 2
+    end select
+    return 0
+end function
+
+'' A dim item's symbol: its binding, else a lookup where it was declared (semslice's ItemSym_).
+private function OptItemSym_( byref c as Ctx, byval id as NodeId ) as uint32
+    '' The binding first, but only a VARIABLE: an item's binding can name something else.
+    dim as SymbolId sid = c.info->RefOf( id )
+    dim as Symbol ptr s = c.syms->SymbolAt( sid )
+    if (s <> nullptr) andalso (s->kind = cast( uint8, SYM_VARIABLE )) then return cast( uint32, sid )
+    sid = c.syms->LookupTyped( c.info->ScopeOf( id ), c.ast->StmtOf( id )->name, false )
+    s = c.syms->SymbolAt( sid )
+    if (s <> nullptr) andalso (s->kind = cast( uint8, SYM_VARIABLE )) then return cast( uint32, sid )
+    for si as int32 = 1 to c.syms->symbols.Count - 1
+        if (c.syms->symbols[si].payload = cast( uint32, id )) andalso (c.syms->symbols[si].kind = cast( uint8, SYM_VARIABLE )) then return cast( uint32, si )
+    next
+    return 0
+end function
+
+private sub OptReport_( byref c as Ctx, byval v as uint32, byval at_ as NodeId, byref member as string )
+    dim as Symbol ptr s = c.syms->SymbolAt( cast( SymbolId, v ) )
+    if s = nullptr then return
+    dim as string chk = "HasValue"
+    if OptKindOfType_( c, s->type_ ) = OPTK_RESULT then chk = "IsOk"
+    dim as string mem = "Value"
+    if member = "failure" then mem = "Failure"
+    c.diags->Report( TKO1150, PointRange( c.ast->Loc( at_ ) ), c.names->Spelling( s->name ), mem, chk )
+end sub
+
+declare sub OptExpr_( byref c as Ctx, byref st as OptState, byval e as NodeId )
+declare sub OptCond_( byref c as Ctx, byref st as OptState, byval e as NodeId, byref t as OptState, byref f as OptState )
+
+'' The literal a comparison tests against: 1 for true, 0 for false or 0, -1 for anything else.
+private function OptTruth_( byref c as Ctx, byval e as NodeId ) as int32
+    e = OptUnparen_( c, e )
+    if e = NODE_NONE then return -1
+    select case c.ast->Kind( e )
+    case N_INT_LIT
+        dim as LiteralPayload ptr lp = c.ast->LiteralOf( e )
+        if (lp->intValue = 0) andalso (lp->intHi = 0) then return 0
+        return -1
+    case N_IDENT
+        dim as Symbol ptr s = c.syms->SymbolAt( c.info->RefOf( e ) )
+        if s = nullptr then return -1
+        if (s->flags and SYMF_BUILTIN) = 0 then return -1
+        if s->payload = 0 then return 0
+        return 1
+    end select
+    return -1
+end function
+
+'' A condition: judge what it reads under 'st', and say which facts hold when it is true ('t')
+'' and when it is false ('f'). Both start empty.
+sub OptCond_( byref c as Ctx, byref st as OptState, byval e as NodeId, byref t as OptState, byref f as OptState )
+    e = OptUnparen_( c, e )
+    if e = NODE_NONE then return
+    select case c.ast->Kind( e )
+    case N_UNARY
+        dim as UnaryPayload ptr up = c.ast->UnaryOf( e )
+        if cast( TokenKind, up->op ) = KW_NOT then
+            OptCond_( c, st, up->operand, f, t )
+            return
+        end if
+    case N_BINARY
+        dim as BinaryPayload ptr bp = c.ast->BinaryOf( e )
+        select case cast( TokenKind, bp->op )
+        case KW_ANDALSO, KW_ORELSE
+            dim as OptState t1, f1, t2, f2, rs
+            OptCond_( c, st, bp->lhs, t1, f1 )
+            '' The right side runs only when the left is true (andalso) or false (orelse).
+            OptCopy_( rs, st )
+            if cast( TokenKind, bp->op ) = KW_ANDALSO then OptUnion_( rs, t1 ) else OptUnion_( rs, f1 )
+            OptCond_( c, rs, bp->rhs, t2, f2 )
+            if cast( TokenKind, bp->op ) = KW_ANDALSO then
+                '' true: both were. false: the left was, or the left was true and the right false.
+                OptCopy_( t, t1 ) : OptUnion_( t, t2 )
+                dim as OptState alt
+                OptCopy_( alt, t1 ) : OptUnion_( alt, f2 )
+                OptCopy_( f, f1 ) : OptIntersect_( f, alt )
+            else
+                OptCopy_( f, f1 ) : OptUnion_( f, f2 )
+                dim as OptState alt
+                OptCopy_( alt, f1 ) : OptUnion_( alt, t2 )
+                OptCopy_( t, t1 ) : OptIntersect_( t, alt )
+            end if
+            return
+        case TK_EQ, TK_NE
+            '' 'x = false', 'x = 0', 'x <> true', ... either way round.
+            dim as int32 lt = OptTruth_( c, bp->lhs ), rt = OptTruth_( c, bp->rhs )
+            dim as NodeId sub_ = NODE_NONE
+            dim as int32 lit = -1
+            if (rt >= 0) andalso (lt < 0) then
+                sub_ = bp->lhs : lit = rt
+            elseif (lt >= 0) andalso (rt < 0) then
+                sub_ = bp->rhs : lit = lt
+            end if
+            if sub_ <> NODE_NONE then
+                '' Equal to true, or unequal to false: the same sense. Otherwise turned round.
+                dim as boolean same = ((cast( TokenKind, bp->op ) = TK_EQ) andalso (lit = 1)) orelse _
+                                      ((cast( TokenKind, bp->op ) = TK_NE) andalso (lit = 0))
+                if same then OptCond_( c, st, sub_, t, f ) else OptCond_( c, st, sub_, f, t )
+                return
+            end if
+        end select
+    case N_CALL, N_MEMBER
+        dim as string member
+        dim as uint32 v = OptMemberCall_( c, e, member )
+        if v <> 0 then
+            if (member = "hasvalue") orelse (member = "isok") then
+                OptAdd_( t.ok, v )
+                if member = "isok" then OptAdd_( f.fl, v )
+                return
+            end if
+        end if
+    end select
+    OptExpr_( c, st, e )
+end sub
+
+'' The parameter list of the procedure a call chose, for its byref arguments.
+private function OptCalleeDecl_( byref c as Ctx, byval callNode as NodeId ) as NodeId
+    dim as Symbol ptr callee = c.syms->SymbolAt( c.info->RefOf( callNode ) )
+    if callee = nullptr then callee = c.syms->SymbolAt( c.info->RefOf( c.ast->ListOf( callNode )->target ) )
+    if callee = nullptr then return NODE_NONE
+    if (callee->kind <> cast( uint8, SYM_PROC )) orelse (callee->payload = 0) then return NODE_NONE
+    dim as NodeId decl = cast( NodeId, callee->payload )
+    if c.ast->Kind( decl ) <> N_PROC then return NODE_NONE
+    return decl
+end function
+
+'' An expression: report each unchecked Value( ) / Failure( ), and apply what it writes.
+sub OptExpr_( byref c as Ctx, byref st as OptState, byval e as NodeId )
+    if (e = NODE_NONE) orelse c.diags->Stopped( ) then return
+    dim as NodeKind k = c.ast->Kind( e )
+    select case k
+    case N_BINARY
+        dim as BinaryPayload ptr bp = c.ast->BinaryOf( e )
+        if (cast( TokenKind, bp->op ) = KW_ANDALSO) orelse (cast( TokenKind, bp->op ) = KW_ORELSE) then
+            dim as OptState t, f
+            OptCond_( c, st, e, t, f )
+            return
+        end if
+        OptExpr_( c, st, bp->lhs )
+        OptExpr_( c, st, bp->rhs )
+        return
+    case N_MEMBER
+        dim as string member
+        dim as uint32 v = OptMemberCall_( c, e, member )
+        if v <> 0 then
+            if (st.dead = false) andalso (member = "value") andalso (OptHas_( st.ok, v ) = false) then OptReport_( c, v, c.ast->BinaryOf( e )->lhs, member )
+            if (st.dead = false) andalso (member = "failure") andalso (OptHas_( st.fl, v ) = false) then OptReport_( c, v, c.ast->BinaryOf( e )->lhs, member )
+            return
+        end if
+        OptExpr_( c, st, c.ast->BinaryOf( e )->lhs )
+        return
+    case N_ADDROF
+        dim as uint32 v = OptVar_( c, c.ast->UnaryOf( e )->operand )
+        if v <> 0 then OptForget_( st, v ) : return
+        OptExpr_( c, st, c.ast->UnaryOf( e )->operand )
+        return
+    case N_UNARY, N_DEREF
+        OptExpr_( c, st, c.ast->UnaryOf( e )->operand )
+        return
+    case N_CALL
+        dim as ListPayload ptr lp = c.ast->ListOf( e )
+        '' 'iif( cond, a, b )': the condition guards each side.
+        dim as NodeId tg = OptUnparen_( c, lp->target )
+        if (tg <> NODE_NONE) andalso (c.ast->Kind( tg ) = N_IDENT) andalso (lp->count = 3) then
+            if lcase( c.names->Spelling( c.ast->IdentOf( tg )->name ) ) = "iif" then
+                dim as OptState t, f, a, b
+                OptCond_( c, st, c.ast->ChildAt( lp->first, 0 ), t, f )
+                OptCopy_( a, st ) : OptUnion_( a, t )
+                OptCopy_( b, st ) : OptUnion_( b, f )
+                OptExpr_( c, a, c.ast->ChildAt( lp->first, 1 ) )
+                OptExpr_( c, b, c.ast->ChildAt( lp->first, 2 ) )
+                return
+            end if
+        end if
+        dim as string member
+        dim as uint32 v = OptMemberCall_( c, e, member )
+        for i as int32 = 0 to lp->count - 1
+            OptExpr_( c, st, c.ast->ChildAt( lp->first, i ) )
+        next
+        if v <> 0 then
+            select case member
+            case "value", "failure"
+                dim as boolean need
+                if member = "value" then need = OptHas_( st.ok, v ) else need = OptHas_( st.fl, v )
+                if (st.dead = false) andalso (need = false) then OptReport_( c, v, c.ast->BinaryOf( OptUnparen_( c, lp->target ) )->lhs, member )
+            case "clear"
+                OptForget_( st, v )
+            case "assign", "assignok"
+                OptForget_( st, v ) : OptAdd_( st.ok, v )
+            case "assignfail"
+                OptForget_( st, v ) : OptAdd_( st.fl, v )
+            end select
+            return
+        end if
+        OptExpr_( c, st, lp->target )
+        '' A tracked variable handed to a byref parameter that is not const may be changed.
+        dim as NodeId decl = OptCalleeDecl_( c, e )
+        if decl <> NODE_NONE then
+            dim as StmtPayload ptr pp = c.ast->StmtOf( decl )
+            dim as int32 ai = 0
+            for i as int32 = 0 to pp->count - 1
+                dim as NodeId prm = c.ast->ChildAt( pp->first, i )
+                if c.ast->Kind( prm ) <> N_PARAM then continue for
+                if ai >= lp->count then exit for
+                dim as NodeId arg = c.ast->ChildAt( lp->first, ai )
+                ai += 1
+                if (c.ast->Flags( prm ) and NF_BYREF) = 0 then continue for
+                dim as uint32 av = OptVar_( c, arg )
+                if av = 0 then continue for
+                dim as TypeId pt = c.info->TypeOf_( c.ast->StmtOf( prm )->a )
+                if (pt <> TYPE_NONE) andalso c.types->IsConst( pt ) then continue for
+                OptForget_( st, av )
+            next
+        end if
+        return
+    case N_INDEX, N_PAREN, N_TUPLE, N_INITIALIZER, N_STRCAT, N_NEW
+        dim as ListPayload ptr lp = c.ast->ListOf( e )
+        if k <> N_NEW then OptExpr_( c, st, lp->target )
+        for i as int32 = 0 to lp->count - 1
+            OptExpr_( c, st, c.ast->ChildAt( lp->first, i ) )
+        next
+        return
+    end select
+end sub
+
+'' Does the statement end the path it is on? 'end', 'stop' and 'error n' do, and so does a
+'' call to the assert macro's '__tko_assert', or to the runtime's 'fb_Assert' that an fbc-style
+'' 'assert_' macro calls: both end the program (lib/rt error/assert.tiko).
+private function OptEndsPath_( byref c as Ctx, byval id as NodeId ) as boolean
+    select case c.ast->Kind( id )
+    case N_RETURN, N_EXIT, N_CONTINUE, N_GOTO, N_END_STMT, N_ERROR_STMT
+        return true
+    case N_INTRINSIC
+        select case cast( TokenKind, c.ast->StmtOf( id )->op )
+        case KW_ERROR, KW_END : return true
+        end select
+    case N_AMBIGUOUS
+        dim as NodeId a = OptUnparen_( c, c.ast->StmtOf( id )->a )
+        if (a <> NODE_NONE) andalso (c.ast->Kind( a ) = N_CALL) then a = OptUnparen_( c, c.ast->ListOf( a )->target )
+        if (a <> NODE_NONE) andalso (c.ast->Kind( a ) = N_IDENT) then
+            select case lcase( c.names->Spelling( c.ast->IdentOf( a )->name ) )
+            case "__tko_assert", "fb_assert", "stop", "end" : return true
+            end select
+        end if
+    end select
+    return false
+end function
+
+'' Every tracked variable a statement (or anything in it) can change, for the loop rule.
+private sub OptKills_( byref c as Ctx, byval id as NodeId, byref out_ as OptState, byval root as NodeId )
+    if id = NODE_NONE then return
+    dim as NodeKind k = c.ast->Kind( id )
+    if (id <> root) andalso ((k = N_PROC) orelse (k = N_TYPE) orelse (k = N_CLOSURE)) then return
+    '' Run the expression rules on an all-knowing state and see what they took away.
+    select case k
+    case N_AMBIGUOUS
+        if c.info->AmbiguousOf( id ) = AMB_ASSIGN then
+            dim as uint32 v = OptVar_( c, c.ast->StmtOf( id )->a )
+            if v <> 0 then OptAdd_( out_.ok, v )
+        end if
+    case N_VAR_ITEM
+        dim as uint32 v = OptItemSym_( c, id )
+        if v <> 0 then OptAdd_( out_.ok, v )
+    case N_CALL
+        dim as string member
+        dim as uint32 v = OptMemberCall_( c, id, member )
+        if v <> 0 then
+            if (member = "clear") orelse (left( member, 6 ) = "assign") then OptAdd_( out_.ok, v )
+        else
+            dim as NodeId decl = OptCalleeDecl_( c, id )
+            if decl <> NODE_NONE then
+                dim as ListPayload ptr lp = c.ast->ListOf( id )
+                dim as StmtPayload ptr pp = c.ast->StmtOf( decl )
+                dim as int32 ai = 0
+                for i as int32 = 0 to pp->count - 1
+                    dim as NodeId prm = c.ast->ChildAt( pp->first, i )
+                    if c.ast->Kind( prm ) <> N_PARAM then continue for
+                    if ai >= lp->count then exit for
+                    dim as uint32 av = OptVar_( c, c.ast->ChildAt( lp->first, ai ) )
+                    ai += 1
+                    if (av <> 0) andalso ((c.ast->Flags( prm ) and NF_BYREF) <> 0) then OptAdd_( out_.ok, av )
+                next
+            end if
+        end if
+    case N_ADDROF
+        dim as uint32 v = OptVar_( c, c.ast->UnaryOf( id )->operand )
+        if v <> 0 then OptAdd_( out_.ok, v )
+    end select
+    '' ...and everything below it.
+    select case k
+    case N_IDENT, N_INT_LIT, N_FLOAT_LIT, N_STRING_LIT, N_TYPEREF
+        return
+    case N_BINARY, N_MEMBER
+        OptKills_( c, c.ast->BinaryOf( id )->lhs, out_, root )
+        OptKills_( c, c.ast->BinaryOf( id )->rhs, out_, root )
+        return
+    case N_UNARY, N_ADDROF, N_DEREF
+        OptKills_( c, c.ast->UnaryOf( id )->operand, out_, root )
+        return
+    case N_CALL, N_INDEX, N_PAREN, N_TUPLE, N_INITIALIZER, N_STRCAT, N_NEW, N_BLOCK, N_MODULE
+        dim as ListPayload ptr lp = c.ast->ListOf( id )
+        if (k <> N_NEW) andalso (k <> N_BLOCK) andalso (k <> N_MODULE) then OptKills_( c, lp->target, out_, root )
+        for i as int32 = 0 to lp->count - 1
+            OptKills_( c, c.ast->ChildAt( lp->first, i ), out_, root )
+        next
+        return
+    end select
+    if (NodeKindCategory( k ) <> NCAT_STMT) andalso (NodeKindCategory( k ) <> NCAT_DECL) then return
+    dim as StmtPayload ptr sp = c.ast->StmtOf( id )
+    OptKills_( c, sp->a, out_, root )
+    OptKills_( c, sp->b, out_, root )
+    OptKills_( c, sp->c, out_, root )
+    for i as int32 = 0 to sp->count - 1
+        OptKills_( c, c.ast->ChildAt( sp->first, i ), out_, root )
+    next
+end sub
+
+'' Does a loop body hold an 'exit' that leaves it (or anything further out)?
+private function OptHasExit_( byref c as Ctx, byval id as NodeId ) as boolean
+    if id = NODE_NONE then return false
+    dim as NodeKind k = c.ast->Kind( id )
+    if (k = N_PROC) orelse (k = N_TYPE) orelse (k = N_CLOSURE) then return false
+    if (k = N_EXIT) orelse (k = N_GOTO) then return true
+    if (NodeKindCategory( k ) <> NCAT_STMT) andalso (NodeKindCategory( k ) <> NCAT_DECL) then return false
+    if k = N_BLOCK then
+        dim as ListPayload ptr lp = c.ast->ListOf( id )
+        for i as int32 = 0 to lp->count - 1
+            if OptHasExit_( c, c.ast->ChildAt( lp->first, i ) ) then return true
+        next
+        return false
+    end if
+    dim as StmtPayload ptr sp = c.ast->StmtOf( id )
+    if OptHasExit_( c, sp->b ) orelse OptHasExit_( c, sp->c ) then return true
+    for i as int32 = 0 to sp->count - 1
+        if OptHasExit_( c, c.ast->ChildAt( sp->first, i ) ) then return true
+    next
+    return false
+end function
+
+declare sub OptStmt_( byref c as Ctx, byref st as OptState, byval id as NodeId, byval root as NodeId )
+
+private sub OptBlock_( byref c as Ctx, byref st as OptState, byval id as NodeId, byval root as NodeId )
+    if id = NODE_NONE then return
+    if (c.ast->Kind( id ) <> N_BLOCK) andalso (c.ast->Kind( id ) <> N_MODULE) then OptStmt_( c, st, id, root ) : return
+    dim as ListPayload ptr lp = c.ast->ListOf( id )
+    for i as int32 = 0 to lp->count - 1
+        OptStmt_( c, st, c.ast->ChildAt( lp->first, i ), root )
+    next
+end sub
+
+'' A tracked variable takes a new value: it holds what that value is known to hold --
+'' Some( )/Ok( )/Fail( )'s fact, or a COPY of another tracked variable's facts -- and nothing else.
+private sub OptBind_( byref c as Ctx, byref st as OptState, byval v as uint32, byval rhs as NodeId )
+    dim as uint32 src = OptVar_( c, rhs )
+    dim as boolean sok = false, sfl = false
+    if src <> 0 then sok = OptHas_( st.ok, src ) : sfl = OptHas_( st.fl, src )
+    OptForget_( st, v )
+    select case OptCtorFact_( c, rhs )
+    case 1 : OptAdd_( st.ok, v )
+    case 2 : OptAdd_( st.fl, v )
+    end select
+    if sok then OptAdd_( st.ok, v )
+    if sfl then OptAdd_( st.fl, v )
+end sub
+
+sub OptStmt_( byref c as Ctx, byref st as OptState, byval id as NodeId, byval root as NodeId )
+    if (id = NODE_NONE) orelse c.diags->Stopped( ) then return
+    dim as NodeKind k = c.ast->Kind( id )
+    if (id <> root) andalso ((k = N_PROC) orelse (k = N_TYPE)) then return
+    select case k
+    case N_MODULE, N_BLOCK
+        OptBlock_( c, st, id, root )
+        return
+    case N_PROC
+        OptBlock_( c, st, c.ast->StmtOf( id )->b, root )
+        return
+    case N_LABEL
+        '' A 'goto' may arrive here with anything.
+        st.dead = false : st.ok.Clear( ) : st.fl.Clear( )
+        return
+    case N_DEFER, N_SPAWN, N_TYPE, N_NAMESPACE, N_TYPEDEF, N_ENUM, N_CONST, N_USING, N_OPTION
+        return
+    end select
+    if (NodeKindCategory( k ) <> NCAT_STMT) andalso (NodeKindCategory( k ) <> NCAT_DECL) then
+        OptExpr_( c, st, id )
+        return
+    end if
+
+    dim as StmtPayload ptr sp = c.ast->StmtOf( id )
+    select case k
+    case N_IF
+        dim as OptState cur, out_
+        OptCopy_( cur, st )
+        out_.dead = true
+        dim as ListPayload ptr bl = c.ast->ListOf( sp->b )
+        for i as int32 = 0 to bl->count - 1
+            dim as NodeId br = c.ast->ChildAt( bl->first, i )
+            dim as StmtPayload ptr bp = c.ast->StmtOf( br )
+            dim as OptState t, f, arm
+            OptCond_( c, cur, bp->a, t, f )
+            OptCopy_( arm, cur ) : OptUnion_( arm, t )
+            OptBlock_( c, arm, bp->b, root )
+            OptJoin_( out_, arm )
+            OptUnion_( cur, f )
+        next
+        '' The else arm, or the way past an 'if' that has none.
+        if sp->c <> NODE_NONE then OptBlock_( c, cur, sp->c, root )
+        OptJoin_( out_, cur )
+        OptCopy_( st, out_ )
+        return
+    case N_SELECT
+        OptExpr_( c, st, sp->a )
+        dim as OptState out_
+        OptCopy_( out_, st )
+        if sp->b <> NODE_NONE then
+            dim as ListPayload ptr cl = c.ast->ListOf( sp->b )
+            for i as int32 = 0 to cl->count - 1
+                dim as NodeId cs = c.ast->ChildAt( cl->first, i )
+                dim as OptState arm
+                OptCopy_( arm, st )
+                if c.ast->Kind( cs ) = N_CASE then
+                    dim as StmtPayload ptr cp = c.ast->StmtOf( cs )
+                    for j as int32 = 0 to cp->count - 1
+                        OptExpr_( c, arm, c.ast->ChildAt( cp->first, j ) )
+                    next
+                    OptBlock_( c, arm, cp->b, root )
+                else
+                    OptBlock_( c, arm, cs, root )
+                end if
+                OptJoin_( out_, arm )
+            next
+        end if
+        if sp->c <> NODE_NONE then
+            dim as OptState arm
+            OptCopy_( arm, st )
+            OptBlock_( c, arm, sp->c, root )
+            OptJoin_( out_, arm )
+        end if
+        OptCopy_( st, out_ )
+        return
+    case N_WHILE, N_DO, N_FOR, N_FOREACH
+        '' Whatever the loop can change is not known on entry, nor after a pass.
+        dim as OptState kills, entry
+        OptKills_( c, id, kills, id )
+        OptCopy_( entry, st )
+        for i as int32 = 0 to kills.ok.Count - 1 : OptForget_( entry, kills.ok[i] ) : next
+        dim as OptState body, after
+        OptCopy_( body, entry ) : OptCopy_( after, entry )
+        dim as NodeId cond = NODE_NONE
+        dim as boolean pre = false, untl = false
+        if (k = N_WHILE) orelse ((k = N_DO) andalso ((c.ast->Flags( id ) and NF_POST_COND) = 0)) then
+            cond = sp->a : pre = true
+        elseif k = N_DO then
+            cond = sp->c
+        end if
+        if k = N_DO then untl = ((c.ast->Flags( id ) and NF_UNTIL) <> 0)
+        if (k = N_FOR) orelse (k = N_FOREACH) then
+            OptExpr_( c, entry, sp->a )
+            for i as int32 = 0 to sp->count - 1
+                OptExpr_( c, entry, c.ast->ChildAt( sp->first, i ) )
+            next
+        end if
+        dim as OptState t, f
+        if pre andalso (cond <> NODE_NONE) then
+            OptCond_( c, entry, cond, t, f )
+            if untl then OptUnion_( body, f ) else OptUnion_( body, t )
+        end if
+        OptBlock_( c, body, sp->b, root )
+        if (pre = false) andalso (cond <> NODE_NONE) then
+            dim as OptState bt
+            OptCopy_( bt, body )
+            if bt.dead then OptCopy_( bt, entry )
+            OptCond_( c, bt, cond, t, f )
+        end if
+        '' Leaving by the condition: its false facts ('until': its true ones), unless an
+        '' 'exit' can leave from somewhere else.
+        if (cond <> NODE_NONE) andalso (OptHasExit_( c, sp->b ) = false) then
+            if untl then OptUnion_( after, t ) else OptUnion_( after, f )
+        end if
+        dim as boolean wasDead = st.dead
+        OptCopy_( st, after )
+        st.dead = wasDead
+        return
+    case N_SCOPE
+        OptBlock_( c, st, sp->b, root )
+        return
+    case N_WITH
+        OptExpr_( c, st, sp->a )
+        OptBlock_( c, st, sp->b, root )
+        return
+    case N_VAR
+        for i as int32 = 0 to sp->count - 1
+            OptStmt_( c, st, c.ast->ChildAt( sp->first, i ), root )
+        next
+        return
+    case N_VAR_ITEM
+        OptExpr_( c, st, sp->b )
+        dim as uint32 v = OptItemSym_( c, id )
+        if v <> 0 then
+            dim as Symbol ptr vs = c.syms->SymbolAt( cast( SymbolId, v ) )
+            if (vs <> nullptr) andalso (OptKindOfType_( c, vs->type_ ) <> OPTK_NONE) then
+                OptBind_( c, st, v, sp->b )
+            end if
+        end if
+        return
+    case N_AMBIGUOUS
+        if c.info->AmbiguousOf( id ) = AMB_ASSIGN then
+            OptExpr_( c, st, sp->b )
+            dim as uint32 v = OptVar_( c, sp->a )
+            if v <> 0 then
+                OptBind_( c, st, v, sp->b )
+            else
+                OptExpr_( c, st, sp->a )
+            end if
+        else
+            OptExpr_( c, st, sp->a )
+            for i as int32 = 0 to sp->count - 1
+                OptExpr_( c, st, c.ast->ChildAt( sp->first, i ) )
+            next
+        end if
+    case N_RETURN
+        OptExpr_( c, st, sp->a )
+    case else
+        OptExpr_( c, st, sp->a )
+        OptExpr_( c, st, sp->b )
+        OptExpr_( c, st, sp->c )
+        for i as int32 = 0 to sp->count - 1
+            OptStmt_( c, st, c.ast->ChildAt( sp->first, i ), root )
+        next
+    end select
+    if OptEndsPath_( c, id ) then
+        st.dead = true : st.ok.Clear( ) : st.fl.Clear( )
+    end if
+end sub
+
+'' One procedure body, or the module's own statements -- only in a unit with a variable or
+'' parameter of an outcome type at all, asked once (optSeen: 1 none, 2 some).
+sub CheckOptAccess_ ( byref c as Ctx, byval id as NodeId )
+    if c.optSeen = 0 then
+        c.optSeen = 1
+        for si as int32 = 1 to c.syms->symbols.Count - 1
+            dim as Symbol ptr s = @c.syms->symbols[si]
+            if (s->kind <> cast( uint8, SYM_VARIABLE )) andalso (s->kind <> cast( uint8, SYM_PARAMETER )) then continue for
+            if s->type_ = TYPE_NONE then continue for
+            if OptKindOfType_( c, s->type_ ) <> OPTK_NONE then c.optSeen = 2 : exit for
+        next
+    end if
+    if c.optSeen <> 2 then return
+    '' A generic body is judged once, where it is written, not once per instance.
+    if c.ast->Kind( id ) = N_PROC then
+        dim as Symbol ptr ps = c.syms->SymbolAt( c.info->RefOf( id ) )
+        if (ps <> nullptr) andalso ((ps->flags and SYMF_GENERIC_INST) <> 0) then return
+        '' A CLOSURE'S BODY is a generated procedure (__tko_lambda_*) that runs whenever it is
+        '' called: what held where it was written says nothing there, and it is not judged.
+        if left( lcase( c.names->Spelling( c.ast->StmtOf( id )->name ) ), 13 ) = "__tko_lambda_" then return
+    end if
+    dim as OptState st
+    OptStmt_( c, st, id, id )
+end sub
+
+end namespace

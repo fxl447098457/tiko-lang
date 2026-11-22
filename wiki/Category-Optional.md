@@ -101,13 +101,15 @@ The same rule the containers already carry, for the same reason: inference reads
 
 ## Empty Access Raises
 
-Value( ) on an empty Optional raises FB_RTERROR_ILLEGALFUNCTIONCALL through the ordinary runtime-error path. With no handler installed the program stops:
+Value( ) on an empty Optional raises FB_RTERROR_ILLEGALFUNCTIONCALL. With no handler installed the program stops, naming the line that called Value( ):
 
 ```freebasic
-Aborting due to runtime error 1 (illegal function call) at line 92 of ...\pkg\std\outcome\optional.tiko()
+Aborting due to runtime error 1 (illegal function call) at line 14 of demo.tiko(), Value( ) of an empty Optional
 ```
 
-It is catchable by 'on error' and reports a line under -exx. This is a bug at the call site, not a recoverable condition: HasValue( ) or ValueOr( ) is available and costs nothing.
+It is catchable by 'on error', where ERR is 1 and ERL is that line. This is a bug at the call site, not a recoverable condition: HasValue( ) or ValueOr( ) is available and costs nothing.
+
+The compiler warns, `TKO1150`, where it can see that no HasValue( ) check covers a Value( ) on every path to it. It follows `if` / `elseif` / `else`, `andalso` / `orelse`, `not` and `= false`, `iif`, `while` loops, and early `return` / `exit` / `error` / `end`; an assignment from `Some( )` or a call to `Assign( )` counts as a check, and `Clear( )`, a new assignment, or passing the Optional `byref` undoes one. It tracks named variables and parameters only, not a call's result or a field. `-Wno-TKO1150` turns it off.
 
 ValueOr( ) is the branch-free alternative and never raises:
 

@@ -45,6 +45,8 @@ unchanged. The handle is `TK_WIDGET ptr`; the font is a borrowed `TTF_Font ptr`.
 - PsRegistry.
 
 **Added:**
+- `tkSelectBar_PaintPanelDefault( p )`: the stock panel, for a panel-paint callback (the form
+  designer's Paint event).
 - **Keyboard focus, from PsPlatform.** The bar is a Tab stop. Left / Right move the selection,
   skipping disabled panels and never wrapping; Home / End go to the first / last enabled panel.
   A key is a user action, so it NOTIFIES. Up / Down, Space and Enter are not claimed (PsPlatform

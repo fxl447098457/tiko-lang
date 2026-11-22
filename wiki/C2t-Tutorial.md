@@ -480,11 +480,11 @@ minigeo/minigeo_<arch><ending>
 minigeo/minigeo<ending>
 ```
 
-| | windows-x86_64 | linux-x86_64 | macos-arm64 |
-|---|---|---|---|
-| `<os>_<arch>` | `windows_x86_64` | `linux_x86_64` | `macos_arm64` |
-| endings for `static` | `.a`, `.lib` | `.a` | `.a` |
-| endings for `dynamic` | `.dll.a`, `.lib`, `.dll` | `.so` | `.dylib` |
+| | windows-x86_64 | linux-x86_64 | linux-arm64 | macos-arm64 |
+|---|---|---|---|---|
+| `<os>_<arch>` | `windows_x86_64` | `linux_x86_64` | `linux_arm64` | `macos_arm64` |
+| endings for `static` | `.a`, `.lib` | `.a` | `.a` | `.a` |
+| endings for `dynamic` | `.dll.a`, `.lib`, `.dll` | `.so` | `.so` | `.dylib` |
 
 So on Windows, `dynamic` finds `minigeo_windows_x86_64.dll`, and `static` finds
 `minigeo_windows_x86_64.a`; on Linux, the two `linux` files. The path is relative to the file that

@@ -1,0 +1,385 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' resfile -- the project's resources (the Resource Center): appResources/appResources.tkres, the
+' files it names in appResources/files/, and the generated module that registers them in a program.
+'
+'   format = 1
+'   app_icon = "logo"             the image that is the program's icon (Windows: appicon writes
+'                                 app.ico and app.rc beside the .tkres); absent = none
+'   [[resource]]
+'   name = "logo"                 a property takes it as "res:logo"
+'   kind = "image"                image | font (from the file's extension)
+'   file = "logo.png"             in files/ beside the .tkres
+'   embed = true                  inside the program ('#embed'); false = a file beside it, in resources/
+'
+' Register(), before tkApp_Init, gives every name to tkHost (tkHost_AddResourceData / File): every
+' image load and font open in tkControls takes "res:<name>" where it takes a file path.
+#module "resfile"
+
+#import "std/config"
+#import "std/fs"
+#import "std/containers"
+#import "../codegen"
+using containers
+
+public const as long RES_FORMAT = 1
+public const as string RES_PREFIX = "res:"
+public const as string RES_MODULE = "appResources"
+public const as string FILES_DIR = "files"              ' beside the .tkres: the project's copies
+public const as string BESIDE_DIR = "resources"         ' beside the program: the files not built in
+const as string NL = chr( 10 )
+
+public type Resource
+    Name as ustring
+    Kind as ustring                    ' "image" | "font"
+    File as ustring                    ' its file name in files/
+    Embed as boolean = true
+end type
+
+public type ResourceDoc
+    Items as Array( of Resource )
+    AppIcon as ustring                 ' the image resource that is the program's icon; "" = none
+    Problems as Array( of ustring )
+end type
+
+' ---- names and kinds ----------------------------------------------------------------------------
+
+' A resource's name: a letter, then letters, digits and _ (it is also a tiko identifier's shape).
+public function IsName( byref s as const ustring ) as boolean
+    if len( s ) = 0 then return false
+    for i as long = 1 to len( s )
+        dim as long a = asc( mid( s, i, 1 ) )
+        dim as boolean letter = ((a >= 65) andalso (a <= 90)) orelse ((a >= 97) andalso (a <= 122))
+        if (i = 1) andalso (letter = false) then return false
+        if (letter = false) andalso (a <> 95) andalso ((a < 48) orelse (a > 57)) then return false
+    next
+    return true
+end function
+
+' "image" or "font" from a file's extension; "" for anything else.
+public function KindOf( byref file as const ustring ) as ustring
+    dim as ustring e = lcase( fs.PathExtension( file ) )
+    if left( e, 1 ) = "." then e = mid( e, 2 )
+    select case e
+    case "png", "jpg", "jpeg", "bmp", "ico", "gif", "webp", "tga", "svg" : return "image"
+    case "ttf", "otf" : return "font"
+    end select
+    return ""
+end function
+
+' The index of a resource by name (case-insensitive), -1 when there is none.
+public function Find( byref doc as ResourceDoc, byref nm as const ustring ) as long
+    for i as long = 0 to doc.Items.Count( ) - 1
+        if lcase( doc.Items[i].Name ) = lcase( nm ) then return i
+    next
+    return -1
+end function
+
+' "res:<name>" for a property; the name back from one ("" when the value isn't a reference).
+public function RefOf( byref nm as const ustring ) as ustring
+    return RES_PREFIX & nm
+end function
+
+public function NameOfRef( byref v as const ustring ) as ustring
+    if lcase( left( v, len( RES_PREFIX ) ) ) <> RES_PREFIX then return ""
+    return mid( v, len( RES_PREFIX ) + 1 )
+end function
+
+' A free name from a file's stem: the stem made a name, then numbered (logo, logo2, ...).
+public function UniqueName( byref doc as ResourceDoc, byref stem as const ustring ) as ustring
+    dim as ustring b
+    for i as long = 1 to len( stem )
+        dim as ustring c = mid( stem, i, 1 )
+        dim as long a = asc( c )
+        if ((a >= 48) andalso (a <= 57)) orelse ((a >= 65) andalso (a <= 90)) orelse ((a >= 97) andalso (a <= 122)) orelse (a = 95) then
+            b &= c
+        else
+            b &= "_"
+        end if
+    next
+    if (len( b ) = 0) orelse (IsName( b ) = false) then b = "res" & b
+    if Find( doc, b ) < 0 then return b
+    dim as long n = 2
+    while Find( doc, b & n ) >= 0
+        n += 1
+    wend
+    return b & n
+end function
+
+' ---- reading and writing ------------------------------------------------------------------------
+
+private function StrOf_( byref t as config.TomlValue, byref k as const ustring ) as ustring
+    dim as config.TomlValue ptr p = t.Find( k )
+    if p = 0 then return ""
+    dim as ustring none = ""
+    return p->AsString( ).ValueOr( none )
+end function
+
+private sub OnlyKeys_( byref t as config.TomlValue, byref allowed as const ustring, byref where as const ustring, byref doc as ResourceDoc )
+    for i as long = 0 to t.Count( ) - 1
+        dim as ustring k = t.KeyAt( i )
+        if instr( " " & allowed & " ", " " & k & " " ) = 0 then doc.Problems.Push( where & ": unknown key '" & k & "'" )
+    next
+end sub
+
+' Always the basic string form.
+private function Quote_( byref s as const ustring ) as ustring
+    dim as ustring o = """"
+    for i as long = 1 to len( s )
+        dim as ustring ch = mid( s, i, 1 )
+        select case asc( ch )
+        case 34 : o &= "\"""
+        case 92 : o &= "\\"
+        case 0 to 31, 127 : o &= "\u" & hex( asc( ch ), 4 )
+        case else : o &= ch
+        end select
+    next
+    return o & """"
+end function
+
+' False when the text isn't TOML or is a newer format; errText says why. Content faults go to Problems.
+public function Parse( byref text as const ustring, byref doc as ResourceDoc, byref errText as ustring ) as boolean
+    dim as config.ConfigResultToml r = config.ParseToml( text )
+    if r.IsOk( ) = false then
+        errText = r.Failure( ).Message( )
+        return false
+    end if
+    dim as config.TomlValue root = r.Value( )
+    dim as longint fmt = 0
+    dim as config.TomlValue ptr f = root.Find( "format" )
+    if f then fmt = f->AsInt( ).ValueOr( fmt )
+    if fmt <> RES_FORMAT then
+        errText = "format " & fmt & " is not one this version reads (expected " & RES_FORMAT & ")"
+        return false
+    end if
+    OnlyKeys_( root, "format app_icon resource", "file", doc )
+    doc.AppIcon = StrOf_( root, "app_icon" )
+    dim as config.TomlValue ptr list = root.Find( "resource" )
+    if list then
+        for i as long = 0 to list->Count( ) - 1
+            dim byref as config.TomlValue t = list->Item( i )
+            dim as ustring where = "resource " & (i + 1)
+            OnlyKeys_( t, "name kind file embed", where, doc )
+            dim as Resource x
+            x.Name = StrOf_( t, "name" )
+            x.Kind = StrOf_( t, "kind" )
+            x.File = StrOf_( t, "file" )
+            dim as boolean yes = true
+            dim as config.TomlValue ptr e = t.Find( "embed" )
+            if e then x.Embed = e->AsBool( ).ValueOr( yes )
+            doc.Items.Push( x )
+        next
+    end if
+    return true
+end function
+
+' The canonical text: the resources in their order, embed written only when it is off.
+public function ToText( byref doc as ResourceDoc ) as ustring
+    dim as ustring o = "format = " & RES_FORMAT & NL
+    if len( doc.AppIcon ) then o &= "app_icon = " & Quote_( doc.AppIcon ) & NL
+    for each x as Resource in doc.Items
+        o &= NL & "[[resource]]" & NL
+        o &= "name = " & Quote_( x.Name ) & NL
+        o &= "kind = " & Quote_( x.Kind ) & NL
+        o &= "file = " & Quote_( x.File ) & NL
+        if x.Embed = false then o &= "embed = false" & NL
+    next
+    return o
+end function
+
+' What is wrong with it. dir_: the folder of the .tkres, whose files/ must hold every file; "" skips
+' the files.
+public sub Check( byref doc as ResourceDoc, byref dir_ as const ustring, byref problems as Array( of ustring ) )
+    for each p as ustring in doc.Problems
+        problems.Push( p )
+    next
+    if len( doc.AppIcon ) then
+        dim as long a = Find( doc, doc.AppIcon )
+        if a < 0 then
+            problems.Push( "app_icon '" & doc.AppIcon & "': no such resource" )
+        elseif doc.Items[a].Kind <> "image" then
+            problems.Push( "app_icon '" & doc.AppIcon & "': not an image" )
+        end if
+    end if
+    for i as long = 0 to doc.Items.Count( ) - 1
+        dim byref as Resource x = doc.Items[i]
+        if IsName( x.Name ) = false then
+            problems.Push( "resource '" & x.Name & "': a name is a letter, then letters, digits and _" )
+        elseif Find( doc, x.Name ) <> i then
+            problems.Push( "resource '" & x.Name & "': the name is taken" )
+        end if
+        if (x.Kind <> "image") andalso (x.Kind <> "font") then problems.Push( "resource '" & x.Name & "': kind is image or font" )
+        if (len( x.File ) = 0) orelse (fs.PathFileName( x.File ) <> x.File) then
+            problems.Push( "resource '" & x.Name & "': file is a file name in " & FILES_DIR & "/" )
+        elseif len( dir_ ) then
+            dim as ustring p = fs.PathJoin( dir_, FILES_DIR, x.File )
+            if fs.IsFile( p ) = false then
+                problems.Push( "resource '" & x.Name & "': " & FILES_DIR & "/" & x.File & " is not there" )
+            elseif x.Embed then
+                ' an empty file cannot be embedded
+                dim as fs.FsResultInfo fi = fs.Stat( p )
+                if fi.IsOk( ) then
+                    if fi.Value( ).Size( ) = 0 then problems.Push( "resource '" & x.Name & "': " & x.File & " is empty" )
+                end if
+            end if
+        end if
+    next
+end sub
+
+' A file copied into dir_/files (numbered when the name is taken there) and added under a free name
+' from its stem. The new index, or -1 (problem says why).
+public function AddFile( byref doc as ResourceDoc, byref dir_ as const ustring, byref src as const ustring, _
+                         byref problem as ustring ) as long
+    dim as ustring kind_ = KindOf( src )
+    if len( kind_ ) = 0 then
+        problem = fs.PathFileName( src ) & ": not an image or a font"
+        return -1
+    end if
+    if fs.IsFile( src ) = false then
+        problem = fs.PathFileName( src ) & ": not found"
+        return -1
+    end if
+    dim as ustring folder = fs.PathJoin( dir_, FILES_DIR )
+    fs.CreateDirAll( folder )
+    dim as ustring fileName = fs.PathFileName( src )
+    dim as ustring dst = fs.PathJoin( folder, fileName )
+    ' the same file already in files/ is taken as it is
+    if fs.PathEquals( fs.PathNormalize( src ), fs.PathNormalize( dst ) ) = false then
+        dim as ustring stem = fs.PathStem( fileName ), ext = mid( fileName, len( stem ) + 1 )
+        dim as long n = 2
+        while fs.Exists( dst )
+            fileName = stem & n & ext
+            dst = fs.PathJoin( folder, fileName )
+            n += 1
+        wend
+        if fs.CopyFile( src, dst, false ).IsOk( ) = false then
+            problem = fs.PathFileName( src ) & ": can't be copied"
+            return -1
+        end if
+    end if
+    dim as Resource x
+    x.Name = UniqueName( doc, fs.PathStem( fileName ) )
+    x.Kind = kind_
+    x.File = fileName
+    doc.Items.Push( x )
+    return doc.Items.Count( ) - 1
+end function
+
+' ---- the generated module ------------------------------------------------------------------------
+
+' The whole generated module for resources that passed Check. Register() names them all to tkHost.
+public function Generate( byref doc as ResourceDoc, byref moduleName as const ustring, byref sourceName as const ustring, _
+                          byref sourceText as const ustring ) as ustring
+    dim as ustring o = "' GENERATED by the tkEdit Form Designer from " & sourceName & ". Do not edit." & NL
+    o &= "' source-hash: " & codegen.SourceHash( sourceText ) & NL
+    o &= "#module """ & moduleName & """" & NL & NL
+    o &= "#import ""vendor/tkControls/tkApp""" & NL & NL
+    o &= "using tkApp" & NL & "using tkHost" & NL & NL
+    dim as boolean anyEmbed = false, anyFile = false
+    for i as long = 0 to doc.Items.Count( ) - 1
+        if doc.Items[i].Embed then anyEmbed = true else anyFile = true
+    next
+    if anyEmbed then
+        o &= "' Inside the program." & NL
+        for i as long = 0 to doc.Items.Count( ) - 1
+            if doc.Items[i].Embed then o &= "#embed gRes" & i & "_ " & Quote_( FILES_DIR & "/" & doc.Items[i].File ) & NL
+        next
+        o &= NL
+    end if
+    if anyFile then
+        o &= "' A file not built in: beside the program in " & BESIDE_DIR & "/ (tkEdit copies it there after a build)," & NL
+        o &= "' else where the project keeps it." & NL
+        o &= "private function Where_( byref f as const ustring ) as ustring" & NL
+        o &= "    dim as ustring beside = tkHost_FontDir( ) & """ & BESIDE_DIR & "/"" & f" & NL
+        o &= "    dim as string p8 = beside" & NL
+        o &= "    if SDL_GetPathInfo( strptr( p8 ), 0 ) then return beside" & NL
+        o &= "    return """ & moduleName & "/" & FILES_DIR & "/"" & f" & NL
+        o &= "end function" & NL & NL
+    end if
+    o &= "' Every resource by its name (""" & RES_PREFIX & "<name>""), before tkApp_Init: a theme's font may be one." & NL
+    o &= "public sub Register( )" & NL
+    for i as long = 0 to doc.Items.Count( ) - 1
+        dim byref as Resource x = doc.Items[i]
+        if x.Embed then
+            o &= "    tkHost_AddResourceData( " & Quote_( RefOf( x.Name ) ) & ", @gRes" & i & "_( 0 ), ubound( gRes" & i & "_ ) + 1 )" & NL
+        else
+            o &= "    tkHost_AddResourceFile( " & Quote_( RefOf( x.Name ) ) & ", Where_( " & Quote_( x.File ) & " ) )" & NL
+        end if
+    next
+    o &= "end sub" & NL
+    return o
+end function
+
+' The resources a new project starts with: none.
+public function DefaultText( ) as ustring
+    dim as ResourceDoc d
+    return ToText( d )
+end function
+
+' ---- references in other files -------------------------------------------------------------------
+
+' Every "res:old" in a form's or theme's text made "res:new" (as a whole quoted value, any case of
+' old). count: how many.
+public function RenameRefs( byref text as const ustring, byref old as const ustring, byref new_ as const ustring, _
+                            byref count as long ) as ustring
+    dim as ustring o, want = lcase( """" & RES_PREFIX & old & """" )
+    dim as long at = 1
+    count = 0
+    do
+        dim as long p = instr( at, lcase( text ), want )
+        if p = 0 then exit do
+        o &= mid( text, at, p - at ) & """" & RES_PREFIX & new_ & """"
+        at = p + len( want )
+        count += 1
+    loop
+    return o & mid( text, at )
+end function
+
+' TRUE when a form's or theme's text refers to "res:nm".
+public function Refers( byref text as const ustring, byref nm as const ustring ) as boolean
+    return instr( lcase( text ), lcase( """" & RES_PREFIX & nm & """" ) ) > 0
+end function
+
+' main.tiko made to register the project's resources: the import beside tkApp's, Register() before
+' tkApp_Init (before appTheme.ApplyOptions when that comes just before it). 1 = done (outText has
+' it), 0 = it already does, -1 = no "if tkApp_Init( x ) = false then" line to hang it on.
+public function InstallIntoMain( byref text as const ustring, byref outText as ustring ) as long
+    if instr( text, RES_MODULE & ".Register" ) then return 0
+    dim as Array( of ustring ) lines
+    dim as long at = 1
+    do
+        dim as long e = instr( at, text, chr( 10 ) )
+        if e = 0 then
+            lines.Push( mid( text, at ) )
+            exit do
+        end if
+        lines.Push( mid( text, at, e - at ) )
+        at = e + 1
+    loop
+    dim as long initLine = -1, importLine = -1
+    for i as long = 0 to lines.Count( ) - 1
+        dim as ustring l = trim( lines[i], any !" \t\r" )
+        if (importLine < 0) andalso (left( l, 7 ) = "#import") then importLine = i
+        if (lcase( left( l, 3 ) ) = "#im") andalso (instr( l, """vendor/tkControls/tkApp""" ) > 0) then importLine = i
+        if (initLine < 0) andalso (instr( lcase( l ), "if tkapp_init(" ) = 1) andalso (instr( lcase( l ), ") = false then" ) > 0) then initLine = i
+    next
+    if initLine < 0 then return -1
+    dim as long before = initLine
+    if (initLine > 0) andalso (instr( lines[initLine - 1], "appTheme.ApplyOptions" ) > 0) then before = initLine - 1
+    dim as ustring indent = left( lines[before], len( lines[before] ) - len( ltrim( lines[before], any !" \t" ) ) )
+    dim as ustring o
+    for i as long = 0 to lines.Count( ) - 1
+        if i = before then o &= indent & RES_MODULE & ".Register( )" & NL
+        o &= lines[i]
+        if i < lines.Count( ) - 1 then o &= NL
+        if i = importLine then o &= "#import ""./" & RES_MODULE & """" & NL
+    next
+    if importLine < 0 then o = "#import ""./" & RES_MODULE & """" & NL & o
+    outText = o
+    return 1
+end function

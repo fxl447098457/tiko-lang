@@ -43,6 +43,90 @@ there: the comparison's −1 or 0 is converted to the `boolean` subject, as ever
 When each branch asks a different question, though, `if` / `elseif` is usually the clearer shape.
 ```
 
+## Matching
+
+`select case` has one weakness that grows with a program: nothing checks that every case is
+handled. Add a member to an enum and every `select case` that forgot it still compiles. `match`
+compares one value against **patterns**, and it does not compile until every value the subject
+can have is handled:
+
+```tiko
+{{#include ../examples/ch06/matching.tiko}}
+```
+
+```text
+{{#include ../examples/ch06/matching.out}}
+```
+
+`match` has two forms. As a **statement** its arms are `case` lines, and each arm's body can be
+as long as you like. Used as a **value** — after `=`, `return`, `print`, as an argument — its arms
+are `pattern => value`, one line each, and the whole `match` is the value of the arm that matched.
+The first matching arm wins and there is no fall-through, as in `select case`.
+
+Remove `case Green` from `Drive` and the program no longer compiles:
+
+```tiko
+{{#include ../examples/ch06/unhandled.tiko}}
+```
+
+```text
+error TKO1250: 'match' is not exhaustive: green is not handled
+```
+
+The check knows the members of a named enum, the two values of a `boolean`, and every combination
+of a tuple's elements — the `( isAdmin, isOwner )` match above lists all four cases between its
+three arms. For an integer, a float or a string no list of values can be complete, so a `match` on
+one needs an `else` arm, as the `code` match has.
+
+Patterns can also take a value apart:
+
+```tiko
+{{#include ../examples/ch06/patterns.tiko}}
+```
+
+```text
+{{#include ../examples/ch06/patterns.out}}
+```
+
+| Pattern | Matches | Binds |
+|---|---|---|
+| `5`, `"quit"`, `Light.Red` | that value | — |
+| `0, 1, 2` | any in a list (top level only) | — |
+| `60 to 89` | a range, ends included | — |
+| `is < 0` | an open comparison | — |
+| `any` / `else` | anything; `else` only as the last arm | — |
+| `( p, q )` | a tuple, element by element | what the elements bind |
+| `Point( x, 0 )` | a `Point`, field by field in declaration order | `x` |
+| `c as Circle` | a `Shape ptr` that points at a `Circle` | `c`, a `Circle ptr` |
+| `starts "load " file` | a string beginning with `"load "` | `file`, the rest |
+
+**A bare name means two different things.** At the top of a pattern it is a *value*, exactly as
+in `select case`: `case Red` compares. Inside a tuple or a UDT pattern it *binds*: `Point( x, y )`
+makes `x` and `y` names for the fields, usable in the arm's body. To compare a field against a
+named constant there, qualify the name or use a guard.
+
+**A guard** — `pattern if condition` — lets an arm match only when its condition also holds, and
+a failed guard moves on to the next arm. Because a guard can fail, a guarded arm does not count
+towards the exhaustiveness check: `Point( x, y ) if x = y` is followed by an unguarded
+`Point( x, y )` that catches the rest.
+
+```admonish note
+`match` works on a **copy** of its subject, taken once before the first arm is tried, and the names
+a pattern binds refer to that copy. Used as a value, the copy is taken before the statement that
+contains the `match` runs — which only matters if the subject is a call with side effects.
+```
+
+```admonish note
+`match` is a contextual keyword: it is one only when a subject follows it, the next line is an arm
+and an `end match` closes it. A variable or a procedure called `match` keeps working.
+```
+
+````admonish warning title="Status in this version"
+`match` arrives after tiko 0.1.6, the toolchain this book is pinned to. The listings in this
+section were compiled and run with the development toolchain; the book's harness reports them as
+blocked (`pin-0.1.6`) until the pin moves to a release that has them.
+````
+
 ## Repeating
 
 ```tiko
@@ -158,6 +242,9 @@ Nothing in this book uses `goto` for control flow. Every loop construct above, p
 - `if` / `elseif` / `else`; a one-line `if` takes no `end if`.
 - `select case` matches values, lists, ranges and open comparisons, first match wins, no
   fall-through. `as const` builds a jump table and takes only constants.
+- `match` tests a value against patterns, as a statement (`case` arms) or as a value
+  (`pattern => value` arms). It refuses to compile until every case is handled, takes tuples,
+  UDTs, class types and string prefixes apart, and binds what it takes out.
 - **A comparison yields an integer, not a `boolean`** — wrap with `cbool` before comparing one
   against `true`.
 - `for … next` with `step`; `do … loop` with the test at either end; `exit` and `continue`.
@@ -176,3 +263,6 @@ Nothing in this book uses `goto` for control flow. Every loop construct above, p
    times it fires and with which values.
 4. Rewrite a `do … loop until` as a `do while … loop` that behaves identically, including when the
    condition is already true at the start. Which needed more care?
+5. Add a fourth member, `Flashing`, to the `Light` enum in `matching.tiko` and compile. Fix the
+   error the compiler reports, then write the same `Drive` with `select case` and add `Flashing`
+   there instead. What does the compiler say this time?

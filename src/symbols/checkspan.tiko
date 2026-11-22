@@ -1,0 +1,154 @@
+'' checkspan.tiko -- ARRAY SLICES in the semantic layer: span( of T ) and 'a(lo to hi)'
+'' (docs/tiko-slices RFC-0003). Declared in checkslice.ti beside the string slices.
+''
+'' A span is a SYNTHETIC UDT, '__tko_span<elem id>', built as a tuple is (SpanUdtFor,
+'' symbols/symbol.tiko): one type per element type, made by Resolve for a written
+'' 'span( of long )' and by Check for 'a(2 to 4)'. Recognised by that name -- '<' cannot be
+'' written in an identifier -- and never by the spelling 'span', which is contextual.
+
+#import "std/containers"
+#include once "symbols/checkslice.ti"
+#include once "symbols/mangle.ti"
+#include once "support/text.ti"
+
+namespace Tko.Slices
+
+'' The element type id in '__tko_span<id>', or TYPE_NONE when t is no span instance.
+private function SpanElemId_( byref types as Tko.TypeContext, byval t as Tko.TypeId ) as Tko.TypeId
+    t = BareType( types, t )
+    if (t = Tko.TYPE_NONE) orelse (types.Kind( t ) <> Tko.TK_UDT) then return Tko.TYPE_NONE
+    if types.names = nullptr then return Tko.TYPE_NONE
+    dim as string ks = Tko.Text.LowerAscii( types.names->Spelling( types.NameOf( t ) ) )
+    if left( ks, 11 ) <> "__tko_span<" then return Tko.TYPE_NONE
+    if right( ks, 1 ) <> ">" then return Tko.TYPE_NONE
+    dim as int32 id = valint( mid( ks, 12, len( ks ) - 12 ) )
+    if (id <= 0) orelse (id > types.Count( )) then return Tko.TYPE_NONE
+    return cast( Tko.TypeId, id )
+end function
+
+function IsSpanType( byref types as Tko.TypeContext, byval t as Tko.TypeId ) as boolean
+    return SpanElemId_( types, t ) <> Tko.TYPE_NONE
+end function
+
+function IsBorrowType _
+    ( byref types as Tko.TypeContext, byref names as Tko.Interner, byval t as Tko.TypeId ) as boolean
+
+    if SliceUnitOfType( types, names, t ) <> SU_NONE then return true
+    return IsSpanType( types, t )
+end function
+
+function SpanElemType( byref types as Tko.TypeContext, byval t as Tko.TypeId ) as Tko.TypeId
+    dim as Tko.TypeId et = SpanElemId_( types, t )
+    if et = Tko.TYPE_NONE then return Tko.TYPE_NONE
+    if AnyConstType( types, t ) then et = types.Qualify( et, Tko.TF_CONST )
+    return et
+end function
+
+function SpanTypeFor _
+    ( byref syms as Tko.SymbolTable, byref types as Tko.TypeContext, _
+      byref names as Tko.Interner, byval elemT as Tko.TypeId, _
+      byval at as Tko.SourceLoc ) as Tko.TypeId
+
+    if elemT = Tko.TYPE_NONE then return Tko.TYPE_NONE
+    '' THE ELEMENT'S CONST IS THE SPAN'S (RFC-0003 §3), and a typedef is what it names, so
+    '' 'span( of int32 )' and 'span( of long )' are one type and assign to each other.
+    dim as boolean isConst = false
+    dim as int32 guard = 0
+    while guard < 64
+        guard += 1
+        if types.IsConst( elemT ) then isConst = true
+        elemT = types.Unqualify( elemT )
+        if types.Kind( elemT ) <> Tko.TK_TYPEDEF then exit while
+        if types.Inner( elemT ) = Tko.TYPE_NONE then exit while
+        elemT = types.Inner( elemT )
+    wend
+    dim as Tko.TypeId st = Tko.SpanUdtFor( syms, types, names, elemT, at )
+    if st = Tko.TYPE_NONE then return Tko.TYPE_NONE
+    dim as containers.Array( of uint32 ) args
+    args.Push( cast( uint32, elemT ) )
+    Tko.Mangle.RegisterInst( types, types.NameOf( st ), names.GetString( "TKOSPAN" ), args )
+    if isConst then st = types.Qualify( st, Tko.TF_CONST )
+    return st
+end function
+
+function SpanArrayRank( byref types as Tko.TypeContext, byval t as Tko.TypeId ) as int32
+    t = BareType( types, t )
+    if (t = Tko.TYPE_NONE) orelse (types.Kind( t ) <> Tko.TK_ARRAY) then return 0
+    '' 'zstring * N' AND ITS SIBLINGS are arrays of a string element type (types/type.ti):
+    '' a STRING, sliced with '[lo to hi]'.
+    dim as Tko.TypeId et = types.Unqualify( types.Inner( t ) )
+    if types.Kind( et ) = Tko.TK_BUILTIN then
+        select case types.BuiltinOf( et )
+        case Tko.TY_FIXSTR, Tko.TY_ZSTRING, Tko.TY_FIXUSTR, Tko.TY_WSTRING
+            return 0
+        end select
+    end if
+    if types.IsDynArray( t ) then
+        if types.DynRank( t ) = 0 then return 1    '' 'dim a( )', 'a()' parameter: run time says
+        return types.DynRank( t )
+    end if
+    dim as int32 r = types.types[cast( int32, t )].dims
+    if r < 1 then return 1
+    return r
+end function
+
+function IsSpanIndexCallee _
+    ( byref ast as Tko.AstArena, byref syms as Tko.SymbolTable, _
+      byref types as Tko.TypeContext, byref info as Tko.SemanticInfo, _
+      byval callee as Tko.NodeId ) as boolean
+
+    if callee = Tko.NODE_NONE then return false
+    if IsSpanType( types, info.TypeOf_( callee ) ) = false then return false
+    dim as Tko.Symbol ptr s = syms.SymbolAt( info.RefOf( callee ) )
+    '' A NAME WITH NO SYMBOL is 'span( of T )' itself, constructing one (resolvetype.tiko).
+    if s = nullptr then return ast.Kind( callee ) <> Tko.N_IDENT
+    return s->kind <> cast( uint8, Tko.SYM_PROC )
+end function
+
+function SpanFitsArrayParam _
+    ( byref types as Tko.TypeContext, byval st as Tko.TypeId, byval pt as Tko.TypeId, _
+      byval prank as int32, byval ignoreConst as boolean ) as boolean
+
+    if prank > 1 then return false
+    dim as Tko.TypeId et = SpanElemType( types, st )
+    if et = Tko.TYPE_NONE then return false
+    if (ignoreConst = false) andalso types.IsConst( et ) andalso (types.IsConst( pt ) = false) then return false
+    dim as Tko.TypeId pu = BareType( types, pt )
+    if (types.Kind( pu ) = Tko.TK_BUILTIN) andalso (types.BuiltinOf( pu ) = Tko.TY_ANY) then return true
+    return BareType( types, et ) = pu
+end function
+
+function IsSpanCall _
+    ( byref ast as Tko.AstArena, byref names as Tko.Interner, _
+      byval id as Tko.NodeId ) as boolean
+
+    if id = Tko.NODE_NONE then return false
+    if ast.Kind( id ) <> Tko.N_CALL then return false
+    dim as Tko.ListPayload ptr cp = ast.ListOf( id )
+    if (cp->target = Tko.NODE_NONE) orelse (cp->count <> 3) then return false
+    if ast.Kind( cp->target ) <> Tko.N_IDENT then return false
+    return Tko.Text.LowerAscii( names.Spelling( ast.IdentOf( cp->target )->name ) ) = "__tko_aslice"
+end function
+
+function SpanCallType _
+    ( byref ast as Tko.AstArena, byref syms as Tko.SymbolTable, _
+      byref types as Tko.TypeContext, byref names as Tko.Interner, _
+      byref info as Tko.SemanticInfo, byval cp as Tko.ListPayload ptr ) as Tko.TypeId
+
+    if cp->count <> 3 then return Tko.TYPE_NONE
+    dim as Tko.NodeId src = cast( Tko.NodeId, ast.ChildSlot( cp->first ) )
+    dim as Tko.TypeId st = info.TypeOf_( src )
+    if st = Tko.TYPE_NONE then return Tko.TYPE_NONE
+    '' A SPAN OF A SPAN IS ITS PARENT'S TYPE, const or not.
+    if IsSpanType( types, st ) then return st
+    '' NOT REPORTED HERE: Check types a node more than once. TKO1069/1070 are semslice.tiko's.
+    if SpanArrayRank( types, st ) <> 1 then return Tko.TYPE_NONE
+    dim as Tko.TypeId at = BareType( types, st )
+    dim as Tko.TypeId rt = SpanTypeFor( syms, types, names, types.Inner( at ), ast.Loc( src ) )
+    if rt = Tko.TYPE_NONE then return Tko.TYPE_NONE
+    if types.IsConst( rt ) then return rt
+    if SliceSourceIsConst( ast, syms, types, info, src, st ) then rt = types.Qualify( rt, Tko.TF_CONST )
+    return rt
+end function
+
+end namespace

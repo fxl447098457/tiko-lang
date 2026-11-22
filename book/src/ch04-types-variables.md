@@ -62,6 +62,22 @@ tiko's numeric types say how big they are:
 cover the rest. **Use these.** A reader never has to ask how wide `int32` is, and the answer is
 the same on every target.
 
+`int128` and `uint128` go past 64 bits, for values a 64-bit integer cannot hold: the product of
+two `int64`s, a 128-bit hash or identifier. They are C's `__int128` and `unsigned __int128`, and
+every integer operator, `print`, `str` and `hex` works on them at full width:
+
+```tiko
+{{#include ../examples/ch04/wide.tiko}}
+```
+
+```text
+{{#include ../examples/ch04/wide.out}}
+```
+
+The first line is the trap. `big * big` is an `int64` expression, so it wraps *before* it is
+stored; storing it in an `int128` widens the wrong answer. Make one operand 128-bit first and the
+whole product is. A literal too large for 64 bits needs no suffix: it is 128-bit already.
+
 Two types deliberately have no fixed-width name:
 
 - **`integer`** is pointer-sized — 8 bytes on the 64-bit targets. Reach for it when a value has to
@@ -70,7 +86,8 @@ Two types deliberately have no fixed-width name:
 
 You will also meet the older names in existing code: `byte`, `short`, `long`, `longint`, `single`,
 `double`, and their unsigned forms. They are what the fixed-width names are made of — `int32` *is*
-`long` — so the two mix freely.
+`long` — so the two mix freely. `int128` and `uint128` are the exception: no older name exists for
+them, so they are types of tiko's own.
 
 ```admonish danger title="Pitfall"
 **`long` is 32 bits.** It is the one name most likely to mislead a C or Java programmer, who will
@@ -78,8 +95,8 @@ read it as 64. The fixed-width spellings exist partly to make that impossible to
 `int64` when you mean 64 bits.
 ```
 
-The fixed-width names are typedefs the compiler predeclares rather than reserved words, which has
-a visible consequence:
+The fixed-width names, the 128-bit pair included, are predeclared by the compiler rather than
+reserved words, which has a visible consequence:
 
 ```tiko
 {{#include ../examples/ch04/shadow.tiko}}
@@ -183,11 +200,13 @@ The `c*` family converts explicitly: `cint`, `clng`, `clngint`, `csng`, `cdbl`, 
 
 - Types are fixed at compile time; every variable is declared, so a typo is an error.
 - Prefer the width-stating names: `int8`…`int64`, `uint8`…`uint64`, `float32`, `float64`.
+- `int128` and `uint128` are 128-bit integers, C's `__int128`. Widen an operand *before* the
+  arithmetic, or a 64-bit result wraps first.
 - `integer` and `uinteger` are pointer-sized and have no fixed-width spelling — that is the reason
   to use them.
 - **`long` is 32 bits.** The older names still appear in existing code, and mix freely with the new
   ones.
-- The fixed-width names are typedefs, so a program may shadow one.
+- The fixed-width names are predeclared, not reserved, so a program may shadow one.
 - `var` infers a type from the value; `dim as T` states it; `const` names a value; `enum` names a
   set.
 - **Float to integer rounds, half to even** — `fix( )` truncates like C, `int( )` floors.

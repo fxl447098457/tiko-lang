@@ -11,6 +11,7 @@
 
 #import "std/containers"
 #include once "symbols/check.ti"
+#include once "symbols/fold128.ti"
 #include once "types/udtlayout.ti"
 #include once "support/text.ti"
 
@@ -104,7 +105,56 @@ private function NarrowConstTo_ _
     case Tko.TY_ULONG    : return CVW_( cast( int64, cast( uint32, v.value ) ), 64 )
     case Tko.TY_BOOLEAN  : return CV_( iif( v.value <> 0, -1, 0 ) )
     end select
+    '' AN int128 NARROWED TO A 64-BIT TYPE keeps its low half, at 64 bits (Mark128_).
+    if v.bits = 128 then
+        dim as ConstVal n64 = CVW_( v.value, 64 )
+        select case bt
+        case Tko.TY_LONGINT, Tko.TY_INTEGER   : return n64
+        case Tko.TY_ULONGINT, Tko.TY_UINTEGER : n64.uns = true : return n64
+        end select
+    end if
     return v
+end function
+
+'' A VALUE CONVERTED TO int128 / uint128 (tiko's; type.ti). ConstVal is 64 bits, so it is
+'' held sign-extended and marked 'bits = 128', and every operator refuses to fold one
+private function Mark128_( byref v as ConstVal, byval uns as boolean ) as ConstVal
+    if v.known = false then return v
+    dim as I128 x = Const128Wide( v )
+    return Const128Of( x, uns )
+end function
+
+'' 1 for int128, 2 for uint128, 0 for anything else -- a TYPEREF, read off the type table
+'' when the caller has one and off its spelling when not: the prelude's typedef names
+'' and their '__tko_' targets.
+private function TypeRef128_ _
+    ( byref ast as Tko.AstArena, byval tref as Tko.NodeId, byval names as Tko.Interner ptr, _
+      byval types as Tko.TypeContext ptr, byval info as Tko.SemanticInfo ptr ) as int32
+
+    if tref = Tko.NODE_NONE then return 0
+    if (types <> nullptr) andalso (info <> nullptr) then
+        dim as Tko.TypeId t = info->TypeOf_( tref )
+        if t <> Tko.TYPE_NONE then
+            t = types->Unqualify( t )
+            if types->Kind( t ) = Tko.TK_BUILTIN then
+                select case types->BuiltinOf( t )
+                case Tko.TY_INT128  : return 1
+                case Tko.TY_UINT128 : return 2
+                end select
+            end if
+            return 0
+        end if
+    end if
+    if names = nullptr then return 0
+    if ast.Kind( tref ) <> Tko.N_TYPEREF then return 0
+    if (ast.NodeAt( tref )->flags and (Tko.NF_PTR or Tko.NF_PROC_TYPE)) <> 0 then return 0
+    dim as Tko.StmtPayload ptr tp = ast.StmtOf( tref )
+    if cast( Tko.TokenKind, tp->op ) <> Tko.TK_IDENT then return 0
+    select case lcase( names->Spelling( tp->name ) )
+    case "int128", "__tko_int128"   : return 1
+    case "uint128", "__tko_uint128" : return 2
+    end select
+    return 0
 end function
 
 '' The width a binary operator folds at: the WIDER of its operands.
@@ -240,6 +290,10 @@ private function LitNum_ _
         '' is 41641895 -- the product of the three single values taken in DOUBLE, then
         '' rounded -- where the exact decimals give 41641893.
         if cast( Tko.NumSuffix, lp->suffix ) = Tko.NSUF_SINGLE then d = cast( float32, d )
+    elseif lp->intHi <> 0 then
+        '' PAST 64 BITS (int128): hi * 2^64 + lo, the high half signed unless the literal is uint128.
+        dim as boolean u128 = Tko.LiteralClassUnsigned( Tko.LiteralClassOf( lp->suffix, lp->radix, lp->intValue, false, true, lp->intHi ) )
+        d = iif( u128, cast( float64, lp->intHi ), cast( float64, cast( int64, lp->intHi ) ) ) * 18446744073709551616.0 + cast( float64, lp->intValue )
     elseif Tko.LiteralClassUnsigned( Tko.LiteralClassOf( lp->suffix, lp->radix, lp->intValue, false, true ) ) then   '' the literal model
         '' AN UNSIGNED LITERAL CONVERTS AS ONE: '10000000000000000000 / 3' folded the
         '' bits as a signed -8.4e18 and printed -2.8e18 where fbc prints 3.3e18.
@@ -577,7 +631,7 @@ private function ConstStrLen_ _
         if (cnm <> "chr") andalso (cnm <> "wchr") then return -1
         if cl->count < 1 then return -1
         for i as int32 = 0 to cl->count - 1
-            dim as ConstVal kv = ConstOf( ast, ast.ChildAt( cl->first, i ), src, names, 64, syms, scope_, depth + 1 )
+            dim as ConstVal kv = ConstOf128( ast, ast.ChildAt( cl->first, i ), src, names, 64, syms, scope_, depth + 1 )
             if kv.known = false then return -1
             if (cnm = "wchr") andalso ((kv.value < 0) orelse (kv.value > &hFFFF)) then return -1
         next
@@ -738,7 +792,7 @@ private function ConstCall_ _
         if rank < 1 then return CVNone_( )
         dim as int64 bd = 1
         if cp->count = 2 then
-            dim as ConstVal dv = ConstOf( ast, cast( Tko.NodeId, ast.ChildSlot( cp->first + 1 ) ), _
+            dim as ConstVal dv = ConstOf128( ast, cast( Tko.NodeId, ast.ChildSlot( cp->first + 1 ) ), _
                                           src, names, intBits, syms, scope_, depth + 1, types, info )
             if dv.known = false then return CVNone_( )
             bd = dv.value
@@ -751,12 +805,12 @@ private function ConstCall_ _
     end if
 
     if (nm = "iif") andalso (cp->count = 3) then
-        dim as ConstVal c = ConstOf( ast, cast( Tko.NodeId, ast.ChildSlot( cp->first ) ), _
+        dim as ConstVal c = ConstOf128( ast, cast( Tko.NodeId, ast.ChildSlot( cp->first ) ), _
                                      src, names, intBits, syms, scope_, depth, _
                                      types, info )
         if c.known = false then return CVNone_( )
-        dim as int32 pick = iif( c.value <> 0, 1, 2 )
-        return ConstOf( ast, ast.ChildAt( cp->first, pick ), _
+        dim as int32 pick = iif( (c.value <> 0) orelse ((c.bits = 128) andalso (c.hi <> 0)), 1, 2 )
+        return ConstOf128( ast, ast.ChildAt( cp->first, pick ), _
                         src, names, intBits, syms, scope_, depth, types, info)
     end if
 
@@ -772,7 +826,7 @@ private function ConstCall_ _
     '' S_OK', 'if failed( hr )', '*ppv = 0 : return E_POINTER'. The line the count
     '' pointed at never mentioned a cast.
     if ((nm = "cast") orelse (nm = "cptr")) andalso (cp->count = 2) then
-        dim as ConstVal cvv = ConstOf( ast, _
+        dim as ConstVal cvv = ConstOf128( ast, _
                         cast( Tko.NodeId, ast.ChildSlot( cp->first + 1 ) ), src, _
                         names, intBits, syms, scope_, depth, types, info)
         '' ...BUT THE CAST NARROWS, and the value it yields is the NARROWED one.
@@ -801,6 +855,11 @@ private function ConstCall_ _
                 end if
             end if
         end if
+        '' A CAST TO int128 marks the value 128-bit (Mark128_), whoever can see the type.
+        select case TypeRef128_( ast, cast( Tko.NodeId, ast.ChildSlot( cp->first ) ), @names, types, info )
+        case 1 : return Mark128_( cvv, false )
+        case 2 : return Mark128_( cvv, true )
+        end select
         if (cvv.known) andalso (types <> nullptr) andalso (info <> nullptr) then
             dim as Tko.NodeId cta = cast( Tko.NodeId, ast.ChildSlot( cp->first ) )
             dim as Tko.TypeId ctt = info->TypeOf_( cta )
@@ -821,7 +880,7 @@ private function ConstCall_ _
     if ((nm = "rgb") andalso (cp->count = 3)) orelse ((nm = "rgba") andalso (cp->count = 4)) then
         dim as uint32 rgbAcc = iif( cp->count = 3, &hFF000000ul, 0ul )
         for k as int32 = 0 to cp->count - 1
-            dim as ConstVal kv = ConstOf( ast, ast.ChildAt( cp->first, k ), _
+            dim as ConstVal kv = ConstOf128( ast, ast.ChildAt( cp->first, k ), _
                                           src, names, intBits, syms, scope_, depth, types, info )
             if kv.known = false then return CVNone_( )
             dim as int32 sh = iif( k = 3, 24, 16 - k * 8 )
@@ -926,7 +985,7 @@ private function ConstCall_ _
 
     dim as float64 d = 0
     dim as boolean isNum = LitNum_( ast, a0, d )
-    dim as ConstVal iv = ConstOf( ast, a0, src, names, intBits, syms, scope_, depth, types, info)
+    dim as ConstVal iv = ConstOf128( ast, a0, src, names, intBits, syms, scope_, depth, types, info)
     '' A NAMED float constant, or an EXPRESSION over one, is a number too -- but only
     '' asked for when the integer folder already said it had nothing, so a named
     '' INTEGER constant keeps the exact integer path below rather than going round
@@ -937,8 +996,17 @@ private function ConstCall_ _
 
     select case nm
     case "abs"
+        '' An int128 keeps its type (intrinsics.tiko) and its high half.
+        if iv.known andalso (iv.bits = 128) then
+            if iv.uns orelse (iv.hi >= 0) then return iv
+            return Const128Of( I128Neg( Const128Wide( iv ) ), false )
+        end if
         if iv.known then return CV_( abs( iv.value ) )
     case "sgn"
+        if iv.known andalso (iv.bits = 128) then
+            if (iv.hi < 0) andalso (iv.uns = false) then return CV_( -1 )
+            return CV_( iif( (iv.hi = 0) andalso (iv.value = 0), 0, 1 ) )
+        end if
         if iv.known then return CV_( sgn( iv.value ) )
     '' A NAMED CONSTANT IS NOT A LITERAL, and 'isNum' asks only about a literal. So
     '' 'const CL = clng( K )' over 'const K = 300' folded to NOTHING while
@@ -1010,10 +1078,15 @@ end function
 '' than the type table, which this module does not have.
 function ClampConstToTypeRef _
     ( byref ast as Tko.AstArena, byval tref as Tko.NodeId, _
-      byref v as ConstVal, byval intBits as int32 ) as ConstVal
+      byref v as ConstVal, byval intBits as int32, _
+      byval names as Tko.Interner ptr ) as ConstVal
 
     if v.known = false then return v
     if tref = Tko.NODE_NONE then return v
+    select case TypeRef128_( ast, tref, names, nullptr, nullptr )
+    case 1 : return Mark128_( v, false )
+    case 2 : return Mark128_( v, true )
+    end select
     if ast.Kind( tref ) <> Tko.N_TYPEREF then return v
     dim as Tko.AstNode ptr tn = ast.NodeAt( tref )
     if (tn->flags and Tko.NF_PTR) <> 0 then return v
@@ -1056,7 +1129,7 @@ function ClampConstToTypeRef _
     r.uns = uns
     return r
 end function
-function ConstOf _
+function ConstOf128 _
     ( byref ast as Tko.AstArena, byval id as Tko.NodeId, _
       byref src as Tko.SourceManager, byref names as Tko.Interner, _
       byval intBits as int32 = 64, byval syms as Tko.SymbolTable ptr = nullptr, _
@@ -1078,7 +1151,9 @@ function ConstOf _
         '' literal folds in 32 bits, a decimal past 2^32 in 64 on a 32-bit target, and an unsuffixed
         '' decimal of 2^31 to 2^32 - 1 is unsigned -- 'const BIGC = 18446744073709551615 : print
         '' BIGC > 0' folded as -1 > 0 before.
-        dim as int32 ilc = Tko.LiteralClassOf( lp->suffix, lp->radix, lp->intValue, false, intBits >= 64 )
+        dim as int32 ilc = Tko.LiteralClassOf( lp->suffix, lp->radix, lp->intValue, false, intBits >= 64, lp->intHi )
+        '' PAST 64 BITS, tiko's int128 / uint128: both halves (Literal.intHi).
+        if lp->intHi <> 0 then return Const128Of( I128Of( lp->intValue, lp->intHi ), Tko.LiteralClassUnsigned( ilc ) )
         dim as int32 ibits = Tko.LiteralClassBits( ilc, intBits )
         if ibits = 0 then ibits = intBits
         return CVWU_( iv, ibits, Tko.LiteralClassUnsigned( ilc ) )
@@ -1121,9 +1196,9 @@ function ConstOf _
         if ast.Kind( qitem ) <> Tko.N_VAR_ITEM then return CVNone_( )
         dim as Tko.StmtPayload ptr qip = _
             ast.StmtOf( qitem )
-        dim as ConstVal qvv = ConstOf( ast, qip->b, src, names, intBits, syms, _
+        dim as ConstVal qvv = ConstOf128( ast, qip->b, src, names, intBits, syms, _
                                        qsy->parent, depth + 1, types, info )
-        return ClampConstToTypeRef( ast, qip->a, qvv, intBits )
+        return ClampConstToTypeRef( ast, qip->a, qvv, intBits, @names )
 
     case Tko.N_IDENT
         '' A NAMED CONSTANT in a constant expression. 'const MAX = 9' followed by
@@ -1172,7 +1247,7 @@ function ConstOf _
         dim as Tko.StmtPayload ptr cip = _
             ast.StmtOf( citem )
         dim as ConstVal ivv = _
-            ConstOf( ast, cip->b, src, names, intBits, syms, cs->parent, depth + 1, types, info)
+            ConstOf128( ast, cip->b, src, names, intBits, syms, cs->parent, depth + 1, types, info)
         '' AT THE CONSTANT'S OWN DECLARED WIDTH AND SIGNEDNESS.
         ''
         '' 'const v as ubyte = not u' folded to the INITIALISER's value and stopped
@@ -1182,20 +1257,21 @@ function ConstOf _
         ''
         '' A POINTER or a proc type is left alone: its value is an address, not a
         '' number to truncate.
-        return ClampConstToTypeRef( ast, cip->a, ivv, intBits )
+        return ClampConstToTypeRef( ast, cip->a, ivv, intBits, @names )
 
     case Tko.N_PAREN
         dim as Tko.ListPayload ptr pp = _
             ast.ListOf( id )
         if pp->count <> 1 then return CVNone_( )
-        return ConstOf( ast, cast( Tko.NodeId, ast.ChildSlot( pp->first ) ), src, names, _
+        return ConstOf128( ast, cast( Tko.NodeId, ast.ChildSlot( pp->first ) ), src, names, _
                         intBits, syms, scope_, depth, types, info)
 
     case Tko.N_UNARY
         dim as Tko.UnaryPayload ptr up = _
             ast.UnaryOf( id )
-        dim as ConstVal v = ConstOf( ast, up->operand, src, names, intBits, syms, scope_, depth, types, info)
+        dim as ConstVal v = ConstOf128( ast, up->operand, src, names, intBits, syms, scope_, depth, types, info)
         if v.known = false then return CVNone_( )
+        if v.bits = 128 then return Fold128Unary( cast( Tko.TokenKind, up->op ), v )   '' fold128.tiko
         '' A unary operator folds at its OPERAND's width: 'not 0' is -1 either way, but
         '' '-(1 shl 31)' at 32 bits is 2147483648 rather than -2147483648.
         '' ...AND AT NO LESS THAN INTEGER WIDTH, because fbc promotes a narrower operand
@@ -1214,10 +1290,11 @@ function ConstOf _
     case Tko.N_BINARY
         dim as Tko.BinaryPayload ptr bp = _
             ast.BinaryOf( id )
-        dim as ConstVal l = ConstOf( ast, bp->lhs, src, names, intBits, syms, scope_, depth, types, info)
+        dim as ConstVal l = ConstOf128( ast, bp->lhs, src, names, intBits, syms, scope_, depth, types, info)
         if l.known = false then return CVNone_( )
-        dim as ConstVal r = ConstOf( ast, bp->rhs, src, names, intBits, syms, scope_, depth, types, info)
+        dim as ConstVal r = ConstOf128( ast, bp->rhs, src, names, intBits, syms, scope_, depth, types, info)
         if r.known = false then return CVNone_( )
+        if (l.bits = 128) orelse (r.bits = 128) then return Fold128Binary( cast( Tko.TokenKind, bp->op ), l, r )
         dim as int64 a = l.value
         dim as int64 b = r.value
         '' The operator folds at the WIDER operand's width, and the result is narrowed
@@ -1329,12 +1406,31 @@ function ConstOf _
         dim as Tko.ListPayload ptr tl = ast.ListOf( id )
         if (tl->count <> 1) orelse (tl->target = Tko.NODE_NONE) then return CVNone_( )
         if ast.Kind( tl->target ) <> Tko.N_TYPEREF then return CVNone_( )
-        dim as ConstVal tv = ConstOf( ast, cast( Tko.NodeId, ast.ChildSlot( tl->first ) ), src, names, _
+        dim as ConstVal tv = ConstOf128( ast, cast( Tko.NodeId, ast.ChildSlot( tl->first ) ), src, names, _
                                       intBits, syms, scope_, depth + 1, types, info )
-        return ClampConstToTypeRef( ast, tl->target, tv, intBits )
+        return ClampConstToTypeRef( ast, tl->target, tv, intBits, @names )
     end select
 
     return CVNone_( )
+end function
+
+'' THE ONE MOST CALLERS WANT: a value that does not fit 64 bits -- an int128 past them --
+'' is NOT KNOWN here, so every caller that writes a constant into 64 bits or less (array
+'' bounds, enum values, case tables, string lengths) stays correct without knowing int128
+'' exists. ConstOf128 hands the whole value to the few that write 128 bits out.
+function ConstOf _
+    ( byref ast as Tko.AstArena, byval id as Tko.NodeId, _
+      byref src as Tko.SourceManager, byref names as Tko.Interner, _
+      byval intBits as int32 = 64, byval syms as Tko.SymbolTable ptr = nullptr, _
+      byval scope_ as Tko.ScopeId = 0, byval depth as int32 = 0, _
+      byval types as Tko.TypeContext ptr = nullptr, _
+      byval info as Tko.SemanticInfo ptr = nullptr ) as ConstVal
+    dim as ConstVal v = ConstOf128( ast, id, src, names, intBits, syms, scope_, depth, types, info )
+    if v.known andalso (v.bits = 128) then
+        dim as int64 signHi = iif( v.value < 0, -1ll, 0ll )
+        if (v.hi <> signHi) orelse (v.uns andalso (v.value < 0)) then return CVNone_( )
+    end if
+    return v
 end function
 
 end namespace

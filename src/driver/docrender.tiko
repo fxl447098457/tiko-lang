@@ -1,0 +1,367 @@
+'' docrender.tiko -- a module's documentation as pages (see doc.ti): Markdown for a repository or
+'' a wiki, HTML to browse, a doc.json fragment for tools (tiko-lsp, tkEdit), and the index lines
+'' 'tiko doc' builds its index page and its search from.
+
+#import "std/containers"
+#include once "driver/doc.ti"
+#include once "support/text.ti"
+
+namespace Tko.Doc
+
+private function NL_( ) as string
+    return chr( 10 )
+end function
+
+'' The order a page lists its items in, by kind.
+private function Section_( byref kind as string ) as int32
+    select case kind
+    case "type", "class", "union", "interface" : return 0
+    case "enum"                                : return 1
+    case "function", "sub", "operator", "property" : return 2
+    case "const"                               : return 3
+    case "variable"                            : return 4
+    case "alias"                               : return 5
+    case "macro"                               : return 6
+    end select
+    return 7
+end function
+
+private function SectionTitle_( byval s as int32 ) as string
+    select case s
+    case 0 : return "Types"
+    case 1 : return "Enums"
+    case 2 : return "Procedures"
+    case 3 : return "Constants"
+    case 4 : return "Variables"
+    case 5 : return "Type aliases"
+    case 6 : return "Macros"
+    end select
+    return "Other"
+end function
+
+private function Qual_( byref it as DocItem ) as string
+    return iif( len( it.nsPath ) > 0, it.nsPath & "." & it.name, it.name )
+end function
+
+private function Base_( byref p as string ) as string
+    dim as int32 k = len( p )
+    while k > 0
+        if (p[k - 1] = 47) orelse (p[k - 1] = 92) then exit while
+        k -= 1
+    wend
+    return mid( p, k + 1 )
+end function
+
+function Summary( byref t as string ) as string
+    dim as string r = ""
+    dim as int32 p = 1
+    while p <= len( t )
+        dim as int32 e = instr( p, t, chr( 10 ) )
+        if e = 0 then e = len( t ) + 1
+        dim as string ln = mid( t, p, e - p )
+        p = e + 1
+        if (len( trim( ln ) ) = 0) orelse (left( ln, 4 ) = "    ") then
+            if len( r ) > 0 then exit while
+            continue while
+        end if
+        r &= iif( len( r ) > 0, " ", "" ) & trim( ln )
+        dim as int32 dot = instr( r, ". " )
+        if dot > 0 then return left( r, dot )
+    wend
+    if len( r ) > 240 then r = left( r, 237 ) & "..."
+    return r
+end function
+
+'' ---------------------------------------------------------------- Markdown
+
+private function Cell_( byref s as string ) as string
+    dim as string r = ""
+    for i as int32 = 0 to len( s ) - 1
+        select case s[i]
+        case 124 : r &= "\|"
+        case 10  : r &= " "
+        case else : r &= chr( s[i] )
+        end select
+    next
+    return r
+end function
+
+private function MdCode_( byref sigs as containers.Array( of DocSig ) ) as string
+    dim as string r = "```freebasic" & NL_( )
+    for k as int32 = 0 to sigs.Count - 1
+        r &= sigs[k].text & NL_( )
+    next
+    return r & "```" & NL_( )
+end function
+
+function Markdown( byref m as DocModule ) as string
+    dim as string r = "# " & m.name & NL_( ) & NL_( )
+    r &= "`#import """ & m.importPath & """`" & NL_( ) & NL_( )
+    if len( m.overview ) > 0 then r &= m.overview & NL_( ) & NL_( )
+    '' Contents, by section.
+    if m.items.Count > 0 then
+        r &= "## Contents" & NL_( ) & NL_( )
+        for s as int32 = 0 to 7
+            dim as string line_ = ""
+            for k as int32 = 0 to m.items.Count - 1
+                if Section_( m.items[k].kind ) <> s then continue for
+                line_ &= iif( len( line_ ) > 0, " · ", "" ) & "[" & Qual_( m.items[k] ) & "](#" & m.items[k].anchor & ")"
+            next
+            if len( line_ ) > 0 then r &= "- **" & SectionTitle_( s ) & ":** " & line_ & NL_( )
+        next
+        r &= NL_( )
+    end if
+    for s as int32 = 0 to 7
+        dim as boolean any_ = false
+        for k as int32 = 0 to m.items.Count - 1
+            if Section_( m.items[k].kind ) <> s then continue for
+            if any_ = false then r &= "## " & SectionTitle_( s ) & NL_( ) & NL_( ) : any_ = true
+            dim as DocItem it = m.items[k]
+            r &= "<a id=""" & it.anchor & """></a>" & NL_( ) & NL_( )
+            r &= "### " & Qual_( it ) & NL_( ) & NL_( )
+            r &= MdCode_( it.sigs ) & NL_( )
+            if len( it.doc ) > 0 then r &= it.doc & NL_( ) & NL_( )
+            if it.members.Count > 0 then
+                r &= "| " & iif( it.kind = "enum", "Value", "Member" ) & " | |" & NL_( ) & "|---|---|" & NL_( )
+                for j as int32 = 0 to it.members.Count - 1
+                    dim as DocMember mb = it.members[j]
+                    for q as int32 = 0 to mb.sigs.Count - 1
+                        r &= "| `" & Cell_( mb.sigs[q].text ) & "`" & iif( mb.vis = "protected", " *(protected)*", "" ) & _
+                             " | " & iif( q = 0, Cell_( Summary( mb.doc ) ), "" ) & " |" & NL_( )
+                    next
+                next
+                r &= NL_( )
+            end if
+            if it.sigs.Count > 0 then
+                r &= "*" & Base_( it.sigs[0].file_ ) & ":" & it.sigs[0].line_ & "*" & NL_( ) & NL_( )
+            end if
+        next
+    next
+    return r
+end function
+
+'' ---------------------------------------------------------------- HTML
+
+function HtmlEsc( byref s as string ) as string
+    dim as string r = ""
+    for i as int32 = 0 to len( s ) - 1
+        select case s[i]
+        case 38 : r &= "&amp;"
+        case 60 : r &= "&lt;"
+        case 62 : r &= "&gt;"
+        case 34 : r &= "&quot;"
+        case else : r &= chr( s[i] )
+        end select
+    next
+    return r
+end function
+
+'' `code` inside escaped text.
+private function Inline_( byref s as string ) as string
+    dim as string e = HtmlEsc( s ), r = ""
+    dim as boolean open_ = false
+    for i as int32 = 0 to len( e ) - 1
+        if e[i] = 96 then
+            r &= iif( open_, "</code>", "<code>" )
+            open_ = not open_
+        else
+            r &= chr( e[i] )
+        end if
+    next
+    if open_ then r &= "</code>"
+    return r
+end function
+
+function TextToHtml( byref t as string ) as string
+    dim as string r = "", para = "", code = "", list_ = ""
+    dim as int32 p = 1
+    dim as boolean more = true
+    while more
+        dim as string ln
+        if p <= len( t ) then
+            dim as int32 e = instr( p, t, chr( 10 ) )
+            if e = 0 then e = len( t ) + 1
+            ln = mid( t, p, e - p )
+            p = e + 1
+        else
+            more = false
+            ln = ""
+        end if
+        dim as boolean isCode = (left( ln, 4 ) = "    ") orelse (left( ln, 1 ) = chr( 9 ))
+        dim as boolean isItem = (left( ln, 2 ) = "- ") orelse (left( ln, 2 ) = "* ")
+        dim as boolean blank = (len( trim( ln ) ) = 0)
+        '' Close what this line does not continue.
+        if (len( code ) > 0) andalso (isCode = false) andalso (blank = false orelse more = false) then
+            r &= "<pre>" & HtmlEsc( code ) & "</pre>" & NL_( ) : code = ""
+        end if
+        if (len( para ) > 0) andalso (blank orelse isCode orelse isItem) then
+            r &= "<p>" & Inline_( para ) & "</p>" & NL_( ) : para = ""
+        end if
+        if (len( list_ ) > 0) andalso (isItem = false) andalso (blank orelse isCode) then
+            r &= "<ul>" & list_ & "</ul>" & NL_( ) : list_ = ""
+        end if
+        if more = false then exit while
+        if isCode then
+            code &= mid( ln, iif( left( ln, 1 ) = chr( 9 ), 2, 5 ) ) & NL_( )
+        elseif blank then
+            if len( code ) > 0 then code &= NL_( )
+        elseif isItem then
+            list_ &= "<li>" & Inline_( mid( ln, 3 ) ) & "</li>"
+        elseif len( list_ ) > 0 then
+            '' A list item's continuation line.
+            list_ = left( list_, len( list_ ) - 5 ) & " " & Inline_( trim( ln ) ) & "</li>"
+        else
+            para &= iif( len( para ) > 0, " ", "" ) & trim( ln )
+        end if
+    wend
+    if len( code ) > 0 then r &= "<pre>" & HtmlEsc( rtrim( code, chr( 10 ) ) ) & "</pre>" & NL_( )
+    return r
+end function
+
+function Page( byref title as string, byref body as string, byref rootHref as string ) as string
+    dim as string r = "<!doctype html>" & NL_( ) & "<html lang=""en""><head><meta charset=""utf-8"">" & NL_( )
+    r &= "<meta name=""viewport"" content=""width=device-width, initial-scale=1"">" & NL_( )
+    r &= "<title>" & HtmlEsc( title ) & "</title>" & NL_( )
+    r &= "<style>" & NL_( )
+    r &= ":root{--bg:#fff;--fg:#1d1f23;--muted:#5f6673;--line:#e3e6ea;--code:#f5f6f8;--link:#1f5fbf}" & NL_( )
+    r &= "@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e4e6ea;--muted:#9aa1ad;--line:#2b2f36;--code:#1f2228;--link:#7fb0ff}}" & NL_( )
+    r &= "body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}" & NL_( )
+    r &= "main{max-width:60rem;margin:0 auto;padding:1rem 1rem 4rem}a{color:var(--link)}" & NL_( )
+    r &= "header{border-bottom:1px solid var(--line);padding:.6rem 1rem;display:flex;gap:1rem;align-items:center;flex-wrap:wrap}" & NL_( )
+    r &= "header input{flex:1;min-width:12rem;padding:.4rem .6rem;border:1px solid var(--line);border-radius:6px;background:var(--code);color:var(--fg)}" & NL_( )
+    r &= "#hits{max-width:60rem;margin:0 auto;padding:0 1rem}#hits a{display:block;padding:.15rem 0}#hits small{color:var(--muted)}" & NL_( )
+    r &= "pre,code{font-family:ui-monospace,Cascadia Mono,Consolas,monospace;font-size:.9em}" & NL_( )
+    r &= "pre{background:var(--code);padding:.7rem .9rem;border-radius:6px;overflow-x:auto}" & NL_( )
+    r &= "p code,li code,td code{background:var(--code);padding:0 .25em;border-radius:4px}" & NL_( )
+    r &= "h2{border-bottom:1px solid var(--line);padding-bottom:.2rem;margin-top:2.2rem}h3{margin-top:1.8rem}" & NL_( )
+    r &= "table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}td,th{border-top:1px solid var(--line);padding:.35rem .5rem;vertical-align:top;text-align:left}" & NL_( )
+    r &= ".where,.kind{color:var(--muted);font-size:.85em}" & NL_( )
+    r &= "</style></head><body>" & NL_( )
+    r &= "<header><a href=""" & rootHref & "index.html""><strong>API</strong></a>" & _
+         "<input id=""q"" type=""search"" placeholder=""Search names"" aria-label=""Search names""></header>" & NL_( )
+    r &= "<div id=""hits""></div>" & NL_( )
+    r &= "<main>" & NL_( ) & body & "</main>" & NL_( )
+    r &= "<script src=""" & rootHref & "search.js""></script>" & NL_( )
+    r &= "<script>(function(){var q=document.getElementById('q'),h=document.getElementById('hits');" & _
+         "q.addEventListener('input',function(){var s=q.value.toLowerCase(),o='';" & _
+         "if(s&&window.TIKO_DOC_INDEX){var n=0;window.TIKO_DOC_INDEX.forEach(function(e){" & _
+         "if(n<40&&e.n.toLowerCase().indexOf(s)>=0){n++;o+='<a href=""" & rootHref & "'+e.u+'"">'+e.n+' <small>'+e.k+' · '+e.m+'</small></a>';}});}" & _
+         "h.innerHTML=o;});})();</script>" & NL_( )
+    r &= "</body></html>" & NL_( )
+    return r
+end function
+
+private function HtmlCode_( byref sigs as containers.Array( of DocSig ) ) as string
+    dim as string r = "<pre>"
+    for k as int32 = 0 to sigs.Count - 1
+        r &= HtmlEsc( sigs[k].text ) & iif( k < sigs.Count - 1, NL_( ), "" )
+    next
+    return r & "</pre>" & NL_( )
+end function
+
+function Html( byref m as DocModule ) as string
+    dim as string b = "<h1>" & HtmlEsc( m.name ) & "</h1>" & NL_( )
+    b &= "<pre>#import &quot;" & HtmlEsc( m.importPath ) & "&quot;</pre>" & NL_( )
+    if len( m.overview ) > 0 then b &= TextToHtml( m.overview )
+    for s as int32 = 0 to 7
+        dim as boolean any_ = false
+        for k as int32 = 0 to m.items.Count - 1
+            if Section_( m.items[k].kind ) <> s then continue for
+            if any_ = false then b &= "<h2>" & SectionTitle_( s ) & "</h2>" & NL_( ) : any_ = true
+            dim as DocItem it = m.items[k]
+            b &= "<h3 id=""" & it.anchor & """>" & HtmlEsc( Qual_( it ) ) & " <span class=""kind"">" & it.kind & "</span></h3>" & NL_( )
+            b &= HtmlCode_( it.sigs )
+            if len( it.doc ) > 0 then b &= TextToHtml( it.doc )
+            if it.members.Count > 0 then
+                b &= "<table>" & NL_( )
+                for j as int32 = 0 to it.members.Count - 1
+                    dim as DocMember mb = it.members[j]
+                    b &= "<tr><td><code>"
+                    for q as int32 = 0 to mb.sigs.Count - 1
+                        b &= HtmlEsc( mb.sigs[q].text ) & iif( q < mb.sigs.Count - 1, "<br>", "" )
+                    next
+                    b &= "</code>" & iif( mb.vis = "protected", " <span class=""kind"">protected</span>", "" ) & _
+                         "</td><td>" & Inline_( Summary( mb.doc ) ) & "</td></tr>" & NL_( )
+                next
+                b &= "</table>" & NL_( )
+            end if
+            if it.sigs.Count > 0 then
+                b &= "<p class=""where"">" & HtmlEsc( Base_( it.sigs[0].file_ ) ) & ":" & it.sigs[0].line_ & "</p>" & NL_( )
+            end if
+        next
+    next
+    return Page( m.name & " -- API", b, "" )
+end function
+
+'' ---------------------------------------------------------------- JSON and the index
+
+private function Js_( byref s as string ) as string
+    dim as string r = """"
+    for i as int32 = 0 to len( s ) - 1
+        dim as uint8 c = s[i]
+        select case c
+        case 34 : r &= "\"""
+        case 92 : r &= "\\"
+        case 10 : r &= "\n"
+        case 13 : r &= "\r"
+        case 9  : r &= "\t"
+        case is < 32 : r &= "\u00" & lcase( hex( c, 2 ) )
+        case else : r &= chr( c )
+        end select
+    next
+    return r & """"
+end function
+
+private function SigsJson_( byref sigs as containers.Array( of DocSig ) ) as string
+    dim as string r = "["
+    for k as int32 = 0 to sigs.Count - 1
+        r &= iif( k > 0, ",", "" ) & "{""text"":" & Js_( sigs[k].text ) & ",""file"":" & _
+             Js_( Base_( sigs[k].file_ ) ) & ",""line"":" & sigs[k].line_ & "}"
+    next
+    return r & "]"
+end function
+
+function JsonOf( byref m as DocModule ) as string
+    dim as string r = "{""chain"":" & Js_( m.chain ) & ",""import"":" & Js_( m.importPath ) & _
+                      ",""name"":" & Js_( m.name ) & ",""files"":["
+    for k as int32 = 0 to m.files.Count - 1
+        r &= iif( k > 0, ",", "" ) & Js_( Base_( m.files[k] ) )
+    next
+    r &= "],""summary"":" & Js_( Summary( m.overview ) ) & ",""doc"":" & Js_( m.overview ) & ",""items"":["
+    for k as int32 = 0 to m.items.Count - 1
+        dim as DocItem it = m.items[k]
+        r &= iif( k > 0, ",", "" ) & "{""kind"":" & Js_( it.kind ) & ",""name"":" & Js_( it.name ) & _
+             ",""namespace"":" & Js_( it.nsPath ) & ",""qualified"":" & Js_( m.name & "." & Qual_( it ) ) & _
+             ",""anchor"":" & Js_( it.anchor ) & ",""summary"":" & Js_( Summary( it.doc ) ) & _
+             ",""doc"":" & Js_( it.doc ) & ",""signatures"":" & SigsJson_( it.sigs ) & ",""members"":["
+        for j as int32 = 0 to it.members.Count - 1
+            dim as DocMember mb = it.members[j]
+            r &= iif( j > 0, ",", "" ) & "{""kind"":" & Js_( mb.kind ) & ",""name"":" & Js_( mb.name ) & _
+                 ",""visibility"":" & Js_( mb.vis ) & ",""doc"":" & Js_( mb.doc ) & _
+                 ",""signatures"":" & SigsJson_( mb.sigs ) & "}"
+        next
+        r &= "]}"
+    next
+    return r & "]}"
+end function
+
+private function Field_( byref s as string ) as string
+    dim as string r = s
+    for i as int32 = 0 to len( r ) - 1
+        if (r[i] = 9) orelse (r[i] = 10) orelse (r[i] = 13) then r[i] = 32
+    next
+    return r
+end function
+
+function IndexLines( byref m as DocModule ) as string
+    dim as string t = chr( 9 )
+    dim as string r = "module" & t & m.chain & t & m.importPath & t & Field_( Summary( m.overview ) ) & NL_( )
+    for k as int32 = 0 to m.items.Count - 1
+        dim as DocItem it = m.items[k]
+        r &= "item" & t & it.kind & t & Field_( m.name & "." & Qual_( it ) ) & t & m.chain & ".html#" & it.anchor & _
+             t & Field_( Summary( it.doc ) ) & NL_( )
+    next
+    return r
+end function
+
+end namespace

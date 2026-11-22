@@ -22,7 +22,7 @@ tiko is honest about where it stops:
 
 - **No compile-time memory safety.** Runtime checks (bounds, null pointers) are available with `-exx`, but there is no borrow checker.
 - **Goroutines are not green threads.** `spawn` queues a call on a pool of operating-system threads.
-- **ARM64 on macOS only.** There is no Linux or Windows ARM64 target.
+- **ARM64 on Linux and macOS only.** There is no Windows ARM64 target.
 - **No inline `ASM`.** It is refused with `TKO0407` rather than miscompiled.
 - **Not every dialect.** `#lang "qb"`, `"fblite"` and `"deprecated"` are refused (`TKO0317`), and so is `GOSUB` (`TKO0409`).
 - **`__FB_MIN_VERSION__`.** tiko does not define it. tiko identifies itself with `__TIKO_COMPILER__` instead. See [`__TIKO_COMPILER__`](Category-Tiko-Compiler-Define).
@@ -32,10 +32,11 @@ tiko is honest about where it stops:
 | Target | |
 | --- | --- |
 | `windows-x86_64` | The default on Windows. Links against `ucrtbase.dll` and needs no Visual Studio. |
-| `linux-x86_64` | The default on Linux. |
+| `linux-x86_64` | The default on x86-64 Linux. |
+| `linux-arm64` | The default on arm64 (aarch64) Linux, with glibc 2.35 or newer. |
 | `macos-arm64` | The default on macOS (Apple Silicon, macOS 13 or newer). It links with Apple's linker and SDK, so on a Mac. |
 
-x86-64 everywhere, and ARM64 on macOS. `-m32` and `-target win32` are refused (`TKO0104`, `TKO0103`). There is **one backend**: LLVM IR through clang. See [LLVM Backend](Category-LLVM-Backend).
+x86-64 on Windows and Linux, and ARM64 on Linux and macOS. `-m32` and `-target win32` are refused (`TKO0104`, `TKO0103`). There is **one backend**: LLVM IR through clang. See [LLVM Backend](Category-LLVM-Backend).
 
 ## Where the syntax comes from
 
@@ -47,9 +48,9 @@ One consequence is useful. tiko still compiles FreeBASIC 1.20 code (`#lang "fb"`
 
 The repository's `README.md` and `HANDOFF.md` carry the measured state. Among them:
 
-- tiko compiles itself to a byte-identical fixpoint on windows-x86_64, linux-x86_64 and macos-arm64.
+- tiko compiles itself to a byte-identical fixpoint on windows-x86_64, linux-x86_64, linux-arm64 and macos-arm64.
 
-tiko is pre-1.0. Prebuilt toolchains for all three are published as [Releases](https://github.com/PaulSquires/tiko-lang/releases).
+tiko is pre-1.0. Prebuilt toolchains for all four are published as [Releases](https://github.com/PaulSquires/tiko-lang/releases).
 
 ## Where to go next
 

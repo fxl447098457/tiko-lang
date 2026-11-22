@@ -167,7 +167,7 @@ LD_LIBRARY_PATH=. ./glfw-dll        # Linux: libglfw.so.3 beside it
 #foreignlib GLFW dynamic "system:glfw", "system:GL"
 ```
 
-**Windows:** keep `vendor/glfw/` in a shared folder with a [binding header](Using-C-Libraries-Tutorial#5-a-binding-header), as the [raylib tutorial](Raylib-Tutorial#7-one-copy-for-every-program) shows.
+**Windows:** keep `vendor/glfw/` in a shared folder with a [binding header](Using-C-Libraries-Tutorial#5-a-binding-header).
 
 ## 7. Beyond OpenGL 1.1
 

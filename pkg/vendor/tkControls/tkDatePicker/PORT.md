@@ -11,7 +11,8 @@
 - `GetIdealSize`'s formula, including the `"Wednesday, September 30, 2222"` stand-in;
 - the editing-box painter: frame fill, icon cell extended past the divider, divider, glyph,
   outline last;
-- Format / Parse with the ISO fallback, the silent revert on a failed parse, AllowEmpty, the
+- Format with the ISO fallback, Parse with none (no callback = typed text is never accepted),
+  the silent revert on a failed parse, AllowEmpty, the
   range clamp and the inverted-pair swap;
 - commit on Enter or focus leaving the field; F4 / Down / Alt+Down open and close;
 - silent setters; `DropDownCallback` also for programmatic opens, the opening edge before
@@ -54,6 +55,10 @@
 - `SetToday( h, st, bPin )`: pins "today" for the ring and the band (tests, screenshots).
 - `GetPopup` and `GetFooterHandle` (test seams).
 - `GetIconHot`.
+- For the form designer: `FormatIso` / `ParseIso` (the ISO pair, for callbacks), `SetDateParts`,
+  `SetMinDate` / `SetMaxDate` (rows hold numbers, not a TKDATE), the border following the theme's
+  BorderWidth until `SetBorderThickness` (which now pins the shape), and `PaintDefault` /
+  `PaintDayDefault` (the stock drawing, for paint callbacks).
 
 **Dropped (Win32-only):**
 - `FilterMessage`. The host routes Escape, dismisses on an outside press, and closes popups

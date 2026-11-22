@@ -13,7 +13,8 @@
 ''
 ''     #tki require "<module chain>" "<header path>"
 ''     #tki define NAME body...        the module had it, like this
-''     #tki undef NAME                 the module did not have it
+''     #tki undef NAME ["<file>"]      the module did not have it -- until <file>, in the
+''                                     subtree, made it its own: an include guard's header
 ''     #include once "<header path>"
 ''     #tki end
 ''
@@ -21,7 +22,16 @@
 ''
 ''     both the same, or both undefined     nothing
 ''     the module had it, the importer not  defined for the header, undefined at '#tki end'
+''     undefined, then <file>'s own, and    nothing: the importer read that same header
+''       the importer's came from <file>
 ''     anything else                        TKO0370, at the '#import'
+''
+'' The third row is the INCLUDE GUARD. The module read crt/wchar.bi under SDL.ti with
+'' '__crt_wchar_bi__' undefined, and crt/wchar.bi then defined it; an importer that read
+'' crt/wchar.bi already -- through windows.bi from sys/win's interface -- has it defined, from
+'' that same file, and the '#include once' in the header is skipped for it: what the guard
+'' kept out, the importer has. Refusing that refused every program importing two modules
+'' whose headers share a system header (measured 2026-11-15: sys/win then vendor/SDL3).
 ''
 '' The middle row is V12: a header testing TIKO_LINK_DYNAMIC sees its own package's mode
 '' even when another package of the same program is linked statically. A '#macro' block
@@ -37,6 +47,16 @@ private function PpModHdrFile_( byref e as PpEngine ) as FileId
         if e.frames[k].file <> FILE_NONE then return e.frames[k].file
     next
     return FILE_NONE
+end function
+
+'' A FILE'S PATH as the hermetic and '#tki undef' checks compare it: lower case, forward slashes.
+private function PpModFilePath_( byref e as PpEngine, byval f as FileId ) as string
+    if f = FILE_NONE then return ""
+    dim as string p = Text.LowerAscii( e.src->AbsPathOf( f ) )
+    for i as int32 = 0 to len( p ) - 1
+        if p[i] = 92 then p[i] = 47
+    next
+    return p
 end function
 
 '' The public slot of the header whose subtree the innermost file is in, or -1.
@@ -168,6 +188,7 @@ sub PpModConsult( byref e as PpEngine, byval id as InternId )
     e.outp->modConsRoot.Push( e.modst.pubRoots[slot] )
     e.outp->modConsName.Push( nm )
     e.outp->modConsText.Push( text_ )
+    e.outp->modConsOwn.Push( "" )
 end sub
 
 '' A '#define' or '#undef' of 'id' read in a public header's subtree: the name is the
@@ -178,7 +199,20 @@ sub PpModNoteOwn( byref e as PpEngine, byval id as InternId )
     dim as int32 i = cast( int32, id )
     if i <= 0 then return
     PpModGrowMarks_( e, i )
-    e.modst.ownMark[i] or= (1ul shl slot)
+    dim as uint32 bit_ = 1ul shl slot
+    '' CONSULTED UNDEFINED FIRST, and now the subtree's own: its record names this file.
+    if ((e.modst.consMark[i] and bit_) <> 0) andalso ((e.modst.ownMark[i] and bit_) = 0) then
+        dim as string nm = e.names->Spelling( id )
+        dim as uint32 root = e.modst.pubRoots[slot]
+        for c as int32 = e.outp->modConsName.Count - 1 to 0 step -1
+            if (e.outp->modConsRoot[c] <> root) orelse (e.outp->modConsName[c] <> nm) then continue for
+            if len( e.outp->modConsText[c] ) = 0 then
+                e.outp->modConsOwn[c] = PpModFilePath_( e, PpModHdrFile_( e ) )
+            end if
+            exit for
+        next
+    end if
+    e.modst.ownMark[i] or= bit_
 end sub
 
 '' TKO0370 at the '#import' being read: 'here' is the importer's macro, 'there' the module's.
@@ -212,13 +246,7 @@ end function
 '' THE FILE A MACRO WAS DEFINED IN, lower case with forward slashes; "" for none.
 private function PpModMacroPath_( byref e as PpEngine, byref m as PpMacro ) as string
     if m.loc = LOC_NONE then return ""
-    dim as FileId f = e.src->Decode( m.loc ).file
-    if f = FILE_NONE then return ""
-    dim as string p = Text.LowerAscii( e.src->AbsPathOf( f ) )
-    for i as int32 = 0 to len( p ) - 1
-        if p[i] = 92 then p[i] = 47
-    next
-    return p
+    return PpModFilePath_( e, e.src->Decode( m.loc ).file )
 end function
 
 '' '#tki hermetic "<package root>"': A MODULE'S OWN HEADER FOLLOWS (tkiemit.tiko). The macros
@@ -382,7 +410,13 @@ sub PpModTki( byref e as PpEngine, byval at as SourceLoc )
     case "undef"
         dim as Token t
         if PeekOnLine( e, t ) andalso (Tk( t ) = TK_IDENT) then
+            Advance( e )
+            dim as string own = PpModTkiString_( e )
             dim as PpMacro ptr m = MacroFor( e, cast( InternId, t.literal ) )
+            '' The importer's from the file that made it the header's own: the third row.
+            if (m <> nullptr) andalso (len( own ) > 0) then
+                if PpModMacroPath_( e, *m ) = own then m = nullptr
+            end if
             if m <> nullptr then
                 PpModTkiDiffers_( e, e.names->Spelling( cast( InternId, t.literal ) ), _
                                   PpModTkiState_( e, m ), "undefined" )

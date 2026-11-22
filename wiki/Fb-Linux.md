@@ -12,7 +12,7 @@ __FB_LINUX__
 
 ## Description
 
-Define without a value created at compile time when compiling to the Linux target. Default in the Linux hosted version of the compiler, or active when the *[-target linux](Compiler-Option-Target)* command line option is used. It can be used to compile parts of the program only if the target is Linux.
+Define without a value, created when compiling for Linux: the `linux-x86_64` and `linux-arm64` targets, the default on Linux, or *[-target linux-x86_64](Compiler-Option-Target)* and *[-target linux-arm64](Compiler-Option-Target)* on any host. It can be used to compile parts of the program only if the target is Linux.
 
 ## Remarks
 

@@ -36,6 +36,8 @@ Returns a string representing the unsigned binary value of the integer `number`.
 
 A string containing the unsigned binary representation of `number`.
 
+ **tiko:** `Bin` also takes an [`Int128` or `UInt128`](Category-Fixed-Width-Types#128-bit-integers), at full width: up to 128 digits.
+
 ## Remarks
 
 ### Usage

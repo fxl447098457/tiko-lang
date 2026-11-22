@@ -436,6 +436,25 @@ end function
 '' __FUNCTION__ is a literal by the time it reaches lowering: the address of the
 '' enclosing procedure's SOURCE name, which MirFunction cannot answer because it carries
 '' the mangled one. Resolve has already typed it 'zstring * n'.
+'' __CALLER_LINE__ / __CALLER_FILE__: the statement being lowered. A parameter default is lowered
+'' at each call (lowercall.tiko CallDefaultAt_), so in one it is the CALLER'S statement -- the
+'' location std/outcome reports an empty Value( ) against. The file is named as LowerError names
+'' it: a module generic's '#line' source rather than its interface.
+private function LowerCallerLoc_( byref c as Ctx, byval s as Tko.Symbol ptr ) as MirValue
+    dim as Tko.DecodedLoc d
+    dim as string fname = ""
+    if (c.srcMgr <> nullptr) andalso (c.stmt.curStmtNode <> 0) then
+        d = c.srcMgr->Decode( c.ast->Loc( cast( Tko.NodeId, c.stmt.curStmtNode ) ) )
+        dim as Tko.SourceFile ptr sf = c.srcMgr->FileAt( d.file )
+        if sf <> nullptr then
+            fname = c.names->Spelling( sf->displayPath )
+            if sf->isVirtual andalso (d.shownName <> Tko.INTERN_NONE) then fname = c.srcMgr->ShownPathOf( d )
+        end if
+    end if
+    if c.types->Kind( s->type_ ) = Tko.TK_POINTER then return LowerTextAddr( c, fname )
+    return ConstInt( c, cast( int64, d.lineNo ), MT_I32 )
+end function
+
 function LowerPredeclared _
     ( byref c as Ctx, byval id as Tko.NodeId ) as MirValue
 
@@ -449,6 +468,7 @@ function LowerPredeclared _
         return LowerTextAddr( c, Tko.Mangle.ProcNameOrMain( _
             *c.syms, c.curProcSym, *c.names ) )
     end if
+    if (s->flags and Tko.SYMF_CALLERLOC) <> 0 then return LowerCallerLoc_( c, s )
 
     '' A user CONST has no storage either -- 'const K = 7' emits no variable -- so it
     '' folds to its value. The payload is the declaration ITEM, and its initialiser is
@@ -480,15 +500,18 @@ function LowerPredeclared _
         '' 'const E_FAIL = cast( long, &h80004005 )' folded to the unnarrowed
         '' 2147500037, and so did every constant built on it.
         dim as Tko.Check.ConstVal cv = _
-            Tko.Check.ConstOf( *c.ast, ip->b, *c.srcMgr, *c.names, _
+            Tko.Check.ConstOf128( *c.ast, ip->b, *c.srcMgr, *c.names, _
                                c.types->target.pointerBits, c.syms, s->parent, _
                                0, c.types, c.info )
         '' AT THE CONSTANT'S OWN DECLARED WIDTH. The INITIALISER is what was folded
         '' and it knows nothing about the type it is declared as, so
         '' 'const v as ubyte = not u' read back as -1 where fbc has 255 -- and it
         '' lowered and verified, as an i8 holding the wrong number.
+        '' The NAMES too: an int128 constant is told by its typedef's spelling, and one that
+        '' needs zero-extension to 128 bits comes back unknown and is lowered from its
+        '' initialiser below (constfold.tiko, Mark128_).
         cv = Tko.Check.ClampConstToTypeRef( *c.ast, ip->a, cv, _
-                                            c.types->target.pointerBits )
+                                            c.types->target.pointerBits, c.names )
         dim as MirType mt = LowerType( c.info->TypeOf_( id ), *c.types )
         if mt = MT_VOID then mt = MT_I64
         '' AN INTEGER CONSTANT WHOSE INITIALISER THE EVALUATOR CANNOT FOLD is lowered
@@ -526,6 +549,8 @@ function LowerPredeclared _
             if fv.kind = cast( uint8, MV_NONE ) then return v
             return Coerce( c, fv, mt )
         end if
+        '' AN int128 CONSTANT is both halves (ConstOf128); anything narrower is its low word.
+        if mt = MT_I128 then return ConstInt128( c, cv.value, cast( int64, Tko.Check.Const128Wide( cv ).hi ), mt )
         return ConstInt( c, cv.value, mt )
     end if
     return v
@@ -874,6 +899,8 @@ function PrintRtlFor( byref c as Ctx, byval t as Tko.TypeId ) as RtlId
         case Tko.TY_ULONG     : return RTL_PRINT_UINT
         case Tko.TY_LONGINT   : return RTL_PRINT_LONGINT
         case Tko.TY_ULONGINT  : return RTL_PRINT_ULONGINT
+        case Tko.TY_INT128    : return RTL_PRINT_INT128
+        case Tko.TY_UINT128   : return RTL_PRINT_UINT128
         case Tko.TY_SINGLE    : return RTL_PRINT_SINGLE
         case Tko.TY_DOUBLE    : return RTL_PRINT_DOUBLE
         case Tko.TY_BOOLEAN   : return RTL_PRINT_BOOL

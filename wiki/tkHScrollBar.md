@@ -10,7 +10,7 @@ not scroll anything itself, so use it under content you already draw that is wid
 view: a timeline, a wide table, a long line of text.
 
 It is a thin module over [tkScrollBar](tkScrollBar), which describes the behaviour both bars
-share: paging and auto-repeat, the minimum thumb, the wheel, theme colours and the porting notes.
+share: the range model, paging and auto-repeat, the minimum thumb, the wheel and theme colours.
 It takes only the horizontal wheel, and a positive wheel delta moves it right.
 
 ## Importing
@@ -45,12 +45,31 @@ tkHScrollBar_SetScrollCallback( gHS, @HS_Scroll )
 scroll callback. Forward a horizontal wheel from your content with
 `tkHScrollBar_HandleWheelDelta( gHS, cint( m->wheelX * 120 ) )`.
 
-## Coming from PsHScrollBar
+## How it behaves
 
-`PsHScrollBar_*` → `tkHScrollBar_*` and `CHSCROLL_*` → `TKHSCROLL_*`; the callback type names are
-unchanged and the handle is `TK_WIDGET ptr`. `tkHScrollBar_GetThumbRect` is new on this bar. The
-rest of the differences are listed on [tkScrollBar](tkScrollBar).
-[PsHScrollBar](PsHScrollBar) remains the behaviour reference.
+The full description is on [tkScrollBar](tkScrollBar); in short, for the horizontal bar:
+
+- `pos` is the index of the leftmost visible unit, a whole number clamped to
+  `0 .. total - page`. When everything fits there is no thumb and `tkHScrollBar_NeedsThumb` is
+  false: hiding the bar then is your decision, and the bar never sizes, places or hides itself.
+- The thumb spans the bar's full height; its width is proportional to `page / total`, but never
+  less than `TKHSCROLL_MIN_THUMB` (scaled).
+- Dragging the thumb takes the mouse capture, so dragging left or right of the window simply
+  clamps. A track click pages by exactly `page` toward the click and repeats while held
+  (`TKHSCROLL_REPEAT_DELAY`, then every `TKHSCROLL_REPEAT_MS` ms) until the thumb reaches the
+  cursor. `tkHScrollBar_IsDragging` is true while either is live: ask it before hiding the bar
+  on mouse-leave, because the cursor may legitimately be outside the bar mid-gesture.
+- Only the horizontal wheel (a sideways swipe or a tilt wheel) is taken; a vertical wheel over
+  the bar passes on to the parent, and there is no Shift+wheel modifier. One notch moves the
+  wheel step, or 3 units when the step is 0; partial notches accumulate.
+  `tkHScrollBar_HandleWheelDelta` takes 120ths of a notch, and a **positive** delta scrolls
+  **right**, increasing the position: the opposite reading from a vertical bar, so a routine
+  that feeds both axes must not assume they match. Pass `wheelX * 120` unchanged.
+- The bar takes no focus and no keys; scroll it yourself with `tkHScrollBar_SetPos`.
+- Colours follow the theme (track `Window`, thumb `Border`, active thumb `TextDisabled`) until
+  `tkHScrollBar_SetColors` pins them; `tkHScrollBar_UnpinColors` hands them back.
+- A paint callback draws the whole bar instead of the built-in painter; call
+  `tkHScrollBar_PaintDefault( p )` in it to draw the stock bar first.
 
 ## Public declarations
 
@@ -89,6 +108,7 @@ function tkHScrollBar_GetThumbRect( byval hSB as TK_WIDGET ptr ) as TKRECT
 sub tkHScrollBar_SetColors( byval hSB as TK_WIDGET ptr, byval backclr as ulong, byval foreclr as ulong, byval foreclrhot as ulong )
 sub tkHScrollBar_ApplyTheme( byval hSB as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
 sub tkHScrollBar_UnpinColors( byval hSB as TK_WIDGET ptr )
+sub tkHScrollBar_PaintDefault( byval p as TKHSCROLLBAR_PAINTINFO ptr )
 sub tkHScrollBar_SetPaintCallback( byval hSB as TK_WIDGET ptr, byval usersub as HScrollPaintCallbackSub )
 sub tkHScrollBar_SetScrollCallback( byval hSB as TK_WIDGET ptr, byval usersub as HScrollCallbackSub )
 ```
@@ -97,4 +117,4 @@ sub tkHScrollBar_SetScrollCallback( byval hSB as TK_WIDGET ptr, byval usersub as
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsHScrollBar](PsHScrollBar), the PsControls control
+- [tkScrollBar](tkScrollBar), [tkVScrollBar](tkVScrollBar)

@@ -30,6 +30,8 @@ Declare Function Str ( ByVal n As ULongInt ) As String
 
  `Str` also converts Unicode character strings to ASCII character strings. Used this way it does the opposite of [`WStr`](Wstr). If an ASCII character string is given, that string is returned unmodified.
 
+ **tiko:** `Str` also takes an [`Int128` or `UInt128`](Category-Fixed-Width-Types#128-bit-integers), at full width: `Str( cast( UInt128, -1 ) )` is `"340282366920938463463374607431768211455"`.
+
 ## Remarks
 
 ### Usage

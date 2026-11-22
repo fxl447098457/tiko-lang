@@ -64,7 +64,9 @@ itself) contradicts vendor's "Behaviour and limits" and was not followed.
 **Added:**
 - `tkSplitter_GetHotColor` (vendor has no hot-colour getter);
 - `TKSPLITTER_COLORS` and `tkSplitter_ThemeColors`;
-- `TKSPLITTER_MAX_UNBOUNDED`.
+- `TKSPLITTER_MAX_UNBOUNDED`;
+- `tkSplitter_PaintDefault( p )`: the stock bar, for a paint callback (the form designer's Paint
+  event).
 
 **Vendor bugs found (fixed here):**
 - `PsSplitter_Rescale` scaled `nPos` but not `dragOffset`, so a DPI change mid-drag made the bar

@@ -79,3 +79,15 @@ extern int shapes_table[8];
 struct point { int x, y; };
 int print(const char *s);
 struct type_names { int mod; int next; int dim; int string; };
+
+/* __int128: tiko's int128 / uint128, under both spellings clang has -- the keyword and its
+   builtin typedefs. A record holding one is 16-aligned by its own rule, not over-aligned. */
+typedef __int128 shapes_i128;
+typedef unsigned __int128 shapes_u128;
+typedef __int128_t shapes_i128t;
+typedef __uint128_t shapes_u128t;
+struct wide16 { char c; __int128 v; unsigned __int128 u; };
+__int128 shapes_wide(__int128 a, unsigned __int128 *b, struct wide16 w);
+/* a 128-bit macro value: libclang reads only its low 64 bits, so none is kept */
+#define SHAPES_WIDE_BIG ((__int128)1 << 100)
+#define SHAPES_WIDE_ONES (~(unsigned __int128)0)

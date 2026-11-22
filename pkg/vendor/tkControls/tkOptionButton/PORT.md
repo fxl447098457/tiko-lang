@@ -77,6 +77,8 @@ top-level buttons).
 **Added:**
 - probes `tkOptionButton_GetTabStop` (does this member carry its group's stop), `GetHot`,
   `GetPressed` (the live gesture), `GetTextSize`.
+- `tkOptionButton_PaintDefault( p )`: the stock drawing, for a paint callback (the form designer's
+  Paint event).
 
 **Vendor bugs found (fixed here):**
 - **Sliding off did not un-flash** (same as PsCheckBox). The README says `PAINTINFO.isPressed` is

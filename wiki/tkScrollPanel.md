@@ -65,31 +65,102 @@ tkWidget_SetPos( gScp, x, y, cx, cy )
 Without a layout callback, place the widgets yourself and call `tkScrollPanel_SetContentHeight`,
 or let `tkScrollPanel_AutoSizeContent` measure the visible children. `tkScrollPanel_SetPos`,
 `tkScrollPanel_SetContentHeight` and the other setters are silent; the wheel, the thumb and the
-focus scroll call the scroll callback.
+focus scroll call the scroll callback. A paint callback draws the page; `tkScrollPanel_PaintDefault( p )` in it fills
+the stock background first.
 
-## Coming from PsScrollPanel
+## Layout
 
-[PsScrollPanel](PsScrollPanel) remains the behaviour reference for everything not listed here.
+- `tkScrollPanel_Create( hParent, CtrlID )` returns the viewport, created zero-sized; pass
+  `tkHost_Root( h )` as the parent for a top-level window and place it with `tkWidget_SetPos`.
+  It creates two widgets of its own: the page (`tkScrollPanel_GetPanel`, id `CtrlID + 1`) and
+  the bar (`tkScrollPanel_GetScrollBar`, id `CtrlID + 2`). The bar's rectangle, visibility,
+  range and position belong to the panel; never show, hide, move or size it yourself.
+- The page is as wide as the viewport minus the strip (`tkScrollPanel_GetPanelWidth`), and as
+  tall as the content height or the viewport, whichever is larger. Scrolling sets the page's
+  top edge to minus the position and moves nothing on it, so a page of fifty widgets scrolls
+  as cheaply as a page of five, and your layout code never sees the scroll position.
+- Vertical only. Content wider than the page is clipped; re-flow to the width you are handed.
+- Everything is pixels in page coordinates: content height, position, `EnsureVisible` margins.
+  The strip width (`tkScrollPanel_SetScrollBarWidth`, default `TKSCROLL_DEFAULT_THICKNESS`, 12)
+  and the wheel line height (default `TKSCROLLPANEL_LINE_HEIGHT`, 20) are given unscaled and
+  scaled at use. On a display-scale change the content height and position are rescaled and the
+  layout runs again.
+- The layout callback runs on every resize, on `tkScrollPanel_Recalc`, when the strip width
+  changes and after a scale change. It is handed the width the page is being given (the page
+  already has it) and returns the page height, or 0 to keep the current content height.
+  Calling `tkScrollPanel_SetContentHeight` inside it is safe: the value is recorded and the
+  running pass finishes the job.
+- The panel does not watch the page. After adding, removing, hiding or moving a widget outside
+  a resize, call `tkScrollPanel_Recalc`. `tkScrollPanel_AutoSizeContent` sets the content
+  height to the bottom of the lowest visible child of the page plus the padding (0, with no
+  padding, when no child is visible) and returns it. Left at 0, nothing scrolls.
+- The position is clamped to 0 .. content height − viewport height.
+- `tkScrollPanel_EnsureVisible` makes the minimum scroll that brings a widget on the page, plus
+  the margin, fully into view; one taller than the viewport is top-aligned. It returns false
+  for a widget that is not on the page or when nothing needed to move, and never moves the focus.
+- The page and your widgets on it are destroyed with the panel.
 
-- Names: `PsScrollPanel_*` → `tkScrollPanel_*`, `PSSCROLLPANEL_*` → `TKSCROLLPANEL_*`.
-  `SCP_PAINTINFO`, `SCP_MESSAGEINFO` and the `SCP_*` callback types keep their names. Handles
-  are `TK_WIDGET ptr`.
-- `tkScrollPanel_Create( hParent, CtrlID )` takes a `TK_WIDGET ptr` parent (`tkHost_Root( h )`
-  for a top-level window). The page has id `CtrlID + 1` and the bar `CtrlID + 2`.
-- Auto-scroll-to-focus works: a focus change landing inside the page scrolls it into view and
-  calls the scroll callback.
-- `SCP_MESSAGEINFO` carries `msg` (a `TKM_*`), `x`, `y` and `wheelY`, and `hFrom` (the page or
-  the panel). It observes the wheel, left and right button down and up, and mouse moves. There
-  is no `lResult`.
-- `tkScrollPanel_HandleWheelDelta` takes 120ths of a notch, positive scrolling up. The
-  lines-per-notch setting is fixed at `TKSCROLL_SYSTEM_WHEEL_LINES` (3), and there is no
-  page-per-notch mode.
-- Added: `tkScrollPanel_GetColors` and `tkScrollPanel_GetLineHeight`, so your own widgets can
-  match the page's colours.
-- Gone: `PsScrollPanel_SetFont` (give each widget its font through its own setter), the
-  `WM_CTLCOLOR*` brush and the forwarding of `WM_COMMAND` / `WM_NOTIFY` to the parent (tk
-  widgets report through their own callbacks), `IsDialogMessage` (the host owns Tab), and
-  PsRegistry.
+## The thumb
+
+- The thumb shows when there is something to scroll **and** either the mouse is over the panel
+  (a cursor resting on one of your widgets counts) or the focus is on the page. So a keyboard
+  user Tabbing through the page still sees where they are. `tkScrollPanel_ShouldShow( bNeeds,
+  bMouse, bFocus )` is that rule as a pure function; `tkScrollPanel_IsThumbVisible` reports the
+  current state. During a thumb drag it stays shown even if the cursor leaves the strip.
+- Only the bar hides. Its strip stays reserved and is painted in the page's background, so the
+  empty strip is invisible and right-aligned widgets never jitter as the mouse comes and goes.
+- The rule is re-checked on mouse moves over the panel and when the mouse leaves, and polled
+  every `TKSCROLLPANEL_REVEAL_MS` (100 ms) while there is something to scroll and the panel is
+  visible, so the thumb can lag the cursor by up to 100 ms. The poll is the panel's timer
+  `TKSCROLLPANEL_TIMER_REVEAL`; don't start a timer of your own with that id on the panel.
+  Hiding the panel stops the poll and hides the thumb.
+- The same tick makes the focus-into-view scroll, on a focus **change** only: a user who
+  scrolls the focused widget off screen does not have it pulled back on the next tick.
+
+## Mouse wheel
+
+- One notch scrolls `TKSCROLL_SYSTEM_WHEEL_LINES` (3) times the line height; set the line
+  height to your row pitch (`tkScrollPanel_SetLineHeight`) and a notch moves whole rows.
+  Sub-notch deltas from a trackpad accumulate rather than being dropped.
+- The wheel scrolls over the page, over your widgets that do not take it themselves (it
+  bubbles up to the page), over the empty strip and over the bar, all by the same step. A
+  purely sideways wheel passes on to the panel's parent.
+- `tkScrollPanel_HandleWheelDelta( h, nDelta )` feeds a delta in 120ths of a notch, positive
+  scrolling up, and notifies as a real wheel does.
+
+## Callbacks
+
+- **Paint** draws the page **instead of** the stock flat fill, so it must fill the background
+  itself; `tkScrollPanel_PaintDefault( p )` does that. `p->b` is the page's paint buffer for
+  this repaint. `p->rcClient` is the whole page in page coordinates, not the visible slice:
+  draw section rules or bands at the coordinates your layout recorded and only the visible
+  slice reaches the screen. `p->nPos` is the scroll position, for content that wants it.
+- **Message** observes the mouse on both the page and the viewport (`hFrom` says which):
+  `TKM_MOUSEWHEEL`, `TKM_LBUTTONDOWN` / `TKM_LBUTTONUP`, `TKM_RBUTTONDOWN` / `TKM_RBUTTONUP` and
+  `TKM_MOUSEMOVE`, with `x`, `y` and `wheelY`. Returning true from a wheel message stops the
+  panel scrolling; for the others the return value is ignored. The panel takes no capture and
+  keeps no press state. Mouse input over your own widgets goes to those widgets.
+- **Scroll** reports user action only: the wheel, a thumb drag or track click, and the
+  focus-into-view scroll. It fires after the page has moved, so `tkScrollPanel_GetPos` already
+  equals `newPos`. `tkScrollPanel_SetPos`, `ScrollBy`, `SetContentHeight`, `AutoSizeContent`,
+  `EnsureVisible` and `Recalc` never fire it, so they are safe to call from inside the handler.
+
+The panel forwards nothing from the widgets on the page: each reports through its own
+callbacks and takes its font through its own setter.
+
+## Colours and theme
+
+- The panel has two colours. The background fills the page and the strip, and is also the
+  bar's background; the foreground is not drawn by the panel at all. `tkScrollPanel_GetColors`
+  reads both back so your own widgets can match the page.
+- They start from the current theme: the page from `Window` / `Text`, the bar from `Window`
+  (background), `Border` (thumb) and `TextDisabled` (thumb while hovered or dragged).
+- `tkScrollPanel_SetColors` also sets the bar's background to the new page background, so call
+  it before `tkScrollPanel_SetScrollBarColors`. A bar background that differs from the page
+  shows as a visible gutter down the right edge.
+- Both setters pin the colours: a theme change then leaves them alone. Unpinned, the panel
+  re-applies the theme whenever it changes. `tkScrollPanel_UnpinColors` returns to the theme
+  and applies it at once.
 
 ## Public declarations
 
@@ -161,6 +232,7 @@ sub tkScrollPanel_SetScrollBarColors( byval hScp as TK_WIDGET ptr, byval backclr
 sub tkScrollPanel_ApplyTheme( byval hScp as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
 sub tkScrollPanel_UnpinColors( byval hScp as TK_WIDGET ptr )
 sub tkScrollPanel_SetScrollBarWidth( byval hScp as TK_WIDGET ptr, byval nWidth as long )
+sub tkScrollPanel_PaintDefault( byval p as SCP_PAINTINFO ptr )
 sub tkScrollPanel_SetPaintCallback( byval hScp as TK_WIDGET ptr, byval usersub as SCP_PaintCallbackSub )
 sub tkScrollPanel_SetMessageCallback( byval hScp as TK_WIDGET ptr, byval userfunc as SCP_MessageCallbackFunc )
 sub tkScrollPanel_SetLayoutCallback( byval hScp as TK_WIDGET ptr, byval userfunc as SCP_LayoutCallbackFunc )
@@ -171,4 +243,3 @@ sub tkScrollPanel_SetScrollCallback( byval hScp as TK_WIDGET ptr, byval usersub 
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsScrollPanel](PsScrollPanel), the PsControls control

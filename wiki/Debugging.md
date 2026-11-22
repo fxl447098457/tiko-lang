@@ -125,7 +125,7 @@ tkEdit looks for lldb-dap on the `PATH`, then in LLVM's usual places; `adapter` 
 
 | System | lldb-dap |
 | --- | --- |
-| Windows | LLVM's `bin` folder, beside clang. It loads `python310.dll`, so **Python 3.10 (64-bit)** must be on the `PATH`. |
+| Windows | LLVM's `bin` folder, beside clang. It loads a 64-bit Python, which must be on the `PATH`: LLVM 23 takes any **Python 3** (`python3.dll`), LLVM 21 only **Python 3.10** (`python310.dll`). tkEdit reads which from `liblldb.dll` and checks for it before it starts. |
 | Linux | The distribution's `lldb` package: `lldb-dap`, or a numbered `lldb-dap-NN` (the newest is taken). |
 | macOS | Apple's Command Line Tools. macOS lets it control a program only in **Developer Mode** -- `sudo DevToolsSecurity -enable` -- or when the dialog asking for it is allowed. |
 
@@ -142,5 +142,6 @@ An instantiation of a generic type is named by an internal number rather than by
 ## See also
 
 - [Compiler Option: -g](Compiler-Option-G)
+- [Compiler Option: -fsanitize](Compiler-Option-Fsanitize): memory errors a debugger does not show
 - [Compiler Error Messages](Compiler-Error-Messages)
 - [`Assert`](Assert)

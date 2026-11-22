@@ -20,17 +20,23 @@
 #import "tkd/itemsdlg"
 #import "tkd/model"
 #import "tkd/panels"
+#import "tkd/reconcile"
 #import "vendor/tkControls/tkApp"
 #import "vendor/tkControls/tkTest"
 #import "vendor/tkControls/tkPaint"
 #import "vendor/tkControls/tkListTree"
 #import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkLabel"
+#import "tkd/glyphdlg"
 #import "vendor/tkControls/tkMenuBar"
 #import "vendor/tkControls/tkToolbar"
 #import "vendor/tkControls/tkStatusBar"
 #import "vendor/tkControls/tkComboBox"
 #import "vendor/tkControls/tkTabControl"
 #import "vendor/tkControls/tkLayout"
+#import "vendor/tkControls/tkGroupBox"
+#import "vendor/tkControls/tkCheckBox"
+#import "vendor/tkControls/tkButton"
 using containers
 using cmdids
 using tkApp
@@ -38,7 +44,11 @@ using tkHost
 using tkTest
 using tkPaint
 using tkListTree
+using tkGroupBox
+using tkCheckBox
+using tkButton
 using tkTextBox
+using tkLabel
 using tkMenuBar
 using tkToolbar
 using tkStatusBar
@@ -48,9 +58,11 @@ using tkLayout
 using model
 
 dim shared as ustring gItemsAsked
+dim shared as ustring gItemsEvent
 
 private sub RecordItems( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref n as const ustring, byref e as const ustring, byval jump as boolean )
     gItemsAsked = n
+    gItemsEvent = e
 end sub
 
 private sub PressIn( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr )
@@ -70,6 +82,77 @@ private sub TypeField( byval h as TK_HOST ptr, byval d as itemsdlg.ItemsEditor p
             tkTest_PumpFor( h, 30 )
         end if
     next
+end sub
+
+' The Stretch check box of an items editor (status bars only).
+private function stretchBoxOf( byval d as itemsdlg.ItemsEditor ptr ) as TK_WIDGET ptr
+    for each f as itemsdlg.ItemField in d->Fields
+        if f.Key = "Stretch" then return f.Edit
+    next
+    return 0
+end function
+
+' Posted to the UI thread before a menu bar is placed: once its editor runs modally, the pencil is
+' pressed from within that modal loop.
+dim shared as long gPencilTries
+private sub PressPencilWhenModal( byval payload as any ptr )
+    dim as mainwin.Window ptr w = payload
+    gPencilTries += 1
+    if (w->ItemsDlg <> 0) andalso w->ItemsDlg->IsModal then
+        w->ItemsDlg->EditHandler( )
+    elseif gPencilTries < 100000 then
+        tkApp_RunOnUI( @PressPencilWhenModal, payload )
+    end if
+end sub
+
+' The author's GPF: a new form, a MenuBar double-clicked in the Toolbox (its editor opens, seeded),
+' the pencil pressed at once. The jump to the code unbinds the panels from the form, and the
+' Toolbox's handler went on to use the form it no longer had.
+public sub PencilPass( byref t as Tally, byval sc as single )
+    dim as mainwin.Window mw
+    mw.ConfigDir = FreshConfig( )
+    mw.Ask = @ScriptedAsk
+    mw.Pick = @ScriptedPick
+    t.Check( mw.Create( sc ), P( sc, "pencil: main window created" ) )
+    if mw.form = 0 then exit sub
+    mw.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( mw.form )
+    tkTest_PumpFor( h, 150 )
+    dim as ustring dir_ = fs.PathJoin( Files( ), "pencil" & cint( sc * 100 ) )
+    fs.RemoveDirAll( dir_ )
+    fs.CreateDirAll( dir_ )
+    mw.NewForm( fs.PathJoin( dir_, "frmNew.tkform" ) )
+    tkTest_PumpFor( h, 100 )
+    dim as DocRef d = mw.Active( )
+    dim as canvas.FormCanvas ptr c = iif( d <> 0, d->Designer, cast( canvas.FormCanvas ptr, 0 ) )
+    if c = 0 then
+        t.Check( false, P( sc, "pencil: a new form on its surface" ) )
+        mw.Destroy( )
+        exit sub
+    end if
+    dim as TK_WIDGET ptr tl = mw.Palettes.ToolList
+    dim as long tr = -1
+    for r as long = 0 to tkListTree_GetCount( tl ) - 1
+        if tkListTree_GetText( tl, r ) = "MenuBar" then tr = r
+    next
+    tkListTree_SetTopIndex( tl, tr )
+    tkTest_PumpFor( h, 30 )
+    dim as TKRECT rl
+    tkWidget_AbsRect( tl, rl )
+    dim as single tx = rl.left + tkHost_Scale( h, 20 ), ty = rl.top + tkListTree_GetRowHeight( tl ) \ 2
+    gPencilTries = 0
+    tkApp_RunOnUI( @PressPencilWhenModal, @mw )
+    tkTest_PushMotion( h, tx, ty )
+    tkTest_Click( h, tx, ty )
+    tkTest_Click( h, tx, ty, SDL_BUTTON_LEFT, 2 )
+    tkTest_PumpFor( h, 100 )
+    dim as long i = FindControl( c->Doc, "MenuBar1" )
+    t.Check( (tr >= 0) andalso (i >= 0) andalso (c->Doc.Controls[i].Items[0].Handler = "MenuBar1_File"), P( sc, "pencil at once after a Toolbox double click: no crash, MenuBar1_File named" ) )
+    t.Check( (mw.Active( ) <> d) andalso (instr( mw.Active( )->Text( ), "sub Form.MenuBar1_File( )" ) > 0), P( sc, "and its body in front" ) )
+    for each dd as DocRef in mw.Docs
+        dd->Main.SetSavePoint( )
+    next
+    mw.Destroy( )
 end sub
 
 public sub ItemsPass( byref t as Tally, byval sc as single )
@@ -103,16 +186,26 @@ public sub ItemsPass( byref t as Tally, byval sc as single )
     dim as TKRECT rs = c->SurfaceRect( ), rg
     tkWidget_AbsRect( c->Glass, rg )
     dim as long ox = rg.left + rs.left, oy = rg.top + rs.top
+    ' a menu bar just placed asks for its editor at once, marked "new" (the host seeds it with the
+    ' standard menu and runs it modally -- recorded here instead)
+    dim as canvas.CanvasWireSub keepPlace = c->OnEditItems
+    c->OnEditItems = @RecordItems
+    gItemsAsked = ""
+    gItemsEvent = ""
     c->Tool = "MenuBar"
     ClickPx( h, ox + tkHost_Scale( h, 100 ), oy + tkHost_Scale( h, 100 ) )
     tkTest_PumpFor( h, 60 )
     dim as long i = FindControl( c->Doc, "MenuBar1" )
     t.Check( i >= 0, P( sc, "a menu bar placed" ) )
     t.Check( c->Doc.Controls[i].Dock = TK_DOCK_TOP, P( sc, "docked top by itself" ) )
+    t.Check( (gItemsAsked = "MenuBar1") andalso (gItemsEvent = "new"), P( sc, "and its editor asked for, new: " & gItemsAsked & " " & gItemsEvent ) )
+    gItemsAsked = ""
     c->Tool = "StatusBar"
     ClickPx( h, ox + tkHost_Scale( h, 100 ), oy + tkHost_Scale( h, 150 ) )
     tkTest_PumpFor( h, 60 )
     t.Check( c->Doc.Controls[FindControl( c->Doc, "StatusBar1" )].Dock = TK_DOCK_BOTTOM, P( sc, "a status bar docked bottom" ) )
+    t.Check( (gItemsAsked = "StatusBar1") andalso (gItemsEvent = ""), P( sc, "a status bar opens its editor too, not seeded: " & gItemsAsked & " " & gItemsEvent ) )
+    ' (placing stays recorded for the rest of this pass: a real editor would be modal)
 
     ' the inspector's row asks to edit the selected control's entries
     c->SelectOnly( "MenuBar1" )
@@ -142,12 +235,33 @@ public sub ItemsPass( byref t as Tally, byval sc as single )
     end if
     dim as TK_HOST ptr dh = tkForm_Host( dlg->Win )
     t.Check( dlg->BtnIn <> 0, P( sc, "a menu can be indented" ) )
+    ' the layout: a bordered list with Up, Down, Outdent, Indent under it; Add and Remove above the
+    ' group box of fields; the buttons are glyphs the glyph font holds, their words as tooltips
+    t.Check( tkListTree_GetBorderWidth( dlg->List ) = 1, P( sc, "the list has a border" ) )
+    dim as long ly = dlg->List->y + dlg->List->ch
+    t.Check( (dlg->BtnUp->y > ly) andalso (dlg->BtnDown->y = dlg->BtnUp->y) andalso (dlg->BtnOut->y = dlg->BtnUp->y) andalso (dlg->BtnIn->y = dlg->BtnUp->y) _
+             andalso (dlg->BtnUp->x < dlg->BtnDown->x) andalso (dlg->BtnDown->x < dlg->BtnOut->x) andalso (dlg->BtnOut->x < dlg->BtnIn->x), _
+             P( sc, "Up, Down, Outdent, Indent in a row under the list" ) )
+    t.Check( (dlg->BtnAdd->y + dlg->BtnAdd->ch <= dlg->Group->y) andalso (dlg->BtnDel->y = dlg->BtnAdd->y) andalso (dlg->BtnAdd->x >= dlg->List->x + dlg->List->cw), _
+             P( sc, "Add and Remove above the group box, right of the list" ) )
+    dim as boolean inGroup = true
+    for each f as itemsdlg.ItemField in dlg->Fields
+        if (f.Edit->pParent <> dlg->Group) orelse (f.Label->pParent <> dlg->Group) then inGroup = false
+    next
+    t.Check( inGroup, P( sc, "the fields are in the group box" ) )
+    dim as TTF_Font ptr gf = tkForm_Font( dlg->Win, TKFONT_GLYPH_LARGE )
+    t.Check( (gf <> 0) andalso TTF_FontHasGlyph( gf, itemsdlg.GLYPH_ADD ) andalso TTF_FontHasGlyph( gf, itemsdlg.GLYPH_DELETE ) _
+             andalso TTF_FontHasGlyph( gf, itemsdlg.GLYPH_UP ) andalso TTF_FontHasGlyph( gf, itemsdlg.GLYPH_DOWN ) _
+             andalso TTF_FontHasGlyph( gf, itemsdlg.GLYPH_LEFT ) andalso TTF_FontHasGlyph( gf, itemsdlg.GLYPH_RIGHT ), _
+             P( sc, "the six glyphs are in the glyph font" ) )
+    t.Check( (tkButton_GetTooltipText( dlg->BtnAdd ) = "Add") andalso (tkButton_GetTooltipText( dlg->BtnIn ) = "Indent"), P( sc, "with their words as tooltips" ) )
     PressIn( dh, dlg->BtnAdd )
     t.Check( dlg->Items.Count( ) = 1, P( sc, "Add adds" ) )
     dim as ustring s = "File"
     TypeField( dh, dlg, "Text", s )
     t.Check( dlg->Items[0].Text = "File", P( sc, "the field edits the item: " & dlg->Items[0].Text ) )
     t.Check( tkListTree_GetText( dlg->List, 0 ) = "File", P( sc, "and the list shows it" ) )
+    t.Check( tkGroupBox_GetText( dlg->Group ) = "File", P( sc, "and the group box is titled with it: " & tkGroupBox_GetText( dlg->Group ) ) )
     PressIn( dh, dlg->BtnAdd )
     s = "Open"
     TypeField( dh, dlg, "Text", s )
@@ -198,7 +312,51 @@ public sub ItemsPass( byref t as Tally, byval sc as single )
     tkTest_PumpFor( h, 50 )
     t.Check( d->Text( ) = text1, P( sc, "changes nothing" ) )
 
+    ' ---- a second menu bar: its editor seeded with the standard menu (what placing one opens), then OK
+    c->OnEditItems = @RecordItems
+    c->Tool = "MenuBar"
+    ClickPx( h, ox + tkHost_Scale( h, 100 ), oy + tkHost_Scale( h, 120 ) )
+    tkTest_PumpFor( h, 60 )
+    t.Check( gItemsAsked = "MenuBar2", P( sc, "a second menu bar asks too: " & gItemsAsked ) )
+    mw.OpenItems( c, "MenuBar2" )
+    tkTest_PumpFor( h, 60 )
+    mw.ItemsDlg->SeedDefaults( )
+    dim as itemsdlg.ItemsEditor ptr sd = mw.ItemsDlg
+    t.Check( (sd->Items.Count( ) = 18) andalso (sd->Items[0].Text = "File") andalso (sd->Items[0].Level = 0), P( sc, "seeded: File first, " & sd->Items.Count( ) & " entries" ) )
+    t.Check( (sd->Items[1].Text = "New") andalso (sd->Items[1].Level = 1) andalso (sd->Items[1].Key = "Primary+N"), P( sc, "File > New, Primary+N" ) )
+    t.Check( (sd->Items[5].Text = "-") andalso (sd->Items[7].Text = "Edit") andalso (sd->Items[16].Text = "Help"), P( sc, "a separator, then Edit, then Help" ) )
+    t.Check( tkGroupBox_GetText( sd->Group ) = "File", P( sc, "the first entry selected: " & tkGroupBox_GetText( sd->Group ) ) )
+    ' a separator has no Shortcut or Handler: both boxes off and empty; a command's are on
+    dim as TK_WIDGET ptr keyBox = 0, handlerBox = 0
+    for each f as itemsdlg.ItemField in sd->Fields
+        if f.Key = "Key" then keyBox = f.Edit
+        if f.Key = "Handler" then handlerBox = f.Edit
+    next
+    sd->ShowItem( 5 )
+    t.Check( (keyBox->isEnabled = false) andalso (handlerBox->isEnabled = false), P( sc, "a separator's Shortcut and Handler are off" ) )
+    sd->ShowItem( 1 )
+    t.Check( keyBox->isEnabled andalso handlerBox->isEnabled andalso (tkTextBox_GetText( keyBox ) = "Primary+N"), P( sc, "a command's are on" ) )
+    ' New typed into a separator: its shortcut goes, and the boxes turn off
+    dim as ustring sepText = "-"
+    TypeField( tkForm_Host( sd->Win ), sd, "Text", sepText )
+    t.Check( (sd->Items[1].Text = "-") andalso (sd->Items[1].Key = "") andalso (sd->Items[1].Handler = ""), P( sc, "made a separator: its shortcut is dropped: " & sd->Items[1].Key ) )
+    t.Check( (tkTextBox_GetText( keyBox ) = "") andalso (keyBox->isEnabled = false), P( sc, "and its Shortcut box is empty and off" ) )
+    PressIn( tkForm_Host( sd->Win ), sd->BtnOk )
+    mw.FinishItems( true )
+    tkTest_PumpFor( h, 80 )
+    t.Check( c->Doc.Controls[FindControl( c->Doc, "MenuBar2" )].Items.Count( ) = 18, P( sc, "OK puts them in the form" ) )
+    t.Check( tkMenuBar_GetItemCount( c->WidgetOf( "MenuBar2" ) ) = 3, P( sc, "and the bar shows File, Edit, Help: " & tkMenuBar_GetItemCount( c->WidgetOf( "MenuBar2" ) ) ) )
+    ' seeding never replaces entries a menu already has
+    mw.OpenItems( c, "MenuBar1" )
+    tkTest_PumpFor( h, 40 )
+    dim as long had = mw.ItemsDlg->Items.Count( )
+    mw.ItemsDlg->SeedDefaults( )
+    t.Check( mw.ItemsDlg->Items.Count( ) = had, P( sc, "a menu with entries isn't seeded" ) )
+    mw.FinishItems( false )
+    tkTest_PumpFor( h, 40 )
+
     ' ---- a bad shortcut is refused
+    text1 = d->Text( )                 ' the form as it now stands, MenuBar2 included
     mw.OpenItems( c, "MenuBar1" )
     tkTest_PumpFor( h, 60 )
     mw.ItemsDlg->Items[1].Key = "Banana+Q"
@@ -206,6 +364,22 @@ public sub ItemsPass( byref t as Tally, byval sc as single )
     tkTest_PumpFor( h, 50 )
     t.Check( d->Text( ) = text1, P( sc, "a bad shortcut is refused" ) )
     t.Check( instr( mw.Message, "shortcut" ) > 0, P( sc, "with a message: " & mw.Message ) )
+
+    ' ---- the pencil beside Handler: a name from the menu path, OK, then that handler in the code
+    mw.OpenItems( c, "MenuBar2" )
+    tkTest_PumpFor( h, 60 )
+    dim as itemsdlg.ItemsEditor ptr pd = mw.ItemsDlg
+    pd->ShowItem( 4 )
+    PressIn( tkForm_Host( pd->Win ), pd->BtnHandler )
+    t.Check( pd->Accepted andalso (pd->Items[4].Handler = "MenuBar2_File_SaveAs"), P( sc, "the pencil names MenuBar2's File > Save As... and accepts: " & pd->Items[4].Handler ) )
+    mw.FinishItems( true )
+    tkTest_PumpFor( h, 80 )
+    dim as DocRef pcode = mw.FindOpen( fs.PathJoin( dir_, "frmI.tiko" ) )
+    dim as long pa, pb
+    t.Check( (pcode <> 0) andalso (mw.Active( ) = pcode) andalso reconcile.FindBody( pcode->Text( ), "MenuBar2_File_SaveAs", pa, pb ) _
+             andalso (mw.View( ).CaretLine( ) = pa + 2), P( sc, "and the code shows its new body, the caret in it" ) )
+    mw.ShowDoc( d )
+    tkTest_PumpFor( h, 40 )
 
     ' ---- a combo's items, a status bar's panels: each with its own fields
     c->Tool = "ComboBox"
@@ -222,13 +396,84 @@ public sub ItemsPass( byref t as Tally, byval sc as single )
     t.Check( tkComboBox_GetCount( c->WidgetOf( "ComboBox1" ) ) = 1, P( sc, "the real combo has it" ) )
     mw.OpenItems( c, "StatusBar1" )
     tkTest_PumpFor( h, 60 )
-    t.Check( mw.ItemsDlg->Fields.Count( ) = 2, P( sc, "a status panel has text and a width" ) )
-    it1.Text = "Ready"
-    it1.Width = 80
-    mw.ItemsDlg->Items.Push( it1 )
+    ' a panel: Text, Width, a Handler for its clicks, and Stretch (stretching panels share the spare width)
+    dim as itemsdlg.ItemsEditor ptr sbd = mw.ItemsDlg
+    t.Check( sbd->Fields.Count( ) = 4, P( sc, "a status panel has text, width, handler and Stretch: " & sbd->Fields.Count( ) ) )
+    dim as TK_HOST ptr sh = tkForm_Host( sbd->Win )
+    dim as TK_WIDGET ptr stretchBox = 0
+    for each f as itemsdlg.ItemField in sbd->Fields
+        if f.Key = "Stretch" then stretchBox = f.Edit
+    next
+    PressIn( sh, sbd->BtnAdd )
+    dim as ustring sv = "Ready"
+    TypeField( sh, sbd, "Text", sv )
+    PressIn( sh, sbd->BtnAdd )
+    sv = "Line 1"
+    TypeField( sh, sbd, "Text", sv )
+    sv = "OnLinePanel"
+    TypeField( sh, sbd, "Handler", sv )
+    PressIn( sh, stretchBox )
+    t.Check( sbd->Items[1].Stretch andalso (sbd->Items[0].Stretch = false), P( sc, "Stretch ticked on the second panel" ) )
+    sbd->ShowItem( 0 )
+    PressIn( sh, stretchBox )
+    t.Check( sbd->Items[0].Stretch andalso sbd->Items[1].Stretch, P( sc, "ticked on the first too: both stretch" ) )
+    PressIn( sh, sbd->BtnOk )
     mw.FinishItems( true )
     tkTest_PumpFor( h, 60 )
-    t.Check( tkStatusBar_GetCount( c->WidgetOf( "StatusBar1" ) ) = 1, P( sc, "the real status bar has it" ) )
+
+    ' ---- a toolbar button's Glyph row (GLYPHS.md V5): "..." picks into it (answered for the person),
+    ' the box shows the code and the row the glyph
+    gItemsAsked = ""
+    c->Tool = "Toolbar"
+    ClickPx( h, ox + tkHost_Scale( h, 40 ), oy + tkHost_Scale( h, 160 ) )
+    tkTest_PumpFor( h, 60 )
+    t.Check( (gItemsAsked = "Toolbar1") andalso (gItemsEvent = "new"), P( sc, "a toolbar placed asks for its editor, new: " & gItemsAsked & " " & gItemsEvent ) )
+    dim as Array( of FormItem ) dtb = itemsdlg.DefaultToolbar( )
+    t.Check( (dtb.Count( ) = 7) andalso (dtb[0].Glyph = "Fluent:E4DB") andalso (len( dtb[0].Text ) > 0) andalso (dtb[3].Kind = "separator") _
+             andalso (dtb[6].Glyph = "Fluent:F2D5"), P( sc, "its defaults: New Open Save | Cut Copy Paste, glyph and text each" ) )
+    mw.OpenItems( c, "Toolbar1" )
+    tkTest_PumpFor( h, 60 )
+    dim as itemsdlg.ItemsEditor ptr tbd = mw.ItemsDlg
+    if (tbd <> 0) andalso (tbd->BtnGlyph <> 0) then
+        dim as TK_HOST ptr tbh = tkForm_Host( tbd->Win )
+        PressIn( tbh, tbd->BtnAdd )
+        mw.GlyphPick = sub( byval w as any ptr, byref gdlg as glyphdlg.GlyphDialog, byref fi as long, byref picked as ustring )
+            fi = 0
+            picked = wchr( &hE824 )
+        end sub
+        PressIn( tbh, tbd->BtnGlyph )
+        mw.GlyphPick = 0
+        dim as ustring box_
+        for each f as itemsdlg.ItemField in tbd->Fields
+            if f.Key = "Glyph" then box_ = tkTextBox_GetText( f.Edit )
+        next
+        dim as ustring g0
+        if tbd->Current >= 0 then g0 = tbd->Items[tbd->Current].Glyph
+        t.Check( (g0 = "Fluent:E824") andalso (box_ = "E824") andalso (tkLabel_GetText( tbd->GlyphPreview ) = wchr( &hE824 )), _
+                 P( sc, "a toolbar button's glyph picked: " & g0 & ", the box " & box_ ) )
+        PressIn( tbh, tbd->BtnCancel )
+        mw.FinishItems( false )
+        tkTest_PumpFor( h, 60 )
+    else
+        t.Check( false, P( sc, "a toolbar's items have a Glyph row with ""...""" ) )
+    end if
+    dim as long sbi = FindControl( c->Doc, "StatusBar1" )
+    t.Check( tkStatusBar_GetCount( c->WidgetOf( "StatusBar1" ) ) = 2, P( sc, "the real status bar has them" ) )
+    t.Check( FindSetting( c->Doc.Controls[sbi].Props, "ExpandPanel" ) < 0, P( sc, "no ExpandPanel property: Stretch is the panels' own" ) )
+    t.Check( (c->Doc.Controls[sbi].Items.Count( ) = 2) andalso c->Doc.Controls[sbi].Items[0].Stretch andalso c->Doc.Controls[sbi].Items[1].Stretch _
+             andalso (c->Doc.Controls[sbi].Items[1].Handler = "OnLinePanel"), P( sc, "the form keeps both stretches and the handler" ) )
+    t.Check( instr( d->Text( ), "stretch = true" ) > 0, P( sc, "written to the .tkform" ) )
+    t.Check( tkStatusBar_GetPanelStretch( c->WidgetOf( "StatusBar1" ), 0 ) andalso tkStatusBar_GetPanelStretch( c->WidgetOf( "StatusBar1" ), 1 ), _
+             P( sc, "and the surface's bar stretches both" ) )
+    dim as DocRef sbCode = mw.FindOpen( fs.PathJoin( dir_, "frmI.tiko" ) )
+    t.Check( (sbCode <> 0) andalso (instr( sbCode->Text( ), "sub Form.OnLinePanel( byval clicks as int32 )" ) > 0), P( sc, "the panel's handler gets a body that is told the clicks" ) )
+    ' opened again, the first panel shows Stretch
+    mw.OpenItems( c, "StatusBar1" )
+    tkTest_PumpFor( h, 40 )
+    mw.ItemsDlg->ShowItem( 0 )
+    t.Check( tkCheckBox_GetChecked( stretchBoxOf( mw.ItemsDlg ) ), P( sc, "reopened: the first panel's Stretch is ticked" ) )
+    mw.FinishItems( false )
+    tkTest_PumpFor( h, 40 )
 
     ' ---- tab pages: controls go with their page, and a page in use can't go
     c->Tool = "TabControl"
@@ -258,6 +503,19 @@ public sub ItemsPass( byref t as Tally, byval sc as single )
     mw.FinishItems( true )
     tkTest_PumpFor( h, 60 )
     t.Check( c->Doc.Controls[FindControl( c->Doc, "Button1" )].Page = 1, P( sc, "swapping pages moves the button with its page" ) )
+    ' a page's glyph: a Glyph row in the editor, kept in the file, drawn on the real tab
+    mw.OpenItems( c, "TabControl1" )
+    tkTest_PumpFor( h, 60 )
+    dim as boolean hasGlyphRow = false
+    for each f as itemsdlg.ItemField in mw.ItemsDlg->Fields
+        if f.Key = "Glyph" then hasGlyphRow = true
+    next
+    t.Check( hasGlyphRow, P( sc, "the page editor has a Glyph row" ) )
+    mw.ItemsDlg->Items[1].Glyph = "Fluent:E824"
+    mw.FinishItems( true )
+    tkTest_PumpFor( h, 60 )
+    t.Check( (PageGlyph( c->Doc.Controls[FindControl( c->Doc, "TabControl1" )], 1 ) = "Fluent:E824") andalso (instr( d->Text( ), "page_glyphs = [" ) > 0) _
+             andalso (tkTabControl_GetPageGlyph( c->WidgetOf( "TabControl1" ), 1 ) = wchr( &hE824 )), P( sc, "a page's glyph in the file and on its tab" ) )
     dim as ustring text2 = d->Text( )
     mw.OpenItems( c, "TabControl1" )
     tkTest_PumpFor( h, 60 )
@@ -273,6 +531,7 @@ public sub ItemsPass( byref t as Tally, byval sc as single )
     tkHost_SetFocus( h, c->Glass )
     Chord( h, SDLK_DELETE, SDL_SCANCODE_DELETE, 0 )
     t.Check( instr( code->Text( ), "OnOpen" ) = 0, P( sc, "deleting a menu removes its empty handlers" ) )
+    c->OnEditItems = keepPlace
 
     for each dd as DocRef in mw.Docs
         dd->Main.SetSavePoint( )

@@ -203,11 +203,21 @@ declare function PxNot( byref x as PpExprState ) as PpValue
 '' '#if sizeof( integer ) = 8' would have taken the wrong branch of every header on
 '' win32 -- silently, since a wrong branch is not an error. WSTRING and ZSTRING were
 '' simply absent, which is what '#if sizeof( wstring ) = 4' failed on.
-private function BuiltinSizeOf( byval k as TokenKind, byval is64 as boolean ) as int32
+''
+'' WSTRING IS THE TARGET'S wchar: 2 on Windows, 4 everywhere else. Measured 2026-11-20 with
+'' '#if sizeof( wstring ) = 2 / = 4' and #print: fbc-modern says 4 for linux-x86_64,
+'' linux-aarch64 and darwin-aarch64 and 2 for win64; fbc 1.10.1 native on aarch64 Linux says
+'' 4. It was 2 here on every target, so tiko-rt's io/devfileencod.tiko compiled its UTF-16
+'' decoder for Linux and macOS -- 16-bit stores into 4-byte characters, whose upper halves
+'' happened to be zero on x86-64 and were not on linux-arm64, where LINE INPUT of an encoded
+'' file read one garbled line (wstring/lineinput, docs/tiko-linux-arm64 L4).
+private function BuiltinSizeOf( byval k as TokenKind, byval is64 as boolean, _
+                                byval wcharBytes as int32 = 2 ) as int32
     select case k
     case KW_BYTE, KW_UBYTE, KW_BOOLEAN            : return 1
     case KW_ZSTRING                               : return 1
-    case KW_SHORT, KW_USHORT, KW_WSTRING          : return 2
+    case KW_WSTRING                               : return wcharBytes
+    case KW_SHORT, KW_USHORT                      : return 2
     case KW_LONG, KW_ULONG, KW_SINGLE             : return 4
     case KW_INTEGER, KW_UINTEGER                  : return iif( is64, 8, 4 )
     case KW_LONGINT, KW_ULONGINT, KW_DOUBLE       : return 8
@@ -577,6 +587,7 @@ private function PxPrimary( byref x as PpExprState ) as PpValue
             if (c = 66) orelse (c = 98) then radix = 2
             dim as int32 start = 2
             if (c >= 48) andalso (c <= 57) then start = 1
+            dim as boolean wide = false     '' past 64 bits: tiko's int128 in code
             for i as int32 = start to len( digits ) - 1
                 dim as int32 d = -1
                 dim as uint8 ch = digits[i]
@@ -584,8 +595,10 @@ private function PxPrimary( byref x as PpExprState ) as PpValue
                 if (ch >= 65) andalso (ch <= 70) then d = ch - 55
                 if (ch >= 97) andalso (ch <= 102) then d = ch - 87
                 if (d < 0) orelse (d >= radix) then exit for
+                if cast( uint64, v ) > ((&hFFFFFFFFFFFFFFFFull - d) \ radix) then wide = true
                 v = v * radix + d
             next
+            if wide andalso (LitSuffix_( *x.e, t ) = NSUF_NONE) then x.bad = true : return PxNum( 0 )
             '' A 'u' SUFFIX MAKES IT UNSIGNED -- '&hFFFFFFFFFFFFFFFFull > 0' is true to fbc, and
             '' '&h0u > -1' false (warning 35); unsuffixed, '&hFFFFFFFFFFFFFFFF' is -1. PxIntLit_.
             return PxIntLit_( x, v, LitSuffix_( *x.e, t ), false )
@@ -595,6 +608,11 @@ private function PxPrimary( byref x as PpExprState ) as PpValue
             '' fbc. Read as a longint it was -1. It is carried UNSIGNED, so it still
             '' equals a '&hFFFFFFFFFFFFFFFF' beside it, which a double would not.
             dim as uint64 uv = valulng( digits )
+            '' PAST 64 BITS AND UNSUFFIXED it is tiko's int128 in code (lexer/littype.tiko); '#if'
+            '' arithmetic is 64-bit, so it is refused (TKO0308) rather than saturated.
+            dim as string dg = ltrim( digits, "0" )
+            if ((len( dg ) > 20) orelse ((len( dg ) = 20) andalso (dg > "18446744073709551615"))) andalso _
+               (LitSuffix_( *x.e, t ) = NSUF_NONE) then x.bad = true : return PxNum( 0 )
             return PxIntLit_( x, cast( int64, uv ), LitSuffix_( *x.e, t ), true )   '' '5ull > -1' is false
         end if
         return PxNum( v )
@@ -852,7 +870,7 @@ private function PxPrimary( byref x as PpExprState ) as PpValue
         dim as TokenKind inner = PxPeek( x )
         dim as int32 v = -1
         if k = KW_SIZEOF then
-            v = BuiltinSizeOf( inner, PxIs64_( x ) )
+            v = BuiltinSizeOf( inner, PxIs64_( x ), iif( x.e->cfg->targetOs = OS_WINDOWS, 2, 4 ) )
         else
             v = TypeIdentityOf( inner )
         end if

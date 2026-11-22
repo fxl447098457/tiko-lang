@@ -91,10 +91,10 @@ CLANGX=${CLANG:-${TIKO_CLANG:-"C:/Program Files/LLVM/bin/clang.exe"}}
 ARX=${TKORT_AR_MSVC:-"C:/Program Files/LLVM/bin/llvm-ar.exe"}
 
 # ---------------------------------------------------------------- the archive
-LIB="$RT_ROOT/lib/windows-x86_64/libfbmt.a"
-[ -f "$LIB" ] || rt_die "no archive at $LIB -- run build/build.sh $CFG windows-x86_64 first"
+RTLIB="$RT_ROOT/lib/windows-x86_64/libfbmt.a"
+[ -f "$RTLIB" ] || rt_die "no archive at $RTLIB -- run build/build.sh $CFG windows-x86_64 first"
 STAMP="$RT_ROOT/lib/windows-x86_64/.config"
-[ -f "$STAMP" ] || rt_die "no .config beside $LIB -- rebuild with build/build.sh $CFG windows-x86_64"
+[ -f "$STAMP" ] || rt_die "no .config beside $RTLIB -- rebuild with build/build.sh $CFG windows-x86_64"
 HAVE=$(cat "$STAMP")
 [ "$HAVE" = "$CFG" ] || rt_die "the windows-x86_64 archives were built [$HAVE], not [$CFG]"
 
@@ -118,7 +118,7 @@ build_obj( ) {
 }
 
 echo "gatemsvc: fbc  $FBCX"
-echo "gatemsvc: lib  $LIB [$HAVE]"
+echo "gatemsvc: lib  $RTLIB [$HAVE]"
 
 # ---------------------------------------------------------------- fbcunit
 CUOBJS=""
@@ -240,7 +240,7 @@ for o in $TOBJS "$W/t/fbc-tests.o"; do cygpath -m "$o" >> "$W/objs.rsp"; done
 # them through LoadLibrary/GetProcAddress. tiko's own MSVC link line keeps the two
 # only for the seed's older prebuilt libfb.a, which this gate does not link.
 if ! "$CLANGX" --target=x86_64-pc-windows-msvc "@$W/objs.rsp" \
-        "$W/libfbcunit.a" "$LIB" -o "$W/gatemsvc.exe" \
+        "$W/libfbcunit.a" "$RTLIB" -o "$W/gatemsvc.exe" \
         -nostdlib "-L$IMPLIBS" -lucrtbase -lkernel32 \
         -luser32 -ladvapi32 -lwinmm -lmsimg32 -lversion -limm32 -lws2_32 \
         -Xlinker /INCLUDE:tkort_msvc_init_ -Xlinker /STACK:2097152 \

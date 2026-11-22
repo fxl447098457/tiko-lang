@@ -34,6 +34,8 @@ Hexadecimal digits range from `0`-`9`, or `A`-`F`.
 
 Returns a hexadecimal [`WString`](Wstring) representation of `number`, truncated or padded with zeros (`"0"`) to fit the number of digits, if specified.
 
+ **tiko:** `WHex` also takes an [`Int128` or `UInt128`](Category-Fixed-Width-Types#128-bit-integers), at full width: up to 32 digits.
+
 ## Remarks
 
 ### Usage

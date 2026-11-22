@@ -2,7 +2,7 @@
 
 # Vendor Packages
 
-> **In tiko.** A C library the toolchain ships, reached with one `#import` and nothing on the command line: `#import "vendor/sqlite3" link dynamic`. Its header comes across whole and unqualified, its library is linked, and a dynamic library is copied beside the program so the program starts. Measured on windows-x86_64, linux-x86_64 and macos-arm64.
+> **In tiko.** A C library the toolchain ships, reached with one `#import` and nothing on the command line: `#import "vendor/sqlite3" link dynamic`. Its header comes across whole and unqualified, its library is linked, and a dynamic library is copied beside the program so the program starts. Measured on windows-x86_64, linux-x86_64, linux-arm64 and macos-arm64.
 
 ## Syntax
 
@@ -36,25 +36,30 @@ Every routine, type and constant of the library's C header is callable as the li
 | Package | Library | Link modes |
 | --- | --- | --- |
 | `vendor/sqlite3` | SQLite 3.54.0 | `static`, `dynamic` (the default) |
-| `vendor/SDL3` | SDL 3.4.4 (static: 3.4.14) | `static`, `dynamic` (the default) |
-| `vendor/SDL3/image` | SDL3_image 3.4.4 (brings `vendor/SDL3`) | `static`, `dynamic` (the default) |
-| `vendor/SDL3/ttf` | SDL3_ttf 3.2.2 with FreeType 2.14.3 and HarfBuzz 14.3.0 (brings `vendor/SDL3`) | `static`, `dynamic` (the default) |
+| `vendor/SDL3` | SDL 3.4.14 (the binding is 3.4.4's) | `static`, `dynamic` (the default) |
+| `vendor/SDL3/image` | SDL3_image 3.4.x, built from release-3.4.x past 3.4.8 for its ILBM fix (brings `vendor/SDL3`) | `static`, `dynamic` (the default) |
+| `vendor/SDL3/ttf` | SDL3_ttf 3.2.2 with FreeType 2.15.0 and HarfBuzz 14.3.0 (brings `vendor/SDL3`) | `static`, `dynamic` (the default) |
 | `vendor/SDL3/mixer` | SDL3_mixer 3.2.4 (brings `vendor/SDL3`) | `dynamic` (the default) |
 | `vendor/raylib6` | raylib 6.2 | `static`, `dynamic` (the default) |
 | `vendor/raylib6/raymath` | raylib's raymath (brings `vendor/raylib6`) | chosen on `vendor/raylib6` |
 | `vendor/raylib6/rlgl` | raylib's rlgl (brings `vendor/raylib6`) | chosen on `vendor/raylib6` |
-| `vendor/cJSON` | cJSON 1.7.19 | `static`, `dynamic` (the default) |
+| `vendor/cJSON` | cJSON 1.7.19, built from master past it with four upstream security PRs applied | `static`, `dynamic` (the default) |
 | `vendor/cJSON/utils` | cJSON_Utils: JSON Pointer, Patch, Merge Patch (brings `vendor/cJSON`) | chosen on `vendor/cJSON` |
+| `vendor/pcre2` | PCRE2 10.49, the 8-bit library (UTF-8), with Unicode support and the JIT | `static`, `dynamic` (the default) |
 
-**`vendor/PsControls/<control>`** is tiko source, not a C library: owner-drawn Win32 controls, one module each, with no library and so no `link`. See [PsControls](Category-PsControls).
+**`vendor/tkControls/<control>`** is tiko source, not a C library: owner-drawn controls on SDL3 for Windows, Linux and macOS, one module each. On macOS they run with Homebrew's SDL3. It links no library of its own (`vendor/SDL3` does) but has runtime files: its fonts, copied beside every program that imports it, and the scintk library for `tkCodeEdit`. `vendor/tkControls/tkCodeEdit` takes `link static`, which puts scintk inside the program. See [tkControls](Category-tkControls).
 
-**`vendor/tkControls/<control>`** is tiko source as well: owner-drawn controls on SDL3 for Windows, Linux and macOS, one module each. On macOS they run with Homebrew's SDL3. It links no library of its own (`vendor/SDL3` does) but has runtime files: its fonts, copied beside every program that imports it, and the scintk library for `tkCodeEdit`. `vendor/tkControls/tkCodeEdit` takes `link static`, which puts scintk inside the program. See [tkControls](Category-tkControls).
-
-**The SDL packages on linux-x86_64 link the system's libraries.** SDL publishes no Linux binaries, so the toolchain ships none: a program is linked with `-lSDL3` (and `-lSDL3_image`, `-lSDL3_ttf`, `-lSDL3_mixer` for those packages) and loads `libSDL3.so.0` and the others from the system's library folders, like any library the distribution installs. Install the distribution's development packages (`libsdl3-dev`, `libsdl3-image-dev`, `libsdl3-ttf-dev`, `libsdl3-mixer-dev` on Debian and Ubuntu; `SDL3-devel` and the like on Fedora) to build; without one the link fails with `cannot find -lSDL3`. Nothing is copied beside the program.
+**The SDL packages on linux-x86_64 and linux-arm64 link the system's libraries.** SDL publishes no Linux binaries, so the toolchain ships none: a program is linked with `-lSDL3` (and `-lSDL3_image`, `-lSDL3_ttf`, `-lSDL3_mixer` for those packages) and loads `libSDL3.so.0` and the others from the system's library folders, like any library the distribution installs. Install the distribution's development packages (`libsdl3-dev`, `libsdl3-image-dev`, `libsdl3-ttf-dev`, `libsdl3-mixer-dev` on Debian and Ubuntu; `SDL3-devel` and the like on Fedora) to build; without one the link fails with `cannot find -lSDL3`. Nothing is copied beside the program. Ubuntu has `libsdl3-dev` from 24.04; on 22.04, build SDL3 from source.
 
 **On macos-arm64 the SDL packages link Homebrew's** (`brew install sdl3 sdl3_image sdl3_ttf sdl3_mixer`), the same way: `-lSDL3`, found in `/opt/homebrew/lib`, which the link searches after your own paths. Nothing is copied beside the program.
 
 **`vendor/raylib6` is not available on macos-arm64** yet. Importing it there stops with an `#error` that says so.
+
+**The packages' shared libraries on linux-x86_64 need glibc 2.34 or newer**, `vendor/raylib6`'s included: the toolchain builds raylib's from its source rather than shipping raylib's prebuilt one, which needs 2.38. On linux-arm64 the toolchain itself needs glibc 2.35 or newer.
+
+**`vendor/pcre2` is PCRE2's 8-bit library only**, so a pattern and a subject are bytes, or UTF-8 with `PCRE2_UTF`: assign a `ustring` to a `string` to get its UTF-8. Its names are the generic ones PCRE2 documents -- `pcre2_compile`, `pcre2_match`, `pcre2_match_data` -- each a `#define` of the `_8` name the library exports. A pattern or subject is a `PCRE2_SPTR`: `strptr( s )` of a `string` passes as one, a string literal does not. PCRE2 backtracks, so a pattern from outside the program can take exponential time: give `pcre2_match` a match context with `pcre2_set_match_limit` (and `pcre2_set_depth_limit`, `pcre2_set_heap_limit`). `pcre2_dfa_match` is no way out: it does not backtrack, but its time still grows steeply and the match limit does not stop it. See the [PCRE2 tutorial](PCRE2-Tutorial).
+
+**`vendor/SDL3` declares `SDL_main.h`'s routines but not its `main`**: `SDL_EnterAppMainCallbacks`, `SDL_RunApp` and `SDL_SetMainReady` (and on Windows `SDL_RegisterApp` and `SDL_UnregisterApp`), as C has them with `SDL_MAIN_HANDLED`. A program written with SDL's main callbacks calls `SDL_EnterAppMainCallbacks` itself; see the [SDL3 tutorial](SDL3-Tutorial).
 
 `vendor/SDL3/image`, `vendor/SDL3/ttf` and `vendor/SDL3/mixer` -- modules inside `vendor/SDL3`, their libraries in its `lib/` -- each import `vendor/SDL3` publicly: one `#import` brings SDL's own names too, and links SDL3 as well.
 
@@ -87,7 +92,7 @@ The program then needs only what the operating system provides. SDL still loads 
 
 One program links a library one way. Two imports asking for different modes are `TKO0157`, with a note at the other import; an import without `link` goes along with one that has it. A mode the package does not ship is `TKO0156`, and `link` on a package that ships no library -- any source-only package -- is `TKO0155`.
 
-On linux-x86_64 a program that links a shared library from `#foreignlib` gets a run path of `$ORIGIN`, so the copy beside it is the one it finds. `LD_LIBRARY_PATH` still wins, and an `-rpath` the program passes with [`-Wl`](Compiler-Option-Wl) stands. `-norpath` turns it off. On macos-arm64 the same run path is `@loader_path`.
+On linux-x86_64 and linux-arm64 a program that links a shared library from `#foreignlib` gets a run path of `$ORIGIN`, so the copy beside it is the one it finds. `LD_LIBRARY_PATH` still wins, and an `-rpath` the program passes with [`-Wl`](Compiler-Option-Wl) stands. `-norpath` turns it off. On macos-arm64 the same run path is `@loader_path`.
 
 ## Inside a vendor package
 
@@ -124,7 +129,7 @@ runtime = ["fonts/ui.ttf", "fonts/ui-mono.ttf", "lib/editcore"]
 ```
 
 - Each entry is a path relative to the **module's** directory, as `#foreignlib "lib/x"` is. It may climb out of it with `..`; an absolute path is `TKO0144`.
-- An entry whose file name has **no extension** is a shared library, spelled as the target spells one: `lib/editcore` is `lib/editcore.dll` for windows-x86_64, `lib/libeditcore.so` for linux-x86_64 and `lib/libeditcore.dylib` for macos-arm64.
+- An entry whose file name has **no extension** is a shared library, spelled as the target spells one: `lib/editcore` is `lib/editcore.dll` for windows-x86_64, `lib/libeditcore.so` for linux-x86_64 and linux-arm64, and `lib/libeditcore.dylib` for macos-arm64.
 - After a link that succeeds, each listed file of **each module the program imports** is copied into the output's directory, flat, under its own file name. A copy already there with the same size and no older is left alone. A module of the package that the program does not import brings nothing.
 - A listed file that is not there is `TKO0176`, before anything is compiled: `module 'vendor.ui' needs 'lib/editcore' at run time, and there is no '.../pkg/vendor/ui/lib/libeditcore.so'`.
 - A module the module cache supplies brings its files too: they are read from the manifest, not from the compile.
@@ -144,7 +149,7 @@ A public header is read twice: once in the module, and again in every program th
 | Option | Effect |
 | --- | --- |
 | `-nocopylibs` | do not copy a vendor package's dynamic library, or a module's runtime files, beside the output |
-| `-norpath` | no `$ORIGIN` run path on a linux-x86_64 link, and no `@loader_path` one on a macos-arm64 link, that takes a shared library |
+| `-norpath` | no `$ORIGIN` run path on a linux-x86_64 or linux-arm64 link, and no `@loader_path` one on a macos-arm64 link, that takes a shared library |
 
 ## Diagnostics
 
@@ -165,5 +170,5 @@ A public header is read twice: once in the module, and again in every program th
 - [C Header Import](Category-C-Header-Import)
 - [Foreign Library Linking](Category-Foreign-Library-Linking)
 - [SQLite Tutorial](SQLite-Tutorial)
-- [PsControls](Category-PsControls)
+- [PCRE2 Tutorial](PCRE2-Tutorial)
 - [tkControls](Category-tkControls)

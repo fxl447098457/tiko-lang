@@ -80,7 +80,13 @@ RT_TARGETS="win64 linux-x86_64 win32"
 # macos-arm64 (docs/tiko-macos RFC-0001) is build-only for the same reason as ARM64 above:
 # fbc has no aarch64, so there is nothing to gate it against. Its oracle is tiko's own
 # linux-x86_64 output, compared by lib/rt/build/darwinlane.sh on the Mac.
-RT_BUILD_ONLY_TARGETS="windows-x86_64 macos-arm64 win64ucrt"
+RT_BUILD_ONLY_TARGETS="windows-x86_64 macos-arm64 linux-arm64 win64ucrt"
+#
+# linux-arm64 (docs/tiko-linux-arm64 L2) is build-only too: fbc-modern refuses aarch64, so the
+# gate has nothing to merge with. Its oracle is tiko's linux-x86_64 output as well, compared by
+# lib/rt/build/armlane.sh in the Lima VM, with native fbc 1.10.1 there to settle a difference.
+# win64ucrt is the fork's own: the same tiko target as win64 -- same triple, same ABI, a
+# different CRT -- built against the ucrt-flavor MinGW (TKORT_UCRT).
 
 # Include path: tiko-rt's own src/, then tiko-lang's inc/ (phase H, 2026-10-10), which
 # supplies crt/long.bi -- the only header lint lets through. It was fbc-modern's src/inc
@@ -125,6 +131,7 @@ rt_is_buildable( ) {
 rt_target_triple( ) {
     case "$1" in
         linux-x86_64)          echo "x86_64-pc-linux-gnu" ;;
+        linux-arm64)           echo "aarch64-unknown-linux-gnu" ;;
         macos-arm64)           echo "arm64-apple-macosx13.0" ;;
         win64|windows-x86_64)  echo "x86_64-w64-windows-gnu" ;;
         win64ucrt)             echo "x86_64-w64-windows-gnu" ;;

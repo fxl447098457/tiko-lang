@@ -29,6 +29,7 @@ Grouped by task. [Collections](Functions-Collections) lists them beside the rest
 - [$Dynamic](Dynamic)
 - [$Static](Static)
 - [Array Functions](Array-Functions)
+- [Array Slices](Category-Array-Slices)
 - [Option Dynamic](Option-Dynamic)
 - [Option Static](Option-Static)
 

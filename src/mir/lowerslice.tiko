@@ -61,6 +61,9 @@ private function Local_( byval slot as int32 ) as MirValue
     return a
 end function
 
+declare function LowerSpanLen_ _
+    ( byref c as Ctx, byval a as Tko.NodeId, byref outv as MirValue ) as boolean
+
 '' THE BYTES OF ONE CODE UNIT of a slice type, or 0 when t is not a slice.
 function SliceUnitBytes( byref c as Ctx, byval t as Tko.TypeId ) as int32
     select case Slices.SliceUnitOfType( *c.types, *c.names, t )
@@ -92,6 +95,7 @@ end function
 '' 'len( v )' over a slice: its second word. False for anything else.
 function LowerSliceLen _
     ( byref c as Ctx, byval a as Tko.NodeId, byref outv as MirValue ) as boolean
+    if Slices.IsSpanType( *c.types, c.info->TypeOf_( a ) ) then return LowerSpanLen_( c, a, outv )   '' an array slice
     if SliceUnitBytes( c, c.info->TypeOf_( a ) ) = 0 then return false
     dim as MirValue sa = SliceStorage( c, a )
     if sa.kind = cast( uint8, MV_NONE ) then return false
@@ -592,6 +596,325 @@ function LowerSliceCall _
     Store_( c, Fld_( c, sa, 8 ), n )
     Store_( c, Fld_( c, sa, 16 ), anchorV )
     outv = LowerExprLoad( c, sa, MT_AGG, SizeOfType( c, rt ) )
+    return (outv.kind <> cast( uint8, MV_NONE ))
+end function
+
+'' ======================================================================================
+'' ARRAY SLICES -- span( of T ), 'a(lo to hi)' (docs/tiko-slices RFC-0003). Here beside the
+'' string slices because a span is the same three words and shares their helpers.
+'' ======================================================================================
+
+'' One pointer word: the field stride of a slice or span, and of a descriptor.
+private function Pb_( byref c as Ctx ) as int32
+    return c.types->target.pointerBits \ 8
+end function
+
+private function WordTy_( byref c as Ctx ) as MirType
+    if c.types->target.pointerBits = 32 then return MT_I32
+    return MT_I64
+end function
+
+'' A pointer-width word widened to i64.
+private function Word64_( byref c as Ctx, byref v as MirValue ) as MirValue
+    if WordTy_( c ) = MT_I64 then return v
+    return CoerceTy( c, v, MT_I64, c.types->Builtin( Tko.TY_LONG ) )
+end function
+
+'' THE BYTES OF ONE ELEMENT of a span type, or 0 when t is not a span.
+function SpanElemBytes( byref c as Ctx, byval t as Tko.TypeId ) as int32
+    dim as Tko.TypeId et = Slices.SpanElemType( *c.types, t )
+    if et = Tko.TYPE_NONE then return 0
+    return SizeOfType( c, et )
+end function
+
+'' 'len( v )' over a span: its second word.
+private function LowerSpanLen_ _
+    ( byref c as Ctx, byval a as Tko.NodeId, byref outv as MirValue ) as boolean
+    if Slices.IsSpanType( *c.types, c.info->TypeOf_( a ) ) = false then return false
+    dim as MirValue sa = SliceStorage( c, a )
+    if sa.kind = cast( uint8, MV_NONE ) then return false
+    outv = Word64_( c, LowerExprLoad( c, Fld_( c, sa, Pb_( c ) ), WordTy_( c ) ) )
+    return (outv.kind <> cast( uint8, MV_NONE ))
+end function
+
+sub EmitSpanChecks _
+    ( byref c as Ctx, byval at as Tko.NodeId, byref sa as MirValue, _
+      byval esz as int32, byval idx as MirValue ptr = nullptr )
+
+    if (c.errFlags and 8) = 0 then return                      '' -earray, in -exx
+    if sa.kind = cast( uint8, MV_NONE ) then return
+    if at = Tko.NODE_NONE then at = cast( Tko.NodeId, c.stmt.curStmtNode )
+    dim as int32 pb = Pb_( c )
+    dim as MirValue p = LowerExprLoad( c, Fld_( c, sa, 0 ), MT_PTR )
+    dim as MirValue n = Word64_( c, LowerExprLoad( c, Fld_( c, sa, pb ), WordTy_( c ) ) )
+    dim as MirValue anc = LowerExprLoad( c, Fld_( c, sa, 2 * pb ), MT_PTR )
+    dim as MirValue ub = ConstInt( c, esz, MT_I64 )
+
+    '' THE INDEX FIRST: 0 <= i < len is one unsigned compare.
+    if idx <> nullptr then
+        dim as int32 badI = NewBlock( c, "spanbadidx" )
+        dim as int32 okI = NewBlock( c, "spanokidx" )
+        Terminate( c, MTERM_CONDBR, okI, badI, Op2_( c, M_ICMP_ULT, MT_I8, *idx, n ) )
+        c.curBlock = badI
+        ThrowSix_( c, at )
+        c.curBlock = okI
+    end if
+
+    '' THE ANCHOR, an FBARRAY descriptor: the view must lie inside the array's current block,
+    '' PTR .. PTR + SIZE -- a REDIM moved or shrank it, an ERASE freed it (RFC-0003 §7).
+    dim as MirValue z = ConstInt( c, 0, MT_PTR )
+    dim as int32 chkB = NewBlock( c, "spananchor" )
+    dim as int32 badB = NewBlock( c, "spananchorbad" )
+    dim as int32 okB = NewBlock( c, "spananchorok" )
+    Terminate( c, MTERM_CONDBR, okB, chkB, Op2_( c, M_ICMP_EQ, MT_I8, anc, z ) )
+    c.curBlock = chkB
+    dim as MirValue d = LowerExprLoad( c, Fld_( c, anc, pb ), MT_PTR )
+    dim as MirValue sz = Word64_( c, LowerExprLoad( c, Fld_( c, anc, 2 * pb ), WordTy_( c ) ) )
+    dim as MirValue dEnd = Op2_( c, M_PTR_ADD, MT_PTR, d, sz )
+    dim as MirValue pEnd = Op2_( c, M_PTR_ADD, MT_PTR, p, Op2_( c, M_MUL, MT_I64, n, ub ) )
+    dim as MirValue lowOk = Op2_( c, M_ICMP_ULE, MT_I8, d, p )
+    dim as MirValue highOk = Op2_( c, M_ICMP_ULE, MT_I8, pEnd, dEnd )
+    '' AN EMPTY VIEW is inside anything, freed or not.
+    dim as MirValue empty_ = Op2_( c, M_ICMP_EQ, MT_I8, n, ConstInt( c, 0, MT_I64 ) )
+    Terminate( c, MTERM_CONDBR, okB, badB, Op2_( c, M_OR, MT_I8, empty_, Op2_( c, M_AND, MT_I8, lowOk, highOk ) ) )
+    c.curBlock = badB
+    ThrowSix_( c, at )
+    c.curBlock = okB
+end sub
+
+'' 'lbound( v )' / 'ubound( v )' over a span: 0 and len - 1 for dimension 1. Dimension 0 is
+'' 1 and 1, any other 0 and -1 -- fbc 1.20 on a one-dimensional array, probed.
+function LowerSpanBound _
+    ( byref c as Ctx, byval a0 as Tko.NodeId, byval cp as Tko.ListPayload ptr, _
+      byval isU as boolean, byref outv as MirValue ) as boolean
+
+    if Slices.IsSpanType( *c.types, c.info->TypeOf_( a0 ) ) = false then return false
+    dim as MirValue lenV
+    if LowerSpanLen_( c, a0, lenV ) = false then return false
+    dim as MirValue one = ConstInt( c, 1, MT_I64 )
+    dim as MirValue zero = ConstInt( c, 0, MT_I64 )
+    dim as MirValue r1 = zero
+    if isU then r1 = Op2_( c, M_SUB, MT_I64, lenV, one )
+    if cp->count < 2 then outv = r1 : return true
+    dim as Tko.NodeId dn = cast( Tko.NodeId, c.ast->ChildSlot( cp->first + 1 ) )
+    dim as MirValue dimV = LowerExpr( c, dn )
+    if dimV.kind = cast( uint8, MV_NONE ) then return false
+    dimV = CoerceTy( c, dimV, MT_I64, c.info->TypeOf_( dn ) )
+    '' Three answers through one temporary: dim 1 -> r1, dim 0 -> 1, any other -> 0 / -1.
+    dim as int32 slot = NewTempLocal( c, MT_I64, 8 )
+    if slot < 0 then return false
+    dim as MirValue tv = Local_( slot )
+    Store_( c, tv, ConstInt( c, iif( isU, -1, 0 ), MT_I64 ) )
+    dim as int32 is1 = NewBlock( c, "spanbnd1" )
+    dim as int32 not1 = NewBlock( c, "spanbndn1" )
+    dim as int32 is0 = NewBlock( c, "spanbnd0" )
+    dim as int32 done = NewBlock( c, "spanbnd" )
+    Terminate( c, MTERM_CONDBR, is1, not1, Op2_( c, M_ICMP_EQ, MT_I8, dimV, one ) )
+    c.curBlock = is1
+    Store_( c, tv, r1 )
+    Terminate( c, MTERM_BR, done, -1, NoVal( ) )
+    c.curBlock = not1
+    Terminate( c, MTERM_CONDBR, is0, done, Op2_( c, M_ICMP_EQ, MT_I8, dimV, zero ) )
+    c.curBlock = is0
+    Store_( c, tv, one )
+    Terminate( c, MTERM_BR, done, -1, NoVal( ) )
+    c.curBlock = done
+    outv = LowerExprLoad( c, tv, MT_I64 )
+    return (outv.kind <> cast( uint8, MV_NONE ))
+end function
+
+'' THE SPAN SOURCE'S (data, lbound, ubound, anchor) -- data is the address of the element at
+'' lbound. False when the source has no lowering here.
+private function SpanSourceParts_ _
+    ( byref c as Ctx, byval id as Tko.NodeId, byval src as Tko.NodeId, _
+      byref dataV as MirValue, byref lbV as MirValue, byref ubV as MirValue, _
+      byref anchorV as MirValue ) as boolean
+
+    anchorV = ConstInt( c, 0, MT_PTR )
+    dim as Tko.TypeId st = c.info->TypeOf_( src )
+    dim as Tko.NodeId u = Unparen_( c, src )
+    dim as int32 pb = Pb_( c )
+    if Slices.IsSpanType( *c.types, st ) then
+        dim as MirValue sa = SliceStorage( c, u )
+        if sa.kind = cast( uint8, MV_NONE ) then return false
+        EmitSpanChecks( c, src, sa, SpanElemBytes( c, st ) )
+        dataV = LowerExprLoad( c, Fld_( c, sa, 0 ), MT_PTR )
+        dim as MirValue n = Word64_( c, LowerExprLoad( c, Fld_( c, sa, pb ), WordTy_( c ) ) )
+        anchorV = LowerExprLoad( c, Fld_( c, sa, 2 * pb ), MT_PTR )
+        lbV = ConstInt( c, 0, MT_I64 )
+        ubV = Op2_( c, M_SUB, MT_I64, n, ConstInt( c, 1, MT_I64 ) )
+        return dataV.kind <> cast( uint8, MV_NONE )
+    end if
+    dim as Tko.TypeId at = Slices.BareType( *c.types, st )
+    if (at = Tko.TYPE_NONE) orelse (c.types->Kind( at ) <> Tko.TK_ARRAY) then return false
+    dim as MirValue base_ = LowerAddr( c, u )
+    if base_.kind = cast( uint8, MV_NONE ) then return false
+    if c.types->IsDynArray( at ) = false then
+        '' A FIXED ARRAY: its own address and constant bounds; nothing to anchor.
+        dim as int32 first = c.types->types[cast( int32, at )].first
+        if c.types->types[cast( int32, at )].count < 2 then return false
+        dataV = base_
+        lbV = ConstInt( c, c.types->boundPool[first], MT_I64 )
+        ubV = ConstInt( c, c.types->boundPool[first + 1], MT_I64 )
+        return true
+    end if
+    '' A DYNAMIC ARRAY OR AN 'a()' PARAMETER: base_ is its descriptor. A rank the source does
+    '' not state is checked here: more than one dimension is error 6.
+    if c.types->DynRank( at ) = 0 then
+        dim as MirValue dims = Word64_( c, LowerExprLoad( c, Fld_( c, base_, 4 * pb ), WordTy_( c ) ) )
+        dim as int32 badD = NewBlock( c, "spanbaddims" )
+        dim as int32 okD = NewBlock( c, "spanokdims" )
+        Terminate( c, MTERM_CONDBR, okD, badD, Op2_( c, M_ICMP_ULE, MT_I8, dims, ConstInt( c, 1, MT_I64 ) ) )
+        c.curBlock = badD
+        ThrowSix_( c, id )
+        c.curBlock = okD
+    end if
+    dataV = LowerExprLoad( c, Fld_( c, base_, pb ), MT_PTR )
+    '' THE ANCHOR IS THE DESCRIPTOR -- unless it is a FIXED-LENGTH one (FLAGS &h20): a fixed array
+    '' or a span handed to an 'x()' parameter, synthesised on the caller's stack, which a span
+    '' returned to that caller would outlive.
+    scope
+        dim as int32 aslot = NewTempLocal( c, MT_PTR, pb )
+        if aslot < 0 then return false
+        dim as MirValue av = Local_( aslot )
+        Store_( c, av, base_ )
+        dim as MirValue fl = Word64_( c, LowerExprLoad( c, Fld_( c, base_, 5 * pb ), WordTy_( c ) ) )
+        dim as MirValue fixedLen = Op2_( c, M_AND, MT_I64, fl, ConstInt( c, &h20, MT_I64 ) )
+        dim as int32 fixB = NewBlock( c, "spanfixeddesc" )
+        dim as int32 dynB = NewBlock( c, "spandyndesc" )
+        Terminate( c, MTERM_CONDBR, dynB, fixB, Op2_( c, M_ICMP_EQ, MT_I8, fixedLen, ConstInt( c, 0, MT_I64 ) ) )
+        c.curBlock = fixB
+        Store_( c, av, ConstInt( c, 0, MT_PTR ) )
+        Terminate( c, MTERM_BR, dynB, -1, NoVal( ) )
+        c.curBlock = dynB
+        anchorV = LowerExprLoad( c, av, MT_PTR )
+    end scope
+    dim as containers.Array( of uint32 ) la
+    la.Push( cast( uint32, base_.kind ) ) : la.Push( cast( uint32, base_.id ) )
+    dim as MirValue d1 = ConstInt( c, 1, WordTy_( c ) )
+    la.Push( cast( uint32, d1.kind ) ) : la.Push( cast( uint32, d1.id ) )
+    lbV = EmitRtl( c, RTL_ARRAY_LBOUND, la )
+    ubV = EmitRtl( c, RTL_ARRAY_UBOUND, la )
+    if (lbV.kind = cast( uint8, MV_NONE )) orelse (ubV.kind = cast( uint8, MV_NONE )) then return false
+    lbV = Word64_( c, lbV )
+    ubV = Word64_( c, ubV )
+    return dataV.kind <> cast( uint8, MV_NONE )
+end function
+
+'' '__tko_aslice( src, lo, hi )' -- the span VALUE. lo and hi are the source's own indices
+'' (a span's are 0-based); valid iff lbound <= lo <= hi + 1 <= ubound + 1, checked in every
+'' build, a failure error 6 in those indices (RFC-0003 §4).
+function LowerSpanCall _
+    ( byref c as Ctx, byval id as Tko.NodeId, byref outv as MirValue ) as boolean
+
+    if Slices.IsSpanCall( *c.ast, *c.names, id ) = false then return false
+    dim as Tko.TypeId rt = c.info->TypeOf_( id )
+    dim as int32 esz = SpanElemBytes( c, rt )
+    if esz <= 0 then return false
+    dim as Tko.ListPayload ptr cp = c.ast->ListOf( id )
+    dim as Tko.NodeId src = c.ast->ChildAt( cp->first, 0 )
+    dim as Tko.NodeId loN = c.ast->ChildAt( cp->first, 1 )
+    dim as Tko.NodeId hiN = c.ast->ChildAt( cp->first, 2 )
+
+    dim as MirValue dataV, lbV, ubV, anchorV
+    if SpanSourceParts_( c, id, src, dataV, lbV, ubV, anchorV ) = false then return false
+
+    dim as MirValue lo = LowerExpr( c, loN )
+    dim as MirValue hi = LowerExpr( c, hiN )
+    if (lo.kind = cast( uint8, MV_NONE )) orelse (hi.kind = cast( uint8, MV_NONE )) then return false
+    lo = CoerceTy( c, lo, MT_I64, c.info->TypeOf_( loN ) )
+    hi = CoerceTy( c, hi, MT_I64, c.info->TypeOf_( hiN ) )
+    dim as MirValue one = ConstInt( c, 1, MT_I64 )
+    dim as MirValue hi1 = Op2_( c, M_ADD, MT_I64, hi, one )
+    dim as MirValue ub1 = Op2_( c, M_ADD, MT_I64, ubV, one )
+
+    '' RELATIVE TO lbound, two unsigned compares as for a string: hi + 1 - lb <=u ub + 1 - lb
+    '' (the element count) and lo - lb <=u hi + 1 - lb.
+    dim as MirValue rHi1 = Op2_( c, M_SUB, MT_I64, hi1, lbV )
+    dim as MirValue rCnt = Op2_( c, M_SUB, MT_I64, ub1, lbV )
+    dim as MirValue rLo = Op2_( c, M_SUB, MT_I64, lo, lbV )
+    dim as MirValue okHi = Op2_( c, M_ICMP_ULE, MT_I8, rHi1, rCnt )
+    dim as MirValue okLo = Op2_( c, M_ICMP_ULE, MT_I8, rLo, rHi1 )
+    dim as MirValue ok = Op2_( c, M_AND, MT_I8, okHi, okLo )
+
+    '' ALL FOUR BLOCKS FIRST, then filled in that order -- see EmitErrorJump_.
+    dim as int32 failB = NewBlock( c, "spanbad" )
+    dim as int32 failHiB = NewBlock( c, "spanbadhi" )
+    dim as int32 failLoB = NewBlock( c, "spanbadlo" )
+    dim as int32 contB = NewBlock( c, "spanok" )
+    Terminate( c, MTERM_CONDBR, contB, failB, ok )
+    c.curBlock = failB
+    Terminate( c, MTERM_CONDBR, failLoB, failHiB, okHi )
+    c.curBlock = failHiB
+    RangeFail_( c, id, src, hi, Op2_( c, M_SUB, MT_I64, lbV, one ), ubV )
+    c.curBlock = failLoB
+    RangeFail_( c, id, src, lo, lbV, hi1 )
+    c.curBlock = contB
+
+    dim as MirValue off = rLo
+    if esz <> 1 then off = Op2_( c, M_MUL, MT_I64, rLo, ConstInt( c, esz, MT_I64 ) )
+    dim as MirValue p = Op2_( c, M_PTR_ADD, MT_PTR, dataV, off )
+    dim as MirValue n = Op2_( c, M_SUB, MT_I64, hi1, lo )
+    if WordTy_( c ) <> MT_I64 then n = CoerceTy( c, n, WordTy_( c ), c.types->Builtin( Tko.TY_LONGINT ) )
+
+    dim as int32 pb = Pb_( c )
+    dim as int32 slot = NewTempLocal( c, MT_AGG, SizeOfType( c, rt ) )
+    if slot < 0 then return false
+    dim as MirValue sa = Local_( slot )
+    Store_( c, Fld_( c, sa, 0 ), p )
+    Store_( c, Fld_( c, sa, pb ), n )
+    Store_( c, Fld_( c, sa, 2 * pb ), anchorV )
+    outv = LowerExprLoad( c, sa, MT_AGG, SizeOfType( c, rt ) )
+    return (outv.kind <> cast( uint8, MV_NONE ))
+end function
+
+'' 'v(i)' over a span: the ADDRESS of element i -- data + i * sizeof( T ). Checked under
+'' -earray only (RFC-0003 §4), as an array subscript is.
+function LowerSpanIndex( byref c as Ctx, byval id as Tko.NodeId ) as MirValue
+    dim as MirValue none_
+    dim as Tko.ListPayload ptr cp = c.ast->ListOf( id )
+    if cp->count <> 1 then return none_
+    dim as Tko.NodeId tgt = cp->target
+    dim as Tko.NodeId ixN = cast( Tko.NodeId, c.ast->ChildSlot( cp->first ) )
+    dim as int32 esz = SpanElemBytes( c, c.info->TypeOf_( tgt ) )
+    if esz <= 0 then return none_
+    dim as MirValue sa = SliceStorage( c, tgt )
+    if sa.kind = cast( uint8, MV_NONE ) then return none_
+    dim as MirValue iv = LowerExpr( c, ixN )
+    if iv.kind = cast( uint8, MV_NONE ) then return none_
+    iv = CoerceTy( c, iv, MT_I64, c.info->TypeOf_( ixN ) )
+    EmitSpanChecks( c, id, sa, esz, @iv )
+    dim as MirValue base_ = LowerExprLoad( c, Fld_( c, sa, 0 ), MT_PTR )
+    dim as MirValue off = iv
+    if esz <> 1 then off = Op2_( c, M_MUL, MT_I64, iv, ConstInt( c, esz, MT_I64 ) )
+    return Op2_( c, M_PTR_ADD, MT_PTR, base_, off )
+end function
+
+function LowerSpanCtor _
+    ( byref c as Ctx, byval id as Tko.NodeId, byref outv as MirValue ) as boolean
+
+    if c.ast->Kind( id ) <> Tko.N_CALL then return false
+    dim as Tko.ListPayload ptr cp = c.ast->ListOf( id )
+    dim as Tko.NodeId tgt = cp->target
+    if (tgt = Tko.NODE_NONE) orelse (c.ast->Kind( tgt ) <> Tko.N_IDENT) then return false
+    if c.info->RefOf( tgt ) <> Tko.SYMBOL_NONE then return false
+    dim as Tko.TypeId t = c.info->TypeOf_( tgt )
+    if Slices.IsSpanType( *c.types, t ) = false then return false
+    if cp->count <> 2 then return false
+    dim as Tko.NodeId pe = c.ast->ChildAt( cp->first, 0 )
+    dim as Tko.NodeId ne = c.ast->ChildAt( cp->first, 1 )
+    dim as MirValue p = LowerExpr( c, pe )
+    dim as MirValue n = LowerExpr( c, ne )
+    if (p.kind = cast( uint8, MV_NONE )) orelse (n.kind = cast( uint8, MV_NONE )) then return false
+    n = CoerceTy( c, n, WordTy_( c ), c.info->TypeOf_( ne ) )
+    dim as int32 pb = Pb_( c )
+    dim as int32 slot = NewTempLocal( c, MT_AGG, SizeOfType( c, t ) )
+    if slot < 0 then return false
+    dim as MirValue sa = Local_( slot )
+    Store_( c, Fld_( c, sa, 0 ), p )
+    Store_( c, Fld_( c, sa, pb ), n )
+    Store_( c, Fld_( c, sa, 2 * pb ), ConstInt( c, 0, MT_PTR ) )
+    outv = LowerExprLoad( c, sa, MT_AGG, SizeOfType( c, t ) )
     return (outv.kind <> cast( uint8, MV_NONE ))
 end function
 

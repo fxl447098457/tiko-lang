@@ -195,9 +195,9 @@ Details, and what is checked only under `-exx`: [String Slice Lifetime](String-S
 ## Known Limits
 
 - **A slice of a `zstring ptr` or `wstring ptr` is as valid as the pointer.** The storage rules still apply, but nothing checks that the memory is alive.
-- **There are no slices of arrays or of other types.** Slices are for strings.
+- **An array is sliced with `( )`, not `[ ]`**: `a( lo to hi )` makes a `span( of T )`. See [Array Slices](Category-Array-Slices).
 
-See also: [String Slice Lifetime](String-Slice-Lifetime), [UString](Category-UString), [String Library](Category-String-Library), [For Each](Category-For-Each).
+See also: [String Slice Lifetime](String-Slice-Lifetime), [Array Slices](Category-Array-Slices), [UString](Category-UString), [String Library](Category-String-Library), [For Each](Category-For-Each).
 
 ---
 

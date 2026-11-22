@@ -4,6 +4,8 @@
 
 Returns a secure random 64-bit value from the operating system.
 
+If the operating system's random source fails it writes one line to stderr and aborts the program, rather than return a value an attacker could predict. A program that can recover from that calls `CryptoBytes`, which returns `false` instead.
+
 ## Syntax
 
 ```freebasic

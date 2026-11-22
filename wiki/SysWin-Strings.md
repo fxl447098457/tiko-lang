@@ -114,10 +114,6 @@ function Ucode( byref ansiStr as const string, byval nCodePage as long = 0 ) as 
 Reads a byte string in a code page and returns it as Unicode. `chr( &hE9 )` is `é` in the ANSI
 code page of a Western machine; `Ucode( chr( &h82 ), 437 )` is `é` too, read as code page 437.
 
-The result has one character per input byte. That is exact for the single-byte code pages; with
-a double-byte code page such as 932 (Japanese), where two bytes make one character, the text is
-followed by spaces: four Shift-JIS bytes for two characters give two characters and two spaces.
-
 | Parameter | Meaning |
 | --- | --- |
 | `ansiStr` | The bytes. |
@@ -142,10 +138,6 @@ function Acode( byval pwszStr as wstring ptr, byval nCodePage as long = 0 ) as s
 Converts Unicode text to bytes in a code page. Characters the code page has no byte for are
 replaced by its default character, normally `?`. `Acode( "café" )` gives four bytes, the last
 `&hE9`, on a Western machine.
-
-The output buffer holds one byte per character. That is enough for the single-byte code pages and
-for UTF-8, which is sized separately; with a double-byte code page such as 932 a character that
-needs two bytes does not fit and the result is `""`.
 
 | Parameter | Meaning |
 | --- | --- |

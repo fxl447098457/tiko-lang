@@ -1,0 +1,1126 @@
+'' match.tiko -- 'match', desugared in the token buffer (docs/tiko-comparison RFC-0001-match).
+''
+''     match l                                    dim as ustring s = match code
+''         case Red : Stop( )                         200, 201   => "OK"
+''         case Amber if late : Hurry( )               400 to 499 => "Client error"
+''         case else : Go( )                           else       => "Other"
+''     end match                                  end match
+''
+'' 'match' IS CONTEXTUAL, as 'defer', 'spawn' and 'test' are: an identifier recognised by spelling.
+'' It is the keyword only where a subject follows it to the end of the line, the next line is an
+'' arm ('case ...' for the statement, '... => ...' for the value), and an 'end match' closes it --
+'' the closer is looked for with 'select' nesting counted, so a paren-less call 'match 10' inside a
+'' SELECT arm (fbc accepts it, measured) keeps its meaning. 'match = 3', 'match( 21 )', 'sub match'
+'' and 'end match' as END with an exit code stay what they are.
+''
+'' REWRITTEN BEFORE THE PARSER READS IT, the way parser/propblock.tiko rewrites a property block,
+'' so Collect, Resolve, Check and lowering see only what they already handle:
+''
+''   STATEMENT      scope
+''                      var __tko_mN = <subject>               '' a COPY: a byref cannot bind an rvalue
+''                      if <test1> then : <bindings> : <body> : elseif <test2> then ... : end if
+''                  end scope
+''                  With a guard anywhere, every arm is its own IF behind a done flag instead, so a
+''                  failed guard falls through to the next arm.
+''
+''   EXPRESSION     var __tko_mN = <subject> :                 '' HOISTED, before the statement
+''                  ... iif( <test1>, ( <v1> ), iif( ..., ( <vn> ) ) ) ...
+''                  Bindings are substituted into the guard and the value. The last arm is not
+''                  tested: the exhaustiveness check stands for it.
+''
+'' A test reaches into the copy through member paths: '._1' for a tuple element, '.__tko_pos<k>' for
+'' a UDT's k-th field (Check's member lookup answers it -- symbols/tuplenames.tiko). Types are not
+'' known here, so what needs them -- exhaustiveness, reachability, a pattern that does not fit its
+'' subject -- is left as a record on the arena (AstArena.matchRecs), keyed by the subject
+'' variable's name, for symbols/semmatch.tiko.
+
+#import "std/containers"
+#include once "parser/parser.ti"
+#include once "support/text.ti"
+
+namespace Tko.Parse
+
+enum MatchPatKind_
+    MPK_WILD = 0        '' 'any'; a top-level 'else'
+    MPK_BIND            '' a bare name inside a tuple or UDT pattern
+    MPK_VALUE           '' any expression: subject = it
+    MPK_RANGE           '' a to b
+    MPK_ISOP            '' is <relop> v
+    MPK_TUPLE           '' ( p, ... )
+    MPK_UDT             '' Name( p, ... )
+    MPK_TYPE            '' x as Class / any as Class
+    MPK_STARTS          '' starts "lit" [rest]
+end enum
+
+type MatchPat_
+    as int32 kind
+    as int32 s, e               '' VALUE, RANGE low, ISOP value, UDT name, TYPE class, STARTS literal
+    as int32 s2, e2             '' RANGE high
+    as int32 kid0, nkid         '' TUPLE / UDT children, in MatchCtx_.kids
+    as int32 relop              '' ISOP's operator token kind
+    as Tko.InternId bind        '' BIND, TYPE, STARTS: the name bound, or 0
+    as Tko.SourceLoc loc
+end type
+
+type MatchArm_
+    as int32 alt0, nalt         '' the top-level alternatives, in MatchCtx_.alts
+    as int32 g0, g1             '' the guard's tokens; g0 < 0 when there is none
+    as int32 b0, b1             '' the body (statement) or the value (expression)
+    as boolean isElse
+    as Tko.SourceLoc loc
+end type
+
+type MatchBind_
+    as Tko.InternId nm
+    as boolean byref_           '' an alias into the copy, or a value of its own
+    as int32 t0, t1             '' the expression, in MatchCtx_.btoks
+end type
+
+type MatchCtx_
+    as containers.Array( of MatchPat_ ) pats
+    as containers.Array( of int32 ) kids
+    as containers.Array( of int32 ) alts
+    as containers.Array( of MatchArm_ ) arms
+    as Tko.TokenVec btoks
+    as boolean bad
+    as Tko.InternId nmMatch
+    as Tko.InternId nmStarts
+    as Tko.InternId subj
+    as Tko.SourceLoc at
+end type
+
+'' ------------------------------------------------------------------------- tokens
+
+private function K_( byref p as ParserState, byval i as int32 ) as Tko.TokenKind
+    if HasTok( p, i ) = false then return Tko.TK_EOF
+    return cast( Tko.TokenKind, p.toks->At( i ).kind )
+end function
+
+'' A TK_IDENT's 'ident' is already the folded spelling (lexer/token.ti), so this is one compare --
+'' it runs on every identifier of every statement.
+private function IsId_( byref p as ParserState, byval i as int32, byval nm as Tko.InternId ) as boolean
+    if K_( p, i ) <> Tko.TK_IDENT then return false
+    return p.toks->At( i ).ident = nm
+end function
+
+'' A NAME: an identifier, or a word fbc does not reserve -- 'Point', 'Color', 'Window' and 'Name'
+'' are intrinsics a program may use for its own type (KWCLASS_INTRINSIC).
+private function NameTok_( byref p as ParserState, byval i as int32 ) as boolean
+    dim as Tko.TokenKind k = K_( p, i )
+    if k = Tko.TK_IDENT then return true
+    if Tko.IsKeywordKind( k ) = false then return false
+    return Tko.KeywordClassOf( k ) = Tko.KWCLASS_INTRINSIC
+end function
+
+'' A name token's folded spelling.
+private function NameText_( byref p as ParserState, byval i as int32 ) as string
+    dim as Tko.TokenKind k = K_( p, i )
+    if k = Tko.TK_IDENT then return p.names->Spelling( p.names->Fold( p.toks->At( i ).ident ) )
+    return Tko.Text.LowerAscii( Tko.TokenKindText( k ) )
+end function
+
+private function Loc_( byref p as ParserState, byval i as int32 ) as Tko.SourceLoc
+    if HasTok( p, i ) = false then return Tko.LOC_NONE
+    return p.toks->At( i ).loc
+end function
+
+private function Opens_( byval k as Tko.TokenKind ) as boolean
+    return (k = Tko.TK_LPAREN) orelse (k = Tko.TK_LBRACKET) orelse (k = Tko.TK_LBRACE)
+end function
+
+private function Closes_( byval k as Tko.TokenKind ) as boolean
+    return (k = Tko.TK_RPAREN) orelse (k = Tko.TK_RBRACKET) orelse (k = Tko.TK_RBRACE)
+end function
+
+private function AtStmtStart_( byref p as ParserState, byval i as int32 ) as boolean
+    if i <= 0 then return true
+    return K_( p, i - 1 ) = Tko.TK_EOL          '' a newline, or a ':' separator (TF_COLON)
+end function
+
+'' The token closing the bracket opened at 'o', or -1.
+private function CloseOf_( byref p as ParserState, byval o as int32 ) as int32
+    dim as int32 depth = 0
+    dim as int32 q = o
+    do
+        dim as Tko.TokenKind k = K_( p, q )
+        if (k = Tko.TK_EOF) orelse (k = Tko.TK_EOL) then return -1
+        if Opens_( k ) then depth += 1
+        if Closes_( k ) then
+            depth -= 1
+            if depth = 0 then return q
+        end if
+        q += 1
+    loop
+end function
+
+'' What may follow 'match' when it is a NAME: an assignment, a call, a member, an operator.
+private function NotASubjectStart_( byval k as Tko.TokenKind ) as boolean
+    select case k
+    case Tko.TK_EOL, Tko.TK_EOF, Tko.TK_COLON, Tko.TK_EQ, Tko.TK_FATARROW, Tko.TK_DOT, _
+         Tko.TK_ARROW, Tko.TK_COMMA, Tko.TK_RPAREN, Tko.TK_RBRACKET, Tko.TK_SEMICOLON, _
+         Tko.TK_PLUSEQ, Tko.TK_MINUSEQ, Tko.TK_STAREQ, Tko.TK_SLASHEQ, Tko.TK_BSLASHEQ, _
+         Tko.TK_CARETEQ, Tko.TK_AMPEQ, Tko.TK_STAR, Tko.TK_SLASH, Tko.TK_BACKSLASH, _
+         Tko.TK_CARET, Tko.TK_AMP, Tko.TK_NE, Tko.TK_LT, Tko.TK_GT, Tko.TK_LE, Tko.TK_GE, _
+         Tko.KW_AS, Tko.KW_AND, Tko.KW_OR, Tko.KW_XOR, Tko.KW_MOD, Tko.KW_SHL, Tko.KW_SHR, _
+         Tko.KW_ANDALSO, Tko.KW_ORELSE, Tko.KW_EQV, Tko.KW_IMP, Tko.KW_IS, Tko.KW_TO, _
+         Tko.KW_THEN, Tko.KW_STEP
+        return true
+    end select
+    return false
+end function
+
+'' 'match' at i with a subject to the end of its line and an arm on the next: the SHAPE of a head,
+'' before its closer is looked for. The subject's EOL, or -1.
+private function HeadShape_( byref p as ParserState, byval i as int32, byval nm as Tko.InternId ) as int32
+    if IsId_( p, i, nm ) = false then return -1
+    if i > 0 then
+        dim as Tko.TokenKind pk = K_( p, i - 1 )
+        if (pk = Tko.TK_DOT) orelse (pk = Tko.TK_ARROW) orelse (pk = Tko.KW_END) then return -1
+    end if
+    if NotASubjectStart_( K_( p, i + 1 ) ) then return -1
+    dim as int32 j = i + 1
+    dim as int32 depth = 0
+    do
+        dim as Tko.TokenKind k = K_( p, j )
+        if k = Tko.TK_EOF then return -1
+        if Opens_( k ) then depth += 1
+        if Closes_( k ) then depth -= 1
+        if (k = Tko.TK_EOL) andalso (depth <= 0) then exit do
+        j += 1
+    loop
+    dim as int32 a = j
+    while K_( p, a ) = Tko.TK_EOL
+        a += 1
+    wend
+    if K_( p, a ) = Tko.KW_CASE then return j
+    if (K_( p, a ) = Tko.KW_END) andalso IsId_( p, a + 1, nm ) then return j     '' an empty match: TKO1240
+    depth = 0
+    do
+        dim as Tko.TokenKind k = K_( p, a )
+        if (k = Tko.TK_EOF) orelse (k = Tko.TK_EOL) then return -1
+        if Opens_( k ) then depth += 1
+        if Closes_( k ) then depth -= 1
+        if (k = Tko.TK_FATARROW) andalso (depth = 0) then return j
+        a += 1
+    loop
+end function
+
+'' The 'end' of the 'end match' closing a head whose subject ends at 'j'. -1 at an unmatched
+'' 'end select' (a paren-less call inside a SELECT arm); -2 at the end of the input or of the
+'' procedure (an unclosed match).
+private function CloserOf_( byref p as ParserState, byval j as int32, byval nm as Tko.InternId ) as int32
+    dim as int32 md = 0, sd = 0
+    dim as int32 q = j
+    do
+        dim as Tko.TokenKind k = K_( p, q )
+        if k = Tko.TK_EOF then return -2
+        if AtStmtStart_( p, q ) then
+            if k = Tko.KW_SELECT then
+                sd += 1
+            elseif k = Tko.KW_END then
+                dim as Tko.TokenKind k1 = K_( p, q + 1 )
+                if k1 = Tko.KW_SELECT then
+                    if sd = 0 then return -1
+                    sd -= 1
+                elseif IsId_( p, q + 1, nm ) then
+                    if md = 0 then return q
+                    md -= 1
+                    q += 2
+                    continue do
+                else
+                    select case k1
+                    case Tko.KW_SUB, Tko.KW_FUNCTION, Tko.KW_PROPERTY, Tko.KW_OPERATOR, _
+                         Tko.KW_CONSTRUCTOR, Tko.KW_DESTRUCTOR, Tko.KW_TYPE, Tko.KW_NAMESPACE
+                        return -2
+                    end select
+                end if
+            end if
+        end if
+        if (k = Tko.TK_IDENT) andalso (HeadShape_( p, q, nm ) >= 0) then md += 1
+        q += 1
+    loop
+end function
+
+'' From inside a statement at 'q', the separator that ends it (EOL or ':' at depth 0), stepping
+'' over every 'match' expression's lines whole. 'limit' bounds the walk.
+private function StmtEnd_( byref p as ParserState, byval q as int32, byval limit as int32, _
+                           byval nm as Tko.InternId, byval colonEnds as boolean = true ) as int32
+    dim as int32 depth = 0
+    while q < limit
+        dim as Tko.TokenKind k = K_( p, q )
+        if k = Tko.TK_EOF then return q
+        if (k = Tko.TK_IDENT) andalso (q > 0) then
+            dim as int32 j = HeadShape_( p, q, nm )
+            if j >= 0 then
+                dim as int32 c = CloserOf_( p, j, nm )
+                if c >= 0 then
+                    q = c + 2
+                    continue while
+                end if
+            end if
+        end if
+        if Opens_( k ) then depth += 1
+        if Closes_( k ) then depth -= 1
+        if depth <= 0 then
+            '' ':' is a TK_EOL too, flagged TF_COLON; an expression's arm is a whole line.
+            if (k = Tko.TK_EOL) andalso (colonEnds orelse ((p.toks->At( q ).flags and Tko.TF_COLON) = 0)) then return q
+        end if
+        q += 1
+    wend
+    return limit
+end function
+
+'' At a statement start 'q' that opens a SELECT, the token after its 'end select'.
+private function PastSelect_( byref p as ParserState, byval q as int32, byval limit as int32 ) as int32
+    dim as int32 sd = 0
+    while q < limit
+        if AtStmtStart_( p, q ) then
+            if K_( p, q ) = Tko.KW_SELECT then sd += 1
+            if (K_( p, q ) = Tko.KW_END) andalso (K_( p, q + 1 ) = Tko.KW_SELECT) then
+                sd -= 1
+                if sd = 0 then return q + 2
+            end if
+        end if
+        q += 1
+    wend
+    return limit
+end function
+
+private sub Err_( byref p as ParserState, byref ctx as MatchCtx_, byval id as Tko.DiagId, _
+                  byval at as Tko.SourceLoc, byval a0 as string = "" )
+    ctx.bad = true
+    p.diags->Report( id, Tko.PointRange( at ), a0 )
+end sub
+
+'' ----------------------------------------------------------------------- patterns
+
+private function NewPat_( byref ctx as MatchCtx_, byval kind as int32, byval s as int32, byval e as int32, _
+                          byval at as Tko.SourceLoc ) as int32
+    dim as MatchPat_ m
+    m.kind = kind
+    m.s = s : m.e = e
+    m.s2 = -1 : m.e2 = -1
+    m.loc = at
+    ctx.pats.Push( m )
+    return ctx.pats.Count - 1
+end function
+
+declare function ParsePat_( byref p as ParserState, byref ctx as MatchCtx_, byval s as int32, _
+                            byval e as int32, byval nested as boolean ) as int32
+
+'' The children of a TUPLE or UDT pattern: [s, e) inside its parentheses, split at depth-0 commas.
+private sub ParseKids_( byref p as ParserState, byref ctx as MatchCtx_, byval pi as int32, _
+                        byval s as int32, byval e as int32 )
+    dim as containers.Array( of int32 ) got
+    if s < e then
+        dim as int32 depth = 0, a = s
+        for q as int32 = s to e
+            dim as Tko.TokenKind k = iif( q < e, K_( p, q ), Tko.TK_COMMA )
+            if Opens_( k ) then depth += 1
+            if Closes_( k ) then depth -= 1
+            if (k = Tko.TK_COMMA) andalso (depth = 0) then
+                got.Push( ParsePat_( p, ctx, a, q, true ) )
+                a = q + 1
+            end if
+        next
+    end if
+    ctx.pats[pi].kid0 = ctx.kids.Count
+    ctx.pats[pi].nkid = got.Count
+    for i as int32 = 0 to got.Count - 1
+        ctx.kids.Push( got[i] )
+    next
+end sub
+
+function ParsePat_( byref p as ParserState, byref ctx as MatchCtx_, byval s as int32, _
+                    byval e as int32, byval nested as boolean ) as int32
+    dim as Tko.SourceLoc at = Loc_( p, s )
+    if s >= e then
+        Err_( p, ctx, Tko.TKO1246, ctx.at, "a pattern is missing" )
+        return NewPat_( ctx, MPK_WILD, s, s, ctx.at )
+    end if
+    dim as Tko.TokenKind k = K_( p, s )
+    if (e = s + 1) andalso (k = Tko.KW_ANY) then return NewPat_( ctx, MPK_WILD, s, e, at )
+    if (e = s + 1) andalso (k = Tko.KW_ELSE) then
+        if nested then Err_( p, ctx, Tko.TKO1246, at, "'else' inside a pattern; write 'any'" )
+        return NewPat_( ctx, MPK_WILD, s, e, at )
+    end if
+    if k = Tko.KW_IS then
+        dim as Tko.TokenKind r = K_( p, s + 1 )
+        select case r
+        case Tko.TK_EQ, Tko.TK_NE, Tko.TK_LT, Tko.TK_GT, Tko.TK_LE, Tko.TK_GE
+        case else
+            Err_( p, ctx, Tko.TKO1246, at, "'is' needs a relational operator" )
+            return NewPat_( ctx, MPK_WILD, s, e, at )
+        end select
+        if s + 2 >= e then
+            Err_( p, ctx, Tko.TKO1246, at, "'is' needs a value" )
+            return NewPat_( ctx, MPK_WILD, s, e, at )
+        end if
+        dim as int32 pi = NewPat_( ctx, MPK_ISOP, s + 2, e, at )
+        ctx.pats[pi].relop = cast( int32, r )
+        return pi
+    end if
+    '' ( p, ... ) -- a TUPLE when a comma splits it; a parenthesised value otherwise.
+    if (k = Tko.TK_LPAREN) andalso (CloseOf_( p, s ) = e - 1) then
+        dim as int32 depth = 0
+        dim as boolean comma = false
+        for q as int32 = s to e - 1
+            dim as Tko.TokenKind kq = K_( p, q )
+            if Opens_( kq ) then depth += 1
+            if Closes_( kq ) then depth -= 1
+            if (kq = Tko.TK_COMMA) andalso (depth = 1) then comma = true
+        next
+        if comma then
+            dim as int32 pi = NewPat_( ctx, MPK_TUPLE, s, e, at )
+            ParseKids_( p, ctx, pi, s + 1, e - 1 )
+            return pi
+        end if
+    end if
+    '' starts "lit" [rest]
+    if (k = Tko.TK_IDENT) andalso IsId_( p, s, ctx.nmStarts ) then
+        dim as Tko.TokenKind k1 = K_( p, s + 1 )
+        if ((k1 = Tko.TK_STRING_LIT) orelse (k1 = Tko.TK_IDENT)) andalso _
+           ((e = s + 2) orelse ((e = s + 3) andalso (K_( p, s + 2 ) = Tko.TK_IDENT))) then
+            dim as int32 pi = NewPat_( ctx, MPK_STARTS, s + 1, s + 2, at )
+            if e = s + 3 then ctx.pats[pi].bind = p.names->Fold( p.toks->At( s + 2 ).ident )
+            return pi
+        end if
+    end if
+    '' x as Class / any as Class
+    if ((k = Tko.TK_IDENT) orelse (k = Tko.KW_ANY)) andalso (K_( p, s + 1 ) = Tko.KW_AS) then
+        if s + 2 >= e then
+            Err_( p, ctx, Tko.TKO1246, at, "a type pattern needs a class after 'as'" )
+            return NewPat_( ctx, MPK_WILD, s, e, at )
+        end if
+        dim as int32 pi = NewPat_( ctx, MPK_TYPE, s + 2, e, at )
+        if k = Tko.TK_IDENT then ctx.pats[pi].bind = p.names->Fold( p.toks->At( s ).ident )
+        return pi
+    end if
+    '' Name( p, ... ) and NS.Name( p, ... ) -- always a UDT pattern: a call is not a pattern.
+    if NameTok_( p, s ) then
+        dim as int32 n = s
+        while NameTok_( p, n ) andalso (K_( p, n + 1 ) = Tko.TK_DOT) andalso (n + 2 < e)
+            n += 2
+        wend
+        if NameTok_( p, n ) andalso (K_( p, n + 1 ) = Tko.TK_LPAREN) andalso _
+           (CloseOf_( p, n + 1 ) = e - 1) then
+            dim as int32 pi = NewPat_( ctx, MPK_UDT, s, n + 1, at )
+            ParseKids_( p, ctx, pi, n + 2, e - 1 )
+            return pi
+        end if
+    end if
+    '' A bare name binds -- but 'true', 'false' and 'nullptr' are values, as they read.
+    dim as boolean litName = false
+    if k = Tko.TK_IDENT then
+        select case NameText_( p, s )
+        case "true", "false", "nullptr" : litName = true
+        end select
+    end if
+    if nested andalso (e = s + 1) andalso (k = Tko.TK_IDENT) andalso (litName = false) then
+        dim as int32 pi = NewPat_( ctx, MPK_BIND, s, e, at )
+        ctx.pats[pi].bind = p.names->Fold( p.toks->At( s ).ident )
+        return pi
+    end if
+    '' a to b
+    dim as int32 depth = 0
+    for q as int32 = s to e - 1
+        dim as Tko.TokenKind kq = K_( p, q )
+        if Opens_( kq ) then depth += 1
+        if Closes_( kq ) then depth -= 1
+        if (kq = Tko.KW_TO) andalso (depth = 0) then
+            if (q = s) orelse (q + 1 >= e) then
+                Err_( p, ctx, Tko.TKO1246, at, "'to' needs a value on each side" )
+                return NewPat_( ctx, MPK_WILD, s, e, at )
+            end if
+            dim as int32 pi = NewPat_( ctx, MPK_RANGE, s, q, at )
+            ctx.pats[pi].s2 = q + 1
+            ctx.pats[pi].e2 = e
+            return pi
+        end if
+    next
+    return NewPat_( ctx, MPK_VALUE, s, e, at )
+end function
+
+'' The names a pattern binds, depth first.
+private sub BoundNames_( byref ctx as MatchCtx_, byval pi as int32, byref out_ as containers.Array( of uint32 ) )
+    dim as MatchPat_ m = ctx.pats[pi]
+    if m.bind <> 0 then out_.Push( cast( uint32, m.bind ) )
+    for i as int32 = 0 to m.nkid - 1
+        BoundNames_( ctx, ctx.kids[m.kid0 + i], out_ )
+    next
+end sub
+
+'' An arm's pattern list [s, e): alternatives at depth-0 commas; then the binding rules.
+private sub ParseArmPats_( byref p as ParserState, byref ctx as MatchCtx_, byref arm as MatchArm_, _
+                           byval s as int32, byval e as int32 )
+    arm.alt0 = ctx.alts.Count
+    dim as int32 depth = 0, a = s
+    for q as int32 = s to e
+        dim as Tko.TokenKind k = iif( q < e, K_( p, q ), Tko.TK_COMMA )
+        if Opens_( k ) then depth += 1
+        if Closes_( k ) then depth -= 1
+        if (k = Tko.TK_COMMA) andalso (depth = 0) then
+            ctx.alts.Push( ParsePat_( p, ctx, a, q, false ) )
+            a = q + 1
+        end if
+    next
+    arm.nalt = ctx.alts.Count - arm.alt0
+    arm.isElse = (e = s + 1) andalso (K_( p, s ) = Tko.KW_ELSE)
+    if arm.nalt > 1 then
+        for i as int32 = 0 to arm.nalt - 1
+            if K_( p, ctx.pats[ctx.alts[arm.alt0 + i]].s ) = Tko.KW_ELSE then
+                Err_( p, ctx, Tko.TKO1246, arm.loc, "'else' cannot be one of several patterns" )
+            end if
+        next
+    end if
+    dim as containers.Array( of uint32 ) nms
+    for i as int32 = 0 to arm.nalt - 1
+        BoundNames_( ctx, ctx.alts[arm.alt0 + i], nms )
+    next
+    if (arm.nalt > 1) andalso (nms.Count > 0) then
+        Err_( p, ctx, Tko.TKO1248, arm.loc )
+        exit sub
+    end if
+    for i as int32 = 0 to nms.Count - 1
+        for j as int32 = i + 1 to nms.Count - 1
+            if nms[i] = nms[j] then
+                Err_( p, ctx, Tko.TKO1247, arm.loc, p.names->Spelling( cast( Tko.InternId, nms[i] ) ) )
+            end if
+        next
+    next
+end sub
+
+'' A guard: 'if' at depth 0 in [s, e) splits it off.
+private sub SplitGuard_( byref p as ParserState, byref arm as MatchArm_, byval s as int32, byref e as int32 )
+    arm.g0 = -1 : arm.g1 = -1
+    dim as int32 depth = 0
+    for q as int32 = s to e - 1
+        dim as Tko.TokenKind k = K_( p, q )
+        if Opens_( k ) then depth += 1
+        if Closes_( k ) then depth -= 1
+        if (k = Tko.KW_IF) andalso (depth = 0) then
+            arm.g0 = q + 1
+            arm.g1 = e
+            e = q
+            exit for
+        end if
+    next
+end sub
+
+'' ------------------------------------------------------------------- token output
+
+private sub T_( byref v as Tko.TokenVec, byval k as Tko.TokenKind, byval at as Tko.SourceLoc, _
+                byval nm as Tko.InternId = 0, byval lineStart as boolean = false )
+    dim as Tko.Token t
+    t.kind = cast( uint16, k )
+    t.flags = Tko.TF_SYNTHESISED or Tko.TF_SPACE_BEFORE
+    if lineStart then t.flags or= Tko.TF_AT_LINE_START
+    t.loc = at
+    t.ident = nm
+    v.Push( t )
+end sub
+
+private sub Int_( byref p as ParserState, byref v as Tko.TokenVec, byval n as int64, byval at as Tko.SourceLoc )
+    dim as Tko.Literal lit
+    lit.kind = cast( uint8, Tko.TK_INT_LIT )
+    lit.radix = 10
+    lit.intValue = cast( uint64, n )
+    p.litPool->Push( lit )
+    dim as Tko.Token t
+    t.kind = cast( uint16, Tko.TK_INT_LIT )
+    t.flags = Tko.TF_SYNTHESISED or Tko.TF_SPACE_BEFORE
+    t.loc = at
+    t.literal = cast( uint32, p.litPool->Count - 1 )
+    v.Push( t )
+end sub
+
+private sub Span_( byref p as ParserState, byref v as Tko.TokenVec, byval s as int32, byval e as int32 )
+    for i as int32 = s to e - 1
+        v.Push( p.toks->At( i ) )
+    next
+end sub
+
+private sub Append_( byref v as Tko.TokenVec, byref w as Tko.TokenVec )
+    for i as int32 = 0 to w.Count - 1
+        v.Push( w[i] )
+    next
+end sub
+
+private function Nm_( byref p as ParserState, byref s as string ) as Tko.InternId
+    return p.names->Fold( p.names->GetString( s ) )
+end function
+
+'' '( a ) andalso ( b )' -- 'acc' grows by 'one'; either may be empty (true).
+private sub AndInto_( byref acc as Tko.TokenVec, byref one as Tko.TokenVec, byval at as Tko.SourceLoc )
+    if one.Count = 0 then exit sub
+    if acc.Count > 0 then T_( acc, Tko.KW_ANDALSO, at )
+    T_( acc, Tko.TK_LPAREN, at )
+    Append_( acc, one )
+    T_( acc, Tko.TK_RPAREN, at )
+end sub
+
+'' The member path of child 'k' (1-based): '._k' in a tuple, '.__tko_pos<k>' in a UDT.
+private sub ChildPath_( byref p as ParserState, byref path as Tko.TokenVec, byval tuple_ as boolean, _
+                        byval k as int32, byval at as Tko.SourceLoc, byref out_ as Tko.TokenVec )
+    out_.SetCount( 0 )
+    Append_( out_, path )
+    T_( out_, Tko.TK_DOT, at )
+    T_( out_, Tko.TK_IDENT, at, Nm_( p, iif( tuple_, "_", "__tko_pos" ) & str( k ) ) )
+end sub
+
+'' The test a pattern makes of 'path'; empty when it always holds.
+private sub Test_( byref p as ParserState, byref ctx as MatchCtx_, byval pi as int32, _
+                   byref path as Tko.TokenVec, byref out_ as Tko.TokenVec )
+    dim as MatchPat_ m = ctx.pats[pi]
+    dim as Tko.SourceLoc at = m.loc
+    select case m.kind
+    case MPK_VALUE, MPK_ISOP
+        T_( out_, Tko.TK_LPAREN, at ) : Append_( out_, path ) : T_( out_, Tko.TK_RPAREN, at )
+        T_( out_, iif( m.kind = MPK_VALUE, Tko.TK_EQ, cast( Tko.TokenKind, m.relop ) ), at )
+        T_( out_, Tko.TK_LPAREN, at ) : Span_( p, out_, m.s, m.e ) : T_( out_, Tko.TK_RPAREN, at )
+    case MPK_RANGE
+        T_( out_, Tko.TK_LPAREN, at ) : Append_( out_, path ) : T_( out_, Tko.TK_RPAREN, at )
+        T_( out_, Tko.TK_GE, at )
+        T_( out_, Tko.TK_LPAREN, at ) : Span_( p, out_, m.s, m.e ) : T_( out_, Tko.TK_RPAREN, at )
+        T_( out_, Tko.KW_ANDALSO, at )
+        T_( out_, Tko.TK_LPAREN, at ) : Append_( out_, path ) : T_( out_, Tko.TK_RPAREN, at )
+        T_( out_, Tko.TK_LE, at )
+        T_( out_, Tko.TK_LPAREN, at ) : Span_( p, out_, m.s2, m.e2 ) : T_( out_, Tko.TK_RPAREN, at )
+    case MPK_TUPLE, MPK_UDT
+        for i as int32 = 0 to m.nkid - 1
+            dim as Tko.TokenVec cp, one
+            ChildPath_( p, path, m.kind = MPK_TUPLE, i + 1, at, cp )
+            Test_( p, ctx, ctx.kids[m.kid0 + i], cp, one )
+            AndInto_( out_, one, at )
+        next
+    case MPK_TYPE
+        '' ( path ) <> 0 andalso ( *( path ) is Class ) -- a null pointer matches no type
+        T_( out_, Tko.TK_LPAREN, at ) : Append_( out_, path ) : T_( out_, Tko.TK_RPAREN, at )
+        T_( out_, Tko.TK_NE, at ) : Int_( p, out_, 0, at )
+        T_( out_, Tko.KW_ANDALSO, at )
+        T_( out_, Tko.TK_LPAREN, at ) : T_( out_, Tko.TK_STAR, at )
+        T_( out_, Tko.TK_LPAREN, at ) : Append_( out_, path ) : T_( out_, Tko.TK_RPAREN, at )
+        T_( out_, Tko.KW_IS, at ) : Span_( p, out_, m.s, m.e ) : T_( out_, Tko.TK_RPAREN, at )
+    case MPK_STARTS
+        '' mid( path, 1, len( lit ) ) = lit
+        T_( out_, Tko.KW_MID, at ) : T_( out_, Tko.TK_LPAREN, at ) : Append_( out_, path )
+        T_( out_, Tko.TK_COMMA, at ) : Int_( p, out_, 1, at ) : T_( out_, Tko.TK_COMMA, at )
+        T_( out_, Tko.KW_LEN, at ) : T_( out_, Tko.TK_LPAREN, at ) : Span_( p, out_, m.s, m.e )
+        T_( out_, Tko.TK_RPAREN, at ) : T_( out_, Tko.TK_RPAREN, at )
+        T_( out_, Tko.TK_EQ, at ) : Span_( p, out_, m.s, m.e )
+    end select
+end sub
+
+'' What a pattern binds, as (name, expression over 'path').
+private sub Binds_( byref p as ParserState, byref ctx as MatchCtx_, byval pi as int32, _
+                    byref path as Tko.TokenVec, byref out_ as containers.Array( of MatchBind_ ) )
+    dim as MatchPat_ m = ctx.pats[pi]
+    dim as Tko.SourceLoc at = m.loc
+    if (m.kind = MPK_TUPLE) orelse (m.kind = MPK_UDT) then
+        for i as int32 = 0 to m.nkid - 1
+            dim as Tko.TokenVec cp
+            ChildPath_( p, path, m.kind = MPK_TUPLE, i + 1, at, cp )
+            Binds_( p, ctx, ctx.kids[m.kid0 + i], cp, out_ )
+        next
+        exit sub
+    end if
+    if m.bind = 0 then exit sub
+    dim as MatchBind_ b
+    b.nm = m.bind
+    b.t0 = ctx.btoks.Count
+    select case m.kind
+    case MPK_BIND
+        b.byref_ = true
+        Append_( ctx.btoks, path )
+    case MPK_TYPE
+        '' cast( Class ptr, path )
+        T_( ctx.btoks, Tko.KW_CAST, at ) : T_( ctx.btoks, Tko.TK_LPAREN, at )
+        Span_( p, ctx.btoks, m.s, m.e ) : T_( ctx.btoks, Tko.KW_PTR, at )
+        T_( ctx.btoks, Tko.TK_COMMA, at ) : Append_( ctx.btoks, path ) : T_( ctx.btoks, Tko.TK_RPAREN, at )
+    case MPK_STARTS
+        '' mid( path, len( lit ) + 1 )
+        T_( ctx.btoks, Tko.KW_MID, at ) : T_( ctx.btoks, Tko.TK_LPAREN, at ) : Append_( ctx.btoks, path )
+        T_( ctx.btoks, Tko.TK_COMMA, at ) : T_( ctx.btoks, Tko.KW_LEN, at ) : T_( ctx.btoks, Tko.TK_LPAREN, at )
+        Span_( p, ctx.btoks, m.s, m.e ) : T_( ctx.btoks, Tko.TK_RPAREN, at )
+        T_( ctx.btoks, Tko.TK_PLUS, at ) : Int_( p, ctx.btoks, 1, at ) : T_( ctx.btoks, Tko.TK_RPAREN, at )
+    end select
+    b.t1 = ctx.btoks.Count
+    out_.Push( b )
+end sub
+
+'' An arm's whole test: its alternatives or-ed. Empty when one always holds.
+private sub ArmTest_( byref p as ParserState, byref ctx as MatchCtx_, byref arm as MatchArm_, _
+                      byref path as Tko.TokenVec, byref out_ as Tko.TokenVec )
+    out_.SetCount( 0 )
+    for i as int32 = 0 to arm.nalt - 1
+        dim as Tko.TokenVec one
+        Test_( p, ctx, ctx.alts[arm.alt0 + i], path, one )
+        if one.Count = 0 then
+            out_.SetCount( 0 )
+            exit sub
+        end if
+        if out_.Count > 0 then T_( out_, Tko.KW_ORELSE, arm.loc )
+        T_( out_, Tko.TK_LPAREN, arm.loc )
+        Append_( out_, one )
+        T_( out_, Tko.TK_RPAREN, arm.loc )
+    next
+end sub
+
+'' [s, e) with every reference to a binding replaced by its expression, parenthesised.
+private sub Subst_( byref p as ParserState, byref ctx as MatchCtx_, byval s as int32, byval e as int32, _
+                    byref bs as containers.Array( of MatchBind_ ), byref out_ as Tko.TokenVec )
+    for q as int32 = s to e - 1
+        dim as Tko.Token t = p.toks->At( q )
+        dim as boolean done = false
+        if (cast( Tko.TokenKind, t.kind ) = Tko.TK_IDENT) andalso (bs.Count > 0) then
+            dim as Tko.TokenKind pk = iif( q > 0, K_( p, q - 1 ), Tko.TK_EOL )
+            if (pk <> Tko.TK_DOT) andalso (pk <> Tko.TK_ARROW) then
+                dim as Tko.InternId f = p.names->Fold( t.ident )
+                for i as int32 = 0 to bs.Count - 1
+                    if bs[i].nm = f then
+                        T_( out_, Tko.TK_LPAREN, t.loc )
+                        for r as int32 = bs[i].t0 to bs[i].t1 - 1
+                            out_.Push( ctx.btoks[r] )
+                        next
+                        T_( out_, Tko.TK_RPAREN, t.loc )
+                        done = true
+                        exit for
+                    end if
+                next
+            end if
+        end if
+        if done = false then out_.Push( t )
+    next
+end sub
+
+'' --------------------------------------------------------------------- the record
+
+private function ValText_( byref p as ParserState, byval s as int32, byval e as int32 ) as string
+    if s >= e then return "?"
+    if (e = s + 1) andalso (K_( p, s ) = Tko.TK_INT_LIT) then
+        return str( cast( int64, (*p.litPool)[cast( int32, p.toks->At( s ).literal )].intValue ) )
+    end if
+    if (e = s + 2) andalso (K_( p, s ) = Tko.TK_MINUS) andalso (K_( p, s + 1 ) = Tko.TK_INT_LIT) then
+        return "-" & str( cast( int64, (*p.litPool)[cast( int32, p.toks->At( s + 1 ).literal )].intValue ) )
+    end if
+    dim as string r
+    for q as int32 = s to e - 1
+        dim as Tko.TokenKind k = K_( p, q )
+        if ((q - s) and 1) = 0 then
+            if NameTok_( p, q ) = false then return "?"
+            r &= NameText_( p, q )
+        else
+            if k <> Tko.TK_DOT then return "?"
+            r &= "."
+        end if
+    next
+    if ((e - s) and 1) = 0 then return "?"
+    return r
+end function
+
+private function Enc_( byref p as ParserState, byref ctx as MatchCtx_, byval pi as int32 ) as string
+    dim as MatchPat_ m = ctx.pats[pi]
+    dim as string kids
+    for i as int32 = 0 to m.nkid - 1
+        if i > 0 then kids &= ","
+        kids &= Enc_( p, ctx, ctx.kids[m.kid0 + i] )
+    next
+    dim as string bn
+    if m.bind <> 0 then bn = p.names->Spelling( m.bind )
+    select case m.kind
+    case MPK_BIND   : return "B" & bn & "~"
+    case MPK_VALUE  : return "V" & ValText_( p, m.s, m.e ) & "~"
+    case MPK_RANGE  : return "R" & ValText_( p, m.s, m.e ) & "~" & ValText_( p, m.s2, m.e2 ) & "~"
+    case MPK_ISOP   : return "O"
+    case MPK_TUPLE  : return "T(" & kids & ")"
+    case MPK_UDT    : return "U" & ValText_( p, m.s, m.e ) & "~" & str( m.loc ) & "~(" & kids & ")"
+    case MPK_TYPE   : return "C" & ValText_( p, m.s, m.e ) & "~" & bn & "~"
+    case MPK_STARTS : return "S" & bn & "~"
+    end select
+    return "W"
+end function
+
+'' name|S or E|loc|arm;arm;...   arm = g or u, loc, ':', alternatives joined by '/'
+private sub Record_( byref p as ParserState, byref ctx as MatchCtx_, byval form as string )
+    if ctx.bad then exit sub
+    dim as string r = p.names->Spelling( ctx.subj ) & "|" & form & "|" & str( ctx.at ) & "|"
+    for a as int32 = 0 to ctx.arms.Count - 1
+        dim as MatchArm_ arm = ctx.arms[a]
+        if a > 0 then r &= ";"
+        r &= iif( arm.g0 >= 0, "g", "u" ) & str( arm.loc ) & ":"
+        for i as int32 = 0 to arm.nalt - 1
+            if i > 0 then r &= "/"
+            r &= Enc_( p, ctx, ctx.alts[arm.alt0 + i] )
+        next
+    next
+    p.ast->matchRecs.Push( r )
+end sub
+
+'' -------------------------------------------------------------------- the splice
+
+'' [r0, r1) becomes 'v'. Only lookahead lies past r0 (propblock.tiko's PropertyBlock does the same).
+private sub Splice_( byref p as ParserState, byval r0 as int32, byval r1 as int32, byref v as Tko.TokenVec )
+    dim as int32 delta = v.Count - (r1 - r0)
+    dim as Tko.TokenVec tail_
+    for q as int32 = r1 to p.toks->Count - 1
+        tail_.Push( p.toks->At( q ) )
+    next
+    p.toks->SetCount( r0 )
+    for q as int32 = 0 to v.Count - 1
+        p.toks->Push( v[q] )
+    next
+    for q as int32 = 0 to tail_.Count - 1
+        p.toks->Push( tail_[q] )
+    next
+    if p.stream <> nullptr then
+        dim as Tko.PpStream ptr st = cast( Tko.PpStream ptr, p.stream )
+        if st->outp <> nullptr then
+            for q as int32 = 0 to st->outp->privateAt.Count - 2 step 2
+                if cast( int32, st->outp->privateAt[q] ) >= r1 then
+                    st->outp->privateAt[q] = cast( uint32, cast( int32, st->outp->privateAt[q] ) + delta )
+                end if
+            next
+        end if
+    end if
+end sub
+
+private sub NewSubject_( byref p as ParserState, byref ctx as MatchCtx_ )
+    ctx.subj = Nm_( p, "__tko_m" & str( p.ast->matchSeq ) )
+    p.ast->matchSeq += 1
+end sub
+
+'' --------------------------------------------------------------- statement form
+
+private sub RewriteStmt_( byref p as ParserState, byref ctx as MatchCtx_, byval s0 as int32, _
+                          byval j as int32, byval c as int32 )
+    dim as Tko.SourceLoc at = ctx.at
+    '' The arms: a 'case' at a statement start, at this match's own depth.
+    dim as int32 q = j + 1
+    dim as int32 curArm = -1
+    while q < c
+        dim as Tko.TokenKind k = K_( p, q )
+        if k = Tko.TK_EOL then
+            q += 1
+            continue while
+        end if
+        if k = Tko.KW_CASE then
+            if curArm >= 0 then ctx.arms[curArm].b1 = q
+            dim as MatchArm_ arm
+            arm.loc = Loc_( p, q )
+            dim as int32 h1 = StmtEnd_( p, q + 1, c, ctx.nmMatch )
+            dim as int32 he = h1
+            for r as int32 = q + 1 to he - 1
+                if K_( p, r ) = Tko.TK_FATARROW then Err_( p, ctx, Tko.TKO1243, arm.loc ) : exit for
+            next
+            SplitGuard_( p, arm, q + 1, he )
+            ParseArmPats_( p, ctx, arm, q + 1, he )
+            if arm.isElse andalso (arm.g0 >= 0) then Err_( p, ctx, Tko.TKO1249, arm.loc )
+            arm.b0 = iif( h1 < c, h1 + 1, c )
+            arm.b1 = c
+            ctx.arms.Push( arm )
+            curArm = ctx.arms.Count - 1
+            q = arm.b0
+            continue while
+        end if
+        if curArm < 0 then
+            '' A line before the first 'case': an arm without one.
+            dim as int32 e = StmtEnd_( p, q, c, ctx.nmMatch )
+            dim as boolean arrow = false
+            for r as int32 = q to e - 1
+                if K_( p, r ) = Tko.TK_FATARROW then arrow = true
+            next
+            if arrow then
+                Err_( p, ctx, Tko.TKO1243, Loc_( p, q ) )
+            else
+                Err_( p, ctx, Tko.TKO1246, Loc_( p, q ), "expected 'case'" )
+            end if
+            q = e
+            continue while
+        end if
+        '' A body statement: step over it whole -- a SELECT's own 'case' lines, a nested match.
+        if k = Tko.KW_SELECT then
+            q = PastSelect_( p, q, c )
+        else
+            q = StmtEnd_( p, q, c, ctx.nmMatch )
+        end if
+    wend
+    if (ctx.arms.Count = 0) andalso (ctx.bad = false) then Err_( p, ctx, Tko.TKO1240, at )
+    for a as int32 = 0 to ctx.arms.Count - 2
+        if ctx.arms[a].isElse then Err_( p, ctx, Tko.TKO1244, ctx.arms[a].loc )
+    next
+
+    NewSubject_( p, ctx )
+    dim as boolean guarded = false
+    for a as int32 = 0 to ctx.arms.Count - 1
+        if ctx.arms[a].g0 >= 0 then guarded = true
+    next
+    dim as Tko.InternId done_ = Nm_( p, "__tko_md" & str( p.ast->matchSeq - 1 ) )
+    dim as Tko.TokenVec path
+    T_( path, Tko.TK_IDENT, at, ctx.subj )
+
+    dim as Tko.TokenVec v
+    T_( v, Tko.KW_SCOPE, at, 0, true ) : T_( v, Tko.TK_EOL, at )
+    T_( v, Tko.KW_VAR, at, 0, true ) : T_( v, Tko.TK_IDENT, at, ctx.subj ) : T_( v, Tko.TK_EQ, at )
+    Span_( p, v, s0 + 1, j ) : T_( v, Tko.TK_EOL, at )
+    if guarded then
+        T_( v, Tko.KW_DIM, at, 0, true ) : T_( v, Tko.KW_AS, at ) : T_( v, Tko.KW_LONG, at )
+        T_( v, Tko.TK_IDENT, at, done_ ) : T_( v, Tko.TK_EOL, at )
+    end if
+    for a as int32 = 0 to ctx.arms.Count - 1
+        dim as MatchArm_ arm = ctx.arms[a]
+        dim as Tko.SourceLoc al = arm.loc
+        dim as Tko.TokenVec t
+        ArmTest_( p, ctx, arm, path, t )
+        dim as containers.Array( of MatchBind_ ) bs
+        if arm.nalt > 0 then Binds_( p, ctx, ctx.alts[arm.alt0], path, bs )   '' a list binds nothing (TKO1248)
+        if guarded = false then
+            if (t.Count = 0) andalso (a = ctx.arms.Count - 1) andalso (a > 0) then
+                T_( v, Tko.KW_ELSE, al, 0, true )
+            else
+                T_( v, iif( a = 0, Tko.KW_IF, Tko.KW_ELSEIF ), al, 0, true )
+                if t.Count = 0 then
+                    Int_( p, v, 0, al ) : T_( v, Tko.TK_EQ, al ) : Int_( p, v, 0, al )
+                else
+                    Append_( v, t )
+                end if
+                T_( v, Tko.KW_THEN, al )
+            end if
+            T_( v, Tko.TK_EOL, al )
+        else
+            T_( v, Tko.KW_IF, al, 0, true )
+            T_( v, Tko.TK_IDENT, al, done_ ) : T_( v, Tko.TK_EQ, al ) : Int_( p, v, 0, al )
+            if t.Count > 0 then
+                T_( v, Tko.KW_ANDALSO, al ) : T_( v, Tko.TK_LPAREN, al )
+                Append_( v, t ) : T_( v, Tko.TK_RPAREN, al )
+            end if
+            T_( v, Tko.KW_THEN, al ) : T_( v, Tko.TK_EOL, al )
+        end if
+        for i as int32 = 0 to bs.Count - 1
+            dim as boolean again = false                '' 'x' bound twice is TKO1247; declare it once
+            for k2 as int32 = 0 to i - 1
+                if bs[k2].nm = bs[i].nm then again = true
+            next
+            if again then continue for
+            T_( v, Tko.KW_VAR, al, 0, true )
+            if bs[i].byref_ then T_( v, Tko.KW_BYREF, al )
+            T_( v, Tko.TK_IDENT, al, bs[i].nm ) : T_( v, Tko.TK_EQ, al )
+            for r as int32 = bs[i].t0 to bs[i].t1 - 1
+                v.Push( ctx.btoks[r] )
+            next
+            T_( v, Tko.TK_EOL, al )
+        next
+        if guarded then
+            if arm.g0 >= 0 then
+                T_( v, Tko.KW_IF, al, 0, true ) : T_( v, Tko.TK_LPAREN, al )
+                Span_( p, v, arm.g0, arm.g1 ) : T_( v, Tko.TK_RPAREN, al )
+                T_( v, Tko.KW_THEN, al ) : T_( v, Tko.TK_EOL, al )
+            end if
+            T_( v, Tko.TK_IDENT, al, done_, true ) : T_( v, Tko.TK_EQ, al ) : Int_( p, v, 1, al )
+            T_( v, Tko.TK_EOL, al )
+        end if
+        Span_( p, v, arm.b0, arm.b1 ) : T_( v, Tko.TK_EOL, al )
+        if guarded then
+            if arm.g0 >= 0 then T_( v, Tko.KW_END, al, 0, true ) : T_( v, Tko.KW_IF, al ) : T_( v, Tko.TK_EOL, al )
+            T_( v, Tko.KW_END, al, 0, true ) : T_( v, Tko.KW_IF, al ) : T_( v, Tko.TK_EOL, al )
+        end if
+    next
+    if (guarded = false) andalso (ctx.arms.Count > 0) then
+        T_( v, Tko.KW_END, at, 0, true ) : T_( v, Tko.KW_IF, at ) : T_( v, Tko.TK_EOL, at )
+    end if
+    T_( v, Tko.KW_END, at, 0, true ) : T_( v, Tko.KW_SCOPE, at )
+    Record_( p, ctx, "S" )
+    Splice_( p, s0, c + 2, v )
+end sub
+
+'' -------------------------------------------------------------- expression form
+
+'' The match expression at 'mi' (subject ends at 'j', closer at 'c') becomes an IIF chain, and its
+'' subject's copy is declared at 'hoistAt', before the statement. Returns the hoist's length.
+private function RewriteExpr_( byref p as ParserState, byref ctx as MatchCtx_, byval hoistAt as int32, _
+                               byval mi as int32, byval j as int32, byval c as int32 ) as int32
+    dim as Tko.SourceLoc at = ctx.at
+    dim as int32 q = j
+    while q < c
+        while (q < c) andalso (K_( p, q ) = Tko.TK_EOL)
+            q += 1
+        wend
+        if q >= c then exit while
+        dim as int32 e = StmtEnd_( p, q, c, ctx.nmMatch, false )
+        dim as MatchArm_ arm
+        arm.loc = Loc_( p, q )
+        if K_( p, q ) = Tko.KW_CASE then
+            Err_( p, ctx, Tko.TKO1242, arm.loc )
+            q = e
+            continue while
+        end if
+        dim as int32 arrow = -1, depth = 0
+        for r as int32 = q to e - 1
+            dim as Tko.TokenKind k = K_( p, r )
+            if Opens_( k ) then depth += 1
+            if Closes_( k ) then depth -= 1
+            if (k = Tko.TK_FATARROW) andalso (depth = 0) then arrow = r : exit for
+        next
+        if arrow < 0 then
+            Err_( p, ctx, Tko.TKO1246, arm.loc, "expected 'pattern => value'" )
+            q = e
+            continue while
+        end if
+        dim as int32 pe = arrow
+        SplitGuard_( p, arm, q, pe )
+        ParseArmPats_( p, ctx, arm, q, pe )
+        if arm.isElse andalso (arm.g0 >= 0) then Err_( p, ctx, Tko.TKO1249, arm.loc )
+        arm.b0 = arrow + 1
+        arm.b1 = e
+        if arm.b0 >= arm.b1 then Err_( p, ctx, Tko.TKO1246, arm.loc, "an arm needs a value after '=>'" )
+        ctx.arms.Push( arm )
+        q = e
+    wend
+    if (ctx.arms.Count = 0) andalso (ctx.bad = false) then Err_( p, ctx, Tko.TKO1240, at )
+    for a as int32 = 0 to ctx.arms.Count - 2
+        if ctx.arms[a].isElse then Err_( p, ctx, Tko.TKO1244, ctx.arms[a].loc )
+    next
+
+    NewSubject_( p, ctx )
+    dim as Tko.TokenVec path
+    T_( path, Tko.TK_IDENT, at, ctx.subj )
+
+    '' var __tko_mN = <subject> :
+    dim as Tko.TokenVec hoist
+    T_( hoist, Tko.KW_VAR, at, 0, true ) : T_( hoist, Tko.TK_IDENT, at, ctx.subj ) : T_( hoist, Tko.TK_EQ, at )
+    Span_( p, hoist, mi + 1, j ) : T_( hoist, Tko.TK_EOL, at ) : hoist[hoist.Count - 1].flags or= Tko.TF_COLON
+
+    '' iif( test, ( value ), iif( ... ( last ) ) )
+    dim as Tko.TokenVec v
+    dim as int32 opens = 0
+    for a as int32 = 0 to ctx.arms.Count - 1
+        dim as MatchArm_ arm = ctx.arms[a]
+        dim as Tko.SourceLoc al = arm.loc
+        dim as containers.Array( of MatchBind_ ) bs
+        if arm.nalt > 0 then Binds_( p, ctx, ctx.alts[arm.alt0], path, bs )   '' a list binds nothing (TKO1248)
+        if a < ctx.arms.Count - 1 then
+            dim as Tko.TokenVec t, g
+            ArmTest_( p, ctx, arm, path, t )
+            if arm.g0 >= 0 then Subst_( p, ctx, arm.g0, arm.g1, bs, g )
+            T_( v, Tko.KW_IIF, al ) : T_( v, Tko.TK_LPAREN, al )
+            if (t.Count = 0) andalso (g.Count = 0) then
+                Int_( p, v, 0, al ) : T_( v, Tko.TK_EQ, al ) : Int_( p, v, 0, al )
+            else
+                dim as Tko.TokenVec cond
+                AndInto_( cond, t, al )
+                AndInto_( cond, g, al )
+                Append_( v, cond )
+            end if
+            T_( v, Tko.TK_COMMA, al )
+            opens += 1
+        end if
+        T_( v, Tko.TK_LPAREN, al )
+        Subst_( p, ctx, arm.b0, arm.b1, bs, v )
+        T_( v, Tko.TK_RPAREN, al )
+        if a < ctx.arms.Count - 1 then T_( v, Tko.TK_COMMA, al )
+    next
+    for i as int32 = 1 to opens
+        T_( v, Tko.TK_RPAREN, at )
+    next
+    if ctx.arms.Count = 0 then Int_( p, v, 0, at )
+
+    Record_( p, ctx, "E" )
+    '' hoist + [hoistAt, mi) + v replaces [hoistAt, c + 2)
+    dim as Tko.TokenVec w
+    Append_( w, hoist )
+    Span_( p, w, hoistAt, mi )
+    Append_( w, v )
+    Splice_( p, hoistAt, c + 2, w )
+    return hoist.Count
+end function
+
+'' What a statement beginning with 'k' cannot hold a match expression in, or "".
+private function RefusedIn_( byval k as Tko.TokenKind ) as string
+    select case k
+    case Tko.KW_WHILE, Tko.KW_DO, Tko.KW_LOOP, Tko.KW_WEND
+        return "a loop condition: the subject would be evaluated once, before the loop"
+    case Tko.KW_SUB, Tko.KW_FUNCTION, Tko.KW_DECLARE, Tko.KW_TYPE, Tko.KW_ENUM, Tko.KW_PROPERTY, _
+         Tko.KW_OPERATOR, Tko.KW_CONSTRUCTOR, Tko.KW_DESTRUCTOR, Tko.KW_CONST, Tko.KW_UNION, _
+         Tko.KW_NAMESPACE, Tko.KW_EXTERN
+        return "a declaration"
+    end select
+    return ""
+end function
+
+'' ----------------------------------------------------------------------- the hook
+
+'' At the start of every statement (parser.tiko's Statement): a 'match' statement is rewritten
+'' whole; every 'match' expression in the statement's own tokens is rewritten in place, its
+'' subject's copy hoisted before the statement, left to right and outermost first.
+sub MatchRewrite( byref p as ParserState )
+    if p.matchNm = 0 then p.matchNm = Nm_( p, "match" )
+    dim as Tko.InternId nm = p.matchNm
+    dim as int32 s0 = p.pos
+    if K_( p, s0 ) = Tko.TK_IDENT then
+        dim as int32 j = HeadShape_( p, s0, nm )
+        if j >= 0 then
+            dim as int32 c = CloserOf_( p, j, nm )
+            if c = -2 then
+                p.diags->Report( Tko.TKO1241, Tko.PointRange( Loc_( p, s0 ) ) )
+                exit sub
+            end if
+            if c >= 0 then
+                dim as MatchCtx_ ctx
+                ctx.nmMatch = nm
+                ctx.nmStarts = Nm_( p, "starts" )
+                ctx.at = Loc_( p, s0 )
+                RewriteStmt_( p, ctx, s0, j, c )
+                exit sub
+            end if
+        end if
+    end if
+
+    dim as Tko.TokenKind head = K_( p, s0 )
+    dim as boolean ifHead = (head = Tko.KW_IF) orelse (head = Tko.KW_ELSEIF)
+    dim as int32 hoisted = 0
+    dim as int32 guard_ = 0
+    do
+        '' One pass over the statement's own tokens; the first head found is rewritten and the
+        '' pass starts again, the statement now 'hoisted' tokens further on.
+        dim as int32 st = s0 + hoisted
+        dim as int32 q = st
+        dim as int32 depth = 0
+        dim as boolean found = false
+        do
+            dim as Tko.TokenKind k = K_( p, q )
+            if k = Tko.TK_EOF then exit do
+            if (k = Tko.TK_IDENT) andalso (q > st) then
+                dim as int32 j = HeadShape_( p, q, nm )
+                if j >= 0 then
+                    dim as int32 c = CloserOf_( p, j, nm )
+                    if c = -2 then
+                        p.diags->Report( Tko.TKO1241, Tko.PointRange( Loc_( p, q ) ) )
+                        exit sub
+                    end if
+                    if c >= 0 then
+                        dim as string why = RefusedIn_( K_( p, st ) )
+                        if len( why ) then p.diags->Report( Tko.TKO1245, Tko.PointRange( Loc_( p, q ) ), why )
+                        dim as MatchCtx_ ctx
+                        ctx.nmMatch = nm
+                        ctx.nmStarts = Nm_( p, "starts" )
+                        ctx.at = Loc_( p, q )
+                        hoisted += RewriteExpr_( p, ctx, st, q, j, c )
+                        found = true
+                        exit do
+                    end if
+                end if
+            end if
+            if Opens_( k ) then depth += 1
+            if Closes_( k ) then depth -= 1
+            if depth <= 0 then
+                if k = Tko.TK_EOL then exit do
+                if ifHead andalso (k = Tko.KW_THEN) then exit do
+            end if
+            q += 1
+        loop
+        if found = false then exit do
+        guard_ += 1
+        if guard_ > 1000 then exit do
+    loop
+end sub
+
+end namespace

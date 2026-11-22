@@ -34,6 +34,8 @@ Returns the octal [`WString`](Wstring) (Unicode) representation of `number`. Oct
 
 The Unicode octal representation of the number, truncated or padded with zeros (`"0"`) to fit the number of digits, if specified.
 
+ **tiko:** `WOct` also takes an [`Int128` or `UInt128`](Category-Fixed-Width-Types#128-bit-integers), at full width: up to 43 digits.
+
 ## Remarks
 
 ### Usage

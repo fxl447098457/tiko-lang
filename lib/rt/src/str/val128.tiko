@@ -1,0 +1,107 @@
+'' val128.tiko -- text to tiko's int128 / uint128, for INPUT and READ (io/inputnum.tiko,
+'' data/read.tiko).
+''
+'' The fbc-family parsers stop at 64 bits, so this one is tiko's own: leading blanks, an
+'' optional sign, the '&h / &o / &b / &' prefixes the 64-bit parser takes, then digits,
+'' accumulated over four 32-bit limbs and WRAPPING past 128 bits as the 64-bit one wraps
+'' past 64. A float token -- INPUT says which -- is rounded to the nearest integer (rint),
+'' as INPUT rounds one into a LONGINT. Written WITHOUT int128 itself, so a runtime built by
+'' a compiler that predates the type still builds; the value goes out through a pointer
+'' to its two halves, low first.
+
+#include once "inc/descriptors.ti"
+
+'' (hi, lo) = (hi, lo) * m + d, modulo 2^128.
+private sub hMulAdd( byref hi as uint64, byref lo as uint64, byval m as uint32, byval d as uint32 )
+	dim as uint64 w(0 to 3)
+	w(0) = lo and &hFFFFFFFFull
+	w(1) = lo shr 32
+	w(2) = hi and &hFFFFFFFFull
+	w(3) = hi shr 32
+	dim as uint64 carry = d
+	for i as int32 = 0 to 3
+		dim as uint64 t = w(i) * m + carry
+		w(i) = t and &hFFFFFFFFull
+		carry = t shr 32
+	next
+	lo = w(0) or (w(1) shl 32)
+	hi = w(2) or (w(3) shl 32)
+end sub
+
+private sub hNeg( byref hi as uint64, byref lo as uint64 )
+	lo = not lo
+	hi = not hi
+	lo += 1
+	if( lo = 0 ) then hi += 1
+end sub
+
+extern "c"   '' NON-FBCALL: tiko-rt's own int128 helpers (tko_*), no fbc counterpart.
+
+'' A double, already rounded, to (lo, hi): exact for every double below 2^127 in
+'' magnitude; beyond it, or NaN, the type's minimum -- as the compiler converts one.
+sub tkort_Dbl2Int128 alias "tko_Dbl2Int128" ( byval d as float64, byval dst as uint64 ptr )
+	dim as boolean neg = (d < 0)
+	if( neg ) then d = -d
+	if( (d <> d) orelse (d >= 170141183460469231731687303715884105728.0) ) then
+		dst[0] = 0
+		dst[1] = &h8000000000000000ull
+		return
+	end if
+	dim as uint64 hi = cast( uint64, int( d / 18446744073709551616.0 ) )
+	dim as float64 rest = d - cast( float64, hi ) * 18446744073709551616.0
+	if( rest < 0 ) then rest = 0
+	dim as uint64 lo = 0
+	if( rest >= 9223372036854775808.0 ) then
+		lo = cast( uint64, cast( int64, rest - 9223372036854775808.0 ) ) or &h8000000000000000ull
+	else
+		lo = cast( uint64, cast( int64, rest ) )
+	end if
+	if( neg ) then hNeg( hi, lo )
+	dst[0] = lo
+	dst[1] = hi
+end sub
+
+sub tkort_hStr2Int128 alias "tko_hStr2Int128" _
+	( byval s as zstring ptr, byval length as integer, byval dst as uint64 ptr )
+
+	dim as uint8 ptr p = cptr( uint8 ptr, s )
+	dim as integer i = 0
+	while( (i < length) andalso ((p[i] = 32) orelse (p[i] = 9)) )
+		i += 1
+	wend
+	dim as boolean neg = false
+	if( i < length ) then
+		if( p[i] = asc( "-" ) ) then
+			neg = true
+			i += 1
+		elseif( p[i] = asc( "+" ) ) then
+			i += 1
+		end if
+	end if
+	dim as int32 radix = 10
+	if( (i + 1 < length) andalso (p[i] = asc( "&" )) ) then
+		select case as const p[i + 1]
+		case asc( "h" ), asc( "H" ) : radix = 16 : i += 2
+		case asc( "o" ), asc( "O" ) : radix = 8  : i += 2
+		case asc( "b" ), asc( "B" ) : radix = 2  : i += 2
+		case else                   : radix = 8  : i += 1
+		end select
+	end if
+	dim as uint64 lo = 0, hi = 0
+	while( i < length )
+		dim as int32 d = -1
+		dim as uint8 ch = p[i]
+		if( (ch >= 48) andalso (ch <= 57) ) then d = ch - 48
+		if( (ch >= 65) andalso (ch <= 70) ) then d = ch - 55
+		if( (ch >= 97) andalso (ch <= 102) ) then d = ch - 87
+		if( (d < 0) orelse (d >= radix) ) then exit while
+		hMulAdd( hi, lo, radix, d )
+		i += 1
+	wend
+	if( neg ) then hNeg( hi, lo )
+	dst[0] = lo
+	dst[1] = hi
+
+end sub
+
+end extern

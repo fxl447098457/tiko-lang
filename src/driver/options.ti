@@ -53,6 +53,11 @@ namespace Tko
     OPT( OPT_PRINTGRAPH, "--print-graph", OPTK_FLAG, OPTCAT_GENERAL, "",     "print the modules the inputs import, in build order, and stop" )
     '' ...and the interface an importer of a module reads (RFC-0004).
     OPT( OPT_EMITTKI,   "--emit-tki",     OPTK_FLAG, OPTCAT_GENERAL, "",     "print the interface of the module directory given, and stop" )
+    '' ...and its documentation, written as files ('tiko doc', driver/docmodel.tiko).
+    OPT( OPT_EMITDOC,   "--emit-doc",     OPTK_VALUE, OPTCAT_GENERAL, "dir", "write the documentation of the module directory given into <dir>, and stop ('tiko doc')" )
+    '' A TEST BUILD ('tiko test'): 'test' blocks are compiled and registered with std/testing, and a
+    '' module of the project's own package takes its '*_test.tiko' files (parser/testblock.tiko).
+    OPT( OPT_TEST,      "--test",         OPTK_FLAG, OPTCAT_GENERAL, "",     "compile 'test' blocks and '*_test.tiko' files and register them with std/testing ('tiko test')" )
     '' ...and the cache the modules a program imports are built into (RFC-0005 §4).
     OPT( OPT_FRONTEND,  "--frontend-only", OPTK_FLAG, OPTCAT_GENERAL, "",    "report every diagnostic a build would, through lowering; write no object, link nothing ('tiko check')" )
     OPT( OPT_NOMODCACHE, "--no-module-cache", OPTK_FLAG, OPTCAT_GENERAL, "",  "build imported modules without reading or writing the module cache" )
@@ -66,10 +71,16 @@ namespace Tko
     '' and then asserts that an interface reached only through a ComPtr still works,
     '' which is a question about the interface and not about the stripping. Rejecting it
     '' made that file an unknown-option error, which is the one answer fbc never gives.
-    OPT( OPT_EXTENDED,  "-z",         OPTK_VALUE, OPTCAT_GENERAL, "option",   "fbc extended option; accepted and ignored" )
+    ''
+    '' '-z nocmdline' IS THE EXCEPTION, and is fbc's: every '#cmdline' in the sources is
+    '' ignored with a warning (TKO0373), so a source cannot choose its own options.
+    OPT( OPT_EXTENDED,  "-z",         OPTK_VALUE, OPTCAT_GENERAL, "option",   "fbc extended option: 'nocmdline' ignores every #cmdline; any other is accepted and ignored" )
 
     OPT( OPT_INCLUDE,   "-i",         OPTK_VALUE, OPTCAT_INPUT,   "dir",      "add an include search path" )
     OPT( OPT_PKGDIR,    "--pkg-dir",  OPTK_VALUE, OPTCAT_INPUT,   "dir",      "the package tree for #import std/... is found in (else TIKO_PKG, else <exe-dir>/pkg)" )
+    '' THE ANONYMOUS PACKAGE'S ROOT, where no tiko.toml is found: otherwise the first root's directory.
+    '' 'tiko test' passes it, its generated main standing in out/test/ below the project.
+    OPT( OPT_PKGROOT,   "--package-root", OPTK_VALUE, OPTCAT_INPUT, "dir",     "the root of the package the inputs belong to when no tiko.toml names one" )
     OPT( OPT_DEFINE,    "-d",         OPTK_VALUE, OPTCAT_INPUT,   "name=val", "define a preprocessor symbol" )
     OPT( OPT_LIBPATH,   "-p",         OPTK_VALUE, OPTCAT_INPUT,   "dir",      "add a library search path" )
     OPT( OPT_LIB,       "-l",         OPTK_VALUE, OPTCAT_INPUT,   "name",     "link against a library" )
@@ -106,8 +117,11 @@ namespace Tko
     '' '-lib' whose objects go into a shared library later (tiko-rt's libfbpic.a).
     OPT( OPT_PIC,       "-pic",       OPTK_FLAG,  OPTCAT_OUTPUT,  "",         "position-independent code, for a Unix shared library (Linux only)" )
     OPT( OPT_MAINMOD,   "-m",         OPTK_VALUE, OPTCAT_OUTPUT,  "name",     "which module owns main; the others become module constructors" )
+    '' tiko's own, clang's spelling: AddressSanitizer -- use-after-free, double free, overflow and
+    '' a returned local's address, caught where they happen (codegen sanitize_address, clang's runtime).
+    OPT( OPT_SANITIZE,  "-fsanitize", OPTK_VALUE, OPTCAT_OUTPUT,  "address",  "instrument the program with AddressSanitizer (debugging builds; needs clang's runtime)" )
 
-    OPT( OPT_TARGET,    "-target",    OPTK_VALUE, OPTCAT_TARGET,  "name",     "windows-x86_64 (the Windows default), win64, win32, linux-x86_64 or macos-arm64" )
+    OPT( OPT_TARGET,    "-target",    OPTK_VALUE, OPTCAT_TARGET,  "name",     "windows-x86_64 (the Windows default), win64, win32, linux-x86_64, linux-arm64 or macos-arm64" )
     OPT( OPT_M64,       "-m64",       OPTK_FLAG,  OPTCAT_TARGET,  "",         "the 64-bit member of the target's family (the default width)" )
     OPT( OPT_M32,       "-m32",       OPTK_FLAG,  OPTCAT_TARGET,  "",         "the 32-bit member of the target's family; Windows only (win32)" )
     OPT( OPT_SUBSYS,    "-s",         OPTK_VALUE, OPTCAT_TARGET,  "console|gui", "Windows subsystem of an executable; console is the default" )
@@ -214,6 +228,12 @@ namespace Tko
         as boolean printCIncludes
         '' --emit-tki: check the module directory given, print its interface, stop.
         as boolean emitTki
+        '' --emit-doc <dir>: write the module directory's documentation into <dir>, stop.
+        as string emitDoc
+        '' --test: a test build -- see OPT_TEST.
+        as boolean testMode
+        '' --package-root <dir>: see OPT_PKGROOT.
+        as string packageRoot
         '' --no-module-cache: the imports are built every time, and nothing is stored.
         as boolean noModuleCache
         '' --clean-module-cache: every entry removed, and nothing else done.
@@ -280,6 +300,8 @@ namespace Tko
         as boolean compileOnly
         as boolean debugInfo
         as boolean threadSafe    '' -mt as WRITTEN; the link's answer is LinkThreadSafe( ctx )
+        '' -fsanitize=address. Not an errFlags bit: errFlags is __FB_ERR__, which fbc defines.
+        as boolean sanitizeAddress
         as boolean guiSubsystem  '' -s gui; console (false) is fbc's default too
         as int64   stackSize     '' -t, in BYTES: a Windows link's stack reserve and commit; 2 MB default
         as int32    optLevel
@@ -336,6 +358,7 @@ namespace Tko
         as boolean cNoCache
         as boolean noRpath        '' -norpath
         as boolean noCopyLibs     '' -nocopylibs
+        as boolean noCmdline      '' -z nocmdline: every '#cmdline' is warned about and dropped
         as string  cCacheDir
         as boolean dumpVtable
         as boolean dumpItable

@@ -37,6 +37,10 @@ procedural shape:
 - Run shows the main form, pumps until it closes or Quit, destroys every form and undoes
   Init, then returns the exit code.
 
+**Added (tk only):** the window's settings, which PsForm leaves to Win32 calls on its HWND --
+`tkForm_SetStartPosition`, `SetResizable`, `SetMinSize` / `SetMaxSize` (design units, re-applied on a
+scale change), `SetWindowState`, `SetAlwaysOnTop`, `SetIcon`, each with a getter.
+
 **Changed:**
 - **Fonts are files.** SDL_ttf cannot look up a face, so `TKAPP_OPTIONS` names files
   (`FontUIFile`, `FontUIBoldFile`, `GlyphFontFile`, `FontMonoFile`) inside `FontDir`. The

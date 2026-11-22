@@ -29,6 +29,7 @@ namespace Tko.CImport
 
 const CXType_ConstantArray_ = 112, CXType_IncompleteArray_ = 114, CXType_Record_ = 105
 const CXType_Char_S_ = 13, CXType_Char_U_ = 4, CXType_Elaborated_ = 119
+const CXType_Int128_ = 20, CXType_UInt128_ = 12
 const MAX_MEMBERS = 512
 const MAX_ANON_DEPTH = 8
 
@@ -87,6 +88,8 @@ type Build_
     as int32 members
     as int64 lastEnd         '' where C's last member ends, in bytes -- for the tail pad
     as int64 maxAlign        '' the widest member alignment, before any #pragma pack
+    as int64 natAlign        '' ...of the members' canonical types: no aligned typedef
+    as int64 has128          '' 16 when a member is an int128 (or an array of one), else 0
     as boolean hasBits       '' a bit-field among the members (tiko c2t's 'extern "c"')
     as Tko.StrVec seen         '' field names taken, upper-cased
 end type
@@ -217,10 +220,27 @@ end function
 '' A member's own alignment, into the record's natural one. Read per member, not per
 '' record: clang's record alignment is already capped by '#pragma pack', and telling the
 '' two apart is what says whether the record was packed.
+''
+'' 'natAlign' is the same over the CANONICAL type, which drops an alignment a typedef added:
+'' what a record's alignment is with no attribute, and so what tiko gives it. 'has128' is a
+'' floor of tiko's own alignment, for the tail pad: int128 is 16-aligned in tiko as in C.
 private sub MemberAlign_( byref x as CImp, byval ft as CXType, byref b as Build_ )
     dim as int64 a = x.api->Type_getAlignOf( ft )
     if a > b.maxAlign then b.maxAlign = a
+    dim as CXType ct = x.api->getCanonicalType( ft )
+    dim as int64 na = x.api->Type_getAlignOf( ct )
+    if na > b.natAlign then b.natAlign = na
+    while ct.kind = CXType_ConstantArray_
+        ct = x.api->getCanonicalType( x.api->getElementType( ct ) )
+    wend
+    if (ct.kind = CXType_Int128_) orelse (ct.kind = CXType_UInt128_) then b.has128 = 16
 end sub
+
+'' 'n' rounded up to a multiple of 'a'.
+private function RoundUp_( byval n as int64, byval a as int64 ) as int64
+    if a <= 1 then return n
+    return ((n + a - 1) \ a) * a
+end function
 
 '' The members of record 'rc', appended to b.body at indentation 'ind'. 'outerT' is the
 '' outermost named record's type, for offsets; 'outerName' names synthetic records.
@@ -289,6 +309,12 @@ private function Members_( byref x as CImp, byval rc as CXCursor, byval outerT a
                 dim as int32 w = x.api->getFieldDeclBitWidth( k )
                 if w <= 0 then
                     why = FieldWhy_( depth, cname, "zero-width bit-field has no FreeBASIC spelling" )
+                    return false
+                end if
+                '' A BIT-FIELD OF __int128 -- clang takes one -- is a type tiko refuses bit-fields of.
+                dim as CXType bct = x.api->getCanonicalType( ft )
+                if (bct.kind = CXType_Int128_) orelse (bct.kind = CXType_UInt128_) then
+                    why = FieldWhy_( depth, cname, "a bit-field of __int128 has no tiko spelling" )
                     return false
                 end if
                 dim as string w2
@@ -394,9 +420,11 @@ function RecordEmit( byref x as CImp, byval c as CXCursor, byref fbName as strin
     '' 'int a:30; int b:5' b at bit 30. A '#pragma pack' that changes no alignment is not
     '' visible here at all, and --verify refuses such a record if it moved a bit-field.
     dim as string head = iif( isUnion, "union ", "type " ) & fbName
-    if x.c2t andalso (align > 8) then
+    if x.c2t andalso (align > 8) andalso (align > b.natAlign) then
         '' tiko c2t REFUSES OVER-ALIGNMENT (RFC-0001 §5.1): its pad member would make sizeof
-        '' right and leave every instance wrongly aligned.
+        '' right and leave every instance wrongly aligned. ALIGNMENT PAST EIGHT IS NOT
+        '' OVER-ALIGNMENT when a member's own type asks for it: a record holding an __int128
+        '' is 16-aligned by C's rule and by tiko's.
         why = "over-aligned record (alignment " & align & ") has no tiko spelling"
         return false
     end if
@@ -415,8 +443,12 @@ function RecordEmit( byref x as CImp, byval c as CXCursor, byref fbName as strin
     ''
     '' The pad runs from where C's last member ends to clang's size. tiko lays the members
     '' out at C's offsets -- phase C checks that -- so the record then ends exactly at a
-    '' multiple of C's alignment, and tiko's own rounding to eight changes nothing.
-    if (align > 8) andalso (size > b.lastEnd) then
+    '' multiple of C's alignment, and tiko's own rounding changes nothing: tiko never
+    '' aligns a record past C. NONE IS WRITTEN WHERE tiko's ROUNDING ALREADY REACHES C's
+    '' SIZE -- 'has128' is a floor of tiko's alignment, so a record whose int128 makes it
+    '' 16-aligned ends where C's does. tiko c2t never pads: it refused over-alignment above,
+    '' and every record it writes is aligned as C's.
+    if (x.c2t = false) andalso (align > 8) andalso (size > RoundUp_( b.lastEnd, b.has128 )) then
         b.body.Push( chr( 9 ) & "__cimport_pad(0 to " & (size - b.lastEnd - 1) & ") as ubyte" )
     end if
 

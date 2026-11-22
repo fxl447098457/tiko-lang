@@ -24,7 +24,9 @@ The compiler is `tiko.exe` at the root. Beside it, `inc\` holds the headers and
 ```
 
 ```admonish info title="On Linux"
-The compiler is `bin/tiko`, with headers under `inc/` and libraries in `lib/linux-x86_64`.
+The compiler is `bin/tiko`, with headers under `inc/` and libraries in `lib/linux-x86_64`, or in
+`lib/linux-arm64` in the toolchain for arm64 (aarch64) Linux. That one runs with glibc 2.35 or
+newer: Ubuntu 22.04 or newer, Debian 12 or newer, Raspberry Pi OS bookworm (64-bit).
 ```
 
 ````admonish info title="On macOS"
@@ -57,7 +59,9 @@ bundled.
 
 On Windows, install the LLVM package; on Linux, your distribution's `clang` package; on macOS,
 Homebrew's (`brew install llvm`), together with Xcode's Command Line Tools
-(`xcode-select --install`), which hold the SDK and the linker every macOS link uses. Then check:
+(`xcode-select --install`), which hold the SDK and the linker every macOS link uses. Where the
+distribution's clang is older than 18 — Ubuntu 22.04, Debian 12, Raspberry Pi OS — install a
+`clang-NN` from apt.llvm.org and set `TIKO_CLANG=/usr/bin/clang-NN`. Then check:
 
 ```bash
 clang --version
@@ -158,12 +162,13 @@ every target — no guessing whether `int` is 32 or 64 bits today. Chapter 4 lis
 
 ## Choosing a target
 
-tiko builds for three targets, and the default is the machine you are on.
+tiko builds for four targets, and the default is the machine you are on.
 
 | Target | What it is | Default on |
 |---|---|---|
 | `windows-x86_64` | Microsoft's ABI, linked against `ucrtbase.dll` | Windows |
-| `linux-x86_64` | The System V ABI, linked against the system's C library | Linux |
+| `linux-x86_64` | The System V ABI, linked against the system's C library | x86-64 Linux |
+| `linux-arm64` | Linux's generic arm64 ABI (AAPCS64), linked against the system's C library | arm64 Linux |
 | `macos-arm64` | Apple's arm64 ABI, linked by Apple's linker against the macOS SDK | macOS |
 
 Name one explicitly with `-target`:
@@ -278,8 +283,9 @@ toolchain from source, which this chapter does not.
 - Source files are `.tiko`; headers you write are `.ti`.
 - `tiko hello.tiko -o hello` compiles and links in one step; `-c` stops at the object file and `-v`
   shows every command.
-- Three targets: `windows-x86_64` (the Windows default, and no Visual Studio needed),
-  `linux-x86_64` (the Linux default) and `macos-arm64` (the macOS default). Objects from different
+- Four targets: `windows-x86_64` (the Windows default, and no Visual Studio needed),
+  `linux-x86_64` and `linux-arm64` (the Linux defaults, by architecture) and `macos-arm64` (the
+  macOS default). Objects from different
   targets do not link together.
 - Diagnostics carry stable `TKOnnnn` identifiers; `--diagnostics-format gnu` suits tools, and
   `-Werror` suits discipline.

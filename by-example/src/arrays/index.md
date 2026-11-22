@@ -39,6 +39,9 @@ An empty array's `ubound` is below its `lbound`, so its count is 0 and a loop
 over it runs zero times. [Dynamic arrays](dynamic.md) covers `redim` and the
 rest.
 
+`a( lo to hi )` names part of an array without copying it;
+[Array slices](slices.md) shows it.
+
 ### Activities
 
 1. Print every month with 31 days by its number.

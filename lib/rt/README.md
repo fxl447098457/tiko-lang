@@ -47,6 +47,11 @@ build/gate.sh win64              # the real thing: fbc's 2,715-file suite
 build/bench.sh win64             # C-libfb vs FB-libfb, the actual question
 ```
 
+Console bytes on a real terminal (COLOR, LOCATE, CLS write nothing to a redirected stdout,
+so the gates above cannot see them) are pinned against fbc's by
+`build/ptylane.sh [linux-x86_64] [macos-arm64]`: `tests/pty/*.bas` under a pty with
+`TERM=xterm-256color`, in WSL and on the Mac.
+
 `gate.sh --baseline` comes first and matters most. A harness that cannot
 reproduce fbc's published numbers with fbc's own runtime cannot judge a change
 to it.

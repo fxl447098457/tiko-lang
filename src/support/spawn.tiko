@@ -28,6 +28,8 @@
         declare function GetExitCodeProcess_ alias "GetExitCodeProcess" _
             ( byval h as any ptr, byval code as uint32 ptr ) as int32
         declare function CloseHandle_ alias "CloseHandle" ( byval h as any ptr ) as int32
+        declare function TerminateProcess_ alias "TerminateProcess" ( byval h as any ptr, _
+            byval code as uint32 ) as int32
         declare function GetStdHandle_ alias "GetStdHandle" ( byval n as uint32 ) as any ptr
         declare function CreateFileW_ alias "CreateFileW" ( byval name_ as wstring ptr, _
             byval access_ as uint32, byval share as uint32, byval sec as any ptr, _
@@ -51,6 +53,7 @@
         declare sub exit__ alias "_exit" ( byval code as int32 )
         declare function waitpid_ alias "waitpid" ( byval pid as int32, byval status as int32 ptr, _
                                                     byval options as int32 ) as int32
+        declare function kill_ alias "kill" ( byval pid as int32, byval sig as int32 ) as int32
     end extern
 #else
     #error "support/spawn.tiko: no process spawning for this target"
@@ -117,13 +120,25 @@ function QuoteArg( byref s as string ) as string
     return r & string( bs * 2, 92 ) & """"
 end function
 
-function Start( byref exe as string, byref args as string, byval quiet as boolean = false ) as Proc
+#ifdef __FB_WIN32__
+'' A UTF-8 string as a fresh UTF-16 one, for the W entry points; null when it cannot be.
+private function Wide_( byref s as string ) as wstring ptr
+    dim as int32 need = MultiByteToWideChar_( 65001, 0, strptr( s ), len( s ), nullptr, 0 )
+    if need <= 0 then return nullptr
+    dim as wstring ptr w = callocate( (need + 1) * 2 )
+    MultiByteToWideChar_( 65001, 0, strptr( s ), len( s ), w, need )
+    return w
+end function
+#endif
+
+'' Start and StartLogged: 'quiet' sends the child's output to NUL, a non-empty 'logPath' to
+'' that file; neither, the parent's own handles.
+private function Start_( byref exe as string, byref args as string, byval quiet as boolean, _
+                         byref logPath as string ) as Proc
 #ifdef __FB_WIN32__
     dim as string cmd = """" & exe & """ " & args
-    dim as int32 need = MultiByteToWideChar_( 65001, 0, strptr( cmd ), len( cmd ), nullptr, 0 )
-    if need <= 0 then return 0
-    dim as wstring ptr w = callocate( (need + 1) * 2 )
-    MultiByteToWideChar_( 65001, 0, strptr( cmd ), len( cmd ), w, need )
+    dim as wstring ptr w = Wide_( cmd )
+    if w = nullptr then return 0
     dim as STARTUPINFOW_ si
     si.cb = sizeof( STARTUPINFOW_ )
     '' THE SAME STANDARD HANDLES, so clang's own messages land where tiko's do -- a pipe or
@@ -134,12 +149,23 @@ function Start( byref exe as string, byref args as string, byval quiet as boolea
     si.hStdError = GetStdHandle_( &hFFFFFFF4ul )
     '' ...OR NUL, for a child whose output nobody reads: an inheritable handle on the NUL
     '' device, GENERIC_WRITE, shared, OPEN_EXISTING, closed here once the child holds it.
+    '' ...OR A LOG FILE, the same way: CREATE_ALWAYS, shared for reading and writing so the
+    '' parent can read it while the child appends.
     dim as any ptr hNul = nullptr
-    if quiet then
+    if quiet orelse (len( logPath ) > 0) then
         dim as SECURITY_ATTRIBUTES_ sa
         sa.nLength = sizeof( SECURITY_ATTRIBUTES_ )
         sa.bInheritHandle = 1
-        hNul = CreateFileW_( "NUL", &h40000000ul, 3, @sa, 3, 0, nullptr )
+        if len( logPath ) > 0 then
+            dim as wstring ptr lw = Wide_( logPath )
+            hNul = cast( any ptr, -1 )
+            if lw then
+                hNul = CreateFileW_( lw, &h40000000ul, 3, @sa, 2, &h80, nullptr )
+                deallocate( lw )
+            end if
+        else
+            hNul = CreateFileW_( "NUL", &h40000000ul, 3, @sa, 3, 0, nullptr )
+        end if
         if hNul <> cast( any ptr, -1 ) then
             si.hStdOutput = hNul
             si.hStdError = hNul
@@ -165,7 +191,11 @@ function Start( byref exe as string, byref args as string, byval quiet as boolea
     dim as int32 pid = fork_( )
     if pid = 0 then
         '' ...or /dev/null, for a child whose output nobody reads.
-        if quiet then Tko.HostPosix.QuietStdio( )
+        if len( logPath ) > 0 then
+            Tko.HostPosix.RedirectStdio( strptr( logPath ) )
+        elseif quiet then
+            Tko.HostPosix.QuietStdio( )
+        end if
         execvp_( argv[0], argv )
         exit__( 127 )
     end if
@@ -174,6 +204,53 @@ function Start( byref exe as string, byref args as string, byval quiet as boolea
     return cast( Proc, pid )
 #endif
 end function
+
+function Start( byref exe as string, byref args as string, byval quiet as boolean = false ) as Proc
+    return Start_( exe, args, quiet, "" )
+end function
+
+function StartLogged( byref exe as string, byref args as string, byref logPath as string ) as Proc
+    return Start_( exe, args, false, logPath )
+end function
+
+function WaitFor( byval p as Proc, byval ms as int32, byref code as int32 ) as boolean
+    code = -1
+    if p = 0 then return true
+#ifdef __FB_WIN32__
+    if ms < 0 then ms = 0
+    if WaitForSingleObject_( cast( any ptr, p ), cast( uint32, ms ) ) = &h102 then return false
+    code = Wait( p )                       '' signalled: collects the code, closes the handle
+    return true
+#else
+    '' waitpid( WNOHANG, which is 1 on Linux and macOS ), polled every 20 ms up to 'ms'.
+    dim as float64 deadline = timer + ms / 1000.0
+    do
+        dim as int32 status = 0
+        dim as int32 r = waitpid_( cast( int32, p ), @status, 1 )
+        if r = cast( int32, p ) then
+            if (status and &h7F) <> 0 then
+                code = -1                  '' killed by a signal
+            else
+                code = (status shr 8) and &hFF
+            end if
+            return true
+        end if
+        if r < 0 then return true          '' not ours, or already reaped: -1
+        if timer >= deadline then return false
+        sleep 20, 1
+    loop
+#endif
+end function
+
+sub Kill( byval p as Proc )
+    if p = 0 then exit sub
+#ifdef __FB_WIN32__
+    TerminateProcess_( cast( any ptr, p ), 1 )
+#else
+    kill_( cast( int32, p ), 9 )
+#endif
+    Wait( p )
+end sub
 
 function Wait( byval p as Proc ) as int32
     if p = 0 then return -1

@@ -62,6 +62,8 @@ function FixedWidthBuiltin( byref nm as string ) as BuiltinType
     case "uint32"  : return TY_ULONG
     case "int64"   : return TY_LONGINT
     case "uint64"  : return TY_ULONGINT
+    case "int128"  : return TY_INT128
+    case "uint128" : return TY_UINT128
     case "float32" : return TY_SINGLE
     case "float64" : return TY_DOUBLE
     end select
@@ -101,6 +103,8 @@ function HostTarget( ) as TargetId
         return TARGET_WINDOWS_X86_64
     #elseif defined( __FB_DARWIN__ )
         return TARGET_MACOS_ARM64
+    #elseif defined( __FB_LINUX__ ) and defined( __FB_ARM__ )
+        return TARGET_LINUX_ARM64
     #elseif defined( __FB_LINUX__ )
         return TARGET_LINUX_X86_64
     #else
@@ -126,6 +130,7 @@ function TargetName( byval t as TargetId ) as string
     case TARGET_LINUX_X86_64    : return "linux-x86_64"
     case TARGET_WINDOWS_X86_64  : return "windows-x86_64"
     case TARGET_MACOS_ARM64     : return "macos-arm64"
+    case TARGET_LINUX_ARM64     : return "linux-arm64"
     case TARGET_WIN32           : return "win32"
     end select
     TargetIce( "TargetName", t )
@@ -139,6 +144,7 @@ function TargetFromName( byval nm as string, byref ok as boolean ) as TargetId
     if s = "windows-x86_64" then return TARGET_WINDOWS_X86_64
     if s = "linux-x86_64" then return TARGET_LINUX_X86_64
     if s = "macos-arm64" then return TARGET_MACOS_ARM64
+    if s = "linux-arm64" then return TARGET_LINUX_ARM64
     '' win32's fbc spelling, as win64 is fbc's for TARGET_WIN64. 'windows-x86' is
     '' accepted beside it so that the name parallels 'windows-x86_64' where a
     '' script spells the whole thing out.
@@ -162,8 +168,8 @@ end function
 function TargetOs( byval t as TargetId ) as TargetOsKind
     select case t
     case TARGET_WIN64, TARGET_WINDOWS_X86_64, TARGET_WIN32 : return OS_WINDOWS
-    case TARGET_LINUX_X86_64                              : return OS_LINUX
-    case TARGET_MACOS_ARM64                               : return OS_DARWIN
+    case TARGET_LINUX_X86_64, TARGET_LINUX_ARM64           : return OS_LINUX
+    case TARGET_MACOS_ARM64                                : return OS_DARWIN
     end select
     TargetIce( "TargetOs", t )
     return OS_WINDOWS
@@ -172,7 +178,7 @@ end function
 function TargetArch( byval t as TargetId ) as TargetArchKind
     select case t
     case TARGET_WIN64, TARGET_WINDOWS_X86_64, TARGET_LINUX_X86_64 : return ARCH_X86_64
-    case TARGET_MACOS_ARM64                                       : return ARCH_ARM64
+    case TARGET_MACOS_ARM64, TARGET_LINUX_ARM64                   : return ARCH_ARM64
     case TARGET_WIN32                                             : return ARCH_X86_32
     end select
     TargetIce( "TargetArch", t )
@@ -214,6 +220,8 @@ function TargetLayoutFor( byval t as TargetId ) as TargetLayout
         r.cvaListBytes = 24
         r.cvaListAlign = 8
         r.cvaListIsPointer = false
+        '' ...and an ARRAY of one, so a byval one decays to a pointer (TargetLayout).
+        r.cvaListIsArray = true
     case TARGET_WIN64, TARGET_WINDOWS_X86_64
         r.pointerBits = 64
         r.wcharBytes = 2
@@ -249,6 +257,19 @@ function TargetLayoutFor( byval t as TargetId ) as TargetLayout
         r.cvaListBytes = 8
         r.cvaListAlign = 8
         r.cvaListIsPointer = true
+    case TARGET_LINUX_ARM64
+        '' MEASURED in the Lima VM, clang 23.1.6 for 'aarch64-unknown-linux-gnu'
+        '' (docs/tiko-linux-arm64 FEASIBILITY section 1): LP64, a 4-byte wchar_t, va_list the
+        '' AAPCS64 record { __stack, __gr_top, __vr_top, __gr_offs, __vr_offs } -- 32 bytes,
+        '' 8-aligned, NOT a pointer -- and plain char UNSIGNED (__CHAR_UNSIGNED__ 1).
+        r.pointerBits = 64
+        r.wcharBytes = 4
+        r.stringBytes = 24
+        r.stringAlign = 8
+        r.cvaListBytes = 32
+        r.cvaListAlign = 8
+        r.cvaListIsPointer = false
+        r.charSigned = false
     case else
         TargetIce( "TargetLayoutFor", t )
     end select
@@ -435,6 +456,16 @@ function TypeContext.IsDynArray( byval t as TypeId ) as boolean
     if t = TYPE_NONE then return false
     if this.Kind( t ) <> TK_ARRAY then return false
     return (this.types[cast( int32, t )].dims < 0)
+end function
+
+'' See type.ti. The parameter's own const is not the question: 'byval as const cva_list'
+'' decays the same way, and fbc mangles it the same way.
+function TypeContext.CvaListDecays( byval t as TypeId ) as boolean
+    if this.target.cvaListIsArray = false then return false
+    if t = TYPE_NONE then return false
+    dim as TypeId u = this.Unqualify( t )
+    if this.Kind( u ) <> TK_BUILTIN then return false
+    return (this.BuiltinOf( u ) = TY_CVA_LIST)
 end function
 
 function TypeContext.DynRank( byval t as TypeId ) as int32
@@ -909,6 +940,13 @@ function TypeContext.Layout( byval t as TypeId ) as TypeLayout
             r.align = 2
             return r
         end if
+        '' INT128 IS 16-ALIGNED PAST maxAlign, as clang's __int128 is (see type.ti). maxAlign
+        '' itself stays 8: it also sets every aggregate's alignment.
+        if (b = TY_INT128) orelse (b = TY_UINT128) then
+            r.size = 16
+            r.align = 16
+            return r
+        end if
         select case BuiltinClass( b )
         case TC_INTPTR
             r.size = ptrBytes
@@ -1064,6 +1102,7 @@ function TypeContext.Name( byval t as TypeId ) as string
                 wend
                 if ok then
                     dim as string bn = left( ks, lt - 1 )
+                    if lcase( bn ) = "__tko_span" then bn = "span"    '' an array slice (RFC-0003)
                     for k as integer = 1 to len( bn )
                         if mid( bn, k, 1 ) = "#" then mid( bn, k, 1 ) = "."
                     next

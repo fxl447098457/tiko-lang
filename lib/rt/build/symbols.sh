@@ -63,6 +63,9 @@ for target in $TARGETS; do
     for sym in $("$TKORT_NM" --defined-only "$ours" 2>/dev/null \
                  | awk '($2=="T"||$2=="D"||$2=="B"||$2=="R") && $3 !~ /^[.]/{print $3}' | sort -u); do
         checked=$((checked + 1))
+        # tiko's OWN entry points -- int128's tko_Int128ToStr and friends -- have no fbc
+        # counterpart by construction: the 'tko_' prefix is reserved for them, and only them.
+        case "$sym" in tko_*) continue ;; esac
         if ! grep -qx "$sym" "$RT_ROOT/obj/.ref.$target"; then
             echo "symbols: $target: '$sym' is not defined by fbc's libfb.a" >&2
             # The likeliest cause, named rather than left to be worked out.

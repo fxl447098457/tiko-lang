@@ -120,6 +120,8 @@ Swap the last two lines and the program compiles: `v` has been read for the last
 | `input`, `line input` into it | writes through a writable slice of it |
 | passing it `byref` to a parameter that is not `const` | reading it, passing it `byval`, `byref as const`, or as a slice |
 
+An **array slice** (`span( of T )`, [Array Slices](Category-Array-Slices), after tiko 0.1.5) follows every rule on this page. Its own lock is on a **dynamic array**: `redim`, `redim preserve`, `erase`, and passing the array to a `b( )` parameter are refused while a span of it is still to be read; a fixed array is never locked. A string slice of an element of a dynamic string array, `q( 1 )[0 to 2]`, is locked by the same four.
+
 **Loops**: a slice read in a loop body is read again by the next iteration, so a write later in the same body counts as before that read — `TKO1062`, unless the slice is pointed at new text first.
 
 The lock is worked out within one procedure, in source order:

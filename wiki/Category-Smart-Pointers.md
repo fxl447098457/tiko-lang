@@ -247,7 +247,7 @@ These three deliberately do not offer the full C11 memory-order vocabulary. They
 
 The cost is a real call per operation, since they cannot inline into tiko code. That is the trade: correct and portable now, faster later.
 
-They are declared with C `int`, not C `long`. C `long` is 64-bit on LP64 and 32-bit on Windows, while tiko's LONG is 32-bit everywhere -- getting this wrong is invisible on windows-x86_64 and silently corrupts the adjacent field on linux-x86_64.
+They are declared with C `int`, not C `long`. C `long` is 64-bit on LP64 and 32-bit on Windows, while tiko's LONG is 32-bit everywhere -- getting this wrong is invisible on windows-x86_64 and silently corrupts the adjacent field on linux-x86_64 and linux-arm64.
 
 ## Tests
 

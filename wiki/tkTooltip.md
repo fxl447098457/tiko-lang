@@ -70,25 +70,220 @@ at create and `tkTipHost_Destroy( @st )` when the control is destroyed. Delays s
 when it does. `tkTipHost_TrackShow` / `tkTipHost_TrackHide` show text at once against a
 rectangle, skipping the hover delay, for a tip that the control drives itself.
 
-## Coming from PsTooltip and PsTipHost
+## Concepts
 
-[PsTooltip](PsTooltip) remains the behaviour reference for everything not listed here.
+### It sizes and places itself
 
-- Names: `PsTooltip_*` → `tkTooltip_*`, `PSTOOLTIP_*` → `TKTOOLTIP_*`, `PsTipHost_*` →
-  `tkTipHost_*`, `PSTIPHOST_STATE` → `TKTIPHOST_STATE`. `TIP_STYLE_*`, `TIP_ALIGN_*` and
-  `TIP_PART_*` keep their names; the `TTDT_*` delay selectors are `TK_TIPDELAY_*`.
-- The handle is `TK_TIP ptr`; fonts are `TTF_Font ptr` (`tkTooltip_SetFonts( tip, fText [,
-  fTitle [, fGlyph]] )`); colours are `ulong`.
-- `tkTooltip_ShowForRect` takes a rectangle in the attached widget's coordinates, not screen
-  coordinates.
-- There is one backend, owner-drawn. `PsTipHost`'s `PSTIP_MODE_*` constants, the controls'
-  `SetTooltipMode` / `GetTooltipMode` and the system tooltip handle have no equivalent.
-- The delays default to 500, 5000 and 100 ms (initial, auto-pop, reshow).
-- The tip window is not click-through. It is placed clear of the cursor, and moving onto it
-  leaves the control and hides it.
-- On Wayland the fade is skipped and the tip appears at once, and the compositor keeps it on
-  screen.
-- Gone: the message callback and `GetSystemFont`.
+A tip is not a rectangle you lay out. Its **size** comes from its content (text, title, glyph,
+padding, border, stem band) and its **position** from the cursor or from an anchor rectangle you
+pass to `tkTooltip_ShowForRect`, in the attached widget's coordinates. Placement is clamped into
+the work area of the display (`tkHost_WorkRect`), and when there is no room below the anchor the
+tip **flips above it** rather than being pushed up over it. The tip window is not click-through:
+at the cursor it is placed clear of the pointer, and moving onto it leaves the widget and hides
+it. On Wayland the compositor does the clamping.
+
+`tkTooltip_GetIdealSize` and `tkTooltip_GetPartRect( tip, TIP_PART_* )` report the size and the
+regions for the current content. Both resolve the text first if it has not been, which can run
+your tooltip callback.
+
+### Size formula
+
+```
+contentW = max( titleRow, message )
+    titleRow = glyphCell + (glyphGap if both a glyph and a title) + title
+    message  = wrapped to (maxWidth - 2*padX - 2*border) when a max width is set,
+               natural width otherwise
+
+width  = contentW + 2*padX + 2*border
+height = titleRowHeight + (titleGap if both bands present) + messageHeight
+         + 2*padY + 2*border
+         + stemHeight   (TIP_STYLE_BALLOON only)
+```
+
+`tkTooltip_SetMaxWidth` bounds the message wrap; 0 turns wrapping off, so only line breaks in the
+text break lines. The width is a `max()` over the bands, so a title longer than the cap
+legitimately makes the tip wider rather than being clipped.
+
+### The glyph cell is declared, not measured
+
+`tkTooltip_SetGlyphCell( tip, cell, gap )` states how much room the icon gets. Nothing is
+measured, so a glyph missing from the font, or a different size from the last one, cannot shift
+the text. The gap is spent only when a title sits beside the glyph.
+
+### It watches the hover; it does not intercept your widget
+
+The tip watches its widget through a hidden, zero-size child of it, which carries the tip's clock
+and receives the widget's scale and theme changes and its destruction. Your widget's own
+messages are untouched. "Over" means the window's hot widget is the attached one or a descendant
+of it (or, while the mouse is captured, that the cursor is inside it). The clock runs only while
+the cursor is over an attached widget or a tip is up or fading, so an idle window costs nothing.
+
+The tip cannot see your widget's *items*. A per-item tip calls `tkTooltip_SetToolIndex( tip, idx )`
+as the hovered item changes (-1 for a whole-widget tip); a set to the current value costs nothing,
+so it is safe from every mouse move. A real change hides a visible tip at once and makes the next
+one a new offer.
+
+### Text resolution order
+
+1. `tkTooltip_SetText`: if it is non-empty, that is the text.
+2. Otherwise the tooltip callback, if one is set.
+3. Otherwise no tip appears.
+
+There is no fallback to the widget's caption: return it from the callback if you want it. Setting
+the text or the callback discards the resolved text, so the next show re-reads it.
+
+### When a tip shows and hides
+
+The cursor must rest on the widget, within the move tolerance, for the initial delay. A tip shown
+and dismissed a moment ago comes back after the shorter reshow delay instead. A tip that is up
+does not follow the cursor: moving within the widget neither moves nor dismisses it. It hides when
+the cursor leaves the widget, when a mouse button is pressed, when the tool index changes, or after
+the auto-pop delay (0: never). After a click or an auto-pop, the tip stays suppressed until the
+cursor leaves the widget and comes back.
+
+Shows and hides fade over the fade time (0: instant); a fade is interruptible, and a hide during a
+fade-in continues down from the current opacity. On Wayland the tip appears at once.
+
+### Programmatic and user-driven shows both notify
+
+`tkTooltip_Show` (at the cursor) and `tkTooltip_ShowForRect` skip the dwell, and the clock still
+auto-hides what they put up; `tkTooltip_Hide` hides with a fade. The show callback reports both
+kinds. Its showing edge is a veto: return FALSE and no tip appears, and no hiding edge follows.
+
+## Behaviour and limits
+
+- **Only one tip is visible at a time**, process-wide. Showing one hides any other.
+- **The stem is always vertical.** A tip goes above or below its anchor, never beside it.
+- **The stem is dropped, not shrunk, when it will not fit.** A tip too narrow to seat it clear of
+  the rounded corners draws as a plain rounded rectangle; so does a stem narrower than 2 or shorter
+  than 1.
+- **A refused show is not retried during the same hover.** Returning FALSE from the show callback,
+  or `""` from the tooltip callback, suppresses the tip until the cursor leaves, so a callback is
+  consulted once per hover. Changing the tool index clears the suppression.
+- **Fonts are borrowed.** A title or glyph font of 0 falls back to the text font, and with no text
+  font the host's default is used. Keep a font alive while any tip uses it.
+- **Timing is per tip.** Each tip has its own delays, fade time and move tolerance.
+- **The tip detaches itself when its widget is destroyed**, hiding first. `tkTooltip_Attach`
+  re-points a tip at another widget (hiding it first) and `tkTooltip_Detach` stops it watching; a
+  tip you created is yours to `tkTooltip_Destroy`.
+
+## Appearance
+
+| Setter | Behaviour |
+|---|---|
+| `tkTooltip_SetStyle` | `TIP_STYLE_RECT` or `TIP_STYLE_BALLOON`. The balloon adds the stem height to the tip and nothing to its width |
+| `tkTooltip_SetMaxWidth` | The wrap bound, above; 0 for no wrapping |
+| `tkTooltip_SetPadding( x, y )` | A negative value leaves that axis alone |
+| `tkTooltip_SetCurvature` | The corner **diameter**; negatives clamp to 0 (square) |
+| `tkTooltip_SetBorderWidth` | Negatives clamp to 0 (no frame). The pen is scaled when it is drawn, so do not pre-scale it |
+| `tkTooltip_SetStemSize( w, h )` | A negative value leaves that axis alone |
+| `tkTooltip_SetGlyphCell( cell, gap )` | A negative value leaves that field alone |
+| `tkTooltip_SetInitialDelay`, `SetAutoPopDelay`, `SetReshowDelay`, `SetFadeTime`, `SetMoveTolerance` | Milliseconds (pixels for the tolerance); negatives clamp to 0 |
+
+The geometry defaults (`TKTOOLTIP_DEFAULT_*`) are scaled when the tip is created; setters take
+pixels afterwards, so scale your literals with `tkHost_Scale`. When the host's scale changes, the
+tip rescales every stored size, the max width and the move tolerance, but not the border width.
+The delays default to 500, 5000 and 100 ms (initial, auto-pop, reshow) and the fade to
+`TKTOOLTIP_DEFAULT_FADEMS`.
+
+### Process-wide defaults
+
+A control creates its tip itself, so the way to style every tip is the defaults:
+`tkTooltip_SetDefaultColors`, `SetDefaultFonts`, `SetDefaultStyle`, `SetDefaultMaxWidth` and
+`SetDefaultDelays`, called once before the controls are created. Each is armed independently: a
+field never set keeps the tip's own default, and a negative argument to `SetDefaultDelays` leaves
+that delay alone, so "change only the hover time" is one call. `tkTooltip_ClearDefaults` disarms
+them all, and `tkTooltip_ApplyDefaults( tip )` applies the armed ones to an existing tip. Default
+fonts are borrowed by every tip created afterwards; they must outlive them all. Default colours are
+applied as set colours, so a tip given them does not follow theme changes.
+
+## Colours
+
+`TKTOOLTIP_COLORS` has five fields, one per surface; a tip is never interactive, so there are no
+hot, pressed or disabled variants. A tip takes its colours from the current theme and follows every
+theme change until `tkTooltip_SetColors` pins them; `tkTooltip_UnpinColors` hands it back to the
+theme and applies it at once. `tkTooltip_ThemeColors` gives the mapping as a value.
+
+| Field | Paints | Theme role |
+|---|---|---|
+| `BackColor` | The body fill and the stem's interior | `Popup` |
+| `BorderColor` | The frame and the stem's two sloped edges | `Border` |
+| `ForeColor` | The message | `PopupText` |
+| `TitleColor` | The title line | `TextStrong` |
+| `GlyphColor` | The icon glyph | `Accent` |
+
+The built-in painter draws, in order: the body fill, the frame, the stem fill, the stem edges, the
+glyph, the title (ellipsised if it must be) and the message. The stem is filled **after** the frame,
+reaching a little into the body, so the frame's edge does not cut across the stem's base and the
+balloon reads as one shape.
+
+## Callbacks
+
+All are optional; passing 0 clears one.
+
+### Tooltip
+
+```freebasic
+type TIP_TooltipCallbackFunc as function( byval hTooltip as TK_TIP ptr, byval hAttached as TK_WIDGET ptr, byval idx as long ) as ustring
+```
+
+Supplies the message on demand: consulted **only** when the tip has no text of its own, and only
+when a tip is about to appear. `idx` is the current tool index, or -1. Return `""` for no tip.
+
+### Show
+
+```freebasic
+type TIP_ShowCallbackFunc as function( byval hTooltip as TK_TIP ptr, byval hAttached as TK_WIDGET ptr, byval idx as long, byval bShowing as boolean ) as boolean
+```
+
+The showing edge runs after the text is resolved and the tip sized, before anything reaches the
+screen: return FALSE to suppress the tip for the rest of the hover. The hiding edge's result is
+ignored. Both edges fire for programmatic shows and hides; a vetoed show has no hiding edge.
+
+### Paint
+
+```freebasic
+type TIP_PaintCallbackSub as sub( byval p as TKTOOLTIP_PAINTINFO ptr )
+```
+
+Draws the whole tip instead of the built-in painter, through `p->b`. Nothing has been drawn when
+you are called: the window is transparent, and the body is the shape.
+
+- Paint the body against `p->rcBody`, not `p->rcClient`, which includes the stem band.
+- Draw the message with `p->nTextFlags` and the text font: the tip was sized by measuring with
+  both, and anything else clips.
+- Stroke a frame with an outline call (`PaintRoundOutline`); a border-rect primitive fills before
+  it strokes and erases what is beneath. `tkTooltip_CountRenderedTones` and
+  `tkTooltip_HashRenderedPart` render the tip offscreen through the real painter and read back one
+  `TIP_PART_*` rect, so you can check a painter: count tones in a part, or compare hashes across a
+  change (isolate the change: if it also resizes the tip, the part moves).
+
+| Field | Meaning |
+|---|---|
+| `hTooltip`, `hAttached` | The tip and the widget it serves |
+| `b` | The paint context for this repaint |
+| `rcClient` | The whole window, including the stem band |
+| `rcBody` | The rounded frame: `rcClient` less the stem band on whichever edge the stem leaves |
+| `rcGlyph` | The declared glyph cell; empty without a glyph |
+| `rcTitle` | The title span, out to the content's right edge; empty without a title |
+| `rcText` | The message span; empty without a message |
+| `ptStem(0 to 2)` | The stem's vertices: base, apex, base |
+| `bHasStem` | FALSE for `TIP_STYLE_RECT`, and when the stem does not fit |
+| `bStemOnTop` | TRUE when the tip is below its anchor and the stem points up |
+| `wszText` | The **resolved** message |
+| `wszTitle`, `wszGlyph` | The title and the glyph |
+| `nStyle`, `nCurvature`, `nBorderWidth` | The style, the corner diameter and the unscaled border width |
+| `nToolIndex` | -1 for a whole-widget tip |
+| `nTextFlags` | The `TK_DT_*` flags the message was measured with |
+
+### Pure helpers
+
+`tkTooltip_ComputeOrigin` (where a tip of a given size goes against an anchor, clamped and
+flipped), `tkTooltip_StemOnTop`, `tkTooltip_ComputeStem` (the stem's vertices, kept clear of the
+corners; FALSE when it does not fit), `tkTooltip_ComputeAlpha` (the fade ramp, 0 to 255) and
+`tkTooltip_ShouldShow` (the decision table) are the arithmetic behind placement and timing,
+exposed so you can predict it. `tkTooltip_TickForTest` drives one tick of the dwell, hide and fade
+state machine with injected inputs; it is for tests, not for application code.
 
 ## Public declarations
 
@@ -258,5 +453,4 @@ sub tkTipHost_SetDelay( byval pHost as TKTIPHOST_STATE ptr, byval nWhich as long
 ### See also
 
 - [tkControls](Category-tkControls)
-- [tkApp](tkApp), [tkHost](tkHost)
-- [PsTooltip](PsTooltip), the PsControls control
+- [tkApp](tkApp), [tkHost](tkHost), [tkTheme](tkTheme)

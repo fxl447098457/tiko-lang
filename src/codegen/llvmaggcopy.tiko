@@ -98,8 +98,10 @@ end sub
 private sub EmitAggShadows_( byref e as EmitCtx )
     for t as int32 = 0 to e.tempShadow.Count - 1
         if e.tempShadow[t] > 0 then
+            dim as int32 shAl = e.tgt->layout.maxAlign
+            if e.m->align16 andalso (e.tempShadow[t] >= 16) then shAl = 16     '' MirModule.align16
             Line( e, TempName( cast( uint32, t ) ) & ".agg = alloca [" & str( e.tempShadow[t] ) & " x i8], align " & _
-                     str( e.tgt->layout.maxAlign ) )
+                     str( shAl ) )
         end if
     next
 end sub
@@ -138,3 +140,162 @@ private function EmitAggCopy_( byref e as EmitCtx, byref b as MirBlock, byval i 
     AggMemcpy_( e, TempName( t ) & ".agg", ValStr( e, q->a ), sz )
     return 1
 end function
+
+'' 'cva_arg' ON GENERIC AAPCS64 (linux-arm64), written out as clang writes it -- EVERY type.
+'' LLVM's own 'va_arg' instruction is a SILENT MISCOMPILE on aarch64-linux: it compiles with no
+'' diagnostic and walks the 32-byte record as Darwin's 'char *' cursor, so 'sum(3, 40, 2,
+'' 100.0)' returned 281478578101908 (probed 2026-11-19, clang 23.1.6 in the Lima VM;
+'' docs/tiko-linux-arm64 FEASIBILITY 2.1). The record, from clang's own IR there:
+''
+''     { ptr __stack @0, ptr __gr_top @8, ptr __vr_top @16, i32 __gr_offs @24, i32 __vr_offs @28 }
+''
+'' gr_offs / vr_offs are NEGATIVE while register-save space is left: the value is at
+'' top + offs. clang's sequence, per class (clang-23 -O1 of a C va_arg):
+''
+''     GP 8     long, pointer   offs < 0 -> offs += 8 is STORED; if the new offs <= 0 read
+''                              gr_top + old offs, else the stack. Stack slot 8.
+''     GP 16    __int128        as GP 8, but offs is first rounded up to 16 and advances by
+''                              16; the stack pointer is aligned to 16 and advances by 16.
+''     VR       double (float)  vr_offs / vr_top, a 16-byte register slot; stack slot 8.
+''
+'' The store when offs went negative but did not fit is clang's too: once a class has spilled
+'' it stays on the stack. Branch-free, as SysV's int128 is: both addresses are formed and a
+'' select picks; when offs >= 0 the unchanged value is stored back. A float reads the slot's
+'' low four bytes, which is what LLVM's 'va_arg float' does on the other targets.
+private sub EmitVaArgAapcs64_ _
+    ( byref e as EmitCtx, byref res as string, byref ins as MirInst, byref ty as string, _
+      byref ap as string )
+
+    dim as string offsAt, topAt, step_, sstep, align_
+    dim as boolean wide = false
+    select case cast( MirType, ins.ty )
+    case MT_I64, MT_PTR
+        offsAt = "24" : topAt = "8"  : step_ = "8"  : sstep = "8"  : align_ = "8"
+    case MT_I128
+        offsAt = "24" : topAt = "8"  : step_ = "16" : sstep = "16" : align_ = "8"
+        wide = true
+    case MT_F64
+        offsAt = "28" : topAt = "16" : step_ = "16" : sstep = "8"  : align_ = "8"
+    case MT_F32
+        offsAt = "28" : topAt = "16" : step_ = "16" : sstep = "8"  : align_ = "4"
+    case else
+        Ice( e, "cva_arg on AAPCS64: no va_list class for MIR type " & str( ins.ty ) )
+        return
+    end select
+    dim as string base_ = res & ".o"
+    Line( e, res & ".op = getelementptr i8, ptr " & ap & ", i64 " & offsAt )
+    Line( e, res & ".o = load i32, ptr " & res & ".op, align 4" )
+    if wide then
+        Line( e, res & ".o15 = add i32 " & res & ".o, 15" )
+        Line( e, res & ".oal = and i32 " & res & ".o15, -16" )
+        base_ = res & ".oal"
+    end if
+    Line( e, res & ".neg = icmp slt i32 " & res & ".o, 0" )
+    Line( e, res & ".nw = add i32 " & base_ & ", " & step_ )
+    Line( e, res & ".fits = icmp slt i32 " & res & ".nw, 1" )
+    Line( e, res & ".inreg = and i1 " & res & ".neg, " & res & ".fits" )
+    Line( e, res & ".st = select i1 " & res & ".neg, i32 " & res & ".nw, i32 " & res & ".o" )
+    Line( e, "store i32 " & res & ".st, ptr " & res & ".op, align 4" )
+    Line( e, res & ".tp = getelementptr i8, ptr " & ap & ", i64 " & topAt )
+    Line( e, res & ".top = load ptr, ptr " & res & ".tp, align 8" )
+    Line( e, res & ".bz = sext i32 " & base_ & " to i64" )
+    Line( e, res & ".ra = getelementptr i8, ptr " & res & ".top, i64 " & res & ".bz" )
+    Line( e, res & ".sk = load ptr, ptr " & ap & ", align 8" )
+    dim as string stk = res & ".sk"
+    if wide then
+        Line( e, res & ".ski = ptrtoint ptr " & res & ".sk to i64" )
+        Line( e, res & ".ski15 = add i64 " & res & ".ski, 15" )
+        Line( e, res & ".skal = and i64 " & res & ".ski15, -16" )
+        Line( e, res & ".ska = inttoptr i64 " & res & ".skal to ptr" )
+        stk = res & ".ska"
+    end if
+    Line( e, res & ".nx = getelementptr i8, ptr " & stk & ", i64 " & sstep )
+    Line( e, res & ".addr = select i1 " & res & ".inreg, ptr " & res & ".ra, ptr " & stk )
+    Line( e, res & ".sn = select i1 " & res & ".inreg, ptr " & res & ".sk, ptr " & res & ".nx" )
+    Line( e, "store ptr " & res & ".sn, ptr " & ap & ", align 8" )
+    Line( e, res & " = load " & ty & ", ptr " & res & ".addr, align " & align_ )
+end sub
+
+'' 'cva_arg( ap, int128 )' ON SysV, written out as clang writes it. LLVM's own 'va_arg ... i128'
+'' is NOT the ABI there (probed 2026-11-19, LLVM 23: it fetches the halves separately, so one
+'' can come from the register save area and the other from the stack, and its overflow
+'' alignment is wrong) -- the C side's 'va_arg( ap, __int128 )' takes BOTH halves from the
+'' registers when two GP slots are left (gp_offset <= 32), else 16 bytes from the overflow
+'' area aligned to 16. Branch-free: both candidate addresses are formed and a select picks.
+'' Every other read, and every other target but linux-arm64, is the plain instruction -- but
+'' for one case.
+
+'' ...A SCALAR READ THROUGH A LIST THAT IS NOT A STACK SLOT of this procedure, on SysV: a
+'' byref cva_list parameter, a byval one (which decays to the caller's list -- TargetLayout.
+'' cvaListIsArray), or '*p'. LLVM's 'va_arg' is miscompiled there at -O0 (LLVM 23, measured
+'' 2026-11-19): X86's VAARG_64 expansion reads the list's address from a spill slot nothing
+'' wrote, 'mov -0x38(%rsp),%rcx', and the program segfaulted; -O1, or an alloca operand, is
+'' right. So it is clang's sequence again -- one eightbyte, from the register save area while
+'' gp_offset <= 40 (fp_offset <= 160 for a float, at 16 a slot), else from the overflow area.
+private sub EmitVaArgSlot_( byref e as EmitCtx, byref res as string, byref ap as string, _
+                            byref ty as string, byval isFp as boolean )
+    dim as string offAt = iif( isFp, "4", "0" )
+    dim as string lim = iif( isFp, "161", "41" )
+    dim as string stp = iif( isFp, "16", "8" )
+    Line( e, res & ".op = getelementptr i8, ptr " & ap & ", i64 " & offAt )
+    Line( e, res & ".o = load i32, ptr " & res & ".op, align 4" )
+    Line( e, res & ".inreg = icmp ult i32 " & res & ".o, " & lim )
+    Line( e, res & ".rsap = getelementptr i8, ptr " & ap & ", i64 16" )
+    Line( e, res & ".rsa = load ptr, ptr " & res & ".rsap, align 8" )
+    Line( e, res & ".oz = zext i32 " & res & ".o to i64" )
+    Line( e, res & ".ra = getelementptr i8, ptr " & res & ".rsa, i64 " & res & ".oz" )
+    Line( e, res & ".ofap = getelementptr i8, ptr " & ap & ", i64 8" )
+    Line( e, res & ".ofa = load ptr, ptr " & res & ".ofap, align 8" )
+    Line( e, res & ".addr = select i1 " & res & ".inreg, ptr " & res & ".ra, ptr " & res & ".ofa" )
+    Line( e, res & " = load " & ty & ", ptr " & res & ".addr, align 4" )
+    Line( e, res & ".o2 = add i32 " & res & ".o, " & stp )
+    Line( e, res & ".o3 = select i1 " & res & ".inreg, i32 " & res & ".o2, i32 " & res & ".o" )
+    Line( e, "store i32 " & res & ".o3, ptr " & res & ".op, align 4" )
+    Line( e, res & ".nx = getelementptr i8, ptr " & res & ".ofa, i64 8" )
+    Line( e, res & ".of2 = select i1 " & res & ".inreg, ptr " & res & ".ofa, ptr " & res & ".nx" )
+    Line( e, "store ptr " & res & ".of2, ptr " & res & ".ofap, align 8" )
+end sub
+
+sub EmitVaArg_( byref e as EmitCtx, byref res as string, byref ins as MirInst, byref ty as string )
+    dim as string ap = ValStr( e, ins.a )
+    '' linux-arm64: every type is clang's AAPCS64 sequence (EmitVaArgAapcs64_ above).
+    if e.tgt->abi = ABI_AAPCS64 then
+        EmitVaArgAapcs64_( e, res, ins, ty, ap )
+        return
+    end if
+    dim as MirType mt = cast( MirType, ins.ty )
+    if (e.tgt->abi = ABI_SYSV_AMD64) andalso (ins.a.kind <> cast( uint8, MV_LOCAL )) then
+        select case mt
+        case MT_I64, MT_PTR
+            EmitVaArgSlot_( e, res, ap, ty, false )
+            return
+        case MT_F64, MT_F32
+            EmitVaArgSlot_( e, res, ap, ty, true )
+            return
+        end select
+    end if
+    if (mt <> MT_I128) orelse (e.tgt->abi <> ABI_SYSV_AMD64) then
+        Line( e, res & " = va_arg ptr " & ap & ", " & ty )
+        return
+    end if
+    Line( e, res & ".gp = load i32, ptr " & ap & ", align 8" )
+    Line( e, res & ".inreg = icmp ult i32 " & res & ".gp, 33" )
+    Line( e, res & ".rsap = getelementptr i8, ptr " & ap & ", i64 16" )
+    Line( e, res & ".rsa = load ptr, ptr " & res & ".rsap, align 8" )
+    Line( e, res & ".gpz = zext i32 " & res & ".gp to i64" )
+    Line( e, res & ".ra = getelementptr i8, ptr " & res & ".rsa, i64 " & res & ".gpz" )
+    Line( e, res & ".ofap = getelementptr i8, ptr " & ap & ", i64 8" )
+    Line( e, res & ".ofa = load ptr, ptr " & res & ".ofap, align 8" )
+    Line( e, res & ".ofi = ptrtoint ptr " & res & ".ofa to i64" )
+    Line( e, res & ".ofi15 = add i64 " & res & ".ofi, 15" )
+    Line( e, res & ".ofal = and i64 " & res & ".ofi15, -16" )
+    Line( e, res & ".ma = inttoptr i64 " & res & ".ofal to ptr" )
+    Line( e, res & ".addr = select i1 " & res & ".inreg, ptr " & res & ".ra, ptr " & res & ".ma" )
+    Line( e, res & " = load i128, ptr " & res & ".addr, align 8" )
+    Line( e, res & ".gp2 = add i32 " & res & ".gp, 16" )
+    Line( e, res & ".gp3 = select i1 " & res & ".inreg, i32 " & res & ".gp2, i32 " & res & ".gp" )
+    Line( e, "store i32 " & res & ".gp3, ptr " & ap & ", align 8" )
+    Line( e, res & ".nx = getelementptr i8, ptr " & res & ".ma, i64 16" )
+    Line( e, res & ".of2 = select i1 " & res & ".inreg, ptr " & res & ".ofa, ptr " & res & ".nx" )
+    Line( e, "store ptr " & res & ".of2, ptr " & res & ".ofap, align 8" )
+end sub

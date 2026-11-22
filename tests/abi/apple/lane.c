@@ -2899,6 +2899,16 @@ static void c_call_hfaf( void ) {
     F2 s7; fill_F2( &s7, 3 );
     t_hfaf( 1, 2, 3, 4, 5, 6, 7, s7, 9 );
 }
+void c_p8hf( double a0, double a1, double a2, double a3, double a4, double a5, double a6, double a7, F3 a8, F3 a9, F1 a10, float a11, F3 a12 ) { calls++; ck_d( "c_p8hf", "a0", a0, 1 ); ck_d( "c_p8hf", "a1", a1, 2 ); ck_d( "c_p8hf", "a2", a2, 3 ); ck_d( "c_p8hf", "a3", a3, 4 ); ck_d( "c_p8hf", "a4", a4, 5 ); ck_d( "c_p8hf", "a5", a5, 6 ); ck_d( "c_p8hf", "a6", a6, 7 ); ck_d( "c_p8hf", "a7", a7, 8 ); ck_F3( "c_p8hf a8", &a8, 1 ); ck_F3( "c_p8hf a9", &a9, 1 ); ck_F1( "c_p8hf a10", &a10, 1 ); ck_d( "c_p8hf", "a11", a11, 12 ); ck_F3( "c_p8hf a12", &a12, 1 ); }
+void c_seen_p8hf( double a0, double a1, double a2, double a3, double a4, double a5, double a6, double a7, const F3 *a8, const F3 *a9, const F1 *a10, float a11, const F3 *a12 ) { calls++; ck_d( "t_p8hf, in tiko", "a0", a0, 1 ); ck_d( "t_p8hf, in tiko", "a1", a1, 2 ); ck_d( "t_p8hf, in tiko", "a2", a2, 3 ); ck_d( "t_p8hf, in tiko", "a3", a3, 4 ); ck_d( "t_p8hf, in tiko", "a4", a4, 5 ); ck_d( "t_p8hf, in tiko", "a5", a5, 6 ); ck_d( "t_p8hf, in tiko", "a6", a6, 7 ); ck_d( "t_p8hf, in tiko", "a7", a7, 8 ); ck_F3( "t_p8hf, in tiko a8", a8, 3 ); ck_F3( "t_p8hf, in tiko a9", a9, 3 ); ck_F1( "t_p8hf, in tiko a10", a10, 3 ); ck_d( "t_p8hf, in tiko", "a11", a11, 12 ); ck_F3( "t_p8hf, in tiko a12", a12, 3 ); }
+void t_p8hf( double a0, double a1, double a2, double a3, double a4, double a5, double a6, double a7, F3 a8, F3 a9, F1 a10, float a11, F3 a12 );
+static void c_call_p8hf( void ) {
+    F3 s8; fill_F3( &s8, 3 );
+    F3 s9; fill_F3( &s9, 3 );
+    F1 s10; fill_F1( &s10, 3 );
+    F3 s12; fill_F3( &s12, 3 );
+    t_p8hf( 1, 2, 3, 4, 5, 6, 7, 8, s8, s9, s10, 12, s12 );
+}
 void c_gpr7( long long a0, long long a1, long long a2, long long a3, long long a4, long long a5, long long a6, L2 a7, long long a8 ) { calls++; ck_i( "c_gpr7", "a0", a0, 1 ); ck_i( "c_gpr7", "a1", a1, 2 ); ck_i( "c_gpr7", "a2", a2, 3 ); ck_i( "c_gpr7", "a3", a3, 4 ); ck_i( "c_gpr7", "a4", a4, 5 ); ck_i( "c_gpr7", "a5", a5, 6 ); ck_i( "c_gpr7", "a6", a6, 7 ); ck_L2( "c_gpr7 a7", &a7, 1 ); ck_i( "c_gpr7", "a8", a8, 9 ); }
 void c_seen_gpr7( long long a0, long long a1, long long a2, long long a3, long long a4, long long a5, long long a6, const L2 *a7, long long a8 ) { calls++; ck_i( "t_gpr7, in tiko", "a0", a0, 1 ); ck_i( "t_gpr7, in tiko", "a1", a1, 2 ); ck_i( "t_gpr7, in tiko", "a2", a2, 3 ); ck_i( "t_gpr7, in tiko", "a3", a3, 4 ); ck_i( "t_gpr7, in tiko", "a4", a4, 5 ); ck_i( "t_gpr7, in tiko", "a5", a5, 6 ); ck_i( "t_gpr7, in tiko", "a6", a6, 7 ); ck_L2( "t_gpr7, in tiko a7", a7, 3 ); ck_i( "t_gpr7, in tiko", "a8", a8, 9 ); }
 void t_gpr7( long long a0, long long a1, long long a2, long long a3, long long a4, long long a5, long long a6, L2 a7, long long a8 );
@@ -2984,9 +2994,37 @@ void c_seen_va( int n, int a, long long b, double c, void *p ) {
     ck_i( "t_va", "ptr", (long long)p, (long long)&marker );
 }
 long long t_va( int n, ... );
+void c_seen_va2( int k, long long i, double d ) {
+    calls++; ck_i( "t_va2", "longint", i, 1000 + k ); ck_d( "t_va2", "double", d, k + 0.5 );
+}
+void c_seen_va128( long long lo, long long hi ) {
+    calls++; ck_i( "t_va2", "int128 lo", lo, 0x1122334455667788LL ); ck_i( "t_va2", "int128 hi", hi, -2 );
+}
+long long t_va2( int n, ... );
+void c_seen_va3( int k, long long i, double d ) {
+    calls++; ck_i( "t_va3", "longint", i, 2000 + k ); ck_d( "t_va3", "double", d, k + 0.25 );
+}
+static void c_vread_( int n, va_list ap ) {
+    calls++;
+    for( int k = 0; k < n; k++ ) {
+        ck_i( "t_va3 c_vread", "longint", va_arg( ap, long long ), 2000 + k );
+        ck_d( "t_va3 c_vread", "double", va_arg( ap, double ), k + 0.25 );
+    }
+}
+void c_vread( int n, va_list ap ) { c_vread_( n, ap ); }
+void c_vreadp( int n, va_list *ap ) { c_vread_( n, *ap ); }
+long long t_va3( int n, ... );
+void c_seen_va4( int k, long long i, double d ) {
+    calls++; ck_i( "t_va4", "longint", i, 3000 + k ); ck_d( "t_va4", "double", d, k + 0.75 );
+}
+long long t_vread4( int n, va_list ap );
+static long long c_va4( int n, ... ) {
+    va_list ap; va_start( ap, n ); long long r = t_vread4( n, ap ); va_end( ap ); return r;
+}
 
 void trun_all( void );
-#define EXPECTED_CALLS 497
+#define EXPECTED_CALLS 534
+#define VA2_Q ((__int128)-2 * ((__int128)1 << 64) + (__int128)0x1122334455667788LL)
 int main( void ) {
     trun_all( );
     c_call_C1( );
@@ -3057,6 +3095,7 @@ int main( void ) {
     c_call_MIX24( );
     c_call_hfa9( );
     c_call_hfaf( );
+    c_call_p8hf( );
     c_call_gpr7( );
     c_call_mix( );
     c_call_big( );
@@ -3070,6 +3109,9 @@ int main( void ) {
     ck_i( "t_ret_short", "result", t_ret_short( 131056 ), -16 );
     ck_i( "t_ret_ushort", "result", t_ret_ushort( 131056 ), 65520 );
     ck_i( "t_va", "result", t_va( 7, 11, 12LL, 13.5, &marker ), 99 );
+    ck_i( "t_va2", "result", t_va2( 12, 1000LL, 0.5, 1001LL, 1.5, 1002LL, 2.5, 1003LL, 3.5, 1004LL, 4.5, 1005LL, 5.5, VA2_Q, 1006LL, 6.5, 1007LL, 7.5, 1008LL, 8.5, 1009LL, 9.5, 1010LL, 10.5, 1011LL, 11.5 ), 77 );
+    ck_i( "t_va3", "result", t_va3( 10, 2000LL, 0.25, 2001LL, 1.25, 2002LL, 2.25, 2003LL, 3.25, 2004LL, 4.25, 2005LL, 5.25, 2006LL, 6.25, 2007LL, 7.25, 2008LL, 8.25, 2009LL, 9.25 ), 55 );
+    ck_i( "t_va4", "result", c_va4( 10, 3000LL, 0.75, 3001LL, 1.75, 3002LL, 2.75, 3003LL, 3.75, 3004LL, 4.75, 3005LL, 5.75, 3006LL, 6.75, 3007LL, 7.75, 3008LL, 8.75, 3009LL, 9.75 ), 44 );
     ck_i( "main", "calls", calls, EXPECTED_CALLS );
     printf( "aapcs lane: %d shapes, %d checks, %d failed\n", 66, checks, fails );
     return fails ? 1 : 0;

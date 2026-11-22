@@ -535,6 +535,28 @@ private function DigitValue( byval c as uint8 ) as int32
     return -1
 end function
 
+'' (hi, lo) = (hi, lo) * m + d, over four 32-bit limbs -- a literal is scanned at 128 bits for
+'' tiko's int128 (littype.tiko). 'over' is set when the value passes 2^128 - 1.
+private sub MulAdd128_ _
+    ( byref hi as uint64, byref lo as uint64, byval m as uint32, byval d as uint32, byref over as boolean )
+    dim as uint64 w(0 to 3) = { lo and &hFFFFFFFFull, lo shr 32, hi and &hFFFFFFFFull, hi shr 32 }
+    dim as uint64 carry = d
+    for i as int32 = 0 to 3
+        dim as uint64 t = w(i) * m + carry
+        w(i) = t and &hFFFFFFFFull
+        carry = t shr 32
+    next
+    if carry <> 0 then over = true
+    lo = w(0) or (w(1) shl 32)
+    hi = w(2) or (w(3) shl 32)
+end sub
+
+'' IS THIS SUFFIX AN INTEGER WIDTH? Then a value past 64 bits is fbc's warning 8 and keeps fbc's
+'' 64-bit answer; with none, the literal is tiko's int128 instead.
+private function IntSuffix_( byval sf as Tko.NumSuffix ) as boolean
+    return (sf <> Tko.NSUF_NONE) andalso (sf <> Tko.NSUF_SINGLE) andalso (sf <> Tko.NSUF_DOUBLE)
+end function
+
 '' &H &O &B and the bare-& octal form.
 private sub ScanRadixLiteral( byref s as Scanner, byval first as int32 )
     s.i += 1                                    '' past '&'
@@ -549,14 +571,13 @@ private sub ScanRadixLiteral( byref s as Scanner, byval first as int32 )
         end select
     end if
 
-    dim as uint64 value = 0
+    dim as uint64 value = 0, valueHi = 0
     dim as int32 digits = 0
     dim as boolean over = false
     while s.i < s.n
         dim as int32 d = DigitValue( s.p[s.i] )
         if (d < 0) orelse (d >= radix) then exit while
-        if value > ((&hFFFFFFFFFFFFFFFFull - d) \ radix) then over = true
-        value = value * radix + d
+        MulAdd128_( valueHi, value, radix, d, over )    '' the low 128 bits, as the 64 wrapped
         digits += 1
         s.i += 1
     wend
@@ -566,20 +587,26 @@ private sub ScanRadixLiteral( byref s as Scanner, byval first as int32 )
         Emit( s, Tko.TK_INVALID, first )
         return
     end if
-    if over then Report( s, Tko.TKO0205, first )
-
     dim as Tko.Literal lit
     lit.kind = cast( uint8, Tko.TK_INT_LIT )
     lit.radix = cast( uint8, radix )
     lit.intValue = value
     lit.suffix = cast( uint8, ScanNumSuffix( s, false, true ) )
+    '' PAST 64 BITS WITH AN INTEGER SUFFIX keeps the low 64, as before, with the warning.
+    if (valueHi <> 0) andalso IntSuffix_( cast( Tko.NumSuffix, lit.suffix ) ) then
+        over = true
+        valueHi = 0
+    end if
+    lit.intHi = valueHi
+    if over then Report( s, Tko.TKO0205, first )
     '' A FLOAT SUFFIX MAKES IT A FLOAT, whatever the radix: '&h3d!' is a SINGLE of 61 and
     '' '&o7d' a DOUBLE of 7, measured. The suffix was recorded on an INTEGER token, and
     '' the literal typed as an integer.
     select case cast( Tko.NumSuffix, lit.suffix )
     case Tko.NSUF_SINGLE, Tko.NSUF_DOUBLE
         lit.kind = cast( uint8, Tko.TK_FLOAT_LIT )
-        lit.fltValue = cast( float64, value )
+        lit.fltValue = cast( float64, valueHi ) * 18446744073709551616.0 + cast( float64, value )
+        lit.intHi = 0
     end select
     PushLiteral( s, lit, first )
 end sub
@@ -659,13 +686,26 @@ private sub ScanNumber( byref s as Scanner )
         lit.kind = cast( uint8, Tko.TK_INT_LIT )
         '' UNSIGNED, so 18446744073709551615 keeps all 64 bits -- the TYPE then says
         '' how to read them (Check.DecimalLitUnsigned).
-        lit.intValue = valulng( spelling )
-        '' PAST 64 BITS IS fbc's WARNING 8, "Literal number too big, truncated" -- the value
-        '' was already fbc's (all ones); only the word was missing (audit F-67).
-        dim as int32 nz = 1
-        while (nz < len( spelling )) andalso (spelling[nz - 1] = 48) : nz += 1 : wend
-        dim as string dg = mid( spelling, nz )
-        if (len( dg ) > 20) orelse ((len( dg ) = 20) andalso (dg > "18446744073709551615")) then Report( s, Tko.TKO0205, first )
+        '' SCANNED AT 128 BITS (MulAdd128_). Past 64 with no suffix it is tiko's int128 / uint128
+        '' (littype.tiko); past 64 WITH an integer suffix, or past 128, it is fbc's warning 8,
+        '' "Literal number too big, truncated", and the value saturates to all ones as fbc's
+        '' does (audit F-67).
+        dim as uint64 dlo = 0, dhi = 0
+        dim as boolean dover = false
+        for di as int32 = 0 to len( spelling ) - 1
+            MulAdd128_( dhi, dlo, 10, spelling[di] - 48, dover )
+        next
+        if (dhi <> 0) andalso IntSuffix_( suffix ) then
+            dover = true
+            dlo = &hFFFFFFFFFFFFFFFFull
+            dhi = 0
+        elseif dover then
+            dlo = &hFFFFFFFFFFFFFFFFull
+            dhi = &hFFFFFFFFFFFFFFFFull
+        end if
+        lit.intValue = dlo
+        lit.intHi = dhi
+        if dover then Report( s, Tko.TKO0205, first )
     end if
 
     PushLiteral( s, lit, first )

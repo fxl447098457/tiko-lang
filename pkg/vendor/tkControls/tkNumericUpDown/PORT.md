@@ -36,7 +36,10 @@ types are unchanged. The handle is the widget.
   instead of uMsg/wParam/lParam.
 
 **Added:** `GetID`, `GetHotPart`, `GetPressedPart`, `IsRepeating` (state for tests and custom
-painters).
+painters). For the form designer: a tooltip (`SetTooltipText` / `GetTooltipText`, `GetTooltipHandle`,
+`SetHoverTime` / `SetAutoPopTime` / `SetReshowTime`, through tkTipHost as tkButton's), the border
+following the theme's BorderWidth until `SetBorderThickness` (which now pins the shape), and
+`PaintDefault` (the stock drawing, for a paint callback). PsNumericUpDown has none of them.
 
 **Fixed while porting (vendor bug):** a button cell's fill, extended past the divider so only its
 outer rounding survives, also paints into the value cell's vpad strips above and below the field

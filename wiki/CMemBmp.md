@@ -338,14 +338,12 @@ Microsoft Learn: [SetPixel](https://learn.microsoft.com/en-us/windows/win32/api/
 ### DrawBitmap
 
 ```freebasic
-function DrawBitmap( byval hbmp as HBITMAP, byval x as single = 0, byval y as single = 0, byval nRight as single = 0, byval nBottom as single = 0 ) as GpStatus
-function DrawBitmap( byval pBitmap as GpBitmap ptr, byval x as single = 0, byval y as single = 0, byval nRight as single = 0, byval nBottom as single = 0 ) as GpStatus
+function DrawBitmap( byval hbmp as HBITMAP, byval x as single = 0, byval y as single = 0 ) as GpStatus
+function DrawBitmap( byval pBitmap as GpBitmap ptr, byval x as single = 0 ) as GpStatus
 ```
 
 Draws a GDI bitmap or a GDI+ bitmap onto the memory bitmap with its top-left corner at
-(`x`, `y`), using GDI+. Despite their names, `nRight` and `nBottom` are the **width and height**
-of the drawn image: when both are nonzero the image is stretched to that size, and when either
-is 0 it is drawn at its own size.
+(`x`, `y`), using GDI+.
 
 The `HBITMAP` form copies the bitmap into a temporary GDI+ bitmap and frees it again; the
 bitmap you pass stays yours. The `GpBitmap ptr` form draws the GDI+ bitmap as it is and does not

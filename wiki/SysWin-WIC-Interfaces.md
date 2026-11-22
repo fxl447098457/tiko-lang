@@ -39,27 +39,10 @@ out holds one reference: call `Release` when done.
 
 **Things to watch.**
 
-- `IID_IWICImagingFactory2` holds a value one byte off the one Windows registers, so
-  `CoCreateInstance` and `QueryInterface` with it fail with `E_NOINTERFACE` (`&h80004002`). Make
-  the identifier yourself, as below.
-- `IWICImageEncoder`, `IWICDdsEncoder` and `IWICDisplayAdaptationControl` are declared as
-  names, but their methods are declared on `Afx_IWICImageEncoder_`,
-  `Afx_IWICDdsEncoder_` and `Afx_IWICDisplayAdaptationControl_`: call through a pointer of
-  that type.
-- `IWICBitmap.Lock` declares its last parameter as `byref ... as IWICBitmapLock`, not a
-  pointer: pass `*cast( IWICBitmapLock ptr, cast( any ptr, @pLock ) )`.
 - Encoders and decoders take Windows' own `IStream ptr`; an `IWICStream` (built on
   `ComStream`) is passed as `cast( IStream ptr, cast( any ptr, pStream ) )`. The
   `IPropertyBag2` that `CreateNewFrame` returns is released with
   `pOptions->lpVtbl->Release( pOptions )`.
-- `CanConvert`, `DoesSupportTransform` and other methods declare a `BOOL` answer as
-  `byref ... as boolean`; Windows writes four bytes there. Pass `*cast( boolean ptr, @b )` with
-  `b` a `BOOL`.
-- The functions `WICConvertBitmapSource`, `WICCreateBitmapFromSection`,
-  `WICCreateBitmapFromSectionEx`, `WICMapGuidToShortName`, `WICMapShortNameToGuid` and
-  `WICMapSchemaToName` are declared with `lib "d2d1"`, which does not provide them: a program
-  calling `WICMapGuidToShortName` failed to link. Use the factory's `CreateFormatConverter` in
-  place of `WICConvertBitmapSource`.
 
 ## Importing
 

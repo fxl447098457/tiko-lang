@@ -40,6 +40,14 @@ public enum AlignMode
     SameSize
 end enum
 
+' Design > Horizontal / Vertical Spacing, after VB6's Format menu.
+public enum SpaceMode
+    SpaceEqual = 0          ' the first and last stay; the gaps between are made one size
+    SpaceIncrease           ' each gap a grid step wider, the active control staying put
+    SpaceDecrease           ' each gap a grid step narrower, never below touching
+    SpaceRemove             ' no gaps: side by side
+end enum
+
 ' The nearest multiple of grid.
 public function Snap( byval v as long, byval grid as long ) as long
     if grid <= 1 then return v
@@ -108,7 +116,20 @@ public function AddControl( byref doc as FormDoc, byref typeName as const ustrin
     c.Y = y
     c.W = w
     c.H = h
+    ' a component sits on the form itself, at its own size, wherever it was dropped
+    if catalog.IsComponent( m->Name ) then
+        c.Parent = ""
+        c.Page = -1
+        c.W = m->Width_
+        c.H = m->Height_
+    end if
     if m->ContainerKind = TKMETA_CONTAINER_PAGES then c.Pages.Push( "Page1" )
+    ' a tab bar starts with a tab, as a tab control starts with a page
+    if m->Name = "TabBar" then
+        dim as FormItem tab_
+        tab_.Text = "Tab1"
+        c.Items.Push( tab_ )
+    end if
     ' these belong along an edge
     select case m->Name
     case "MenuBar", "Toolbar" : c.Dock = TK_DOCK_TOP
@@ -116,6 +137,18 @@ public function AddControl( byref doc as FormDoc, byref typeName as const ustrin
     end select
     dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, "Text" )
     if (p <> 0) andalso (p->Kind = "text") then PutSetting( c.Props, "Text", c.Name )
+    ' an option button joins the group of the last one placed beside it (same parent, same page):
+    ' a column of them drawn one after another is one group without setting each one's GroupID
+    if m->Name = "OptionButton" then
+        for k as long = doc.Controls.Count( ) - 1 to 0 step -1
+            if (doc.Controls[k].TypeName = "OptionButton") andalso (lcase( doc.Controls[k].Parent ) = lcase( c.Parent )) _
+               andalso (doc.Controls[k].Page = c.Page) then
+                dim as long g = FindSetting( doc.Controls[k].Props, "GroupID" )
+                if g >= 0 then c.Props.Push( doc.Controls[k].Props[g] )
+                exit for
+            end if
+        next
+    end if
     doc.Controls.Push( c )
     return doc.Controls.Count( ) - 1
 end function
@@ -133,6 +166,11 @@ public sub DeleteControls( byref doc as FormDoc, byref names as Array( of ustrin
         if gone then doc.Controls.Remove( i )
         i -= 1
     wend
+    ' a ContextMenu naming a PopupMenu that went names nothing
+    for k as long = 0 to doc.Controls.Count( ) - 1
+        if len( doc.Controls[k].ContextMenu ) andalso (FindControl( doc, doc.Controls[k].ContextMenu ) < 0) then doc.Controls[k].ContextMenu = ""
+    next
+    if len( doc.ContextMenu ) andalso (FindControl( doc, doc.ContextMenu ) < 0) then doc.ContextMenu = ""
 end sub
 
 ' ---- z-order ----------------------------------------------------------------------------------
@@ -175,6 +213,28 @@ public sub BringToFront( byref doc as FormDoc, byref names as Array( of ustring 
     next
 end sub
 
+' names (each with what is inside it) into parent -- page: a tab control's page, else -1 -- at
+' xs/ys in its client, at the top of their new siblings and keeping their order among themselves.
+' Their names, properties and handlers stay: this is a move, not a cut and paste.
+public sub Reparent( byref doc as FormDoc, byref names as Array( of ustring ), byref parent as const ustring, byval page as long, _
+                     byref xs as Array( of long ), byref ys as Array( of long ) )
+    for k as long = 0 to names.Count( ) - 1
+        dim as long i = FindControl( doc, names[k] )
+        if i < 0 then continue for
+        doc.Controls[i].Parent = parent
+        doc.Controls[i].Page = page
+        doc.Controls[i].X = xs[k]
+        doc.Controls[i].Y = ys[k]
+    next
+    ' after the new parent in the list, as a child must be
+    for each nm as ustring in InListOrder_( doc, names )
+        dim as Array( of FormControl ) block = CutBlock_( doc, FindControl( doc, nm ) )
+        for each c as FormControl in block
+            doc.Controls.Push( c )
+        next
+    next
+end sub
+
 ' To the bottom of its siblings.
 public sub SendToBack( byref doc as FormDoc, byref names as Array( of ustring ) )
     dim as Array( of ustring ) order = InListOrder_( doc, names )
@@ -203,7 +263,7 @@ end sub
 ' ---- geometry ---------------------------------------------------------------------------------
 
 ' Lines up names against the first of them, which stays where it is. Docked controls are left out:
-' their dock decides where they go.
+' their dock decides where they go. So are locked ones.
 public sub AlignControls( byref doc as FormDoc, byref names as Array( of ustring ), byval mode as AlignMode )
     if names.Count( ) < 2 then exit sub
     dim as long r = FindControl( doc, names[0] )
@@ -212,7 +272,7 @@ public sub AlignControls( byref doc as FormDoc, byref names as Array( of ustring
     for k as long = 1 to names.Count( ) - 1
         dim as long i = FindControl( doc, names[k] )
         if i < 0 then continue for
-        if doc.Controls[i].Dock <> TK_DOCK_NONE then continue for
+        if (doc.Controls[i].Dock <> TK_DOCK_NONE) orelse doc.Controls[i].Locked then continue for
         dim as long x0 = doc.Controls[i].X, y0 = doc.Controls[i].Y, w0 = doc.Controls[i].W, h0 = doc.Controls[i].H
         select case mode
         case AlignMode.AlignLefts   : doc.Controls[i].X = ref_.X
@@ -225,6 +285,136 @@ public sub AlignControls( byref doc as FormDoc, byref names as Array( of ustring
         case AlignMode.SameHeight   : ResizeControl( doc, i, x0, y0, w0, ref_.H )
         case AlignMode.SameSize     : ResizeControl( doc, i, x0, y0, ref_.W, ref_.H )
         end select
+    next
+end sub
+
+' A control's position and length along one axis: across (X, W) or down (Y, H).
+private function Pos_( byref c as FormControl, byval down_ as boolean ) as long
+    return iif( down_, c.Y, c.X )
+end function
+
+' (Not Len_: on Linux that private name reached std/fs's posix header, whose struct has a len_
+' field -- TKO0776 there; a compiler bug, 2026-11-14.)
+private function SpanOf_( byref c as FormControl, byval down_ as boolean ) as long
+    return iif( down_, c.H, c.W )
+end function
+
+private sub MoveTo_( byref c as FormControl, byval down_ as boolean, byval p as long )
+    if down_ then c.Y = p else c.X = p
+end sub
+
+' The indexes of what Spacing and Center may move: the first of names, and those of the rest on its
+' parent and page that are neither docked nor locked. The first leads even when locked (it stays put
+' all the same); fixedFirst false leaves a locked first out, as what moves it there would move it.
+private function Movable_( byref doc as FormDoc, byref names as Array( of ustring ), byval fixedFirst as boolean ) as Array( of long )
+    dim as Array( of long ) out_
+    if names.Count( ) = 0 then return out_
+    dim as long r = FindControl( doc, names[0] )
+    if (r < 0) orelse (doc.Controls[r].Dock <> TK_DOCK_NONE) then return out_
+    if fixedFirst orelse (doc.Controls[r].Locked = false) then out_.Push( r )
+    for k as long = 1 to names.Count( ) - 1
+        dim as long i = FindControl( doc, names[k] )
+        if i < 0 then continue for
+        if (lcase( doc.Controls[i].Parent ) <> lcase( doc.Controls[r].Parent )) orelse (doc.Controls[i].Page <> doc.Controls[r].Page) then continue for
+        if (doc.Controls[i].Dock <> TK_DOCK_NONE) orelse doc.Controls[i].Locked then continue for
+        out_.Push( i )
+    next
+    return out_
+end function
+
+' Design > Horizontal (down_ false) / Vertical Spacing: the gaps between names, in order along the
+' axis. Make Equal keeps the first and last where they are and needs three; the others keep the
+' active control (the first of names) where it is and move the rest out from it.
+public sub SpaceControls( byref doc as FormDoc, byref names as Array( of ustring ), byval down_ as boolean, _
+                          byval mode as SpaceMode, byval grid as long )
+    dim as Array( of long ) set_ = Movable_( doc, names, mode <> SpaceMode.SpaceEqual )
+    dim as long n = set_.Count( )
+    if (n < 2) orelse ((mode = SpaceMode.SpaceEqual) andalso (n < 3)) then exit sub
+    if grid < 1 then grid = 1
+    ' in order along the axis
+    dim as Array( of long ) o
+    for each i as long in set_
+        dim as long at_ = o.Count( )
+        while (at_ > 0) andalso (Pos_( doc.Controls[o[at_ - 1]], down_ ) > Pos_( doc.Controls[i], down_ ))
+            at_ -= 1
+        wend
+        o.Insert( at_, i )
+    next
+    dim as Array( of long ) gap
+    dim as long fixed_ = 0                  ' which of o stays where it is
+    if mode = SpaceMode.SpaceEqual then
+        dim as long used = 0
+        for each i as long in o
+            used += SpanOf_( doc.Controls[i], down_ )
+        next
+        dim as long first_ = Pos_( doc.Controls[o[0]], down_ )
+        dim as long free_ = Pos_( doc.Controls[o[n - 1]], down_ ) + SpanOf_( doc.Controls[o[n - 1]], down_ ) - first_ - used
+        ' each gap its share, the remainder spread so the last ends where it did
+        for j as long = 0 to n - 2
+            gap.Push( (free_ * (j + 1)) \ (n - 1) - (free_ * j) \ (n - 1) )
+        next
+    else
+        for j as long = 0 to n - 1
+            if o[j] = set_[0] then fixed_ = j
+        next
+        for j as long = 0 to n - 2
+            dim as long g = Pos_( doc.Controls[o[j + 1]], down_ ) - Pos_( doc.Controls[o[j]], down_ ) - SpanOf_( doc.Controls[o[j]], down_ )
+            select case mode
+            case SpaceMode.SpaceIncrease : g += grid
+            case SpaceMode.SpaceDecrease : if g > 0 then g = iif( g > grid, g - grid, 0 )
+            case SpaceMode.SpaceRemove   : g = 0
+            end select
+            gap.Push( g )
+        next
+    end if
+    for j as long = fixed_ + 1 to n - 1
+        MoveTo_( doc.Controls[o[j]], down_, Pos_( doc.Controls[o[j - 1]], down_ ) + SpanOf_( doc.Controls[o[j - 1]], down_ ) + gap[j - 1] )
+    next
+    for j as long = fixed_ - 1 to 0 step -1
+        MoveTo_( doc.Controls[o[j]], down_, Pos_( doc.Controls[o[j + 1]], down_ ) - gap[j] - SpanOf_( doc.Controls[o[j]], down_ ) )
+    next
+end sub
+
+' Design > Center in Form: names as one block in the middle of lo .. hi, the free part of their
+' parent along the axis (what docked controls leave), in its design units.
+public sub CenterControls( byref doc as FormDoc, byref names as Array( of ustring ), byval down_ as boolean, _
+                           byval lo as long, byval hi as long )
+    dim as Array( of long ) set_ = Movable_( doc, names, false )
+    if set_.Count( ) = 0 then exit sub
+    dim as long a = Pos_( doc.Controls[set_[0]], down_ ), b = a + SpanOf_( doc.Controls[set_[0]], down_ )
+    for each i as long in set_
+        dim as long p = Pos_( doc.Controls[i], down_ )
+        if p < a then a = p
+        if p + SpanOf_( doc.Controls[i], down_ ) > b then b = p + SpanOf_( doc.Controls[i], down_ )
+    next
+    dim as long d = lo + (hi - lo - (b - a)) \ 2 - a
+    for each i as long in set_
+        MoveTo_( doc.Controls[i], down_, Pos_( doc.Controls[i], down_ ) + d )
+    next
+end sub
+
+' Design > Lock Controls acts on these: the selection, or with nothing selected every control.
+private function LockTarget_( byref doc as FormDoc, byref names as Array( of ustring ), byval i as long ) as boolean
+    return (names.Count( ) = 0) orelse IsListed_( names, doc.Controls[i].Name )
+end function
+
+' Lock Controls' check: everything it acts on is locked.
+public function AllLocked( byref doc as FormDoc, byref names as Array( of ustring ) ) as boolean
+    dim as long n = 0
+    for i as long = 0 to doc.Controls.Count( ) - 1
+        if LockTarget_( doc, names, i ) then
+            if doc.Controls[i].Locked = false then return false
+            n += 1
+        end if
+    next
+    return n > 0
+end function
+
+' Locks them, or unlocks them when every one already is.
+public sub ToggleLock( byref doc as FormDoc, byref names as Array( of ustring ) )
+    dim as boolean on_ = (AllLocked( doc, names ) = false)
+    for i as long = 0 to doc.Controls.Count( ) - 1
+        if LockTarget_( doc, names, i ) then doc.Controls[i].Locked = on_
     next
 end sub
 
@@ -279,8 +469,11 @@ public sub ResizeControl( byref doc as FormDoc, byval i as long, byval x as long
     codegen.EffectiveSizes( doc, was )
     doc.Controls[i].X = x
     doc.Controls[i].Y = y
-    doc.Controls[i].W = w
-    doc.Controls[i].H = h
+    ' a component's box keeps its size: it moves, nothing more
+    if catalog.IsComponent( doc.Controls[i].TypeName ) = false then
+        doc.Controls[i].W = w
+        doc.Controls[i].H = h
+    end if
     Reflow_( doc, was, doc.ClientW, doc.ClientH )
 end sub
 
@@ -313,19 +506,25 @@ public sub RenameControl( byref doc as FormDoc, byref oldName as const ustring, 
         elseif lcase( doc.Controls[i].Parent ) = was then
             doc.Controls[i].Parent = newName
         end if
+        ' a PopupMenu's name, wherever a ContextMenu names it
+        if lcase( doc.Controls[i].ContextMenu ) = was then doc.Controls[i].ContextMenu = newName
     next
+    if lcase( doc.ContextMenu ) = was then doc.ContextMenu = newName
 end sub
 
 public sub SetDock( byref doc as FormDoc, byref names as Array( of ustring ), byval dock_ as long )
     for each s as ustring in names
         dim as long i = FindControl( doc, s )
-        if i >= 0 then doc.Controls[i].Dock = dock_
+        if i >= 0 then
+            if catalog.IsComponent( doc.Controls[i].TypeName ) = false then doc.Controls[i].Dock = dock_
+        end if
     next
 end sub
 
 public sub SetAnchorBit( byref doc as FormDoc, byref names as Array( of ustring ), byval bit_ as long, byval onOff as boolean )
     for each s as ustring in names
         dim as long i = FindControl( doc, s )
+        if (i >= 0) andalso catalog.IsComponent( doc.Controls[i].TypeName ) then i = -1
         if i >= 0 then
             if onOff then
                 doc.Controls[i].Anchor or= bit_
@@ -427,8 +626,10 @@ public function ApplyPages( byref doc as FormDoc, byval i as long, byref edited 
     next
     if edited.Count( ) = 0 then return "a tab control needs a page"
     doc.Controls[i].Pages.Clear( )
+    doc.Controls[i].PageGlyphs.Clear( )
     for each it as FormItem in edited
         doc.Controls[i].Pages.Push( it.Text )
+        doc.Controls[i].PageGlyphs.Push( it.Glyph )
     next
     for k as long = 0 to doc.Controls.Count( ) - 1
         if lcase( doc.Controls[k].Parent ) = me_ then
@@ -475,15 +676,35 @@ public function CopyText( byref doc as FormDoc, byref names as Array( of ustring
     return formfile.Render( clip )
 end function
 
-' Adds what CopyText made under parent, offset by dx, dy, each with a fresh name. newNames gets the
-' top-level ones, in order. False when the text isn't controls.
+' Is text what CopyText made (so Paste has something to add)?
+public function IsClipText( byref text as const ustring ) as boolean
+    return instr( text, CLIP_CAPTION ) > 0
+end function
+
+' Adds what CopyText made under parent, offset by dx, dy, each with a fresh name. atPoint: dx, dy is
+' where the top-left corner of the copied controls goes instead. newNames gets the top-level ones, in
+' order. False when the text isn't controls.
 public function PasteText( byref doc as FormDoc, byref text as const ustring, byref parent as const ustring, byval page as long, _
-                           byval dx as long, byval dy as long, byref newNames as Array( of ustring ) ) as boolean
+                           byval dx as long, byval dy as long, byref newNames as Array( of ustring ), _
+                           byval atPoint as boolean = false ) as boolean
     if instr( text, CLIP_CAPTION ) = 0 then return false
     dim as FormDoc clip
     dim as ustring e
     if formfile.Parse( text, clip, e ) = false then return false
     if clip.Caption <> CLIP_CAPTION then return false
+    if atPoint then
+        dim as boolean any_ = false
+        dim as long minX, minY
+        for each c as FormControl in clip.Controls
+            if len( c.Parent ) = 0 then
+                if (any_ = false) orelse (c.X < minX) then minX = c.X
+                if (any_ = false) orelse (c.Y < minY) then minY = c.Y
+                any_ = true
+            end if
+        next
+        dx -= minX
+        dy -= minY
+    end if
     ' first every new name, so a child's parent can be mapped wherever it sits
     dim as Array( of Setting ) map_
     dim as FormDoc taken = doc
@@ -501,11 +722,24 @@ public function PasteText( byref doc as FormDoc, byref text as const ustring, by
         if len( c.Parent ) = 0 then
             n.Parent = parent
             n.Page = page
+            if catalog.IsComponent( c.TypeName ) then
+                n.Parent = ""
+                n.Page = -1
+            end if
             n.X += dx
             n.Y += dy
             newNames.Push( n.Name )
         else
             n.Parent = SettingOr( map_, lcase( c.Parent ) )
+        end if
+        ' a ContextMenu follows a PopupMenu pasted along, keeps one already on the form, else goes
+        if len( c.ContextMenu ) then
+            dim as ustring mapped = SettingOr( map_, lcase( c.ContextMenu ) )
+            if len( mapped ) then
+                n.ContextMenu = mapped
+            elseif FindControl( doc, c.ContextMenu ) < 0 then
+                n.ContextMenu = ""
+            end if
         end if
         ' a Text left at its own name follows the new one
         dim as long t = FindSetting( n.Props, "Text" )

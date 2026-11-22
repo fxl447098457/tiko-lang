@@ -1,0 +1,98 @@
+'' untrusted -- patterns and subjects from outside the program. PCRE2 backtracks: a pattern like
+'' (a+)+$ tries every way of splitting the a's before it gives up, twice as many for each a
+'' more. A compile context caps what may be compiled; a match context caps what one match may
+'' spend -- calls, nesting, heap -- and pcre2_match stops there with an error code. The DFA
+'' matcher, pcre2_dfa_match, does not backtrack, and is still no way out.
+''
+'' Build it with 'tiko untrusted.tiko'.
+''
+'' PCRE2 is BSD-licensed (pkg/vendor/pcre2/LICENSE); so is this.
+
+#import "vendor/pcre2" link dynamic
+
+function Message( byval rc as int32 ) as string
+    dim as zstring * 256 text
+    pcre2_get_error_message( rc, cast( PCRE2_UCHAR ptr, @text ), sizeof( text ) )
+    return text
+end function
+
+'' Compiled under the compile context's limits, or nullptr with the reason printed.
+function CompileWith( byref pattern as const string, byval cc as pcre2_compile_context ptr ) _
+        as pcre2_code ptr
+    dim as int32 errorCode
+    dim as PCRE2_SIZE errorOffset
+    dim as pcre2_code ptr re = pcre2_compile( strptr( pattern ), len( pattern ), 0, _
+                                              @errorCode, @errorOffset, cc )
+    if re = nullptr then print "  refused: "; Message( errorCode )
+    return re
+end function
+
+sub Attempt( byref label as const string, byval re as pcre2_code ptr, byref subject as const string, _
+             byval mc as pcre2_match_context ptr )
+    dim as pcre2_match_data ptr md = pcre2_match_data_create_from_pattern( re, nullptr )
+    dim as double t = timer
+    dim as int32 rc = pcre2_match( re, strptr( subject ), len( subject ), 0, 0, md, mc )
+    t = timer - t
+    print "  "; label; ": rc "; rc; " ("; Message( rc ); ")";
+    if t > 0.5 then print ", over half a second" else print
+    pcre2_match_data_free( md )
+end sub
+
+'' THE PATTERN: a compile context limits its length and how deeply its parentheses nest.
+dim as pcre2_compile_context ptr cc = pcre2_compile_context_create( nullptr )
+pcre2_set_max_pattern_length( cc, 100 )
+pcre2_set_parens_nest_limit( cc, 20 )
+print "compiling:"
+CompileWith( string( 200, "a" ), cc )
+CompileWith( string( 30, "(" ) & "a" & string( 30, ")" ), cc )
+dim as pcre2_code ptr evil = CompileWith( "(a+)+$", cc )
+print "  (a+)+$ compiled"
+
+'' THE MATCH: 26 a's and a b. Every split of the a's fails at the b, and there are 2^25 of them.
+dim as string subject = string( 26, "a" ) & "b"
+print "matching (a+)+$ against " & len( subject ) & " characters:"
+
+'' The defaults: 10,000,000 steps of the matching loop, counted again from zero at each start
+'' position, and 20,000,000 KiB of heap -- about 20 GB, so in effect none.
+Attempt( "default limits", evil, subject, nullptr )
+
+'' Your own limits, through a match context.
+dim as pcre2_match_context ptr mc = pcre2_match_context_create( nullptr )
+pcre2_set_match_limit( mc, 100000 )
+Attempt( "match limit 100000", evil, subject, mc )
+pcre2_set_match_limit( mc, 10000000 )
+pcre2_set_depth_limit( mc, 10 )
+Attempt( "depth limit 10", evil, subject, mc )
+pcre2_set_depth_limit( mc, 10000000 )
+pcre2_set_heap_limit( mc, 1 )          '' in kibibytes
+Attempt( "heap limit 1 KiB", evil, subject, mc )
+
+'' The JIT keeps to the match limit too. The depth and heap limits do not apply to JIT code,
+'' which has its own stack (pcre2_jit_stack_create).
+pcre2_set_heap_limit( mc, 20000 )
+pcre2_set_match_limit( mc, 100000 )
+pcre2_jit_compile( evil, PCRE2_JIT_COMPLETE )
+Attempt( "JIT, match limit 100000", evil, subject, mc )
+
+'' THE DFA MATCHER runs every alternative at once instead of backtracking. It finds no groups,
+'' allows no back references, and needs a workspace of ints from the caller -- and on this
+'' pattern it is no defence. It answers 27 characters at once, but its time grows steeply with
+'' the subject (measured: 100 characters 6 ms, 300 characters 0.3 s, 1,000 characters 31 s),
+'' and the match limit does not stop it: the 300 below return "no match", not -47.
+print "the DFA matcher:"
+dim as int32 workspace( 0 to 99999 )
+dim as pcre2_match_data ptr md = pcre2_match_data_create( 10, nullptr )
+dim as int32 rc = pcre2_dfa_match( evil, strptr( subject ), len( subject ), 0, 0, md, nullptr, _
+                                   @workspace( 0 ), 100000 )
+print "  27 characters: rc "; rc; " ("; Message( rc ); ")"
+dim as string longer = string( 299, "a" ) & "b"
+rc = pcre2_dfa_match( evil, strptr( longer ), len( longer ), 0, 0, md, mc, @workspace( 0 ), 100000 )
+print "  300 characters, match limit 100000: rc "; rc; " ("; Message( rc ); ")"
+'' Too little workspace is an error of its own.
+rc = pcre2_dfa_match( evil, strptr( longer ), len( longer ), 0, 0, md, nullptr, @workspace( 0 ), 1000 )
+print "  300 characters, 1000 ints of workspace: rc "; rc; " ("; Message( rc ); ")"
+pcre2_match_data_free( md )
+
+pcre2_match_context_free( mc )
+pcre2_code_free( evil )
+pcre2_compile_context_free( cc )

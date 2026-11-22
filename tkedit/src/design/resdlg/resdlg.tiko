@@ -1,0 +1,564 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' resdlg -- the Resource Center: the project's images and fonts (appResources, resfile), each under a
+' name a property takes as "res:<name>".
+'
+'   Manage      opened from Design > Resource Center...: Add, Remove, rename, built in or not.
+'   Pick        opened from a property's "...": only the kind it takes, a "(none)" row first, and the
+'               Select button. Picked is "res:<name>", or "" for (none).
+'
+' Nothing is written here. Added files are copied into files/ at once (they are previewed from there);
+' on Select or Close the caller writes the .tkres (when Changed), carries Renames into the
+' project's forms and theme, and deletes Removed's files. Close picks nothing (author 2026-11-14).
+#module "resdlg"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkCheckBox"
+#import "vendor/tkControls/tkPicture"
+#import "vendor/tkControls/tkPanel"
+#import "../model"
+#import "../resfile"
+using containers
+using tkApp
+using tkListTree
+using tkButton
+using tkLabel
+using tkTextBox
+using tkCheckBox
+using tkPicture
+using tkPanel
+using tkImage
+using tkHost
+using tkPaint
+using model
+
+const as long WIN_CX = 720
+const as long WIN_CY = 460
+const as long ROW_CY = 28
+const as long GAP = 8
+const as long GLYPH_CX = 40                     ' a glyph button's width (design units)
+const as ulong GLYPH_ADD = &hF109               ' add (a plus)
+const as ulong GLYPH_DELETE = &hF34C            ' remove (a bin)
+
+' The caller's answers: a yes/no question, files picked (one path per line, "" = cancelled), and the
+' files that refer to a name ("" = none).
+public type ResAskFunc as function( byval owner as any ptr, byref text as const ustring ) as boolean
+public type ResPickFunc as function( byval owner as any ptr ) as ustring
+public type ResUsedFunc as function( byval owner as any ptr, byref nm as const ustring ) as ustring
+
+public type ResourceDialog
+    Win as TK_FORM ptr
+    Dir_ as ustring                     ' the appResources folder
+    Doc as resfile.ResourceDoc           ' the working copy
+    PickKind as ustring                 ' "" = manage; "image" / "font" = pick one of that kind
+    Picked as ustring                   ' Pick: "res:<name>" on Select, "" for (none)
+    Renames as Array( of Setting )      ' Key = the name as the project has it, Value = the new one
+    Removed as Array( of ustring )      ' files/ names of resources removed (deleted by the caller on OK)
+    Added as Array( of ustring )        ' files/ names copied in here
+    OrigText as ustring                 ' the .tkres as opened: Changed( ) compares against it
+    Accepted as boolean
+    IsModal as boolean
+    Loading as boolean
+    Owner as any ptr
+    Ask as ResAskFunc
+    PickFiles as ResPickFunc
+    UsedBy as ResUsedFunc
+    PreviewFont as TTF_Font ptr
+    ShownIdx as long = -1               ' the resource the name box and the preview show
+
+    List as TK_WIDGET ptr
+    LblName as TK_WIDGET ptr
+    TxtName as TK_WIDGET ptr
+    ChkEmbed as TK_WIDGET ptr
+    ChkAppIcon as TK_WIDGET ptr         ' Manage, an image: the program's icon (Windows)
+    LblInfo as TK_WIDGET ptr
+    Preview as TK_WIDGET ptr
+    Picture as TK_WIDGET ptr
+    Sample as TK_WIDGET ptr
+    LblSize as TK_WIDGET ptr            ' the file's size, under the preview
+    BtnAdd as TK_WIDGET ptr
+    BtnRemove as TK_WIDGET ptr
+    BtnOk as TK_WIDGET ptr
+    BtnCancel as TK_WIDGET ptr
+
+    declare sub Open( byval owner_ as TK_FORM ptr, byref dir__ as const ustring, byref kind_ as const ustring, _
+                      byref current as const ustring )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub Finish( byval ok as boolean )
+    declare sub Layout( )
+    declare sub Fill( byval selectIdx as long )
+    declare function SelIndex( ) as long
+    declare sub ShowSelected( )
+    declare function AddFiles( byref paths as Array( of ustring ) ) as long
+    declare sub AddPressed( )
+    declare function RemoveSelected( ) as boolean
+    declare function RenameSelected( byref newName as const ustring ) as ustring
+    declare function NameFault( byref nm as const ustring ) as ustring
+    declare sub EmbedToggled( byval on_ as boolean )
+    declare sub AppIconToggled( byval on_ as boolean )
+    declare function Changed( ) as boolean
+end type
+
+private sub RaiseOwner_( byval f as TK_FORM ptr )
+    if (f <> 0) andalso (f->pOwner <> 0) then SDL_RaiseWindow( f->pOwner->host->win )
+end sub
+
+private function DlgOf( byval w as TK_WIDGET ptr ) as ResourceDialog ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub OnButton( byval h as TK_WIDGET ptr, byval id as long )
+    dim as ResourceDialog ptr d = DlgOf( h )
+    if d = 0 then exit sub
+    select case h
+    case d->BtnOk     : d->Finish( true )
+    case d->BtnCancel : d->Finish( false )
+    case d->BtnAdd    : d->AddPressed( )
+    case d->BtnRemove : d->RemoveSelected( )
+    end select
+end sub
+
+private sub OnSel( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as ResourceDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->ShowSelected( )
+end sub
+
+' A double click (or Enter) on a row: in Pick, that one is the choice.
+private sub OnActivate( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as ResourceDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (len( d->PickKind ) > 0) then d->Finish( true )
+end sub
+
+' The name box: Enter renames, as leaving it does.
+private sub OnNameEnter( byval h as TK_WIDGET ptr )
+    dim as ResourceDialog ptr d = DlgOf( h )
+    if d = 0 then exit sub
+    dim as ustring fault = d->RenameSelected( tkTextBox_GetText( h ) )
+    if len( fault ) then tkLabel_SetText( d->LblInfo, fault )
+end sub
+
+' As the name is typed: what is wrong with it, or the name it will go by -- so a fault clears once fixed.
+private sub OnNameTyped( byval h as TK_WIDGET ptr )
+    dim as ResourceDialog ptr d = DlgOf( h )
+    if (d = 0) orelse d->Loading orelse (d->SelIndex( ) < 0) then exit sub
+    dim as ustring nm = trim( tkTextBox_GetText( h ) )
+    dim as ustring fault = d->NameFault( nm )
+    tkLabel_SetText( d->LblInfo, iif( len( fault ) > 0, fault, resfile.RefOf( nm ) ) )
+end sub
+
+private sub OnEmbed( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as ResourceDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->EmbedToggled( isChecked )
+end sub
+
+private sub OnAppIcon( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as ResourceDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->AppIconToggled( isChecked )
+end sub
+
+private function MakeButton_( byval parent as TK_WIDGET ptr, byref text as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    dim as ustring t = text
+    tkButton_SetText( b, t )
+    tkButton_SetClickCallback( b, @OnButton )
+    return b
+end function
+
+' A small button that is one glyph; tip is its word, shown on hover.
+private function MakeGlyphButton_( byval parent as TK_WIDGET ptr, byval cp as ulong, byref tip as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    tkButton_SetGlyphFont( b, tkForm_Font( tkForm_FromWidget( parent ), TKFONT_GLYPH_LARGE ) )   ' else it draws in the text font
+    tkButton_SetGlyphLeft( b, wchr( cp ) )
+    tkButton_SetTooltipText( b, tip )
+    tkButton_SetClickCallback( b, @OnButton )
+    return b
+end function
+
+' A row's tooltip: the full path of its file ((none) has none).
+private function RowTip_( byval h as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ustring
+    dim as ResourceDialog ptr d = DlgOf( h )
+    if d = 0 then return ""
+    dim as integer i = tkListTree_GetItemData( h, row )
+    if (i < 0) orelse (i >= d->Doc.Items.Count( )) then return ""
+    return fs.PathJoin( d->Dir_, resfile.FILES_DIR, d->Doc.Items[i].File )
+end function
+
+' A file's size: bytes under 1 K, else K (rounded); "" when it can't be read.
+private function SizeText_( byref file as const ustring ) as ustring
+    dim as fs.FsResultInfo r = fs.Stat( file )
+    if (r.IsOk( ) = false) orelse (r.Value( ).Exists( ) = false) then return ""
+    dim as longint n = r.Value( ).Size( )
+    if n < 1024 then return strings.Format( i18n.Tr( "designer.res_bytes", "{} bytes" ), n )
+    return strings.Format( i18n.Tr( "designer.res_kbytes", "{} K" ), (n + 512) \ 1024 )
+end function
+
+' The column header shows its whole text: no tooltip.
+private function NoHeaderTip_( byval h as TK_WIDGET ptr, byval idx as integer ) as ustring
+    return ""
+end function
+
+private function KindText_( byref k as const ustring ) as ustring
+    if k = "font" then return i18n.Tr( "designer.res_kind_font", "Font" )
+    return i18n.Tr( "designer.res_kind_image", "Image" )
+end function
+
+sub ResourceDialog.Open( byval owner_ as TK_FORM ptr, byref dir__ as const ustring, byref kind_ as const ustring, _
+                         byref current as const ustring )
+    Dir_ = dir__
+    PickKind = kind_
+    dim as ustring none, e
+    dim as ustring path = fs.PathJoin( Dir_, resfile.RES_MODULE & ".tkres" )
+    resfile.Parse( fs.ReadAllText( path ).ValueOr( none ), Doc, e )
+    OrigText = resfile.ToText( Doc )
+
+    dim as ustring t = i18n.Tr( "designer.res_center", "Resource Center" )
+    dim as single sc = 0
+    if owner_ then sc = tkForm_Host( owner_ )->fScaleForced
+    Win = tkApp_NewForm( t, WIN_CX, WIN_CY, owner_, sc )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    tkForm_OnClose( Win, function( byval f as TK_FORM ptr ) as boolean
+        RaiseOwner_( f )
+        return true
+    end function )
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    Loading = true
+
+    List = tkListTree_Create( root_, 1 )
+    tkListTree_AddColumn( List, i18n.Tr( "designer.res_col_name", "Name" ), tkForm_Scale( Win, 150 ) )
+    tkListTree_AddColumn( List, i18n.Tr( "designer.res_col_kind", "Kind" ), tkForm_Scale( Win, 60 ) )
+    tkListTree_AddColumn( List, i18n.Tr( "designer.res_col_embed", "Built in" ), tkForm_Scale( Win, 70 ) )
+    tkListTree_AddColumn( List, i18n.Tr( "designer.res_col_file", "File" ), tkForm_Scale( Win, 160 ) )
+    tkListTree_ShowHeader( List, true )
+    tkListTree_SetPaintCallback( List, @tkListTree_PaintRowDefault )   ' a tkListTree draws no row by itself
+    tkListTree_SetHeaderTooltipCallback( List, @NoHeaderTip_ )
+    tkListTree_SetTooltipCallback( List, @RowTip_ )
+    tkListTree_SetSelChangeCallback( List, @OnSel )
+    tkListTree_SetActivateCallback( List, @OnActivate )
+
+    LblName = tkLabel_Create( root_, 1 )
+    tkLabel_SetText( LblName, i18n.Tr( "designer.res_name", "Name" ) )
+    TxtName = tkTextBox_Create( root_, 1 )
+    tkTextBox_SetEnterPressedCallback( TxtName, @OnNameEnter )
+    tkTextBox_SetChangeCallback( TxtName, @OnNameTyped )
+    ChkEmbed = tkCheckBox_Create( root_, 1 )
+    tkCheckBox_SetText( ChkEmbed, i18n.Tr( "designer.res_embed", "Build into the program" ) )
+    tkCheckBox_SetCheckChangedCallback( ChkEmbed, @OnEmbed )
+    ChkAppIcon = tkCheckBox_Create( root_, 1 )
+    tkCheckBox_SetText( ChkAppIcon, i18n.Tr( "designer.res_app_icon", "Application icon (Windows)" ) )
+    tkCheckBox_SetCheckChangedCallback( ChkAppIcon, @OnAppIcon )
+    LblInfo = tkLabel_Create( root_, 1 )
+    Preview = tkPanel_Create( root_, 1 )
+    Picture = tkPicture_Create( Preview, 1 )
+    tkPicture_SetFit( Picture, TK_IMGFIT_ASPECT )
+    Sample = tkLabel_Create( Preview, 1 )
+    tkLabel_SetText( Sample, "AaBbCc 123" )
+    LblSize = tkLabel_Create( Preview, 1 )
+    tkLabel_SetAlign( LblSize, LBL_ALIGN_CENTER )
+
+    BtnAdd = MakeGlyphButton_( root_, GLYPH_ADD, i18n.Tr( "designer.res_add", "Add..." ) )
+    BtnRemove = MakeGlyphButton_( root_, GLYPH_DELETE, i18n.Tr( "designer.res_remove", "Remove" ) )
+    BtnOk = MakeButton_( root_, i18n.Tr( "designer.res_select", "Select" ) )
+    if len( PickKind ) = 0 then tkWidget_Show( BtnOk, false )    ' Manage: Close is the one way out (author)
+    ' Close keeps the changes made here and picks nothing (author)
+    BtnCancel = MakeButton_( root_, i18n.Tr( "designer.res_close", "Close" ) )
+
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        cast( ResourceDialog ptr, f->Tag )->Layout( )
+    end sub )
+    Loading = false
+    this.Fill( resfile.Find( Doc, resfile.NameOfRef( current ) ) )
+    tkForm_Show( Win )
+    this.Layout( )
+    this.ShowSelected( )
+end sub
+
+function ResourceDialog.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub ResourceDialog.Close( )
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+end sub
+
+' Anything added, removed, renamed or built in differently since it opened.
+function ResourceDialog.Changed( ) as boolean
+    return resfile.ToText( Doc ) <> OrigText
+end function
+
+' Select (Pick only) / Close. Close picks nothing; the caller keeps the Center's changes either way (author).
+sub ResourceDialog.Finish( byval ok as boolean )
+    ' a name still being typed is taken as if Enter had been pressed (the box's own resource only);
+    ' one that can't be taken keeps the Center open, saying why
+    dim as long i = this.SelIndex( )
+    if (i >= 0) andalso (i = ShownIdx) andalso (tkTextBox_GetText( TxtName ) <> Doc.Items[i].Name) then
+        dim as ustring fault = this.RenameSelected( tkTextBox_GetText( TxtName ) )
+        if len( fault ) then
+            tkLabel_SetText( LblInfo, fault )
+            exit sub
+        end if
+    end if
+    if ok andalso (len( PickKind ) > 0) then
+        i = this.SelIndex( )
+        Picked = ""
+        if i >= 0 then Picked = resfile.RefOf( Doc.Items[i].Name )
+    end if
+    Accepted = ok
+    if IsModal then
+        RaiseOwner_( Win )
+        tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+    end if
+end sub
+
+sub ResourceDialog.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long g = tkForm_Scale( Win, GAP ), rh = tkForm_Scale( Win, ROW_CY ), cw = root_->cw, ch = root_->ch
+    dim as long pvW = tkForm_Scale( Win, 220 ), bw = tkForm_Scale( Win, 90 ), lw = tkForm_Scale( Win, 50 )
+    dim as long bottomY = ch - g - rh
+    dim as long lstW = cw - pvW - 3 * g
+    ' the list, then the selected one's name with its built-in box beside it, the application
+    ' icon box under that, and the info line
+    dim as long fieldsY = bottomY - 3 * (rh + g)
+    dim as long chkX = 3 * g + lw + tkForm_Scale( Win, 180 )
+    tkWidget_SetPos( List, g, g, lstW, fieldsY - 2 * g )
+    tkWidget_SetPos( LblName, g, fieldsY, lw, rh )
+    tkWidget_SetPos( TxtName, 2 * g + lw, fieldsY, tkForm_Scale( Win, 180 ), rh )
+    tkWidget_SetPos( ChkEmbed, chkX, fieldsY, lstW - chkX + g, rh )
+    tkWidget_SetPos( ChkAppIcon, chkX, fieldsY + rh + g, lstW - chkX + g, rh )
+    tkWidget_SetPos( LblInfo, g, fieldsY + 2 * (rh + g), lstW, rh )
+    tkWidget_SetPos( Preview, cw - pvW - g, g, pvW, fieldsY - 2 * g )
+    ' the picture (or the font's sample), its file's size centred under it
+    dim as long picH = fieldsY - 5 * g - rh
+    tkWidget_SetPos( Picture, g, g, pvW - 2 * g, picH )
+    tkWidget_SetPos( Sample, g, g, pvW - 2 * g, picH )
+    tkWidget_SetPos( LblSize, g, 2 * g + picH, pvW - 2 * g, rh )
+    dim as long gw = tkForm_Scale( Win, GLYPH_CX )
+    tkWidget_SetPos( BtnAdd, g, bottomY, gw, rh )
+    tkWidget_SetPos( BtnRemove, 2 * g + gw, bottomY, gw, rh )
+    tkWidget_SetPos( BtnCancel, cw - g - bw, bottomY, bw, rh )
+    tkWidget_SetPos( BtnOk, cw - 2 * (g + bw), bottomY, bw, rh )
+end sub
+
+' The list again: (none) first in Pick, then the resources (of the kind picked). selectIdx: the
+' resource to select (-1 = the first row).
+sub ResourceDialog.Fill( byval selectIdx as long )
+    Loading = true
+    tkListTree_BeginUpdate( List )
+    tkListTree_Clear( List )
+    dim as long selRow = 0
+    if len( PickKind ) then tkListTree_AddString( List, i18n.Tr( "designer.res_none", "(none)" ), -1 )
+    for i as long = 0 to Doc.Items.Count( ) - 1
+        dim byref as resfile.Resource x = Doc.Items[i]
+        if (len( PickKind ) > 0) andalso (x.Kind <> PickKind) then continue for
+        dim as integer r = tkListTree_AddString( List, x.Name, i )
+        tkListTree_SetCellText( List, r, 1, KindText_( x.Kind ) )
+        tkListTree_SetCellText( List, r, 2, iif( x.Embed, i18n.Tr( "designer.res_yes", "Yes" ), i18n.Tr( "designer.res_no", "No" ) ) )
+        tkListTree_SetCellText( List, r, 3, x.File )
+        if i = selectIdx then selRow = r
+    next
+    tkListTree_EndUpdate( List )
+    if tkListTree_GetCount( List ) then tkListTree_SetCurSel( List, selRow )
+    Loading = false
+end sub
+
+' The resource on the selected row; -1 for (none) or nothing.
+function ResourceDialog.SelIndex( ) as long
+    dim as integer r = tkListTree_GetCurSel( List )
+    if r < 0 then return -1
+    return tkListTree_GetItemData( List, r )
+end function
+
+' The selected resource in the fields and the preview.
+sub ResourceDialog.ShowSelected( )
+    dim as long i = this.SelIndex( )
+    ShownIdx = i
+    Loading = true
+    tkWidget_Enable( TxtName, i >= 0 )
+    tkWidget_Enable( ChkEmbed, i >= 0 )
+    tkWidget_Enable( BtnRemove, i >= 0 )
+    tkLabel_SetText( LblInfo, "" )
+    tkWidget_Show( Picture, false )
+    tkWidget_Show( Sample, false )
+    tkLabel_SetText( LblSize, "" )
+    ' the application icon box: Manage only, on an image
+    dim as boolean isImage = false
+    if (i >= 0) andalso (i < Doc.Items.Count( )) then isImage = (Doc.Items[i].Kind = "image")
+    tkWidget_Show( ChkAppIcon, (len( PickKind ) = 0) andalso isImage )
+    tkCheckBox_SetChecked( ChkAppIcon, false )
+    if i < 0 then
+        tkTextBox_SetText( TxtName, "" )
+        tkCheckBox_SetChecked( ChkEmbed, false )
+    else
+        dim byref as resfile.Resource x = Doc.Items[i]
+        tkTextBox_SetText( TxtName, x.Name )
+        tkCheckBox_SetChecked( ChkEmbed, x.Embed )
+        tkCheckBox_SetChecked( ChkAppIcon, lcase( Doc.AppIcon ) = lcase( x.Name ) )
+        tkLabel_SetText( LblInfo, resfile.RefOf( x.Name ) )
+        dim as ustring file = fs.PathJoin( Dir_, resfile.FILES_DIR, x.File )
+        tkLabel_SetText( LblSize, SizeText_( file ) )
+        if x.Kind = "image" then
+            tkPicture_SetFile( Picture, file )
+            tkWidget_Show( Picture, true )
+        else
+            ' the surface owns every font it opened: one per pick is fine for a dialog's life
+            dim as TTF_Font ptr f = tkHost_OpenFont( tkForm_Host( Win ), file, 18 )
+            if f then
+                PreviewFont = f
+                tkLabel_SetFont( Sample, f )
+            end if
+            tkWidget_Show( Sample, true )
+        end if
+    end if
+    Loading = false
+end sub
+
+' Files into the project (copied into files/), each under a free name. The count added; a file that
+' isn't an image or a font is named in the info line.
+function ResourceDialog.AddFiles( byref paths as Array( of ustring ) ) as long
+    dim as long n = 0, last = -1
+    dim as ustring fault
+    for each p as ustring in paths
+        if len( p ) = 0 then continue for
+        dim as ustring problem
+        dim as long i = resfile.AddFile( Doc, Dir_, p, problem )
+        if i < 0 then
+            fault = problem
+            continue for
+        end if
+        Added.Push( Doc.Items[i].File )
+        last = i
+        n += 1
+    next
+    ' in Pick, one of another kind is added but not shown: the list stays the kind asked for
+    this.Fill( last )
+    this.ShowSelected( )
+    if len( fault ) then tkLabel_SetText( LblInfo, fault )
+    return n
+end function
+
+sub ResourceDialog.AddPressed( )
+    if PickFiles = 0 then exit sub
+    dim as ustring got = PickFiles( Owner )
+    if len( got ) = 0 then exit sub
+    dim as Array( of ustring ) paths = strings.Split( got, wchr( 10 ) )
+    this.AddFiles( paths )
+end sub
+
+' The selected resource out. One a form or the theme uses asks first, naming where.
+function ResourceDialog.RemoveSelected( ) as boolean
+    dim as long i = this.SelIndex( )
+    if i < 0 then return false
+    dim as ustring nm = Doc.Items[i].Name
+    ' the project knows it by the name it had before any rename here
+    dim as ustring was = nm
+    for each s as Setting in Renames
+        if lcase( s.Value ) = lcase( nm ) then was = s.Key
+    next
+    if UsedBy then
+        dim as ustring where = UsedBy( Owner, was )
+        if len( where ) andalso (Ask <> 0) then
+            if Ask( Owner, strings.Format( i18n.Tr( "designer.res_remove_used", "{0} is used by {1}. Remove it anyway?" ), _
+                                           resfile.RefOf( nm ), where ) ) = false then return false
+        end if
+    end if
+    dim as long a = -1
+    for k as long = 0 to Added.Count( ) - 1
+        if Added[k] = Doc.Items[i].File then a = k
+    next
+    if a >= 0 then
+        fs.RemoveFile( fs.PathJoin( Dir_, resfile.FILES_DIR, Doc.Items[i].File ) )   ' added and gone again
+        Added.Remove( a )
+    else
+        Removed.Push( Doc.Items[i].File )
+    end if
+    if lcase( Doc.AppIcon ) = lcase( nm ) then Doc.AppIcon = ""      ' the program's icon goes with it
+    Doc.Items.Remove( i )
+    this.Fill( iif( i < Doc.Items.Count( ), i, Doc.Items.Count( ) - 1 ) )
+    this.ShowSelected( )
+    return true
+end function
+
+' The selected resource renamed. "" when done (or nothing changed), else why not.
+' What is wrong with nm as the selected resource's name; "" when nothing is.
+function ResourceDialog.NameFault( byref nm as const ustring ) as ustring
+    if resfile.IsName( nm ) = false then
+        dim as long a = asc( nm )
+        if ((a >= 65) andalso (a <= 90)) orelse ((a >= 97) andalso (a <= 122)) then
+            return i18n.Tr( "designer.res_name_chars", "Letters, digits and underscores only" )
+        end if
+        return i18n.Tr( "designer.res_name_start", "Start with a letter" )
+    end if
+    dim as long j = resfile.Find( Doc, nm )
+    if (j >= 0) andalso (j <> this.SelIndex( )) then return strings.Format( i18n.Tr( "designer.res_name_taken", "{} is taken" ), nm )
+    return ""
+end function
+
+function ResourceDialog.RenameSelected( byref newName as const ustring ) as ustring
+    dim as long i = this.SelIndex( )
+    if i < 0 then return ""
+    dim as ustring old = Doc.Items[i].Name, nm = trim( newName )
+    if nm = old then return ""
+    dim as ustring fault = this.NameFault( nm )
+    if len( fault ) then return fault
+    Doc.Items[i].Name = nm
+    if lcase( Doc.AppIcon ) = lcase( old ) then Doc.AppIcon = nm   ' the program's icon follows it
+    ' one entry per resource the project already knows: old -> newest; one added here needs none
+    dim as boolean isNew = false
+    for each f as ustring in Added
+        if f = Doc.Items[i].File then isNew = true
+    next
+    if isNew = false then
+        dim as long k = -1
+        for r as long = 0 to Renames.Count( ) - 1
+            if lcase( Renames[r].Value ) = lcase( old ) then k = r
+        next
+        if k >= 0 then
+            Renames[k].Value = nm
+        else
+            PutSetting( Renames, old, nm )
+        end if
+    end if
+    this.Fill( i )
+    this.ShowSelected( )
+    return ""
+end function
+
+' The selected image is the program's icon, or no longer is. One at a time: ticking it moves it here.
+sub ResourceDialog.AppIconToggled( byval on_ as boolean )
+    dim as long i = this.SelIndex( )
+    if (i < 0) orelse (Doc.Items[i].Kind <> "image") then exit sub
+    if on_ then
+        Doc.AppIcon = Doc.Items[i].Name
+    elseif lcase( Doc.AppIcon ) = lcase( Doc.Items[i].Name ) then
+        Doc.AppIcon = ""
+    end if
+end sub
+
+sub ResourceDialog.EmbedToggled( byval on_ as boolean )
+    dim as long i = this.SelIndex( )
+    if i < 0 then exit sub
+    Doc.Items[i].Embed = on_
+    this.Fill( i )
+    this.ShowSelected( )
+end sub

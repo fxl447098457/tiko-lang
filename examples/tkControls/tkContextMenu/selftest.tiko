@@ -1,0 +1,192 @@
+' tkContextMenu self-test. Real windows, real SDL events: right-clicks and keys are pushed at the
+' host, the menu's rows clicked on its own popup surface.
+#import "vendor/tkControls/tkContextMenu"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkTest"
+using tkContextMenu
+using tkPopupMenu
+using tkTextBox
+using tkTest
+using tkHost
+using tkPaint
+
+enum
+    IDM_CUT = 101, IDM_COPY, IDM_MORE, IDM_DEEP
+end enum
+
+dim shared as long gPopups, gCommands, gLastId, gRUps
+dim shared as TK_WIDGET ptr gSource
+
+sub OnPopup( byval hCtx as TK_WIDGET ptr, byval hSource as TK_WIDGET ptr )
+    gPopups += 1
+    gSource = hSource
+end sub
+
+sub OnCommand( byval hCtx as TK_WIDGET ptr, byval id as long )
+    gCommands += 1
+    gLastId = id
+end sub
+
+' a plain control that counts the right button's releases it is given
+function PlainProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg = TKM_RBUTTONUP then gRUps += 1 : return true
+    if m->msg = TKM_PAINT then return true
+    return false
+end function
+
+function Plain( byval parent as TK_WIDGET ptr, byval id as long, byval x as long, byval y as long, byval w as long, byval hh as long ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr k = tkWidget_CreateChild( parent, id, @PlainProc, 0 )
+    tkWidget_SetPos( k, x, y, w, hh )
+    return k
+end function
+
+sub ClickRow( byval m as TK_MENU ptr, byval idx as long )
+    dim as TKRECT rc
+    tkPopupMenu_GetItemRect( m, idx, rc )
+    dim as single x = (rc.left + rc.right) / 2, y = (rc.top + rc.bottom) / 2
+    dim as TK_HOST ptr ps = tkPopupMenu_Surface( m )
+    tkTest_PushMotion( ps, x, y )
+    tkTest_PumpFor( ps, 30 )
+    tkTest_Click( ps, x, y )
+end sub
+
+sub RightClick( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr )
+    tkTest_PushMotion( h, tkTest_CX( w ), tkTest_CY( w ) )
+    tkTest_Click( h, tkTest_CX( w ), tkTest_CY( w ), SDL_BUTTON_RIGHT )
+    tkTest_PumpFor( h, 60 )
+end sub
+
+sub CloseMenus( byval h as TK_HOST ptr )
+    dim as TK_MENU ptr r = tkPopupMenu_GetOpenRoot( )
+    if r then tkPopupMenu_CloseChain( r )
+    tkTest_PumpFor( h, 40 )
+end sub
+
+sub RunPass( )
+    tkTest_Begin( "context menu" )
+    dim as TK_HOST ptr h = tkHost_Create( "tkContextMenu selftest", 480, 320, tkHost_FontDir() & TK_FONT_UI, 1.0 )
+    tkHost_Show( h )
+    dim as TK_WIDGET ptr root = tkHost_Root( h )
+    dim as TK_WIDGET ptr cm = tkContextMenu_Create( root, 50 )
+    dim as TK_MENU ptr m = tkContextMenu_GetMenu( cm )
+    tkPopupMenu_AddItem( m, IDM_CUT, "Cut" )
+    tkPopupMenu_AddItem( m, IDM_COPY, "Copy" )
+    tkPopupMenu_AddSeparator( m )
+    tkPopupMenu_AddItem( m, IDM_MORE, "More" )
+    dim as TK_MENU ptr sm = tkPopupMenu_Create( h )
+    tkPopupMenu_AddItem( sm, IDM_DEEP, "Deep" )
+    tkPopupMenu_SetItemSubMenu( m, IDM_MORE, sm )
+    tkContextMenu_SetPopupCallback( cm, @OnPopup )
+    tkContextMenu_SetCommandCallback( cm, @OnCommand )
+
+    tkTest_Check( "created hidden, not a tab stop", (cm <> 0) andalso (cm->isVisible = false) andalso (cm->isFocusable = false) )
+    tkTest_Check( "it owns a menu", m <> 0 )
+
+    dim as TK_WIDGET ptr a = Plain( root, 1, 20, 20, 120, 40 )
+    dim as TK_WIDGET ptr pnl = Plain( root, 2, 200, 20, 200, 120 )
+    dim as TK_WIDGET ptr kid = Plain( pnl, 3, 20, 20, 80, 30 )
+    dim as TK_WIDGET ptr bare = Plain( root, 4, 20, 200, 120, 40 )
+    tkHost_SetFocus( h, 0 )
+    tkTest_PumpFor( h, 40 )
+
+    ' nothing attached: the control gets the release, no menu
+    gRUps = 0 : gPopups = 0
+    RightClick( h, bare )
+    tkTest_Check( "unattached: the control gets the right button", (gRUps = 1) andalso (gPopups = 0) andalso (tkContextMenu_IsOpen( cm ) = false) )
+
+    ' attached: the menu opens instead, told which widget
+    tkContextMenu_Attach( cm, a )
+    tkTest_Check( "Attach sets the widget's context menu", tkWidget_GetContextMenu( a ) = cm )
+    gRUps = 0 : gPopups = 0 : gSource = 0
+    RightClick( h, a )
+    tkTest_Check( "attached: a right-click opens it", tkContextMenu_IsOpen( cm ) andalso (gPopups = 1) )
+    tkTest_Check( "...for that widget", (gSource = a) andalso (tkContextMenu_GetSource( cm ) = a) )
+    tkTest_Check( "...and the control doesn't get the release", gRUps = 0, str( gRUps ) )
+
+    ' a choice calls Command with its id
+    gCommands = 0 : gLastId = 0
+    ClickRow( m, 1 )
+    tkTest_PumpFor( h, 40 )
+    tkTest_Check( "a choice: Command with its id", (gCommands = 1) andalso (gLastId = IDM_COPY), gCommands & " " & gLastId )
+    tkTest_Check( "...and the menu is closed", tkContextMenu_IsOpen( cm ) = false )
+
+    ' a submenu's choice reaches Command too
+    RightClick( h, a )
+    gCommands = 0 : gLastId = 0
+    ClickRow( m, 3 )
+    tkTest_PumpFor( h, 60 )
+    tkTest_Check( "the submenu opens", tkPopupMenu_IsOpen( sm ) )
+    ClickRow( sm, 0 )
+    tkTest_PumpFor( h, 40 )
+    tkTest_Check( "a submenu's choice: Command with its id", (gCommands = 1) andalso (gLastId = IDM_DEEP), gCommands & " " & gLastId )
+    CloseMenus( h )
+
+    ' a child of an attached widget opens its parent's menu
+    tkContextMenu_Attach( cm, pnl )
+    gRUps = 0 : gSource = 0
+    RightClick( h, kid )
+    tkTest_Check( "inside an attached widget: its menu, for the widget that has it", tkContextMenu_IsOpen( cm ) andalso (gSource = pnl) andalso (gRUps = 0) )
+    CloseMenus( h )
+
+    ' a TextBox's own menu is replaced
+    dim as TK_WIDGET ptr tb = tkTextBox_Create( root, 5 )
+    tkWidget_SetPos( tb, 20, 100, 160, 28 )
+    tkTest_PumpFor( h, 30 )
+    RightClick( h, tb )
+    dim as TK_MENU ptr own = tkPopupMenu_GetOpenRoot( )
+    tkTest_Check( "a TextBox opens its own menu while it has none attached", (own <> 0) andalso (own <> m) )
+    CloseMenus( h )
+    tkContextMenu_Attach( cm, tb )
+    gSource = 0
+    RightClick( h, tb )
+    tkTest_Check( "attached to a TextBox: ours, not its own", (tkPopupMenu_GetOpenRoot( ) = m) andalso (gSource = tb) )
+    CloseMenus( h )
+
+    ' the keyboard: the Menu key and Shift+F10 on the focused widget
+    tkHost_SetFocus( h, tb )
+    gSource = 0 : gPopups = 0
+    tkTest_PushKey( h, SDLK_APPLICATION )
+    tkTest_PumpFor( h, 60 )
+    tkTest_Check( "the Menu key opens it for the focused widget", tkContextMenu_IsOpen( cm ) andalso (gSource = tb) andalso (gPopups = 1) )
+    CloseMenus( h )
+    tkTest_PushKey( h, SDLK_F10, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 60 )
+    tkTest_Check( "...and Shift+F10", tkContextMenu_IsOpen( cm ) andalso (gPopups = 2) )
+    CloseMenus( h )
+
+    ' disabled: nothing opens, and the control still doesn't get the release
+    tkWidget_Enable( cm, false )
+    gPopups = 0 : gRUps = 0
+    RightClick( h, a )
+    tkTest_Check( "disabled: no menu", (tkContextMenu_IsOpen( cm ) = false) andalso (gPopups = 0) )
+    tkWidget_Enable( cm, true )
+
+    ' detached: the control has its right button back
+    tkContextMenu_Detach( a )
+    gRUps = 0
+    RightClick( h, a )
+    tkTest_Check( "detached: the control gets the release again", (gRUps = 1) andalso (tkContextMenu_IsOpen( cm ) = false) )
+
+    ' destroyed: every attachment goes with it, and a right-click is the control's again
+    tkContextMenu_Attach( cm, a )
+    tkWidget_Destroy( cm )
+    tkTest_Check( "destroyed: no widget keeps it", (tkWidget_GetContextMenu( a ) = 0) andalso (tkWidget_GetContextMenu( pnl ) = 0) andalso (tkWidget_GetContextMenu( tb ) = 0) )
+    gRUps = 0
+    RightClick( h, a )
+    tkTest_Check( "...and a right-click reaches the control", gRUps = 1 )
+
+    ' one surface only
+    dim as TK_HOST ptr h2 = tkHost_Create( "other", 200, 120, tkHost_FontDir() & TK_FONT_UI, 1.0 )
+    dim as TK_WIDGET ptr cm2 = tkContextMenu_Create( tkHost_Root( h2 ), 60 )
+    tkContextMenu_Attach( cm2, a )
+    tkTest_Check( "a menu of another surface is refused", tkWidget_GetContextMenu( a ) = 0 )
+    tkHost_Destroy( h2 )
+
+    tkHost_Destroy( h )
+end sub
+
+if tkTest_Init() = false then end 99
+RunPass( )
+dim as long nFail = tkTest_Report( "tkContextMenu" )
+tkTest_Quit()
+end nFail

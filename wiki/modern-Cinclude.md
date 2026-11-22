@@ -175,7 +175,7 @@ A callback whose **parameters** differ from the C type is also `TKO0833`. Treat 
 - **`static inline` functions.** They have no symbol to link against.
 - **`NULL`.** Use [`nullptr`](Category-Nullptr).
 - **C++.** C headers only.
-- **Types tiko cannot express**, each listed under *declarations were skipped* with the reason: `_Complex` numbers, an 80-bit `long double` (Linux), infinity and NaN as constant values, array typedefs, flexible array members, and function pointers declared with `(...)` and no named parameter (Windows' `FARPROC`, and so `GetProcAddress`).
+- **Types tiko cannot express**, each listed under *declarations were skipped* with the reason: `_Complex` numbers, an 80-bit `long double` (Linux), infinity and NaN as constant values, a bit-field of `__int128`, a 128-bit constant value (libclang reads only its low 64 bits), array typedefs, flexible array members, and function pointers declared with `(...)` and no named parameter (Windows' `FARPROC`, and so `GetProcAddress`).
 
 **The Universal C Runtime's inline functions (windows-x86_64).** The UCRT's `stdio.h` defines `printf` and its family in the header, as inline functions with no symbol. The fourteen functions of the `printf` and `scanf` families (`printf`, `fprintf`, `sprintf`, `snprintf`, `scanf`, `fscanf`, `sscanf` and their `v` forms) work all the same, because tiko's runtime supplies each one. Any other inline UCRT function is not declared. `time` is one: it is a real function on Linux and an inline one on Windows.
 
@@ -235,6 +235,7 @@ For a library installed on the system, name it with `system:`, or with [`#inclib
 
 ## Remarks
 
+- **`__int128`** and `unsigned __int128` (and `__int128_t` / `__uint128_t`) are tiko's `int128` and `uint128`, 16-aligned as in C, so a record holding one is not over-aligned and imports.
 - **Over-alignment** (`__declspec(align(16))`, `_Alignas(16)`) has no tiko spelling, so such a record usually fails the layout check and is refused. The exception is a record whose members already need 8-byte alignment: tiko writes out C's padding, so its size and every member offset match, but a local variable or array element of it is aligned to 8 bytes where C promises 16.
 
 ### See also

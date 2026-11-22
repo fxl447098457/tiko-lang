@@ -173,6 +173,25 @@ function LowerCvaEnd( byref c as Ctx, byval id as NodeId ) as boolean
     return true
 end function
 
+'' AN int128 IN A '...' TAIL, on Windows, goes BY ADDRESS of a 16-aligned copy -- clang and
+'' MSVC's rule for a vararg over eight bytes; LowerCvaArg reads it back the same way. SysV
+'' and AAPCS64 pass it as the i128 it is, as clang does.
+function VarargI128_( byref c as Ctx, byref a as MirValue ) as MirValue
+    if c.types->target.isWindows = false then return a
+    dim as int32 vslot = NewTempLocal( c, MT_I128, 16 )
+    dim as MirValue vaddr
+    vaddr.kind = cast( uint8, MV_LOCAL )
+    vaddr.ty = cast( uint8, MT_PTR )
+    vaddr.id = cast( uint32, vslot )
+    dim as MirInst vst
+    vst.op = cast( uint16, M_STORE )
+    vst.ty = cast( uint8, MT_VOID )
+    vst.a = vaddr
+    vst.b = a
+    Emit( c, vst )
+    return vaddr
+end function
+
 '' 'cva_arg( list, TYPE )' IS AN EXPRESSION, and the only one of the four. Returns false
 '' when the node is not one, so the ordinary call path can have it.
 function LowerCvaArg _
@@ -224,6 +243,23 @@ function LowerCvaArg _
         case MT_I8, MT_I16, MT_I32
             readTy = MT_I64
         end select
+        '' AN int128 ON WINDOWS IS PASSED BY ADDRESS (lowercall.tiko's promotion): the slot
+        '' holds a pointer, and the value is loaded through it. Win32's slot is the address
+        '' too -- the pointerBits test above covers it.
+        if (mt = MT_I128) andalso c.types->target.isWindows then
+            dim as MirInst pa
+            pa.op = cast( uint16, M_VA_ARG )
+            pa.ty = cast( uint8, MT_PTR )
+            pa.a = av
+            dim as MirValue pv = Emit( c, pa )
+            if pv.kind = cast( uint8, MV_NONE ) then return false
+            dim as MirInst ld
+            ld.op = cast( uint16, M_LOAD )
+            ld.ty = cast( uint8, MT_I128 )
+            ld.a = pv
+            outv = Emit( c, ld )
+            return (outv.kind <> cast( uint8, MV_NONE ))
+        end if
     end if
     dim as MirInst ins
     ins.op = cast( uint16, M_VA_ARG )

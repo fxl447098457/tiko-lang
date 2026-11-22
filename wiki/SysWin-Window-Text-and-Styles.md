@@ -95,7 +95,7 @@ end main()
 | [RedrawNonClientArea](#redrawnonclientarea) | Repaints the frame of a window. |
 | [SetRenderingPolicy](#setrenderingpolicy) | Turns the desktop compositor's drawing of the window frame on or off. |
 | [EnableVisualStyles](#enablevisualstyles) | Gives the program's controls the current Windows look without a manifest. |
-| [SetDialogResult](#setdialogresult) | Stores a dialog procedure's message result, for a fixed set of messages. |
+| [SetDialogResult](#setdialogresult) | Stores a dialog procedure's message result. |
 
 ## Reference
 
@@ -406,21 +406,7 @@ Microsoft Learn: [CreateActCtxW](https://learn.microsoft.com/en-us/windows/win32
 function SetDialogResult( byval hDlg as HWND, byval uMsg as UINT, byval result as LONG_PTR ) as boolean
 ```
 
-Stores `result` in a dialog's `DWLP_MSGRESULT` slot, but only when `uMsg` is one of these twelve
-messages: `WM_CTLCOLORMSGBOX`, `WM_CTLCOLOREDIT`, `WM_CTLCOLORLISTBOX`, `WM_CTLCOLORBTN`,
-`WM_CTLCOLORDLG`, `WM_CTLCOLORSCROLLBAR`, `WM_CTLCOLORSTATIC`, `WM_COMPAREITEM`,
-`WM_VKEYTOITEM`, `WM_CHARTOITEM`, `WM_QUERYDRAGICON` and `WM_INITDIALOG`. For any other message
-it does nothing.
-
-For those twelve messages the dialog manager takes the result from the dialog procedure's return
-value, not from `DWLP_MSGRESULT`: return the brush, the comparison or the focus flag directly.
-For every other message that needs a result, such as `WM_NOTIFY`, store it yourself and return
-`TRUE`:
-
-```freebasic
-SetWindowLongPtrW( hDlg, DWLP_MSGRESULT, CDRF_NOTIFYITEMDRAW )
-return TRUE
-```
+Stores `result` in a dialog's `DWLP_MSGRESULT` slot.
 
 | Parameter | Meaning |
 | --- | --- |

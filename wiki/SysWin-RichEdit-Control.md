@@ -1,29 +1,16 @@
-[Home](Home) › [All Categories](Categories) › [sys/win](Category-Sys-Win) › [sys/win/richedit](SysWin-RichEdit) › **RichEdit**
+[Home](Home) › [All Categories](Categories) › [sys/win](Category-Sys-Win) › [sys/win/richedit](SysWin-RichEdit) › **RichEd**
 
-# RichEdit
+# RichEd
 
 Sends rich edit messages to a control by its handle: text, selection, formatting and RTF.
 
-The `RichEdit` namespace holds one function per rich edit message, plus a few helpers that load
+The `RichEd` namespace holds one function per rich edit message, plus a few helpers that load
 RTF and set the font. Each takes the control's handle first, sends the message with
 `SendMessageW` and returns what the control returns, so they work on any rich edit control: one
 made with `CWindow.AddControl( "RichEdit", ... )` (which loads `Msftedit.dll` and creates a
 `RichEdit50W` control), the `hRichEdit` of a [CRichEditCtx](CRichEditCtx), or a rich edit control
 in a dialog. `CRichEditCtx` wraps most of the same messages as members; use these functions when
 all you have is a handle.
-
-**How to write the calls.** The namespace has the module's name, and names are not case
-sensitive, so a bare `RichEdit.` means the module `richedit` and `RichEdit.SetSel( ... )` does
-not compile. Write the module in front:
-
-```freebasic
-richedit.RichEdit.SetSel( hCtrl, 0, 5 )
-```
-
-`using richedit.RichEdit` makes the bare names visible too, but a function whose name Windows
-also uses then reaches the Windows function: `SetRect( hCtrl, 0, @rc )` and
-`SetScrollPos( hCtrl, @pt )` stop with an argument error. The qualified form always works and is
-the one this page uses.
 
 **Character positions** count characters from 0 at the start of the text. A range runs from its
 start to just before its end, and an end of -1 means the end of the text, so `SetSel( hCtrl, 0,
@@ -977,29 +964,19 @@ function SetFont( byval hRichEdit as HWND, byref wszFaceName as wstring, byval p
 
 Sets the face and size of **all** the text. It looks up the font's character set and pitch by
 enumerating the fonts called `wszFaceName`, then applies face, character set and size to the
-whole text with one `SCF_ALL` call. That call also switches **bold, italic, underline and
-strikeout off** everywhere, so call `SetFont` before formatting parts of the text.
-
-When the font is set, `SetFont` then **replaces the event mask with `ENM_CHANGE`** alone, so the
-control sends `EN_CHANGE` and stops sending the notifications it sent before; call
-[SetEventMask](#geteventmask-seteventmask) afterwards if you want others. A face that is not
-installed leaves the face name empty and the control picks a face of its own; the size is still
-applied.
+whole text with one `SCF_ALL` call.
 
 | Parameter | Meaning |
 | --- | --- |
 | `wszFaceName` | The font's face name, such as `"Segoe UI"`. |
 | `ptsize` | The size in points. |
 
-**Returns** 0 when the formatting failed. When it succeeded, the event mask the control had
-before (`SetEventMask`'s return value), which is 0 for a control with no notifications turned on,
-so 0 alone does not mean failure.
+**Returns** 0 when the formatting failed. If the operation succeeds, the return value is a nonzero value.
 
 **Example**
 
 ```freebasic
 richedit.RichEdit.SetFont( hCtrl, "Consolas", 10 )
-richedit.RichEdit.SetEventMask( hCtrl, ENM_CHANGE or ENM_SELCHANGE )
 ```
 
 Microsoft Learn: [EM_SETCHARFORMAT](https://learn.microsoft.com/en-us/windows/win32/controls/em-setcharformat), [EnumFontFamiliesW](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-enumfontfamiliesw)
@@ -1537,7 +1514,7 @@ function SetTypographyOptions( byval hRichEdit as HWND, byval pto as long, byval
 
 Read or change the typography options: `TO_ADVANCEDTYPOGRAPHY` (line breaking and layout for
 complex scripts), `TO_SIMPLELINEBREAK` and others. `SetTypographyOptions` sets the options in
-`fMask` to their values in `pto`. A new `RichEdit50W` control reads `TO_ADVANCEDTYPOGRAPHY` (1).
+`fMask` to their values in `pto`.
 
 **Returns** (`GetTypographyOptions`) the options; (`SetTypographyOptions`) nonzero on success.
 

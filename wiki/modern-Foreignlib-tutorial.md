@@ -68,7 +68,7 @@ Three rules carry the whole directive:
 
 1. **The path is relative to the source file**, so the project builds from any folder.
 2. **You state the kind.** If no file of that kind is found, you get an error that lists every file tiko tried. tiko never falls back to the other kind.
-3. **You never write the platform.** For `"vendor/greet/greet"`, tiko looks for `greet_windows_x86_64.lib` on Windows , `greet_linux_x86_64.so` on Linux and `greet_macos_arm64.dylib` on macOS, among others (section 9). One line works on all three.
+3. **You never write the platform.** For `"vendor/greet/greet"`, tiko looks for `greet_windows_x86_64.lib` on Windows , `greet_linux_x86_64.so` on Linux (`greet_linux_arm64.so` on arm64) and `greet_macos_arm64.dylib` on macOS, among others (section 9). One line works on all three.
 
 ## 4. Build a tiny C library
 
@@ -335,12 +335,12 @@ dir/base_<arch><ext>
 dir/base<ext>
 ```
 
-| | Windows | Linux | macOS |
-|---|---|---|---|
-| `<os>` | `windows` | `linux` | `macos` |
-| `<arch>` | `x86_64` | `x86_64` | `arm64` |
-| `<ext>` for `static` | `.a`, then `.lib` | `.a` | `.a` |
-| `<ext>` for `dynamic` | `.dll.a`, then `.lib`, then `.dll` | `.so` | `.dylib` |
+| | Windows | Linux x86-64 | Linux arm64 | macOS |
+|---|---|---|---|---|
+| `<os>` | `windows` | `linux` | `linux` | `macos` |
+| `<arch>` | `x86_64` | `x86_64` | `arm64` | `arm64` |
+| `<ext>` for `static` | `.a`, then `.lib` | `.a` | `.a` | `.a` |
+| `<ext>` for `dynamic` | `.dll.a`, then `.lib`, then `.dll` | `.so` | `.so` | `.dylib` |
 
 Every ending for the kind is tried at each step, and the first file that exists is used.
 

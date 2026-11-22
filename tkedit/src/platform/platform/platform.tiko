@@ -214,8 +214,42 @@ end function
 '   Windows  a .cmd (it runs through cmd.exe; a GUI process's console child gets a new window)
 '   Linux    a .sh, under $TERMINAL / x-terminal-emulator / gnome-terminal / konsole / ... / xterm
 '   macOS    a .command, opened by Terminal.app (open -a Terminal)
-public function TerminalArgv( byref exe as const ustring, byref args as const Array( of ustring ), _
-                              byref workDir as const ustring, byref scriptDir as const ustring ) as Array( of ustring )
+' Text for a cmd "echo": its special characters escaped.
+private function CmdEchoText_( byref s as const ustring ) as ustring
+    dim as ustring out_
+    for i as long = 1 to len( s )
+        dim as ustring ch = mid( s, i, 1 )
+        select case ch
+        case "^", "&", "|", "<", ">" : out_ &= "^" & ch
+        case "%"                     : out_ &= "%%"
+        case else                    : out_ &= ch
+        end select
+    next
+    return out_
+end function
+
+' A Windows program built for the GUI subsystem (its PE header says so): started from a console,
+' it never writes to it. False for anything else, or a file that can't be read.
+public function IsWindowsGuiExe( byref exe as const ustring ) as boolean
+    dim as fs.File f
+    if f.OpenRead( exe ).IsOk( ) = false then return false
+    dim as ubyte b( 0 to 1023 )
+    dim as fs.FsResultI64 r = f.Read( @b( 0 ), 1024 )
+    f.Close( )
+    if r.IsOk( ) = false then return false
+    dim as long n = clng( r.Value( ) )
+    if (n < 64) orelse (b( 0 ) <> 77) orelse (b( 1 ) <> 90) then return false            ' "MZ"
+    dim as long pe = b( 60 ) or (b( 61 ) shl 8) or (b( 62 ) shl 16)
+    if pe + 24 + 70 > n then return false
+    if (b( pe ) <> 80) orelse (b( pe + 1 ) <> 69) orelse (b( pe + 2 ) <> 0) orelse (b( pe + 3 ) <> 0) then return false   ' "PE\0\0"
+    ' the optional header's Subsystem, at 68 in PE32 and PE32+ alike: 2 = Windows GUI
+    dim as long ss = pe + 24 + 68
+    return (b( ss ) or (b( ss + 1 ) shl 8)) = 2
+end function
+
+public function TerminalArgv(byref exe as const ustring, byref args as const Array( of ustring ), _
+                              byref workDir as const ustring, byref scriptDir as const ustring, _
+                              byref note as const ustring = "" ) as Array( of ustring )
     dim as Array( of ustring ) argv
     dim as ustring q = chr( 34 )
     fs.CreateDirAll( scriptDir )
@@ -225,8 +259,12 @@ public function TerminalArgv( byref exe as const ustring, byref args as const Ar
         for each a as ustring in args
             line_ &= " " & q & a & q
         next
+        ' note: a line printed before the program starts (Windows only: why a GUI program prints nothing here)
+        dim as ustring noteLines
+        ' (the script is UTF-8: the console reads the rest of it so once chcp 65001 has run)
+        if len( note ) then noteLines = "chcp 65001 >nul" & nl & "echo " & CmdEchoText_( note ) & nl & "echo." & nl
         dim as ustring script = fs.PathJoin( scriptDir, "tkEdit-run.cmd" )
-        fs.WriteAllText( script, "@echo off" & nl & "cd /d " & q & workDir & q & nl & line_ & nl & _
+        fs.WriteAllText( script, "@echo off" & nl & "cd /d " & q & workDir & q & nl & noteLines & line_ & nl & _
                                  "echo." & nl & "pause" & nl )
         argv.Push( script )
         return argv

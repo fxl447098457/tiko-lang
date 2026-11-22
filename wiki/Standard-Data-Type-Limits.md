@@ -18,12 +18,15 @@ Standard variable types and limits.
 | UINTEGER | 32/64 \[\*\] | unsigned integer | 0 | \[\*\]32bit: +4294967295, 64bit: +18446744073709551615 | u | \[\*\] |
 | LONGINT | 64 | signed integer | -9223372036854775808 | +9223372036854775807 | ll | 18+ |
 | ULONGINT | 64 | unsigned integer | 0 | +18446744073709551615 | ull | 19+ |
+| INT128 \[\*\*\*\] | 128 | signed integer | -170141183460469231731687303715884105728 | +170141183460469231731687303715884105727 | | 38+ |
+| UINT128 \[\*\*\*\] | 128 | unsigned integer | 0 | +340282366920938463463374607431768211455 | | 38+ |
 | SINGLE | 32 | floating point | \[\*\*\]+/-1.401 298 E-45 | \[\*\*\]+/-3.402 823 E+38 | !, f | 6+ |
 | DOUBLE | 64 | floating point | \[\*\*\]+/-4.940 656 458 412 465 E-324 | \[\*\*\]+/-1.797 693 134 862 316 E+308 | #, d | 15+ |
 | enums | 32/64 \[\*\] | signed integer | \[\*\]32bit: -2147483648, 64bit: -9223372036854775808 | \[\*\]32bit: +2147483647, 64bit: +9223372036854775807 | | \[\*\] |
 
 \[\*\] *[`Integer`](Integer) and [`UInteger`](Uinteger) data types vary with platform, matching the size of pointers.*  
- \[\*\*\] *The minimum and maximum values for the floating-point types [`Single`](Single) and [`Double`](Double) are, respectively, the values closest to zero and the values closest to positive and negative infinity.*
+ \[\*\*\] *The minimum and maximum values for the floating-point types [`Single`](Single) and [`Double`](Double) are, respectively, the values closest to zero and the values closest to positive and negative infinity.*  
+ \[\*\*\*\] ***tiko:** [`Int128` and `UInt128`](Category-Fixed-Width-Types#128-bit-integers) have no literal suffix: a literal too big for 64 bits is 128-bit by itself.*
 
 ***String Types***
 

@@ -34,6 +34,7 @@
 #import "tks/dapengine"
 #import "tks/parser"
 #import "tka/mainwin"
+#import "tka/keysdlg"
 #import "tka/chrome"
 #import "tka/completion"
 #import "tka/startpanel"
@@ -147,11 +148,17 @@ end function
 
 ' A fresh, empty config folder for one pass. Under the install folder (platform.InstallDir), never
 ' inside a macOS bundle: a file written in tkEdit.app breaks its signature.
-private function FreshConfig( ) as ustring
+' An empty config folder -- but for a settings.toml that turns the explorer off: a new file has it
+' on (2026-11-16), and the passes measure the editor's layout without the side panel. The window's
+' first sync writes every other key at its default. ExplorerPass asks for none: FreshConfig( false ).
+private function FreshConfig( byval explorerOff as boolean = true ) as ustring
     dim as ustring res = platform.ResourceDir( ).ValueOr( platform.InstallDir( ) )
     dim as ustring cfg = fs.PathJoin( res, "out", "selftest", "config" )
     fs.RemoveDirAll( cfg )
     fs.CreateDirAll( cfg )
+    if explorerOff then
+        fs.WriteAtomic( fs.PathJoin( cfg, settings.SETTINGS_FILE ), "version = 1" & chr( 10 ) & "[ui]" & chr( 10 ) & "explorer = false" & chr( 10 ) )
+    end if
     return cfg
 end function
 
@@ -371,6 +378,19 @@ public sub Pass( byref t as Tally, byval sc as single )
     mw.Destroy( )
 end sub
 
+' Posted before a step that opens the Keyboard Shortcuts dialog modally: once its loop runs, Cancel --
+' so the step comes back by itself, with no one at the keyboard.
+dim shared as long gKeysCancelTries
+private sub CancelKeysWhenModal( byval payload as any ptr )
+    dim as mainwin.Window ptr w = payload
+    gKeysCancelTries += 1
+    if (w->KeysDlg <> 0) andalso w->KeysDlg->IsModal then
+        w->KeysDlg->Finish( false )
+    elseif gKeysCancelTries < 100000 then
+        tkApp_RunOnUI( @CancelKeysWhenModal, payload )
+    end if
+end sub
+
 ' P1: the command table, key dispatch, first-run files, live reload of settings.toml,
 ' keybindings.toml and the theme file, a broken file changing nothing, settings.toml rewritten.
 public sub ConfigPass( byref t as Tally, byval sc as single )
@@ -502,8 +522,10 @@ public sub ConfigPass( byref t as Tally, byval sc as single )
              (instr( st2, nl & "tab_size = 4" & nl ) > 0) andalso (instr( st2, nl & "[[builds]]" & nl ) > 0) andalso _
              (instr( st2, "# tab_size" ) = 0), P( sc, "reopened, settings.toml sets every key at its value" ) )
     t.Check( mw.View( ).IsModified( ) = false, P( sc, "and is unmodified" ) )
-    Chord( h, SDLK_K, SDL_SCANCODE_K, KMOD_PRIMARY )
-    t.Check( lcase( mw.ActivePath( ) ) = lcase( kf ), P( sc, "Ctrl+K opened keybindings.toml" ) )
+    ' keybindings.toml as text (Ctrl+K is the Keyboard Shortcuts dialog now: keyspass)
+    mw.SyncKeysFile( )
+    mw.OpenFile( kf )
+    t.Check( lcase( mw.ActivePath( ) ) = lcase( kf ), P( sc, "keybindings.toml opened as text" ) )
     mw.View( ).SetText( "format = 1" & nl & "[bindings]" & nl & "DuplicateLine = 'Primary+Shift+D'" & nl & _
                      "DeleteLine = 'Primary+S'" & nl )
     Chord( h, SDLK_S, SDL_SCANCODE_S, KMOD_PRIMARY )
@@ -520,7 +542,8 @@ public sub ConfigPass( byref t as Tally, byval sc as single )
     Chord( h, SDLK_S, SDL_SCANCODE_S, KMOD_PRIMARY )
     t.Check( mw.Keys.Effective( Cmd.DuplicateLine ) = "Primary+D", P( sc, "an emptied file restores the defaults" ) )
     mw.Execute( Cmd.FileClose )
-    Chord( h, SDLK_K, SDL_SCANCODE_K, KMOD_PRIMARY )
+    mw.SyncKeysFile( )
+    mw.OpenFile( kf )
     dim as ustring kt2 = mw.View( ).Text( )
     t.Check( (lcase( mw.ActivePath( ) ) = lcase( kf )) andalso (instr( kt2, nl & "DuplicateLine = 'Primary+D'" & nl ) > 0) andalso _
              (instr( kt2, nl & "FileSave = 'Primary+S'" & nl ) > 0) andalso (instr( kt2, "# FileSave" ) = 0), _
@@ -678,15 +701,18 @@ public sub ConfigPass( byref t as Tally, byval sc as single )
     t.Check( (mw.StatusText( mainwin.StatusPanel.Project ) = "Project") andalso (i18n.CurrentCode( ) = "en"), P( sc, "the language gone: English" ) )
     t.Check( (tkTabBar_GetText( mw.Out.tabs, 0 ) = "Results") andalso (tkToolbar_GetText( mw.Finder.rtools, 0 ) = "Replace"), _
              P( sc, "and the tab and the tool back in English" ) )
-    Chord( h, SDLK_K, SDL_SCANCODE_K, KMOD_PRIMARY )                    ' back to keybindings.toml, as before
+    mw.OpenFile( kf )                                                   ' back to keybindings.toml, as before
 
     ' ---- the Settings and Keys panels open their files
     mw.View( ).SetText( "format = 1" & nl & "[bindings]" & nl )
     Chord( h, SDLK_S, SDL_SCANCODE_S, KMOD_PRIMARY )
     ClickPanel( mw, mainwin.StatusPanel.Settings )
     t.Check( lcase( mw.ActivePath( ) ) = lcase( sf ), P( sc, "the Settings panel opened settings.toml: " & mw.ActivePath( ) ) )
+    ' the Keys panel runs Ctrl+K: the dialog comes and goes (Cancel), the buffers untouched
+    gKeysCancelTries = 0
+    tkApp_RunOnUI( @CancelKeysWhenModal, @mw )
     ClickPanel( mw, mainwin.StatusPanel.Keys )
-    t.Check( lcase( mw.ActivePath( ) ) = lcase( kf ), P( sc, "the Keys panel opened keybindings.toml: " & mw.ActivePath( ) ) )
+    t.Check( (gKeysCancelTries > 0) andalso (mw.KeysDlg = 0) andalso (lcase( mw.ActivePath( ) ) = lcase( sf )), P( sc, "the Keys panel's dialog left the buffers alone: " & mw.ActivePath( ) ) )
 
     ' ---- tkEdit's own theme (THEMES.md TH7): Ctrl+Shift+T opens the Theme Center on a copy of the
     ' shipped Default.tktheme in the config folder; its Save applies it. 'light' is Default, light.
@@ -704,12 +730,13 @@ public sub ConfigPass( byref t as Tally, byval sc as single )
         tkTest_PumpFor( th, 40 )
         ClickRow( th, tdlg->Roles, TKROLE_SURFACE )
         TypeInto( th, tdlg->TxtRole, "#123456" )
-        PressIn( th, tdlg->BtnSave )
+        PressIn( th, tdlg->BtnSave )         ' Save writes, applies and closes the dialog
         tkTest_PumpFor( h, 40 )
         t.Check( tkApp_Theme( ).Surface = &hFF123456ul, P( sc, "Save applied it to tkEdit at once: &h" & hex( tkApp_Theme( ).Surface ) ) )
         t.Check( lcase( mw.Theme.Path ) = lcase( tf ), P( sc, "the user's copy wins" ) )
-        PressIn( th, tdlg->BtnClose )
-        tkTest_PumpFor( h, 30 )
+        dim as ustring sft = fs.ReadAllText( sf ).ValueOr( "" )
+        t.Check( (instr( sft, "theme = 'Default'" ) > 0) andalso (instr( sft, "theme_mode = 'light'" ) > 0), _
+                 P( sc, "and settings.toml keeps it: Default, light" ) )
     end if
     t.Check( mw.ThemeDlg = 0, P( sc, "the Theme Center closed" ) )
     ' the file as text: its [light.editor] applies on save
@@ -3156,7 +3183,7 @@ end sub
 
 public sub ExplorerPass( byref t as Tally, byval sc as single )
     dim as mainwin.Window mw
-    mw.ConfigDir = FreshConfig( )
+    mw.ConfigDir = FreshConfig( false )
     mw.Ask = @ScriptedAsk
     mw.Pick = @ScriptedPick
     t.Check( mw.Create( sc ), P( sc, "explorer: main window created" ) )
@@ -3172,9 +3199,10 @@ public sub ExplorerPass( byref t as Tally, byval sc as single )
     mw.OpenFile( pathA )
     mw.OpenFile( pathB )
 
-    ' ---- off in a new settings.toml
+    ' ---- on in a new settings.toml; then off
     dim as ustring st = fs.ReadAllText( mw.SettingsFile( ) ).ValueOr( "" )
-    t.Check( (instr( st, nl & "explorer = false" ) > 0) andalso (instr( st, nl & "explorer_side = 'left'" ) > 0), P( sc, "explorer: a new settings.toml has it off, on the left" ) )
+    t.Check( (instr( st, nl & "explorer = true" ) > 0) andalso (instr( st, nl & "explorer_side = 'left'" ) > 0), P( sc, "explorer: a new settings.toml has it on, on the left" ) )
+    SetExplorerKeys( mw, "explorer = false" )
     t.Check( (tkWidget_IsVisible( mw.Side.frame ) = false) andalso (tkWidget_IsVisible( mw.sideBar ) = false) andalso (mw.tabs->x = 0) andalso (mw.tabs->cw = cx), _
              P( sc, "explorer: off, the panel and its bar are gone" ) )
 
@@ -3431,27 +3459,68 @@ private sub ClickMenuTitle( byref mw as mainwin.Window, byval idx as long )
     tkTest_PumpFor( tkForm_Host( mw.form ), 60 )
 end sub
 
-' The row index of command id in the menu of its group: rows in table order, a separator where the
-' table says (none above a menu's first row).
+' Walks group g's menu as mainwin.BuildMenus lays it out: rows in table order, a separator where the
+' table says (none above a menu's or a submenu's first row), a run of one submenu's rows (mainwin.MenuSub)
+' one title row of the menu. Gives command id's row in its own level (the menu, or its submenu; -1:
+' not in g), that submenu's title row in the menu (-1: none) and the count of the menu's own rows.
+private sub MenuWalk( byval g as MenuGroup, byval id as long, byref row as long, byref titleRow as long, byref topRows as long )
+    dim as cmdids.CommandTable t
+    dim as long top = 0, subR = 0, smN = 0, curTitle = -1
+    row = -1 : titleRow = -1
+    for each c as Cmd in t.InGroup( g )
+        if mainwin.InMenu( c ) = false then continue for
+        dim as long n = mainwin.MenuSub( c )
+        dim as boolean sep = t.Info( c ).SepBefore
+        if n <> smN then
+            smN = n : subR = 0
+            if n then
+                if sep andalso (top > 0) then top += 1
+                curTitle = top
+                top += 1
+            end if
+        end if
+        if n then
+            if sep andalso (subR > 0) then subR += 1
+            if clng( c ) = id then row = subR : titleRow = curTitle
+            subR += 1
+        else
+            if sep andalso (top > 0) then top += 1
+            if clng( c ) = id then row = top
+            top += 1
+        end if
+    next
+    topRows = top
+end sub
+
+' The row index of command id in its level of its group's menu (the menu, or its submenu).
 private function MenuRow( byval id as Cmd ) as long
     dim as cmdids.CommandTable t
-    dim as long r = 0
-    for each c as Cmd in t.InGroup( t.Info( id ).Group )
-        if t.Info( c ).SepBefore andalso (r > 0) then r += 1
-        if c = id then return r
-        r += 1
-    next
-    return -1
+    dim as long r, tr, tc
+    MenuWalk( t.Info( id ).Group, clng( id ), r, tr, tc )
+    return r
 end function
 
-' Clicks command id's row in the open dropdown m.
-private sub ClickMenuRow( byref mw as mainwin.Window, byval m as TK_MENU ptr, byval id as Cmd )
+' Clicks row idx of the open popup m on its own surface.
+private sub ClickPopupRow( byref mw as mainwin.Window, byval m as TK_MENU ptr, byval idx as long )
     dim as TKRECT ir
     dim as TK_HOST ptr ms = tkPopupMenu_Surface( m )
-    if (ms <> 0) andalso tkPopupMenu_GetItemRect( m, MenuRow( id ), ir ) then
+    if (ms <> 0) andalso tkPopupMenu_GetItemRect( m, idx, ir ) then
         tkTest_Click( ms, (ir.left + ir.right) \ 2, (ir.top + ir.bottom) \ 2 )
     end if
     tkTest_PumpFor( tkForm_Host( mw.form ), 60 )
+end sub
+
+' Clicks command id's row in the open dropdown m: in a submenu, its title row first, which opens it.
+private sub ClickMenuRow( byref mw as mainwin.Window, byval m as TK_MENU ptr, byval id as Cmd )
+    dim as cmdids.CommandTable t
+    dim as long r, tr, tc
+    MenuWalk( t.Info( id ).Group, clng( id ), r, tr, tc )
+    dim as TK_MENU ptr lv = m
+    if tr >= 0 then
+        ClickPopupRow( mw, m, tr )
+        lv = tkPopupMenu_GetItemSubMenu( m, mainwin.MENU_SUB_ID + mainwin.MenuSub( id ) )
+    end if
+    if lv then ClickPopupRow( mw, lv, r )
 end sub
 
 public sub MenuPass( byref t as Tally, byval sc as single )
@@ -3475,16 +3544,60 @@ public sub MenuPass( byref t as Tally, byval sc as single )
              P( sc, strings.Format( "menu: the bar at {},{} {}x{}, want 0,0 {}x{}", mw.menuBar->x, mw.menuBar->y, mw.menuBar->cw, mw.menuBar->ch, cx, mh ) ) )
     t.Check( (tkMenuBar_GetItemCount( mw.menuBar ) = 7) andalso (tkMenuBar_GetItemText( mw.menuBar, 0 ) = "File") andalso _
              (tkMenuBar_GetItemText( mw.menuBar, 4 ) = "Build") andalso (tkMenuBar_GetItemText( mw.menuBar, 5 ) = "Debug"), _
-             P( sc, strings.Format( "menu: seven menus, File .. Debug, Form ({})", tkMenuBar_GetItemCount( mw.menuBar ) ) ) )
+             P( sc, strings.Format( "menu: seven menus, File .. Debug, Design ({})", tkMenuBar_GetItemCount( mw.menuBar ) ) ) )
     dim as cmdids.CommandTable ct
     dim as boolean rowsOk = true
     for g as long = 0 to clng( MenuGroup.Count_ ) - 1
         dim as Array( of Cmd ) ids = ct.InGroup( cast( MenuGroup, g ) )
         dim as TK_MENU ptr m = tkMenuBar_GetDropDown( mw.menuBar, g )
-        dim as long last_ = MenuRow( ids[ids.Count( ) - 1] )
-        if (m = 0) orelse (tkPopupMenu_GetItemCount( m ) <> last_ + 1) then rowsOk = false
+        dim as long r, tr, tc
+        MenuWalk( cast( MenuGroup, g ), -1, r, tr, tc )
+        if (m = 0) orelse (tkPopupMenu_GetItemCount( m ) <> tc) then rowsOk = false : continue for
+        ' each submenu ends at its last command's row
+        for i as long = 0 to ids.Count( ) - 1
+            dim as long n = mainwin.MenuSub( ids[i] )
+            if n = 0 then continue for
+            if (i < ids.Count( ) - 1) andalso (mainwin.MenuSub( ids[i + 1] ) = n) then continue for
+            MenuWalk( cast( MenuGroup, g ), clng( ids[i] ), r, tr, tc )
+            dim as TK_MENU ptr sm = tkPopupMenu_GetItemSubMenu( m, mainwin.MENU_SUB_ID + n )
+            if (sm = 0) orelse (tkPopupMenu_GetItemCount( sm ) <> r + 1) then rowsOk = false
+        next
     next
-    t.Check( rowsOk, P( sc, "menu: every command a row of its group's menu, the separators between" ) )
+    t.Check( rowsOk, P( sc, "menu: every command a row of its group's menu or submenu, the separators between" ) )
+    ' SetItemEnabled says whether the menu has the row at all (any level)
+    dim as TK_MENU ptr dsm0 = tkMenuBar_GetDropDown( mw.menuBar, clng( MenuGroup.Design ) )
+    t.Check( (tkPopupMenu_SetItemEnabled( dsm0, clng( Cmd.FormPreviewVariant ), true ) = false) andalso _
+             (tkPopupMenu_SetItemEnabled( dsm0, clng( Cmd.FormFloatToolbox ), true ) = false) andalso _
+             (tkPopupMenu_SetItemEnabled( dsm0, clng( Cmd.FormFloatProperties ), true ) = false) andalso _
+             tkPopupMenu_SetItemEnabled( dsm0, clng( Cmd.FormSnapToGrid ), true ), _
+             P( sc, "menu: Design has no Preview Light / Dark, Float Toolbox, Float Properties rows; Snap to Grid stays" ) )
+    ' no menu but Design taller than 14 rows and 6 separators (a small laptop screen, author
+    ' 2026-11-21); Design, grouped after VB6's Format menu, is the tallest and only reported
+    dim as long tallest = 0
+    dim as ustring heights
+    for g as long = 0 to clng( MenuGroup.Count_ ) - 1
+        dim as long iw, ih
+        tkPopupMenu_GetIdealSize( tkMenuBar_GetDropDown( mw.menuBar, g ), iw, ih )
+        if (ih > tallest) andalso (g <> clng( MenuGroup.Design )) then tallest = ih
+        heights &= iif( g, " ", "" ) & tkMenuBar_GetItemText( mw.menuBar, g ) & "=" & ih
+    next
+    t.Check( (tallest > 0) andalso (tallest <= tkForm_Scale( mw.form, 14 * TKPOPUPMENU_DEFAULT_ITEMHEIGHT + 6 * TKPOPUPMENU_DEFAULT_SEPHEIGHT )), _
+             P( sc, strings.Format( "menu: no dropdown but Design taller than 14 rows + 6 separators ({}: {})", _
+                tkForm_Scale( mw.form, 14 * TKPOPUPMENU_DEFAULT_ITEMHEIGHT + 6 * TKPOPUPMENU_DEFAULT_SEPHEIGHT ), heights ) ) )
+    dim as TK_MENU ptr esm = tkMenuBar_GetDropDown( mw.menuBar, clng( MenuGroup.Edit ) )
+    dim as TK_MENU ptr lnm = tkPopupMenu_GetItemSubMenu( esm, mainwin.MENU_SUB_ID + mainwin.MenuSub( Cmd.DeleteLine ) )
+    t.Check( (lnm <> 0) andalso (tkPopupMenu_GetItemCount( lnm ) = 7) andalso (MenuRow( Cmd.DeleteLine ) = 2) andalso _
+             tkPopupMenu_GetItemEnabled( esm, clng( Cmd.MoveLineUp ) ), _
+             P( sc, "menu: Edit > Line holds Select Line, a separator, Delete .. New Line Below" ) )
+    dim as TK_MENU ptr dsm = tkMenuBar_GetDropDown( mw.menuBar, clng( MenuGroup.Design ) )
+    dim as TK_MENU ptr alm = tkPopupMenu_GetItemSubMenu( dsm, mainwin.MENU_SUB_ID + mainwin.MenuSub( Cmd.FormAlignLefts ) )
+    t.Check( (tkMenuBar_GetItemText( mw.menuBar, clng( MenuGroup.Design ) ) = "Design") andalso (alm <> 0) andalso _
+             (tkPopupMenu_GetItemCount( alm ) = 7), P( sc, "menu: Design > Align holds Lefts .. Bottoms, a separator between" ) )
+    dim as TK_MENU ptr hsm = tkPopupMenu_GetItemSubMenu( dsm, mainwin.MENU_SUB_ID + mainwin.MenuSub( Cmd.FormHSpaceEqual ) )
+    dim as TK_MENU ptr cfm = tkPopupMenu_GetItemSubMenu( dsm, mainwin.MENU_SUB_ID + mainwin.MenuSub( Cmd.FormCenterHorz ) )
+    t.Check( (hsm <> 0) andalso (tkPopupMenu_GetItemCount( hsm ) = 4) andalso (cfm <> 0) andalso (tkPopupMenu_GetItemCount( cfm ) = 2) andalso _
+             tkPopupMenu_GetItemEnabled( dsm, clng( Cmd.FormLockControls ) ), _
+             P( sc, "menu: Design > Horizontal Spacing (4 rows), Center in Form (2), Lock Controls" ) )
     t.Check( mw.Start.frame->y = mh, P( sc, strings.Format( "menu: the start panel under it ({})", mw.Start.frame->y ) ) )
 
     ' ---- File opens on a click; with no buffer what acts on one is greyed
@@ -3547,6 +3660,13 @@ public sub MenuPass( byref t as Tally, byval sc as single )
     ClickMenuRow( mw, tkMenuBar_GetDropDown( mw.menuBar, clng( MenuGroup.View ) ), Cmd.OutputPane )
     t.Check( mw.OutputShown, P( sc, "menu: View > Output showed the output pane" ) )
     mw.ShowOutput( false )
+
+    ' ---- View > Split > Left/Right: a submenu's row runs its command too
+    ClickMenuTitle( mw, clng( MenuGroup.View ) )
+    ClickMenuRow( mw, tkMenuBar_GetDropDown( mw.menuBar, clng( MenuGroup.View ) ), Cmd.SplitLeftRight )
+    t.Check( (mw.Pane2 <> 0) andalso (tkMenuBar_IsMenuOpen( mw.menuBar ) = false), _
+             P( sc, "menu: View > Split > Left/Right split the editor and closed the menu" ) )
+    if mw.Pane2 then mw.Execute( Cmd.SplitLeftRight )
 
     ' ---- the Menu Bar row has its chord in force
     t.Check( mw.ShortcutText( Cmd.ShowMenu ) <> "", P( sc, "menu: Menu Bar has a chord (" & mw.ShortcutText( Cmd.ShowMenu ) & ")" ) )
@@ -3685,16 +3805,20 @@ public sub StartPass( byref t as Tally, byval sc as single )
     t.Check( mw.ShowsStart( ) andalso (mw.Docs.Count( ) = 1) andalso (mw.Pane1->Main.Length( ) = 0) andalso (mw.Pane2 = 0) andalso _
              (mw.Chooser.IsOpen( ) = false), P( sc, "start: typing, Ctrl+\, Ctrl+E and Ctrl+W did nothing" ) )
 
-    ' ---- Down Down Enter: Show All Commands, keybindings.toml; closing it brings the panel back
+    ' ---- Down to Settings, Enter: settings.toml; closing it brings the panel back (row 1, Show
+    ' All Commands, is the Keyboard Shortcuts dialog: keyspass)
     Chord( h, SDLK_DOWN, SDL_SCANCODE_DOWN, 0 )
     Chord( h, SDLK_DOWN, SDL_SCANCODE_DOWN, 0 )
     t.Check( mw.Start.Sel = 1, P( sc, strings.Format( "start: Down twice: row 1 ({})", mw.Start.Sel ) ) )
+    Chord( h, SDLK_DOWN, SDL_SCANCODE_DOWN, 0 )
+    Chord( h, SDLK_DOWN, SDL_SCANCODE_DOWN, 0 )
+    Chord( h, SDLK_DOWN, SDL_SCANCODE_DOWN, 0 )
     Chord( h, SDLK_RETURN, SDL_SCANCODE_RETURN, 0 )
-    t.Check( (mw.ShowsStart( ) = false) andalso (mw.Docs.Count( ) = 1) andalso (lcase( mw.ActivePath( ) ) = lcase( mw.KeysFile( ) )) andalso _
+    t.Check( (mw.ShowsStart( ) = false) andalso (mw.Docs.Count( ) = 1) andalso (lcase( mw.ActivePath( ) ) = lcase( mw.SettingsFile( ) )) andalso _
              (tkWidget_IsVisible( sp ) = false) andalso (mw.TabsHeight( ) > 0), _
-             P( sc, "start: Enter opened keybindings.toml in the blank's place, tabs back" ) )
+             P( sc, "start: Enter on Settings opened settings.toml in the blank's place, tabs back" ) )
     Chord( h, SDLK_F, SDL_SCANCODE_F, KMOD_PRIMARY )
-    t.Check( mw.Finder.isOpen, P( sc, "start: Ctrl+F in keybindings.toml opened the find strip" ) )
+    t.Check( mw.Finder.isOpen, P( sc, "start: Ctrl+F in settings.toml opened the find strip" ) )
     Chord( h, SDLK_W, SDL_SCANCODE_W, KMOD_PRIMARY )
     t.Check( mw.ShowsStart( ) andalso (mw.Docs.Count( ) = 1) andalso tkWidget_IsVisible( sp ) andalso (tkHost_GetFocus( h ) = sp) andalso _
              (mw.Finder.isOpen = false) andalso (sp->ch = cy - sh - mh), P( sc, "start: closing the last buffer brought it back, focused, the strip closed" ) )

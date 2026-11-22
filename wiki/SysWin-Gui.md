@@ -90,10 +90,8 @@ end main()
 | [CWindow](CWindow) | the main window class: creating windows and controls, DPI scaling, the message loop, colours, anchors, accelerators, scrolling |
 | [CTabPage](CTabPage) | a `CWindow` that is one page of a tab control |
 | [CDialog](CDialog) | dialog boxes built from an in-memory template, with the same services as `CWindow` |
-| [CXpButton](CXpButton) | an owner-drawn button that follows the visual style and shows images beside or instead of its text |
 | [CMaskedEdit](CMaskedEdit) | an edit box that accepts input only in the shape of a mask |
 | [CMemBmp](CMemBmp) | a memory bitmap with its own device context, blank or loaded from a file or resource |
-| [CPrint](CPrint) | choosing and setting up a printer, its page measurements and printing |
 | [CGraphCtx](CGraphCtx) | a graphic control: a child window that keeps what is drawn on it, with GDI, GDI+ or OpenGL |
 | [CExplorerBrowser](CExplorerBrowser) | the Windows Explorer browser hosted in a window, with its events |
 | [File dialogs](SysWin-Gui-File-Dialogs) | `CIOpenFileDialog` and `CISaveFileDialog`, the Windows open and save dialogs |

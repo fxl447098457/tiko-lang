@@ -204,6 +204,7 @@ type TktEng
     as uinteger key                    '' Accept: the imported key, deleted at the end
     as any ptr cert                    '' Accept: the leaf's CERT_CONTEXT
     as any ptr store                   '' Accept: the chain's memory store
+    as string peer                     '' Connect, verified: the server leaf's DER, held for a renegotiation
 end type
 
 private function hW( byref s as const ustring ) as ustring
@@ -325,6 +326,25 @@ private function hPolicy( byval eng as any ptr, byval leaf as TktCertContext ptr
     return rc
 end function
 
+'' TRUE when the server's current leaf is byte for byte the one hVerify accepted; FALSE
+'' when it differs or cannot be read.
+private function hSamePeer( byval e as TktEng ptr ) as boolean
+    dim as TktCertContext ptr leaf = nullptr
+    dim as long st = tkt_QueryContextAttributesW( @e->ctx, &h53, @leaf )     '' SECPKG_ATTR_REMOTE_CERT_CONTEXT
+    if( ( st <> 0 ) orelse ( leaf = nullptr ) ) then return FALSE
+    dim as boolean same = ( leaf->cbCertEncoded = len( e->peer ) )
+    if( same ) then
+        for i as long = 0 to len( e->peer ) - 1
+            if( leaf->pbCertEncoded[i] <> e->peer[i] ) then
+                same = FALSE
+                exit for
+            end if
+        next
+    end if
+    tkt_CertFreeCertificateContext( leaf )
+    return same
+end function
+
 '' The client's check of the server: the system roots first; if the chain does not
 '' end at one of them and the config adds roots, again with those as the only roots.
 private function hVerify( byref s as TlsStream, byval e as TktEng ptr, byref cfg as const TlsConfig, _
@@ -350,6 +370,10 @@ private function hVerify( byref s as TlsStream, byval e as TktEng ptr, byref cfg
             end if
             tkt_CertCloseStore( roots, 0 )
         end if
+    end if
+    if( rc = 0 ) then
+        e->peer = space( leaf->cbCertEncoded )
+        TlsMemcpy( strptr( e->peer ), leaf->pbCertEncoded, leaf->cbCertEncoded )
     end if
     tkt_CertFreeCertificateContext( leaf )
     if( rc <> 0 ) then return TlsFail( hMapPolicy( rc ), rc, op, s.hName )
@@ -624,6 +648,14 @@ function TlsEngRead( byref s as TlsStream, byval buf as ubyte ptr, byval n as lo
                     '' update): SSPI wants them fed back through the handshake call
                     dim as TlsResultBool h = hHandshake( s, e, FALSE, FALSE, "Read" )
                     if( h.IsOk( ) = FALSE ) then return fs.FsFail( of longint )( fs.FS_INVALID_DATA, "Read", "" )
+                    '' UNDER TLS 1.2 THIS IS A REAL RENEGOTIATION, and with manual validation SChannel
+                    '' checks nothing: the server may present another certificate.  It must be the
+                    '' very one verified at the handshake.  (TLS 1.3 cannot change it.)
+                    if( ( len( e->peer ) > 0 ) andalso ( s.hProto <> "TLSv1.3" ) ) then
+                        if( hSamePeer( e ) = FALSE ) then
+                            return Fail( of longint, fs.FsError )( fs.FsError( fs.FS_INVALID_DATA, 0, "Read", s.hName ) )
+                        end if
+                    end if
                 end if
             case TKT_SEC_E_INCOMPLETE_MESSAGE
                 needRead = TRUE

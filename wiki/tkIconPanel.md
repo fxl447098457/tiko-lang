@@ -8,7 +8,7 @@ tkIconPanel is a compact strip of icon buttons with no captions: the small tool 
 
 Each cell is its declared icon size plus padding, whatever the glyph, and `tkIconPanel_SetJustify` places the run left, centred or right. The item set is static once built. Selection is a set of latched toggles; a radio-style group is one call, `tkIconPanel_SelectExclusive`, from the SelChange callback.
 
-`tkIconPanel_SetVertical` turns the row into a column, and `tkIconPanel_SetMarker` draws a selection marker: a slab down a column's left edge, or a rule under a row's cell. Both are off by default. A click never takes the keyboard focus. Setters are silent; Click and SelChange fire only for what the user does.
+`tkIconPanel_SetVertical` turns the row into a column, and `tkIconPanel_SetMarker` draws a selection marker: a slab down a column's left edge, or a rule under a row's cell. Both are off by default. A paint callback draws each item yourself; `tkIconPanel_PaintItemDefault( p )` in it draws the stock item first. A click never takes the keyboard focus. Setters are silent; Click and SelChange fire only for what the user does.
 
 ## Importing
 
@@ -54,19 +54,177 @@ tkWidget_SetPos( bar, 0, 0, tkIconPanel_GetIdealWidth( bar ), tkIconPanel_GetIde
 
 The toolchain's `examples/tkControls/tkIconPanel/` shows three rows (left, centred and right, one with a custom painter) and this column.
 
-## Coming from PsIconPanel
+## How it works
 
-The [PsIconPanel](PsIconPanel) page remains the behaviour reference for everything not listed here: the cell layout, the three kinds, selection, the press / slide-off / release gesture, the colours and the tooltips are the same.
+### The cell model: you own the spacing
 
-- `PsIconPanel_*` → `tkIconPanel_*`; `PSICONPANEL_*` → `TKICONPANEL_*` (`_COLORS`, `_ITEM`, `_PAINTINFO`, `_MESSAGEINFO`, `_DEFAULT_*`). `IP_JUSTIFY_*`, `IP_KIND_*` and the `IP_*` callback types keep their names.
-- `tkIconPanel_Create( parent, id )` takes a `TK_WIDGET ptr` parent and returns the panel as a `TK_WIDGET ptr`. The font is a `TTF_Font ptr` the panel borrows; with none set, the host's default font draws.
-- `tkIconPanel_SetImage` loads any image file [tkImage](tkImage) can read. In `TKICONPANEL_PAINTINFO`, `b` is a `TK_PAINT ptr` and `pImage` a `tkImageFile ptr` (draw it with `tkImage_Paint`); `isVertical` is new.
-- `TKICONPANEL_MESSAGEINFO` carries `msg` (a `TKM_*` value), `x` and `y` instead of `uMsg` / `wParam` / `lParam`. A double click is two ordinary presses.
-- `tkIconPanel_SetHoverTime` is the tooltip delay only; `tkIconPanel_GetTooltipHandle` returns the `TK_TIP ptr`.
-- Added: `tkIconPanel_SetVertical` / `tkIconPanel_GetVertical`. In a column, `IP_JUSTIFY_LEFT` / `CENTER` / `RIGHT` mean top / centre / bottom, `tkIconPanel_GetIdealWidth` is the widest icon and `tkIconPanel_GetIdealHeight` the whole run.
-- Added: `tkIconPanel_SetMarker( h, nSize, bFillSelected )`, `tkIconPanel_GetMarker`, `tkIconPanel_GetMarkerRect`, coloured by `TKICONPANEL_COLORS.MarkerColor` (theme role `Accent`). `bFillSelected = false` leaves a latched toggle on the idle fill, for a tab-row look.
-- Added: `tkIconPanel_SelectExclusive` (silent), `tkIconPanel_GetHotItem`, `tkIconPanel_GetPressedItem`.
-- No equivalent: `WM_MOUSEHOVER` reporting, `SetTooltipMode` / `GetTooltipMode`, PsRegistry.
+Each item occupies a cell whose length along the run is the sum of three declared numbers.
+Nothing is measured, ever. For a row (a column is the same with the axes swapped):
+
+```
+  cellWidth(i)  = padBefore(i) + iconWidth(i)   + padAfter(i)     TOGGLE / COMMAND
+                = padBefore(i) + separatorWidth + padAfter(i)     SEPARATOR
+  padBefore(i)  = the item's own value, or the panel's when the item's is -1
+  padAfter(i)   = the item's own value, or the panel's when the item's is -1
+  iconWidth(i)  = the item's own value, or the panel's when the item's is  0
+  iconHeight(i) = the item's own value, or the panel's when the item's is  0
+                  (clamped down to the client height, once there is one)
+  totalW        = sum of every cellWidth        <- GetIdealWidth
+  x0            = 0                             LEFT, or totalW >= clientW
+                = (clientW - totalW) \ 2        CENTER
+                = clientW - totalW              RIGHT
+  rc(i)         = ( x, 0, x + cellWidth(i), clientH )        the full client height
+  rcIcon(i)     = ( x + padBefore(i), yTop, x + padBefore(i) + iconWidth(i), yTop + iconHeight(i) )
+                  where yTop = (clientH - iconHeight(i)) \ 2
+```
+
+- A resize moves `x0` and nothing else: the spacing inside the run is authored and is never
+  redistributed or squeezed, so the run slides as one block.
+- `rc` spans the full client height, so the hot and selected fills read like a menu bar and the
+  hit target includes the padding. The glyph sits centred in its cell only when `padBefore` and
+  `padAfter` are equal, as the defaults are.
+- In a column (`SetVertical`) the cells stack downwards, the icon is centred across the column,
+  a separator's rule lies flat, and justify LEFT / CENTER / RIGHT means top / centre / bottom.
+  `GetIdealWidth` is then the widest icon and `GetIdealHeight` the whole run; in a row
+  `GetIdealHeight` is the tallest icon.
+- Layout is lazy. A setter marks it stale and asks for a repaint; the next paint, or any rect,
+  hit-test or ideal-size query, recomputes it. Building twenty items costs one layout pass.
+- When the run is longer than the client, justification falls back to LEFT and the tail clips
+  at the far edge; the leading items keep honest rects, and a point outside the client never
+  lights an item.
+- Item rects are empty until the panel has a size. `GetIdealWidth` and `GetIdealHeight` are the
+  exception: they are valid immediately, which is what you call to choose that size.
+
+### Three kinds of item
+
+| Kind | Behaviour |
+| --- | --- |
+| `IP_KIND_TOGGLE` | Latches. A completed click flips its selected flag and calls the SelChange callback. |
+| `IP_KIND_COMMAND` | Momentary. Draws pressed while held, calls the Click callback on a completed click, never latches. |
+| `IP_KIND_SEPARATOR` | A rule the panel draws. Never hot, never pressed, and `tkIconPanel_HitTest` returns -1 for it. |
+
+The kind is fixed when the item is added. A separator's rule replaces the icon's length along
+the run but keeps its extent across it, so it stands as tall (or, in a column, as wide) as the
+icons it divides; give it its own padding to size the gap. The kind is not validated: any
+other value is laid out and painted like an icon item, but a completed click on it does nothing.
+
+### Selection is a set
+
+Every toggle latches independently, so any number can be selected at once. Radio behaviour is
+yours to ask for: call `tkIconPanel_SelectExclusive( h, idx )` (latch `idx`, clear every other
+toggle) from the SelChange callback. It is silent, as is `tkIconPanel_SetSelected`, which
+refuses (returns false for) anything but a toggle; so neither can re-enter the callback.
+
+### A click is decided on release
+
+Pressing the left button over an enabled, non-separator item takes the mouse capture and arms
+the press. The action happens on release, and only if the pointer is still over the same item:
+press, slide off, release, and nothing fires. While the pointer is off the item it stops
+drawing as pressed, and sliding back re-arms it. Only a release, a capture loss, disabling the
+pressed item or disabling the panel ends the gesture. A click never takes the keyboard focus,
+so the panel cannot steal the caret from an editor beside it. A rapid second click is an
+ordinary press and toggles the item again.
+
+### Glyph or image
+
+An icon cell holds a glyph or an image, never both. `tkIconPanel_SetImage( h, idx, path )`
+loads any file [tkImage](tkImage) can read and draws it in the same declared cell, aspect kept
+and centred, so no geometry changes. A successful load clears the item's glyph; a non-empty
+`SetGlyph` frees its image; `SetImage( h, idx, "" )` removes the image. It returns false only
+for a bad index or a file that would not load, and a failed load leaves no image. The panel
+owns the images and frees them when it is destroyed.
+
+The font is a paint-time input: `SetFont` repaints but never re-lays out, because no geometry
+came from it. `rcIcon` is a layout cell, not a measurement, so a glyph too large for it clips:
+pick a size that fits the icon size you declared. With no font set, the host's default font
+draws.
+
+### Pixels
+
+The defaults (icon 20 x 20, padding 4 and 4, separator 1) are scaled for the surface at
+creation, and every size is rescaled when the scale changes; an item's inherit values (-1, 0)
+stay inheriting. Every setter takes pixels as given: scale them with `tkHost_Scale`.
+
+### Tooltips
+
+One tooltip serves the whole panel and resolves its text for the item under the pointer:
+the item's own text (`SetTooltipText`), else the tooltip callback, else no tip. Moving to
+another item hides the tip and re-resolves it on the next dwell, and a press hides it.
+`SetHoverTime`, `SetAutoPopTime` and `SetReshowTime` set the tip's delays in milliseconds, and
+`tkIconPanel_GetTooltipHandle` returns its `TK_TIP ptr` for any [tkTooltip](tkTooltip) call.
+
+## Behaviour and limits
+
+- The item set is static: `AddItem` and `AddSeparator` add, and nothing removes, inserts or
+  reorders. Drive a built strip with `SetSelected`, `SetEnabled`, `SetGlyph`, `SetImage` and
+  `SetItemForeColor`.
+- `FindItemByID` returns the first item with that id and skips separators, which all carry
+  id 0.
+- A disabled item keeps its cell, greys out, never goes hot or pressed and swallows clicks, but
+  `HitTest` still reports it. Disabling the hot item clears the hover; disabling the pressed
+  item cancels the press.
+- `SetJustify` ignores values outside the three `IP_JUSTIFY_*` constants.
+- No keyboard handling and no focus. The right button is reported to the message callback and
+  never acted on, so that is where a context menu goes.
+- A paint callback replaces the built-in painter for every item, separators included.
+
+## Colours
+
+`TKICONPANEL_COLORS` holds nine colours. They come from the theme at creation and on every
+theme change until `SetColors` pins them; `UnpinColors` hands them back.
+
+| Field | Theme role | Paints |
+| --- | --- | --- |
+| `BackColor` | `Window` | The panel background, and an idle cell |
+| `ForeColor` | `Text` | An idle glyph |
+| `BackColorHot` / `ForeColorHot` | `SurfaceHot` / `TextHot` | The item under the pointer |
+| `BackColorSelect` / `ForeColorSelect` | `Selected` / `SelectedText` | A latched toggle, and the press flash |
+| `ForeColorDisabled` | `TextDisabled` | A disabled glyph; its cell keeps `BackColor` |
+| `SeparatorColor` | `Divider` | A separator's rule |
+| `MarkerColor` | `Accent` | The selection marker |
+
+The built-in painter picks one fill and one glyph colour per item:
+
+```
+disabled  >  pressed  >  hot  >  selected  >  per-item fore colour  >  idle
+```
+
+There is no separate pressed colour: a press reuses the Select pair, a flash on a command and a
+preview of the latched look on a toggle. `SetItemForeColor` overrides only the idle glyph
+colour (a red record dot, a green run arrow); `ClearItemForeColor` drops it. With a marker
+(`SetMarker( h, nSize, bFillSelected )`, `nSize` 0 for none) a selected item also gets a slab of
+`MarkerColor` down a column's left edge or under a row's cell; `bFillSelected = false` keeps the
+selected item on the idle fill, so the marker alone shows it, as in a tab row.
+
+The painter fills the client with `BackColor`, then for each item fills `rc`, draws the marker,
+and draws the image into `rcIcon` or, failing that, the glyph centred in it. A separator is its
+cell in `BackColor` with `rcIcon` filled in `SeparatorColor`.
+
+## Callbacks
+
+- **Click**, `IP_ClickCallbackSub( h, idx, id )`: a command item was clicked (a completed
+  press and release on the same enabled item). `id` is the item's command id.
+- **SelChange**, `IP_SelChangeCallbackSub( h, idx, isSelected )`: the user latched or
+  unlatched a toggle. The state is already updated, so `GetSelected( h, idx )` equals
+  `isSelected`.
+- **Tooltip**, `IP_TooltipCallbackFunc( h, idx ) as ustring`: the tip for an item with no text
+  of its own, asked only when a tip is about to show; `""` for none.
+- **Paint item**, `IP_PaintItemCallbackSub( p )`: draws one item instead of the built-in
+  painter, separators included, so it must handle `p->itemKind = IP_KIND_SEPARATOR`. The client
+  is already filled with `BackColor`. Confine drawing to `p->rc` (the whole cell, padding
+  included); draw the icon in `p->rcIcon`, and when `p->pImage` is set draw it with
+  `tkImage_Paint` instead of the glyph. `isPressed` is true only while the press is live and the
+  pointer is still on the item; `isVertical` says which way the run goes.
+  `tkIconPanel_PaintItemDefault( p )` draws the stock item first.
+- **Message**, `IP_MessageCallbackFunc( m ) as boolean`: reports `TKM_MOUSEMOVE`,
+  `TKM_MOUSELEAVE`, `TKM_LBUTTONDOWN`, `TKM_LBUTTONUP`, `TKM_RBUTTONDOWN` and `TKM_RBUTTONUP`
+  with `x`, `y` and `idx`, the item under the pointer (-1 for none, a separator or a disabled
+  item; always -1 for the leave). Returning true from `TKM_LBUTTONDOWN` suppresses the press;
+  for the others the return value is ignored. The button-up is reported after the capture is
+  released and before Click or SelChange fires.
+
+`tkIconPanel_GetHotItem` and `tkIconPanel_GetPressedItem` return the item under the pointer and
+the item under a live press, or -1.
 
 ## Public declarations
 
@@ -223,6 +381,7 @@ function tkIconPanel_GetTooltipText( byval hIconPanel as TK_WIDGET ptr, byval id
 function tkIconPanel_SetTooltipText( byval hIconPanel as TK_WIDGET ptr, byval idx as long, byval Text as ustring ) as boolean
 function tkIconPanel_GetHotItem( byval hIconPanel as TK_WIDGET ptr ) as long
 function tkIconPanel_GetPressedItem( byval hIconPanel as TK_WIDGET ptr ) as long
+sub tkIconPanel_PaintItemDefault( byval p as TKICONPANEL_PAINTINFO ptr )
 sub tkIconPanel_SetPaintItemCallback( byval hIconPanel as TK_WIDGET ptr, byval usersub as IP_PaintItemCallbackSub )
 sub tkIconPanel_SetMessageCallback( byval hIconPanel as TK_WIDGET ptr, byval userfunc as IP_MessageCallbackFunc )
 sub tkIconPanel_SetTooltipCallback( byval hIconPanel as TK_WIDGET ptr, byval userfunc as IP_TooltipCallbackFunc )
@@ -234,4 +393,4 @@ sub tkIconPanel_SetSelChangeCallback( byval hIconPanel as TK_WIDGET ptr, byval u
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsIconPanel](PsIconPanel), the PsControls control
+- [tkImage](tkImage), [tkTooltip](tkTooltip), [tkToolbar](tkToolbar)

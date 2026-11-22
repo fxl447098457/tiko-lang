@@ -75,7 +75,9 @@
 
 **Added:**
 - `tkProgressBar_GetMarqueeTick` (test probe; vendor's self-test read `nTick` directly);
-- `tkProgressBar_GetID`.
+- `tkProgressBar_GetID`;
+- `tkProgressBar_PaintDefault( p )`: the stock bar, for a paint callback (the form designer's
+  Paint event).
 
 **Vendor bugs found (fixed here):**
 - `PsProgressBar_GetBlockRect` returned FALSE for an index past the last block but left `rc`

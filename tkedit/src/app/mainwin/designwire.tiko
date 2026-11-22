@@ -29,18 +29,26 @@
 #import "tkd/reconcile"
 #import "tkd/itemsdlg"
 #import "tkd/themefile"
+#import "tkd/resfile"
+#import "tkd/resdlg"
+#import "tkd/appicon"
+#import "tkd/glyphdlg"
+#import "tkd/glyphfile"
+#import "tkd/fontwriter"
 #import "tkd/themecenter"
 #import "tkd/colorsdlg"
 #import "vendor/tkControls/tkMeta"
 #import "vendor/tkControls/tkApp"
 #import "vendor/tkControls/tkLayout"
 #import "vendor/tkControls/tkFileDialog"
+#import "vendor/tkControls/tkMessageBox"
 using containers
 using tkMeta
 using tkApp
 using tkHost
 using tkLayout
 using tkFileDialog
+using tkMessageBox
 using model
 
 private function CodePathOf_( byref formPath as const ustring ) as ustring
@@ -120,7 +128,7 @@ sub Window.WireHandler( byval c as canvas.FormCanvas ptr, byref name_ as const u
         if len( handler ) = 0 then handler = c->Doc.Controls[i].Name & "_" & ev
     else
         if len( ev ) = 0 then ev = "Load"
-        if ev = "Close" then params = "byref Cancel as boolean"
+        params = catalog.FormEventParams( ev )
         handler = SettingOr( c->Doc.Events, ev )
         if len( handler ) = 0 then handler = "Form_" & ev
     end if
@@ -179,15 +187,30 @@ sub Window.OpenItems( byval c as canvas.FormCanvas ptr, byref name_ as const ust
         for p as long = 0 to c->Doc.Controls[i].Pages.Count( ) - 1
             dim as FormItem it
             it.Text = c->Doc.Controls[i].Pages[p]
+            it.Glyph = PageGlyph( c->Doc.Controls[i], p )
             it.Origin = p
             items.Push( it )
         next
     else
         items = c->Doc.Controls[i].Items
     end if
+    ' a status bar from before panels stretched themselves: its ExpandPanel property shows as that
+    ' panel's Stretch, and OK moves it there for good
+    if kind_ = catalog.ItemsKind.ItemsStatus then
+        dim as boolean any_ = false
+        for each it as FormItem in items
+            if it.Stretch then any_ = true
+        next
+        dim as long ep = FindSetting( c->Doc.Controls[i].Props, "ExpandPanel" )
+        if (any_ = false) andalso (ep >= 0) then
+            dim as long k = valint( c->Doc.Controls[i].Props[ep].Value )
+            if (k >= 0) andalso (k < items.Count( )) then items[k].Stretch = true
+        end if
+    end if
     ItemsDlg = new itemsdlg.ItemsEditor
     ItemsOf = c
     ItemsName = name_
+    ItemsDlg->C = c                             ' its Glyph row's picker and fonts
     ItemsDlg->Open( form, kind_, items, name_ )
 end sub
 
@@ -199,6 +222,7 @@ sub Window.FinishItems( byval apply_ as boolean )
     ItemsDlg = 0
     dim as Array( of FormItem ) items = dlg->Items
     dim as long kind_ = dlg->Kind
+    dim as ustring wanted = dlg->GoToHandler      ' the pencil: that handler, once the entries are in
     dlg->Close( )
     delete dlg
     ' the keyboard goes back to the form: Undo from here undoes this
@@ -216,6 +240,42 @@ sub Window.FinishItems( byval apply_ as boolean )
     else
         trial.Controls[i].Items = items
     end if
+    ' Stretch lives on the panels now: an old ExpandPanel property would make its panel the only one
+    if kind_ = catalog.ItemsKind.ItemsStatus then
+        dim as long ep = FindSetting( trial.Controls[i].Props, "ExpandPanel" )
+        if ep >= 0 then trial.Controls[i].Props.Remove( ep )
+    end if
+    if kind_ <> catalog.ItemsKind.ItemsPages then
+        ' a kept (orphaned) handler named again is called again: no longer an orphan
+        for each it as FormItem in items
+            for k as long = trial.Orphans.Count( ) - 1 to 0 step -1
+                if (len( it.Handler ) > 0) andalso (lcase( trial.Orphans[k].Handler ) = lcase( it.Handler )) then trial.Orphans.Remove( k )
+            next
+        next
+        ' handlers the entries no longer call, as an Events row's: a renamed entry's body takes the new
+        ' name (when that has no body yet); any other empty body goes, one with code keeps its
+        ' declaration (an orphan) so the file still compiles
+        dim as Array( of Setting ) dropped = reconcile.DroppedItemHandlers( c->Doc.Controls[i].Items, items, trial )
+        if dropped.Count( ) then
+            dim as ustring bad = validate.FirstNewProblem( c->Doc, trial )
+            if len( bad ) then
+                this.SetMessage( bad )
+                exit sub
+            end if
+            for each s as Setting in dropped
+                dim as boolean renamed = false
+                if len( s.Value ) then renamed = this.HandlerRenamed( c, s.Key, s.Value )
+                if renamed = false then
+                    if this.HandlerGone( c, s.Key ) then
+                        dim as FormOrphan o
+                        o.Handler = s.Key
+                        o.Params = catalog.ItemHandlerParams( kind_ )
+                        trial.Orphans.Push( o )
+                    end if
+                end if
+            next
+        end if
+    end if
     dim as ustring fault = c->ApplyEdit( trial, true, "" )
     if len( fault ) then
         this.SetMessage( fault )
@@ -229,10 +289,19 @@ sub Window.FinishItems( byval apply_ as boolean )
             if code = 0 then exit for
             dim as long a, b, bodyLine
             if reconcile.FindBody( code->Text( ), it.Handler, a, b ) = false then
-                this.PutCodeText( code, reconcile.AddStub( code->Text( ), it.Handler, "", bodyLine ) )
+                this.PutCodeText( code, reconcile.AddStub( code->Text( ), it.Handler, catalog.ItemHandlerParams( kind_ ), bodyLine ) )
             end if
         end if
     next
+    if len( wanted ) then
+        dim as DocRef code = this.CodeDocOf( d )
+        dim as long a, b
+        if (code <> 0) andalso reconcile.FindBody( code->Text( ), wanted, a, b ) then
+            this.ShowDoc( code )
+            code->Main.GoToLine( a + 1, 4 )
+            code->Main.Focus( )
+        end if
+    end if
 end sub
 
 ' ---- a control's [control.colors]: the Colors dialog ----------------------------------------------------
@@ -248,11 +317,15 @@ sub Window.RefreshFormThemes( )
     for each d as DocRef in Docs
         if d->Designer then
             d->Designer->ThemePath = this.ProjectThemePath( )
+            d->Designer->PkgDir = this.PkgDir( )
+            d->Designer->GlyphPaths = this.GlyphFontPaths( )
             d->Designer->ApplyProjectTheme( )
         end if
     next
     if Preview then
         Preview->ThemePath = this.ProjectThemePath( )
+        Preview->PkgDir = this.PkgDir( )
+        Preview->GlyphPaths = this.GlyphFontPaths( )
         Preview->ApplyProjectTheme( )
     end if
 end sub
@@ -266,7 +339,7 @@ sub Window.OpenColors( byval c as canvas.FormCanvas ptr, byref name_ as const us
     ColorsOf = c
     ColorsName = name_
     ColorsDlg->Open( form, ctl.TypeName, ctl.StyleName, ctl.Colors, this.ProjectThemePath( ), _
-                     name_ & " - " & i18n.Tr( "designer.colors", "Colours" ) )
+                     name_ & " - " & i18n.Tr( "designer.colors", "Colors" ) )
     if ColorsDlg->Win = 0 then
         delete ColorsDlg
         ColorsDlg = 0
@@ -299,10 +372,28 @@ sub Window.EditColors( byval c as canvas.FormCanvas ptr, byref name_ as const us
     if ColorsDlg then this.FinishColors( ColorsDlg->RunModal( ) )
 end sub
 
-sub Window.EditItems( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
+' seed: a menu bar or popup menu just placed -- the editor opens on its default entries.
+sub Window.EditItems( byval c as canvas.FormCanvas ptr, byref name_ as const ustring, byval seed as boolean = false )
     this.OpenItems( c, name_ )
-    if ItemsDlg then this.FinishItems( ItemsDlg->RunModal( ) )
+    if ItemsDlg = 0 then exit sub
+    if seed then ItemsDlg->SeedDefaults( )
+    this.FinishItems( ItemsDlg->RunModal( ) )
 end sub
+
+' Controls dragged over a container that isn't their parent: Yes moves them into it. Asked as Ask
+' asks (Save changes? on exit): over the main window, with its large question icon (AskOver's box
+' takes the form's glyph font, half the size).
+function Window.AskParent( byref what as const ustring, byval n as long, byref parent as const ustring, byref page as const ustring ) as boolean
+    dim as ustring into = parent
+    if len( page ) then into = strings.Format( i18n.Tr( "designer.parent_page", "{}, page '{}'" ), parent, page )
+    dim as ustring q
+    if n = 1 then
+        q = strings.Format( i18n.Tr( "designer.parent_one", "Make {} a child of {}?" ), what, into )
+    else
+        q = strings.Format( i18n.Tr( "designer.parent_many", "Make the {} controls children of {}?" ), n, into )
+    end if
+    return Ask( form, q, MBX_BTN_YESNO ) = MBX_IDYES
+end function
 
 ' ---- Test Form: the form as it is now, in a window of its own, working but wired to nothing ----
 
@@ -335,6 +426,8 @@ sub Window.TestForm( )
     Preview->Live = true
     ' in the project's theme, the variant the design surface shows
     Preview->ThemePath = this.ProjectThemePath( )
+    Preview->PkgDir = this.PkgDir( )
+    Preview->GlyphPaths = this.GlyphFontPaths( )
     Preview->PreviewSet = true
     Preview->PreviewDark = d->Designer->ShowsDark( )
     Preview->Create( tkForm_Widget( PreviewForm ), 1 )
@@ -457,22 +550,657 @@ private function GuiManifest_( byref pkg as const ustring ) as ustring
     return strings.Replace( project.NewManifestText( pkg, pkg, "main.tiko" ), "# subsystem = 'console'", "subsystem = 'gui'     " )
 end function
 
-' The main that shows one form, in the project's theme (appTheme: its fonts before Init, the rest after).
+' The main that shows one form, in the project's theme (appTheme: its fonts before Init, the rest after),
+' with the project's resources (appResources) named before either.
 private function FormMain_( byref pkg as const ustring, byref formName as const ustring ) as ustring
     dim as ustring nl = wchr( 10 )
     return "' " & pkg & ": starts the program and shows its first form." & nl _
         & "#import ""vendor/tkControls/tkApp""" & nl _
+        & "#import ""./appResources""" & nl _
         & "#import ""./appTheme""" & nl _
         & "#import ""./" & formName & """" & nl _
         & "using tkApp" & nl & nl _
         & "dim as TKAPP_OPTIONS options" & nl _
+        & "appResources.Register( )" & nl _
         & "appTheme.ApplyOptions( options )" & nl _
         & "if tkApp_Init( options ) = false then end 1" & nl _
         & "appTheme.Install( )" & nl _
         & "dim as " & formName & ".Form mainForm" & nl _
         & "mainForm.Build( )" & nl _
-        & "end tkApp_Run( mainForm.Wnd )" & nl
+        & "end tkApp_Run( mainForm.Handle )" & nl
 end function
+
+' The project's resources: appResources/appResources.tkres, none yet, and its module. One already
+' there is kept.
+private function CreateResourceFiles_( byref dir_ as const ustring ) as boolean
+    dim as ustring folder = fs.PathJoin( dir_, resfile.RES_MODULE )
+    dim as ustring path = fs.PathJoin( folder, resfile.RES_MODULE & ".tkres" )
+    if fs.IsFile( path ) then return true
+    fs.CreateDirAll( folder )
+    dim as ustring text = resfile.DefaultText( )
+    dim as resfile.ResourceDoc doc
+    dim as ustring e
+    if resfile.Parse( text, doc, e ) = false then return false
+    if WriteNew_( path, text ) = false then return false
+    return WriteNew_( fs.PathJoin( folder, resfile.RES_MODULE & ".design.tiko" ), _
+                      resfile.Generate( doc, resfile.RES_MODULE, resfile.RES_MODULE & ".tkres", text ) )
+end function
+
+' The open project's appResources/appResources.tkres ("" with no project open).
+function Window.ResourcesPath( ) as ustring
+    if ProjOpen = false then return ""
+    return fs.PathJoin( fs.PathParent( Proj.Path ), resfile.RES_MODULE, resfile.RES_MODULE & ".tkres" )
+end function
+
+' appResources.design.tiko from a .tkres's text. False, with a message, when it has a problem.
+function Window.WriteResourcesGenerated( byref path as const ustring, byref text as const ustring ) as boolean
+    dim as resfile.ResourceDoc doc
+    dim as ustring e
+    dim as Array( of ustring ) problems
+    if resfile.Parse( text, doc, e ) = false then
+        problems.Push( e )
+    else
+        resfile.Check( doc, fs.PathParent( path ), problems )
+    end if
+    if problems.Count( ) then
+        this.SetMessage( fs.PathFileName( path ) & ": " & problems[0] )
+        return false
+    end if
+    dim as ustring generated = resfile.Generate( doc, fs.PathStem( path ), fs.PathFileName( path ), text )
+    dim as ustring target = left( path, instrrev( path, "." ) - 1 ) & ".design.tiko", none
+    if fs.IsFile( target ) then
+        if codegen.WithoutCr( fs.ReadAllText( target ).ValueOr( none ) ) = generated then return true
+    end if
+    if fs.WriteAtomic( target, generated ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( target ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    return true
+end function
+
+' After a build: the resources not built in, copied beside the program (resources/), where its
+' Register looks first. A copy already there and as new is kept.
+sub Window.CopyResourceFiles( byref exePath as const ustring )
+    dim as ustring path = this.ResourcesPath( ), none
+    if (len( path ) = 0) orelse (len( exePath ) = 0) orelse (fs.IsFile( path ) = false) then exit sub
+    dim as resfile.ResourceDoc doc
+    dim as ustring e
+    if resfile.Parse( fs.ReadAllText( path ).ValueOr( none ), doc, e ) = false then exit sub
+    dim as ustring dst = fs.PathJoin( fs.PathParent( exePath ), resfile.BESIDE_DIR )
+    for each x as resfile.Resource in doc.Items
+        if x.Embed then continue for
+        dim as ustring src = fs.PathJoin( fs.PathParent( path ), resfile.FILES_DIR, x.File )
+        if fs.IsFile( src ) = false then continue for
+        fs.CreateDirAll( dst )
+        fs.CopyFile( src, fs.PathJoin( dst, x.File ), true )
+    next
+end sub
+
+' ---- the Resource Center ---------------------------------------------------------------------------
+
+private function ResAsk_( byval owner as any ptr, byref text as const ustring ) as boolean
+    dim as Window ptr w = owner
+    return w->Ask( w->form, text, MBX_BTN_YESNO ) = MBX_IDYES
+end function
+
+private function ResPick_( byval owner as any ptr ) as ustring
+    dim as Window ptr w = owner
+    return w->Pick( w->form, PICK_RESOURCES, "" )
+end function
+
+private function ResUsed_( byval owner as any ptr, byref nm as const ustring ) as ustring
+    return cast( Window ptr, owner )->ResourceUsers( nm )
+end function
+
+' The project's forms and theme files on disk (not under out/, files/ or a dot folder).
+private sub ProjectRefFiles_( byref dir_ as const ustring, byref out_ as Array( of ustring ), byval depth as long )
+    if depth > 8 then exit sub
+    for each r in fs.ReadDir( dir_ )
+        if r.IsOk( ) = false then continue for
+        dim as fs.DirEntry e = r.Value( )
+        dim as ustring nm = e.Name( ), l = lcase( e.Name( ) )
+        if e.IsDirectory( ) then
+            if (left( nm, 1 ) <> ".") andalso (l <> "out") andalso (l <> resfile.FILES_DIR) then ProjectRefFiles_( fs.PathJoin( dir_, nm ), out_, depth + 1 )
+        elseif (right( l, 7 ) = ".tkform") orelse (right( l, 8 ) = ".tktheme") then
+            out_.Push( fs.PathJoin( dir_, nm ) )
+        end if
+    next
+end sub
+
+private function OpenDocAt_( byref docs as Array( of DocRef ), byref path as const ustring ) as DocRef
+    for each d as DocRef in docs
+        if (len( d->Path ) > 0) andalso fs.PathEquals( d->Path, path ) then return d
+    next
+    return 0
+end function
+
+private sub UsersAdd_( byref o as ustring, byref one as const ustring )
+    if len( o ) then o &= ", "
+    o &= one
+end sub
+
+' How many times text has "res:nm" in quotes.
+private function CountRefs_( byref text as const ustring, byref nm as const ustring ) as long
+    dim as ustring t = lcase( text ), q = lcase( """" & resfile.RefOf( nm ) & """" )
+    dim as long n = 0, at = instr( t, q )
+    while at > 0
+        n += 1
+        at = instr( at + len( q ), t, q )
+    wend
+    return n
+end function
+
+' What refers to "res:nm", comma-separated ("" = none): a form's control as "Form1.tkform: Button1.ImageLeft"
+' (its icon as "Form1.tkform: Icon"), a theme or any other use by file name. An open file is read as
+' it stands in its buffer. The property a "..." is picking for now is left out: Select replaces it.
+function Window.ResourceUsers( byref nm as const ustring ) as ustring
+    if ProjOpen = false then return ""
+    dim as Array( of ustring ) files
+    ProjectRefFiles_( fs.PathParent( Proj.Path ), files, 0 )
+    dim as ustring o, none
+    for each p as ustring in files
+        dim as DocRef d = OpenDocAt_( Docs, p )
+        dim as ustring text
+        if d then text = d->Text( ) else text = fs.ReadAllText( p ).ValueOr( none )
+        if resfile.Refers( text, nm ) = false then continue for
+        dim as ustring fname = fs.PathFileName( p )
+        dim as long found = 0
+        dim as FormDoc fd
+        dim as ustring e
+        if (lcase( right( p, 7 ) ) = ".tkform") andalso formfile.Parse( text, fd, e ) then
+            ' by control and property; the "..." picking now (ResPickCanvas, ResPickProp) is not one
+            dim as boolean picking = (d <> 0) andalso (ResPickCanvas <> 0) andalso (d->Designer = ResPickCanvas)
+            dim as ustring ref_ = lcase( resfile.RefOf( nm ) )
+            if lcase( fd.Icon ) = ref_ then
+                found += 1
+                if (picking andalso (ResPickCanvas->Selected.Count( ) = 0) andalso (ResPickProp = "@Icon")) = false then
+                    UsersAdd_( o, fname & ": Icon" )
+                end if
+            end if
+            for each fc as FormControl in fd.Controls
+                for each s as Setting in fc.Props
+                    if lcase( s.Value ) <> ref_ then continue for
+                    found += 1
+                    if picking andalso (s.Key = ResPickProp) andalso ResPickCanvas->IsSelected( fc.Name ) then continue for
+                    UsersAdd_( o, fname & ": " & fc.Name & "." & s.Key )
+                next
+            next
+        end if
+        ' a use not found above (a theme, a place this doesn't look): the file by name
+        if CountRefs_( text, nm ) > found then UsersAdd_( o, fname )
+    next
+    return o
+end function
+
+' ---- the Glyph Picker (docs/tkDesigner/GLYPHS.md) ----------------------------------------------------
+
+private sub AddGlyphFont_( byref dlg as glyphdlg.GlyphDialog, byref label as const ustring, byref value as const ustring, _
+                           byref path as const ustring )
+    if len( path ) = 0 then exit sub
+    dim as glyphdlg.GlyphFontEntry x
+    x.Label = label : x.Value = value : x.Path = path
+    dlg.Fonts.Push( x )
+end sub
+
+' The project's glyph fonts (GLYPHS.md V3): appGlyphs/appGlyphs.tkglyphs; "" outside a project.
+function Window.GlyphsPath( ) as ustring
+    if ProjOpen = false then return ""
+    return fs.PathJoin( fs.PathParent( Proj.Path ), glyphfile.GLYPHS_MODULE, glyphfile.GLYPHS_MODULE & ".tkglyphs" )
+end function
+
+' Each font of the project's list (the defaults outside a project) and its file, for the canvas.
+function Window.GlyphFontPaths( ) as Array( of Setting )
+    dim as Array( of Setting ) out_
+    dim as glyphfile.GlyphDoc gd
+    dim as ustring gp = this.GlyphsPath( ), gdir
+    glyphfile.Load( gp, gd )
+    if len( gp ) then gdir = fs.PathParent( gp )
+    for each x as glyphfile.GlyphFontRef in gd.Fonts
+        dim as ustring path = glyphfile.FontPath( x, gdir, this.PkgDir( ) )
+        if len( path ) then PutSetting( out_, x.Key, path )
+    next
+    return out_
+end function
+
+' The project's forms that hold a glyph of font key, by file name, comma-separated ("" = none).
+function Window.GlyphUsers( byref key_ as const ustring ) as ustring
+    if ProjOpen = false then return ""
+    dim as Array( of ustring ) files
+    ProjectRefFiles_( fs.PathParent( Proj.Path ), files, 0 )
+    dim as ustring o, none, want = lcase( """" & key_ & ":" )
+    for each p as ustring in files
+        dim as DocRef d = OpenDocAt_( Docs, p )
+        dim as ustring text
+        if d then text = d->Text( ) else text = fs.ReadAllText( p ).ValueOr( none )
+        if instr( lcase( text ), want ) then UsersAdd_( o, fs.PathFileName( p ) )
+    next
+    return o
+end function
+
+' The list as the picker left it, into appGlyphs/appGlyphs.tkglyphs; every open form then draws from it.
+sub Window.SaveGlyphList( )
+    dim as ustring gp = this.GlyphsPath( )
+    if len( gp ) = 0 then exit sub
+    fs.CreateDirAll( fs.PathParent( gp ) )
+    if fs.WriteAtomic( gp, glyphfile.Render( GlyphList ) ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( gp ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+    end if
+    this.RefreshFormThemes( )
+end sub
+
+private function GlyphFontLabel_( byref x as glyphfile.GlyphFontRef ) as ustring
+    select case lcase( x.Bundled )
+    case lcase( TK_FONT_ICONS ) : return "Fluent UI System Icons"
+    case "materialicons-regular.ttf" : return "Material Icons"
+    end select
+    if len( x.File ) then return x.Key & " (" & fs.PathFileName( x.File ) & ")"
+    return x.Key
+end function
+
+' The picker's Add: a font file chosen, copied into appGlyphs/fonts and put on the list.
+private function GlyphAddFont_( byval owner as any ptr, byval d as glyphdlg.GlyphDialog ptr ) as long
+    dim as Window ptr w = owner
+    dim as ustring src = w->Pick( d->Win, PICK_FONT, "" )
+    if len( src ) = 0 then return -1
+    dim as ustring problem, gdir = fs.PathParent( w->GlyphsPath( ) )
+    dim as long i = glyphfile.AddFont( w->GlyphList, gdir, src, problem )
+    if i < 0 then
+        w->SetMessage( problem )
+        return -1
+    end if
+    dim byref as glyphfile.GlyphFontRef x = w->GlyphList.Fonts[i]
+    AddGlyphFont_( *d, GlyphFontLabel_( x ), x.Key, glyphfile.FontPath( x, gdir, w->PkgDir( ) ) )
+    w->GlyphListChanged = true
+    return d->Fonts.Count( ) - 1
+end function
+
+' The picker's Remove: asked first when the project's forms hold glyphs of it (they would show
+' nothing); an added font's copy goes too.
+private function GlyphRemoveFont_( byval owner as any ptr, byval d as glyphdlg.GlyphDialog ptr, byval i as long ) as boolean
+    dim as Window ptr w = owner
+    dim as ustring key_ = d->Fonts[i].Value
+    dim as ustring users = w->GlyphUsers( key_ )
+    if len( users ) then
+        if w->Ask( d->Win, strings.Format( i18n.Tr( "designer.glyph_font_used", "{0} is used in {1}. Remove it anyway? Those glyphs will show nothing." ), _
+                                           key_, users ), MBX_BTN_YESNO ) <> MBX_IDYES then return false
+    end if
+    dim as long k = glyphfile.Find( w->GlyphList, key_ )
+    if k >= 0 then
+        dim as ustring f = w->GlyphList.Fonts[k].File
+        if len( f ) then fs.RemoveFile( fs.PathJoin( fs.PathParent( w->GlyphsPath( ) ), f ) )
+        w->GlyphList.Fonts.Remove( k )
+    end if
+    d->Fonts.Remove( i )
+    w->GlyphListChanged = true
+    return true
+end function
+
+' A glyph property's "...": the Glyph Picker on the project's glyph fonts (the bundled ones outside a
+' project), opened on the value the property has, its font shown first; Add and Remove edit the
+' project's list. True on Select, picked then "<font>:<hex>" (GV7), or "" for none.
+function Window.PickGlyph( byref current as const ustring, byref picked as ustring ) as boolean
+    picked = ""
+    dim as glyphdlg.GlyphDialog dlg
+    dim as ustring gp = this.GlyphsPath( ), gdir
+    glyphfile.Load( gp, GlyphList )
+    GlyphListChanged = false
+    if len( gp ) then gdir = fs.PathParent( gp )
+    for each x as glyphfile.GlyphFontRef in GlyphList.Fonts
+        AddGlyphFont_( dlg, GlyphFontLabel_( x ), x.Key, glyphfile.FontPath( x, gdir, this.PkgDir( ) ) )
+    next
+    dlg.ThemeIdx = 0
+    dim as ustring want = lcase( GlyphFontKey( current ) )
+    for k as long = 0 to dlg.Fonts.Count( ) - 1
+        if lcase( dlg.Fonts[k].Value ) = want then dlg.ThemeIdx = k
+    next
+    if len( gp ) then
+        dlg.Owner = @this
+        dlg.OnAddFont = @GlyphAddFont_
+        dlg.OnRemoveFont = @GlyphRemoveFont_
+    end if
+    dim as long fi = -1
+    dim as ustring ch
+    dim as boolean ok
+    if GlyphPick then
+        ' a self-test answers for the person: the font and the character it would click
+        fi = 0
+        GlyphPick( @this, dlg, fi, ch )
+        ok = true
+    elseif dlg.Fonts.Count( ) = 0 then
+        return false
+    else
+        dlg.Open( form, GlyphChar( current ) )
+        if dlg.Win = 0 then return false
+        ok = dlg.RunModal( )
+        ch = dlg.Picked
+        fi = dlg.PickedFont
+        dlg.Close( )
+    end if
+    if ok andalso (len( ch ) > 0) andalso (fi >= 0) andalso (fi < dlg.Fonts.Count( )) then picked = GlyphRef( dlg.Fonts[fi].Value, asc( ch ) )
+    ' the list as left, kept: changed, or a project's first glyph (its list starts as the defaults)
+    if (len( gp ) > 0) andalso (GlyphListChanged orelse ((len( picked ) > 0) andalso (fs.IsFile( gp ) = false))) then this.SaveGlyphList( )
+    return ok
+end function
+
+' The project's glyphs (GLYPHS.md V4): every "<font>:<hex>" its forms use (open ones as they stand),
+' numbered in appGlyphs.tkglyphs [codes], built into appGlyphs/glyphs.ttf with the generated module
+' beside it and the source fonts' licences in licenses/; main.tiko made to use it; codegen told the
+' numbering. Nothing is written while no form uses a glyph.
+sub Window.BuildGlyphs( )
+    dim as Array( of Setting ) noCodes
+    codegen.SetGlyphCodes( noCodes )
+    dim as ustring gp = this.GlyphsPath( ), none, e
+    if len( gp ) = 0 then exit sub
+    dim as Array( of ustring ) used, files
+    ProjectRefFiles_( fs.PathParent( Proj.Path ), files, 0 )
+    for each p as ustring in files
+        if lcase( right( p, 7 ) ) <> ".tkform" then continue for
+        dim as DocRef d = OpenDocAt_( Docs, p )
+        dim as ustring text
+        if d then text = d->Text( ) else text = fs.ReadAllText( p ).ValueOr( none )
+        dim as FormDoc fd
+        if formfile.Parse( text, fd, e ) = false then continue for
+        for each fc as FormControl in fd.Controls
+            ' its glyph properties, then its items' glyphs (toolbar buttons, icons: V5)
+            dim as Array( of ustring ) vals
+            dim as TKMETA_CONTROL ptr m = catalog.Find( fc.TypeName )
+            for each s as Setting in fc.Props
+                dim as TKMETA_PROP ptr pr = tkMeta_FindProp( m, s.Key )
+                if (pr <> 0) andalso (pr->Kind = "glyph") then vals.Push( s.Value )
+            next
+            for each it as FormItem in fc.Items
+                vals.Push( it.Glyph )
+            next
+            for each pg as ustring in fc.PageGlyphs
+                vals.Push( pg )
+            next
+            for each gv as ustring in vals
+                if GlyphCode( gv ) = 0 then continue for
+                dim as ustring u = GlyphRef( GlyphFontKey( gv ), GlyphCode( gv ) )
+                dim as boolean seen = false
+                for each x as ustring in used
+                    if ucase( x ) = ucase( u ) then seen = true
+                next
+                if seen = false then used.Push( u )
+            next
+        next
+    next
+    if used.Count( ) = 0 then exit sub
+    dim as glyphfile.GlyphDoc gd
+    glyphfile.Load( gp, gd )
+    dim as boolean numbered = glyphfile.AssignCodes( gd, used )
+    dim as ustring gdir = fs.PathParent( gp ), tkg = glyphfile.Render( gd )
+    fs.CreateDirAll( gdir )
+    if numbered orelse (fs.IsFile( gp ) = false) then fs.WriteAtomic( gp, tkg )
+    ' the font: each glyph used, at its number
+    dim as Array( of fontwriter.GlyphTake ) takes
+    dim as Array( of ustring ) licenses
+    for each u as ustring in used
+        dim as long k = glyphfile.Find( gd, GlyphFontKey( u ) )
+        if k < 0 then continue for
+        dim as ustring path = glyphfile.FontPath( gd.Fonts[k], gdir, this.PkgDir( ) )
+        if len( path ) = 0 then continue for
+        dim as fontwriter.GlyphTake t
+        t.Path = path : t.Code = GlyphCode( u ) : t.Target = glyphfile.CodeOf( gd, u )
+        if t.Target = 0 then continue for
+        takes.Push( t )
+        dim as ustring lic = glyphfile.LicenseOf( path )
+        dim as boolean have = (len( lic ) = 0)
+        for each l as ustring in licenses
+            if l = lic then have = true
+        next
+        if have = false then licenses.Push( lic )
+    next
+    ' tkControls' own icons at their own codes, from the bundled Fluent (its licence with them)
+    dim as glyphfile.GlyphFontRef fluent
+    fluent.Key = GLYPH_FONT_FLUENT : fluent.Bundled = TK_FONT_ICONS
+    dim as ustring fluentPath = glyphfile.FontPath( fluent, gdir, this.PkgDir( ) )
+    if len( fluentPath ) then
+        for each cp as ulong in glyphfile.BuiltinCodes( )
+            dim as fontwriter.GlyphTake t
+            t.Path = fluentPath : t.Code = cp : t.Target = cp : t.Optional = true
+            takes.Push( t )
+        next
+        dim as ustring lic = glyphfile.LicenseOf( fluentPath )
+        dim as boolean have = (len( lic ) = 0)
+        for each l as ustring in licenses
+            if l = lic then have = true
+        next
+        if have = false then licenses.Push( lic )
+    end if
+    dim as Array( of ubyte ) bytes, old
+    dim as ustring problem, fontPath = fs.PathJoin( gdir, glyphfile.GLYPHS_FONT )
+    if fontwriter.Build( takes, fs.PathFileName( fs.PathParent( Proj.Path ) ) & " Glyphs", bytes, problem ) then
+        dim as boolean same = false
+        if fs.IsFile( fontPath ) andalso fs.ReadAllBytes( fontPath, old ).IsOk( ) andalso (old.Count( ) = bytes.Count( )) then
+            same = true
+            for i as long = 0 to bytes.Count( ) - 1
+                if old[i] <> bytes[i] then same = false : exit for
+            next
+        end if
+        if same = false then fs.WriteAtomic( fontPath, bytes )
+    end if
+    if len( problem ) then this.SetMessage( glyphfile.GLYPHS_FONT & ": " & problem )
+    ' the module, and the licences beside the font
+    dim as ustring gen = glyphfile.Generate( tkg ), target = fs.PathJoin( gdir, glyphfile.GLYPHS_MODULE & ".design.tiko" )
+    if (fs.IsFile( target ) = false) orelse (codegen.WithoutCr( fs.ReadAllText( target ).ValueOr( none ) ) <> gen) then fs.WriteAtomic( target, gen )
+    if licenses.Count( ) then
+        dim as ustring ld = fs.PathJoin( gdir, glyphfile.LICENSES_DIR )
+        fs.CreateDirAll( ld )
+        for each l as ustring in licenses
+            dim as ustring dst = fs.PathJoin( ld, fs.PathFileName( l ) )
+            if fs.IsFile( dst ) = false then fs.CopyFile( l, dst, false )
+        next
+    end if
+    ' main.tiko uses it, as a new project's would
+    dim as ustring mainPath = fs.PathJoin( fs.PathParent( Proj.Path ), "main.tiko" ), outText
+    dim as DocRef mainDoc = OpenDocAt_( Docs, mainPath )
+    dim as ustring mainText
+    if mainDoc then mainText = mainDoc->Text( ) else mainText = fs.ReadAllText( mainPath ).ValueOr( none )
+    if len( mainText ) then
+        select case glyphfile.InstallIntoMain( codegen.WithoutCr( mainText ), outText )
+        case 1
+            if mainDoc then mainDoc->Main.ReplaceAllText( outText ) else fs.WriteAtomic( mainPath, outText )
+        case -1
+            this.SetMessage( i18n.Tr( "designer.glyph_main_by_hand", "main.tiko: add appGlyphs.ApplyOptions( options ) just before tkApp_Init" ) )
+        end select
+    end if
+    codegen.SetGlyphCodes( gd.Codes )
+end sub
+
+' Every resource of the open project known to this process by its name, as a file: the canvas and
+' the Test Form show "res:<name>" as the program will. Names from before are taken back first.
+sub Window.RegisterProjectResources( )
+    for each n as ustring in ResRegistered
+        tkHost_RemoveResource( n )
+    next
+    ResRegistered.Clear( )
+    dim as ustring path = this.ResourcesPath( ), none, e
+    if (len( path ) = 0) orelse (fs.IsFile( path ) = false) then exit sub
+    dim as resfile.ResourceDoc doc
+    if resfile.Parse( fs.ReadAllText( path ).ValueOr( none ), doc, e ) = false then exit sub
+    for each x as resfile.Resource in doc.Items
+        dim as string nm = resfile.RefOf( x.Name )
+        tkHost_AddResourceFile( nm, fs.PathJoin( fs.PathParent( path ), resfile.FILES_DIR, x.File ) )
+        ResRegistered.Push( nm )
+    next
+end sub
+
+' The Resource Center. kind_: "" to manage; "image" / "font" to pick one (current: the value the
+' property has). True on OK / Select; picked is then "res:<name>", or "" for (none).
+function Window.EditResources( byref kind_ as const ustring, byref current as const ustring, byref picked as ustring, _
+                               byval owner_ as TK_FORM ptr = 0 ) as boolean
+    picked = ""
+    if (ProjOpen = false) orelse (ResDlg <> 0) then
+        if ProjOpen = false then this.SetMessage( i18n.Tr( "designer.res_needs_project", "Resources belong to a project: open or make one first" ) )
+        return false
+    end if
+    dim as ustring projDir = fs.PathParent( Proj.Path )
+    if CreateResourceFiles_( projDir ) = false then
+        this.SetMessage( resfile.RES_MODULE & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    ResDlg = new resdlg.ResourceDialog
+    ResDlg->Owner = @this
+    ResDlg->Ask = @ResAsk_
+    ResDlg->PickFiles = @ResPick_
+    ResDlg->UsedBy = @ResUsed_
+    ResDlg->Open( iif( owner_ <> 0, owner_, form ), fs.PathParent( this.ResourcesPath( ) ), kind_, current )
+    if ResDlg->Win = 0 then
+        delete ResDlg
+        ResDlg = 0
+        return false
+    end if
+    dim as boolean ok = ResDlg->RunModal( )
+    dim as resdlg.ResourceDialog ptr dlg = ResDlg
+    ResDlg = 0
+    ' Close picks nothing, but the Center's changes stay (author)
+    if ok orelse dlg->Changed( ) then this.ApplyResources( *dlg )
+    picked = dlg->Picked
+    if (ok = false) andalso (len( kind_ ) > 0) then
+        ' a property whose resource was removed there is left at (none), not an orphan
+        dim as ustring nm = resfile.NameOfRef( current )
+        for each s as Setting in dlg->Renames
+            if lcase( s.Key ) = lcase( nm ) then nm = s.Value
+        next
+        if (len( nm ) > 0) andalso (resfile.Find( dlg->Doc, nm ) < 0) then
+            picked = ""
+            ok = true
+        end if
+    end if
+    dlg->Close( )
+    delete dlg
+    return ok
+end function
+
+' The program's icon as the .tkres has it: app.ico and app.rc beside it and the .rc in tiko.toml's
+' [target.<t>.windows] resources, or (none) all three gone. The target is the options' one, else the
+' first; the manifest is rewritten through its open document when it has one.
+sub Window.ApplyAppIcon( byref doc as resfile.ResourceDoc, byref tkresPath as const ustring )
+    dim as ustring dir_ = fs.PathParent( tkresPath ), none
+    dim as ustring ico = fs.PathJoin( dir_, appicon.ICO_FILE ), rc = fs.PathJoin( dir_, appicon.RC_FILE )
+    dim as boolean on_ = false
+    dim as long a = resfile.Find( doc, doc.AppIcon )
+    if (len( doc.AppIcon ) > 0) andalso (a >= 0) then
+        dim as ustring fault = appicon.MakeIco( fs.PathJoin( dir_, resfile.FILES_DIR, doc.Items[a].File ), ico )
+        if len( fault ) = 0 then
+            if fs.WriteAllText( rc, appicon.RcText( ) ).IsOk( ) = false then fault = appicon.RC_FILE & ": " & i18n.Tr( "message.cannot_create", "can't be created" )
+        end if
+        if len( fault ) then
+            this.SetMessage( i18n.Tr( "designer.res_app_icon", "Application icon (Windows)" ) & ": " & fault )
+            exit sub
+        end if
+        on_ = true
+    else
+        if fs.IsFile( ico ) then fs.RemoveFile( ico )
+        if fs.IsFile( rc ) then fs.RemoveFile( rc )
+    end if
+    if (len( Proj.Path ) = 0) orelse (Proj.Targets.Count( ) = 0) then exit sub
+    dim as ustring target = Proj.Targets[0].Name
+    if (len( ProjOpts.Target ) > 0) andalso (Proj.TargetIndex( ProjOpts.Target ) >= 0) then target = ProjOpts.Target
+    dim as DocRef open_ = OpenDocAt_( Docs, Proj.Path )
+    dim as ustring t0
+    if open_ then t0 = open_->Text( ) else t0 = fs.ReadAllText( Proj.Path ).ValueOr( none )
+    dim as boolean changed
+    dim as ustring t1 = appicon.TomlWithResource( t0, target, resfile.RES_MODULE & "/" & appicon.RC_FILE, on_, changed )
+    if changed = false then exit sub
+    if open_ then
+        open_->Main.ReplaceAllText( t1 )
+        this.SaveDoc( open_, false )
+    elseif fs.WriteAtomic( Proj.Path, t1 ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( Proj.Path ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+    end if
+end sub
+
+' OK: the .tkres and its module written, renames carried into the project's forms and theme,
+' removed files deleted, main made to register them, and this process told the new names.
+sub Window.ApplyResources( byref dlg as resdlg.ResourceDialog )
+    dim as ustring path = this.ResourcesPath( ), none
+    dim as ustring text = resfile.ToText( dlg.Doc )
+    dim as DocRef open_ = OpenDocAt_( Docs, path )
+    if open_ then
+        open_->Main.ReplaceAllText( text )
+        this.SaveDoc( open_, false )
+    elseif fs.WriteAtomic( path, text ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( path ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        exit sub
+    end if
+    this.WriteResourcesGenerated( path, text )
+    this.ApplyAppIcon( dlg.Doc, path )
+    for each f as ustring in dlg.Removed
+        fs.RemoveFile( fs.PathJoin( fs.PathParent( path ), resfile.FILES_DIR, f ) )
+    next
+    this.RegisterProjectResources( )
+
+    ' renames: open forms through their canvas (one undo step each), others in their text
+    dim as long changed = 0
+    if dlg.Renames.Count( ) then
+        dim as Array( of ustring ) files
+        ProjectRefFiles_( fs.PathParent( Proj.Path ), files, 0 )
+        for each p as ustring in files
+            dim as DocRef d = OpenDocAt_( Docs, p )
+            if (d <> 0) andalso (d->Designer <> 0) then
+                dim as canvas.FormCanvas ptr c = d->Designer
+                dim as FormDoc trial = c->Doc
+                dim as long n = 0
+                for each s as Setting in dlg.Renames
+                    dim as ustring was = lcase( resfile.RefOf( s.Key ) ), now_ = resfile.RefOf( s.Value )
+                    if lcase( trial.Icon ) = was then trial.Icon = now_ : n += 1
+                    for k as long = 0 to trial.Controls.Count( ) - 1
+                        for j as long = 0 to trial.Controls[k].Props.Count( ) - 1
+                            if lcase( trial.Controls[k].Props[j].Value ) = was then trial.Controls[k].Props[j].Value = now_ : n += 1
+                        next
+                    next
+                next
+                if n then
+                    dim as ustring fault = c->ApplyEdit( trial, true, "" )
+                    if len( fault ) then this.SetMessage( fault ) else changed += n
+                end if
+            else
+                dim as ustring t0
+                if d then t0 = d->Text( ) else t0 = fs.ReadAllText( p ).ValueOr( none )
+                dim as ustring t1 = t0
+                for each s as Setting in dlg.Renames
+                    dim as long n
+                    t1 = resfile.RenameRefs( t1, s.Key, s.Value, n )
+                    changed += n
+                next
+                if t1 <> t0 then
+                    if d then
+                        d->Main.ReplaceAllText( t1 )
+                    else
+                        fs.WriteAtomic( p, t1 )
+                    end if
+                end if
+            end if
+        next
+    end if
+
+    ' the project's main registers them, as a new project's does
+    dim as ustring mainPath = fs.PathJoin( fs.PathParent( Proj.Path ), "main.tiko" ), outText
+    dim as DocRef mainDoc = OpenDocAt_( Docs, mainPath )
+    dim as ustring mainText
+    if mainDoc then mainText = mainDoc->Text( ) else mainText = fs.ReadAllText( mainPath ).ValueOr( none )
+    dim as boolean byHand = false
+    if len( mainText ) then
+        select case resfile.InstallIntoMain( codegen.WithoutCr( mainText ), outText )
+        case 1
+            if mainDoc then mainDoc->Main.ReplaceAllText( outText ) else fs.WriteAtomic( mainPath, outText )
+        case -1
+            byHand = true
+        end select
+    end if
+    for each d as DocRef in Docs
+        if d->Designer then d->Designer->Rebuild( )
+    next
+    if byHand then
+        this.SetMessage( i18n.Tr( "designer.res_main_by_hand", "main.tiko: add appResources.Register( ) before tkApp_Init" ) )
+    elseif changed then
+        this.SetMessage( strings.Format( i18n.Tr( "designer.res_renamed", "Resources saved; {} references renamed" ), changed ) )
+    else
+        this.SetMessage( i18n.Tr( "designer.res_saved", "Resources saved" ) )
+    end if
+end sub
 
 ' The project's theme: appTheme/appTheme.tktheme, the presets named "Default", and its module.
 private function CreateThemeFiles_( byref dir_ as const ustring ) as boolean
@@ -502,6 +1230,14 @@ function Window.WriteThemeGenerated( byref path as const ustring, byref text as 
     if problems.Count( ) then
         this.SetMessage( fs.PathFileName( path ) & ": " & problems[0] )
         return false
+    end if
+    ' [fonts] embed: the fonts copied beside the module first, where its #embed lines read them at build time
+    if doc.EmbedFonts then
+        themefile.CopyEmbeddedFonts( doc, fs.PathParent( path ), this.PkgDir( ), problems )
+        if problems.Count( ) then
+            this.SetMessage( fs.PathFileName( path ) & ": " & problems[0] )
+            return false
+        end if
     end if
     dim as ustring generated = themefile.Generate( doc, fs.PathStem( path ), fs.PathFileName( path ), text )
     dim as ustring target = left( path, instrrev( path, "." ) - 1 ) & ".design.tiko", none
@@ -533,7 +1269,7 @@ function Window.NewProjectForForm( byref formPath as const ustring ) as boolean
         end if
         dim as ustring pkg = PackageName_( fs.PathFileName( dir_ ) )
         if (WriteNew_( manifest, GuiManifest_( pkg ) ) = false) orelse (WriteNew_( mainPath, FormMain_( pkg, formName ) ) = false) _
-           orelse (CreateThemeFiles_( dir_ ) = false) then
+           orelse (CreateThemeFiles_( dir_ ) = false) orelse (CreateResourceFiles_( dir_ ) = false) then
             this.SetMessage( pkg & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
             return false
         end if
@@ -584,6 +1320,7 @@ function Window.NewFormProject( byref folder as const ustring ) as boolean
     dim as boolean ok = WriteNew_( manifest, GuiManifest_( pkg ) )
     ok = ok andalso WriteNew_( fs.PathJoin( dir_, "main.tiko" ), FormMain_( pkg, "frmMain" ) )
     ok = ok andalso CreateThemeFiles_( dir_ )
+    ok = ok andalso CreateResourceFiles_( dir_ )
     dim as ustring formPath = CreateFormFiles_( dir_, "frmMain" )
     if (ok = false) orelse (len( formPath ) = 0) then
         this.SetMessage( pkg & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
@@ -608,6 +1345,25 @@ function Window.HandlerGone( byval c as canvas.FormCanvas ptr, byref handler as 
     if reconcile.IsEmptyBody( text, a, b ) = false then return true
     this.PutCodeText( code, reconcile.RemoveLines( text, a, b ) )
     return false
+end function
+
+' An Events row now calls newName instead of oldName, which nothing else on the form calls: the
+' body and its uses in the code take the new name -- not when newName already has a body of its own
+' (the row was pointed at another handler), and not when oldName has none. True: renamed.
+function Window.HandlerRenamed( byval c as canvas.FormCanvas ptr, byref oldName as const ustring, byref newName as const ustring ) as boolean
+    dim as DocRef d = this.DocOfCanvas( c )
+    if d = 0 then return false
+    dim as ustring path = CodePathOf_( d->Path )
+    if (this.FindOpen( path ) = 0) andalso (fs.IsFile( path ) = false) then return false
+    dim as DocRef code = this.OpenQuietly( path )
+    if code = 0 then return false
+    dim as ustring text = code->Text( )
+    dim as long a, b
+    if (lcase( oldName ) <> lcase( newName )) andalso reconcile.FindBody( text, newName, a, b ) then return false
+    if reconcile.FindBody( text, oldName, a, b ) = false then return false
+    dim as FormDoc noForm                        ' a handler's name alone: no control-prefixed names follow it
+    this.PutCodeText( code, reconcile.RenameInCode( text, oldName, newName, noForm ) )
+    return true
 end function
 
 sub Window.ControlRenamed( byval c as canvas.FormCanvas ptr, byref oldName as const ustring, byref newName as const ustring )
@@ -654,6 +1410,7 @@ function Window.WriteGenerated( byval d as DocRef ) as boolean
         this.SetMessage( fs.PathFileName( d->Path ) & ": " & problems[0] )
         return false
     end if
+    if GlyphsReady = false then this.BuildGlyphs( )        ' the numbering its glyphs are written at
     dim as ustring generated = codegen.Generate( d->Designer->Doc, moduleName, fs.PathFileName( d->Path ), d->Text( ) )
     dim as ustring target = DesignPathOf_( d->Path ), none
     if fs.IsFile( target ) then
@@ -670,6 +1427,9 @@ end function
 ' Before a build: every open form's code matches, and its generated file is current.
 function Window.PrepareForms( ) as boolean
     dim as boolean ok = true
+    ' the project's glyphs first, once: every form's code is written at their numbering
+    this.BuildGlyphs( )
+    GlyphsReady = true
     for each d as DocRef in Docs
         if d->Designer then
             this.ReconcileDesigner( d )
@@ -685,8 +1445,26 @@ function Window.PrepareForms( ) as boolean
             elseif this.WriteThemeGenerated( d->Path, d->Text( ) ) = false then
                 ok = false
             end if
+        elseif lcase( right( d->Path, 6 ) ) = ".tkres" then
+            if Prefs.SaveBeforeBuild andalso d->IsModified( ) then
+                if this.SaveDoc( d, false ) = false then ok = false
+            elseif this.WriteResourcesGenerated( d->Path, d->Text( ) ) = false then
+                ok = false
+            end if
         end if
     next
+    ' the project's resources, when no buffer has them: from the disk
+    dim as ustring resPath = this.ResourcesPath( ), none
+    if len( resPath ) andalso fs.IsFile( resPath ) then
+        dim as boolean isOpen = false
+        for each d as DocRef in Docs
+            if (len( d->Path ) > 0) andalso fs.PathEquals( d->Path, resPath ) then isOpen = true
+        next
+        if isOpen = false then
+            if this.WriteResourcesGenerated( resPath, fs.ReadAllText( resPath ).ValueOr( none ) ) = false then ok = false
+        end if
+    end if
+    GlyphsReady = false
     if len( SaveNote ) then
         this.SetMessage( SaveNote )
         SaveNote = ""
@@ -723,6 +1501,33 @@ sub Window.ToggleFormView( )
     end if
 end sub
 
+' A form's code file if it's open in a tab, else 0. Nothing is opened or created.
+function Window.OpenCodeDocOf( byval formDoc as DocRef ) as DocRef
+    if (formDoc = 0) orelse (len( formDoc->Path ) = 0) then return 0
+    return this.FindOpen( CodePathOf_( formDoc->Path ) )
+end function
+
+' d is a form whose code file is there, or a form's code file (frmX.tiko, frmX.design.tiko) whose form is:
+' Next Pane (Primary+Tilde) then goes between the two. Nothing is created to find out.
+function Window.HasFormPartner( byval d as DocRef ) as boolean
+    if (d = 0) orelse (len( d->Path ) = 0) then return false
+    dim as ustring other
+    if d->Designer then
+        other = CodePathOf_( d->Path )
+    else
+        dim as ustring base_ = d->Path
+        if lcase( right( base_, 12 ) ) = ".design.tiko" then
+            base_ = left( base_, len( base_ ) - 12 )
+        elseif lcase( right( base_, 5 ) ) = ".tiko" then
+            base_ = left( base_, len( base_ ) - 5 )
+        else
+            return false
+        end if
+        other = base_ & ".tkform"
+    end if
+    return (this.FindOpen( other ) <> 0) orelse fs.IsFile( other )
+end function
+
 ' A form's code file sees its generated half, unsaved changes included.
 sub Window.AddFormOverlay( byval d as DocRef, byref o as parser.ScanOptions )
     dim as ustring p = d->Path
@@ -747,8 +1552,19 @@ end sub
 
 private sub ThemeSaved_( byval tc as themecenter.ThemeDialog ptr )
     dim as Window ptr mw = tc->Host
-    if mw then mw->SaveTheme( tc )
+    if mw then tc->Saved = mw->SaveTheme( tc )
 end sub
+
+' A project theme's font slot "...": the Resource Center over the Theme Center, picking a font.
+private function ThemePickFont_( byval tc as themecenter.ThemeDialog ptr, byref current as const ustring, byref picked as ustring ) as boolean
+    return cast( Window ptr, tc->Host )->EditResources( "font", current, picked, tc->Win )
+end function
+
+' Delete's question, over the dialog (AskOver: its form's Tag is the dialog, not a Window).
+private function ThemeAsk_( byval tc as themecenter.ThemeDialog ptr, byref text as const ustring ) as boolean
+    dim as Window ptr w = tc->Host
+    return w->AskOver( tc->Win, text, MBX_BTN_YESNO ) = MBX_IDYES
+end function
 
 private sub ThemeClosed_( byval tc as themecenter.ThemeDialog ptr )
     dim as Window ptr mw = tc->Host
@@ -774,16 +1590,33 @@ sub Window.OpenThemeCenterOn( byref path as const ustring, byval forEditor as bo
     ThemeDlg->ForEditor = forEditor
     ThemeDlg->OnSave = @ThemeSaved_
     ThemeDlg->OnClose = @ThemeClosed_
+    ThemeDlg->OnAsk = @ThemeAsk_
+    if forEditor = false then ThemeDlg->OnPickFont = @ThemePickFont_
     dim as ustring title
     if forEditor then title = i18n.Tr( "designer.theme_editor_title", "tkEdit Theme" )
     ThemeDlg->Open( form, path, fs.PathJoin( ConfigDir, themes.THEME_DIR ), title )
+    ' tkEdit's own theme opens on the variant tkEdit wears
+    if forEditor then ThemeDlg->ShowVariant( tkApp_Theme( ).IsDark )
+    ' modal to tkEdit, as the OS sees it (tkHost_RunModal's SDL_SetWindowModal): tkEdit's window takes
+    ' no input until it closes. The dialog keeps running in tkEdit's own loop.
+    if ThemeDlg->Win then SDL_SetWindowModal( tkForm_Host( ThemeDlg->Win )->win, true )
 end sub
 
 sub Window.CloseThemeCenter( )
     if ThemeDlg = 0 then exit sub
     dim as themecenter.ThemeDialog ptr d = ThemeDlg
     ThemeDlg = 0
+    ' tkEdit enabled again, then active, BEFORE the dialog's window goes: destroying the active window
+    ' let Windows activate some other program's window now and then
+    if d->Win then SDL_SetWindowModal( tkForm_Host( d->Win )->win, false )
+    this.Raise( )
     d->Close( )
+    ' tkEdit's own theme deleted in the dialog and nothing saved in its place: Default from now on
+    dim as ustring mode = Prefs.ThemeMode
+    if d->ForEditor andalso (len( themes.FindTheme( themes.CurrentName( Prefs.Theme, mode ), ConfigDir, "" ) ) = 0) then
+        this.KeepTheme( themes.DEFAULT_THEME, mode )
+        this.ReloadTheme( )
+    end if
     delete d
 end sub
 
@@ -795,6 +1628,15 @@ function Window.SaveTheme( byval tc as themecenter.ThemeDialog ptr ) as boolean
     if problems.Count( ) then
         this.SetMessage( fs.PathFileName( tc->Path ) & ": " & problems[0] )
         return false
+    end if
+    ' tkEdit's own theme is saved by its name in <config>/themes: a theme picked in the gallery is
+    ' saved as itself, never over the file the dialog opened on
+    dim as ustring renamedFrom
+    if tc->ForEditor andalso (tc->SavingToLibrary = false) then
+        tc->Path = tc->LibraryPath( )
+        ' a new name: the library file it came from is renamed (a shipped theme's name can't change)
+        if (len( tc->Source ) > 0) andalso fs.PathEquals( fs.PathParent( tc->Source ), tc->LibraryDir ) _
+           andalso (fs.PathEquals( tc->Source, tc->Path ) = false) then renamedFrom = tc->Source
     end if
     dim as ustring text = themefile.Render( tc->Doc )
     fs.CreateDirAll( fs.PathParent( tc->Path ) )
@@ -814,8 +1656,16 @@ function Window.SaveTheme( byval tc as themecenter.ThemeDialog ptr ) as boolean
         this.SetMessage( strings.Format( i18n.Tr( "designer.theme_saved", "{} saved" ), tc->Path ) )
         return true
     end if
+    if len( renamedFrom ) then fs.RemoveFile( renamedFrom )
     if tc->ForEditor then
+        tc->Source = tc->Path
+        tc->SourceName = tc->Doc.Name
+        ' and it is what tkEdit wears from now on, in the variant the dialog shows: settings.toml's
+        ' theme and theme_mode say so
+        dim as ustring fn = fs.PathFileName( tc->Path )
+        dim as boolean kept = this.KeepTheme( left( fn, len( fn ) - len( themes.THEME_EXT ) ), iif( tc->IsDark, "dark", "light" ) )
         this.ReloadTheme( )
+        if kept = false then return true        ' KeepTheme said why
         this.SetMessage( strings.Format( i18n.Tr( "designer.theme_saved", "{} saved" ), tc->Path ) )
         return true
     end if

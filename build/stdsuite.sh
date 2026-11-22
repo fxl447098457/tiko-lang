@@ -32,8 +32,14 @@ TKO=${TKO:-$ROOT/bin/tiko$EXT}
 case "$EXT" in
     .exe) TC=$ROOT/toolchains/tiko-windows; LIBT=windows-x86_64 ;;
     *)    if [ "$(uname -s)" = Darwin ]; then TC=$ROOT/toolchains/tiko-macos; LIBT=macos-arm64
+          elif [ "$(uname -m)" = aarch64 ]; then TC=$ROOT/toolchains/tiko-linux-arm64; LIBT=linux-arm64
           else TC=$ROOT/toolchains/tiko-linux; LIBT=linux-x86_64; fi ;;
 esac
+# linux-arm64 has no packaged toolchain until docs/tiko-linux-arm64 L5: build/standin.sh lays
+# out this tree's inc/, runtime, graphics library and libfbcunit.a in its place.
+if [ "$LIBT" = linux-arm64 ] && [ ! -d "$TC" ]; then
+    . "$ROOT/build/standin.sh"; TC=$(standin_linux_arm64)
+fi
 # A RUN WITH A TIME LIMIT. macOS has no timeout(1): Homebrew's coreutils call it gtimeout, and
 # without either perl's alarm survives the exec -- a hang is still a result, not a stall.
 run_limited( ) {

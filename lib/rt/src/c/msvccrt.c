@@ -197,6 +197,44 @@ void __cdecl tkort_run_terminators( void )
     "    ret\n"
 );
 
+/* THE /GS COOKIE PAIR.  LLVM's prebuilt clang_rt.builtins-x86_64.lib -- linked for
+** int128's '\', MOD and float conversions (toolchain.tiko, rtBuiltinsLib) -- is
+** compiled with /GS, so __divti3, __modti3, __floatuntidf & co. reference
+** __security_cookie and __security_check_cookie, which live in Visual Studio's
+** libcmt like __chkstk above. Measured 2026-11-19, LLVM 23.1.5: the link failed on
+** exactly those two. The value is MSVC's own default (it is never re-seeded here:
+** nothing calls __security_init_cookie), and a mismatch fails fast, as MSVC's does.
+**
+** The check is ASSEMBLY for __chkstk's reason: it is called in an EPILOGUE, after the
+** result is already in RAX or XMM0, and must touch nothing but the flags.
+**
+** BOTH ARE WEAK, for sprintf's reason above: a static library built by MSVC brings
+** Visual Studio's own pair. raylib.lib's objects are compiled with /GS, reference
+** __GSHandlerCheck, and their /DEFAULTLIB:MSVCRT names VC's static MSVCRT.lib, whose
+** gshandler.obj pulls in gs_cookie.obj for __security_cookie_complement -- and that object
+** defines __security_cookie too. Strong here, every link of such a library stopped on
+** 'duplicate symbol: __security_cookie' between libfb.a(msvccrt.o) and
+** MSVCRT.lib(gs_cookie.obj): the book's Chapter 30 raylib and SDL3 listings, measured
+** 2026-11-20 with lld-link /verbose. Weak, VC's definition wins where it is linked and
+** ours is used where it is not; either way the program has ONE cookie, and every /GS
+** check -- ours, VC's, the library's -- compares against it.
+**
+** The check is a NAKED weak function rather than a '.globl' label in top-level asm:
+** LLVM's COFF assembler keeps a '.weak' label in inline asm strong (measured), while
+** 'weak, naked' gives a weak external over exactly these four instructions. */
+__attribute__(( weak )) unsigned long long __security_cookie = 0x00002B992DDFA232ull;
+
+__attribute__(( weak, naked )) void __cdecl __security_check_cookie( void )
+{
+    __asm__(
+        "    cmp  __security_cookie(%rip), %rcx\n"
+        "    jne  1f\n"
+        "    ret\n"
+        "1:\n"
+        "    ud2\n"
+    );
+}
+
 /* THE FLOATING-POINT MARKER.  The backend emits a reference to _fltused from
 ** any module that touches a float, and the CRT is expected to define it. Its
 ** value is never read; only its presence is. */

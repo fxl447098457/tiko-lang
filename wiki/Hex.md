@@ -36,6 +36,8 @@ Returns the unsigned hexadecimal string representation of the integer `number`. 
 
 A [String](String) containing the unsigned hexadecimal representation of `number`.
 
+ **tiko:** `Hex` also takes an [`Int128` or `UInt128`](Category-Fixed-Width-Types#128-bit-integers), at full width: up to 32 digits, so `Hex( cast( Int128, -1 ) )` is 32 `F`s.
+
 ## Remarks
 
 ### Usage

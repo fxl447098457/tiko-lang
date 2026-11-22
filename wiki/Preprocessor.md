@@ -124,6 +124,8 @@ Reserves symbol name.
 
 Sets compiler command options from source.
 
+> **In tiko.** Only the first source file's `#cmdline` counts, and the compile restarts with its options after the command line's, so the source's win. A source may set fbc's options — `-mt`, `-exx`, `-g`, `-s`, `-d`, `-O`, `-w`, `-t`, `-x`, `-Wl` and the like — and not the ones only the person running the compiler should choose: `--diagnostics-file`, `--pkg-dir`, `-copt`, `-ccachedir`, `-cimport*` and the inspection modes are `TKO0178`. `-x` and `-o` must be relative and may not use `..`, and `-Wl` passes only linker options that change the program (`-rpath`, `-z`, `-L`, `-l`, `--as-needed`, `/STACK`, `/SUBSYSTEM` and the like), never `-plugin`, an `@file` or `/OUT`. [`-z nocmdline`](Compiler-Option-Z) ignores every `#cmdline`, with warning `TKO0373`: use it to compile a source you do not trust.
+
 **[#lang](procedures-Lang)**
 
 Sets dialect from source.

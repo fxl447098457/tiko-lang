@@ -133,6 +133,17 @@ the library calls, and it is the widget.
     painted the rows out.
 - **ABI 2:** call tips, IME, caret rect and per-editor DPI.
 
+## For the form designer (2026-11-13)
+
+- Settings by name over `SCI_*` (ReadOnly, TabWidth, IndentWidth, UseTabs, EOLMode, WrapMode,
+  LineNumbers, IndentGuides, HighlightCurrentLine, ViewWhitespace, ViewEOL, Zoom, Keywords), with
+  `TKCE_WRAP_*` / `TKCE_EOL_*` here because the generated constants file lacks
+  `SC_WRAP_WHITESPACE`.
+- Callbacks of their own for Change, CharAdded, UpdateUI, Dirty (the save point), MarginClick
+  and DoubleClick, dispatched from the notify stream after `SetNotifyCallback`'s sub.
+- An editor with no `SetFont` now draws in the bundled mono face: before, a CodeEdit placed on a
+  form drew and measured nothing (`TeOpen` refuses an empty path).
+
 ## Still not done
 
 - Ligature fonts: measuring sums advances while drawing shapes.

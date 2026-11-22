@@ -6,6 +6,7 @@
 #include once "build/events.ti"
 #include once "build/lock.ti"
 #include once "build/plan.ti"
+#include once "build/testdoc.ti"
 #include once "c2t/c2t.ti"
 #include once "driver/driver.ti"
 #include once "driver/diagout.ti"
@@ -19,7 +20,7 @@ namespace Tko.Build
 
 function IsCommand( byref w as string ) as boolean
     select case w
-    case "build", "run", "check", "clean", "metadata"
+    case "build", "run", "check", "clean", "metadata", "test", "doc"
         return true
     end select
     return false
@@ -36,9 +37,9 @@ private function ParseArgs_ _
     dim as int32 i = 1
     while i < args.Count
         dim as string w = args[i]
-        '' '--' ENDS tiko's arguments: the rest are the program's, for 'tiko run' only.
+        '' '--' ENDS tiko's arguments: the rest are the program's, for 'tiko run' and 'tiko test'.
         if w = "--" then
-            if a.verb <> "run" then
+            if (a.verb <> "run") andalso (a.verb <> "test") then
                 diags.ReportGlobal( Tko.TKO0154, "--", "tiko " & a.verb )
                 ok = false
             end if
@@ -48,7 +49,8 @@ private function ParseArgs_ _
             exit while
         end if
         select case w
-        case "-target", "-o", "-x", "--options", "--message-format", "--diagnostics-file", "--profile", "--format", "--manifest", "-j"
+        case "-target", "-o", "-x", "--options", "--message-format", "--diagnostics-file", "--profile", "--format", "--manifest", "-j", _
+             "--timeout", "--filter"
             if i + 1 >= args.Count then
                 diags.ReportGlobal( Tko.TKO0101, w )
                 return false
@@ -62,6 +64,19 @@ private function ParseArgs_ _
             case "--options"         : Tko.Spawn.SplitArgs( v, a.extra )
             case "--profile"         : a.profile = v : a.hasProfile = true
             case "--manifest"        : a.manifest = v
+            case "--filter"          : a.filters.Push( v )
+            case "--timeout"
+                '' HOISTED: a digit test beside a comparison is warning 38.
+                dim as boolean digits = (len( v ) > 0)
+                for k as int32 = 0 to len( v ) - 1
+                    if (v[k] < 48) orelse (v[k] > 57) then digits = false
+                next
+                if digits then
+                    a.timeoutSec = valint( v )
+                else
+                    diags.ReportGlobal( Tko.TKO0106, v, w )
+                    ok = false
+                end if
             case "-j"
                 a.jobs = valint( v )
                 if a.jobs < 1 then
@@ -85,6 +100,8 @@ private function ParseArgs_ _
             continue while
         case "-v"
             a.verbose = true
+        case "--no-run"
+            a.noRun = true
         '' NOTHING READ FROM OR WRITTEN TO THE CACHE, modules or roots (B3).
         case "--no-cache"
             a.extra.Push( "--no-module-cache" )
@@ -310,7 +327,7 @@ end function
 '' 'tiko build', and 'tiko check' (checkOnly): the same plans and the same runs, with
 '' --frontend-only -- every diagnostic through lowering, nothing written, so no lock and no
 '' output directory either.
-private function Build_ _
+function Build_ _
     ( byref a as BuildArgs, byref m as Tko.Modules.Manifest, byref mdir as string, _
       byref plans as Tko.StrVec, byref ctx as Tko.CompilerContext, byref obs as Observer, _
       byval checkOnly as boolean = false ) as int32
@@ -555,6 +572,18 @@ function Entry( byref args as Tko.StrVec ) as int32
     if ok andalso hasM then
         if Tko.Modules.LoadManifest( ctx, mdir, m ) = false then ok = false
     end if
+    '' 'tiko test' AND 'tiko doc' TAKE DIRECTORIES AND FILES, not targets: their own commands
+    '' (build/testcmd.tiko, build/doccmd.tiko) from here.
+    dim as int32 rc = Tko.EXIT_CMDLINE
+    if ok andalso (a.verb = "test") then
+        dim as Tko.StrVec pf0
+        if a.hasProfile then ok = ProfileFlags( m, a.profile, pf0, ctx.diags )
+        if ok then rc = TestCommand( a, hasM, m, mdir, ctx, obs )
+        ok = false
+    elseif ok andalso (a.verb = "doc") then
+        rc = DocCommand( a, hasM, m, mdir, ctx, obs )
+        ok = false
+    end if
     dim as Tko.StrVec targets, roots, plans
     if ok then ok = Classify_( a, hasM, m, targets, roots, ctx.diags )
     '' THE PROFILE, checked once rather than once per target.
@@ -584,7 +613,6 @@ function Entry( byref args as Tko.StrVec ) as int32
         ok = Plan_( a, hasM, m, mdir, targets, ctx, plans )
     end if
 
-    dim as int32 rc = Tko.EXIT_CMDLINE
     if ok then
         select case a.verb
         case "build"
@@ -608,7 +636,8 @@ function Entry( byref args as Tko.StrVec ) as int32
     if ran = false then rc = Tko.DiagOut.Finish( ctx, rc )
     '' ...and one raised after a run -- a later target's busy lock -- still reaches the console.
     if ran then ctx.diags.Flush( )
-    if ((a.verb = "build") orelse (a.verb = "check") orelse (a.verb = "run")) andalso (ran = false) then
+    if ((a.verb = "build") orelse (a.verb = "check") orelse (a.verb = "run") orelse (a.verb = "test")) andalso _
+       (ran = false) then
         obs.errors = ctx.diags.ErrorCount( )
         obs.warnings = ctx.diags.WarningCount( )
         EmitLine( obs, """event"":""build-end"",""errors"":" & obs.errors & ",""warnings"":" & _

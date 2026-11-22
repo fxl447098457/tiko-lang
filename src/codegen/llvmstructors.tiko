@@ -48,7 +48,7 @@
 private function StructorSection_ _
     ( byref e as EmitCtx, byval isCtor as boolean, byval prio as int32 ) as string
     select case e.tgt->id
-    case Tko.TARGET_LINUX_X86_64
+    case Tko.TARGET_LINUX_X86_64, Tko.TARGET_LINUX_ARM64
         return iif( isCtor, ".init_array.", ".fini_array." ) & right( "0000" & str( prio ), 5 )
     case Tko.TARGET_WIN64
         return iif( isCtor, ".ctors.", ".dtors." ) & right( "0000" & str( 65535 - prio ), 5 )
@@ -233,13 +233,20 @@ private sub ListPush_ _
     n += 1
 end sub
 
+'' UNDER -fsanitize=address A STRUCTOR RECORD MUST STAY UNPADDED: ASan puts a redzone after each
+'' global it instruments, and fbrt0.c (Mach-O) and mingw (.ctors.N) walk these at a fixed stride
+'' -- the redzone's zeros would read as a record calling NULL. Measured with clang 23.
+private function NoAsan_( byref e as EmitCtx ) as string
+    return iif( e.asan, ", no_sanitize_address", "" )
+end function
+
 '' One Mach-O priority record: { i64 number, ptr function }, 16 bytes, the layout fbrt0.c's
 '' 'struct tko_rec' reads.
 private function MachoRecord_ _
-    ( byref gn as string, byval isCtor as boolean, byval prio as int32, byref fname as string ) as string
+    ( byref e as EmitCtx, byref gn as string, byval isCtor as boolean, byval prio as int32, byref fname as string ) as string
     return gn & " = internal global { i64, ptr } { i64 " & str( prio ) & ", ptr " & fname & _
            " }, section ""__DATA," & iif( isCtor, "__tko_ctors", "__tko_dtors" ) & _
-           """, align 8" & chr( 10 )
+           """, align 8" & NoAsan_( e ) & chr( 10 )
 end function
 
 private function StructorLists_( byref e as EmitCtx, byref m as MirModule ) as string
@@ -265,7 +272,7 @@ private function StructorLists_( byref e as EmitCtx, byref m as MirModule ) as s
             end if
             if macho then
                 dim as string rn = "@__tko_" & iif( isCtor, "ctor.", "dtor." ) & str( nused )
-                r += MachoRecord_( rn, isCtor, f->structorPrio, GlobalName( e, f->name ) )
+                r += MachoRecord_( e, rn, isCtor, f->structorPrio, GlobalName( e, f->name ) )
                 if nused > 0 then used += ", "
                 used += "ptr " & rn
                 nused += 1
@@ -280,7 +287,7 @@ private function StructorLists_( byref e as EmitCtx, byref m as MirModule ) as s
             dim as string gk = iif( e.tgt->layout.isMsvc, "constant", "global" )
             r += gn & " = internal " & gk & " ptr " & GlobalName( e, f->name ) & _
                  ", section """ & StructorSection_( e, isCtor, f->structorPrio ) & _
-                 """, align 8" & chr( 10 )
+                 """, align 8" & NoAsan_( e ) & chr( 10 )
             if nused > 0 then used += ", "
             used += "ptr " & gn
             nused += 1
@@ -342,14 +349,14 @@ private function StructorLists_( byref e as EmitCtx, byref m as MirModule ) as s
         next
         r += "  ret void" & nl & "}" & nl
         if macho then
-            r += MachoRecord_( "@__tko_ctor.modinit", true, 65534, ModSym_( "__tko_initall", "" ) )
-            r += MachoRecord_( "@__tko_dtor.modfini", false, 65534, ModSym_( "__tko_modfini_drain", "" ) )
+            r += MachoRecord_( e, "@__tko_ctor.modinit", true, 65534, ModSym_( "__tko_initall", "" ) )
+            r += MachoRecord_( e, "@__tko_dtor.modfini", false, 65534, ModSym_( "__tko_modfini_drain", "" ) )
         else
             dim as string gk = iif( e.tgt->layout.isMsvc, "constant", "global" )
             r += "@__tko_ctor.modinit = internal " & gk & " ptr " & ModSym_( "__tko_initall", "" ) & _
-                 ", section " & chr( 34 ) & StructorSection_( e, true, 65534 ) & chr( 34 ) & ", align 8" & nl
+                 ", section " & chr( 34 ) & StructorSection_( e, true, 65534 ) & chr( 34 ) & ", align 8" & NoAsan_( e ) & nl
             r += "@__tko_dtor.modfini = internal " & gk & " ptr " & ModSym_( "__tko_modfini_drain", "" ) & _
-                 ", section " & chr( 34 ) & StructorSection_( e, false, 65534 ) & chr( 34 ) & ", align 8" & nl
+                 ", section " & chr( 34 ) & StructorSection_( e, false, 65534 ) & chr( 34 ) & ", align 8" & NoAsan_( e ) & nl
         end if
         if nused > 0 then used += ", "
         used += "ptr @__tko_ctor.modinit, ptr @__tko_dtor.modfini"

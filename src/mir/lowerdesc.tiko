@@ -24,6 +24,7 @@
 #include once "lowercall.ti"
 #include once "lowerstruct.ti"
 #include once "lowerstore.ti"
+#include once "lowerslice.ti"
 
 namespace Tko.Mir
 
@@ -191,6 +192,52 @@ function SynthFixedArrayDesc _
         DescStoreConst_( c, desc, b + 2 * ptrBytes, hi[d] )
     next
 
+    outv = desc
+    return true
+end function
+
+
+function SpanDescArg _
+    ( byref c as Ctx, byval argNode as Tko.NodeId, byref outv as MirValue ) as boolean
+
+    dim as Tko.TypeId st = c.info->TypeOf_( argNode )
+    if Slices.IsSpanType( *c.types, st ) = false then return false
+    dim as int32 elemLen = SpanElemBytes( c, st )
+    if elemLen <= 0 then return false
+    dim as MirValue sa = SliceStorage( c, argNode )
+    if sa.kind = cast( uint8, MV_NONE ) then return false
+    EmitSpanChecks( c, argNode, sa, elemLen )
+    dim as int32 pb = DescPtrBytes_( c )
+    dim as MirType zt = DescIntTy_( c )
+    dim as MirInst fa
+    fa.op = cast( uint16, M_FIELD_ADDR ) : fa.ty = cast( uint8, MT_PTR ) : fa.a = sa
+    fa.imm = 0
+    dim as MirValue p = LowerExprLoad( c, Emit( c, fa ), MT_PTR )
+    fa.imm = pb
+    dim as MirValue n = LowerExprLoad( c, Emit( c, fa ), zt )
+    if (p.kind = cast( uint8, MV_NONE )) orelse (n.kind = cast( uint8, MV_NONE )) then return false
+
+    dim as int32 slot = NewTempLocal( c, MT_AGG, 9 * pb )
+    if slot < 0 then return false
+    dim as MirValue desc
+    desc.kind = cast( uint8, MV_LOCAL )
+    desc.ty = cast( uint8, MT_PTR )
+    desc.id = slot
+    dim as MirInst m
+    m.op = cast( uint16, M_MUL ) : m.ty = cast( uint8, zt ) : m.a = n : m.b = ConstInt( c, elemLen, zt )
+    dim as MirValue size_ = Emit( c, m )
+    dim as MirInst s1
+    s1.op = cast( uint16, M_SUB ) : s1.ty = cast( uint8, zt ) : s1.a = n : s1.b = ConstInt( c, 1, zt )
+    dim as MirValue ubv = Emit( c, s1 )
+    DescStore_( c, desc, 0, p )                      '' DATA: lbound 0, no bias
+    DescStore_( c, desc, pb, p )                     '' PTR
+    DescStore_( c, desc, 2 * pb, size_ )             '' SIZE
+    DescStoreConst_( c, desc, 3 * pb, elemLen )      '' ELEMENT_LEN
+    DescStoreConst_( c, desc, 4 * pb, 1 )            '' DIMENSIONS
+    DescStoreConst_( c, desc, 5 * pb, 48 + 1 )       '' FLAGS: fixed length, fixed dimensions, 1
+    DescStore_( c, desc, 6 * pb, n )                 '' ELEMENTS
+    DescStoreConst_( c, desc, 7 * pb, 0 )            '' LBOUND
+    DescStore_( c, desc, 8 * pb, ubv )               '' UBOUND
     outv = desc
     return true
 end function
@@ -1228,6 +1275,7 @@ function LowerArrayBoundCall _
     end if
 
     dim as Tko.NodeId a0 = cast( Tko.NodeId, c.ast->ChildSlot( cp->first ) )
+    if LowerSpanBound( c, a0, cp, (r = RTL_ARRAY_UBOUND), outv ) then return true   '' a span: lowerslice.tiko
 
     '' A FIXED ARRAY FOLDS, and nothing was folding it. The comment above said so and
     '' the code returned false instead, so 'ubound( a )' over 'dim a( 0 to 7 )'

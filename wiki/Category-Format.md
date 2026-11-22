@@ -61,7 +61,7 @@ A width or precision can come from a value: `{:{}}` takes the width from the nex
 
 | Value | Types | Default |
 |---|---|---|
-| integers of every width, enums | `d` decimal, `b` `B` binary, `o` octal, `x` `X` hexadecimal, `c` the character with that code | `d` |
+| integers of every width, `int128` and `uint128` included, enums | `d` decimal, `b` `B` binary, `o` octal, `x` `X` hexadecimal, `c` the character with that code | `d` |
 | `single`, `double` | `f` `F` fixed, `e` `E` exponent, `g` `G` general, `a` `A` hexadecimal float | the shortest text that reads back as the same value |
 | `boolean` | `s`, or any integer type for `1` / `0` | `true` / `false` |
 | `ustring`, `string`, `wstring`, literals, `zstring ptr` | `s`, `?` (quoted, with escapes) | `s` |

@@ -14,9 +14,15 @@
 '' '#if sizeof( integer ) = 8' would have taken the wrong branch of every header on
 '' win32 -- silently, because a wrong branch is not an error. WSTRING and ZSTRING were
 '' simply absent, which is what '#if sizeof( wstring ) = 4' failed on.
+''
+'' WSTRING IS THE TARGET'S wchar, 4 off Windows: fbc-modern prints 4 for linux-x86_64,
+'' linux-aarch64 and darwin-aarch64, fbc 1.10.1 native on aarch64 Linux 4 (2026-11-20). So the
+'' line below is WSTRING-2 on win64 and WSTRING-4 on the other targets (their goldens).
 
 #if sizeof( wstring ) = 2
 #print WSTRING-2
+#elseif sizeof( wstring ) = 4
+#print WSTRING-4
 #endif
 
 #if sizeof( zstring ) = 1

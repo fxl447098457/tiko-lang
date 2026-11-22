@@ -5,7 +5,6 @@
 The functions to draw on a graphics screen, read the mouse, build GUI controls for Windows, Linux and macOS, grouped by what you want to do. The **From** column says what a program needs before it can call one:
 
 - **built-in**: nothing; it is always available.
-- `vendor/PsControls/<Name>`: `#import "vendor/PsControls/<Name>"`, then `using <Name>` to call it by its bare name.
 - `vendor/tkControls/<Name>`: `#import "vendor/tkControls/<Name>"`, then `using <Name>` to call it by its bare name.
 - `fbgfx.bi`: `#include "fbgfx.bi"`.
 
@@ -122,8 +121,6 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsApp](PsApp) | Runs a program of controls: start-up, the message loop, forms with callbacks, DPI. | `vendor/PsControls/PsApp` |
-| [PsTheme](PsTheme) | Colours every control from one light or dark theme that can follow Windows. | `vendor/PsControls/PsTheme` |
 | [tkApp](tkApp) | Runs a tkControls program: start-up, the event loop, forms, fonts and the theme. | `vendor/tkControls/tkApp` |
 | [tkTheme](tkTheme) | Keeps the shared light and dark theme every tkControls control takes its colours from. | `vendor/tkControls/tkTheme` |
 | [tkForms](tkForms) | Provides the base a designed form extends: a window, its layout, show and close. | `vendor/tkControls/tkForms` |
@@ -132,10 +129,6 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsTextBox](PsTextBox) | Lets the user type text in a themed frame, on one line or several. | `vendor/PsControls/PsTextBox` |
-| [PsNumericUpDown](PsNumericUpDown) | Lets the user pick a number with minus and plus buttons, or type it. | `vendor/PsControls/PsNumericUpDown` |
-| [PsDatePicker](PsDatePicker) | Lets the user type a date or pick it from a dropdown calendar. | `vendor/PsControls/PsDatePicker` |
-| [PsCalendar](PsCalendar) | Shows one or more month grids inside your window for choosing a day. | `vendor/PsControls/PsCalendar` |
 | [tkTextBox](tkTextBox) | Draws an editable text box, single-line or word-wrapped multiline, with its own editor. | `vendor/tkControls/tkTextBox` |
 | [tkNumericUpDown](tkNumericUpDown) | Draws a numeric spinner: a typed value between minus and plus buttons, kept in range. | `vendor/tkControls/tkNumericUpDown` |
 | [tkDatePicker](tkDatePicker) | Shows an editable date field with a calendar icon that drops down a month calendar. | `vendor/tkControls/tkDatePicker` |
@@ -147,10 +140,6 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsButton](PsButton) | Draws a push button with an optional caption and icons on either side. | `vendor/PsControls/PsButton` |
-| [PsCheckBox](PsCheckBox) | Draws a checkbox, checked or unchecked, with an optional caption. | `vendor/PsControls/PsCheckBox` |
-| [PsOptionButton](PsOptionButton) | Draws a radio button; checking one in a group unchecks the others. | `vendor/PsControls/PsOptionButton` |
-| [PsToggle](PsToggle) | Draws an on and off switch: a pill with a knob at one end. | `vendor/PsControls/PsToggle` |
 | [tkButton](tkButton) | Draws a momentary command button with an optional glyph or image on either side. | `vendor/tkControls/tkButton` |
 | [tkCheckBox](tkCheckBox) | Draws a two-state checkbox with an optional caption on either side of the box. | `vendor/tkControls/tkCheckBox` |
 | [tkOptionButton](tkOptionButton) | Draws a radio button whose group allows at most one checked choice. | `vendor/tkControls/tkOptionButton` |
@@ -160,10 +149,6 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsListTree](PsListTree) | Shows a list, tree or multi-column report of rows you paint, with in-place renaming. | `vendor/PsControls/PsListTree` |
-| [PsComboBox](PsComboBox) | Shows the current choice on a button that drops down a list of the others. | `vendor/PsControls/PsComboBox` |
-| [PsSelectBar](PsSelectBar) | Shows a row of labels with a line under the current one, for switching views. | `vendor/PsControls/PsSelectBar` |
-| [PsTabBar](PsTabBar) | Shows a strip of tabs that can be selected, closed and dragged to a new place. | `vendor/PsControls/PsTabBar` |
 | [tkListTree](tkListTree) | Shows a scrolling list of rows you paint that is also a tree, with columns and editing. | `vendor/tkControls/tkListTree` |
 | [tkComboBox](tkComboBox) | Shows the current choice on a button that drops a scrolling list of the alternatives. | `vendor/tkControls/tkComboBox` |
 | [tkSelectBar](tkSelectBar) | Draws a strip of text panels where exactly one is current, marked by a line beneath it. | `vendor/tkControls/tkSelectBar` |
@@ -173,10 +158,6 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsMenuBar](PsMenuBar) | Shows a menu bar of items such as File and Edit, each with its own dropdown. | `vendor/PsControls/PsMenuBar` |
-| [PsToolbar](PsToolbar) | Shows a strip of command buttons; items that do not fit move into an overflow menu. | `vendor/PsControls/PsToolbar` |
-| [PsIconPanel](PsIconPanel) | Shows a strip of icon buttons and toggles, spaced exactly as you declare. | `vendor/PsControls/PsIconPanel` |
-| [PsStatusBar](PsStatusBar) | Shows panels of text in a strip along the bottom of a window. | `vendor/PsControls/PsStatusBar` |
 | [tkMenuBar](tkMenuBar) | Draws a window's menu bar, whose items drop down tkPopupMenu menus. | `vendor/tkControls/tkMenuBar` |
 | [tkToolbar](tkToolbar) | Draws a toolbar of command, toggle, split and dropdown buttons that overflows to a menu. | `vendor/tkControls/tkToolbar` |
 | [tkIconPanel](tkIconPanel) | Draws a row or column of icon-only buttons, toggles and separators. | `vendor/tkControls/tkIconPanel` |
@@ -186,10 +167,6 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsSplitter](PsSplitter) | Draws a divider between two panes that the user drags, and reports where it went. | `vendor/PsControls/PsSplitter` |
-| [PsScrollPanel](PsScrollPanel) | Scrolls a page of ordinary child controls that is taller than the space for it. | `vendor/PsControls/PsScrollPanel` |
-| [PsVScrollBar](PsVScrollBar) | Draws a vertical scrollbar for content whose scrolling you manage yourself. | `vendor/PsControls/PsVScrollBar` |
-| [PsHScrollBar](PsHScrollBar) | Draws a horizontal scrollbar for content whose scrolling you manage yourself. | `vendor/PsControls/PsHScrollBar` |
 | [tkSplitter](tkSplitter) | Draws a draggable divider bar between two panes and reports where the user drags it. | `vendor/tkControls/tkSplitter` |
 | [tkScrollPanel](tkScrollPanel) | Scrolls a page of ordinary child widgets that is taller than the space it is shown in. | `vendor/tkControls/tkScrollPanel` |
 | [tkVScrollBar](tkVScrollBar) | Draws a vertical scrollbar that you size, feed a range, and listen to. | `vendor/tkControls/tkVScrollBar` |
@@ -203,9 +180,6 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsMessageBox](PsMessageBox) | Shows a themed modal message box with an optional icon and one to three buttons. | `vendor/PsControls/PsMessageBox` |
-| [PsColorPicker](PsColorPicker) | Shows a modal colour picker and returns true with the colour, or false if abandoned. | `vendor/PsControls/PsColorPicker` |
-| [PsTooltip](PsTooltip) | Shows a themed tooltip near the cursor, with an optional title, wrapping and fade. | `vendor/PsControls/PsTooltip` |
 | [tkMessageBox](tkMessageBox) | Shows a themed modal message box and returns the id of the button that closed it. | `vendor/tkControls/tkMessageBox` |
 | [tkColorPicker](tkColorPicker) | Shows a modal colour picker popup and returns the colour and alpha the user chose. | `vendor/tkControls/tkColorPicker` |
 | [tkFileDialog](tkFileDialog) | Shows the system open, save and folder dialogs and returns the chosen paths. | `vendor/tkControls/tkFileDialog` |
@@ -215,9 +189,8 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsProgressBar](PsProgressBar) | Draws a progress bar, flat or gradient, solid or in blocks, or with no known end. | `vendor/PsControls/PsProgressBar` |
-| [PsChart](PsChart) | Draws a line, column, price or pie chart from the series you supply. | `vendor/PsControls/PsChart` |
 | [tkProgressBar](tkProgressBar) | Draws a horizontal or vertical progress bar, determinate or with a running marquee. | `vendor/tkControls/tkProgressBar` |
+| [tkSpinner](tkSpinner) | Shows a small animation while something takes its time. | `vendor/tkControls/tkSpinner` |
 | [tkChart](tkChart) | Draws line, column, HLOC and pie charts from series of labelled values. | `vendor/tkControls/tkChart` |
 | [tkPicture](tkPicture) | Shows an image, scaled or clipped to its area. | `vendor/tkControls/tkPicture` |
 
@@ -225,17 +198,13 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 
 | Function | What it does | From |
 |---|---|---|
-| [PsBufferPaint](PsBufferPaint) | Paints a window offscreen and copies it in one go, so drawing never flickers. | `vendor/PsControls/PsBufferPaint` |
-| [PsImage](PsImage) | Loads an icon, PNG, BMP or JPEG file so a control can show it in an icon slot. | `vendor/PsControls/PsImage` |
-| [PsPopupMenu](PsPopupMenu) | Shows a themed popup menu with checks, accelerator labels and nested submenus. | `vendor/PsControls/PsPopupMenu` |
-| [PsColumnHeader](PsColumnHeader) | Draws a band of resizable column headers above a list or grid. | `vendor/PsControls/PsColumnHeader` |
-| [PsTipHost](PsTipHost) | Switches the controls' tooltips between the system tooltip and PsTooltip. | `vendor/PsControls/PsTipHost` |
-| [PsRegistry](PsRegistry) | Keeps what each control needs from the message loop, the theme and DPI changes. | `vendor/PsControls/PsRegistry` |
 | [tkHost](tkHost) | Runs every tkControls widget: SDL windows, the widget tree, input, timers and fonts. | `vendor/tkControls/tkHost` |
 | [tkPaint](tkPaint) | Paints shapes, text and images for tkControls widgets on SDL_Renderer and SDL_ttf. | `vendor/tkControls/tkPaint` |
 | [tkKeys](tkKeys) | Parses, formats and dispatches keyboard shortcuts for tkControls surfaces. | `vendor/tkControls/tkKeys` |
 | [tkImage](tkImage) | Loads an image file once and draws it in any tkControls window. | `vendor/tkControls/tkImage` |
 | [tkPopupMenu](tkPopupMenu) | Shows a popup menu of commands, separators, check marks and submenus. | `vendor/tkControls/tkPopupMenu` |
+| [tkContextMenu](tkContextMenu) | Opens a menu when a widget is right-clicked. | `vendor/tkControls/tkContextMenu` |
+| [tkTimer](tkTimer) | Calls a procedure every so many milliseconds. | `vendor/tkControls/tkTimer` |
 | [tkColumnHeader](tkColumnHeader) | Draws a band of column headings with draggable dividers and one column taking the rest. | `vendor/tkControls/tkColumnHeader` |
 | [tkScrollBar](tkScrollBar) | Runs the one scrollbar engine behind tkVScrollBar and tkHScrollBar. | `vendor/tkControls/tkScrollBar` |
 | [tkFontList](tkFontList) | Lists the fonts installed on the machine by family, style and file. | `vendor/tkControls/tkFontList` |
@@ -246,7 +215,6 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 - [Screen functions](Category-Screen-Functions)
 - [2D drawing functions](Category-2D-Drawing-Functions)
 - [Graphics input functions](Category-User-Input-Functions-Graphics-Library)
-- [PsControls guide](Category-PsControls)
 - [Vendor packages](Vendor-Packages)
 - [tkControls guide](Category-tkControls)
 

@@ -53,7 +53,7 @@ private function IsInt_( byval b as Tko.BuiltinType ) as boolean
     select case b
     case Tko.TY_BYTE, Tko.TY_UBYTE, Tko.TY_SHORT, Tko.TY_USHORT, _
          Tko.TY_LONG, Tko.TY_ULONG, Tko.TY_INTEGER, Tko.TY_UINTEGER, _
-         Tko.TY_LONGINT, Tko.TY_ULONGINT
+         Tko.TY_LONGINT, Tko.TY_ULONGINT, Tko.TY_INT128, Tko.TY_UINT128
         return true
     end select
     return false
@@ -196,6 +196,7 @@ private function IntResult_ _
     if w = iw then
         return types.Builtin( iif( uns, Tko.TY_UINTEGER, Tko.TY_INTEGER ) )
     end if
+    if w >= 16 then return types.Builtin( iif( uns, Tko.TY_UINT128, Tko.TY_INT128 ) )
     return types.Builtin( iif( uns, Tko.TY_ULONGINT, Tko.TY_LONGINT ) )
 end function
 
@@ -203,8 +204,6 @@ end function
 '' HERE because it reads the operator-class predicates and the integer-promotion
 '' helpers above.
 #include once "symbols/binresult.tiko"
-
-
 
 '' ----------------------------------------------------------- overload resolution
 
@@ -224,15 +223,17 @@ private function Rank_( byval b as Tko.BuiltinType ) as int32
     case Tko.TY_UINTEGER : return 8
     case Tko.TY_LONGINT  : return 9
     case Tko.TY_ULONGINT : return 10
-    case Tko.TY_SINGLE   : return 11
-    case Tko.TY_DOUBLE   : return 12
+    case Tko.TY_INT128   : return 11      '' tiko's: past every fbc integer, below the floats
+    case Tko.TY_UINT128  : return 12
+    case Tko.TY_SINGLE   : return 13
+    case Tko.TY_DOUBLE   : return 14
     end select
     return 0
 end function
 
 private function IsUnsignedInt_( byval b as Tko.BuiltinType ) as boolean
     select case b
-    case Tko.TY_UBYTE, Tko.TY_USHORT, Tko.TY_ULONG, Tko.TY_UINTEGER, Tko.TY_ULONGINT
+    case Tko.TY_UBYTE, Tko.TY_USHORT, Tko.TY_ULONG, Tko.TY_UINTEGER, Tko.TY_ULONGINT, Tko.TY_UINT128
         return true
     end select
     return false
@@ -270,7 +271,6 @@ function FixedStringElem _
     end select
     return Tko.TYPE_NONE
 end function
-
 
 '' WHICH STRING PARAMETER A STRING ARGUMENT PREFERS: 0 is best, 3 worst, and -1 when
 '' either side is not one of the four string builtins.
@@ -531,7 +531,7 @@ declare function TypeOf_ _
 function DecimalLitUnsigned( byref lp as Tko.LiteralPayload ) as boolean
     '' THE LITERAL MODEL's answer (lexer/littype.tiko) for an UNSUFFIXED literal, either target.
     if cast( Tko.NumSuffix, lp.suffix ) <> Tko.NSUF_NONE then return false
-    return Tko.LiteralClassUnsigned( Tko.LiteralClassOf( lp.suffix, lp.radix, lp.intValue, false, true ) )
+    return Tko.LiteralClassUnsigned( Tko.LiteralClassOf( lp.suffix, lp.radix, lp.intValue, false, true, lp.intHi ) )
 end function
 
 '' A literal class as the builtin it is (lexer/littype.tiko).
@@ -542,6 +542,8 @@ function LitClassBuiltin( byref types as Tko.TypeContext, byval lc as int32 ) as
     case Tko.LC_ULONG    : return types.Builtin( Tko.TY_ULONG )
     case Tko.LC_LONGINT  : return types.Builtin( Tko.TY_LONGINT )
     case Tko.LC_ULONGINT : return types.Builtin( Tko.TY_ULONGINT )
+    case Tko.LC_INT128   : return types.Builtin( Tko.TY_INT128 )
+    case Tko.LC_UINT128  : return types.Builtin( Tko.TY_UINT128 )
     case Tko.LC_SINGLE   : return types.Builtin( Tko.TY_SINGLE )
     case Tko.LC_DOUBLE   : return types.Builtin( Tko.TY_DOUBLE )
     end select
@@ -558,7 +560,7 @@ private function LiteralType_ _
         '' THE LITERAL MODEL (lexer/littype.tiko) -- suffix first, then by magnitude and radix, as
         '' fbc's lexer types it. Typed INTEGER always, 's < 3000000000' over 'dim s as integer =
         '' -1' was TRUE and '3000000000 \ -2' negative, where fbc reads the literal unsigned.
-        return LitClassBuiltin( *c.types, Tko.LiteralClassOf( lp->suffix, lp->radix, lp->intValue, false, c.types->target.pointerBits = 64 ) )
+        return LitClassBuiltin( *c.types, Tko.LiteralClassOf( lp->suffix, lp->radix, lp->intValue, false, c.types->target.pointerBits = 64, lp->intHi ) )
     case Tko.N_FLOAT_LIT
         '' THE SUFFIX TYPES IT, exactly as it does for an integer literal one arm
         '' above. '1.0f' and '1.0!' are SINGLE and were read as DOUBLE, so an
@@ -854,7 +856,7 @@ private function TypeOfUncached_ _
                 dim as Tko.BuiltinType ib = _
                     c.types->BuiltinOf( c.types->Unqualify( inner ) )
                 if ib = Tko.TY_WSTRING then
-                    inner = c.types->Builtin( Tko.TY_USHORT )
+                    inner = c.types->Builtin( iif( c.types->target.wcharBytes = 4, Tko.TY_ULONG, Tko.TY_USHORT ) )
                 else
                     inner = c.types->Builtin( Tko.TY_UBYTE )
                 end if
@@ -881,6 +883,7 @@ private function TypeOfUncached_ _
                         select case c.types->BuiltinOf( t )
                         case Tko.TY_UINTEGER : t = c.types->Builtin( Tko.TY_INTEGER )
                         case Tko.TY_ULONGINT : t = c.types->Builtin( Tko.TY_LONGINT )
+                        case Tko.TY_UINT128  : t = c.types->Builtin( Tko.TY_INT128 )
                         end select
                     end if
                 end if
@@ -1155,8 +1158,8 @@ private function TypeOfUncached_ _
         '' this is. An array subscript yields the ELEMENT type; without this the whole
         '' expression is untyped and every use of a(i) falls back to nothing.
         dim as Tko.TypeId ct = TypeOf_( c, cp->target )
-        if (ct <> Tko.TYPE_NONE) andalso (c.types->Kind( ct ) = Tko.TK_ARRAY) then
-            t = c.types->Inner( ct )
+        if (ct <> Tko.TYPE_NONE) andalso ((c.types->Kind( ct ) = Tko.TK_ARRAY) orelse Tko.Slices.IsSpanIndexCallee( *c.ast, *c.syms, *c.types, *c.info, cp->target )) then
+            t = iif( c.types->Kind( ct ) = Tko.TK_ARRAY, c.types->Inner( ct ), Tko.Slices.SpanElemType( *c.types, ct ) )   '' 'v(i)' over a span: checkspan.tiko
         else
             '' A conversion intrinsic is a KEYWORD, so nothing was ever bound and the
             '' callee lookup below finds nothing. Its result is a measured table.
@@ -1313,21 +1316,21 @@ private function TypeOfUncached_ _
                     '' TK_BUILTIN, so the var-len test (TY_STRING/TY_USTRING only) and
                     '' the array test both missed it and '(*pz)[0]' was UNTYPED. A
                     '' SELECT CASE over it then had nothing to switch on and declined.
-                    '' Measured, fbc: '(*pz)[0]' is UBYTE and '(*pw)[0]' is USHORT,
-                    '' and it writes '*(uint8*)PZ$0' / '*(uint16*)PW$0'.
+                    '' Measured, fbc: '(*pz)[0]' is UBYTE and '(*pw)[0]' the target's wchar,
+                    '' USHORT on win64 and ULONG on linux-x86_64 ('*(uint32*)PW$0').
                     dim as Tko.BuiltinType wb = _
                         c.types->BuiltinOf( c.types->Unqualify( pt ) )
                     if wb = Tko.TY_WSTRING then
-                        t = c.types->Builtin( Tko.TY_USHORT )
+                        t = c.types->Builtin( iif( c.types->target.wcharBytes = 4, Tko.TY_ULONG, Tko.TY_USHORT ) )
                     else
                         t = c.types->Builtin( Tko.TY_UBYTE )
                     end if
                 elseif c.types->Kind( pt ) = Tko.TK_ARRAY then
                     '' A FIXED-LENGTH STRING SUBSCRIPTED IS ITS CHARACTER, and an
-                    '' UNSIGNED one: fbc writes '(int32)*(uint16*)(...)' for a wstring
-                    '' and '(int32)*(uint8*)(...)' for a zstring. Signedness is the
-                    '' point -- a sign extension would turn a wide character above
-                    '' 0x7FFF negative.
+                    '' UNSIGNED one: fbc writes '(int32)*(uint8*)(...)' for a zstring and
+                    '' the target's wchar for a wstring -- ULONG where it is 4 bytes, so
+                    '' 'q[0] = 34' is '*(uint32*)Q$1 = 34u' on linux-x86_64 and stored 16
+                    '' bits of 32 here. A ustring * N is UTF-16 everywhere.
                     dim as Tko.TypeId el = c.types->Inner( pt )
                     if el <> Tko.TYPE_NONE then
                         if c.types->Kind( el ) = Tko.TK_BUILTIN then
@@ -1342,8 +1345,8 @@ private function TypeOfUncached_ _
                             '' fb_PrintUByte.
                             case Tko.TY_ZSTRING, Tko.TY_FIXSTR
                                 t = c.types->Builtin( Tko.TY_UBYTE )
-                            case Tko.TY_WSTRING, Tko.TY_FIXUSTR
-                                t = c.types->Builtin( Tko.TY_USHORT )
+                            case Tko.TY_WSTRING : t = c.types->Builtin( iif( c.types->target.wcharBytes = 4, Tko.TY_ULONG, Tko.TY_USHORT ) )
+                            case Tko.TY_FIXUSTR : t = c.types->Builtin( Tko.TY_USHORT )
                             case else           : t = el
                             end select
                         else
@@ -1463,7 +1466,6 @@ end function
 '' the same namespace. Nothing moved changed in the move.
 #include once "symbols/checkinfer.tiko"
 
-
 #include once "symbols/checkeach.tiko"
 
 #include once "symbols/checkwalk.tiko"
@@ -1494,7 +1496,5 @@ function Run( byref u as Tko.FrontUnit, byref st as Stats ) as int32
     InferUnusedVarTypes_( c )
     return st.badOperands
 end function
-
-#include once "symbols/checkdump.tiko"
 
 end namespace

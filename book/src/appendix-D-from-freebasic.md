@@ -80,7 +80,7 @@ parameters, usable in module-level code only), an empty `__FB_BUILD_SHA1__`, eve
 | Define | fbc | tiko |
 |---|---|---|
 | `__TIKO_COMPILER__` | not defined | `1`: how a source tree asks "is this tiko?" |
-| `__TIKO_VERSION__` | not defined | `"0.1.4"` |
+| `__TIKO_VERSION__` | not defined | `"0.1.6"` |
 | `__FB_SIGNATURE__` | `"FreeBASIC 1.20.0"` | `"tiko-lang"` |
 | `__FB_BACKEND__` | `"gcc"` | `"llvm"` |
 | `__FB_GCC__` | `-1` | `0` |
@@ -163,9 +163,10 @@ The usual mistakes, side by side:
   declaration of one replaces tiko's.
 - **Graphics is Windows-only.** The Linux and macOS toolchains ship no graphics library, so a
   program that uses `screen` builds on Windows only.
-- **tiko targets x86-64 on Windows and Linux, and arm64 on macOS** (`macos-arm64`, Apple
-  Silicon). There it defines `__FB_DARWIN__`, `__FB_UNIX__` and `__FB_ARM__`, and not
-  `__FB_X86__`. `-m32` is `TKO0104`.
+- **tiko targets x86-64 on Windows and Linux, and arm64 on Linux and macOS** (`linux-arm64`,
+  and `macos-arm64` for Apple Silicon). Both arm64 targets define `__FB_ARM__` and not
+  `__FB_X86__`: `linux-arm64` with `__FB_LINUX__` and `__FB_UNIX__`, `macos-arm64` with
+  `__FB_DARWIN__` and `__FB_UNIX__`. `-m32` is `TKO0104`.
 
 ## What fbc 1.20 does not have
 

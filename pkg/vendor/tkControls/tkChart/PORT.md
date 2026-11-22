@@ -54,7 +54,8 @@ setters; every recycled series or point slot reset in full; the probes (`CountRe
 **Added:** `GetBandCount`, `GetUpdateDepth`, `GetValueStep`, `GetFont`, `GetSliceInfo` (start,
 sweep, label out / dropped), `GetPointAnchor`, the rect queries `GetLegendRect`, `GetTitleRect`,
 `GetSubtitleRect`, `GetAxisYRect`, `GetAxisXRect`, `GetPieRect`, `GetTooltipHandle`,
-`SetHoverTime`.
+`SetHoverTime`; `PaintDefault( p )`, the built-in chart over the filled background, for a paint
+callback (the form designer's Paint event).
 
 **Dropped (Win32-only):** the hot-poll timer and `TrackMouseEvent` (the host guarantees the leave),
 `WM_SETFONT` / `WM_GETFONT`, `WM_GETDLGCODE`, `TTN_GETDISPINFOW` and the comctl32 tooltip backend,

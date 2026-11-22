@@ -288,9 +288,18 @@ end function
 '' a single-letter code is never a substitution candidate, so 'sub S6( a as integer,
 '' b as integer )' ends 'Eu7INTEGERS0_' on win64 and plainly 'Ell' on win32. It falls
 '' out of IsSubstitutable rather than needing a rule.
+'' WHICH OF THE THREE cva_list MANGLINGS a target has (BuiltinCode's comment): a pointer
+'' (Windows, Darwin), SysV's one-element array of __va_list_tag (x86-64 Linux), or AAPCS64's
+'' std::__va_list struct (arm64 Linux).
+private function CvaListCode_( byref tl as Tko.TargetLayout ) as string
+    if tl.cvaListIsPointer then return "Pc"
+    if tl.arch = Tko.ARCH_ARM64 then return "St9__va_list"
+    return "A1_13__va_list_tag"
+end function
+
 private function BuiltinCode _
     ( byval b as Tko.BuiltinType, byval is32 as boolean, _
-      byval cvaPtr as boolean = true ) as string
+      byval cvaCode as string = "Pc" ) as string
 
     '' 'cva_list' IS NOT ONE TYPE ACROSS TARGETS, and the mangling is where that shows.
     '' Measured, 'namespace N: sub P( byref a as cva_list )':
@@ -304,10 +313,15 @@ private function BuiltinCode _
     '' neither is guessable from the width, which is why both are written out. Which one
     '' a target has is TargetLayout.cvaListIsPointer: Darwin's arm64 va_list is 'char *'
     '' too, so it mangles as Windows does (clang: '_Z1fRPc' for 'void f(va_list&)').
-    if b = Tko.TY_CVA_LIST then
-        if cvaPtr then return "Pc"
-        return "A1_13__va_list_tag"
-    end if
+    ''
+    '' A THIRD ONE ON linux-arm64: AAPCS64's va_list is a struct, std::__va_list --
+    ''
+    ''     linux-arm64  _ZN1N1PERSt9__va_list  -- reference to std::__va_list
+    ''
+    '' measured from fbc 1.10.1 built natively for linux-aarch64, and from clang++ 23 for
+    '' 'void N::P(va_list&)', in the Lima VM (docs/tiko-linux-arm64 probes/l1-fbc). The
+    '' caller picks which, from the layout (CvaListCode_).
+    if b = Tko.TY_CVA_LIST then return cvaCode
 
     if is32 then
         select case b
@@ -326,6 +340,9 @@ private function BuiltinCode _
     case Tko.TY_UINTEGER : return "u8UINTEGER"
     case Tko.TY_LONGINT  : return "x"
     case Tko.TY_ULONGINT : return "y"
+    '' Itanium's __int128 / unsigned __int128, as g++ and clang++ spell them.
+    case Tko.TY_INT128   : return "n"
+    case Tko.TY_UINT128  : return "o"
     case Tko.TY_SINGLE   : return "f"
     case Tko.TY_DOUBLE   : return "d"
     case Tko.TY_BOOLEAN  : return "b"
@@ -462,12 +479,83 @@ private function EmitPrefix _
     return body
 end function
 
+'' SysV x86-64's va_list, '__va_list_tag[1]', and what C adjusts a parameter of that
+'' array type to: a pointer to its element. TypeCode and ParamCode_.
+const CVA_ARRAY_CODE as string = "A1_13__va_list_tag"
+const CVA_DECAYED_CODE as string = "P13__va_list_tag"
+
+'' A BYVAL PARAMETER'S TYPE in a mangled name -- a procedure's own or one inside a
+'' procedure type. The same as TypeCode except for a cva_list that decays (TargetLayout.
+'' cvaListIsArray), which is written as C's adjusted type, a pointer, and -- like the
+'' array -- NEVER SUBSTITUTED, BUT COUNTED, as ONE candidate. Measured from fbc-modern
+'' (-target linux-x86_64 -gen gcc -r), 2026-11-19 -- tests/codegen/cva-list-mangle-*x86_64.test:
+''
+''     sub R( byval a as cva_list, byval b as cva_list )
+''                                       _ZN1N1REP13__va_list_tagP13__va_list_tag
+''     sub U( byval, byval, byref, byref )
+''                     _ZN1N1UEP13__va_list_tagP13__va_list_tagRA1_13__va_list_tagS3_
+''     sub F1( byval f as sub( byval as cva_list ), byval a as cva_list )
+''                                       _ZN1N2F1EPFvP13__va_list_tagEP13__va_list_tag
+''
+'' U's last is S3_: N, the two byval ones, c's array, c's R. tiko wrote the array for a
+'' byval one and substituted it: R was 'A1_13__va_list_tagS0_'.
+private function ParamCode_ _
+    ( byval t as Tko.TypeId, byref types as Tko.TypeContext, _
+      byref syms as Tko.SymbolTable, byref names as Tko.Interner, _
+      byref subs as Substitutions ) as string
+
+    if types.CvaListDecays( t ) then
+        subs.AddRaw( CVA_DECAYED_CODE )
+        return CVA_DECAYED_CODE
+    end if
+    return TypeCode( t, types, syms, names, subs )
+end function
+
 function TypeCode _
     ( byval t as Tko.TypeId, byref types as Tko.TypeContext, _
       byref syms as Tko.SymbolTable, byref names as Tko.Interner, _
       byref subs as Substitutions ) as string
 
     if t = Tko.TYPE_NONE then return "v"
+
+    '' linux-arm64's cva_list IS NEVER SUBSTITUTED, BUT ALWAYS COUNTED. Measured from fbc
+    '' (fbc-modern -target linux-aarch64 -r, and fbc 1.10.1 native in the Lima VM), 2026-11-19:
+    ''
+    ''     sub R( byval a as cva_list, byval b as cva_list )    _ZN1N1RESt9__va_listSt9__va_list
+    ''     sub Q( byref a as cva_list, byref b as cva_list )    _ZN1N1QERSt9__va_listS1_
+    ''     sub U( byval, byval, byref, byref )  _ZN1N1UESt9__va_listSt9__va_listRSt9__va_listS3_
+    ''
+    '' -- the type itself is written out every time, never as S<n>_, yet each occurrence is a
+    '' candidate (U's last is S3_: N, a, b, c's St9__va_list, c's R). A reference or pointer to
+    '' it is an ordinary candidate (Q's S1_). clang++ substitutes the byval pair (S0_); fbc is the
+    '' ground truth. linux-x86_64's fbc has the same rule over its own spelling: the block below.
+    if types.Kind( t ) = Tko.TK_BUILTIN then
+        if types.BuiltinOf( t ) = Tko.TY_CVA_LIST then
+            dim as string cvc = CvaListCode_( types.target )
+            if cvc = "St9__va_list" then
+                subs.AddRaw( cvc, t )
+                return cvc
+            end if
+        end if
+    end if
+
+    '' linux-x86_64's cva_list IS NEVER SUBSTITUTED, BUT ALWAYS COUNTED. Measured from
+    '' fbc-modern (-target linux-x86_64 -gen gcc -r), 2026-11-19:
+    ''
+    ''     sub Q( byref a as cva_list, byref b as cva_list )  _ZN1N1QERA1_13__va_list_tagS1_
+    ''     sub X( byref a as cva_list, byval p as cva_list ptr )
+    ''                                         _ZN1N1XERA1_13__va_list_tagPA1_13__va_list_tag
+    ''     sub W( byval a as cva_list ptr, byval b as cva_list ptr )
+    ''                                         _ZN1N1WEPA1_13__va_list_tagS1_
+    ''
+    '' -- the array is written out at every occurrence, never as S<n>_, yet each one is a
+    '' candidate (Q's S1_ is the R over it: N, then A1_..., then R); a reference or
+    '' pointer to it is an ordinary candidate (Q's S1_, W's S1_). tiko substituted it, so
+    '' X came out 'PS0_'. A BYVAL one is C's adjusted type -- see ParamCode_.
+    if types.CvaListDecays( t ) andalso (types.IsConst( t ) = false) then
+        subs.AddRaw( CVA_ARRAY_CODE )
+        return CVA_ARRAY_CODE
+    end if
 
     '' Look the TYPE up before encoding it. Doing it afterwards compares an encoding
     '' whose inner components have already been substituted, which never matches.
@@ -587,7 +675,7 @@ function TypeCode _
         else
             for i as int32 = 0 to n - 1
                 dim as Tko.TypeId pt = cast( Tko.TypeId, types.pool[ti->first + i] )
-                body += TypeCode( pt, types, syms, names, subs )
+                body += ParamCode_( pt, types, syms, names, subs )
             next
         end if
         '' ...AND THE ELLIPSIS, which is 'z' and comes last. Measured: fbc writes
@@ -601,7 +689,7 @@ function TypeCode _
 
     case Tko.TK_BUILTIN
         enc = BuiltinCode( types.BuiltinOf( t ), (types.target.pointerBits = 32), _
-                           types.target.cvaListIsPointer )
+                           CvaListCode_( types.target ) )
 
     case else
         enc = "v"
@@ -1274,7 +1362,7 @@ private function ProcNameCore _
             '' overloads. Only the TOP level is stripped: a pointee's const stays.
             pt = types.Unqualify( pt )
         end if
-        outp += TypeCode( pt, types, syms, names, subs )
+        outp += ParamCode_( pt, types, syms, names, subs )
         emitted += 1
     next
     if emitted = 0 then outp += "v"

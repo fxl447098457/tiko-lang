@@ -4,6 +4,8 @@
 
 The libary named GfxLib is the built-in graphics library included in FreeBASIC. As well as re-creating every QuickBASIC graphics command, GfxLib has built-in commands to handle input from the keyboard and mouse. Major contributors of the library are Lillo, coderJeff and DrV.
 
+> **In tiko.** tiko's graphics library, libtkogfx, is a drop-in for GfxLib and ships for Windows, Linux and macOS. Its drivers are **GDI** on Windows, **X11** on Linux (libX11 loaded at run time) and **Cocoa** on macOS, plus **`Null`** everywhere. The DirectX, Direct2D, OpenGL and FBDev drivers listed below are not provided. See [Compatibility](Compatibility).
+
  The library supports various drivers depending on the platform:
 
 - All:

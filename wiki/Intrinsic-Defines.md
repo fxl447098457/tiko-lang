@@ -270,6 +270,10 @@ Defined as the name of the procedure where it's used.
 
 Defined as an integer literal of the line of the module where it's used.
 
+**[\_\_CALLER_LINE\_\_ and \_\_CALLER_FILE\_\_](Caller-Line)**
+
+tiko's own. As a parameter's default, the line and file of the statement that calls the procedure.
+
 **[\_\_FB_OPTION_BYVAL\_\_](Fb-Option-Byval)**
 
 True (`-1`) if parameters are declared by value by default, zero (`0`) otherwise.

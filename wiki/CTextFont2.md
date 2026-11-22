@@ -239,10 +239,7 @@ formatting. The copy is not attached to any text: change it freely, compare it w
 in a `CTextFont2` or release it.
 
 `SetDuplicate` (and assigning `Duplicate`) copies the formatting of `pFont` into this object;
-attributes that are `tomUndefined` in `pFont` are left as they are. These members call the
-`ITextFont2` methods `GetDuplicate2` and `SetDuplicate2`. On the rich edit control of current
-Windows versions `SetDuplicate2` returns `E_NOTIMPL` (`&h80004001`) and nothing changes; the
-`ITextFont` method `SetDuplicate`, reached through `m_pTextFont2`, applies the copy.
+attributes that are `tomUndefined` in `pFont` are left as they are.
 
 | Parameter | Meaning |
 | --- | --- |

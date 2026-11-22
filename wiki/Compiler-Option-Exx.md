@@ -26,6 +26,7 @@ See also
 - [Compiler Option: -elocation](Compiler-Option-Elocation)
 - [Compiler Option: -enullptr](Compiler-Option-Enullptr)
 - [Compiler Option: -ex](Compiler-Option-Ex)
+- [Compiler Option: -fsanitize](Compiler-Option-Fsanitize)
 - [Error Handling](Error-Handling)
 - [Using the Command Line](Quick-Start#compile-a-program)
 

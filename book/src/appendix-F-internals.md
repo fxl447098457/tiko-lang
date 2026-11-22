@@ -58,8 +58,8 @@ so that what comes out is plain code over plain values. A verifier checks every 
 it goes on. This is the biggest directory in the compiler.
 
 **The ABI pass** (`src/codegen`). Rewrites each signature and call for the target's calling
-convention — the Microsoft x64 convention on Windows, System V on Linux, Apple's AAPCS64 on
-macOS — so the IR that follows
+convention — the Microsoft x64 convention on Windows, System V on x86-64 Linux, the generic
+AAPCS64 on arm64 Linux, Apple's AAPCS64 on macOS — so the IR that follows
 has no implicit ABI behaviour: which structures travel in registers, which by hidden pointer, how
 a function returns one. `--dump-ir` shows MIR after this pass, so what will really be passed is
 visible without reading LLVM.

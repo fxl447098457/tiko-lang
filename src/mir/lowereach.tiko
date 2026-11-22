@@ -794,6 +794,45 @@ private function LowerForEachSlice_ _
     return EachEmit_( c, sp, vaddr, sq )
 end function
 
+'' FOR EACH over an ARRAY SLICE (docs/tiko-slices RFC-0003 §5): its elements, from its own data
+'' pointer and length, read once before the loop -- the fixed-array loop over a base that is
+'' the span's, 'byref' binding each element in place.
+private function LowerForEachSpan_ _
+    ( byref c as Ctx, byval sp as Tko.StmtPayload ptr, byval seqE as Tko.NodeId, _
+      byval at as Tko.TypeId ) as boolean
+
+    dim as EachSeq sq
+    sq.elT = Tko.Slices.SpanElemType( *c.types, at )
+    sq.emt = cast( int32, LowerType( sq.elT, *c.types ) )
+    sq.elIsStr = IsStringType( c, sq.elT )
+    sq.elIsU = IsUStringType( c, sq.elT )
+    sq.elIsAgg = (sq.elIsStr = false) andalso (sq.emt = cast( int32, MT_AGG )) andalso _
+                 (c.types->Kind( c.types->Unqualify( sq.elT ) ) = Tko.TK_UDT)
+    if (sq.elIsStr = false) andalso (sq.elIsAgg = false) then
+        if (sq.emt = cast( int32, MT_VOID )) orelse (sq.emt = cast( int32, MT_AGG )) then return false
+    end if
+    sq.esz = SizeOfType( c, sq.elT )
+    if sq.esz <= 0 then return false
+    dim as MirValue vaddr
+    if EachVarAddr_( c, sp, sq.elT, vaddr ) = false then return false
+
+    dim as MirValue sa = SliceStorage( c, seqE )
+    if sa.kind = cast( uint8, MV_NONE ) then return false
+    EmitSpanChecks( c, seqE, sa, sq.esz )   '' -earray: the anchor, once before the loop
+    dim as MirType offTy = MT_I64
+    if c.types->target.pointerBits = 32 then offTy = MT_I32
+    dim as MirInst fa
+    fa.op = cast( uint16, M_FIELD_ADDR ) : fa.ty = cast( uint8, MT_PTR ) : fa.a = sa
+    fa.imm = 0
+    sq.base_ = LowerExprLoad( c, Emit( c, fa ), MT_PTR )
+    fa.imm = c.types->target.pointerBits \ 8
+    sq.limitV = LowerExprLoad( c, Emit( c, fa ), offTy )
+    if (sq.base_.kind = cast( uint8, MV_NONE )) orelse (sq.limitV.kind = cast( uint8, MV_NONE )) then return false
+    sq.startV = ConstInt( c, 0, offTy )
+    sq.cmpOp = cast( int32, M_ICMP_SLT )
+    return EachEmit_( c, sp, vaddr, sq )
+end function
+
 '' FOR EACH over an ARRAY.
 ''
 '' An ordinary counted loop over the array's own bounds. A NONZERO lbound keeps the
@@ -823,6 +862,7 @@ function LowerForEachArray _
     '' A USER COLLECTION, not an array: the RFC-0002 iterator protocol. Tried first
     '' because a UDT can never be the array form, so there is nothing to fall back to.
     if SliceUnitBytes( c, at ) > 0 then return LowerForEachSlice_( c, sp, seqE, at )   '' a string slice
+    if Tko.Slices.IsSpanType( *c.types, at ) then return LowerForEachSpan_( c, sp, seqE, at )   '' an array slice
     if c.types->Kind( at ) = Tko.TK_UDT then
         return LowerForEachIter( c, id, sp, seqE, at )
     end if

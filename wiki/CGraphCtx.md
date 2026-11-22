@@ -333,20 +333,15 @@ print ds.dsBm.bmWidth; " x"; ds.dsBm.bmHeight; ","; ds.dsBm.bmBitsPixel; " bits 
 function GetBits() as any ptr
 ```
 
-Returns the pointer the class keeps for the buffer's pixels. The class never asks Windows for
-it, so the value is `NULL`. To reach the pixels, read `dsBm.bmBits` from the `DIBSECTION` of
-[GethBmp](#gethbmp): rows run from the bottom of the picture up, 4 bytes per pixel (blue, green,
-red, unused) at 32 bits per pixel.
+Returns the pointer the class keeps for the buffer's pixels.
 
-**Returns** `NULL`.
+**Returns** A pointer to the location of the DIB bit values.
 
 **Example**
 
 ```freebasic
 dim pGraphCtx as CGraphCtx ptr = CGraphCtxPtr( hCtrl )
-dim ds as DIBSECTION
-GetObjectW( pGraphCtx->GethBmp(), sizeof( ds ), @ds )
-dim pPixels as ulong ptr = iif( pGraphCtx->GetBits(), pGraphCtx->GetBits(), ds.dsBm.bmBits )
+dim pBits as any ptr = pGraphCtx.GetBits
 ```
 
 ### GethRC
@@ -535,16 +530,13 @@ pGraphCtx->LoadImageFromRes( GetModuleHandleW( NULL ), "#101", 0, false, ARGB_WH
 ### DrawBitmap
 
 ```freebasic
-function DrawBitmap( byval hbmp as HBITMAP, byval x as single = 0, byval y as single = 0, byval nRight as single = 0, byval nBottom as single = 0 ) as GpStatus
-function DrawBitmap( byval pBitmap as GpBitmap ptr, byval x as single = 0, byval y as single = 0, byval nRight as single = 0, byval nBottom as single = 0 ) as GpStatus
-function DrawBitmap( byref pMemBmp as CMemBmp, byval x as single = 0, byval y as single = 0, byval nRight as single = 0, byval nBottom as single = 0 ) as GpStatus
+function DrawBitmap( byval hbmp as HBITMAP, byval x as single = 0, byval y as single = 0 ) as GpStatus
+function DrawBitmap( byval pBitmap as GpBitmap ptr, byval x as single = 0, byval y as single = 0, ) as GpStatus
+function DrawBitmap( byref pMemBmp as CMemBmp, byval x as single = 0, byval y as single = 0 ) as GpStatus
 ```
 
 Draws a GDI bitmap, a GDI+ bitmap or a [CMemBmp](CMemBmp) onto the buffer with GDI+, its
-top-left corner at (`x`, `y`). Despite their names, `nRight` and `nBottom` are the **width and
-height** of the drawn image: when both are nonzero the image is stretched to that size,
-otherwise it is drawn at its own size. The buffer keeps its size and the control is not
-repainted.
+top-left corner at (`x`, `y`).
 
 GDI+ must be running: call `gdiplus.Init()` first, or keep a GDI+ object alive. The bitmap you
 pass stays yours.
@@ -782,5 +774,4 @@ Microsoft Learn: [GetWindowLongPtrW](https://learn.microsoft.com/en-us/windows/w
 - [CGpGraphics](CGpGraphics) for drawing on the memory device context with GDI+
 - [Direct2D render targets](SysWin-Direct2D-Render-Targets) for drawing on it with a Direct2D DC render target
 - [GDI+ images](SysWin-GdiPlus-Images) for `BitmapFromFile` and the image helpers the loaders use
-- [CPrint](CPrint) for printing with a printer of your choice
 - [sys/win/gui](SysWin-Gui)

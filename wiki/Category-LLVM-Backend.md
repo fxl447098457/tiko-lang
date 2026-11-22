@@ -14,7 +14,7 @@ The IR comes from tiko's own pipeline:
 
 1. the frontend builds a typed AST;
 2. lowering turns it into **MIR**, a typed IR over basic blocks with its own verifier;
-3. an **ABI pass** rewrites procedure signatures and calls for the target's C calling convention, one classifier each for Win64, SysV AMD64 and Apple's AAPCS64;
+3. an **ABI pass** rewrites procedure signatures and calls for the target's C calling convention, one classifier each for Win64, SysV AMD64, Linux's generic AAPCS64 and Apple's AAPCS64;
 4. the emitter writes the LLVM IR.
 
 `--emit-ir` writes that IR and stops: to standard output, or with `-o x.ll` to that file. `--emit-asm` runs `clang -S` on it and stops, writing `x.s`, or `<source>.s` with no `-o`. With several modules and one `-o`, each is `<name>.<n>.ll` (or `.s`). `-v` echoes every clang invocation, and `--keep-temps` keeps the `.ll` files.
@@ -24,7 +24,8 @@ Each target has its own triple:
 | Target | clang triple |
 | --- | --- |
 | `windows-x86_64` (default on Windows) | `x86_64-pc-windows-msvc` |
-| `linux-x86_64` (default on Linux) | `x86_64-pc-linux-gnu` |
+| `linux-x86_64` (default on x86-64 Linux) | `x86_64-pc-linux-gnu` |
+| `linux-arm64` (default on arm64 Linux) | `aarch64-unknown-linux-gnu` |
 | `macos-arm64` (default on macOS) | `arm64-apple-macosx13.0` |
 
 ## What you need: clang
@@ -56,7 +57,7 @@ An `ASM` block is raw assembler text with direct symbol references. LLVM wants c
 
 ## How it is verified
 
-- **Self-hosting.** tiko compiles itself to a byte-identical fixpoint on windows-x86_64 and linux-x86_64, at `-O0` and `-O2`, and on macos-arm64 at `-O0` (`build/bootstrap.sh`).
+- **Self-hosting.** tiko compiles itself to a byte-identical fixpoint on windows-x86_64 and linux-x86_64, at `-O0` and `-O2`, on linux-arm64 at `-O2`, and on macos-arm64 at `-O0` (`build/bootstrap.sh`).
 - **Codegen coverage.** `build/icescan.sh` compiles all 2,709 corpus files to objects and reports anything the emitter or clang refuses: 21 failures in 12 files at the last run.
 
 ---

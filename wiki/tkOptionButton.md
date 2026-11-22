@@ -54,32 +54,135 @@ tkOptionButton_SetChecked( opt(1), true )        ' silent: no callback
 print tkOptionButton_FindCheckedID( tkHost_Root( host ), GRP_QUALITY )
 ```
 
-## Coming from PsOptionButton
+## Groups
 
-[PsOptionButton](PsOptionButton) is the Win32 twin; its page remains the behaviour reference for
-everything not listed here.
+- A group is the pair (parent widget, group id); for top-level buttons the parent is
+  `tkHost_Root( host )`. Two groups on one parent never interfere, and buttons with different
+  parents are never in one group. The id defaults to 0, so a parent with a single group needs no
+  ids. `tkOptionButton_SetGroupID` moves a button later.
+- A group starts with nothing checked, and `tkOptionButton_FindCheckedID` returns -1 for it
+  (unanswered, not failed). The user can never get back there: clicking the checked member does
+  nothing and no gesture unchecks. Only `SetChecked( h, false )` or `ClearGroup` empties a group.
+- `SetChecked`, `SetGroupID` and `ClearGroup` are silent. `SetChecked` works on a disabled
+  button, so saved settings can be restored onto a greyed-out form.
+- A checked button moved by `SetGroupID` into a group that already has a checked member arrives
+  unchecked; the group it left is left with nothing checked. Destroying the checked member also
+  leaves its group with nothing checked: the check is not handed on.
+- `GetGroupMember` counts in creation order. `SetID` changes the id `FindCheckedID` reports (the
+  `ctrlId` given to `Create` until then); `SetItemData` stores a value the control never reads.
+  Group calls given a widget that is not an option button answer 0 or false.
 
-- Names: `PsOptionButton_*` → `tkOptionButton_*`, `PSOPTIONBUTTON_*` → `TKOPTIONBUTTON_*`.
-  `OPT_BOXALIGN_*`, `OPT_TEXTALIGN_*`, `OPT_MOOD_*`, `OPT_PART_*` and the `OPT_*Callback*` types
-  keep their names. The handle is `TK_WIDGET ptr`.
-- `tkOptionButton_Create( hParent, ctrlId, nGroupID = 0 )` takes a `TK_WIDGET ptr` parent; for
-  top-level buttons pass `tkHost_Root( host )`. The group is (parent, group id) as before.
-- The group's Tab stop is the one focusable member. While focus is inside the group, the focused
-  member holds the stop, so Tab always leaves the group. A disabled checked member hands the stop
-  to an enabled one. `tkOptionButton_GetTabStop` says which member holds it.
-- Ring and focus-ring thicknesses are drawn as given, not scaled.
-- Out-of-range `SetBoxAlign` / `SetTextAlign` values are ignored; negative padding and box gap
-  clamp to 0.
-- Fonts are `TTF_Font ptr`, borrowed. There is no glyph font: `tkOptionButton_ApplyFonts`
-  ignores its glyph argument.
-- Colours start from the current [tkTheme](tkTheme) palette.
-- `TKOPTIONBUTTON_MESSAGEINFO` carries `msg` (a `TKM_*` code), `x`, `y` and `key` instead of
-  `uMsg` / `wParam` / `lParam`.
-- The tooltip is a [tkTooltip](tkTooltip); `tkOptionButton_GetTooltipHandle` returns it. There
-  is no tooltip mode and no comctl32 tooltip.
-- Scale changes reach the control as `TKM_SCALECHANGED`; there is no `Rescale` call.
-- No equivalent: window text (`WM_SETTEXT` / `WM_GETTEXT`), PsRegistry, the self-test.
-- Added: `tkOptionButton_GetTabStop`, `GetHot`, `GetPressed` and `GetTextSize`.
+Exactly one member of a group is focusable, which makes the group one Tab stop: the checked member
+if it is enabled, else the first enabled member, else the first. While focus is on a member, that
+member holds the stop, so Tab leaves the group from wherever focus sits. The stop moves by itself
+when the check moves, a member is enabled, disabled, regrouped or destroyed; do not set
+focusability on these widgets yourself. `tkOptionButton_GetTabStop` says whether a member holds
+it.
+
+## Layout
+
+A new button is 0 x 0. Size it from `tkOptionButton_GetIdealSize`, which is valid before the
+button has ever been sized, or turn on `tkOptionButton_SetAutoSize`, which resizes it to its ideal
+size, keeping its top-left, after any change that could alter it. The rects are derived from the
+inputs and can be read but not set:
+
+```
+ringPad   = focusGap + focusThick          reserved always, focused or not
+textBlock = caption ? boxGap + textW : 0
+contentH  = max( caption ? textH : 0, boxHeight )
+
+idealW    = 2*ringPad + padLeft + boxWidth + textBlock + padRight
+idealH    = 2*ringPad + padTop  + contentH + padBottom
+```
+
+- The box cell sits against the padding on its `OPT_BOXALIGN_*` side, centred vertically, and the
+  caption takes the whole span left over, placed in it by `OPT_TEXTALIGN_*`. Sized to its ideal
+  size the button packs as `(o) Caption`; sized to a full row the circle sits at the far side. A
+  column of `OPT_BOXALIGN_RIGHT` buttons of one width lines its circles up. The box side does not
+  change the ideal size.
+- `rcText` is the caption's span, not its ink, so the one-line caption has room to end in "…"
+  when the button is too narrow. With no caption it is empty and the box gap is not charged; a
+  caption-less button is also shorter, because its height ignores the font.
+- `rcBox` is the declared cell; `rcCircle`, the largest centred square inside it, is what is drawn.
+  They differ once the cell is not square, so a paint callback should draw round `rcCircle`.
+- A dot size of 0 (the default) makes the dot 40% of the circle; a non-zero size is fixed, and no
+  longer follows `SetBoxSize`. Either way it is at least 2 pixels and at most the circle.
+- The caption font is also the measuring font; without one, the host's default font measures and
+  draws.
+- Setters take pixels; the defaults are scaled when the button is created. The ring and focus-ring
+  thicknesses are drawn as given, never scaled. Negative sizes, padding and gaps clamp to 0, and
+  out-of-range `SetBoxAlign` / `SetTextAlign` values are ignored. When the window's scale changes,
+  padding, gap, box, a fixed dot size, focus gap and focus curvature rescale; the two thicknesses
+  do not.
+- The rect getters lay out first, so they are never stale. They return false while the button has
+  no size, or when the rect is empty (`GetTextRect` with no caption).
+
+## Mouse and keyboard
+
+The whole client, caption included, is the hit area. A left press takes focus and the mouse
+capture; the check lands on release inside. Slide off while pressed and the pressed look goes as
+the cursor leaves; release outside and nothing is checked. Losing the capture cancels the press.
+Right-button presses are reported to the message callback and otherwise ignored.
+
+Space checks the focused button and the arrows move through the group as described above; Enter,
+Tab and every other key go on to the window. A disabled button ignores the mouse and the keyboard,
+drops any hover or press, and is stepped over by the arrows. `tkOptionButton_Click` checks a button
+exactly as the user would, notifying; it is the way to give a button an accelerator. It does
+nothing on a checked or disabled button.
+
+## Callbacks
+
+- **Check changed** fires only for the user's actions: a completed click, Space, an arrow move, or
+  `tkOptionButton_Click`. Both edges fire, the loser first: checking B while A was checked calls
+  `OnChanged( A, false )`, then `OnChanged( B, true )`. Both state changes land before either
+  call, so `GetChecked` and `FindChecked` are coherent inside either one, and calling a setter from
+  the handler cannot recurse. If only the winner matters, test `isChecked`.
+- **Message** sees `TKM_MOUSEMOVE`, `TKM_MOUSELEAVE`, the left and right button messages,
+  `TKM_SETFOCUS` / `TKM_KILLFOCUS` and `TKM_KEYDOWN`, as `msg`, `x`, `y` and `key`. Returning true
+  vetoes a `TKM_LBUTTONDOWN` (focus has already moved) or a `TKM_KEYDOWN`, which arrives before
+  Space or an arrow acts. Every other result is ignored: suppressing `TKM_LBUTTONUP` would strand
+  the capture, and focus is a fact, not a request.
+- **Paint** replaces the built-in drawing. The client is already filled with the state's back
+  colour, so draw only what you add; `tkOptionButton_PaintDefault( p )` draws the stock look first
+  if you want it. Draw the caption in the font given to `SetFont`, which measured the ideal width.
+  Frame with `PaintRoundOutline`: `PaintBorderRect` fills before it strokes and `PaintEllipse`
+  always fills, so either wipes what is under it. `tkOptionButton_CountRenderedTones` and
+  `HashRenderedPart` render one `OPT_PART_*` rect with the current painter and the focus ring
+  forced on, so a test can assert a paint callback has not flooded a part (tones cap at 64; both
+  return 0 on failure).
+- **Tooltip** text is the button's own `SetTooltipText` text, else the callback's answer, else
+  nothing: the caption is never repeated as a tip. A press or disabling hides the tip.
+  `SetHoverTime`, `SetAutoPopTime` and `SetReshowTime` set its delays, and
+  `tkOptionButton_GetTooltipHandle` returns the [tkTooltip](tkTooltip) for any `tkTooltip_*` call.
+
+## Colours and theme
+
+The unchecked circle is filled with the back colour and stroked in `RingColor*`; the checked
+circle is a disc in `RingColorChecked*` with the dot on it in `DotColor*`. `FocusRingColor` outlines
+the visual rect while the button has focus, its corners rounded by the focus curvature (a
+diameter). The state precedence is disabled, then pressed, then hot, then idle, and checked picks
+between the two ring sets within it. `tkOptionButton_ResolveMood` and `ResolveColors` are pure, so
+a paint callback can get exactly the colours the built-in drawing would use.
+
+The button is flat by default: `BackColorHot`, `BackColorPressed` and `BackColorDisabled` equal
+`BackColor`, so hovering changes only the circle and the caption. For a highlight across the row:
+
+```freebasic
+dim as TKOPTIONBUTTON_COLORS c
+tkOptionButton_GetColors( hOpt, @c )
+c.BackColorHot     = tkRGB( 44, 49, 58 )
+c.BackColorPressed = tkRGB( 44, 49, 58 )
+tkOptionButton_SetColors( hOpt, @c )
+```
+
+The dot sits on the accent fill, so it takes the theme's selected-text colour, and
+`DotColorDisabled` equals the back colour: a disabled checked button reads as a hollow ring.
+
+Colours start from the current [tkTheme](tkTheme) palette (`tkOptionButton_ThemeColors` is the
+mapping) and follow theme changes. `SetColors` pins them, so theme changes pass the button by until
+`tkOptionButton_UnpinColors` hands it back. The focus curvature follows the theme's corner radius
+until `SetFocusCurvature` sets it. Fonts are `TTF_Font ptr`, borrowed; there is no glyph font, so
+`tkOptionButton_ApplyFonts` ignores its glyph argument.
 
 ## Public declarations
 
@@ -264,6 +367,7 @@ function tkOptionButton_GetTooltipHandle( byval hOptionButton as TK_WIDGET ptr )
 sub tkOptionButton_SetHoverTime( byval hOptionButton as TK_WIDGET ptr, byval ms as long )
 sub tkOptionButton_SetAutoPopTime( byval hOptionButton as TK_WIDGET ptr, byval ms as long )
 sub tkOptionButton_SetReshowTime( byval hOptionButton as TK_WIDGET ptr, byval ms as long )
+sub tkOptionButton_PaintDefault( byval p as TKOPTIONBUTTON_PAINTINFO ptr )
 sub tkOptionButton_SetPaintCallback( byval hOptionButton as TK_WIDGET ptr, byval usersub as OPT_PaintCallbackSub )
 sub tkOptionButton_SetMessageCallback( byval hOptionButton as TK_WIDGET ptr, byval userfunc as OPT_MessageCallbackFunc )
 sub tkOptionButton_SetTooltipCallback( byval hOptionButton as TK_WIDGET ptr, byval userfunc as OPT_TooltipCallbackFunc )
@@ -276,4 +380,3 @@ function tkOptionButton_HashRenderedPart( byval hOptionButton as TK_WIDGET ptr, 
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsOptionButton](PsOptionButton), the PsControls control

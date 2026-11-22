@@ -43,10 +43,7 @@ It gets `WM_INITDIALOG` with `lParam` pointing at the `CDialog`. To hand a value
 message whose result is not the return value, call [CBSetDlgMsgResult](#cbgetdlgmsgresult-cbsetdlgmsgresult)
 and return `true`.
 
-**Closing.** End a dialog by sending it `WM_CLOSE` and calling [DialogEnd](#dialogend) from the
-`WM_CLOSE` handler, as the example does: `CDialog` re-enables the parent of a modal dialog when
-the dialog receives `WM_CLOSE`, not when `DialogEnd` runs. `DialogEnd` destroys the window and
-also posts `WM_QUIT`.
+**Closing.** End a dialog by calling `DialogEnd`. 
 
 **What it handles for you.** Anchored controls move on `WM_SIZE`; the colours set with
 [ControlSetColor](#controlsetcolor) answer the `WM_CTLCOLOR…` messages (your procedure does not
@@ -403,14 +400,7 @@ function DialogNewPixels( byref wszClassName as wstring, byval hParent as HWND =
 ```
 
 Creates the dialog like [DialogNew](#dialognew), with the same styles and the same class-name
-rule, but makes pixels the object's unit. `cx` and `cy` are the client size in **96-DPI units**:
-they are multiplied by the desktop's scaling ratios, so `300, 200` gives a client area of 525 ×
-350 pixels at 175 %. The dialog is centred when `x` and `y` are both -1 or the style has
-`DS_CENTER`.
-
-`x` and `y` themselves go into the dialog template unchanged, so Windows reads them as dialog
-units; to place the dialog at a pixel position, create it centred and call
-[DialogSetLoc](#dialoggetloc-dialogsetloc).
+rule, but makes pixels the object's unit. `cx` and `cy` are the client size: they are multiplied by the desktop's scaling ratios, so `300, 200` gives a client area of 525 × 350 pixels at 175 %. The dialog is centred when `x` and `y` are both -1 or the style has `DS_CENTER`.
 
 **Returns** the dialog handle, or `NULL` on failure.
 
@@ -666,10 +656,7 @@ Microsoft Learn: [IsDialogMessageW](https://learn.microsoft.com/en-us/windows/wi
 function DialogEnd( byval nResult as long = 0 ) as INT_PTR
 ```
 
-Records `nResult` for [DialogEndResult](#dialogendresult), destroys the dialog window and posts
-`WM_QUIT` to the thread. The modal loop and a `DialogDoEvents` loop stop because the window is
-gone; a `GetMessage` loop elsewhere in the program, such as [CWindow](CWindow)'s, receives the
-`WM_QUIT` and ends too.
+Records `nResult` for [DialogEndResult](#dialogendresult) and destroys the dialog window. The modal loop and a `DialogDoEvents` loop stop because the window is gone.
 
 Call it from the `WM_CLOSE` handler, so that the owner of a modal dialog is enabled again first.
 
@@ -1110,10 +1097,6 @@ function DialogSetLoc( byval nLeft as long, byval nTop as long ) as boolean
 
 `DialogGetLoc` reads the top-left corner of the dialog; `DialogSetLoc` moves the dialog there
 without resizing it. Both are in dialog units, or physical pixels for a pixel dialog.
-
-For a dialog without an owner both use screen coordinates. For a dialog that has an owner,
-`DialogGetLoc` measures from the owner's client area while `DialogSetLoc` still places the
-dialog in screen coordinates.
 
 **Returns** `true` on success.
 
@@ -1880,10 +1863,7 @@ pDlg->ControlCenterHoriz( IDOK )
 sub ControlCenterVert( byval cId as long )
 ```
 
-Moves control `cId` so that it is centred vertically in its parent's client area. It also moves
-the control **right by half its width**: a button 88 pixels wide at x = 140 ends up at x = 184.
-Put it back with [ControlSetLoc](#controlgetloc-controlsetloc) if the horizontal position must
-stay.
+Moves control `cId` so that it is centred vertically in its parent's client area.
 
 **Example**
 
@@ -2018,7 +1998,7 @@ Gives a control its own text colour and background, given by handle or identifie
 the dialog. Setting a control again replaces its colours.
 
 The colours are applied when Windows asks the dialog how to paint a control, so they work for
-labels, edit controls and list boxes. Push buttons are not coloured this way: use [CXpButton](CXpButton). Your dialog procedure
+labels, edit controls and list boxes. Push buttons are not coloured this way. Your dialog procedure
 does not receive the `WM_CTLCOLOR…` messages of a coloured control.
 
 **Returns** `true`, or `false` when the window does not exist.
@@ -2205,10 +2185,7 @@ function ControlSetImage( byval cId as long, byref wszImage as wstring ) as bool
 
 Loads an icon or bitmap resource, at its own size, into image label `cId` (an `Image` from
 [ControlAdd](#controladd)); the label takes the size of the image. `wszImage` is `"#"` plus a
-resource number or a resource name. The image that was in the label is passed to `DeleteObject`.
-
-A file name ending in `.ico` is tried as a file, but as a bitmap, and nothing is loaded; other
-file names are not tried as files. In practice the image must be a resource.
+resource number or a resource name. The image that was in the label is passed to `DeleteObject` or `DestroyIcon`.
 
 **Returns** `true` when control `cId` exists, whether or not an image was loaded; `false`
 otherwise.
@@ -2251,7 +2228,7 @@ function ControlSetImgButton( byval cId as long, byref wszImage as wstring ) as 
 Loads an icon or bitmap resource, at its own size, onto button `cId` (an `ImgButton` from
 [ControlAdd](#controladd), or a button with `BS_ICON` or `BS_BITMAP`). The button keeps its size
 and clips an image that is larger. Names and files are treated as in
-[ControlSetImage](#controlsetimage); the image that was on the button is passed to `DeleteObject`.
+[ControlSetImage](#controlsetimage); the image that was on the button is passed to `DeleteObject` or `DestrpyIcon`.
 
 **Returns** `true` when control `cId` exists.
 
@@ -2785,10 +2762,6 @@ records that client area as the whole content, shrinks the client area to `nWidt
 scrollable. From then on `CDialog` sets up the scroll bars on every `WM_SIZE` and scrolls the
 contents on `WM_HSCROLL` and `WM_VSCROLL`, in steps of 10 pixels. Centre the dialog afterwards.
 
-The scroll bars' ranges are set in pixels while `CDialog` keeps their positions in those 10-pixel
-steps: after two clicks on the down arrow the contents have moved 20 pixels and the thumb
-position reads 2, and dragging the thumb a few pixels scrolls straight to the end.
-
 **Returns** `true`.
 
 **Example**
@@ -3107,7 +3080,6 @@ ud.Values(0) = 42
 
 - [sys/win/gui](SysWin-Gui) for the module and its other classes
 - [CWindow](CWindow), the window class for programs that are not dialog-based
-- [CXpButton](CXpButton) for buttons with colours and images
 - [Units](SysWin-Units) for dialog units, pixels and 96-DPI units
 - [Display, screen and DPI](SysWin-Display-and-DPI) for `SetProcessDpiAwareness` and the scaling ratios
 - [Window size and position](SysWin-Window-Size-and-Position) for the same measurements on any window

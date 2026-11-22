@@ -62,7 +62,9 @@ The editor itself is **scintk**, a Scintilla and Lexilla build made for tkContro
 
 - **Text** is UTF-8. `tkCodeEdit_SendText` passes a string parameter (`SCI_SETKEYWORDS`, `SCI_STYLESETFONT`, `SCI_AUTOCSHOW` ...); `tkCodeEdit_GetText` and `tkCodeEdit_SetText` move the whole document as a `ustring`.
 - **Fonts are files.** `tkCodeEdit_SetFont( h, file, points )` gives every style one font file, at the editor's scale, and resets the styles (`SCI_STYLECLEARALL`), so set style colours after it. `tkCodeEdit_SetFontFace( family, regular, bold, italic, boldItalic )` maps a family name, as `SCI_STYLESETFONT` names it, to files; a missing bold or italic file renders the regular one. `tkCodeEdit_SetFallbackFonts` names, one per line, the faces a glyph the editor font lacks is drawn from (for example a CJK font); call it before `tkCodeEdit_SetFont`. A face inside a `.ttc` collection is written `"path|Family"` (see [tkFontList](tkFontList)).
-- **Notifications** arrive through `tkCodeEdit_SetNotifyCallback` as `TKCE_NOTIFICATION`, which carries Scintilla's notification fields; `n->code` is an `SCN_*` value. `n->text` is borrowed: copy it during the callback.
+- **Fonts start bundled.** Until something calls `tkCodeEdit_SetFont`, editors draw in the bundled mono face (`TK_FONT_MONO` beside the program) at 10 points; without a font file nothing would be drawn or measured.
+- **Notifications** arrive through `tkCodeEdit_SetNotifyCallback` as `TKCE_NOTIFICATION`, which carries Scintilla's notification fields; `n->code` is an `SCN_*` value. `n->text` is borrowed: copy it during the callback. The common ones also have callbacks of their own, called after the notify callback: `SetChangeCallback` (text inserted or deleted, by the user or by code), `SetCharAddedCallback`, `SetUpdateUICallback`, `SetDirtyCallback` (left or returned to the save point `SCI_SETSAVEPOINT` marks), `SetMarginClickCallback` (which makes the margins click-sensitive) and `SetDoubleClickCallback`.
+- **Settings by name.** For a form designer, the common `SCI_*` settings have setters and getters of their own: `ReadOnly`, `TabWidth`, `IndentWidth`, `UseTabs`, `EOLMode` (`TKCE_EOL_*`), `WrapMode` (`TKCE_WRAP_*`), `LineNumbers` (margin 0 sized for five digits, again when the font or scale changes), `IndentGuides`, `HighlightCurrentLine`, `ViewWhitespace`, `ViewEOL`, `Zoom` and `SetKeywords` (the lexer's first list).
 - **Context menu.** Right-click shows Scintilla's own menu (Undo, Cut, Copy, Paste, Select All ...). `tkCodeEdit_SetContextMenuCallback( h, proc )` replaces it with yours; `proc` gets editor pixels.
 - **Scale.** Each editor restyles its fonts when its window moves to a monitor with another scale. Margins you sized in pixels are yours to resize: `tkCodeEdit_SetScaleCallback` tells you when.
 - **Keys.** The editor claims the keys Scintilla uses; the rest bubble to its parent as usual, and a [tkKeys](tkKeys) map attached to the surface is asked first.
@@ -76,6 +78,19 @@ Every public name the module declares, as the source declares it. Signatures are
 
 ```freebasic
 const TKCE_ABI_VERSION = 2
+
+enum
+    TKCE_WRAP_NONE = 0
+    TKCE_WRAP_WORD
+    TKCE_WRAP_CHAR
+    TKCE_WRAP_WHITESPACE
+end enum
+
+enum
+    TKCE_EOL_CRLF = 0
+    TKCE_EOL_CR
+    TKCE_EOL_LF
+end enum
 ```
 
 ### Types
@@ -132,6 +147,37 @@ sub tkCodeEdit_SetFontFace( byref sFamily as string, byref sRegular as string, b
 sub tkCodeEdit_SetFallbackFonts( byref sChain as string )
 sub tkCodeEdit_SetContextMenuCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_ContextMenuSub )
 sub tkCodeEdit_SetScaleCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_ScaleSub )
+sub tkCodeEdit_SetReadOnly( byval hEdit as TK_WIDGET ptr, byval bReadOnly as boolean )
+function tkCodeEdit_GetReadOnly( byval hEdit as TK_WIDGET ptr ) as boolean
+sub tkCodeEdit_SetTabWidth( byval hEdit as TK_WIDGET ptr, byval nWidth as long )
+function tkCodeEdit_GetTabWidth( byval hEdit as TK_WIDGET ptr ) as long
+sub tkCodeEdit_SetIndentWidth( byval hEdit as TK_WIDGET ptr, byval nWidth as long )
+function tkCodeEdit_GetIndentWidth( byval hEdit as TK_WIDGET ptr ) as long
+sub tkCodeEdit_SetUseTabs( byval hEdit as TK_WIDGET ptr, byval bUseTabs as boolean )
+function tkCodeEdit_GetUseTabs( byval hEdit as TK_WIDGET ptr ) as boolean
+sub tkCodeEdit_SetEOLMode( byval hEdit as TK_WIDGET ptr, byval nMode as long )
+function tkCodeEdit_GetEOLMode( byval hEdit as TK_WIDGET ptr ) as long
+sub tkCodeEdit_SetWrapMode( byval hEdit as TK_WIDGET ptr, byval nMode as long )
+function tkCodeEdit_GetWrapMode( byval hEdit as TK_WIDGET ptr ) as long
+sub tkCodeEdit_SetLineNumbers( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+function tkCodeEdit_GetLineNumbers( byval hEdit as TK_WIDGET ptr ) as boolean
+sub tkCodeEdit_SetIndentGuides( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+function tkCodeEdit_GetIndentGuides( byval hEdit as TK_WIDGET ptr ) as boolean
+sub tkCodeEdit_SetHighlightCurrentLine( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+function tkCodeEdit_GetHighlightCurrentLine( byval hEdit as TK_WIDGET ptr ) as boolean
+sub tkCodeEdit_SetViewWhitespace( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+function tkCodeEdit_GetViewWhitespace( byval hEdit as TK_WIDGET ptr ) as boolean
+sub tkCodeEdit_SetViewEOL( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+function tkCodeEdit_GetViewEOL( byval hEdit as TK_WIDGET ptr ) as boolean
+sub tkCodeEdit_SetZoom( byval hEdit as TK_WIDGET ptr, byval nPoints as long )
+function tkCodeEdit_GetZoom( byval hEdit as TK_WIDGET ptr ) as long
+sub tkCodeEdit_SetKeywords( byval hEdit as TK_WIDGET ptr, byval sWords as ustring )
+sub tkCodeEdit_SetChangeCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_ChangeSub )
+sub tkCodeEdit_SetCharAddedCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_CharAddedSub )
+sub tkCodeEdit_SetUpdateUICallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_UpdateUISub )
+sub tkCodeEdit_SetDirtyCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_DirtySub )
+sub tkCodeEdit_SetMarginClickCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_MarginClickSub )
+sub tkCodeEdit_SetDoubleClickCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_DoubleClickSub )
 function tkCodeEdit_ListPopup() as TK_HOST ptr
 function tkCodeEdit_CallTipPopup() as TK_HOST ptr
 function tkCodeEdit_ContextMenu() as TK_MENU ptr

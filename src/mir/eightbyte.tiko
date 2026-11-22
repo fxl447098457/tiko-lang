@@ -154,18 +154,36 @@ private sub AapcsLeaves_ _
     mask or= (1ul shl (off \ esz))
 end sub
 
+'' Is the aggregate 16-ALIGNED -- does it hold an int128 (TKO_AA_ALIGN16)? A UDT's alignment is
+'' its record layout's; TypeContext.Layout answers for builtins and arrays.
+private function Align16_( byref c as Ctx, byval t as Tko.TypeId ) as boolean
+    dim as Tko.TypeId b = c.types->Unqualify( t )
+    if c.types->Kind( b ) = Tko.TK_UDT then
+        dim as int32 li = c.udts->Find( b )
+        if li < 0 then return false
+        return c.udts->udts[li].align >= 16
+    end if
+    return c.types->Layout( b ).align >= 16
+end function
+
 private function ClassifyAapcs64_( byref c as Ctx, byval t as Tko.TypeId, byval sz as int32 ) as uint32
     dim as int32 esz = 0
     dim as uint32 mask = 0
     dim as boolean bad = false
     AapcsLeaves_( c, t, 0, esz, mask, bad )
-    if bad orelse (esz = 0) then return TKO_AA_MARK
+    if bad orelse (esz = 0) then
+        if Align16_( c, t ) then return TKO_AA_MARK or TKO_AA_ALIGN16
+        return TKO_AA_MARK
+    end if
     '' Members 0 to n-1, every one present, and nothing else in the size.
     dim as int32 n = 0
     while (mask and (1ul shl n)) <> 0
         n += 1
     wend
-    if (mask <> ((1ul shl n) - 1)) orelse (n * esz <> sz) then return TKO_AA_MARK
+    if (mask <> ((1ul shl n) - 1)) orelse (n * esz <> sz) then
+        if Align16_( c, t ) then return TKO_AA_MARK or TKO_AA_ALIGN16
+        return TKO_AA_MARK
+    end if
     return TKO_AA_MARK or cast( uint32, n ) or iif( esz = 8, TKO_AA_HFA_DBL, 0ul )
 end function
 
@@ -180,19 +198,20 @@ function ClassifyEightbytes _
     dim as int32 sz = SizeOfType( c, t )
     if sz <= 0 then return 0
     if c.types->target.arch = Tko.ARCH_ARM64 then return ClassifyAapcs64_( c, t, sz )
+    dim as uint32 a16 = iif( Align16_( c, t ), TKO_EB_ALIGN16, 0ul )
     '' OVER SIXTEEN BYTES IS MEMORY, before anything is walked.
-    if sz > 16 then return TKO_EB_MEMORY
+    if sz > 16 then return TKO_EB_MEMORY or a16
 
     dim as uint32 cls0 = TKO_EB_NONE
     dim as uint32 cls1 = TKO_EB_NONE
     dim as boolean memory = false
     FoldField_( c, t, 0, cls0, cls1, memory )
-    if memory then return TKO_EB_MEMORY
+    if memory then return TKO_EB_MEMORY or a16
     '' An aggregate with no classifiable field at all -- an empty type. Nothing is
     '' passed for it, and saying INTEGER is both harmless and what clang does.
     if cls0 = TKO_EB_NONE then cls0 = TKO_EB_INTEGER
     if (sz > 8) andalso (cls1 = TKO_EB_NONE) then cls1 = TKO_EB_INTEGER
-    return TKO_EB_PACK( cls0, cls1 )
+    return TKO_EB_PACK( cls0, cls1 ) or a16
 end function
 
 end namespace

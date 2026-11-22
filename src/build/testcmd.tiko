@@ -1,0 +1,351 @@
+'' testcmd.tiko -- 'tiko test': find the tests, build them into one program, run it (testdoc.ti).
+''
+'' WHAT IS A TEST (docs/tiko-test-doc RFC-0001 §3):
+''
+''   - a '*_test.tiko' file IN A MODULE DIRECTORY: white-box. It begins '#module' like the rest of
+''     the module and sees the module's private names; a normal build leaves it out of the module
+''     (driver/modresolve.tiko ModuleFiles), a test build takes it in.
+''   - a 'test' block in a module's own files: the same, compiled only in a test build.
+''   - any OTHER '*_test.tiko' in the project: black-box, a root of the test program, importing
+''     what it tests. It must import std/testing -- a program merely NAMED like a test (rosetta
+''     code has several) is left alone, with TKO1204 under -v.
+''
+'' THE PROGRAM is out/test/tests.tiko -- generated, imports std/testing and each white-box module,
+'' and is one line of code: 'end testing.RunMain( )' -- plus the black-box files as further roots,
+'' built through 'tiko build''s implicit target with --test, under the 'debug' profile unless
+'' --profile names another: -g -exx, so a null or out-of-bounds access in a test is a runtime
+'' error with its line rather than a quiet wrong answer. Without a tiko.toml the project is the
+'' first directory named, else the current one: its out/test/ holds the program, and it is the
+'' package root (--package-root), so out/test/'s relative imports reach the project's modules.
+
+#import "std/containers"
+#import "std/fs"
+#include once "build/testdoc.ti"
+#include once "driver/driver.ti"
+#include once "driver/modresolve.ti"
+#include once "support/diskcache.ti"
+#include once "support/text.ti"
+#include once "types/type.ti"
+
+namespace Tko.Build
+
+function ReadText( byref path_ as string ) as string
+    dim as string t
+    if Tko.DiskCache.ReadAll( path_, t ) = false then return ""
+    return t
+end function
+
+function WriteTextIfChanged( byref path_ as string, byref text as string ) as boolean
+    if fs.IsFile( path_ ) andalso (ReadText( path_ ) = text) then return true
+    dim as string d = Tko.Modules.DirOfFile( path_ )
+    if (len( d ) > 0) andalso (fs.IsDir( d ) = false) then fs.CreateDirAll( d )
+    dim as int32 f = freefile
+    if open( path_ for output as #f ) <> 0 then return false
+    print #f, text;
+    close #f
+    return true
+end function
+
+'' The lines of a text, without their CR.
+private sub Lines_( byref t as string, byref outv as Tko.StrVec )
+    dim as int32 p = 1
+    while p <= len( t )
+        dim as int32 e = instr( p, t, chr( 10 ) )
+        if e = 0 then e = len( t ) + 1
+        dim as string ln = mid( t, p, e - p )
+        if right( ln, 1 ) = chr( 13 ) then ln = left( ln, len( ln ) - 1 )
+        outv.Push( ln )
+        p = e + 1
+    wend
+end sub
+
+function IsModuleFile( byref path_ as string ) as boolean
+    dim as Tko.StrVec ls
+    Lines_( ReadText( path_ ), ls )
+    for each ln as string in ls
+        dim as string t = Tko.Text.LowerAscii( trim( ln, any chr( 32, 9 ) ) )
+        if len( t ) = 0 then continue for
+        if left( t, 1 ) = "'" then continue for
+        if left( t, 4 ) = "rem " then continue for
+        return left( t, 7 ) = "#module"
+    next
+    return false
+end function
+
+private function IsSource_( byref nm as string ) as boolean
+    dim as string l = Tko.Text.LowerAscii( nm )
+    return (right( l, 5 ) = ".tiko") orelse (right( l, 4 ) = ".bas")
+end function
+
+'' The source files of a directory, in name order (ModuleFiles' order), test files included.
+private sub Sources_( byref dir_ as string, byref outv as Tko.StrVec )
+    Tko.Modules.ModuleFiles( dir_, outv, true )
+end sub
+
+function IsModuleDir( byref dir_ as string ) as boolean
+    dim as Tko.StrVec fv
+    Sources_( dir_, fv )
+    for each nm as string in fv
+        if IsModuleFile( Tko.Modules.JoinPath( dir_, nm ) ) then return true
+    next
+    return false
+end function
+
+'' A line of the file is the head of a 'test' block: 'test "...', first on its line.
+private function HasTestBlock_( byref path_ as string ) as boolean
+    dim as Tko.StrVec ls
+    Lines_( ReadText( path_ ), ls )
+    for each ln as string in ls
+        dim as string t = Tko.Text.LowerAscii( ltrim( ln, any chr( 32, 9 ) ) )
+        if (left( t, 5 ) = "test ") andalso (instr( t, chr( 34 ) ) > 0) then
+            if left( ltrim( mid( t, 5 ) ), 1 ) = chr( 34 ) then return true
+        end if
+    next
+    return false
+end function
+
+'' The file imports std/testing: an '#import "std/testing"' line.
+private function ImportsTesting_( byref path_ as string ) as boolean
+    dim as Tko.StrVec ls
+    Lines_( ReadText( path_ ), ls )
+    for each ln as string in ls
+        dim as string t = Tko.Text.LowerAscii( trim( ln, any chr( 32, 9 ) ) )
+        if (left( t, 7 ) = "#import") andalso (instr( t, chr( 34 ) & "std/testing" & chr( 34 ) ) > 0) then return true
+    next
+    return false
+end function
+
+private sub Walk_( byref d as string, byval top as boolean, byref outv as Tko.StrVec, byval depth as int32 )
+    if depth > 32 then return
+    if (top = false) andalso Tko.Modules.HasManifest( d ) then return
+    outv.Push( d )
+    dim as containers.Array( of fs.DirEntry ) es
+    if fs.ListDir( d, es ).IsOk( ) = false then return
+    dim as Tko.StrVec subs
+    for k as int32 = 0 to es.Count - 1
+        if es[k].IsDirectory( ) = false then continue for
+        dim as string nm = es[k].Name( )
+        if (left( nm, 1 ) = ".") orelse (Tko.Text.LowerAscii( nm ) = "out") then continue for
+        '' Insertion by name, for an order that does not depend on the file system's.
+        dim as int32 at = subs.Count
+        subs.Push( nm )
+        while at > 0
+            if Tko.Text.LowerAscii( subs[at - 1] ) <= Tko.Text.LowerAscii( nm ) then exit while
+            subs[at] = subs[at - 1]
+            at -= 1
+        wend
+        subs[at] = nm
+    next
+    for each nm as string in subs
+        Walk_( Tko.Modules.JoinPath( d, nm ), false, outv, depth + 1 )
+    next
+end sub
+
+sub ProjectDirs( byref root as string, byref outv as Tko.StrVec )
+    Walk_( Tko.Modules.NormPath( root ), true, outv, 0 )
+end sub
+
+function RelPathFrom( byref fromDir as string, byref toPath as string ) as string
+    dim as string a = Tko.Modules.AbsPath( fromDir ), b = Tko.Modules.AbsPath( toPath )
+    dim as Tko.StrVec pa, pb
+    '' Split on '/'.
+    a &= "/" : b &= "/"
+    dim as int32 st = 1
+    do
+        dim as int32 e = instr( st, a, "/" )
+        if e = 0 then exit do
+        if e > st then pa.Push( mid( a, st, e - st ) )
+        st = e + 1
+    loop
+    st = 1
+    do
+        dim as int32 e = instr( st, b, "/" )
+        if e = 0 then exit do
+        if e > st then pb.Push( mid( b, st, e - st ) )
+        st = e + 1
+    loop
+    dim as int32 c = 0
+    while (c < pa.Count) andalso (c < pb.Count)
+        dim as boolean same
+        #ifdef __FB_WIN32__
+            same = Tko.Text.LowerAscii( pa[c] ) = Tko.Text.LowerAscii( pb[c] )
+        #else
+            same = pa[c] = pb[c]
+        #endif
+        if same = false then exit while
+        c += 1
+    wend
+    '' Another drive: no relative spelling exists.
+    if c = 0 then return Tko.Modules.NormPath( b )
+    dim as string r = ""
+    for k as int32 = c to pa.Count - 1
+        r &= "../"
+    next
+    for k as int32 = c to pb.Count - 1
+        r &= pb[k] & iif( k < pb.Count - 1, "/", "" )
+    next
+    if len( r ) = 0 then r = "."
+    if right( r, 1 ) = "/" then r = left( r, len( r ) - 1 )
+    return r
+end function
+
+private sub PushOnce_( byref v as Tko.StrVec, byref s as string )
+    for each x as string in v
+        if Tko.Text.LowerAscii( x ) = Tko.Text.LowerAscii( s ) then return
+    next
+    v.Push( s )
+end sub
+
+'' One directory's tests: a module with test files or blocks, or black-box files.
+private sub Discover_ _
+    ( byref d as string, byref modDirs as Tko.StrVec, byref blackBox as Tko.StrVec, _
+      byref a as BuildArgs, byref ctx as Tko.CompilerContext )
+    dim as Tko.StrVec fv
+    Sources_( d, fv )
+    if fv.Count = 0 then return
+    if IsModuleDir( d ) then
+        for each nm as string in fv
+            dim as string p = Tko.Modules.JoinPath( d, nm )
+            if Tko.Modules.IsTestFileName( nm ) orelse HasTestBlock_( p ) then
+                PushOnce_( modDirs, d )
+                exit for
+            end if
+        next
+        return
+    end if
+    for each nm as string in fv
+        if Tko.Modules.IsTestFileName( nm ) = false then continue for
+        dim as string p = Tko.Modules.JoinPath( d, nm )
+        if ImportsTesting_( p ) then
+            PushOnce_( blackBox, p )
+        elseif a.verbose then
+            ctx.diags.ReportGlobal( Tko.TKO1204, p )
+        end if
+    next
+end sub
+
+'' The program's main: std/testing, every white-box module, and the one line that runs them.
+private function MainText_( byref mainDir as string, byref modDirs as Tko.StrVec ) as string
+    dim as string nl = chr( 10 )
+    dim as string t = "'' tests.tiko -- generated by 'tiko test' for this project; do not edit." & nl & _
+                      "#import ""std/testing""" & nl
+    for k as int32 = 0 to modDirs.Count - 1
+        t &= "#import """ & RelPathFrom( mainDir, modDirs[k] ) & """ as __tko_tm" & k & nl
+    next
+    return t & "end testing.RunMain( )" & nl
+end function
+
+'' The build can run here: no -target, or the host's own.
+private function RunsHere_( byref target as string ) as boolean
+    if len( target ) = 0 then return true
+    dim as boolean ok
+    dim as Tko.TargetId t = Tko.TargetFromName( target, ok )
+    if ok = false then return true             '' the build has already said what is wrong
+    return t = Tko.HostTarget( )
+end function
+
+function TestCommand _
+    ( byref a as BuildArgs, byval hasM as boolean, byref m as Tko.Modules.Manifest, _
+      byref mdir as string, byref ctx as Tko.CompilerContext, byref obs as Observer ) as int32
+
+    '' THE SCOPE: the directories named, else the project (the manifest's, else this one); and
+    '' any test files named one by one.
+    dim as string root = iif( hasM, mdir, "." )
+    dim as Tko.StrVec scopes, files
+    for each w as string in a.words
+        if fs.IsDir( w ) then
+            scopes.Push( w )
+        elseif fs.IsFile( w ) andalso Tko.Modules.IsTestFileName( w ) then
+            files.Push( w )
+        else
+            ctx.diags.ReportGlobal( Tko.TKO1211, w )
+            return Tko.EXIT_CMDLINE
+        end if
+    next
+    '' NO tiko.toml: the first directory named is the project, and its out/test/ the program's.
+    if (hasM = false) andalso (scopes.Count > 0) then root = scopes[0]
+    if (scopes.Count = 0) andalso (files.Count = 0) then scopes.Push( root )
+
+    dim as Tko.StrVec modDirs, blackBox
+    for each s as string in scopes
+        dim as Tko.StrVec ds
+        ProjectDirs( s, ds )
+        for each d as string in ds
+            Discover_( d, modDirs, blackBox, a, ctx )
+        next
+    next
+    for each f as string in files
+        dim as string d = Tko.Modules.DirOfFile( f )
+        if IsModuleDir( d ) then
+            PushOnce_( modDirs, d )
+        elseif ImportsTesting_( f ) then
+            PushOnce_( blackBox, f )
+        else
+            ctx.diags.ReportGlobal( Tko.TKO1204, f )
+        end if
+    next
+    ctx.diags.Flush( )                     '' the notes about what was left out, before the build
+    if (modDirs.Count = 0) andalso (blackBox.Count = 0) then
+        dim as string where_ = ""
+        for each s as string in scopes
+            where_ &= iif( len( where_ ) > 0, ", ", "" ) & "'" & s & "'"
+        next
+        for each f as string in files
+            where_ &= iif( len( where_ ) > 0, ", ", "" ) & "'" & f & "'"
+        next
+        ctx.diags.ReportGlobal( Tko.TKO1203, where_ )
+        ctx.diags.Flush( )
+        return Tko.EXIT_OK
+    end if
+
+    '' ANOTHER SYSTEM'S PROGRAM cannot run here: say so before building it, unless only the build
+    '' was asked for.
+    if (a.noRun = false) andalso (RunsHere_( a.target ) = false) then
+        ctx.diags.ReportGlobal( Tko.TKO1205, a.target )
+        ctx.diags.Flush( )
+        return Tko.EXIT_CMDLINE
+    end if
+
+    '' THE PROGRAM: out/test/tests.tiko, written only when it changed so its build can be a hit.
+    dim as string work = iif( hasM, Rel( mdir, "out/test" ), Tko.Modules.JoinPath( root, "out/test" ) )
+    dim as string mainPath = work & "/tests.tiko"
+    if WriteTextIfChanged( mainPath, MainText_( work, modDirs ) ) = false then
+        ctx.diags.ReportGlobal( Tko.TKO0171, "tests.tiko", mainPath )
+        return Tko.EXIT_TOOL_FAILED
+    end if
+
+    '' BUILT AS 'tiko build' builds an implicit target: the main first, then the black-box files.
+    dim as BuildArgs b
+    b.verb = "build"
+    b.words.Push( mainPath )
+    for each f as string in blackBox
+        b.words.Push( f )
+    next
+    for each x as string in a.extra
+        b.extra.Push( x )
+    next
+    b.extra.Push( "--test" )
+    if hasM = false then
+        b.extra.Push( "--package-root" )
+        b.extra.Push( root )
+    end if
+    b.target = a.target
+    b.diagFile = a.diagFile
+    b.profile = iif( a.hasProfile, a.profile, "debug" )
+    b.hasProfile = true
+    b.manifest = a.manifest
+    b.json = a.json
+    b.verbose = a.verbose
+    b.jobs = a.jobs
+    dim as Tko.StrVec plans
+    plans.Push( "" )
+    dim as int32 rc = Build_( b, m, mdir, plans, ctx, obs )
+    if rc <> Tko.EXIT_OK then return rc
+
+    if a.noRun then return Tko.EXIT_OK
+    dim as TargetPlan p
+    if PlanImplicit( b, m, p, ctx.diags ) = false then return Tko.EXIT_CMDLINE
+    return RunTests( a, Tko.Modules.AbsPath( p.artifact ), work, ctx, obs )
+end function
+
+end namespace

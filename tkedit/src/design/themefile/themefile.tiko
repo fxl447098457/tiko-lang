@@ -13,7 +13,8 @@
 '   accent = "#1E88E5"            quick theme: both variants derived from the presets + this
 '   [dark] / [light]              accent = a variant's own; Role = "#RRGGBB[AA]" overrides one role;
 '                                 [dark.editor], [dark.syntax] ... are tkEdit's, kept as found
-'   [fonts]                       ui = { file, bold, size }, glyph = { file }, mono = { file }
+'   [fonts]                       ui = { file, bold, size }, glyph = { file }, mono = { file };
+'                                 embed = true builds the four fonts into the program (appTheme/fonts/)
 '   [shape]                       CornerRadius, BorderWidth (-1 = each control's own)
 '   [controls.Button]             Field = colour: every Button
 '   [styles.Primary]              Role = colour: a role remap any control can wear by name
@@ -21,6 +22,7 @@
 #module "themefile"
 
 #import "std/config"
+#import "std/fs"
 #import "std/containers"
 #import "vendor/tkControls/tkMeta"
 #import "../model"
@@ -31,6 +33,7 @@
 using containers
 using tkMeta
 using tkTheme
+using tkHost
 using model
 
 public const as long THEME_FORMAT = 1
@@ -67,9 +70,9 @@ public type ThemeDoc
     Light as ThemeVariant
     UIFile as ustring
     UIBold as ustring
-    UISize as long                     ' 0 = tkApp's
-    GlyphFile as ustring
+    UISize as long                     ' 0 = "System": the OS's normal size at run time (GLYPHS.md GV2)
     MonoFile as ustring
+    EmbedFonts as boolean              ' [fonts] embed: the fonts go inside the program, from appTheme/fonts/
     CornerRadius as long = -1
     BorderWidth as long = -1
     Controls as Array( of ThemeTypeBlock )
@@ -228,7 +231,12 @@ public function Parse( byref text as const ustring, byref doc as ThemeDoc, byref
     if p then ReadVariant_( *p, doc.Light, "light", doc )
     p = root.Find( "fonts" )
     if p then
-        OnlyKeys_( *p, "ui glyph mono", "fonts", doc )
+        OnlyKeys_( *p, "ui glyph mono embed", "fonts", doc )
+        dim as config.TomlValue ptr e = p->Find( "embed" )
+        if e then
+            dim as boolean no = false
+            doc.EmbedFonts = e->AsBool( ).ValueOr( no )
+        end if
         dim as config.TomlValue ptr f = p->Find( "ui" )
         if f then
             OnlyKeys_( *f, "file bold size", "fonts.ui", doc )
@@ -236,11 +244,8 @@ public function Parse( byref text as const ustring, byref doc as ThemeDoc, byref
             doc.UIBold = StrOf_( *f, "bold" )
             doc.UISize = IntOf_( *f, "size", 0 )
         end if
-        f = p->Find( "glyph" )
-        if f then
-            OnlyKeys_( *f, "file", "fonts.glyph", doc )
-            doc.GlyphFile = StrOf_( *f, "file" )
-        end if
+        ' [fonts] glyph is no more (GLYPHS.md GV3): glyph fonts are the Glyph Picker's. A file from
+        ' before still reads; the slot is ignored and goes on the next save.
         f = p->Find( "mono" )
         if f then
             OnlyKeys_( *f, "file", "fonts.mono", doc )
@@ -384,8 +389,10 @@ public function Render( byref doc as ThemeDoc ) as ustring
     if len( doc.Accent ) then o &= "accent = " & Quote_( doc.Accent ) & NL
     VariantText_( o, doc.Dark, "dark" )
     VariantText_( o, doc.Light, "light" )
-    if len( doc.UIFile ) orelse len( doc.UIBold ) orelse doc.UISize orelse len( doc.GlyphFile ) orelse len( doc.MonoFile ) then
+    if len( doc.UIFile ) orelse len( doc.UIBold ) orelse doc.UISize orelse len( doc.MonoFile ) _
+       orelse doc.EmbedFonts then
         o &= NL & "[fonts]" & NL
+        if doc.EmbedFonts then o &= "embed = true" & NL
         if len( doc.UIFile ) orelse len( doc.UIBold ) orelse doc.UISize then
             dim as ustring parts
             if len( doc.UIFile ) then parts &= ", file = " & Quote_( doc.UIFile )
@@ -393,7 +400,6 @@ public function Render( byref doc as ThemeDoc ) as ustring
             if doc.UISize then parts &= ", size = " & doc.UISize
             o &= "ui = { " & mid( parts, 3 ) & " }" & NL
         end if
-        if len( doc.GlyphFile ) then o &= "glyph = { file = " & Quote_( doc.GlyphFile ) & " }" & NL
         if len( doc.MonoFile ) then o &= "mono = { file = " & Quote_( doc.MonoFile ) & " }" & NL
     end if
     if (doc.CornerRadius <> -1) orelse (doc.BorderWidth <> -1) then
@@ -526,6 +532,115 @@ private sub CollectTypes_( byref doc as ThemeDoc, all as Array( of TKCOLOR_SRC )
     next
 end sub
 
+' ---- embedded fonts ([fonts] embed) --------------------------------------------------------------
+
+' The folder, beside the generated module, that the embedded fonts are read from at build time.
+public const EMBED_DIR = "fonts"
+
+' A font slot's file as embedded: the name the theme gives (its file name only), else tkApp's default.
+' A font slot that names one of the project's resources ("res:<name>", the Resource Center).
+private function IsResource_( byref f as const ustring ) as boolean
+    return lcase( left( f, 4 ) ) = "res:"
+end function
+
+private function EmbedName_( byref f as const ustring, byref dflt as const ustring ) as ustring
+    if len( f ) = 0 then return dflt
+    if IsResource_( f ) then return f            ' appResources has it: tkHost knows it by this name
+    return fs.PathFileName( f )
+end function
+
+' The slot's file as the theme gives it (a path kept), else tkApp's default.
+private function OrDefault_( byref f as const ustring, byref dflt as const ustring ) as ustring
+    if len( f ) then return f
+    return dflt
+end function
+
+' The font files an embedding theme builds in: UI, bold, glyph and mono, a default for a slot it leaves
+' empty, each once.
+public function EmbeddedFonts( byref doc as ThemeDoc ) as Array( of ustring )
+    dim as Array( of ustring ) out_
+    dim as ustring slots( 0 to 3 )
+    slots( 0 ) = EmbedName_( doc.UIFile, TK_FONT_UI )
+    slots( 1 ) = EmbedName_( doc.UIBold, TK_FONT_UI_BOLD )
+    slots( 2 ) = TK_FONT_ICONS                       ' the glyph role's, until appGlyphs (GLYPHS.md V4)
+    slots( 3 ) = EmbedName_( doc.MonoFile, TK_FONT_MONO )
+    for i as long = 0 to 3
+        if IsResource_( slots( i ) ) then continue for
+        dim as boolean seen = false
+        for each s as ustring in out_
+            if lcase( s ) = lcase( slots( i ) ) then seen = true
+        next
+        if seen = false then out_.Push( slots( i ) )
+    next
+    return out_
+end function
+
+' Where one embedded font comes from: a path the theme gives (beside the theme file when relative),
+' the copy already in themeDir/fonts, the project folder (themeDir's parent), then the toolchain's
+' tkControls fonts (pkgDir/vendor/tkControls/fonts). "" = nowhere.
+public function FontSource( byref given as const ustring, byref themeDir as const ustring, byref pkgDir as const ustring ) as ustring
+    dim as ustring f = fs.PathFileName( given )
+    if (instr( given, "/" ) > 0) orelse (instr( given, "\" ) > 0) then
+        dim as ustring p = given
+        if fs.PathIsAbsolute( p ) = false then p = fs.PathJoin( themeDir, given )
+        if fs.IsFile( p ) then return p
+    end if
+    dim as ustring tries( 0 to 2 )
+    tries( 0 ) = fs.PathJoin( themeDir, EMBED_DIR, f )
+    tries( 1 ) = fs.PathJoin( fs.PathParent( themeDir ), f )
+    if len( pkgDir ) then tries( 2 ) = fs.PathJoin( fs.PathJoin( pkgDir, "vendor", "tkControls" ), "fonts", f )
+    for i as long = 0 to 2
+        if len( tries( i ) ) andalso fs.IsFile( tries( i ) ) then return tries( i )
+    next
+    return ""
+end function
+
+' Where the glyph font is, for tkEdit to open (the designer's canvas, the Glyph Picker): the bundled
+' icons, from the toolchain the project builds with (pkgDir/vendor/tkControls/fonts) -- a shipped
+' tkEdit is one file, with no fonts beside it -- else beside tkEdit (a tree build). Until appGlyphs
+' (GLYPHS.md V4). "" = neither.
+public function GlyphFontPath( byref pkgDir as const ustring ) as ustring
+    dim as ustring p
+    if len( pkgDir ) then
+        p = fs.PathJoin( fs.PathJoin( pkgDir, "vendor", "tkControls" ), "fonts", TK_FONT_ICONS )
+        if fs.IsFile( p ) then return p
+    end if
+    p = tkHost_FontDir( ) & TK_FONT_ICONS
+    if fs.IsFile( p ) then return p
+    return ""
+end function
+
+' The UI size the generated ApplyOptions gives: the theme's, else the OS's normal size at run time.
+private function UISizeExpr_( byref doc as ThemeDoc ) as ustring
+    if doc.UISize > 0 then return str( doc.UISize )
+    return "tkApp_SystemFontSize( )"
+end function
+
+' The embedding theme's fonts copied into themeDir/fonts, where the generated module embeds them from.
+' A file already there is kept (it may be the user's own). Problems name each font not found.
+public sub CopyEmbeddedFonts( byref doc as ThemeDoc, byref themeDir as const ustring, byref pkgDir as const ustring, _
+                              byref problems as Array( of ustring ) )
+    if doc.EmbedFonts = false then exit sub
+    dim as ustring given( 0 to 3 )
+    given( 0 ) = OrDefault_( doc.UIFile, TK_FONT_UI )
+    given( 1 ) = OrDefault_( doc.UIBold, TK_FONT_UI_BOLD )
+    given( 2 ) = TK_FONT_ICONS
+    given( 3 ) = OrDefault_( doc.MonoFile, TK_FONT_MONO )
+    dim as ustring dir_ = fs.PathJoin( themeDir, EMBED_DIR )
+    for i as long = 0 to 3
+        if IsResource_( given( i ) ) then continue for     ' appResources builds it in, or not
+        dim as ustring dst = fs.PathJoin( dir_, fs.PathFileName( given( i ) ) )
+        if fs.IsFile( dst ) then continue for
+        dim as ustring src = FontSource( given( i ), themeDir, pkgDir )
+        if len( src ) = 0 then
+            problems.Push( "fonts: " & fs.PathFileName( given( i ) ) & " not found to embed" )
+            continue for
+        end if
+        fs.CreateDirAll( dir_ )
+        if fs.CopyFile( src, dst, false ).IsOk( ) = false then problems.Push( "fonts: " & fs.PathFileName( given( i ) ) & " can't be copied" )
+    next
+end sub
+
 ' The whole generated module for a theme that passed Check. Install() makes it the program's theme.
 public function Generate( byref doc as ThemeDoc, byref moduleName as const ustring, byref sourceName as const ustring, _
                           byref sourceText as const ustring ) as ustring
@@ -554,13 +669,35 @@ public function Generate( byref doc as ThemeDoc, byref moduleName as const ustri
     if doc.BorderWidth <> -1 then o &= "    s.BorderWidth = " & doc.BorderWidth & NL
     o &= "    return s" & NL & "end function" & NL & NL
 
+    if doc.EmbedFonts then
+        ' the four fonts inside the program, read from appTheme/fonts/ when it is built
+        dim as Array( of ustring ) files = EmbeddedFonts( doc )
+        o &= "' The fonts, inside the program ([fonts] embed): tkEdit copies them into fonts/ beside this file." & NL
+        for i as long = 0 to files.Count( ) - 1
+            o &= "#embed gFont" & i & "_ " & Quote_( EMBED_DIR & "/" & files[i] ) & NL
+        next
+        o &= NL
+    end if
     o &= "' The theme's fonts, into the options before tkApp_Init (fonts are opened there)." & NL
     o &= "public sub ApplyOptions( byref o as TKAPP_OPTIONS )" & NL
-    if len( doc.UIFile ) then o &= "    o.FontUIFile = " & Quote_( doc.UIFile ) & NL
-    if len( doc.UIBold ) then o &= "    o.FontUIBoldFile = " & Quote_( doc.UIBold ) & NL
-    if doc.UISize then o &= "    o.FontUISize = " & doc.UISize & NL
-    if len( doc.GlyphFile ) then o &= "    o.GlyphFontFile = " & Quote_( doc.GlyphFile ) & NL
-    if len( doc.MonoFile ) then o &= "    o.FontMonoFile = " & Quote_( doc.MonoFile ) & NL
+    if doc.EmbedFonts then
+        ' registered as "mem:<file>" and looked up there: no font file is read from disk
+        dim as Array( of ustring ) files = EmbeddedFonts( doc )
+        for i as long = 0 to files.Count( ) - 1
+            o &= "    tkHost_AddFontData( " & Quote_( "mem:" & files[i] ) & ", @gFont" & i & "_( 0 ), ubound( gFont" & i & "_ ) + 1 )" & NL
+        next
+        o &= "    o.FontDir = ""mem:""" & NL
+        o &= "    o.FontUIFile = " & Quote_( EmbedName_( doc.UIFile, TK_FONT_UI ) ) & NL
+        o &= "    o.FontUIBoldFile = " & Quote_( EmbedName_( doc.UIBold, TK_FONT_UI_BOLD ) ) & NL
+        o &= "    o.FontUISize = " & UISizeExpr_( doc ) & NL
+        o &= "    o.GlyphFontFile = " & Quote_( TK_FONT_ICONS ) & NL
+        o &= "    o.FontMonoFile = " & Quote_( EmbedName_( doc.MonoFile, TK_FONT_MONO ) ) & NL
+    else
+        if len( doc.UIFile ) then o &= "    o.FontUIFile = " & Quote_( doc.UIFile ) & NL
+        if len( doc.UIBold ) then o &= "    o.FontUIBoldFile = " & Quote_( doc.UIBold ) & NL
+        o &= "    o.FontUISize = " & UISizeExpr_( doc ) & NL
+        if len( doc.MonoFile ) then o &= "    o.FontMonoFile = " & Quote_( doc.MonoFile ) & NL
+    end if
     o &= "end sub" & NL & NL
 
     o &= "private sub Fill_( )" & NL & "    if gFilled_ then exit sub" & NL & "    gFilled_ = true" & NL

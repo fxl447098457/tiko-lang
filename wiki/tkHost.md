@@ -103,12 +103,15 @@ The proc gets `TK_MSG` messages shaped like the Win32 ones they replace. Return 
 | `TKM_TIMER` | `timerId` |
 | `TKM_SCALECHANGED`, `TKM_THEMECHANGED`, `TKM_DESTROY` | `fOld`, `fNew` for the scale |
 | `TKM_DROPFILES`, `TKM_DROPTEXT` | `text` (paths LF-separated, `nStart` = how many), `x`, `y`; **bubble** if refused |
+| `TKM_CONTEXTMENU` | to a context-menu component: `pOther` = the widget it opens for, `x`, `y` = where, in window pixels; `bFlag` = from the keyboard |
 
 Rules a widget author relies on:
 
 - **Focus is the widget's to take.** A click focuses nothing by itself: call `tkHost_SetFocus( w->pHost, w )` in `TKM_LBUTTONDOWN`. Tab and Shift+Tab walk the focusable widgets in tree order when no widget claims the key.
 - **Capture** with `tkHost_SetCapture( w )` and `tkHost_ReleaseCapture( h )`: moves and the release keep coming to `w` while the mouse is outside it or the window. While a widget holds the capture it hears Esc first.
 - **Timers** with `tkWidget_SetTimer( w, id, ms )`, delivered as `TKM_TIMER` on the UI thread. Ids below `TK_TIMER_APP` are reserved.
+- **Context menus** with `tkWidget_SetContextMenu( w, hMenu )`: the right button's release over `w` or anything inside it, and the Menu key or Shift+F10 when the focus is there, go to `hMenu` as `TKM_CONTEXTMENU` instead of to the control. [tkContextMenu](tkContextMenu) is the component that answers it; it calls `tkWidget_ClearContextMenuRefs` as it goes.
+- **Watching the mouse from outside** with `tkWidget_SetMouseMoveCallback( w, cb )`: `cb` (a `TK_MouseMoveSub`) is told of every move over `w`, and over anything inside it that has no watcher of its own, with `x, y` in pixels from `w`'s top-left, SDL's button mask and the modifier keys. It runs after the widget's own `TKM_MOUSEMOVE`, needs no subclassing, and works on any control; 0 clears it. The Form Designer's MouseMove event is built on it.
 - **Theme.** On `TKM_THEMECHANGED`, re-read [tkTheme](tkTheme)'s `tkTheme_Get()` unless your widget's colours are pinned.
 - **Notify like the controls do**: callbacks for user actions only; setters are silent.
 - `tkHost_SetTextInputArea` tells the IME where to put its candidate window; `tkHost_SetClipboardText`, `GetClipboardText` and `HasClipboardText` reach the clipboard.
@@ -125,9 +128,9 @@ tkControls ships its own fonts, copied beside every program that imports tkHost,
 
 `tkHost_FontDir()` is the folder they are in (the program's own, ending in a separator), so `tkHost_FontDir() & TK_FONT_UI` is always a file that is there. `tkHost_OpenFont( h, path, pt )` opens a font in points at the surface's scale; the surface owns it, re-sizes it when the scale changes and closes it when the surface goes. `h->pDefaultFont` is the font every control falls back to.
 
-### Fonts from memory
+### Fonts and images by name
 
-A program can carry its fonts inside itself instead of beside it. Register each one's bytes under a name, and every font tkHost, [tkApp](tkApp) and [tkCodeEdit](tkCodeEdit) open takes that name where it takes a file path:
+A program can carry its fonts and images inside itself instead of beside it. Register each one's bytes under a name, and every font tkHost, [tkApp](tkApp) and [tkCodeEdit](tkCodeEdit) open, and every image [tkImage](tkImage), [tkPicture](tkPicture), [tkButton](tkButton) and `tkForm_SetIcon` load, takes that name where it takes a file path:
 
 ```freebasic
 #embed InterRegular "fonts/Inter-Regular.ttf"
@@ -139,6 +142,9 @@ dim as TK_HOST ptr h = tkHost_Create( "app", 400, 240, "mem:Inter-Regular.ttf" )
 - The name must match exactly; nothing is derived from it. `mem:` plus the file name is the convention: with tkApp's `FontDir` set to `"mem:"`, its role fonts are found under their usual file names.
 - The bytes stay the program's and must outlive every font opened from them. An [`#embed`](Category-Embed) array lives as long as the program.
 - Registering a name again replaces it. `tkHost_HasFontData( name )` says whether a name is registered.
+- `tkHost_AddResourceData( name, p, n )` is the same registry for any font or image; `tkHost_AddFontData` is its older name. `tkHost_AddResourceFile( name, path )` makes a name stand for a file instead, `tkHost_RemoveResource( name )` takes one back, `tkHost_HasResource( name )` says whether it stands for something there (bytes, or a file that exists) and `tkHost_ResourceFile( name )` is the file it stands for.
+- The [Form Designer](Form-Designer)'s Resource Center names a project's resources `res:<name>`.
+- `tkHost_LoadSurface( path )` loads an image as an `SDL_Surface` from a registered name or a file, through SDL_image; the caller destroys it. The image loads above go through it.
 - `tkHost_OpenFontFace( path, pt, face )` opens face `face` of a font file or registered name, unscaled and owned by the caller. The other font opens go through it.
 
 The `TK_ICON_*` constants are code points in `TK_FONT_ICONS` (`TK_ICON_SAVE`, `TK_ICON_FOLDER_OPEN`, `TK_ICON_SEARCH`, `TK_ICON_SETTINGS`, `TK_ICON_CLOSE` and more). Draw one with that font set: `p->PaintChar( wchr( TK_ICON_SAVE ), @rc, clr )`; controls with a glyph slot take the same string.
@@ -221,6 +227,9 @@ enum
     TKM_DROPFILES            ' files dropped from the OS: m->text = their paths, LF-separated (UTF-8),
     ' m->nStart = how many, m->x / y = the drop point; BUBBLES if refused
     TKM_DROPTEXT             ' text dropped from the OS: m->text, m->x / y; BUBBLES if refused
+    TKM_CONTEXTMENU          ' to a CONTEXT-MENU COMPONENT (tkWidget_SetContextMenu): m->pOther = the widget
+                             ' it opens for, m->x / y = where, in the surface's window pixels; m->bFlag =
+                             ' from the keyboard (the Menu key, Shift+F10)
 end enum
 
 enum
@@ -305,6 +314,7 @@ type tkHostDropSub as sub( byval h as TK_HOST ptr, byval m as TK_MSG ptr )
 type tkRendererGoneSub as sub( byval r as SDL_Renderer ptr )
 type tkHotChangedSub as sub( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr )
 type tkEventHookFunc as function( byval e as SDL_Event ptr ) as boolean
+type TK_MouseMoveSub as sub( byval w as TK_WIDGET ptr, byval x as long, byval y as long, byval buttons as long, byval mods as long )
 ```
 
 ### Procedures
@@ -319,8 +329,14 @@ sub tkHost_RemoveEventHook( byval f as tkEventHookFunc )
 function tkHost_PressSerial() as ulong
 function tkHost_Count() as long
 function tkHost_Scale( byval h as TK_HOST ptr, byval v as long ) as long
+sub tkHost_AddResourceData( byref name_ as string, byval pData as const any ptr, byval nBytes as integer )
+sub tkHost_AddResourceFile( byref name_ as string, byref file as ustring )
+sub tkHost_RemoveResource( byref name_ as string )
+function tkHost_HasResource( byref name_ as string ) as boolean
+function tkHost_ResourceFile( byref name_ as string ) as string
 sub tkHost_AddFontData( byref name_ as string, byval pData as const any ptr, byval nBytes as integer )
 function tkHost_HasFontData( byref name_ as string ) as boolean
+function tkHost_LoadSurface( byref path as ustring ) as SDL_Surface ptr
 function tkHost_OpenFontFace( byref path as string, byval pt as single, byval face as long ) as TTF_Font ptr
 function tkHost_OpenFont( byval h as TK_HOST ptr, byref path as ustring, byval pt as single ) as TTF_Font ptr
 function tkHost_Create( byref title as ustring, byval w as long, byval hgt as long, byref defaultFont as ustring, byval forcedScale as single = 0 ) as TK_HOST ptr
@@ -352,6 +368,10 @@ function tkWidget_IsAncestorOf( byval w as TK_WIDGET ptr, byval p as TK_WIDGET p
 sub tkWidget_Reparent( byval w as TK_WIDGET ptr, byval newParent as TK_WIDGET ptr )
 sub tkWidget_Enable( byval w as TK_WIDGET ptr, byval bEnable as boolean )
 sub tkWidget_Show( byval w as TK_WIDGET ptr, byval bShow as boolean )
+sub tkWidget_SetContextMenu( byval w as TK_WIDGET ptr, byval hMenu as TK_WIDGET ptr )
+function tkWidget_GetContextMenu( byval w as TK_WIDGET ptr ) as TK_WIDGET ptr
+sub tkWidget_ClearContextMenuRefs( byval hMenu as TK_WIDGET ptr )
+sub tkWidget_SetMouseMoveCallback( byval w as TK_WIDGET ptr, byval cb as TK_MouseMoveSub )
 sub tkWidget_SetCursor( byval w as TK_WIDGET ptr, byval cursor as long )
 sub tkWidget_KillTimer( byval w as TK_WIDGET ptr, byval id as long )
 sub tkWidget_SetTimer( byval w as TK_WIDGET ptr, byval id as long, byval ms as long )

@@ -1,0 +1,551 @@
+'' docmodel.tiko -- a module's documentation model from its interface text (see doc.ti), and
+'' '--emit-doc', which writes its pages.
+''
+'' THE INTERFACE TEXT, line by line (tkiemit.tiko writes it): '#line N "file"' says the next line
+'' is line N+1 of that file, and every line after it one more -- blank lines stand where comments
+'' were, so the count holds. Inside 'namespace __tko_mod_<chain>':
+''
+''     public declare function F( ... ) as T      a procedure (overloads merge into one item)
+''     public type T ... end type                 a type, its members, 'private:' sections and all
+''     public enum E ... end enum                 an enum and its values
+''     public const K = v                         a constant
+''     public extern x alias "..." as T           a 'dim shared' variable
+''     function G( of T )( ... ) ... end function a generic, written whole: its header is kept
+''     namespace N ... end namespace              a namespace of the module's own
+''
+'' and nothing without 'public' is documented: a module-private name is in the interface only for
+'' the module's own macros (tkiemit.tiko), and a 'private' one is not there at all.
+
+#import "std/containers"
+#import "std/fs"
+#include once "driver/doc.ti"
+#include once "driver/modresolve.ti"
+#include once "driver/modbuild.ti"
+#include once "driver/tkiemit.ti"
+#include once "driver/diagout.ti"
+#include once "support/text.ti"
+
+namespace Tko.Doc
+
+'' ---------------------------------------------------------------- small text helpers
+
+private function Lower_( byref s as string ) as string
+    return Tko.Text.LowerAscii( s )
+end function
+
+private function IdChar_( byval c as uint8 ) as boolean
+    return ((c >= 48) andalso (c <= 57)) orelse ((c >= 65) andalso (c <= 90)) orelse _
+           ((c >= 97) andalso (c <= 122)) orelse (c = 95)
+end function
+
+'' The name at the start of s (letters, digits, '_' and '.'), "" when none.
+private function NameAt_( byref s as string ) as string
+    dim as int32 e = 0
+    while e < len( s )
+        dim as uint8 c = s[e]
+        if (IdChar_( c ) = false) andalso (c <> 46) then exit while
+        e += 1
+    wend
+    return left( s, e )
+end function
+
+'' 's' without a leading word 'w' (and the blanks after it), else s unchanged; 'had' says which.
+private function Strip_( byref s as string, byref w as string, byref had as boolean ) as string
+    had = false
+    if Lower_( left( s, len( w ) + 1 ) ) = w & " " then
+        had = true
+        return ltrim( mid( s, len( w ) + 2 ), any chr( 32, 9 ) )
+    end if
+    return s
+end function
+
+private function Anchor_( byref m as DocModule, byref nm as string ) as string
+    dim as string a = ""
+    for i as int32 = 0 to len( nm ) - 1
+        dim as uint8 c = nm[i]
+        if IdChar_( c ) then
+            a &= Lower_( chr( c ) )
+        elseif (len( a ) > 0) andalso (right( a, 1 ) <> "-") then
+            a &= "-"
+        end if
+    next
+    if len( a ) = 0 then a = "item"
+    '' Unique on the page.
+    dim as string base_ = a
+    dim as int32 n = 2
+    dim as boolean taken
+    do
+        taken = false
+        for k as int32 = 0 to m.items.Count - 1
+            if m.items[k].anchor = a then taken = true : exit for
+        next
+        if taken = false then exit do
+        a = base_ & "-" & n
+        n += 1
+    loop
+    return a
+end function
+
+'' THE MODULE PREFIXES an interface writes -- '__tko_mod_std_strings.' -- as the alias a program
+'' would write: the chain's last part, or nothing for the module's own.
+private function Unmangle_( byref ctx as Tko.CompilerContext, byref s as string, byref ownNs as string ) as string
+    dim as string r = s
+    dim as int32 p = instr( r, "__tko_mod_" )
+    while p > 0
+        dim as int32 e = p
+        while (e <= len( r )) andalso IdChar_( r[e - 1] )
+            e += 1
+        wend
+        dim as string ns = mid( r, p, e - p )
+        dim as string alias_ = ""
+        if Lower_( ns ) <> Lower_( ownNs ) then
+            alias_ = mid( ns, 11 )
+            for each c as string in ctx.ifaceChains
+                if Lower_( Tko.Modules.InterfaceNamespace( c ) ) = Lower_( ns ) then
+                    alias_ = mid( c, instrrev( c, "." ) + 1 )
+                    exit for
+                end if
+            next
+        end if
+        '' 'ns.' becomes 'alias.', or nothing for the module itself.
+        dim as int32 skip_ = e - p
+        if mid( r, e, 1 ) = "." then skip_ += 1
+        if len( alias_ ) > 0 then
+            r = left( r, p - 1 ) & alias_ & "." & mid( r, p + skip_ )
+            p = instr( p + len( alias_ ) + 1, r, "__tko_mod_" )
+        else
+            r = left( r, p - 1 ) & mid( r, p + skip_ )
+            p = instr( p, r, "__tko_mod_" )
+        end if
+    wend
+    return r
+end function
+
+'' ---------------------------------------------------------------- the model
+
+private sub AddSig_( byref sigs as containers.Array( of DocSig ), byref text as string, _
+                     byref file_ as string, byval line_ as int32 )
+    for k as int32 = 0 to sigs.Count - 1
+        if sigs[k].text = text then return               '' a macro's copies: one line each
+    next
+    dim as DocSig s
+    s.text = text
+    s.file_ = file_
+    s.line_ = line_
+    sigs.Push( s )
+end sub
+
+private function Family_( byref kind as string ) as string
+    select case kind
+    case "function", "sub", "operator", "property" : return "proc"
+    end select
+    return kind
+end function
+
+'' An item, or the overload of one already there (same namespace, family and name).
+private function ItemFor_( byref m as DocModule, byref kind as string, byref nm as string, _
+                           byref ns as string ) as int32
+    if Family_( kind ) = "proc" then
+        for k as int32 = 0 to m.items.Count - 1
+            if (Family_( m.items[k].kind ) = "proc") andalso (Lower_( m.items[k].name ) = Lower_( nm )) andalso _
+               (Lower_( m.items[k].nsPath ) = Lower_( ns )) then return k
+        next
+    end if
+    dim as DocItem it
+    it.kind = kind
+    it.name = nm
+    it.nsPath = ns
+    it.anchor = Anchor_( m, iif( len( ns ) > 0, ns & "." & nm, nm ) )
+    m.items.Push( it )
+    return m.items.Count - 1
+end function
+
+'' The doc of a declaration at file:line, else of its definition.
+private function DocFor_( byref m as DocModule, byref file_ as string, byval line_ as int32, _
+                          byref qualName as string ) as string
+    dim as string d = DocAbove( m.src, file_, line_ )
+    if len( d ) = 0 then d = DocOfDefinition( m.src, m.files, qualName )
+    return d
+end function
+
+'' What a procedure head names: 'declare function Foo( ...' -> Foo; operators by their token.
+private sub ProcHead_( byref sig as string, byref kind as string, byref nm as string )
+    dim as string s = sig, w
+    dim as boolean had
+    s = Strip_( s, "declare", had )
+    s = Strip_( s, "static", had )
+    dim as int32 sp = instr( s, " " )
+    kind = Lower_( iif( sp > 0, left( s, sp - 1 ), s ) )
+    dim as string rest = ltrim( mid( s, sp + 1 ) )
+    if kind = "operator" then
+        dim as int32 e = instr( rest, " " )
+        dim as int32 lp = instr( rest, "(" )
+        if (lp > 0) andalso ((e = 0) orelse (lp < e)) then e = lp
+        nm = "operator " & trim( iif( e > 0, left( rest, e - 1 ), rest ) )
+    else
+        nm = NameAt_( rest )
+    end if
+end sub
+
+'' THE BODY OF A TYPE: members until its 'end', sections by label.
+private sub TypeMember_( byref m as DocModule, byref it as DocItem, byref ln as string, _
+                         byref vis as string, byref file_ as string, byval line_ as int32, _
+                         byref ctx as Tko.CompilerContext, byref ownNs as string )
+    dim as string t = trim( ln, any chr( 32, 9 ) )
+    dim as string lt = Lower_( t )
+    if (vis = "private") orelse (len( t ) = 0) then return
+    dim as string sig = Unmangle_( ctx, t, ownNs )
+    dim as DocMember mb
+    mb.vis = vis
+    if (left( lt, 9 ) = "inherits ") orelse (left( lt, 11 ) = "implements ") then
+        AddSig_( it.sigs, sig, file_, line_ )
+        return
+    end if
+    if left( lt, 8 ) = "declare " then
+        dim as string sh = mid( sig, 9 )
+        dim as boolean had
+        dim as string s2 = Strip_( sh, "static", had )
+        dim as int32 sp = instr( s2, " " )
+        dim as string k = Lower_( iif( sp > 0, left( s2, sp - 1 ), s2 ) )
+        select case k
+        case "constructor", "destructor"
+            mb.kind = k
+            mb.name = k
+        case "function", "sub"
+            mb.kind = "method"
+            mb.name = NameAt_( ltrim( mid( s2, sp + 1 ) ) )
+        case "property"
+            mb.kind = "property"
+            mb.name = NameAt_( ltrim( mid( s2, sp + 1 ) ) )
+        case "operator"
+            dim as string pk, pn
+            ProcHead_( sh, pk, pn )
+            mb.kind = "operator"
+            mb.name = pn
+        case else
+            return
+        end select
+        sig = sh
+    elseif (left( lt, 6 ) = "const ") then
+        mb.kind = "const"
+        mb.name = NameAt_( ltrim( mid( t, 7 ) ) )
+    elseif (left( lt, 3 ) = "as ") then
+        '' 'as T a, b'
+        mb.kind = "field"
+        dim as string rest = t
+        mb.name = ""
+        dim as int32 cm = instrrev( rest, " " )
+        mb.name = trim( mid( rest, cm + 1 ) )
+    else
+        '' 'a as T', 'a( any ) as T', 'a : 4 as long'
+        mb.kind = "field"
+        mb.name = NameAt_( t )
+        if len( mb.name ) = 0 then return
+    end if
+    '' Methods with one name are one member, its overloads its signatures.
+    for k as int32 = 0 to it.members.Count - 1
+        if (it.members[k].kind = mb.kind) andalso (Lower_( it.members[k].name ) = Lower_( mb.name )) then
+            AddSig_( it.members[k].sigs, sig, file_, line_ )
+            if len( it.members[k].doc ) = 0 then
+                it.members[k].doc = DocFor_( m, file_, line_, it.name & "." & mb.name )
+            end if
+            return
+        end if
+    next
+    dim as string qn = it.name & "." & iif( (mb.kind = "constructor") orelse (mb.kind = "destructor"), it.name, mb.name )
+    mb.doc = DocAbove( m.src, file_, line_ )
+    if (len( mb.doc ) = 0) andalso (mb.kind = "field") then mb.doc = DocTrailing( m.src, file_, line_ )
+    if (len( mb.doc ) = 0) andalso (mb.kind <> "field") then mb.doc = DocOfDefinition( m.src, m.files, qn )
+    AddSig_( mb.sigs, sig, file_, line_ )
+    it.members.Push( mb )
+end sub
+
+sub FromInterface _
+    ( byref ctx as Tko.CompilerContext, byref iface as string, byref chain as string, _
+      byref importPath as string, byref dir_ as string, byref outm as DocModule )
+
+    outm.chain = chain
+    outm.importPath = importPath
+    outm.name = mid( chain, instrrev( chain, "." ) + 1 )
+    outm.dir_ = dir_
+    Tko.Modules.ModuleFiles( dir_, outm.files )
+    for k as int32 = 0 to outm.files.Count - 1
+        outm.files[k] = Tko.Modules.JoinPath( dir_, outm.files[k] )
+    next
+    '' THE OVERVIEW: the file named like the module, else the first.
+    dim as string mainFile = ""
+    for each f as string in outm.files
+        dim as string b = Lower_( mid( f, instrrev( f, "/" ) + 1 ) )
+        if (b = Lower_( outm.name ) & ".tiko") orelse (b = Lower_( outm.name ) & ".bas") then mainFile = f
+    next
+    if (len( mainFile ) = 0) andalso (outm.files.Count > 0) then mainFile = outm.files[0]
+    if len( mainFile ) > 0 then outm.overview = Overview( outm.src, mainFile )
+
+    dim as string ownNs = Tko.Modules.InterfaceNamespace( chain )
+    dim as string file_ = ""
+    dim as int32 nextLine = 0
+    dim as Tko.StrVec nsStack            '' the module's own namespaces; "" for transparent blocks
+    dim as int32 cur = -1                '' the item whose block is open (type or enum)
+    dim as string curVis                 '' its section
+    dim as int32 depth = 0               '' nested anonymous union/type inside a type
+    dim as boolean skipBlock = false     '' a block that is not documented: read to its end
+    dim as string blockEnd = ""          '' the 'end ...' that closes the open block
+    dim as int32 bodyDepth = 0           '' inside a generic's body
+
+    dim as int32 p = 1
+    while p <= len( iface )
+        dim as int32 e = instr( p, iface, chr( 10 ) )
+        if e = 0 then e = len( iface ) + 1
+        dim as string ln = mid( iface, p, e - p )
+        p = e + 1
+        if right( ln, 1 ) = chr( 13 ) then ln = left( ln, len( ln ) - 1 )
+        dim as string t = trim( ln, any chr( 32, 9 ) )
+        dim as string lt = Lower_( t )
+        if left( lt, 6 ) = "#line " then
+            dim as int32 q = instr( t, chr( 34 ) )
+            nextLine = valint( mid( t, 7 ) ) + 1
+            if q > 0 then file_ = mid( t, q + 1, instrrev( t, chr( 34 ) ) - q - 1 )
+            continue while
+        end if
+        dim as int32 srcLine = nextLine
+        if nextLine > 0 then nextLine += 1
+        if len( t ) = 0 then continue while
+        if (left( t, 1 ) = "'") orelse (left( t, 1 ) = "#") then continue while
+
+        '' A GENERIC'S BODY, written whole: skipped to its end.
+        if bodyDepth > 0 then
+            dim as boolean had
+            dim as string s = Strip_( Strip_( Strip_( t, "public", had ), "private", had ), "static", had )
+            dim as string ls = Lower_( s )
+            if (left( ls, 4 ) = "end ") andalso _
+               ((ls = "end function") orelse (ls = "end sub") orelse (ls = "end operator") orelse _
+                (ls = "end property") orelse (ls = "end constructor") orelse (ls = "end destructor")) then
+                bodyDepth -= 1
+            elseif (left( ls, 9 ) = "function ") orelse (left( ls, 4 ) = "sub ") orelse _
+                   (left( ls, 9 ) = "operator ") orelse (left( ls, 9 ) = "property ") orelse _
+                   (left( ls, 12 ) = "constructor ") orelse (left( ls, 11 ) = "destructor ") then
+                bodyDepth += 1
+            end if
+            '' A one-line lambda opens nothing a line of its own closes, and a block lambda's
+            '' 'end function' is matched by its 'function(' head below.
+            if (instr( ls, "function(" ) > 0) orelse (instr( ls, "sub(" ) > 0) orelse _
+               (instr( ls, "function[" ) > 0) orelse (instr( ls, "sub[" ) > 0) then
+                if (instr( ls, "end function" ) = 0) andalso (instr( ls, "end sub" ) = 0) then bodyDepth += 1
+            end if
+            continue while
+        end if
+
+        '' AN OPEN BLOCK: a type's or an enum's body, or one read only to its end.
+        if len( blockEnd ) > 0 then
+            if (lt = blockEnd) andalso (depth = 0) then
+                blockEnd = ""
+                cur = -1
+                skipBlock = false
+                continue while
+            end if
+            if skipBlock then continue while
+            dim as DocItem ptr it = @outm.items[cur]
+            if it->kind = "enum" then
+                '' 'A, B = 2, C'
+                dim as int32 q = 1
+                do
+                    dim as int32 c = instr( q, t, "," )
+                    dim as string part = trim( iif( c = 0, mid( t, q ), mid( t, q, c - q ) ) )
+                    if len( part ) > 0 then
+                        dim as DocMember mb
+                        mb.kind = "value"
+                        mb.name = NameAt_( part )
+                        mb.vis = "public"
+                        mb.doc = DocAbove( outm.src, file_, srcLine )
+                        if len( mb.doc ) = 0 then mb.doc = DocTrailing( outm.src, file_, srcLine )
+                        AddSig_( mb.sigs, part, file_, srcLine )
+                        it->members.Push( mb )
+                    end if
+                    if c = 0 then exit do
+                    q = c + 1
+                loop
+                continue while
+            end if
+            if (lt = "private:") orelse (lt = "protected:") orelse (lt = "public:") then
+                curVis = left( lt, len( lt ) - 1 )
+                continue while
+            end if
+            '' Nested anonymous unions and types are their fields' grouping, not members.
+            if (lt = "union") orelse (lt = "type") then depth += 1 : continue while
+            if ((lt = "end union") orelse (lt = "end type")) andalso (depth > 0) then depth -= 1 : continue while
+            TypeMember_( outm, *it, t, curVis, file_, srcLine, ctx, ownNs )
+            continue while
+        end if
+
+        '' NAMESPACES: the module's own wrapper is the top level; a user namespace prefixes names.
+        if left( lt, 10 ) = "namespace " then
+            dim as string nm = trim( mid( t, 11 ) )
+            nsStack.Push( iif( left( Lower_( nm ), 10 ) = "__tko_mod_", "", nm ) )
+            continue while
+        end if
+        if lt = "end namespace" then
+            if nsStack.Count > 0 then nsStack.Pop( )
+            continue while
+        end if
+        '' extern "C" ... end extern: transparent.
+        if (left( lt, 8 ) = "extern """) then continue while
+        if lt = "end extern" then continue while
+
+        dim as string ns = ""
+        for each s as string in nsStack
+            if len( s ) > 0 then ns &= iif( len( ns ) > 0, ".", "" ) & s
+        next
+
+        dim as boolean isPub
+        dim as string s = Strip_( t, "public", isPub )
+        dim as boolean isPriv
+        s = Strip_( s, "private", isPriv )
+        dim as string ls = Lower_( s )
+        dim as string sig = Unmangle_( ctx, s, ownNs )
+
+        '' BLOCKS: type / union / class / interface / enum. Read whole, documented when public.
+        dim as string head = Lower_( NameAt_( ls ) )
+        dim as string rest = ltrim( mid( s, len( head ) + 1 ) )
+        dim as boolean isAlias = false
+        if head = "type" then
+            dim as string lr = Lower_( rest )
+            dim as int32 asAt = instr( lr, " as " )
+            isAlias = (asAt > 0) andalso (right( lr, 8 ) <> " as view")
+        end if
+        if (head = "partial") then
+            rest = ltrim( mid( rest, 1 ) )
+            head = Lower_( NameAt_( Lower_( rest ) ) )
+            rest = ltrim( mid( rest, len( head ) + 1 ) )
+        end if
+        select case head
+        case "type", "union", "class", "interface", "enum"
+            if isAlias then
+                if isPub then
+                    dim as string nm = NameAt_( rest )
+                    dim as int32 k = ItemFor_( outm, "alias", nm, ns )
+                    AddSig_( outm.items[k].sigs, sig, file_, srcLine )
+                    if len( outm.items[k].doc ) = 0 then outm.items[k].doc = DocAbove( outm.src, file_, srcLine )
+                end if
+                continue while
+            end if
+            blockEnd = "end " & head
+            depth = 0
+            if isPub = false then
+                skipBlock = true
+                continue while
+            end if
+            dim as string nm = NameAt_( rest )
+            cur = ItemFor_( outm, head, nm, ns )
+            curVis = "public"
+            AddSig_( outm.items[cur].sigs, sig, file_, srcLine )
+            outm.items[cur].doc = DocAbove( outm.src, file_, srcLine )
+            continue while
+        end select
+
+        if isPub = false then
+            '' A generic of the module's own, written whole: its body is skipped all the same.
+            if (head = "function") orelse (head = "sub") orelse (head = "operator") then bodyDepth = 1
+            continue while
+        end if
+
+        dim as boolean decl
+        dim as string s2 = Strip_( s, "declare", decl )
+        dim as string h2 = Lower_( NameAt_( Lower_( s2 ) ) )
+        select case h2
+        case "function", "sub", "operator", "property", "static"
+            dim as string kind, nm
+            ProcHead_( s, kind, nm )
+            if decl = false then
+                '' A GENERIC, written whole: the head documents it, the body is skipped. An
+                '' out-of-line member of a generic type ('Box( of T ).Get') is the type's.
+                bodyDepth = 1
+                if instr( nm, "." ) > 0 then continue while
+            end if
+            dim as int32 k = ItemFor_( outm, kind, nm, ns )
+            dim as string shown = iif( decl, Unmangle_( ctx, s2, ownNs ), sig )
+            AddSig_( outm.items[k].sigs, shown, file_, srcLine )
+            if len( outm.items[k].doc ) = 0 then outm.items[k].doc = DocFor_( outm, file_, srcLine, nm )
+        case "const"
+            dim as string nm = NameAt_( ltrim( mid( s, 6 ) ) )
+            dim as int32 k = ItemFor_( outm, "const", nm, ns )
+            AddSig_( outm.items[k].sigs, sig, file_, srcLine )
+            if len( outm.items[k].doc ) = 0 then
+                outm.items[k].doc = DocAbove( outm.src, file_, srcLine )
+                if len( outm.items[k].doc ) = 0 then outm.items[k].doc = DocTrailing( outm.src, file_, srcLine )
+            end if
+        case "extern"
+            '' 'extern NAME alias "mangled" as T' -- a 'dim shared'.
+            dim as string r2 = ltrim( mid( s, 7 ) )
+            dim as string nm = NameAt_( r2 )
+            dim as string ty = ""
+            dim as int32 asAt = instrrev( Lower_( r2 ), " as " )
+            if asAt > 0 then ty = mid( r2, asAt + 4 )
+            dim as int32 k = ItemFor_( outm, "variable", nm, ns )
+            AddSig_( outm.items[k].sigs, "dim shared " & nm & " as " & Unmangle_( ctx, ty, ownNs ), file_, srcLine )
+            if len( outm.items[k].doc ) = 0 then outm.items[k].doc = DocAbove( outm.src, file_, srcLine )
+        end select
+    wend
+
+    '' THE EXPORTED MACROS, from the sources: the interface keeps them only renamed.
+    dim as Tko.StrVec macs
+    ExportedMacros( outm.src, outm.files, macs )
+    for each mline as string in macs
+        dim as int32 t1 = instr( mline, chr( 9 ) )
+        dim as int32 t2 = instr( t1 + 1, mline, chr( 9 ) )
+        dim as int32 t3 = instr( t2 + 1, mline, chr( 9 ) )
+        dim as string nm = left( mline, t1 - 1 )
+        dim as string sg = mid( mline, t1 + 1, t2 - t1 - 1 )
+        dim as string mf = mid( mline, t2 + 1, t3 - t2 - 1 )
+        dim as int32 ml = valint( mid( mline, t3 + 1 ) )
+        dim as int32 k = ItemFor_( outm, "macro", nm, "" )
+        AddSig_( outm.items[k].sigs, outm.name & "." & sg, mf, ml )
+        outm.items[k].doc = DocAbove( outm.src, mf, ml )
+    next
+end sub
+
+'' ---------------------------------------------------------------- --emit-doc
+
+private function WriteFile_( byref path_ as string, byref text as string ) as boolean
+    dim as string d = Tko.Modules.DirOfFile( path_ )
+    if (len( d ) > 0) andalso (fs.IsDir( d ) = false) then fs.CreateDirAll( d )
+    if fs.IsDir( path_ ) then return false
+    dim as int32 f = freefile
+    if open( path_ for output as #f ) <> 0 then return false
+    print #f, text;
+    close #f
+    return true
+end function
+
+function EmitDoc( byref ctx as Tko.CompilerContext, byref dir_ as string, byref outDir as string ) as int32
+    dim as int32 rc = Tko.EXIT_OK
+    dim as int32 i = Tko.Modules.BuildForInterface( ctx, dir_, rc )
+    if i < 0 then return rc
+    dim as string chain = ctx.ifaceChains[i]
+    '' HOW A PROGRAM IMPORTS IT: by its package path, 'std/strings' or 'shapes/geo' -- the
+    '' spelling that works from anywhere, a file of its own package included (a bare 'geo' is
+    '' looked for in the toolchain's pkg/ only).
+    dim as string importAs = chain
+    for k as int32 = 0 to len( importAs ) - 1
+        if importAs[k] = 46 then importAs[k] = 47
+    next
+    dim as DocModule m
+    FromInterface( ctx, ctx.ifaceTexts[i], chain, importAs, ctx.ifaceDirs[i], m )
+    dim as string base_ = Tko.Modules.JoinPath( outDir, chain )
+    dim as string parts = Tko.Modules.JoinPath( outDir, ".parts" )
+    dim as string files( 0 to 3 ) = { base_ & ".md", base_ & ".html", _
+        Tko.Modules.JoinPath( parts, chain & ".json" ), Tko.Modules.JoinPath( parts, chain & ".idx" ) }
+    dim as string texts( 0 to 3 )
+    texts( 0 ) = Markdown( m )
+    texts( 1 ) = Html( m )
+    texts( 2 ) = JsonOf( m )
+    texts( 3 ) = IndexLines( m )
+    for k as int32 = 0 to 3
+        if WriteFile_( files( k ), texts( k ) ) = false then
+            ctx.diags.ReportGlobal( Tko.TKO1208, files( k ) )
+            return Tko.EXIT_TOOL_FAILED
+        end if
+    next
+    return Tko.EXIT_OK
+end function
+
+end namespace

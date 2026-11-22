@@ -207,6 +207,17 @@ sub RunPass( byval fScale as single )
     tkForm_Destroy( owned )
     gAllowClose = true
 
+    ' An owner destroyed while its owned form is open takes that form with it, first (SDL destroys
+    ' a parent's child windows along with it: the owned form's own destroy would come too late).
+    dim as long nOwnerBefore = tkApp_FormCount()
+    dim as TK_FORM ptr top = tkApp_NewForm( "Owner", 300, 200, 0, fScale )
+    dim as TK_FORM ptr child = tkApp_NewForm( "Owned by it", 200, 120, top )
+    tkForm_Show( top )
+    tkForm_Show( child )
+    tkTest_PumpFor( tkForm_Host( child ), 30 )
+    tkForm_Destroy( top )
+    tkTest_Check( "destroying an owner destroys its open owned form too", tkApp_FormCount() = nOwnerBefore, str( tkApp_FormCount() ) )
+
     ' ShowModalKeep: the controls survive the modal loop, the window is hidden, it can be reused.
     dim as TK_FORM ptr kept = tkApp_NewForm( "Kept", 300, 160, f )
     dim as TK_WIDGET ptr keptBox = tkTextBox_Create( tkForm_Widget( kept ), 1 )
@@ -221,6 +232,90 @@ sub RunPass( byval fScale as single )
     tkForm_Destroy( kept )
     tkApp_KillTimer( wd )
     gModal = 0
+
+    ' ---- H: the window -------------------------------------------------------------------
+    dim as TK_FORM ptr wf = tkApp_NewForm( "Window", 300, 200, 0, fScale )
+    dim as TK_HOST ptr wh = tkForm_Host( wf )
+    tkTest_Check( "a top-level form starts resizable", tkForm_GetResizable( wf ) )
+    tkForm_SetResizable( wf, false )
+    tkTest_Check( "SetResizable false", tkForm_GetResizable( wf ) = false )
+    tkForm_SetResizable( wf, true )
+    tkForm_SetMinSize( wf, 200, 150 )
+    tkForm_SetMaxSize( wf, 800, 600 )
+    dim as long mw, mh, xw, xh
+    SDL_GetWindowMinimumSize( wh->win, @mw, @mh )
+    SDL_GetWindowMaximumSize( wh->win, @xw, @xh )
+    dim as single k = wh->fScale / wh->fDensity
+    tkTest_Check( "the size limits, scaled to window coordinates", _
+        (mw = cint( 200 * k )) andalso (mh = cint( 150 * k )) andalso (xw = cint( 800 * k )) andalso (xh = cint( 600 * k )), _
+        mw & "x" & mh & " " & xw & "x" & xh )
+    dim as long gw, gh
+    tkForm_GetMinSize( wf, gw, gh )
+    tkTest_Check( "GetMinSize answers design units", (gw = 200) andalso (gh = 150) )
+    tkForm_SetMaxSize( wf, 0, 0 )
+    SDL_GetWindowMaximumSize( wh->win, @xw, @xh )
+    tkTest_Check( "a maximum of 0 is no limit", (xw = 0) andalso (xh = 0) )
+    ' Wayland has no always-on-top, and a window icon only where the compositor offers one
+    dim as string drv = *SDL_GetCurrentVideoDriver()
+    if drv <> "wayland" then
+        tkForm_SetAlwaysOnTop( wf, true )
+        tkTest_Check( "AlwaysOnTop", tkForm_GetAlwaysOnTop( wf ) )
+        tkForm_SetAlwaysOnTop( wf, false )
+        tkTest_Check( "and off again", tkForm_GetAlwaysOnTop( wf ) = false )
+    end if
+    tkTest_Check( "a missing icon file is refused", tkForm_SetIcon( wf, "no-such-icon.png" ) = false )
+    if drv <> "wayland" then
+        dim as SDL_Surface ptr s = SDL_CreateSurface( 16, 16, SDL_PIXELFORMAT_ARGB8888 )
+        SDL_FillSurfaceRect( s, 0, &hFF3366CCul )
+        dim as string iconPath = "selftest-icon.bmp"
+        SDL_SaveBMP( s, strptr( iconPath ) )
+        SDL_DestroySurface( s )
+        tkTest_Check( "an icon from an image file", tkForm_SetIcon( wf, iconPath ) )
+        kill iconPath
+    end if
+    tkForm_SetWindowState( wf, TKFORM_STATE_MAXIMIZED )
+    tkTest_Check( "before the show, the state asked for", tkForm_GetWindowState( wf ) = TKFORM_STATE_MAXIMIZED )
+    tkForm_Show( wf )
+    tkTest_PumpFor( wh, 200 )
+    tkTest_Check( "it shows maximized", tkForm_GetWindowState( wf ) = TKFORM_STATE_MAXIMIZED )
+    tkForm_SetWindowState( wf, TKFORM_STATE_NORMAL )
+    tkTest_PumpFor( wh, 200 )
+    tkTest_Check( "and is restored", tkForm_GetWindowState( wf ) = TKFORM_STATE_NORMAL )
+    tkForm_Destroy( wf )
+    ' where a form starts: on Linux the window manager has the last word (WSLg's ignores it), so
+    ' only where SDL places the window itself
+    if (drv = "windows") orelse (drv = "cocoa") then
+        dim as TK_FORM ptr cf = tkApp_NewForm( "Centred", 300, 200, 0, fScale )
+        tkForm_SetStartPosition( cf, TKFORM_POS_CENTER_OWNER )
+        tkTest_Check( "CENTER_OWNER is kept", tkForm_GetStartPosition( cf ) = TKFORM_POS_CENTER_OWNER )
+        tkForm_Show( cf )
+        tkTest_PumpFor( tkForm_Host( cf ), 100 )
+        ' SDL centres in the display's usable area (Windows: above the taskbar), or the whole of it
+        dim as SDL_Rect rb, ru
+        dim as SDL_DisplayID disp = SDL_GetDisplayForWindow( tkForm_Host( cf )->win )
+        SDL_GetDisplayBounds( disp, @rb )
+        SDL_GetDisplayUsableBounds( disp, @ru )
+        dim as long px, py, pw, ph
+        SDL_GetWindowPosition( tkForm_Host( cf )->win, @px, @py )
+        SDL_GetWindowSize( tkForm_Host( cf )->win, @pw, @ph )
+        dim as boolean inUsable = (abs( px - (ru.x + (ru.w - pw) \ 2) ) <= 1) andalso (abs( py - (ru.y + (ru.h - ph) \ 2) ) <= 1)
+        dim as boolean inWhole = (abs( px - (rb.x + (rb.w - pw) \ 2) ) <= 1) andalso (abs( py - (rb.y + (rb.h - ph) \ 2) ) <= 1)
+        tkTest_Check( "CENTER_OWNER with no owner centres on the screen", inUsable orelse inWhole, _
+            px & "," & py & " in " & ru.x & "," & ru.y & " " & ru.w & "x" & ru.h & " size " & pw & "x" & ph )
+        tkForm_Destroy( cf )
+        dim as TK_FORM ptr oc = tkApp_NewForm( "Over owner", 200, 100, f )
+        tkForm_SetStartPosition( oc, TKFORM_POS_CENTER_OWNER )
+        tkForm_Show( oc )
+        tkTest_PumpFor( tkForm_Host( oc ), 100 )
+        dim as long ox, oy, ow, oh
+        SDL_GetWindowPosition( h->win, @ox, @oy )
+        SDL_GetWindowSize( h->win, @ow, @oh )
+        SDL_GetWindowPosition( tkForm_Host( oc )->win, @px, @py )
+        SDL_GetWindowSize( tkForm_Host( oc )->win, @pw, @ph )
+        tkTest_Check( "CENTER_OWNER centres over the owner", _
+            (abs( px - (ox + (ow - pw) \ 2) ) <= 1) andalso (abs( py - (oy + (oh - ph) \ 2) ) <= 1), px & "," & py )
+        tkForm_Destroy( oc )
+    end if
 
     ' ---- F: the close button asks OnClose ----------------------------------------------------
     gAllowClose = false
@@ -265,6 +360,18 @@ scope
 end scope
 RunPass( 1.0 )
 RunPass( 1.75 )
+
+' ---- the OS's normal UI font size (Windows: the message font; macOS 13; else 10)
+tkTest_Begin( "systemfont" )
+scope
+    dim as single sz = tkApp_SystemFontSize( )
+    print "  system font size: " & sz & " pt"
+#ifdef __FB_WIN32__
+    tkTest_Check( "Windows' message font size, in points", (sz >= 6) andalso (sz <= 24) )
+#else
+    tkTest_Check( "the OS's normal size", (sz >= 6) andalso (sz <= 24) )
+#endif
+end scope
 
 ' ---- Run / Quit: the last thing, Run shuts the application down -------------------------
 tkTest_Begin( "run" )

@@ -13,6 +13,7 @@ using outcome
 const HTTP_HEAD_MAX = 65536             '' the status line and headers together
 const HTTP_LINE_MAX = 8192              '' one chunk-size or trailer line
 const HTTP_BUF = 16384
+const HTTP_INTERIM_MAX = 16             '' 1xx responses skipped before one request fails
 
 '' -------------------------------------------------------------- connections
 
@@ -179,26 +180,48 @@ private function hValidValue( byref v as const ustring ) as boolean
     return TRUE
 end function
 
-'' The request head in bytes: request line, headers, blank line.
+'' TRUE for the headers that carry credentials, which never follow a redirect off the origin.
+private function hIsCredential( byref nm as const ustring ) as boolean
+    dim as string n = lcase( nm )
+    return ( n = "authorization" ) orelse ( n = "proxy-authorization" ) orelse ( n = "cookie" )
+end function
+
+'' FALSE when s holds a byte no request line or Host header may carry: a control
+'' character, DEL, or (target) a space.
+private function hValidWire( byref s as const ustring, byval spaceOk as boolean ) as boolean
+    for i as long = 1 to len( s )
+        dim as long ch = asc( s, i )
+        if( ( ch < 32 ) orelse ( ch = 127 ) orelse ( ( ch = 32 ) andalso ( spaceOk = FALSE ) ) ) then return FALSE
+    next
+    return TRUE
+end function
+
+'' The request head in bytes: request line, headers, blank line.  noCreds: a redirect has
+'' left the original origin, so the client's DefaultHeader credentials are not added.
 private function hHead( byref cl as Client, byref req as const Request, byref u as net.Url, byval secure as boolean, _
-                        byref head as string ) as boolean
+                        byval noCreds as boolean, byref head as string ) as boolean
     dim as ustring target = u.EscapedPath( )
     if( len( target ) = 0 ) then target = "/"
     if( len( u.RawQuery ) > 0 ) then target &= "?" & u.RawQuery
     dim as ustring host = u.Host
     if( instr( host, ":" ) > 0 ) then host = "[" & host & "]"
     if( ( u.Port >= 0 ) andalso ( u.Port <> iif( secure, 443, 80 ) ) ) then host &= ":" & u.Port
+    if( ( hValidWire( target, FALSE ) = FALSE ) orelse ( hValidWire( host, TRUE ) = FALSE ) ) then return FALSE
     dim as Headers h = req.Header
-    for i as long = 0 to h.Count( ) - 1
-        if( ( hValidName( h.NameAt( i ) ) = FALSE ) orelse ( hValidValue( h.ValueAt( i ) ) = FALSE ) ) then return FALSE
-    next
     for i as long = 0 to cl.DefaultHeader.Count( ) - 1
-        if( h.Has( cl.DefaultHeader.NameAt( i ) ) = FALSE ) then h.Add( cl.DefaultHeader.NameAt( i ), cl.DefaultHeader.ValueAt( i ) )
+        dim as ustring dn = cl.DefaultHeader.NameAt( i )
+        if( noCreds andalso hIsCredential( dn ) ) then continue for
+        if( h.Has( dn ) = FALSE ) then h.Add( dn, cl.DefaultHeader.ValueAt( i ) )
     next
     if( ( len( u.User ) > 0 ) andalso ( h.Has( "Authorization" ) = FALSE ) ) then
         h.Add( "Authorization", "Basic " & codec.Base64Encode( u.User & ":" & u.Password ) )
     end if
     if( ( h.Has( "User-Agent" ) = FALSE ) andalso ( len( cl.UserAgent ) > 0 ) ) then h.Add( "User-Agent", cl.UserAgent )
+    '' Every header is checked AFTER the merge: DefaultHeader and UserAgent are as able to
+    '' carry a CR/LF into the head as the request's own.
+    for i as long = 0 to h.Count( ) - 1
+        if( ( hValidName( h.NameAt( i ) ) = FALSE ) orelse ( hValidValue( h.ValueAt( i ) ) = FALSE ) ) then return FALSE
+    next
     if( h.Has( "Accept" ) = FALSE ) then h.Add( "Accept", "*/*" )
     h.Remove( "Host" )
     h.Remove( "Content-Length" )
@@ -536,7 +559,8 @@ end function
 
 '' Sends `req` to `u` and reads the final response head into rs (1xx skipped).
 private function hExchange( byref cl as Client, byref req as const Request, byref u as net.Url, _
-                            byref url as const ustring, byref rs as ResponseStream, byref op as const ustring ) as HttpResultBool
+                            byref url as const ustring, byref rs as ResponseStream, byref op as const ustring, _
+                            byval noCreds as boolean ) as HttpResultBool
     dim as string scheme = lcase( u.Scheme )
     if( ( scheme <> "http" ) andalso ( scheme <> "https" ) ) then
         return HttpFail( of boolean )( HTTP_UNSUPPORTED_SCHEME, 0, op, url )
@@ -546,7 +570,7 @@ private function hExchange( byref cl as Client, byref req as const Request, byre
     dim as ushort port = iif( u.Port >= 0, u.Port, iif( secure, 443, 80 ) )
     dim as ustring key = scheme & "://" & lcase( u.Host ) & ":" & port
     dim as string head
-    if( hHead( cl, req, u, secure, head ) = FALSE ) then
+    if( hHead( cl, req, u, secure, noCreds, head ) = FALSE ) then
         return HttpFail( of boolean )( HTTP_INVALID_ARGUMENT, 0, op, url, "header" )
     end if
 
@@ -565,6 +589,7 @@ private function hExchange( byref cl as Client, byref req as const Request, byre
             if( reused ) then continue for
             return hIoFail( of boolean )( w.Failure( ), op, url )
         end if
+        dim as long interim = 0
         do
             dim as HttpResultBool fail_
             dim as long r = hReadHead( c, rs, op, url, fail_ )
@@ -577,7 +602,15 @@ private function hExchange( byref cl as Client, byref req as const Request, byre
                 hConnFree( c )
                 return fail_
             end if
-            if( ( rs.StatusCode >= 100 ) andalso ( rs.StatusCode < 200 ) andalso ( rs.StatusCode <> 101 ) ) then continue do
+            if( ( rs.StatusCode >= 100 ) andalso ( rs.StatusCode < 200 ) andalso ( rs.StatusCode <> 101 ) ) then
+                '' a server may send any number of them; a request is not held open by an endless run
+                interim += 1
+                if( interim > HTTP_INTERIM_MAX ) then
+                    hConnFree( c )
+                    return HttpFail( of boolean )( HTTP_BAD_RESPONSE, 0, op, url, "too many 1xx responses" )
+                end if
+                continue do
+            end if
             exit do
         loop
         dim as HttpResultBool fail_
@@ -613,6 +646,13 @@ private sub hDiscard( byref rs as ResponseStream )
     rs.Close( )
 end sub
 
+'' scheme://host:port, the port always written: what a redirect must keep for credentials to follow.
+private function hOrigin( byref u as const net.Url ) as ustring
+    dim as string scheme = lcase( u.Scheme )
+    dim as long port = iif( u.Port >= 0, u.Port, iif( scheme = "https", 443, 80 ) )
+    return scheme & "://" & lcase( u.Host ) & ":" & port
+end function
+
 private function hOpen( byref cl as Client, byref req0 as const Request, byref rs as ResponseStream, _
                         byref op as const ustring ) as HttpResultBool
     if( rs.hConn <> nullptr ) then rs.Close( )
@@ -625,8 +665,9 @@ private function hOpen( byref cl as Client, byref req0 as const Request, byref r
     dim as net.Url u = pu.Value( )
     dim as ustring url = req.Url
     dim as long hops = 0
+    dim as boolean noCreds = FALSE
     do
-        dim as HttpResultBool r = hExchange( cl, req, u, url, rs, op )
+        dim as HttpResultBool r = hExchange( cl, req, u, url, rs, op, noCreds )
         if( r.IsOk( ) = FALSE ) then return r
         if( ( hIsRedirect( rs.StatusCode ) = FALSE ) orelse ( cl.MaxRedirects <= 0 ) ) then return r
         dim as Optional( of ustring ) loc = rs.Header.Get( "Location" )
@@ -641,13 +682,16 @@ private function hOpen( byref cl as Client, byref req0 as const Request, byref r
         hDiscard( rs )
         dim as net.Url nxt = nu.Value( )
         nxt.Fragment = ""
-        '' CREDENTIALS DO NOT FOLLOW a redirect to another host, nor one from https down to
-        '' http, where they would cross the wire in the clear.
-        if( ( lcase( nxt.Host ) <> lcase( u.Host ) ) orelse _
-            ( ( lcase( u.Scheme ) = "https" ) andalso ( lcase( nxt.Scheme ) <> "https" ) ) ) then
+        '' CREDENTIALS DO NOT FOLLOW a redirect off the origin -- another host, another port on
+        '' the same host (a different service: curl's CVE-2022-27776), or another scheme, which
+        '' covers https down to http where they would cross the wire in the clear.  Once
+        '' dropped they stay dropped for the rest of the chain, and that holds for the
+        '' client's DefaultHeader as well as the request's own headers.
+        if( hOrigin( nxt ) <> hOrigin( u ) ) then
             req.Header.Remove( "Authorization" )
             req.Header.Remove( "Proxy-Authorization" )
             req.Header.Remove( "Cookie" )
+            noCreds = TRUE
         end if
         dim as ustring m = ucase( req.Method )
         if( ( code = 303 andalso m <> "HEAD" ) orelse ( ( code = 301 orelse code = 302 ) andalso m = "POST" ) ) then

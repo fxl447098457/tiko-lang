@@ -35,6 +35,8 @@ the no-yank-back rule and for `SetAutoScrollToFocus( false )`.
 - The reveal timer is the container's `TKSCROLLPANEL_TIMER_REVEAL` (`TK_TIMER_APP`).
 - Added `GetColors`, `GetLineHeight` (the foreground has no `WM_CTLCOLOR*` to go to, so hosts
   read it back for their own widgets).
+- Added `PaintDefault( p )`: the page's stock background, for a paint callback (the form
+  designer's Paint event).
 
 **Dropped as Win32-only:** `WM_CTLCOLORSTATIC/BTN/EDIT/LISTBOX` and the brush; forwarding
 `WM_COMMAND` / `WM_NOTIFY` / `WM_HSCROLL` / `WM_VSCROLL` to the container's parent;

@@ -7,15 +7,22 @@
 #
 # A vendor package commits its translated headers and a fetch.toml; its binaries are never
 # committed. This reads each pkg/vendor/<module>/fetch.toml and, for THIS host's [<os>.<n>]
-# entries, downloads the pinned archive, checks its SHA-256, and either copies a file out of
+# entries -- [linux-arm64.<n>] on an aarch64 Linux host (docs/tiko-linux-arm64 D-L4-1), never
+# linux's, whose 'copy' entries can be x86-64 binaries -- downloads the pinned archive, checks its SHA-256, and either copies a file out of
 # it ('copy': where upstream publishes the binary) or compiles C sources with clang into a
 # static archive and/or a shared library ('cbuild': where it does not). A host makes its own
 # binaries, as package.sh makes its own toolchain. A 'copy' whose url is a single file, not an
 # archive, copies that file. 'script' runs a build script committed in the package
-# (vendor/tkControls' scintk, vendor/SDL3's static libraries) and copies what it made; its
+# (tkControls' scintk, SDL3's static libraries, raylib6's Linux .so) and copies what it made; its
 # optional 'inputs' -- 'url sha256 url sha256 ...' -- are fetched and verified first, like any
 # download, and handed to the script as TIKO_VENDOR_INPUTS (the local paths, in order), with
-# TIKO_VENDOR_HOST (windows, linux, macos) and TIKO_VENDOR_CACHE.
+# TIKO_VENDOR_HOST (windows, linux, macos: the OS, also on linux-arm64), TIKO_VENDOR_ARCH
+# (x86_64, arm64) and TIKO_VENDOR_CACHE. A 'cbuild' entry's optional
+# 'patches' -- files committed in the package, relative to it, applied in order with 'patch -p1'
+# inside 'dir' before compiling -- carry upstream fixes no release has yet. Its optional
+# 'copies' -- 'from:to' pairs, both relative to 'dir' -- are copied after the patches: the
+# files a library ships under one name for builds without its own build system to rename
+# (PCRE2's config.h.generic, pcre2.h.generic, pcre2_chartables.c.dist).
 #
 #   TIKO_VENDOR_CACHE    where downloads are kept (default build/.vendorfetch); one already
 #                       there with the right SHA-256 is not downloaded again
@@ -37,23 +44,26 @@ while [ $# -gt 0 ]; do
     case $1 in
         --out)    OUT=$2;  shift 2 ;;
         --module) ONLY=$2; shift 2 ;;
-        -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1'" ;;
     esac
 done
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-        HOST=windows; TRIPLE=x86_64-pc-windows-msvc
+        HOST=windows; TRIPLE=x86_64-pc-windows-msvc; VOS=windows; VARCH=x86_64
         CLANG=${TIKO_CLANG:-"C:/Program Files/LLVM/bin/clang.exe"}
         AR=${TIKO_AR:-"$(dirname "$CLANG")/llvm-ar.exe"}
         [ -n "$CXX" ] || CXX="$(dirname "$CLANG")/clang++.exe"; export CXX ;;
     Linux)
-        HOST=linux; TRIPLE=x86_64-pc-linux-gnu
+        HOST=linux; TRIPLE=x86_64-pc-linux-gnu; VOS=linux; VARCH=x86_64
+        if [ "$(uname -m)" = aarch64 ]; then
+            HOST=linux-arm64; TRIPLE=aarch64-unknown-linux-gnu; VARCH=arm64
+        fi
         CLANG=${TIKO_CLANG:-${CLANG:-clang}}
         AR=${TIKO_AR:-$(command -v llvm-ar || command -v ar)} ;;
     Darwin)
         # The SDK is clang's own business here: Apple's clang (and Homebrew's) find it.
-        HOST=macos; TRIPLE=arm64-apple-macosx13.0
+        HOST=macos; TRIPLE=arm64-apple-macosx13.0; VOS=macos; VARCH=arm64
         CLANG=${TIKO_CLANG:-${CLANG:-clang}}
         AR=${TIKO_AR:-$(command -v llvm-ar || command -v ar)} ;;
     *) die "unsupported host '$(uname -s)'" ;;
@@ -129,7 +139,7 @@ entry( ) {
             shift 2
         done
         [ $# -eq 0 ] || die "$_mod [$_tab]: 'inputs' must be url sha256 pairs"
-        export TIKO_VENDOR_INPUTS TIKO_VENDOR_HOST=$HOST TIKO_VENDOR_CACHE=$CACHE
+        export TIKO_VENDOR_INPUTS TIKO_VENDOR_HOST=$VOS TIKO_VENDOR_ARCH=$VARCH TIKO_VENDOR_CACHE=$CACHE
         bash "$_scr" >/dev/null || die "$_mod [$_tab]: $(_get script) failed"
         [ -f "$_from" ] || die "$_mod [$_tab]: $(_get script) made no $(_get from)"
         mkdir -p "$(dirname "$_mdir/$_to")"
@@ -144,9 +154,17 @@ entry( ) {
         cbuild) _outs="$(_get static) $(_get shared)" ;;
         *) die "$_mod [$_tab]: kind is 'copy', 'cbuild' or 'script', not '$_kind'" ;;
     esac
+    # A PATCH IS AN INPUT TOO: one newer than an output rebuilds it, as fetch.toml does.
+    _pats=
+    for _p in $(_get patches); do
+        [ "$_kind" = cbuild ] || die "$_mod [$_tab]: 'patches' is for 'cbuild' entries"
+        [ -f "$ROOT/pkg/vendor/$_mod/$_p" ] || die "$_mod [$_tab]: patch '$_p' is not in the package"
+        _pats="$_pats $ROOT/pkg/vendor/$_mod/$_p"
+    done
     _fresh=1
     for _o in $_outs; do
         if [ ! -f "$_mdir/$_o" ] || [ "$_toml" -nt "$_mdir/$_o" ]; then _fresh=0; fi
+        for _p in $_pats; do [ "$_p" -nt "$_mdir/$_o" ] && _fresh=0; done
     done
     if [ "$_fresh" = 1 ]; then note "$_mod [$_tab]: up to date"; return; fi
     _dl=$(fetch "$_url" "$_sha")
@@ -161,7 +179,12 @@ entry( ) {
     case $_kind in
     copy)
         _from=$(_get from); _to=$(_get to)
-        _src=$(find "$_x" -path "*/$_from" -o -name "$_from" | head -1)
+        # with a folder in it, a path's end; else a name anywhere (GNU find warns that -name
+        # never matches a pattern with a '/')
+        case $_from in
+        */*) _src=$(find "$_x" -path "*/$_from" | head -1) ;;
+        *)   _src=$(find "$_x" -name "$_from" | head -1) ;;
+        esac
         [ -n "$_src" ] && [ -f "$_src" ] || die "$_mod [$_tab]: '$_from' is not in ${_url##*/}"
         mkdir -p "$(dirname "$_mdir/$_to")"
         cp -f "$_src" "$_mdir/$_to"
@@ -169,6 +192,15 @@ entry( ) {
         ;;
     cbuild)
         _dir="$_x/$(_get dir)"; _objs=
+        for _p in $_pats; do
+            patch -p1 -s -t -d "$_dir" -i "$_p" || die "$_mod: patch $(basename "$_p") does not apply"
+            note "$_mod [$_tab]: patched with $(basename "$_p")"
+        done
+        for _c in $(_get copies); do
+            case $_c in *:*) ;; *) die "$_mod [$_tab]: a 'copies' entry is 'from:to', not '$_c'" ;; esac
+            [ -f "$_dir/${_c%%:*}" ] || die "$_mod [$_tab]: '${_c%%:*}' is not in ${_url##*/}"
+            cp -f "$_dir/${_c%%:*}" "$_dir/${_c#*:}"
+        done
         for _s in $(_get sources); do
             _o="$_x/$(basename "$_s" .c).o"
             # shellcheck disable=SC2046

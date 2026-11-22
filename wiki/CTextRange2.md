@@ -1248,8 +1248,6 @@ function SetFont( byval pFont as ITextFont2 ptr ) as HRESULT
 
 `GetFont` returns an `ITextFont2` for the character formatting of the range. The caller owns it: wrap it in a [CTextFont2](CTextFont2). The object is **live**: setting a property on it, such as `SetBold` or `SetSize`, changes the text of the range at once.
 
-`SetFont` passes `pFont` to `ITextRange2::SetFont2`, which the rich edit control refused with `E_NOTIMPL` (&h80004001) in testing, both for the range's own font and for a duplicate. Change the object `GetFont` returns instead.
-
 | Parameter | Meaning |
 | --- | --- |
 | `pFont` | The font object whose attributes to apply. |

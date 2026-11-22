@@ -1,12 +1,15 @@
-# Logging, Terminal UIs and SQLite
+# Logging, Terminal UIs, SQLite and Regular Expressions
 
-Three libraries cover three things most programs end up doing. A program that runs for any length
+Four libraries cover four things most programs end up doing. A program that runs for any length
 of time needs to say what it did, and **`std/logs`** writes that record properly: with levels,
 typed fields, more than one destination and no lines torn apart by threads. A tool that a person
 drives from a terminal can do better than `print` and `input`, and **`std/tui`** builds full-screen
 interfaces from a grid of cells, a layout solver and some thirty widgets. A program that keeps data
 between runs usually wants a database rather than files of its own invention, and
 **`vendor/sqlite3`** puts SQLite, the most widely deployed database there is, an `#import` away.
+Text that has to be searched for a shape rather than for fixed words — a date, an amount, the
+fields of a log line — wants a regular expression, and **`vendor/pcre2`** brings PCRE2, the
+library PHP's `preg_` functions are built on.
 
 The chapter ends with a map of the finance library, the rest of the `std/money` module from
 Chapter 27.
@@ -279,6 +282,121 @@ into the program instead, which is then one file, say so on the import:
 Nothing else in the program changes. A program links a library one way only: two imports asking
 for different modes are an error, `TKO0157`.
 
+## Regular expressions
+
+A regular expression describes the shape of some text: `\d{4}-\d\d-\d\d` is four digits, a hyphen,
+two digits, a hyphen and two more, which is any ISO date. tiko ships **PCRE2**, the Perl-compatible
+regular-expression library, as **`vendor/pcre2`**: its 8-bit library, built with Unicode support
+and its just-in-time compiler. As with SQLite, what you call is PCRE2's own C interface, written as
+PCRE2's documentation writes it: `pcre2_compile`, `pcre2_match`, `pcre2_match_data`.
+
+```tiko
+{{#include ../examples/ch28/regex-find.tiko}}
+```
+
+```text
+{{#include ../examples/ch28/regex-find.out}}
+```
+
+A pattern is compiled once, by **`pcre2_compile`**, into a `pcre2_code ptr`, and matched as often
+as you like. When the pattern is wrong, `pcre2_compile` returns `nullptr` and fills in an error
+code and the offset where it gave up; **`pcre2_get_error_message`** turns the code into words. That
+is the listing's last line: the `(` at the start of `(\d+` is never closed. Like SQLite, PCRE2
+raises no runtime error; a return value that is not checked is a failure that is not noticed.
+
+**Text crosses as UTF-8 bytes.** The 8-bit library takes a pattern or a subject as a `PCRE2_SPTR`,
+a `const uint8 ptr`, and a length, so the listing keeps its text in `string` and passes
+`strptr( s )` and `len( s )`. A `ustring` holds UTF-16 (Chapter 9), and assigning it to a `string`
+converts it to UTF-8, which is what `subject` is. A string literal does not convert to a
+`PCRE2_SPTR` at all (`TKO0698`), which is why `Compile` takes its pattern as a `string`.
+**`PCRE2_UTF`** tells PCRE2 that pattern and subject are UTF-8, so `\p{Lu}`, any uppercase letter,
+can match `Ł`, which is two bytes. **`PCRE2_UCP`** gives `\w`, `\d` and `\b` their Unicode meaning;
+without it `\w` is ASCII letters, digits and `_`, and `Zoë` stops fitting the pattern, as the
+listing's second-last line shows.
+
+### Groups and the ovector
+
+Parentheses make **groups**, numbered from 1 by their opening parenthesis; group 0 is the whole
+match. **`pcre2_match`** returns one more than the highest group that matched, `PCRE2_ERROR_NOMATCH`
+(-1) when there is no match, and another negative code for an error. Where everything was found is
+in the **match data**, which `pcre2_match_data_create_from_pattern` sizes to hold every group of the
+pattern: `pcre2_get_ovector_pointer` gives its **ovector**, a start and an end offset for each group,
+group *n* at `ov[2 * n]` and `ov[2 * n + 1]`. A group that took no part in the match has both set
+to `PCRE2_UNSET`.
+
+To find **every** match, `pcre2_match` takes the offset to start from. After each match,
+**`pcre2_next_match`** says what that offset should be and which options the next attempt needs:
+after a match of nothing, starting again at the same place would find the same empty match for
+ever, and it handles that. It returns 0 when there is nothing more to try.
+
+```admonish danger title="Pitfall"
+**Every offset PCRE2 gives is in bytes.** The ovector, the error offset and the start of a match
+all count bytes of the UTF-8 subject. Used on the `string`, as `Group` uses them, they cut the right
+text. Used on the `ustring` the bytes came from, they cut the wrong characters as soon as anything
+before them was not ASCII: `Łukasz` starts at byte 31, but character 32 of `text` is the `u`,
+because `ë` took two bytes and one character. Cut from the bytes, then convert.
+```
+
+Both the compiled pattern and the match data belong to PCRE2, and go back to it:
+**`pcre2_code_free`** and **`pcre2_match_data_free`**.
+
+### Replacing
+
+```tiko
+{{#include ../examples/ch28/regex-replace.tiko}}
+```
+
+```text
+{{#include ../examples/ch28/regex-replace.out}}
+```
+
+**`pcre2_substitute`** copies the subject with matches replaced. `$1` in the replacement is group 1,
+and `${1}` the same where letters or digits follow. `PCRE2_SUBSTITUTE_GLOBAL` replaces
+every match rather than the first. `PCRE2_SUBSTITUTE_EXTENDED` adds more syntax, such as `\U` and
+`\E` around text to put in upper case. A replacement that names a group the pattern lacks is an
+error code like any other, and `$4` gets "unknown substring".
+
+The result goes into **a buffer the caller provides**, here a `string` of spaces as long as the
+subject. The last argument gives its size, and comes back as the result's length. Too small a
+buffer is `PCRE2_ERROR_NOMEMORY`; with `PCRE2_SUBSTITUTE_OVERFLOW_LENGTH` set, PCRE2 goes on to
+work out how much room it needs, and `Replace` makes that much and tries again. The room includes a
+terminating zero that PCRE2 always writes, so a result as long as its subject does not fit the
+first buffer either: the dates line took the second attempt, as did the third line, which is longer
+than its subject. Only the shorter second line fitted at once.
+
+### Patterns from outside the program
+
+PCRE2 finds a match by **backtracking**: when part of the pattern fails, it goes back and tries the
+next way of matching what came before. Most patterns have few ways to try. A pattern like `(a+)+$`
+has as many as there are ways of splitting a run of `a`s into groups, and doubles them with each
+`a` more; given a long run that does not end where `$` wants it to, PCRE2 tries them all.
+
+When the pattern comes from a user, a file or the network, that is a way to stop a program, and
+PCRE2 has limits for it:
+
+```tiko
+{{#include ../examples/ch28/regex-limits.tiko}}
+```
+
+```text
+{{#include ../examples/ch28/regex-limits.out}}
+```
+
+A **match context**, given as `pcre2_match`'s last argument, carries limits for one match.
+**`pcre2_set_match_limit`** caps the steps it may take, and a match that reaches the cap stops with
+`PCRE2_ERROR_MATCHLIMIT` (-47) rather than an answer. `pcre2_set_depth_limit` and
+`pcre2_set_heap_limit` cap how deep its backtracking may nest and how much memory it may use. A
+**compile context**, `pcre2_compile`'s last argument, does the same for the pattern:
+`pcre2_set_max_pattern_length` refuses one that is too long.
+
+**`pcre2_jit_compile`** translates a compiled pattern into machine code. After it, `pcre2_match` on
+that pattern runs the machine code, and the match limit still holds, as the second line shows. The
+depth and heap limits do not apply to machine code, which has a stack of its own.
+
+`#import "vendor/pcre2" link static` builds PCRE2 into the program, exactly as for SQLite; the
+default, `link dynamic`, copies `pcre2.dll` (on Linux `pcre2_linux_x86_64.so`, on macOS
+`pcre2_macos_arm64.dylib`) beside it.
+
 ## The finance library
 
 Chapter 27 used `Decimal`, `Currency` and loan schedules from **`#import "std/money"`**. The same
@@ -329,6 +447,15 @@ every function, and all of them are reached as `money.`.
   and `sqlite3_errmsg` explains a failure. Text is UTF-8, so values travel as `string`.
 - `link static` or `link dynamic` on the import chooses how SQLite is linked; dynamic, the
   default, copies the shared library beside the program. `strings.SplitCsv` reads CSV to load.
+- `#import "vendor/pcre2"`: PCRE2's C interface, unqualified. `pcre2_compile` once,
+  `pcre2_get_error_message` when it fails; `pcre2_match` into match data, whose ovector holds each
+  group's start and end; `pcre2_next_match` to find every match; `pcre2_substitute` to replace,
+  into a buffer of yours. Free with `pcre2_code_free` and `pcre2_match_data_free`.
+- Text goes in as UTF-8 bytes: a `string`, passed as `strptr( s )` and `len( s )`, with
+  `PCRE2_UTF` (and `PCRE2_UCP` for Unicode `\w`). Every offset that comes back counts bytes.
+- A pattern from outside the program gets a match context with `pcre2_set_match_limit`; a
+  match that reaches it returns `PCRE2_ERROR_MATCHLIMIT`. After `pcre2_jit_compile`, matching
+  runs machine code and still keeps to the match limit.
 - `std/money` also carries rates, the time value of money, loans, cash flows, depreciation and
   portfolio measures.
 
@@ -345,3 +472,7 @@ every function, and all of them are reached as `money.`.
 5. Import a CSV file of your own, then, inside a transaction, delete the rows that fail a check,
    and roll back if more than half of them would go. `sqlite3_changes( db )` says how many rows
    the last statement changed.
+6. Write `Split( pattern, text )`, which returns the pieces of `text` between the matches of
+   `pattern`, and use it to split `"a, b ,c,,d"` on `\s*,\s*`. Which pieces are empty, and why?
+7. Make `regex-find.tiko` print each name with the character position it starts at in `text`,
+   computed from the byte offset PCRE2 gives.

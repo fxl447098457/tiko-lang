@@ -6,8 +6,9 @@
 '    file, You can obtain one at https://mozilla.org/MPL/2.0/.
 '
 ' itemsdlg -- the one editor behind a form's menus, toolbars, status bars, list columns, combo items
-' and tab pages: a list on the left, the selected item's fields on the right. What the fields are
-' depends on the control; everything else is the same.
+' and tab pages: a list on the left with its order buttons under it, Add and Remove on the right above
+' a group box (titled with the selected item's text) of its fields. What the fields are depends on the
+' control; everything else is the same. The small buttons are glyphs, their words in tooltips.
 #module "itemsdlg"
 
 #import "std/containers"
@@ -18,9 +19,13 @@
 #import "vendor/tkControls/tkLabel"
 #import "vendor/tkControls/tkTextBox"
 #import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkGroupBox"
+#import "vendor/tkControls/tkCheckBox"
 #import "vendor/tkControls/tkTheme"
 #import "../model"
 #import "../catalog"
+#import "../validate"
+#import "../canvas"
 using containers
 using tkApp
 using tkListTree
@@ -28,6 +33,8 @@ using tkButton
 using tkLabel
 using tkTextBox
 using tkComboBox
+using tkGroupBox
+using tkCheckBox
 using tkTheme
 using tkHost
 using tkPaint
@@ -36,12 +43,23 @@ using model
 const as long ROW_CY = 32
 const as long LABEL_CX = 90
 const as long MAX_FIELDS = 5
+const as long GLYPH_CX = 40         ' a glyph button's width (design units)
+
+' Fluent UI System Icons codepoints, all in tkEdit's PsIcons
+public const as ulong GLYPH_ADD = &hF109       ' add
+public const as ulong GLYPH_DELETE = &hF34C    ' delete (a bin)
+public const as ulong GLYPH_UP = &hF19B        ' arrow up
+public const as ulong GLYPH_DOWN = &hF148      ' arrow down
+public const as ulong GLYPH_LEFT = &hF15B      ' arrow left: outdent
+public const as ulong GLYPH_RIGHT = &hF181     ' arrow right: indent
+public const as ulong GLYPH_EDIT = &hF3DD      ' edit (a pencil): the item's handler, in the code
 
 public type ItemField
-    Key as ustring          ' Text, Key, Glyph, Handler, Kind, Width
+    Key as ustring          ' Text, Key, Glyph, Handler, Kind, Width, Stretch
     Label as TK_WIDGET ptr
     Edit as TK_WIDGET ptr
     IsCombo as boolean
+    IsCheck as boolean      ' a check box (Stretch); its label is empty, the box carries the words
 end type
 
 public type ItemsEditor
@@ -49,6 +67,7 @@ public type ItemsEditor
     Win as TK_FORM ptr
     Items as Array( of FormItem )
     List as TK_WIDGET ptr
+    Group as TK_WIDGET ptr      ' the selected item's fields, under its text
     BtnAdd as TK_WIDGET ptr
     BtnDel as TK_WIDGET ptr
     BtnUp as TK_WIDGET ptr
@@ -57,7 +76,15 @@ public type ItemsEditor
     BtnOut as TK_WIDGET ptr
     BtnOk as TK_WIDGET ptr
     BtnCancel as TK_WIDGET ptr
+    BtnHandler as TK_WIDGET ptr ' beside the Handler box: OK, then the handler in the code
+    ' the Glyph row (GLYPHS.md V5): the glyph drawn before its code box, "..." after it -- the Glyph
+    ' Picker through the form's canvas (C->OnPickGlyph), as the Properties panel's glyph rows
+    C as canvas.FormCanvas ptr
+    GlyphPreview as TK_WIDGET ptr
+    BtnGlyph as TK_WIDGET ptr
     Fields as Array( of ItemField )
+    ControlName as ustring      ' whose entries these are
+    GoToHandler as ustring      ' set by the pencil: the handler to show once the entries are in
     Current as long = -1
     Accepted as boolean
     IsModal as boolean
@@ -67,6 +94,7 @@ public type ItemsEditor
     declare function RunModal( ) as boolean
     declare sub Close( )
     declare sub AddField( byref key_ as const ustring, byref caption as const ustring, byref options as const ustring = "" )
+    declare sub AddCheck( byref key_ as const ustring, byref caption as const ustring )
     declare sub Layout( )
     declare sub FillList( )
     declare function RowText( byval i as long ) as ustring
@@ -77,7 +105,20 @@ public type ItemsEditor
     declare sub Move( byval delta as long )
     declare sub Indent( byval delta as long )
     declare sub Finish( byval ok as boolean )
+    declare sub ShowCaption( )
+    declare sub SyncSeparator( )
+    declare sub SeedDefaults( )
+    declare function DefaultHandler( byval i as long ) as ustring
+    declare sub EditHandler( )
+    declare sub PickGlyph( )
+    declare sub ShowGlyph( )
 end type
+
+' The owner (tkEdit) to the front BEFORE a modal dialog's window is hidden: hiding the active window
+' let Windows activate some other program's window now and then.
+private sub RaiseOwner_( byval f as TK_FORM ptr )
+    if (f <> 0) andalso (f->pOwner <> 0) then SDL_RaiseWindow( f->pOwner->host->win )
+end sub
 
 private function DlgOf( byval w as TK_WIDGET ptr ) as ItemsEditor ptr
     dim as TK_FORM ptr f = tkForm_FromWidget( w )
@@ -91,6 +132,11 @@ private sub OnPick( byval h as TK_WIDGET ptr, byval row as integer )
 end sub
 
 private sub OnTextChanged( byval h as TK_WIDGET ptr )
+    dim as ItemsEditor ptr d = DlgOf( h )
+    if d then d->FieldChanged( h )
+end sub
+
+private sub OnCheckChanged( byval h as TK_WIDGET ptr, byval isChecked as boolean )
     dim as ItemsEditor ptr d = DlgOf( h )
     if d then d->FieldChanged( h )
 end sub
@@ -112,6 +158,8 @@ private sub OnButton( byval h as TK_WIDGET ptr, byval id as long )
     case d->BtnOut    : d->Indent( -1 )
     case d->BtnOk     : d->Finish( true )
     case d->BtnCancel : d->Finish( false )
+    case d->BtnHandler : d->EditHandler( )
+    case d->BtnGlyph   : d->PickGlyph( )
     end select
 end sub
 
@@ -123,8 +171,18 @@ private function MakeButton_( byval parent as TK_WIDGET ptr, byref text as const
     return b
 end function
 
+' A small button that is one glyph; tip is its word, shown on hover.
+private function MakeGlyphButton_( byval parent as TK_WIDGET ptr, byval cp as ulong, byref tip as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    tkButton_SetGlyphFont( b, tkForm_Font( tkForm_FromWidget( parent ), TKFONT_GLYPH_LARGE ) )   ' else it draws in the text font
+    tkButton_SetGlyphLeft( b, wchr( cp ) )
+    tkButton_SetTooltipText( b, tip )
+    tkButton_SetClickCallback( b, @OnButton )
+    return b
+end function
+
 sub ItemsEditor.AddField( byref key_ as const ustring, byref caption as const ustring, byref options as const ustring = "" )
-    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as TK_WIDGET ptr root_ = Group          ' the fields live in the group box
     dim as ItemField f
     f.Key = key_
     f.Label = tkLabel_Create( root_, 1 )
@@ -147,22 +205,42 @@ sub ItemsEditor.AddField( byref key_ as const ustring, byref caption as const us
     Fields.Push( f )
 end sub
 
+' A check box field: an empty label beside it keeps the column, the box carries the words.
+sub ItemsEditor.AddCheck( byref key_ as const ustring, byref caption as const ustring )
+    dim as ItemField f
+    f.Key = key_
+    f.IsCheck = true
+    f.Label = tkLabel_Create( Group, 1 )
+    f.Edit = tkCheckBox_Create( Group, Fields.Count( ) + 20 )
+    tkCheckBox_SetText( f.Edit, caption )
+    tkCheckBox_SetCheckChangedCallback( f.Edit, @OnCheckChanged )
+    Fields.Push( f )
+end sub
+
 ' A window of its own, not yet modal: the tests drive it this way, and RunModal adds the loop.
 sub ItemsEditor.Open( byval owner as TK_FORM ptr, byval kind_ as long, byref items_ as Array( of FormItem ), byref title as const ustring )
     Kind = kind_
     Items = items_
+    ControlName = title
     dim as ustring t = title
     Win = tkApp_NewForm( t, 560, 420, owner, tkForm_Host( owner )->fScaleForced )
     if Win = 0 then exit sub
     Win->Tag = @this
+    ' the title bar's close: the owner up first, then the modal loop ends as Cancel
+    tkForm_OnClose( Win, function( byval f as TK_FORM ptr ) as boolean
+        RaiseOwner_( f )
+        return true
+    end function )
     dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
     List = tkListTree_Create( root_, 1 )
     tkListTree_SetPaintCallback( List, @tkListTree_PaintRowDefault )   ' a tkListTree draws no row by itself
     tkListTree_SetSelChangeCallback( List, @OnPick )
-    BtnAdd = MakeButton_( root_, i18n.Tr( "designer.item_add", "Add" ) )
-    BtnDel = MakeButton_( root_, i18n.Tr( "designer.item_remove", "Remove" ) )
-    BtnUp = MakeButton_( root_, i18n.Tr( "designer.item_up", "Up" ) )
-    BtnDown = MakeButton_( root_, i18n.Tr( "designer.item_down", "Down" ) )
+    tkListTree_SetBorderWidth( List, 1 )
+    BtnAdd = MakeGlyphButton_( root_, GLYPH_ADD, i18n.Tr( "designer.item_add", "Add" ) )
+    BtnDel = MakeGlyphButton_( root_, GLYPH_DELETE, i18n.Tr( "designer.item_remove", "Remove" ) )
+    BtnUp = MakeGlyphButton_( root_, GLYPH_UP, i18n.Tr( "designer.item_up", "Up" ) )
+    BtnDown = MakeGlyphButton_( root_, GLYPH_DOWN, i18n.Tr( "designer.item_down", "Down" ) )
+    Group = tkGroupBox_Create( root_, 1 )
     BtnOk = MakeButton_( root_, i18n.Tr( "designer.ok", "OK" ) )
     BtnCancel = MakeButton_( root_, i18n.Tr( "designer.cancel", "Cancel" ) )
 
@@ -170,9 +248,9 @@ sub ItemsEditor.Open( byval owner as TK_FORM ptr, byval kind_ as long, byref ite
     dim as ustring handlerLabel = i18n.Tr( "designer.item_handler", "Handler" )
     dim as ustring widthLabel = i18n.Tr( "designer.width", "Width" )
     select case kind_
-    case catalog.ItemsKind.ItemsMenu
-        BtnIn = MakeButton_( root_, i18n.Tr( "designer.item_in", "Indent" ) )
-        BtnOut = MakeButton_( root_, i18n.Tr( "designer.item_out", "Outdent" ) )
+    case catalog.ItemsKind.ItemsMenu, catalog.ItemsKind.ItemsPopup
+        BtnIn = MakeGlyphButton_( root_, GLYPH_RIGHT, i18n.Tr( "designer.item_in", "Indent" ) )
+        BtnOut = MakeGlyphButton_( root_, GLYPH_LEFT, i18n.Tr( "designer.item_out", "Outdent" ) )
         this.AddField( "Text", textLabel )
         this.AddField( "Key", i18n.Tr( "designer.item_key", "Shortcut" ) )
         this.AddField( "Handler", handlerLabel )
@@ -181,15 +259,39 @@ sub ItemsEditor.Open( byval owner as TK_FORM ptr, byval kind_ as long, byref ite
         this.AddField( "Text", textLabel )
         this.AddField( "Glyph", i18n.Tr( "designer.item_glyph", "Glyph" ) )
         this.AddField( "Handler", handlerLabel )
-    case catalog.ItemsKind.ItemsStatus, catalog.ItemsKind.ItemsColumns
+    case catalog.ItemsKind.ItemsIcons
+        ' an icon: no caption (its tip comes from the Tooltip event)
+        this.AddField( "Kind", i18n.Tr( "designer.item_kind", "Kind" ), "toggle,command,separator" )
+        this.AddField( "Glyph", i18n.Tr( "designer.item_glyph", "Glyph" ) )
+        this.AddField( "Handler", handlerLabel )
+    case catalog.ItemsKind.ItemsStatus
+        ' a panel: its text and width, a handler for its clicks, and whether it takes the spare width
         this.AddField( "Text", textLabel )
         this.AddField( "Width", widthLabel )
+        this.AddField( "Handler", handlerLabel )
+        this.AddCheck( "Stretch", i18n.Tr( "designer.item_stretch", "Stretch" ) )
+    case catalog.ItemsKind.ItemsColumns
+        this.AddField( "Text", textLabel )
+        this.AddField( "Width", widthLabel )
+    case catalog.ItemsKind.ItemsPages, catalog.ItemsKind.ItemsTabs
+        ' a tab: its caption and the glyph before it (the control's GlyphSize sizes every tab's)
+        this.AddField( "Text", textLabel )
+        this.AddField( "Glyph", i18n.Tr( "designer.item_glyph", "Glyph" ) )
     case else
         this.AddField( "Text", textLabel )
     end select
+    ' a pencil beside the Handler box, as an event row has in the Properties panel
+    for each f as ItemField in Fields
+        if f.Key = "Handler" then BtnHandler = MakeGlyphButton_( Group, GLYPH_EDIT, i18n.Tr( "designer.open_code", "Open code" ) )
+        if f.Key = "Glyph" then
+            GlyphPreview = tkLabel_Create( Group, 1 )
+            tkLabel_SetAlign( GlyphPreview, LBL_ALIGN_CENTER )
+            BtnGlyph = MakeGlyphButton_( Group, TK_ICON_MORE, i18n.Tr( "designer.glyph_pick", "Pick a glyph" ) )
+        end if
+    next
 
     tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
-        cast( ItemsEditor ptr, f->Tag )->Layout( )
+        if f->Tag then cast( ItemsEditor ptr, f->Tag )->Layout( )
     end sub )
     this.FillList( )
     if Items.Count( ) then this.ShowItem( 0 ) else this.ShowItem( -1 )
@@ -212,6 +314,7 @@ end sub
 sub ItemsEditor.Finish( byval ok as boolean )
     Accepted = ok
     if IsModal then
+        RaiseOwner_( Win )
         tkForm_EndModal( Win, iif( ok, 1, 0 ) )
     end if
 end sub
@@ -219,28 +322,150 @@ end sub
 sub ItemsEditor.Layout( )
     if Win = 0 then exit sub
     dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
-    dim as long sc8 = tkForm_Scale( Win, 8 ), bw = tkForm_Scale( Win, 80 ), bh = tkForm_Scale( Win, 28 ), rh = tkForm_Scale( Win, ROW_CY )
+    dim as long g = tkForm_Scale( Win, 8 ), gap = tkForm_Scale( Win, 4 ), bw = tkForm_Scale( Win, 80 )
+    dim as long bh = tkForm_Scale( Win, 28 ), rh = tkForm_Scale( Win, ROW_CY ), gw = tkForm_Scale( Win, GLYPH_CX )
     dim as long cw = root_->cw, ch = root_->ch
     dim as long listW = cw * 42 \ 100
-    dim as long bottom = ch - sc8 - bh
-    dim as long listB = bottom - sc8 - bh - sc8
-    tkWidget_SetPos( List, sc8, sc8, listW, listB - sc8 )
-    dim as long x = sc8, y = listB + sc8, gap = tkForm_Scale( Win, 4 ), bs = (listW - 3 * gap) \ 4
-    tkWidget_SetPos( BtnAdd, x, y, bs, bh )
-    tkWidget_SetPos( BtnDel, x + bs + gap, y, bs, bh )
-    tkWidget_SetPos( BtnUp, x + 2 * (bs + gap), y, bs, bh )
-    tkWidget_SetPos( BtnDown, x + 3 * (bs + gap), y, bs, bh )
-    tkWidget_SetPos( BtnOk, cw - 2 * bw - 2 * sc8, bottom, bw, bh )
-    tkWidget_SetPos( BtnCancel, cw - bw - sc8, bottom, bw, bh )
-    dim as long fx = sc8 * 2 + listW, lw = tkForm_Scale( Win, LABEL_CX ), fy = sc8
+    dim as long bottom = ch - g - bh                    ' OK and Cancel
+    dim as long orderY = bottom - g - bh                ' the list's order buttons, under it
+
+    ' left: the list (bordered), then Up, Down and -- for a menu -- Outdent, Indent
+    tkWidget_SetPos( List, g, g, listW, orderY - g - g )
+    dim as TK_WIDGET ptr order_( 0 to 3 ) = { BtnUp, BtnDown, BtnOut, BtnIn }
+    dim as long x = g
+    for k as long = 0 to 3
+        if order_( k ) then
+            tkWidget_SetPos( order_( k ), x, orderY, gw, bh )
+            x += gw + gap
+        end if
+    next
+
+    ' right: Add and Remove, then the group box of fields under them
+    dim as long fx = 2 * g + listW, fw = cw - fx - g
+    tkWidget_SetPos( BtnAdd, fx, g, gw, bh )
+    tkWidget_SetPos( BtnDel, fx + gw + gap, g, gw, bh )
+    dim as long gy = 2 * g + bh, n = Fields.Count( )
+    ' the box sized once to read its frame and caption, then to fit its rows
+    tkWidget_SetPos( Group, fx, gy, fw, 4 * rh )
+    dim as TKRECT inner
+    tkGroupBox_GetClientRect( Group, inner )
+    dim as long frameH = 4 * rh - (inner.bottom - inner.top)
+    tkWidget_SetPos( Group, fx, gy, fw, frameH + n * rh )
+    tkGroupBox_GetClientRect( Group, inner )
+    dim as long lw = tkForm_Scale( Win, LABEL_CX ), fy = inner.top
     for each f as ItemField in Fields
-        tkWidget_SetPos( f.Label, fx, fy, lw, bh )
-        tkWidget_SetPos( f.Edit, fx + lw, fy, cw - fx - lw - sc8, bh )
+        tkWidget_SetPos( f.Label, inner.left, fy, lw, bh )
+        dim as long ew = inner.right - inner.left - lw
+        if (f.Key = "Handler") andalso (BtnHandler <> 0) then
+            ew -= gw + gap
+            tkWidget_SetPos( BtnHandler, inner.right - gw, fy, gw, bh )
+        end if
+        dim as long ex = inner.left + lw
+        if (f.Key = "Glyph") andalso (BtnGlyph <> 0) then
+            ' the glyph, a square before the box; "..." after it
+            tkWidget_SetPos( GlyphPreview, ex, fy, bh, bh )
+            ex += bh + gap
+            ew -= bh + gap + gw + gap
+            tkWidget_SetPos( BtnGlyph, inner.right - gw, fy, gw, bh )
+        end if
+        tkWidget_SetPos( f.Edit, ex, fy, ew, bh )
         fy += rh
     next
-    if BtnIn then
-        tkWidget_SetPos( BtnIn, fx, fy, bw, bh )
-        tkWidget_SetPos( BtnOut, fx + bw + gap, fy, bw, bh )
+
+    tkWidget_SetPos( BtnOk, cw - 2 * bw - 2 * g, bottom, bw, bh )
+    tkWidget_SetPos( BtnCancel, cw - bw - g, bottom, bw, bh )
+end sub
+
+' A new menu bar's starting point: File, Edit and Help with their usual commands and shortcuts, in
+' tkEdit's language. No handlers: the program's author names them.
+private sub MenuItem_( byref a as Array( of FormItem ), byref text as const ustring, byval level as long, byref key_ as const ustring = "" )
+    dim as FormItem it
+    it.Text = text
+    it.Level = level
+    it.Key = key_
+    it.Origin = -1
+    a.Push( it )
+end sub
+
+public function DefaultMenu( ) as Array( of FormItem )
+    dim as Array( of FormItem ) a
+    MenuItem_( a, i18n.Tr( "designer.menu_file", "File" ), 0 )
+    MenuItem_( a, i18n.Tr( "designer.menu_new", "New" ), 1, "Primary+N" )
+    MenuItem_( a, i18n.Tr( "designer.menu_open", "Open..." ), 1, "Primary+O" )
+    MenuItem_( a, i18n.Tr( "designer.menu_save", "Save" ), 1, "Primary+S" )
+    MenuItem_( a, i18n.Tr( "designer.menu_save_as", "Save As..." ), 1, "Primary+Shift+S" )
+    MenuItem_( a, "-", 1 )
+    MenuItem_( a, i18n.Tr( "designer.menu_exit", "Exit" ), 1 )
+    MenuItem_( a, i18n.Tr( "designer.menu_edit", "Edit" ), 0 )
+    MenuItem_( a, i18n.Tr( "designer.menu_undo", "Undo" ), 1, "Primary+Z" )
+    MenuItem_( a, i18n.Tr( "designer.menu_redo", "Redo" ), 1, "Primary+Y" )
+    MenuItem_( a, "-", 1 )
+    MenuItem_( a, i18n.Tr( "designer.menu_cut", "Cut" ), 1, "Primary+X" )
+    MenuItem_( a, i18n.Tr( "designer.menu_copy", "Copy" ), 1, "Primary+C" )
+    MenuItem_( a, i18n.Tr( "designer.menu_paste", "Paste" ), 1, "Primary+V" )
+    MenuItem_( a, "-", 1 )
+    MenuItem_( a, i18n.Tr( "designer.menu_select_all", "Select All" ), 1, "Primary+A" )
+    MenuItem_( a, i18n.Tr( "designer.menu_help", "Help" ), 0 )
+    MenuItem_( a, i18n.Tr( "designer.menu_about", "About" ), 1 )
+    return a
+end function
+
+' A new popup menu's starting point: the usual edit commands. No shortcuts: a menu bar's Edit menu
+' may already bind them on the same form.
+public function DefaultPopup( ) as Array( of FormItem )
+    dim as Array( of FormItem ) a
+    MenuItem_( a, i18n.Tr( "designer.menu_cut", "Cut" ), 0 )
+    MenuItem_( a, i18n.Tr( "designer.menu_copy", "Copy" ), 0 )
+    MenuItem_( a, i18n.Tr( "designer.menu_paste", "Paste" ), 0 )
+    MenuItem_( a, "-", 0 )
+    MenuItem_( a, i18n.Tr( "designer.menu_select_all", "Select All" ), 0 )
+    return a
+end function
+
+private sub ToolItem_( byref a as Array( of FormItem ), byref kind_ as const ustring, byref text as const ustring, byref glyph as const ustring )
+    dim as FormItem it
+    it.Kind = kind_
+    it.Text = text
+    it.Glyph = glyph
+    it.Origin = -1
+    a.Push( it )
+end sub
+
+' A new toolbar's starting point: New, Open, Save, a separator, Cut, Copy, Paste -- each with its
+' Fluent glyph and its words. No handlers: the program's author names them.
+public function DefaultToolbar( ) as Array( of FormItem )
+    dim as Array( of FormItem ) a
+    ToolItem_( a, "command", i18n.Tr( "designer.menu_new", "New" ), "Fluent:E4DB" )         ' document_add
+    ToolItem_( a, "command", i18n.Tr( "designer.tool_open", "Open" ), "Fluent:F42E" )       ' folder_open
+    ToolItem_( a, "command", i18n.Tr( "designer.menu_save", "Save" ), "Fluent:F67F" )       ' save
+    ToolItem_( a, "separator", "", "" )
+    ToolItem_( a, "command", i18n.Tr( "designer.menu_cut", "Cut" ), "Fluent:F33A" )         ' cut
+    ToolItem_( a, "command", i18n.Tr( "designer.menu_copy", "Copy" ), "Fluent:F32B" )       ' copy
+    ToolItem_( a, "command", i18n.Tr( "designer.menu_paste", "Paste" ), "Fluent:F2D5" )     ' clipboard_paste
+    return a
+end function
+
+' An empty menu or toolbar editor filled with its defaults, the first entry selected.
+sub ItemsEditor.SeedDefaults( )
+    if Items.Count( ) > 0 then exit sub
+    select case Kind
+    case catalog.ItemsKind.ItemsMenu    : Items = DefaultMenu( )
+    case catalog.ItemsKind.ItemsPopup   : Items = DefaultPopup( )
+    case catalog.ItemsKind.ItemsToolbar : Items = DefaultToolbar( )
+    case else : exit sub
+    end select
+    Current = 0
+    this.FillList( )
+    this.ShowItem( 0 )
+end sub
+
+' The group box's title: the selected item's text, as the list shows it but not indented.
+sub ItemsEditor.ShowCaption( )
+    if Group = 0 then exit sub
+    if (Current >= 0) andalso (Current < Items.Count( )) then
+        tkGroupBox_SetText( Group, ltrim( this.RowText( Current ) ) )
+    else
+        tkGroupBox_SetText( Group, "" )
     end if
 end sub
 
@@ -250,6 +475,11 @@ function ItemsEditor.RowText( byval i as long ) as ustring
         s &= "    "
     next
     if Items[i].Kind = "separator" then return s & "---"
+    ' an icon has no caption: its kind, and its handler once it has one
+    if Kind = catalog.ItemsKind.ItemsIcons then
+        if len( Items[i].Handler ) then return s & Items[i].Kind & "  " & Items[i].Handler
+        return s & Items[i].Kind
+    end if
     if len( Items[i].Text ) = 0 then return s & "(" & i18n.Tr( "designer.item_empty", "empty" ) & ")"
     return s & Items[i].Text
 end function
@@ -275,33 +505,71 @@ sub ItemsEditor.ShowItem( byval i as long )
             select case f.Key
             case "Text"    : v = Items[i].Text
             case "Key"     : v = Items[i].Key
-            case "Glyph"   : v = Items[i].Glyph
+            case "Glyph"   : v = GlyphShown( Items[i].Glyph )
             case "Handler" : v = Items[i].Handler
             case "Kind"    : v = Items[i].Kind
             case "Width"
                 if Items[i].Width then v = str( Items[i].Width )
             end select
         end if
-        if f.IsCombo then
+        if f.IsCheck then
+            tkCheckBox_SetChecked( f.Edit, (i >= 0) andalso (i < Items.Count( )) andalso Items[i].Stretch )
+        elseif f.IsCombo then
             tkComboBox_SetCurSel( f.Edit, tkComboBox_FindItemByText( f.Edit, v ) )
         else
             tkTextBox_SetText( f.Edit, v )
         end if
     next
     if (i >= 0) andalso (i < Items.Count( )) then tkListTree_SetCurSel( List, i )
+    this.ShowGlyph( )
+    this.ShowCaption( )
     Loading = false
+    this.SyncSeparator( )
+end sub
+
+' The Glyph row's preview: the item's glyph in its own font (the canvas opened them).
+sub ItemsEditor.ShowGlyph( )
+    if GlyphPreview = 0 then exit sub
+    dim as ustring v
+    if (Current >= 0) andalso (Current < Items.Count( )) then v = Items[Current].Glyph
+    dim as TTF_Font ptr gf = 0
+    if C then gf = C->GlyphFontFor( GlyphFontKey( v ), false )
+    if gf = 0 then gf = tkForm_Font( Win, TKFONT_GLYPH )
+    tkLabel_SetFont( GlyphPreview, gf )
+    tkLabel_SetText( GlyphPreview, GlyphChar( v ) )
+end sub
+
+' The Glyph row's "...": the Glyph Picker on the item's glyph; Select puts "<font>:<hex>" in.
+sub ItemsEditor.PickGlyph( )
+    if (C = 0) orelse (C->OnPickGlyph = 0) orelse (Current < 0) orelse (Current >= Items.Count( )) then exit sub
+    dim as ustring picked
+    if C->OnPickGlyph( C->Host, C, Items[Current].Glyph, picked ) = false then exit sub
+    Items[Current].Glyph = picked
+    Loading = true
+    for each f as ItemField in Fields
+        if f.Key = "Glyph" then tkTextBox_SetText( f.Edit, GlyphShown( picked ) )
+    next
+    Loading = false
+    this.ShowGlyph( )
+    tkListTree_SetText( List, Current, this.RowText( Current ) )
 end sub
 
 sub ItemsEditor.FieldChanged( byval w as TK_WIDGET ptr )
     if Loading orelse (Current < 0) orelse (Current >= Items.Count( )) then exit sub
     for each f as ItemField in Fields
-        if f.Edit = w then
+        if (f.Edit = w) andalso f.IsCheck then
+            ' Stretch: several panels may share the spare width
+            Items[Current].Stretch = tkCheckBox_GetChecked( f.Edit )
+        elseif f.Edit = w then
             dim as ustring v
             if f.IsCombo then v = tkComboBox_GetText( f.Edit ) else v = tkTextBox_GetText( f.Edit )
             select case f.Key
             case "Text"    : Items[Current].Text = v
             case "Key"     : Items[Current].Key = v
-            case "Glyph"   : Items[Current].Glyph = v
+            case "Glyph"
+                ' the code box: "E824" in the glyph's font, "Material:E8B8", or a character as typed
+                Items[Current].Glyph = GlyphTyped( v, Items[Current].Glyph )
+                this.ShowGlyph( )
             case "Handler" : Items[Current].Handler = v
             case "Kind"    : Items[Current].Kind = v
             case "Width"   : Items[Current].Width = valint( v )
@@ -309,6 +577,101 @@ sub ItemsEditor.FieldChanged( byval w as TK_WIDGET ptr )
         end if
     next
     tkListTree_SetText( List, Current, this.RowText( Current ) )
+    this.ShowCaption( )
+    this.SyncSeparator( )
+end sub
+
+' A menu separator (text "-") is a line, not a command: its Shortcut and Handler boxes are off and
+' empty, and the item keeps neither.
+sub ItemsEditor.SyncSeparator( )
+    if catalog.IsMenuKind( Kind ) = false then exit sub
+    dim as boolean has = (Current >= 0) andalso (Current < Items.Count( ))
+    dim as boolean sep = has andalso (trim( Items[Current].Text ) = "-")
+    if sep then
+        Items[Current].Key = ""
+        Items[Current].Handler = ""
+    end if
+    dim as boolean was = Loading
+    Loading = true
+    for each f as ItemField in Fields
+        if (f.Key = "Key") orelse (f.Key = "Handler") then
+            if sep andalso (len( tkTextBox_GetText( f.Edit ) ) > 0) then tkTextBox_SetText( f.Edit, "" )
+            tkWidget_Enable( f.Edit, sep = false )
+            tkWidget_Enable( f.Label, sep = false )
+        end if
+    next
+    if BtnHandler then tkWidget_Enable( BtnHandler, sep = false )
+    Loading = was
+end sub
+
+' A word of an item's text as part of a name: its letters, digits and underscores ("Save As..." is
+' "SaveAs", "&Open" is "Open").
+private function NamePart_( byref s as const ustring ) as ustring
+    dim as ustring o
+    for k as long = 1 to len( s )
+        dim as ustring ch = mid( s, k, 1 )
+        if ((ch >= "a") andalso (ch <= "z")) orelse ((ch >= "A") andalso (ch <= "Z")) orelse ((ch >= "0") andalso (ch <= "9")) orelse (ch = "_") then o &= ch
+    next
+    return o
+end function
+
+' The name the pencil gives an item with no handler: the control's name, then for a menu the item's
+' path (MenuBar1's File > Save As... is MenuBar1_File_SaveAs), for any other entry its text (tbr_Go).
+' Never a name another entry here already calls, nor one tiko keeps for itself.
+function ItemsEditor.DefaultHandler( byval i as long ) as ustring
+    dim as ustring n
+    if catalog.IsMenuKind( Kind ) then
+        n = NamePart_( Items[i].Text )
+        dim as long lvl = Items[i].Level
+        for j as long = i - 1 to 0 step -1
+            if lvl = 0 then exit for
+            if Items[j].Level < lvl then
+                dim as ustring part = NamePart_( Items[j].Text )
+                if len( part ) then n = iif( len( n ), part & "_" & n, part )
+                lvl = Items[j].Level
+            end if
+        next
+        if len( n ) = 0 then n = "Item" & (i + 1)
+        n = ControlName & "_" & n
+    else
+        dim as ustring part = NamePart_( Items[i].Text )
+        if len( part ) = 0 then part = "Item" & (i + 1)
+        n = ControlName & "_" & part
+    end if
+    if (validate.IsIdentifier( n ) = false) orelse validate.IsReserved( n ) then n = ControlName & "_" & n
+    ' one of its own: a number after it while another entry already calls that name
+    dim as ustring want = n
+    dim as long k = 2
+    dim as boolean taken = true
+    while taken
+        taken = false
+        for j as long = 0 to Items.Count( ) - 1
+            if (j <> i) andalso (lcase( Items[j].Handler ) = lcase( n )) then taken = true
+        next
+        if taken then
+            n = want & k
+            k += 1
+        end if
+    wend
+    return n
+end function
+
+' The pencil: an entry with no handler is given one (DefaultHandler), then the editor closes as OK
+' does and the host shows that handler in the code.
+sub ItemsEditor.EditHandler( )
+    if (Current < 0) orelse (Current >= Items.Count( )) then exit sub
+    if catalog.IsMenuKind( Kind ) andalso (trim( Items[Current].Text ) = "-") then exit sub
+    if len( trim( Items[Current].Handler ) ) = 0 then
+        Items[Current].Handler = this.DefaultHandler( Current )
+        dim as boolean was = Loading
+        Loading = true
+        for each f as ItemField in Fields
+            if f.Key = "Handler" then tkTextBox_SetText( f.Edit, Items[Current].Handler )
+        next
+        Loading = was
+    end if
+    GoToHandler = trim( Items[Current].Handler )
+    this.Finish( true )
 end sub
 
 sub ItemsEditor.AddItem( )
@@ -316,6 +679,7 @@ sub ItemsEditor.AddItem( )
     it.Text = i18n.Tr( "designer.item_new", "New" )
     it.Origin = -1
     if Kind = catalog.ItemsKind.ItemsToolbar then it.Kind = "command"
+    if Kind = catalog.ItemsKind.ItemsIcons then it.Kind = "toggle" : it.Text = ""
     dim as long at_ = Items.Count( )
     if (Current >= 0) andalso (Current < Items.Count( )) then
         at_ = Current + 1

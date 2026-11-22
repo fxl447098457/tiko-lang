@@ -12,7 +12,7 @@ __FB_ARM__
 
 ## Description
 
-Define created at compile time if the compilation target uses the ARM CPU architecture, otherwise undefined.
+Define created at compile time if the compilation target uses the ARM CPU architecture, otherwise undefined. In tiko that is the `linux-arm64` and `macos-arm64` targets.
 
 ## Remarks
 

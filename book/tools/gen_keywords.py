@@ -42,6 +42,7 @@ CONTEXTUAL = [
     ("each", "`for each` (Chapter 20)"),
     ("from", "`case receive v from ch` in `select channel`"),
     ("in", "`for each x in …`"),
+    ("match", "`match x` followed by `case` arms or `pattern => value` arms, closed by `end match` (Chapter 6)"),
     ("of", "type arguments: `Array( of int32 )` (Chapter 17)"),
     ("override", "after a method's declaration: `declare sub M( ) override` (Chapter 14)"),
     ("partial", "`partial type` and `partial class`, one type in several blocks (Chapter 15)"),
@@ -55,6 +56,7 @@ FIXED_WIDTH = [
     ("int8", "byte"), ("uint8", "ubyte"), ("int16", "short"), ("uint16", "ushort"),
     ("int32", "long"), ("uint32", "ulong"), ("int64", "longint"), ("uint64", "ulongint"),
     ("float32", "single"), ("float64", "double"),
+    ("int128", None), ("uint128", None),
 ]
 
 
@@ -201,17 +203,19 @@ def main() -> int:
         "",
         "## Fixed-width type names {#app-kw-fixed}",
         "",
-        "tiko predeclares ten type names that fbc does not have. They are typedefs, not "
-        "reserved words (Chapter 4): a program's own declaration of one of them replaces "
-        "tiko's without a diagnostic, so code that already declares `INT32` — as "
-        "`win/basetsd.bi` does — compiles unchanged.",
+        "tiko predeclares twelve type names that fbc does not have. Ten are typedefs for "
+        "built-in types; `int128` and `uint128` are 128-bit integer types of tiko's own, "
+        "C's `__int128` (Chapter 4). None is a reserved word: a program's own declaration "
+        "of one of them replaces tiko's without a diagnostic, so code that already declares "
+        "`INT32` — as `win/basetsd.bi` does — compiles unchanged.",
         "",
         "| Name | Same type as | Name | Same type as |",
         "|---|---|---|---|",
     ]
     for i in range(0, len(FIXED_WIDTH), 2):
         a, b = FIXED_WIDTH[i], FIXED_WIDTH[i + 1]
-        L.append(f"| `{a[0]}` | `{a[1]}` | `{b[0]}` | `{b[1]}` |")
+        same = lambda t: f"`{t}`" if t else "its own type"
+        L.append(f"| `{a[0]}` | {same(a[1])} | `{b[0]}` | {same(b[1])} |")
     L += [
         "",
         "## The predeclared constant {#app-kw-nullptr}",

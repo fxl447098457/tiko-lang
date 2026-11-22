@@ -69,8 +69,113 @@ sub CheckSliceCtor_ ( byref c as Ctx, byval id as NodeId )
     if ok = false then c.diags->Report( TKO1050, PointRange( c.ast->Loc( lp->target ) ), iif( at = TYPE_NONE, "( )", c.types->Name( at ) ) )
 end sub
 
+'' The name a slice diagnostic gives its source: the variable's spelling, else its type.
+private function SourceName_( byref c as Ctx, byval src as NodeId, byval st as TypeId ) as string
+    if c.ast->Kind( src ) = N_IDENT then return c.names->Spelling( c.ast->IdentOf( src )->name )
+    return c.types->Name( st )
+end function
+
+'' 'a(lo to hi)' and 'v(i)' (docs/tiko-slices RFC-0003 §2, §4, §8): TKO1069 for an array of
+'' more than one dimension, TKO1070 for anything else that is no array or span, TKO1071 for
+'' constant bounds that cannot fit, TKO1072 for a span given other than one index.
+'' 'span( of T )( p, n )' (RFC-0003 §5): a 'T ptr' -- or an 'any ptr' -- and a count, TKO1073; a
+'' pointer to const T only for a 'span( of const T )', TKO1052.
+private sub CheckSpanCtor_ ( byref c as Ctx, byval id as NodeId )
+    dim as ListPayload ptr cp = c.ast->ListOf( id )
+    dim as NodeId tgt = cp->target
+    if (tgt = NODE_NONE) orelse (c.ast->Kind( tgt ) <> N_IDENT) then return
+    if c.info->RefOf( tgt ) <> SYMBOL_NONE then return
+    dim as TypeId st = c.info->TypeOf_( tgt )
+    if Slices.IsSpanType( *c.types, st ) = false then return
+    dim as TypeId et = Slices.SpanElemType( *c.types, st )
+    dim as boolean ok = (cp->count = 2)
+    dim as TypeId pt = TYPE_NONE
+    if ok then
+        pt = Slices.BareType( *c.types, c.info->TypeOf_( c.ast->ChildAt( cp->first, 0 ) ) )
+        ok = (pt <> TYPE_NONE) andalso (c.types->Kind( pt ) = TK_POINTER)
+    end if
+    dim as TypeId pe = TYPE_NONE
+    if ok then
+        pe = c.types->Inner( pt )
+        dim as TypeId pu = Slices.BareType( *c.types, pe )
+        ok = (pu = Slices.BareType( *c.types, et ))
+        if (ok = false) andalso (c.types->Kind( pu ) = TK_BUILTIN) then ok = (c.types->BuiltinOf( pu ) = TY_ANY)
+    end if
+    if ok then
+        dim as NodeId ne = c.ast->ChildAt( cp->first, 1 )
+        dim as TypeId nt = Slices.BareType( *c.types, c.info->TypeOf_( ne ) )
+        ok = (nt <> TYPE_NONE) andalso (c.types->Kind( nt ) = TK_BUILTIN)
+    end if
+    if ok = false then
+        c.diags->Report( TKO1073, PointRange( c.ast->Loc( tgt ) ), c.types->Name( c.types->Unqualify( et ) ) )
+        return
+    end if
+    if c.types->IsConst( pe ) andalso (c.types->IsConst( et ) = false) then
+        c.diags->Report( TKO1052, PointRange( c.ast->Loc( c.ast->ChildAt( cp->first, 0 ) ) ), c.types->Name( Slices.BareType( *c.types, st ) ) )
+    end if
+end sub
+
+private sub CheckSpanCall_ ( byref c as Ctx, byval id as NodeId )
+    dim as ListPayload ptr cp = c.ast->ListOf( id )
+    CheckSpanCtor_( c, id )
+    if Slices.IsSpanCall( *c.ast, *c.names, id ) = false then
+        if (cp->target = NODE_NONE) orelse (cp->count = 1) then return
+        if Slices.IsSpanIndexCallee( *c.ast, *c.syms, *c.types, *c.info, cp->target ) = false then return
+        c.diags->Report( TKO1072, PointRange( c.ast->Loc( id ) ), str( cp->count ) )
+        return
+    end if
+    dim as NodeId src = c.ast->ChildAt( cp->first, 0 )
+    dim as TypeId st = c.info->TypeOf_( src )
+    if st = TYPE_NONE then return
+    dim as string nm = SourceName_( c, src, st )
+    dim as boolean isSpan = Slices.IsSpanType( *c.types, st )
+    dim as int32 rank = Slices.SpanArrayRank( *c.types, st )
+    if (isSpan = false) andalso (rank > 1) then
+        c.diags->Report( TKO1069, PointRange( c.ast->Loc( cp->target ) ), nm, str( rank ) )
+        return
+    end if
+    if (isSpan = false) andalso (rank <> 1) then
+        dim as Slices.SliceSource ss
+        dim as string hint = ""
+        if Slices.SliceSourceOf( *c.types, *c.names, st, ss ) <> Slices.SU_NONE then hint = " -- a string is sliced with '[lo to hi]'"
+        c.diags->Report( TKO1070, PointRange( c.ast->Loc( cp->target ) ), nm, hint )
+        return
+    end if
+
+    '' RFC-0003 §4: valid iff lbound <= lo <= hi + 1 <= ubound + 1. A fixed array's bounds are
+    '' constant; a span's lbound is 0; a dynamic array's are not known.
+    dim as int64 lo, hi
+    dim as boolean loK = SliceBound_( c, c.ast->ChildAt( cp->first, 1 ), id, lo )
+    dim as boolean hiK = SliceBound_( c, c.ast->ChildAt( cp->first, 2 ), id, hi )
+    dim as boolean lbK = false, ubK = false
+    dim as int64 lb = 0, ub = 0
+    dim as string lbS = "lbound", ubS = "ubound"
+    if isSpan then
+        lbK = true : lbS = "0" : ubS = "len - 1"
+    else
+        dim as TypeId at = Slices.BareType( *c.types, st )
+        if c.types->IsDynArray( at ) = false then
+            dim as int32 first = c.types->types[cast( int32, at )].first
+            if c.types->types[cast( int32, at )].count >= 2 then
+                lb = c.types->boundPool[first] : ub = c.types->boundPool[first + 1]
+                lbK = true : ubK = true : lbS = str( lb ) : ubS = str( ub )
+            end if
+        end if
+    end if
+    dim as boolean bad = false
+    if loK andalso hiK andalso (lo > hi + 1) then bad = true
+    if loK andalso lbK andalso (lo < lb) then bad = true
+    if hiK andalso lbK andalso (hi < lb - 1) then bad = true
+    if hiK andalso ubK andalso (hi > ub) then bad = true
+    if loK andalso ubK andalso (lo > ub + 1) then bad = true
+    if bad = false then return
+    c.diags->Report( TKO1071, PointRange( c.ast->Loc( cp->target ) ), _
+        iif( loK, str( lo ), "lo" ) & " to " & iif( hiK, str( hi ), "hi" ), nm, lbS & " to " & ubS )
+end sub
+
 sub CheckSliceCall_ ( byref c as Ctx, byval id as NodeId )
     CheckSliceCtor_( c, id )
+    CheckSpanCall_( c, id )
     if Slices.IsSliceCall( *c.ast, *c.names, id ) = false then return
     dim as ListPayload ptr cp = c.ast->ListOf( id )
     dim as NodeId src = c.ast->ChildAt( cp->first, 0 )
@@ -78,6 +183,11 @@ sub CheckSliceCall_ ( byref c as Ctx, byval id as NodeId )
     if st = TYPE_NONE then return
     dim as Slices.SliceSource ss
     if Slices.SliceSourceOf( *c.types, *c.names, st, ss ) = Slices.SU_NONE then
+        '' THE OTHER BRACKET: an array or a span is sliced with '( )' (RFC-0003 §2).
+        if Slices.IsSpanType( *c.types, st ) orelse (Slices.SpanArrayRank( *c.types, st ) > 0) then
+            c.diags->Report( TKO1074, PointRange( c.ast->Loc( cp->target ) ), SourceName_( c, src, st ) )
+            return
+        end if
         c.diags->Report( TKO1050, PointRange( c.ast->Loc( cp->target ) ), c.types->Name( st ) )
         return
     end if
@@ -117,6 +227,10 @@ end sub
 '' 'return', an argument. The reverse, mutable into const, is the ordinary widening.
 private function ConstDropped_ ( byref c as Ctx, byval dst as TypeId, byval src as TypeId ) as boolean
     if (dst = TYPE_NONE) orelse (src = TYPE_NONE) then return false
+    '' A SPAN the same way, through 'v(i)' (RFC-0003 §3).
+    if Slices.IsSpanType( *c.types, dst ) andalso Slices.IsSpanType( *c.types, src ) then
+        return c.types->IsConst( Slices.SpanElemType( *c.types, src ) ) andalso (c.types->IsConst( Slices.SpanElemType( *c.types, dst ) ) = false)
+    end if
     if Slices.SliceUnitOfType( *c.types, *c.names, dst ) = Slices.SU_NONE then return false
     if Slices.SliceUnitOfType( *c.types, *c.names, src ) = Slices.SU_NONE then return false
     '' Through 'v[i]': the element is const exactly when its slice is (SliceElemType).
@@ -134,6 +248,7 @@ end function
 
 private sub ReportDropped_ ( byref c as Ctx, byval at as NodeId, byval dst as TypeId )
     dim as string nm = "slice"
+    if Slices.IsSpanType( *c.types, dst ) then nm = c.types->Name( Slices.BareType( *c.types, dst ) )
     select case Slices.SliceUnitOfType( *c.types, *c.names, dst )
     case Slices.SU_UTF16 : nm = "uslice"
     case Slices.SU_WIDE : nm = "wslice"
@@ -291,9 +406,9 @@ private function LifeUnparen_( byref c as Ctx, byval e as NodeId ) as NodeId
     return e
 end function
 
-'' A SLICE, OR A VIEW-KIND TYPE (RFC-0002 §3), which borrows as a slice does.
+'' A SLICE, A SPAN (RFC-0003 §7), OR A VIEW-KIND TYPE (RFC-0002 §3), which borrows as a slice does.
 private function IsSliceT_( byref c as Ctx, byval t as TypeId ) as boolean
-    if Slices.SliceUnitOfType( *c.types, *c.names, t ) <> Slices.SU_NONE then return true
+    if Slices.IsBorrowType( *c.types, *c.names, t ) then return true
     return Slices.IsViewType( *c.ast, *c.syms, *c.types, *c.names, t )
 end function
 
@@ -423,7 +538,8 @@ function CallOrigin_( byref c as Ctx, byval e as NodeId ) as SliceOrigin
                 ao = StorageOrigin_( c, arg )
                 if (au <> Slices.SliceUnitOfType( *c.types, *c.names, pt )) andalso (ao.kind <> ORG_FOREVER) then ao = Org_( ORG_TEMP )
             end if
-        elseif (c.ast->Flags( prm ) and NF_BYREF) <> 0 then
+        elseif (c.ast->Flags( prm ) and (NF_BYREF or NF_ARRAY)) <> 0 then
+            '' ...and an 'x()' parameter, whose array the callee may slice (RFC-0003 §7).
             ao = StorageOrigin_( c, arg )
         else
             continue for
@@ -522,7 +638,15 @@ function SliceOrigin_ ( byref c as Ctx, byval e as NodeId ) as SliceOrigin
             return StorageOrigin_( c, src )
         end if
         if SliceCtorType_( c, e ) <> TYPE_NONE then return Org_( ORG_FOREVER )   '' slice( p ): trusted
+        '' 'a(lo to hi)' borrows the array's storage -- or its span's (RFC-0003 §7).
+        if Slices.IsSpanCall( *c.ast, *c.names, e ) then
+            dim as NodeId asrc = c.ast->ChildAt( c.ast->ListOf( e )->first, 0 )
+            if IsSliceT_( c, c.info->TypeOf_( asrc ) ) then return SliceOrigin_( c, asrc )
+            return StorageOrigin_( c, asrc )
+        end if
         dim as ListPayload ptr lp = c.ast->ListOf( e )
+        '' span( of T )( p, n ): a pointer, trusted as slice( p ) is.
+        if (c.ast->Kind( lp->target ) = N_IDENT) andalso (c.info->RefOf( lp->target ) = SYMBOL_NONE) andalso Slices.IsSpanType( *c.types, c.info->TypeOf_( lp->target ) ) then return Org_( ORG_FOREVER )
         if c.ast->Kind( lp->target ) = N_IDENT then
             if lcase( c.names->Spelling( c.ast->IdentOf( lp->target )->name ) ) = "iif" then
                 if lp->count = 3 then
@@ -567,6 +691,7 @@ private sub JudgeBinding_ _
 end sub
 
 private function SliceName_( byref c as Ctx, byval t as TypeId ) as string
+    if Slices.IsSpanType( *c.types, t ) then return "span"
     select case Slices.SliceUnitOfType( *c.types, *c.names, t )
     case Slices.SU_NARROW : return "slice"
     case Slices.SU_UTF16 : return "uslice"
@@ -635,6 +760,11 @@ sub CheckSliceLife_ ( byref c as Ctx, byval id as NodeId, byval resultType as Ty
         dim as boolean isArr = (c.ast->Flags( id ) and NF_ARRAY) <> 0
         if vt <> TYPE_NONE then
             if (c.types->Kind( c.types->Unqualify( vt ) ) = TK_ARRAY) orelse c.types->IsDynArray( c.types->Unqualify( vt ) ) then isArr = true : vt = c.types->Inner( c.types->Unqualify( vt ) )
+        end if
+        '' A SPAN OF SLICES OR SPANS keeps views where nothing tracks them (RFC-0003 §7).
+        if Slices.IsSpanType( *c.types, vt ) andalso IsSliceT_( c, Slices.SpanElemType( *c.types, vt ) ) then
+            c.diags->Report( TKO1054, PointRange( c.ast->Loc( id ) ), SliceName_( c, Slices.SpanElemType( *c.types, vt ) ), "a span element" )
+            return
         end if
         if IsSliceT_( c, vt ) = false then return
         dim as string what = ""
@@ -818,6 +948,15 @@ private function StringRoot_( byref c as Ctx, byval e as NodeId ) as SymbolId
     return SYMBOL_NONE
 end function
 
+'' 'a()' as an argument: the array's name node, whose type is the array's; else e itself.
+private function StringRootNode_( byref c as Ctx, byval e as NodeId ) as NodeId
+    e = LifeUnparen_( c, e )
+    if c.ast->Kind( e ) = N_CALL then
+        if c.ast->ListOf( e )->count = 0 then return c.ast->ListOf( e )->target
+    end if
+    return e
+end function
+
 '' THE STRINGS A SLICE OR VIEW VALUE BORROWS, appended to out_.
 private sub LockSources_( byref c as Ctx, byref st as LockState, byval e as NodeId, byref out_ as containers.Array( of uint32 ), byval depth as int32 = 0 )
     if depth > 16 then return
@@ -832,7 +971,7 @@ private sub LockSources_( byref c as Ctx, byref st as LockState, byval e as Node
         next
     case N_CALL
         dim as ListPayload ptr lp = c.ast->ListOf( e )
-        if Slices.IsSliceCall( *c.ast, *c.names, e ) then
+        if Slices.IsSliceCall( *c.ast, *c.names, e ) orelse Slices.IsSpanCall( *c.ast, *c.names, e ) then
             dim as NodeId src = c.ast->ChildAt( lp->first, 0 )
             if IsSliceT_( c, c.info->TypeOf_( src ) ) then
                 LockSources_( c, st, src, out_, depth + 1 )
@@ -855,12 +994,14 @@ private sub LockSources_( byref c as Ctx, byref st as LockState, byval e as Node
     end select
 end sub
 
-'' MAY A WRITE OF THIS TYPE REALLOCATE: a var-length string, or a UDT, which may hold one.
+'' MAY A WRITE OF THIS TYPE REALLOCATE: a var-length string, or a UDT, which may hold one -- or
+'' a DYNAMIC array, which REDIM and ERASE move (RFC-0003 §7).
 private function ReallocType_( byref c as Ctx, byval t as TypeId ) as boolean
     if t = TYPE_NONE then return false
     t = c.types->Unqualify( t )
     if c.types->Kind( t ) = TK_REFERENCE then t = c.types->Unqualify( c.types->Inner( t ) )
     if IsSliceT_( c, t ) then return false
+    if c.types->IsDynArray( t ) then return true
     select case c.types->Kind( t )
     case TK_BUILTIN
         select case c.types->BuiltinOf( t )
@@ -998,6 +1139,8 @@ sub LockWalk_( byref c as Ctx, byref st as LockState, byval id as NodeId, byval 
                             if ai >= lp->count then exit for
                             dim as NodeId arg = c.ast->ChildAt( lp->first, ai )
                             ai += 1
+                            '' ...AND A DYNAMIC ARRAY PASSED TO AN 'x()' PARAMETER, which the callee may REDIM.
+                            if ((c.ast->Flags( prm ) and NF_ARRAY) <> 0) andalso ReallocType_( c, c.info->TypeOf_( StringRootNode_( c, arg ) ) ) then LockWrite_( c, st, StringRoot_( c, arg ), id ) : continue for
                             if (c.ast->Flags( prm ) and NF_BYREF) = 0 then continue for
                             dim as TypeId pt = c.info->TypeOf_( c.ast->StmtOf( prm )->a )
                             if (pt = TYPE_NONE) orelse c.types->IsConst( pt ) then continue for
@@ -1052,8 +1195,24 @@ sub LockWalk_( byref c as Ctx, byref st as LockState, byval id as NodeId, byval 
             LockWrite_( c, st, tr, id )
         end if
         return
+    case N_VAR
+        '' REDIM MOVES A DYNAMIC ARRAY (RFC-0003 §7): each item writes its array.
+        if sp->op = cast( uint16, KW_REDIM ) then
+            for i as int32 = 0 to sp->count - 1
+                dim as NodeId it = c.ast->ChildAt( sp->first, i )
+                if c.ast->Kind( it ) <> N_VAR_ITEM then continue for
+                dim as SymbolId rs = c.info->RefOf( it )
+                if rs = SYMBOL_NONE then rs = c.syms->LookupTyped( c.info->ScopeOf( it ), c.ast->StmtOf( it )->name, false )
+                if rs <> SYMBOL_NONE then LockWrite_( c, st, rs, id )
+            next
+        end if
     case N_INTRINSIC
         select case cast( TokenKind, sp->op )
+        case KW_ERASE
+            for i as int32 = 0 to sp->count - 1
+                dim as NodeId a = c.ast->ChildAt( sp->first, i )
+                if ReallocType_( c, c.info->TypeOf_( StringRootNode_( c, a ) ) ) then LockWrite_( c, st, StringRoot_( c, a ), id )
+            next
         case KW_SWAP, KW_INPUT, KW_LINE
             '' The operands: in 'a' / 'b' for some statements, in the child list for others.
             dim as NodeId opnd( 1 ) = { sp->a, sp->b }

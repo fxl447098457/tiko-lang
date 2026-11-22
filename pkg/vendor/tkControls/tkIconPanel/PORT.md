@@ -33,6 +33,8 @@ before sizing, and the per-monitor rescale (inherit sentinels left alone).
   latched toggle on the idle fill (the tab-row look).
 - `SelectExclusive`: the radio helper, silent.
 - `GetHotItem`, `GetPressedItem`: state queries the selftest asserts through.
+- `PaintItemDefault( p )`: the stock item, for an item-paint callback (the form designer's Paint
+  event).
 
 **Dropped as Win32-only:** the 100 ms hot-track timer (`IDT_CICONPANEL_HOTTRACK`,
 `PSICONPANEL_HOTTRACK_MS`; the host guarantees the leave), `WM_MOUSEHOVER` reporting and the

@@ -147,6 +147,13 @@ HOST_DEPENDENT = {
     "filesystem/fsvolume.bas": "the assert count follows the machine's volumes (five per drive).",
 }
 
+# PORTED BUT NOT RUN: no .test is written for these. filesystem/fslink makes symbolic links,
+# which Windows refuses to a process that is not elevated (and has no Developer Mode), so it
+# failed on every ordinary run and said nothing about the code (the author's decision, 2026-11-21).
+NOT_RUN = {
+    "filesystem/fslink.bas": "creating a symbolic link needs elevation on Windows.",
+}
+
 # THE LOGEVENT FIELD METHODS ARE Add<kind> in std/logs -- AddText, AddInt, ... -- where
 # fb/logging.bi spelled them Str, Int_, UInt, Dbl, Bool, Ptr_, Time, Span and Val. The
 # old names collided with keywords and intrinsics; see pkg/std/logs/logger.tiko.
@@ -455,7 +462,7 @@ def main():
             continue
         area, fn = rel.split("/")
         basef = os.path.join(OUT, "baseline", area, fn[:-4] + ".txt")
-        if not os.path.isfile(basef):
+        if not os.path.isfile(basef) or rel in NOT_RUN:
             continue
         base = io.open(basef, encoding="utf-8").read()
         want[rel[:-4] + ".test"] = test_for(rel, base, (rel[:-4] + "_mod2.bas") in want)

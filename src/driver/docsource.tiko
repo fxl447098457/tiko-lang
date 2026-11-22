@@ -1,0 +1,251 @@
+'' docsource.tiko -- the comments a module's documentation is made of, read from its source
+'' files (see doc.ti). The lexer keeps none, so each file is read as text, once per run.
+
+#import "std/containers"
+#include once "driver/doc.ti"
+#include once "support/diskcache.ti"
+#include once "support/text.ti"
+
+namespace Tko.Doc
+
+private function Key_( byref p as string ) as string
+    dim as string k = p
+    for i as int32 = 0 to len( k ) - 1
+        if k[i] = 92 then k[i] = 47
+    next
+    #ifdef __FB_WIN32__
+        k = Tko.Text.LowerAscii( k )
+    #endif
+    return k
+end function
+
+'' The file's index in the cache, read now if need be; -1 when it cannot be read.
+private function Load_( byref src as DocSources, byref path_ as string ) as int32
+    dim as string k = Key_( path_ )
+    for i as int32 = 0 to src.paths.Count - 1
+        if src.paths[i] = k then return i
+    next
+    dim as string t
+    if Tko.DiskCache.ReadAll( path_, t ) = false then return -1
+    src.starts.Push( src.lines.Count )
+    dim as int32 n = 0, p = 1
+    while p <= len( t )
+        dim as int32 e = instr( p, t, chr( 10 ) )
+        if e = 0 then e = len( t ) + 1
+        dim as string ln = mid( t, p, e - p )
+        if right( ln, 1 ) = chr( 13 ) then ln = left( ln, len( ln ) - 1 )
+        src.lines.Push( ln )
+        n += 1
+        p = e + 1
+    wend
+    src.counts.Push( n )
+    src.paths.Push( k )
+    return src.paths.Count - 1
+end function
+
+function SourceLine( byref src as DocSources, byref path_ as string, byval line_ as int32 ) as string
+    dim as int32 f = Load_( src, path_ )
+    if f < 0 then return ""
+    if (line_ < 1) orelse (line_ > src.counts[f]) then return ""
+    return src.lines[src.starts[f] + line_ - 1]
+end function
+
+private function Count_( byref src as DocSources, byref path_ as string ) as int32
+    dim as int32 f = Load_( src, path_ )
+    if f < 0 then return 0
+    return src.counts[f]
+end function
+
+'' The line is a comment and nothing else: its first non-blank character is a quote, or REM.
+private function IsComment_( byref ln as string ) as boolean
+    dim as string t = ltrim( ln, any chr( 32, 9 ) )
+    if left( t, 1 ) = "'" then return true
+    return Tko.Text.LowerAscii( left( t, 4 ) ) = "rem "
+end function
+
+'' A comment line's text: the quotes (or REM) and one space after them gone; indentation past
+'' that kept.
+private function Clean_( byref ln as string ) as string
+    dim as string t = ltrim( ln, any chr( 32, 9 ) )
+    if Tko.Text.LowerAscii( left( t, 4 ) ) = "rem " then
+        t = mid( t, 5 )
+    else
+        while left( t, 1 ) = "'"
+            t = mid( t, 2 )
+        wend
+        if left( t, 1 ) = " " then t = mid( t, 2 )
+    end if
+    return rtrim( t, any chr( 32, 9 ) )
+end function
+
+'' A divider: '----', '====', '****' runs, or a banner '---- name ----' / '==== name'.
+private function Divider_( byref t as string ) as boolean
+    dim as string s = trim( t )
+    if len( s ) < 3 then return false
+    dim as string lead = left( s, 3 )
+    return (lead = "---") orelse (lead = "===") orelse (lead = "***") orelse (lead = "~~~") orelse (lead = "___")
+end function
+
+'' Lines first..last of the file as documentation: cleaned, dividers out, blank edges trimmed.
+private function Block_( byref src as DocSources, byref path_ as string, byval first as int32, byval last as int32 ) as string
+    dim as string r = ""
+    for i as int32 = first to last
+        dim as string c = Clean_( SourceLine( src, path_, i ) )
+        if Divider_( c ) then continue for
+        r &= c & chr( 10 )
+    next
+    '' Leading and trailing empty lines.
+    while left( r, 1 ) = chr( 10 )
+        r = mid( r, 2 )
+    wend
+    while right( r, 2 ) = chr( 10 ) & chr( 10 )
+        r = left( r, len( r ) - 1 )
+    wend
+    if right( r, 1 ) = chr( 10 ) then r = left( r, len( r ) - 1 )
+    return r
+end function
+
+function DocAbove( byref src as DocSources, byref path_ as string, byval line_ as int32 ) as string
+    if (len( path_ ) = 0) orelse (line_ < 2) then return ""
+    dim as int32 last = line_ - 1
+    if IsComment_( SourceLine( src, path_, last ) ) = false then return ""
+    dim as int32 first = last
+    while (first > 1) andalso IsComment_( SourceLine( src, path_, first - 1 ) )
+        first -= 1
+    wend
+    '' THE MODULE'S OVERVIEW, sitting right above the first declaration, is not that declaration's.
+    if (Key_( path_ ) = src.ovPath) andalso (first <= src.ovLast) andalso (last >= src.ovFirst) then return ""
+    '' A '#module'/'#import' line above the block makes it a file header, not a declaration's.
+    if first > 1 then
+        dim as string above = Tko.Text.LowerAscii( ltrim( SourceLine( src, path_, first - 1 ), any chr( 32, 9 ) ) )
+        if left( above, 7 ) = "#module" then return ""
+    end if
+    return Block_( src, path_, first, last )
+end function
+
+function DocTrailing( byref src as DocSources, byref path_ as string, byval line_ as int32 ) as string
+    dim as string ln = SourceLine( src, path_, line_ )
+    dim as boolean quoted = false
+    for i as int32 = 0 to len( ln ) - 1
+        if ln[i] = 34 then quoted = not quoted
+        if (quoted = false) andalso (ln[i] = 39) then
+            if i = 0 then return ""
+            return Clean_( mid( ln, i + 1 ) )
+        end if
+    next
+    return ""
+end function
+
+function Overview( byref src as DocSources, byref path_ as string ) as string
+    dim as int32 n = Count_( src, path_ )
+    dim as int32 i = 1
+    '' To the '#module' line.
+    while i <= n
+        dim as string t = Tko.Text.LowerAscii( ltrim( SourceLine( src, path_, i ), any chr( 32, 9 ) ) )
+        i += 1
+        if left( t, 7 ) = "#module" then exit while
+    wend
+    '' Past blank lines, then the block.
+    while (i <= n) andalso (len( trim( SourceLine( src, path_, i ), any chr( 32, 9 ) ) ) = 0)
+        i += 1
+    wend
+    if (i > n) orelse (IsComment_( SourceLine( src, path_, i ) ) = false) then return ""
+    dim as int32 first = i
+    while (i <= n) andalso IsComment_( SourceLine( src, path_, i ) )
+        i += 1
+    wend
+    src.ovPath = Key_( path_ )
+    src.ovFirst = first
+    src.ovLast = i - 1
+    return Block_( src, path_, first, i - 1 )
+end function
+
+'' 'ident' starts at position i of lower-case 's' and is not part of a longer name.
+private function WordAt_( byref s as string, byval i as int32, byref ident as string ) as boolean
+    if mid( s, i, len( ident ) ) <> ident then return false
+    dim as int32 j = i + len( ident )
+    if j > len( s ) then return true
+    dim as uint8 c = s[j - 1]
+    return (c = 32) orelse (c = 9) orelse (c = 40)
+end function
+
+function DocOfDefinition( byref src as DocSources, byref files as Tko.StrVec, byref qualName as string ) as string
+    dim as string want = Tko.Text.LowerAscii( qualName )
+    for each f as string in files
+        dim as int32 n = Count_( src, f )
+        for i as int32 = 1 to n
+            dim as string t = Tko.Text.LowerAscii( ltrim( SourceLine( src, f, i ), any chr( 32, 9 ) ) )
+            if left( t, 7 ) = "public " then t = ltrim( mid( t, 8 ) )
+            if left( t, 8 ) = "private " then t = ltrim( mid( t, 9 ) )
+            if left( t, 7 ) = "static " then t = ltrim( mid( t, 8 ) )
+            dim as int32 sp = instr( t, " " )
+            if sp = 0 then continue for
+            select case left( t, sp - 1 )
+            case "function", "sub", "property", "operator", "constructor", "destructor"
+            case else
+                continue for
+            end select
+            if WordAt_( ltrim( mid( t, sp + 1 ) ), 1, want ) then
+                dim as string d = DocAbove( src, f, i )
+                if len( d ) > 0 then return d
+            end if
+        next
+    next
+    return ""
+end function
+
+sub ExportedMacros( byref src as DocSources, byref files as Tko.StrVec, byref outv as Tko.StrVec )
+    '' The names '#export' gives, in any file of the module.
+    dim as string names_ = "|"
+    for each f as string in files
+        for i as int32 = 1 to Count_( src, f )
+            dim as string t = ltrim( SourceLine( src, f, i ), any chr( 32, 9 ) )
+            if Tko.Text.LowerAscii( left( t, 8 ) ) <> "#export " then continue for
+            dim as string rest = mid( t, 9 )
+            dim as int32 q = instr( rest, "'" )
+            if q > 0 then rest = left( rest, q - 1 )
+            dim as int32 p = 1
+            do
+                dim as int32 c = instr( p, rest, "," )
+                dim as string nm = trim( iif( c = 0, mid( rest, p ), mid( rest, p, c - p ) ) )
+                if len( nm ) > 0 then names_ &= Tko.Text.LowerAscii( nm ) & "|"
+                if c = 0 then exit do
+                p = c + 1
+            loop
+        next
+    next
+    if names_ = "|" then return
+    '' Each one's definition: the name as written, its parameters, where.
+    for each f as string in files
+        for i as int32 = 1 to Count_( src, f )
+            dim as string t = ltrim( SourceLine( src, f, i ), any chr( 32, 9 ) )
+            dim as string lt = Tko.Text.LowerAscii( t )
+            dim as int32 skip_ = 0
+            if left( lt, 8 ) = "#define " then skip_ = 8
+            if left( lt, 7 ) = "#macro " then skip_ = 7
+            if skip_ = 0 then continue for
+            dim as string rest = ltrim( mid( t, skip_ + 1 ) )
+            dim as int32 e = 1
+            while e <= len( rest )
+                dim as uint8 c = rest[e - 1]
+                dim as boolean idc = ((c >= 48) andalso (c <= 57)) orelse ((c >= 65) andalso (c <= 90)) orelse _
+                                     ((c >= 97) andalso (c <= 122)) orelse (c = 95)
+                if idc = false then exit while
+                e += 1
+            wend
+            dim as string nm = left( rest, e - 1 )
+            if instr( names_, "|" & Tko.Text.LowerAscii( nm ) & "|" ) = 0 then continue for
+            dim as string params = ""
+            if mid( rest, e, 1 ) = "(" then
+                dim as int32 cp = instr( e, rest, ")" )
+                if cp > 0 then params = mid( rest, e, cp - e + 1 )
+            end if
+            '' Each name once: the first definition, where an #if gives it two.
+            dim as int32 at = instr( names_, "|" & Tko.Text.LowerAscii( nm ) & "|" )
+            names_ = left( names_, at ) & mid( names_, at + len( nm ) + 2 )
+            outv.Push( nm & chr( 9 ) & nm & params & chr( 9 ) & f & chr( 9 ) & i )
+        next
+    next
+end sub
+
+end namespace

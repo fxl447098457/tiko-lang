@@ -47,19 +47,24 @@ Each control has, beside its own `SetColors`:
 
 Any colour setter the program calls pins the control. Item-level colours (a chart series, a toolbar item's foreground) are data, never pinned and never themed. A widget of your own follows the theme by handling `TKM_THEMECHANGED` and reading `tkTheme_Get()`.
 
-## Coming from PsTheme
+## The roles
 
-| [PsTheme](PsTheme) | tkTheme |
+| Role | Used for |
 | --- | --- |
-| `PSTHEME_COLORS` | `TKTHEME_COLORS` (the same roles, the same preset values) |
-| `PsTheme_Dark`, `Light`, `System`, `SystemIsDark`, `Equal` | `tkTheme_Dark`, `Light`, `System`, `SystemIsDark`, `Equal` |
-| `Ps<X>_ThemeColors`, `ApplyTheme`, `UnpinColors` | `tk<X>_ThemeColors`, `ApplyTheme`, `UnpinColors` |
+| `IsDark` | Whether this is a dark theme, for the program's own choices |
+| `Window` | The form background, and controls that sit flat on it |
+| `Surface`, `SurfaceHot`, `SurfaceDisabled` | Control faces: buttons, fields, bars |
+| `Text`, `TextHot`, `TextStrong`, `TextDim`, `TextDisabled` | Text: normal, under the mouse, emphasised (titles, pressed), secondary (captions, placeholders), disabled |
+| `Accent`, `AccentHot` | Checked, on, progress, today |
+| `FocusRing` | Focus rings and focused borders |
+| `Border`, `BorderDisabled`, `Divider` | Outlines, separators, grid lines |
+| `Selected`, `SelectedText` | Selection and pressed fill |
+| `Popup`, `PopupText` | Menus, dropdowns, tooltips |
+| `Track` | The unfilled part of a track: toggle off, progress |
+| `Success`, `Warning`, `Error` | Status colours |
 
-- Colours are `ulong` `&hAARRGGBB` (`tkRGB`), not `COLORREF`.
-- Added: the current theme itself, `tkTheme_Get` and `tkTheme_Apply`, which works without tkApp.
-- Dropped: `PsTheme_ApplyTitleBar` and `ApplyCaptionOf`. SDL draws no caption, so the OS colours the title bar in its own theme.
-
-The [PsTheme](PsTheme) page remains the behaviour reference for everything not listed here.
+Colours are `ulong` `&hAARRGGBB` values, built with `tkRGB`. `tkTheme_Apply` makes `Window`
+opaque whatever alpha it was given.
 
 ## Public declarations
 
@@ -112,4 +117,3 @@ sub tkTheme_Apply( byref t as TKTHEME_COLORS )
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsTheme](PsTheme), the PsControls module

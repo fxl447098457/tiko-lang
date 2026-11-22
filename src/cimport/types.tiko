@@ -69,6 +69,8 @@ private function C2tBuiltin_( byval kind as int32, byref r as string ) as boolea
     case CXType_UInt, CXType_Char32        : r = "uint32"
     case CXType_LongLong                   : r = "int64"
     case CXType_ULongLong                  : r = "uint64"
+    case CXType_Int128                     : r = "int128"
+    case CXType_UInt128                    : r = "uint128"
     case CXType_Float                      : r = "float32"
     case CXType_Double                     : r = "float64"
     case else                              : return false
@@ -114,9 +116,11 @@ private function Builtin_( byref x as CImp, byval t as CXType, byref why as stri
         if ldsz = 8 then return iif( x.c2t, "float64", "double" )
         why = "long double is " & ldsz & " bytes here; FreeBASIC has no 80-bit type"
         return ""
-    case CXType_Int128, CXType_UInt128
-        why = "__int128 has no FreeBASIC equivalent"
-        return ""
+    '' __int128 IS tiko's OWN int128 -- fbc has no 128-bit integer, so the spelling is the
+    '' prelude typedef's in both branches. Size 16 and alignment 16, as clang's (probed
+    '' 2026-11-19, clang 23, x86_64-pc-windows-msvc and x86_64-linux-gnu).
+    case CXType_Int128                     : r = "int128"   : want = 16
+    case CXType_UInt128                    : r = "uint128"  : want = 16
     case CXType_Float128, CXType_Ibm128, CXType_Half, CXType_Float16, CXType_BFloat16
         why = "extended/reduced float types have no FreeBASIC equivalent"
         return ""
@@ -224,7 +228,8 @@ private function C2tPtrToRecord_( byref x as CImp, byval st as uint8, byval self
 end function
 
 private function PtrToRecord_( byref x as CImp, byval pt as CXType, byval constPointee as boolean, _
-                               byref why as string, byref wholeText as string ) as boolean
+                               byref written as string, byref why as string, _
+                               byref wholeText as string ) as boolean
     dim as int32 id = DeclUsrOf_( x, pt )
     if id < 0 then return false
     dim as uint8 st = UsrState( x, id )
@@ -238,7 +243,12 @@ private function PtrToRecord_( byref x as CImp, byval pt as CXType, byval constP
                 wholeText = iif( constPointee, "const ", "" ) & sn & " ptr"
                 return true
             end if
-            why = "'" & ClangText( *x.api, x.api->getTypeSpelling( pt ) ) & "' is a system header's type"
+            '' NAMED AS WRITTEN: 'max_align_t *' is the typedef's name, not the record's spelling,
+            '' which clang 23 gives a typedef-named anonymous record as 'struct max_align_t' and
+            '' older clangs as 'max_align_t' -- two passes, two texts, one TODO listed twice.
+            dim as string sp = written
+            if len( sp ) = 0 then sp = ClangText( *x.api, x.api->getTypeSpelling( pt ) )
+            why = "'" & sp & "' is a system header's type"
             return true
         end if
         return C2tPtrToRecord_( x, st, self_, nm, constPointee, why, wholeText )
@@ -376,8 +386,10 @@ function TypeText( byref x as CImp, byval t0 as CXType, byref why as string ) as
         '' one: windows.h's 'BEM_REFERENCE *' is 'BEM_REFERENCE ptr', where resolving to the
         '' record wrote 'any ptr'. wchar_t is a typedef too, and is a wide string.
         dim as boolean wide = false
+        dim as string written
         if pu.kind = CXType_Typedef then
-            wide = (ClangText( *x.api, x.api->getTypedefName( pu ) ) = "wchar_t")
+            written = ClangText( *x.api, x.api->getTypedefName( pu ) )
+            wide = (written = "wchar_t")
             if wide = false then
                 dim as CXType rt = UnwrittenTypedefs_( x, pu )
                 if rt.kind = CXType_Record then pu = rt
@@ -397,7 +409,7 @@ function TypeText( byref x as CImp, byval t0 as CXType, byref why as string ) as
             if wide then inner = "wstring" else inner = TypeText( x, pt, why )
         case CXType_Record
             dim as string whole
-            if PtrToRecord_( x, pu, constPointee, why, whole ) then
+            if PtrToRecord_( x, pu, constPointee, written, why, whole ) then
                 if len( why ) then return ""
                 '' A CONST POINTER TO A RECORD keeps its const where it has a spelling -- on
                 '' 'Name ptr' -- and not on a forward alias, where fbc-modern drops it too.

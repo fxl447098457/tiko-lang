@@ -41,6 +41,7 @@ tiko defines one `TIKO_OS_` name for the target being built, always `1`:
 | --- | --- | --- |
 | `windows-x86_64` | `TIKO_OS_WINDOWS` | `TIKO_OS_LINUX`, `TIKO_OS_MACOS` |
 | `linux-x86_64` | `TIKO_OS_LINUX` | `TIKO_OS_WINDOWS`, `TIKO_OS_MACOS` |
+| `linux-arm64` | `TIKO_OS_LINUX` | `TIKO_OS_WINDOWS`, `TIKO_OS_MACOS` |
 | `macos-arm64` | `TIKO_OS_MACOS` | `TIKO_OS_WINDOWS`, `TIKO_OS_LINUX` |
 
 The name follows `-target`, not the machine running the compiler, so `-target linux-x86_64` on Windows takes the Linux branch:
@@ -49,7 +50,7 @@ The name follows `-target`, not the machine running the compiler, so `-target li
 #ifdef TIKO_OS_WINDOWS
 	print "windows"; TIKO_OS_WINDOWS     '' windows-x86_64 prints: windows 1
 #elseif defined( TIKO_OS_LINUX )
-	print "linux"; TIKO_OS_LINUX         '' linux-x86_64 prints: linux 1
+	print "linux"; TIKO_OS_LINUX         '' linux-x86_64 and linux-arm64 print: linux 1
 #elseif defined( TIKO_OS_MACOS )
 	print "macos"; TIKO_OS_MACOS         '' macos-arm64 prints: macos 1
 #else
@@ -70,12 +71,14 @@ Exactly one of the three is defined on every target.
 | `__FB_BACKEND__` | `"llvm"` |
 | `__FB_MIN_VERSION__` | not defined |
 | `TIKO_OS_WINDOWS` | `1` on `windows-x86_64`, otherwise not defined |
-| `TIKO_OS_LINUX` | `1` on `linux-x86_64`, otherwise not defined |
+| `TIKO_OS_LINUX` | `1` on `linux-x86_64` and `linux-arm64`, otherwise not defined |
 | `TIKO_OS_MACOS` | `1` on `macos-arm64`, otherwise not defined |
+| `__TIKO_ASAN__` | `1` when built with [`-fsanitize=address`](Compiler-Option-Fsanitize), otherwise not defined |
 | `TIKO_ARCH_X86_64` | `1` on `windows-x86_64` and `linux-x86_64`, otherwise not defined |
-| `TIKO_ARCH_ARM64` | `1` on `macos-arm64`, otherwise not defined |
+| `TIKO_ARCH_ARM64` | `1` on `linux-arm64` and `macos-arm64`, otherwise not defined |
+| `__TIKO_CALLER_LOCATION__` | `1`: [`__CALLER_LINE__` and `__CALLER_FILE__`](Caller-Line) exist |
 
-`__TIKO_COMPILER__` says **which compiler** is building; `__TIKO_VERSION__` says which version of it. Neither says which features it has, so code that must build with several versions still tests more than one symbol.
+`__TIKO_COMPILER__` says **which compiler** is building; `__TIKO_VERSION__` says which version of it. Neither says which features it has, so code that must build with several versions still tests more than one symbol. `__TIKO_CALLER_LOCATION__` is one such feature test.
 
 tests/pp/tiko-compiler-define.test holds the define and its value; tests/pp/tiko-target-defines.test holds the `TIKO_OS_` and `TIKO_ARCH_` names on each target.
 

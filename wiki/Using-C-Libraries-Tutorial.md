@@ -2,7 +2,7 @@
 
 # Using C Libraries Tutorial
 
-> 📘 **Step by step, one library each:** [SQLite](SQLite-Tutorial) · [raylib](Raylib-Tutorial) · [GLFW](GLFW-Tutorial) · [SDL3](SDL3-Tutorial)
+> 📘 **Step by step, one library each:** [SQLite](SQLite-Tutorial) · [PCRE2](PCRE2-Tutorial) · [raylib](Raylib-Tutorial) · [GLFW](GLFW-Tutorial) · [SDL3](SDL3-Tutorial)
 >
 > 📖 **In the book:** [Chapter 30, Using C Libraries](https://tiko-lang.net/book/ch30-c-libraries.html) covers the same ground in one chapter. Every program on these pages is one of its listings, compiled and run on Windows and Linux with tiko.
 
@@ -37,7 +37,7 @@ the directory with -cinclude
 
 On Windows, a static library and an import library are both `.lib`. The package's documentation, or the file size, tells you which is which: raylib's static `raylib.lib` is 5 MB, and its import library `raylibdll.lib` is 400 KB.
 
-**A DLL with no import library is fine.** When `#foreignlib ... dynamic` finds only a `.dll`, tiko reads the DLL's table of exports and makes the import library itself while linking, naming the DLL as the DLL names itself. The [SQLite tutorial](SQLite-Tutorial#3-lay-it-out-windows) uses that.
+**A DLL with no import library is fine.** When `#foreignlib ... dynamic` finds only a `.dll`, tiko reads the DLL's table of exports and makes the import library itself while linking, naming the DLL as the DLL names itself. The [SQLite tutorial](SQLite-Tutorial#lay-it-out-windows) uses that.
 
 **Choose the right download.** tiko builds 64-bit programs only, so skip anything marked `win32`, `x86`, `i386` or `i686`. On Windows, take the package built for **Visual C++** (`msvc`, `VC`, `vc2022`), because tiko's Windows target follows Visual C++'s conventions and uses its C runtime. The `mingw` packages are for a different toolchain.
 
@@ -174,7 +174,7 @@ main    = "main.tiko"
 options = ["-i", "../vendor"]
 ```
 
-To share the bindings between every program on the machine, put `raylib.ti` and its `raylib/` folder in `C:\tiko-libs`, and use `options = ["-i", "C:/tiko-libs"]` in each `tiko.toml` (or `-i C:\tiko-libs` on the command line). The [raylib tutorial](Raylib-Tutorial#7-one-copy-for-every-program) shows the whole project.
+To share the bindings between every program on the machine, put `raylib.ti` and its `raylib/` folder in `C:\tiko-libs`, and use `options = ["-i", "C:/tiko-libs"]` in each `tiko.toml` (or `-i C:\tiko-libs` on the command line).
 
 ### Or a binding module
 
@@ -200,7 +200,7 @@ public #cinclude once "../../vendor/raylib/raylib.h"
 #endif
 ```
 
-A program then needs one line, `#import "raylib"`. Install the module for every program by putting its folder in a directory named in **`TIKO_PATH`** (`;`-separated on Windows, `:` on Linux and macOS). A module may not use `#cmdline`, so a library whose headers need `-cinclude` (SDL3's do) is still best kept as a binding header. The [raylib tutorial](Raylib-Tutorial#8-a-binding-module) has the whole project.
+A program then needs one line, `#import "raylib"`. Install the module for every program by putting its folder in a directory named in **`TIKO_PATH`** (`;`-separated on Windows, `:` on Linux and macOS). A module may not use `#cmdline`, so a library whose headers need `-cinclude` (SDL3's do) is still best kept as a binding header. The book's [chapter 30](https://tiko-lang.net/book/ch30-c-libraries.html#a-binding-module) has the whole project, and every [vendor package](Vendor-Packages) is one.
 
 ## 6. When it goes wrong
 

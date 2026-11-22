@@ -34,11 +34,12 @@
 '' T's default constructor runs.  That is the price of not using a union.
 ''
 '' EMPTY ACCESS RAISES.  Value( ) on an empty Optional raises the runtime error
-'' FB_RTERROR_ILLEGALFUNCTIONCALL through the ordinary fbc path, so it is
-'' catchable by 'on error' and reports a line under -exx.  With no handler
-'' installed the program aborts with 'runtime error 1 (illegal function call)'
-'' and the line inside this file, which is the intended outcome: reading a value
-'' that is not there is a bug at the call site, not a recoverable condition.
+'' FB_RTERROR_ILLEGALFUNCTIONCALL, so it is catchable by 'on error'.  With no
+'' handler installed the program aborts with 'runtime error 1 (illegal function
+'' call) at line N of CALLER.tiko(), Value( ) of an empty Optional' -- the CALLER'S
+'' line, which is the intended outcome: reading a value that is not there is a
+'' bug at the call site, not a recoverable condition.  The compiler warns where
+'' it can see the call is not covered by a HasValue( ) check (TKO1150).
 '' It still has to return a reference to something afterwards; it returns the
 '' stored slot, which is always a real default-constructed T.  ValueOr( ) is the
 '' branch-free alternative and never raises.
@@ -55,6 +56,37 @@
 
 using FB
 
+'' THE RAISE NAMES THE CALLER (__TIKO_CALLER_LOCATION__ below). Value( ) takes the caller's line
+'' and file as defaults -- __CALLER_LINE__ / __CALLER_FILE__ are lowered at each call -- and
+'' raises through the runtime's own thrower with them and a message. The error is still
+'' FB_RTERROR_ILLEGALFUNCTIONCALL, so 'on error' and ERR see what they always saw; ERL is now
+'' the caller's line. The function name an -exx build recorded on entry ('VALUE') is cleared
+'' first: beside the caller's file it would name a procedure that file does not hold.
+''
+'' extern "C" for the alias, as std/chrono does: at a module's scope an alias alone is spelled
+'' through the module's chain. Declared once, here, for result.tiko too: the module is one scope.
+'' A seed older than the feature has no __CALLER_LINE__, and the seed builds the tree's pkg/
+'' (build.sh: TIKO_PKG); it keeps the plain 'error' until the seed has it.
+''
+'' THE TWO CONVENTIONS DISAGREE ON WIN32, which is why the block is two. The archive
+'' spells fb_ErrorThrowMsg undecorated (src/err/throw.tiko defines it extern "c", per
+'' fb_error.h) and fb_ErrorSetFuncName decorated '_fb_ErrorSetFuncName@4'
+'' (src/err/getset.tiko defines it extern "rtlib", FBCALL) -- one extern "C" block
+'' answered both cdecl and linked win32 with an undefined '_fb_ErrorSetFuncName'
+'' (measured, tests/smoke/errors). extern "rtlib" is the same foreign linkage -- the
+'' alias travels the same way -- with the block convention the target's FBCALL is.
+#ifdef __TIKO_CALLER_LOCATION__
+extern "C"
+declare function tkoOutcomeThrow_ alias "fb_ErrorThrowMsg" _
+    ( byval err_num as long, byval line_num as long, byval mod_name as zstring ptr, _
+      byval msg as zstring ptr, byval res_label as any ptr, byval resnext_label as any ptr ) as any ptr
+end extern
+
+extern "rtlib"
+declare function tkoOutcomeSetFuncName_ alias "fb_ErrorSetFuncName" ( byval fun_name as zstring ptr ) as zstring ptr
+end extern
+#endif
+
 public type Optional( of T )
     private:
     as T v
@@ -62,7 +94,11 @@ public type Optional( of T )
 
     public:
     declare function HasValue( ) as boolean
+    #ifdef __TIKO_CALLER_LOCATION__
+    declare function Value( byval callerLine_ as long = __CALLER_LINE__, byval callerFile_ as zstring ptr = __CALLER_FILE__ ) byref as T
+    #else
     declare function Value( ) byref as T
+    #endif
     declare function ValueOr( byref dflt as T ) byref as T
     declare sub Clear( )
     '' Holds v from now on -- what Some( v ) builds. The fields are private.
@@ -90,6 +126,16 @@ end function
 '' a function-'static' UDT in FreeBASIC is constructed lazily on first call and
 '' is NEVER destroyed, so every instantiation of this member would retain one T
 '' -- and its resources -- for the lifetime of the program.
+#ifdef __TIKO_CALLER_LOCATION__
+function Optional( of T ).Value( byval callerLine_ as long, byval callerFile_ as zstring ptr ) byref as T
+    if( this.has = FALSE ) then
+        tkoOutcomeSetFuncName_( 0 )
+        tkoOutcomeThrow_( FB.FB_RTERROR_ILLEGALFUNCTIONCALL, callerLine_, callerFile_, _
+                          @"Value( ) of an empty Optional", 0, 0 )
+    end if
+    return this.v
+end function
+#else
 function Optional( of T ).Value( ) byref as T
     if( this.has = FALSE ) then
         '' QUALIFIED, and it has to be.  A generic body is replayed at the
@@ -102,6 +148,7 @@ function Optional( of T ).Value( ) byref as T
     end if
     return this.v
 end function
+#endif
 
 '' Never raises.  Returns BYREF, so the result aliases either the stored value
 '' or the caller's default -- passing a temporary as dflt gives a reference that

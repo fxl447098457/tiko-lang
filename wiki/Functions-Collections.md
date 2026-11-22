@@ -315,6 +315,7 @@ Jump to: [Choose a container](#choose-a-container) · [Array: add and remove](#a
 - [OrderedMap and OrderedSet guide](Category-OrderedMap)
 - [Sorting guide](Category-Sorting)
 - [Collection initializers](Category-Collection-Initializers)
+- [Array slices](Category-Array-Slices)
 
 ---
 

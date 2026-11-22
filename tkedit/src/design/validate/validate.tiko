@@ -12,12 +12,14 @@
 #import "std/containers"
 #import "vendor/tkControls/tkMeta"
 #import "vendor/tkControls/tkKeys"
+#import "vendor/tkControls/tkLayout"
 #import "../model"
 #import "../catalog"
 #import "../formfile"
 using containers
 using tkMeta
 using tkKeys
+using tkLayout
 using model
 
 public function IsIdentifier( byref s as const ustring ) as boolean
@@ -40,7 +42,7 @@ end function
 
 ' What FormBase and the generated Form already use, and the names a field must not hide.
 private function IsFormMember_( byref s as const ustring ) as boolean
-    const as string MEMBERS = " wnd layout build show showmodal endmodal close isopen openwindow form this base "
+    const as string MEMBERS = " handle layout build show showmodal endmodal close isopen openwindow form this base "
     return instr( MEMBERS, " " & lcase( s ) & " " ) > 0
 end function
 
@@ -90,6 +92,16 @@ public function IsFontRole( byref s as const ustring ) as boolean
     return instr( " UI UI_SMALL UI_BOLD UI_LARGE GLYPH GLYPH_LARGE MONO ", " " & s & " " ) > 0
 end function
 
+' A glyph size in points: a whole number from 6 to 200.
+private function IsPoints_( byref s as const ustring ) as boolean
+    if (len( s ) = 0) orelse (len( s ) > 3) then return false
+    for i as long = 1 to len( s )
+        dim as long a = asc( mid( s, i, 1 ) )
+        if (a < 48) orelse (a > 57) then return false
+    next
+    return (valint( s ) >= 6) andalso (valint( s ) <= 200)
+end function
+
 ' "" when this value suits the kind, or what's wrong with it.
 private function ValueFault_( byref s as Setting, byref kind_ as const ustring, byref pairs as const ustring ) as ustring
     select case kind_
@@ -104,6 +116,8 @@ private function ValueFault_( byref s as Setting, byref kind_ as const ustring, 
     case "color"
         if (s.Kind <> VALUE_TEXT) orelse (IsColor_( s.Value ) = false) then return "must be a colour such as &hFF336699"
     case "font"
+        ' GlyphFont is shown as GlyphSize: a role (GLYPH, GLYPH_LARGE) or a size in points (GLYPHS.md)
+        if (s.Key = "GlyphFont") andalso (s.Kind = VALUE_TEXT) andalso IsPoints_( s.Value ) then return ""
         if (s.Kind <> VALUE_TEXT) orelse (IsFontRole( s.Value ) = false) then return "must be a font role (UI, UI_BOLD, MONO, ...)"
     case "list"
         if s.Kind <> VALUE_TEXT then return "must be a string"
@@ -186,24 +200,49 @@ end function
 
 ' Every problem in `doc`, as one line each, for a form in module `moduleName`. Includes what reading
 ' the file reported.
+' A ContextMenu has to name a PopupMenu of this form.
+private sub ContextMenuProblem_( byref doc as FormDoc, byref who as const ustring, byref menuName as const ustring, byref out_ as Array( of ustring ) )
+    dim as long k = FindControl( doc, menuName )
+    if k < 0 then
+        out_.Push( who & ": context menu '" & menuName & "' doesn't exist" )
+    elseif doc.Controls[k].TypeName <> catalog.POPUP_TYPE then
+        out_.Push( who & ": context menu '" & menuName & "' isn't a " & catalog.POPUP_TYPE )
+    end if
+end sub
+
 public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref out_ as Array( of ustring ) )
     for each s as ustring in doc.Problems
         out_.Push( s )
     next
+    if len( doc.ContextMenu ) then ContextMenuProblem_( doc, "form", doc.ContextMenu, out_ )
     if IsIdentifier( moduleName ) = false then
         out_.Push( "form file name '" & moduleName & "' is not an identifier" )
     elseif IsReserved( moduleName ) orelse (lcase( moduleName ) = "form") then
         out_.Push( "form file name '" & moduleName & "' can't be a module name" )
     end if
     if (doc.ClientW <= 0) orelse (doc.ClientH <= 0) then out_.Push( "form: width and height must be positive" )
+    select case doc.StartPosition
+    case "", "CenterScreen", "CenterOwner"
+    case else : out_.Push( "form: no start position '" & doc.StartPosition & "'" )
+    end select
+    select case doc.WindowState
+    case "", "Maximized", "Minimized"
+    case else : out_.Push( "form: no window state '" & doc.WindowState & "'" )
+    end select
+    if (doc.WindowState = "Maximized") andalso (doc.Resizable = "false") then out_.Push( "form: a maximized window has to be resizable" )
+    if (doc.MinW < 0) orelse (doc.MinH < 0) orelse (doc.MaxW < 0) orelse (doc.MaxH < 0) then
+        out_.Push( "form: a size limit can't be negative" )
+    elseif ((doc.MaxW > 0) andalso (doc.MaxW < doc.MinW)) orelse ((doc.MaxH > 0) andalso (doc.MaxH < doc.MinH)) then
+        out_.Push( "form: a maximum size is below its minimum" )
+    end if
 
     dim as Array( of Setting ) handlers
     for each s as Setting in doc.Events
-        select case s.Key
-        case "Load"  : AddHandler_( handlers, "form", s.Value, "", doc, out_ )
-        case "Close" : AddHandler_( handlers, "form", s.Value, "byref Cancel as boolean", doc, out_ )
-        case else    : out_.Push( "form: no event '" & s.Key & "'" )
-        end select
+        if catalog.IsFormEvent( s.Key ) then
+            AddHandler_( handlers, "form", s.Value, catalog.FormEventParams( s.Key ), doc, out_ )
+        else
+            out_.Push( "form: no event '" & s.Key & "'" )
+        end if
     next
 
     for i as long = 0 to doc.Controls.Count( ) - 1
@@ -218,6 +257,22 @@ public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref
         if m = 0 then
             out_.Push( c.Name & ": unknown control type '" & c.TypeName & "'" )
             continue for
+        end if
+
+        ' a ContextMenu names a PopupMenu of this form; a component has none
+        if len( c.ContextMenu ) then
+            if catalog.IsComponent( c.TypeName ) then
+                out_.Push( c.Name & ": a " & m->Name & " has no context menu" )
+            else
+                ContextMenuProblem_( doc, c.Name, c.ContextMenu, out_ )
+            end if
+        end if
+
+        ' a component (a Timer) is never shown: it belongs to the form, with nothing to lay out
+        if catalog.IsComponent( c.TypeName ) then
+            if len( c.Parent ) then out_.Push( c.Name & ": a " & m->Name & " belongs to the form, not inside '" & c.Parent & "'" )
+            if c.Dock <> TK_DOCK_NONE then out_.Push( c.Name & ": a " & m->Name & " is never shown, so it can't be docked" )
+            if c.Anchor <> TK_ANCHOR_DEFAULT then out_.Push( c.Name & ": a " & m->Name & " is never shown, so it has no anchors" )
         end if
 
         if len( c.Parent ) then
@@ -276,10 +331,14 @@ public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref
         end if
         dim as long prev = -1
         for each it as FormItem in c.Items
-            if kind_ = catalog.ItemsKind.ItemsMenu then
-                if (prev < 0) andalso (it.Level <> 0) then out_.Push( c.Name & ": the first menu item must be on the bar" )
+            if catalog.IsMenuKind( kind_ ) then
+                if kind_ = catalog.ItemsKind.ItemsMenu then
+                    if (prev < 0) andalso (it.Level <> 0) then out_.Push( c.Name & ": the first menu item must be on the bar" )
+                    if (it.Level = 0) andalso (it.Text = "-") then out_.Push( c.Name & ": a separator can't be on the bar" )
+                else
+                    if (prev < 0) andalso (it.Level <> 0) then out_.Push( c.Name & ": the first item must be on the menu itself, not indented" )
+                end if
                 if (it.Level > prev + 1) orelse (it.Level > 2) then out_.Push( c.Name & ": '" & it.Text & "' is indented too far" )
-                if (it.Level = 0) andalso (it.Text = "-") then out_.Push( c.Name & ": a separator can't be on the bar" )
                 prev = it.Level
                 if len( it.Key ) then
                     dim as TK_CHORD ch
@@ -292,6 +351,13 @@ public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref
                 case "", "command", "toggle", "separator", "split", "dropdown"
                 case else
                     out_.Push( c.Name & ": no toolbar item kind '" & it.Kind & "'" )
+                end select
+            end if
+            if kind_ = catalog.ItemsKind.ItemsIcons then
+                select case it.Kind
+                case "", "toggle", "command", "separator"
+                case else
+                    out_.Push( c.Name & ": no icon panel item kind '" & it.Kind & "'" )
                 end select
             end if
             if len( it.Handler ) then AddHandler_( handlers, c.Name, it.Handler, "", doc, out_ )

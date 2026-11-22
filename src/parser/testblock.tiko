@@ -1,0 +1,219 @@
+'' testblock.tiko -- the 'test' block, for the parser ('tiko test', docs/tiko-test-doc RFC-0001).
+''
+''     #import "std/testing"
+''     test "Tally counts separators"
+''         testing.ExpectEq( strings.Tally( "a,b,c", "," ), 2 )
+''     end test
+''
+'' 'test' IS CONTEXTUAL, as 'defer' and 'spawn' are: an identifier, recognised by spelling, and
+'' only at the start of a statement, followed by a string literal and then the end of the
+'' statement, when no procedure called test has been declared above it. 'test "x"' is a
+'' paren-less call in FreeBASIC wherever a 'sub test' exists, and that call keeps its meaning;
+'' nothing in fbc's suite, pkg/ or examples/ is written that way without one (measured
+'' 2026-11-21).
+''
+'' WHERE: the top level of a file only, not inside a procedure, a namespace, a type or another
+'' test -- TKO1200, and the block is parsed and dropped. The body is hoisted to module level,
+'' which would lose an enclosing namespace's lookup.
+''
+'' OUTSIDE A TEST BUILD the block is parsed and DROPPED: nothing of it reaches Collect, any
+'' lambda written in it is not hoisted, and the program never names std/testing.
+''
+'' IN A TEST BUILD (--test, ParserState.testMode) it is desugared, the way a lambda is:
+''
+''     private sub __tko_test_<hash>_<n>( )        '' hoisted through p.lambdas
+''         <body>
+''     end sub
+''     __tko_mod_std_testing.RegisterTest( "name", @__tko_test_<hash>_<n>, "<file>", <line> )
+''
+'' The call is TOP-LEVEL CODE where the block stood: a module's initialiser, or a constructor
+'' for a root that is not main, so every test is registered before main runs. It names
+'' std/testing through its interface namespace, as 'spawn' names std/tasks (TasksNs), so a
+'' test build of a file that does not import it is TKO1201 here, not an undeclared name later.
+
+#import "std/containers"
+#include once "parser/parser.ti"
+#include once "support/text.ti"
+#include once "pp/pp.ti"
+
+namespace Tko.Parse
+
+declare function Block( byref p as Tko.ParserState ) as Tko.NodeId
+declare function StringLitText( byref p as Tko.ParserState ) as Tko.InternId
+
+'' Token i is an identifier spelled 'word' (lower case), in any case.
+private function IdentIs_( byref p as Tko.ParserState, byval i as int32, byref word as string ) as boolean
+    if HasTok( p, i ) = false then return false
+    dim as Tko.Token t = p.toks->At( i )
+    if cast( Tko.TokenKind, t.kind ) <> Tko.TK_IDENT then return false
+    return Tko.Text.LowerAscii( p.names->Spelling( cast( Tko.InternId, t.literal ) ) ) = word
+end function
+
+function TestBlockHead( byref p as Tko.ParserState, byval k as Tko.TokenKind ) as boolean
+    if k <> Tko.TK_IDENT then return false
+    if IdentIs_( p, p.pos, "test" ) = false then return false
+    if HasTok( p, p.pos + 2 ) = false then return false
+    if cast( Tko.TokenKind, p.toks->At( p.pos + 1 ).kind ) <> Tko.TK_STRING_LIT then return false
+    dim as Tko.TokenKind after = cast( Tko.TokenKind, p.toks->At( p.pos + 2 ).kind )
+    if (after <> Tko.TK_EOL) andalso (after <> Tko.TK_EOF) then return false
+    '' A 'sub test' declared above: the paren-less call it always was.
+    return KnownProc_( p, false, cast( uint32, Cur( p ).literal ) ) = false
+end function
+
+function EndTestHere_( byref p as Tko.ParserState ) as boolean
+    if p.testDepth <= 0 then return false
+    if Peek( p ) <> Tko.KW_END then return false
+    return IdentIs_( p, p.pos + 1, "test" )
+end function
+
+'' 'end test', or TKO0405 with a note at the 'test' that opened it -- ExpectEnd's shape.
+private sub ExpectEndTest_( byref p as Tko.ParserState, byval openedAt as Tko.SourceLoc )
+    if EndTestHere_( p ) then
+        Advance( p )
+        Advance( p )
+        return
+    end if
+    ErrorNode( p, Tko.TKO0405, "test" )
+    p.diags->AddNote( Tko.TKO0905, Tko.PointRange( openedAt ), "test" )
+end sub
+
+'' std/testing's interface has been read by this unit: '#import "std/testing"' above.
+private function TestingImported_( byref p as Tko.ParserState ) as boolean
+    if p.ifaceChains = nullptr then return false
+    for k as int32 = 0 to p.ifaceChains->Count - 1
+        if (*p.ifaceChains)[k] = "std.testing" then return true
+    next
+    return false
+end function
+
+private function Ident_( byref p as Tko.ParserState, byref s as string, byval loc as Tko.SourceLoc ) as Tko.NodeId
+    dim as Tko.IdentPayload ip
+    ip.name = p.names->Fold( p.names->GetString( s ) )
+    p.ast->PushIdent( ip )
+    return NewNodeAt( p, Tko.N_IDENT, loc, p.ast->IdentPoolCount( ) - 1 )
+end function
+
+'' A string literal whose text is 's': a virtual source buffer holds it, as a literal's span
+'' must index one. One buffer per source file, kept for the next test of the same file.
+private function FileLiteral_( byref p as Tko.ParserState, byref s as string, byval loc as Tko.SourceLoc ) as Tko.NodeId
+    if (p.testFileVirt = 0) orelse (p.testFilePath <> s) then
+        p.testFileVirt = cast( int32, p.src->AddVirtual( "<test-file>", s ) )
+        p.testFilePath = s
+    end if
+    dim as Tko.LiteralPayload lp
+    lp.strFile = p.testFileVirt
+    lp.strOffset = 0
+    lp.strLength = len( s )
+    lp.strKind = Tko.STRK_PLAIN
+    p.ast->PushLiteral( lp )
+    return NewNodeAt( p, Tko.N_STRING_LIT, loc, p.ast->LiteralPoolCount( ) - 1 )
+end function
+
+private function IntLiteral_( byref p as Tko.ParserState, byval v as int64, byval loc as Tko.SourceLoc ) as Tko.NodeId
+    dim as Tko.LiteralPayload lp
+    lp.intValue = cast( uint64, v )
+    lp.radix = 10
+    p.ast->PushLiteral( lp )
+    return NewNodeAt( p, Tko.N_INT_LIT, loc, p.ast->LiteralPoolCount( ) - 1 )
+end function
+
+'' The registration: the hoisted sub, and the call that stands where the block stood.
+private function Desugar_( byref p as Tko.ParserState, byref t as Tko.Token, byref nt as Tko.Token, _
+                           byval body as Tko.NodeId ) as Tko.NodeId
+    dim as Tko.DecodedLoc d = p.src->Decode( t.loc )
+    dim as uint32 fh = 0
+    dim as Tko.SourceFile ptr sf = p.src->FileAt( d.file )
+    if sf <> nullptr then fh = sf->contentHash
+    dim as Tko.StmtPayload sp
+    sp.name = p.names->GetString( "__tko_test_" & Tko.Text.LowerAscii( hex( fh ) ) & "_" & _
+                                  trim( str( p.lambdaSeq ) ) )
+    p.lambdaSeq += 1
+    sp.rawName = sp.name
+    sp.op = cast( uint16, Tko.KW_SUB )
+    sp.first = p.ast->ChildPoolCount( )
+    sp.count = 0
+    sp.b = body
+    sp.extra or= Tko.PF_PRIVATE
+    dim as Tko.NodeId pn = MakeStmt( p, Tko.N_PROC, t.loc, sp )
+    p.lambdas.Push( cast( uint32, pn ) )
+
+    dim as Tko.BinaryPayload qb
+    qb.op = cast( uint16, Tko.TK_DOT )
+    qb.lhs = Ident_( p, "__tko_mod_std_testing", t.loc )
+    qb.rhs = Ident_( p, "registertest", t.loc )
+    p.ast->PushBinary( qb )
+    dim as Tko.NodeId qn = NewNodeAt( p, Tko.N_BINARY, t.loc, p.ast->BinaryPoolCount( ) - 1 )
+    p.ast->SetKind( qn, cast( uint16, Tko.N_MEMBER ) )
+
+    dim as Tko.NodeIdVec args
+    args.Push( cast( uint32, MakeTokenNode( p, nt ) ) )
+    args.Push( cast( uint32, MakeAddrOfName( p, sp.name, t.loc, d.offset, cast( int32, t.length ) ) ) )
+    args.Push( cast( uint32, FileLiteral_( p, p.src->AbsPathOf( d.file ), t.loc ) ) )
+    args.Push( cast( uint32, IntLiteral_( p, d.lineNo, t.loc ) ) )
+    dim as Tko.StmtPayload cs
+    cs.a = MakeList( p, Tko.N_CALL, t.loc, qn, args )
+    return MakeStmt( p, Tko.N_AMBIGUOUS, t.loc, cs )
+end function
+
+function TestBlock( byref p as Tko.ParserState ) as Tko.NodeId
+    dim as Tko.Token t = Cur( p )
+    dim as int32 tok0 = p.pos
+    Advance( p )                                   '' test
+    dim as Tko.Token nt = Cur( p )
+    dim as boolean ok = true
+    if StringLitText( p ) = 0 then
+        p.diags->Report( Tko.TKO1202, Tko.PointRange( nt.loc ) )
+        ok = false
+    end if
+    Advance( p )                                   '' the name
+
+    dim as string where_ = ""
+    if p.testDepth > 0 then
+        where_ = "another test"
+    elseif p.procDepth > 0 then
+        where_ = "a procedure"
+    elseif p.aggDepth > 0 then
+        where_ = "a type"
+    elseif p.nsDepth > 0 then
+        where_ = "a namespace"
+    end if
+    if len( where_ ) > 0 then
+        p.diags->Report( Tko.TKO1200, Tko.PointRange( t.loc ), where_ )
+        ok = false
+    end if
+
+    '' THE BODY, AS A PROCEDURE'S: what it declares is local to it, and the preprocessor is
+    '' told a body began (decl.tiko).
+    dim as int32 lam0 = p.lambdas.Count
+    p.testDepth += 1
+    p.procDepth += 1
+    dim as boolean outerSL = p.staticLocals
+    p.staticLocals = false
+    if p.stream <> nullptr then Tko.PpProcEnter( *cast( Tko.PpStream ptr, p.stream ) )
+    dim as Tko.NodeId body = Block( p )
+    p.procDepth -= 1
+    p.staticLocals = outerSL
+    if p.stream <> nullptr then Tko.PpProcLeave( *cast( Tko.PpStream ptr, p.stream ) )
+    ExpectEndTest_( p, t.loc )
+    p.testDepth -= 1
+
+    '' ITS TOKENS ARE A RANGE OF THEIR OWN in a module unit, so the interface writer skips the
+    '' whole block -- a 'dim' inside it is the body's, never the module's (tkiemit.tiko).
+    if p.recordDecls andalso (body <> Tko.NODE_NONE) andalso (p.pos > tok0) then
+        p.ast->declRanges.Push( cast( uint32, body ) )
+        p.ast->declRanges.Push( cast( uint32, tok0 ) )
+        p.ast->declRanges.Push( cast( uint32, p.pos ) )
+    end if
+
+    if ok andalso p.testMode then
+        if TestingImported_( p ) then return Desugar_( p, t, nt, body )
+        p.diags->Report( Tko.TKO1201, Tko.PointRange( t.loc ) )
+    end if
+    '' DROPPED: and so is every lambda or spawn thunk its body hoisted.
+    while p.lambdas.Count > lam0
+        p.lambdas.Pop( )
+    wend
+    return Tko.NODE_NONE
+end function
+
+end namespace

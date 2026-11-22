@@ -173,7 +173,6 @@ On a typical system the three lines read Microsoft Sans Serif, Times New Roman a
 constructor
 constructor( byval pFont as CGpFont ptr )
 constructor( byval hdc as HDC )
-constructor( byval hdc as HDC, byval hFont as HFONT )
 constructor( byval hdc as HDC, byval plogfont as LOGFONTW ptr )
 constructor( byval hdc as HDC, byval plogfont as LOGFONTA ptr )
 constructor( byval pFamily as CGpFontFamily_ ptr, byval emSize as single, byval nStyle as INT_ = 0, byval nUnit as GpUnit = 0 )
@@ -195,10 +194,6 @@ Creates the GDI+ font:
   `pFontCollection` or, when it is `NULL`, among the installed fonts. **When no family of that
   name exists the font falls back to the generic sans-serif family** (Microsoft Sans Serif) and
   the status is still `Ok`; call [GetFamily](#getfamily) to see which family you got.
-
-The `hdc, hFont` form is declared but has no implementation in the module: a program that uses
-it compiles but does not link. Get the font's `LOGFONTW` with `GetObjectW` and use the
-`LOGFONTW` form instead.
 
 `nStyle` and `nUnit` default to 0: `FontStyleRegular` and `UnitWorld`.
 

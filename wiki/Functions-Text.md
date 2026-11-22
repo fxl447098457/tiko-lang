@@ -188,6 +188,7 @@ Jump to: [Find text in a string](#find-text-in-a-string) · [Check what a string
 - [UString](Category-UString)
 - [Block strings](Category-Block-Strings)
 - [String slices](Category-String-Slices)
+- [Regular expressions (PCRE2)](PCRE2-Tutorial)
 - [Base64, hex and percent-encoding](Category-Codec)
 
 ---

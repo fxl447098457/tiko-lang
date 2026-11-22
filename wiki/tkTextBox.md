@@ -60,39 +60,287 @@ The buffer is UTF-8. `GetSel`, `SetSel`, `GetCaret`, `GetTextLength`, `PosFromCh
 `CharFromPos` work in **byte offsets**, snapped to character boundaries; for ASCII text they
 equal character indices. `SetLimitText` counts characters, and its default 0 means no limit.
 
-## Coming from PsTextBox
+## Concepts
 
-[PsTextBox](PsTextBox) is the Win32 twin; its page remains the behaviour reference for everything
-not listed here. PsTextBox frames a RichEdit control; tkTextBox draws its own editor behind the
-same API.
+### One widget, one editor
 
-- Names: `PsTextBox_*` → `tkTextBox_*`, `PSTEXTBOX_MESSAGEINFO` → `TKTEXTBOX_MESSAGEINFO`.
-  `TXT_ALIGN_*` and the `TXT_*Callback*` types keep their names. The handle is `TK_WIDGET ptr`.
-- `tkTextBox_Create( hParent, CtrlID, bMultiline = false )` takes a `TK_WIDGET ptr` parent; for
-  a top-level control pass `tkHost_Root( host )`.
-- Offsets are UTF-8 byte offsets (see above).
-- Colours: a `TKTEXTBOX_COLORS` struct adds `SelBackColor`, `SelForeColor` and
-  `ForeColorDisabled`, with `tkTextBox_GetColors` / `SetColors` / `ThemeColors` beside the
-  per-colour setters. Defaults are the dark theme.
-- Fonts are `TTF_Font ptr` (`tkTextBox_SetFont`, `SetCueBannerFont`).
-- `TKTEXTBOX_MESSAGEINFO` carries `msg` (a `TKM_*` code or `TKTEXTBOX_MSG_CONTEXTMENU`), `x`,
-  `y`, `key`, `mods`, `wheelY` and `text`.
-- The context menu is a [tkPopupMenu](tkPopupMenu) (`TK_MENU ptr`). It opens on the right
-  button's release, the Menu key and Shift+F10.
-- Escape is not claimed; the message callback still sees it.
-- A multi-line string pasted or set into a single-line box keeps only its first line.
-- The selection is kept but not painted while the box is unfocused.
-- The password character applies to single-line boxes only, and a password box will not copy or
-  cut.
-- Tabs are drawn and measured as one space.
-- `SetTextAlign` keeps the undo history.
-- No equivalent: `GetRichEditHandle`, forwarding of `EM_*` / `WM_SETTEXT` messages,
-  `FilterMessage`, `Rescale` (scale changes arrive as `TKM_SCALECHANGED`), PsRegistry.
-- Added: Redo (`Ctrl+Y`, `Ctrl+Shift+Z`, `tkTextBox_Redo` / `CanRedo`); inline IME composition
-  (`GetComposition`); an optional built-in scrollbar (`SetScrollBarVisible` / `GetScrollBar`);
-  `GetTextRect`, `PosFromChar`, `CharFromPos`, `GetCaretRect`, `GetCaret`, `GetCaretVisible`,
-  `SetCaretBlink` / `GetCaretBlink`, `ShowsCue`, `GetPasswordChar`, `GetID`; the clipboard keys
-  Ctrl+Insert, Shift+Insert and Shift+Delete.
+`tkTextBox_Create( hParent, CtrlID, bMultiline = false )` creates the box as a child of a
+`TK_WIDGET ptr` (for a top-level control pass `tkHost_Root( host )`); place it with
+`tkWidget_SetPos`. The widget is focusable, shows the I-beam cursor, and draws its frame and
+its editor itself. The buffer is one UTF-8 string with LF line breaks; the visual lines are
+derived from it whenever the text, the width or the font changes.
+
+### Single-line and multiline
+
+The choice is made at creation and is fixed for the control's lifetime.
+
+| | Single-line | Multiline |
+|---|---|---|
+| Text layout | One line, vertically centred in the frame | Word-wrapped from the top, at the last space that fits |
+| Enter | Always claimed; runs the Enter-pressed callback | Inserts a new line |
+| Tab | Not claimed, so the host moves focus | Inserts a tab; not claimed with Ctrl or when read-only |
+| Horizontal scroll | Follows the caret | None: the text wraps |
+| Vertical scroll | n/a | Wheel, keys, caret, optional built-in scrollbar |
+| Up / Down / Page Up / Page Down | Not claimed | Move by line or page, keeping the column |
+| Numeric mode | Available | Refused |
+| Password character | Available | Refused |
+| Pasted or set line breaks | Only the first line is kept | CRLF and lone CR become LF |
+| Cue banner | One line, on the centred baseline | Word-wrapped at the top left |
+
+### Programmatic changes are silent
+
+`tkTextBox_SetText`, `tkTextBox_ReplaceSel`, `tkTextBox_Clear`, `tkTextBox_SetValue` and the
+numeric reformat on focus loss never run the change callback. Typing, Backspace, Delete, Cut,
+Paste, Undo and Redo do, whether they come from the keyboard, the context menu or
+`tkTextBox_Cut` / `Paste` / `Undo` / `Redo`. So you can call a setter from inside your own change
+handler without recursing.
+
+### Undo, the modify flag and read-only
+
+Every edit goes through one primitive, so undo, the length limit, the numeric filter and the
+change notification each apply the same way everywhere. Undo keeps up to `TKTEXTBOX_MAX_UNDO`
+steps; consecutive typing coalesces into one step until whitespace, a caret move or another
+edit. `tkTextBox_ReplaceSel` is undoable. `tkTextBox_SetText`, `Clear`, `SetValue` and the
+numeric reformat clear the undo history and the modify flag; any edit sets the flag.
+
+A read-only box (`tkTextBox_SetReadOnly`) refuses typing, Cut, Paste, Undo and Redo, but still
+selects and copies, and its context menu still offers Copy and Select All.
+
+`tkTextBox_SetLimitText` counts characters. An insert that would pass the limit is trimmed to
+fit; lowering the limit never truncates what is already there. A password box
+(`tkTextBox_SetPasswordChar`, single-line only, 0 turns it off) shows the given character for
+each character and will not copy or cut.
+
+### Keyboard
+
+Ctrl below is Cmd on macOS. Shift with any movement key extends the selection.
+
+| Keys | Action |
+|---|---|
+| Ctrl+A | Select all |
+| Ctrl+C, Ctrl+Insert | Copy |
+| Ctrl+X, Shift+Delete | Cut |
+| Ctrl+V, Shift+Insert | Paste |
+| Ctrl+Z | Undo |
+| Ctrl+Y, Ctrl+Shift+Z | Redo |
+| Left / Right | One character; with a selection, collapse it to that side |
+| Ctrl+Left / Ctrl+Right | One word |
+| Up / Down / Page Up / Page Down | Multiline only: by line or page, keeping the column across moves |
+| Home / End | Start / end of the line (multiline) or of the text (single-line) |
+| Ctrl+Home / Ctrl+End | Start / end of the text |
+| Backspace / Delete | Delete the selection, or the character before / after the caret |
+| Ctrl+Backspace / Ctrl+Delete | Delete to the start / end of the word |
+| Enter | Single-line: the Enter-pressed callback. Multiline: a new line |
+| Tab | Multiline: a tab character. Single-line: not claimed |
+| Menu key, Shift+F10 | Open the context menu at the caret |
+
+Escape is not claimed; the message callback still sees it. While an input method is composing,
+key presses belong to it: the composition is drawn inline at the caret, underlined, and
+`tkTextBox_GetComposition` returns it.
+
+### Mouse
+
+A left click focuses the box and places the caret; Shift+click extends the selection; a double
+click selects the word. Dragging selects, holding the capture, and dragging past an edge scrolls.
+A right click focuses the box; the context menu opens on the right button's release. The wheel
+scrolls a multiline box `TKTEXTBOX_WHEEL_LINES` lines per notch, and fractional notches
+accumulate, so a slow trackpad swipe still scrolls; a single-line box does not handle the wheel.
+
+`tkTextBox_SetSelectOnFocus` selects everything when the box gains focus by Tab or
+programmatically; a click still places the caret where it lands.
+
+### Numeric mode
+
+Single-line only (`tkTextBox_SetNumericMode` is a no-op on a multiline box). The accepted text is
+an optional leading minus, digits, and at most one decimal point followed by at most
+`tkTextBox_GetDecimalPlaces` digits (default 2; 0 means integers only and refuses the point).
+Every keystroke is checked against the text as it would be after replacing the selection, and a
+paste is checked whole and refused whole.
+
+On focus loss a non-empty value is reformatted to exactly the decimal places (`"5."` becomes
+`"5.00"`), silently and before the focus callback runs. An empty box stays empty, and shows its
+cue banner, unless `tkTextBox_SetZeroWhenEmpty` is on; turning that on stamps the formatted zero
+at once if the box is numeric, empty and not focused. `tkTextBox_GetValue` reads empty, `"-"` and
+`"."` as 0; `tkTextBox_SetValue` formats to the decimal places, without thousands separators.
+Neither setting reformats text already in the box.
+
+### Scrolling in lines
+
+A multiline box exposes its vertical scroll state in lines, shaped for a scrollbar:
+`tkTextBox_GetVScrollInfo` returns the total lines, the whole lines per page (a partial bottom
+line is not counted) and the first visible line. All three are 0 before the box has a size; a
+single-line box reports one line, first visible 0. `tkTextBox_ScrollToLine` makes a line the
+first visible one, clamped, silently.
+
+The scroll-changed callback fires whenever those three numbers change: typing, the wheel, caret
+moves, a resize, and a programmatic `SetText` too. Treat it as "re-read the numbers", not "the
+user scrolled". Wire an external scrollbar by pushing the numbers into it from that callback and
+calling `tkTextBox_ScrollToLine` from the scrollbar's own callback.
+
+Or let the box do it: `tkTextBox_SetScrollBarVisible( box, true )` adds a built-in
+[tkVScrollBar](tkVScrollBar) along the right edge (multiline only, off by default), reachable
+through `tkTextBox_GetScrollBar`. Its strip is reserved whether or not a thumb is needed, so text
+never re-wraps on its account.
+
+### The frame and the cue banner
+
+Each repaint fills the whole widget with `OuterBackColor`, then draws the rounded frame filled
+with `BackColor` and stroked in `FocusBorderColor` while the box has focus, `BorderColor`
+otherwise. Pass your form's background as the outer colour so rounded corners blend in. A border
+width of 0 draws no border. The editor area is the widget inset by the border width; the text
+rect (`tkTextBox_GetTextRect`) is that area less the margins and any scrollbar strip.
+
+The cue banner shows whenever the buffer is empty and nothing is being composed, focused or not,
+where typed text would appear. It has its own colour and its own font, falling back to the text
+font. `tkTextBox_ShowsCue` says whether it is showing.
+
+`tkTextBox_SetTextAlign` aligns each line between the margins while it fits; a line wider than
+the text rect starts at the left. An unrecognised value falls back to `TXT_ALIGN_LEFT`. Changing
+the alignment keeps the undo history.
+
+The selection is kept but not painted while the box is unfocused. Tabs are drawn and measured as
+one space. The caret blinks with a half-period of `TKTEXTBOX_CARET_BLINK_MS` by default;
+`tkTextBox_SetCaretBlink( box, 0 )` makes it steady.
+
+### Pixels and scale
+
+Margins and the corner radius are pixels; scale your literals with `tkHost_Scale`. When the
+host's scale changes, the box rescales its margins, its corner radius, its scrollbar strip and its
+context menu. The border width is a pen width and is never scaled. Until you set a corner radius
+or border width, the box takes them from the current theme's shape; setting either pins it.
+
+| Setting | Default |
+|---|---|
+| Border width | 1 px |
+| Corner radius | 0 (square), unless the theme's shape says otherwise |
+| Left / right margin | 0 / 0 |
+| Text alignment | `TXT_ALIGN_LEFT` |
+| Length limit | 0 (none) |
+| Select on focus | off |
+| Numeric mode / decimal places / zero when empty | off / 2 / off |
+| Text font | 0: the host's default font |
+| Cue banner font | 0: the text font |
+| Context menu labels | `Cut`, `Copy`, `Paste`, `Select All` |
+
+## Behaviour and limits
+
+- **Multiline is a creation-time choice.** There is no setter.
+- **Numeric mode and the password character are single-line only.**
+- **A single-line Enter is always claimed**, callback or not.
+- **No horizontal scroll API.** A single-line box follows its caret; a multiline box wraps.
+- **No per-character formatting.** One font and one text colour for the whole buffer.
+- **No vertical alignment setting.** A single-line box centres its line; a multiline box starts
+  at the top.
+- **Alignment is measured between the margins**, so lopsided margins put centred text
+  off-centre.
+- **The context menu is rebuilt on every open** from the selection, the clipboard and the
+  read-only state: Cut (a selection, not read-only, not a password box), Copy (a selection, not a
+  password box), Paste (text on the clipboard, not read-only), Select All (any text). When
+  nothing qualifies, no menu opens.
+- **Offsets are UTF-8 byte offsets** (see above); the length limit counts characters.
+
+## Colours
+
+`TKTEXTBOX_COLORS` holds nine colours. The box takes them from the current theme when it is
+created (including any theme recipe for `"TextBox"`) and follows every theme change.
+`tkTextBox_SetColors` and every per-colour setter pin the colours, so a theme change leaves this
+box alone; `tkTextBox_UnpinColors` hands it back to the theme and applies it at once. The
+per-colour setters that return a value return the previous colour.
+
+| Colour | Paints | Theme role |
+|---|---|---|
+| `ForeColor` | All text, the caret and the composition underline | `Text` |
+| `BackColor` | The editor's background, inside the frame | `Surface` |
+| `CueColor` | The cue banner | `TextDim` |
+| `BorderColor` | The frame without focus | `Border` |
+| `FocusBorderColor` | The frame with focus | `FocusRing` |
+| `OuterBackColor` | The whole widget under the frame, visible outside the rounded corners | `Window` |
+| `SelBackColor` | The selection band | `Selected` |
+| `SelForeColor` | Selected text | `SelectedText` |
+| `ForeColorDisabled` | All text while the box is disabled | `TextDisabled` |
+
+There is no hot or pressed variant; the frame takes exactly one of its two border colours per
+repaint.
+
+## Context menu
+
+`tkTextBox_GetContextMenu` returns the box's [tkPopupMenu](tkPopupMenu), created with the box
+and stable for its lifetime. Style it once with `tkPopupMenu`'s setters; it follows theme and
+scale changes with the box. Its items are rebuilt on every open; `tkTextBox_SetMenuText`
+localises the labels (an empty Select All label keeps the current one).
+`tkTextBox_CloseContextMenu()` closes whichever text box menu is open, without running any
+command.
+
+## Callbacks
+
+All are optional and independent; passing 0 clears one.
+
+### Change
+
+```freebasic
+type TXT_ChangeCallbackSub as sub( byval hTextBox as TK_WIDGET ptr )
+```
+
+The user changed the text. Read it with `tkTextBox_GetText`. Never fired by the programmatic
+setters listed above.
+
+### Focus
+
+```freebasic
+type TXT_FocusCallbackSub as sub( byval hTextBox as TK_WIDGET ptr, byval bGotFocus as boolean )
+```
+
+The box gained or lost the keyboard focus. On a loss in numeric mode the value has already been
+reformatted. `tkTextBox_HasFocus` asks the same question at any time.
+
+### Enter pressed
+
+```freebasic
+type TXT_EnterPressedCallbackSub as sub( byval hTextBox as TK_WIDGET ptr )
+```
+
+The user pressed Enter in a single-line box. Never fired by a multiline box.
+
+### Scroll changed
+
+```freebasic
+type TXT_ScrollChangedCallbackSub as sub( byval hTextBox as TK_WIDGET ptr )
+```
+
+The multiline scroll numbers changed; see *Scrolling in lines*. Not fired by
+`tkTextBox_ScrollToLine`, which is the receiving end of a scrollbar.
+
+### Message
+
+```freebasic
+type TXT_MessageCallbackFunc as function( byval m as TKTEXTBOX_MESSAGEINFO ptr ) as boolean
+```
+
+Observes messages **before** the box acts on them. Return TRUE to suppress the box's handling.
+`TKTEXTBOX_MESSAGEINFO` carries `hTextBox`, `msg`, widget-local `x` / `y`, `key`, `mods`,
+`wheelY` and `text` (UTF-8, for `TKM_CHAR` and `TKM_IMECOMPOSE`). It is called for
+`TKM_KEYDOWN`, `TKM_KEYUP`, `TKM_CHAR`, `TKM_IMECOMPOSE`, `TKM_LBUTTONDOWN`, `TKM_LBUTTONUP`,
+`TKM_RBUTTONDOWN`, `TKM_RBUTTONUP`, `TKM_MBUTTONDOWN`, `TKM_MBUTTONUP`, `TKM_MOUSEMOVE`,
+`TKM_MOUSEWHEEL`, `TKM_SETFOCUS` and `TKM_KILLFOCUS`, and, after `TKM_RBUTTONUP`, once more as
+`TKTEXTBOX_MSG_CONTEXTMENU` just before the menu would open.
+
+| Veto | Effect |
+|---|---|
+| `TKM_KEYDOWN` for Tab in a single-line box | The key is claimed, so focus stays: how to drive something else, such as a picker list, with Tab |
+| `TKM_KEYDOWN` for Escape | Act on Escape (clear the box, close a panel) |
+| `TKTEXTBOX_MSG_CONTEXTMENU` | No menu opens on the right click (the Menu key and Shift+F10 arrive as `TKM_KEYDOWN`) |
+| `TKM_SETFOCUS` / `TKM_KILLFOCUS` | The frame and caret still follow focus, but select-on-focus, the numeric reformat and the focus callback are skipped |
+| `TKM_LBUTTONUP` | Use with care: it is what ends a selection drag and releases the capture |
+
+```freebasic
+function Search_Message( byval m as TKTEXTBOX_MESSAGEINFO ptr ) as boolean
+    if (m->msg = TKM_KEYDOWN) andalso (m->key = SDLK_ESCAPE) then
+        tkTextBox_Clear( m->hTextBox )     ' programmatic, so no change callback
+        return true
+    end if
+    return false
+end function
+```
 
 ## Public declarations
 
@@ -102,9 +350,9 @@ Every public name the module declares, as the source declares it. Signatures are
 
 ```freebasic
 const TKTEXTBOX_MSG_CONTEXTMENU = 1000
-const TKTEXTBOX_CARET_BLINK_MS = 530 ' GetCaretBlinkTime's default
+const TKTEXTBOX_CARET_BLINK_MS = 530
 const TKTEXTBOX_MAX_UNDO = 100
-const TKTEXTBOX_WHEEL_LINES = 3 ' SPI_GETWHEELSCROLLLINES' default
+const TKTEXTBOX_WHEEL_LINES = 3
 
 enum
     TXT_ALIGN_LEFT = 0
@@ -262,5 +510,4 @@ sub tkTextBox_SetScrollChangedCallback( byval hTextBox as TK_WIDGET ptr, byval u
 ### See also
 
 - [tkControls](Category-tkControls)
-- [tkApp](tkApp), [tkHost](tkHost)
-- [PsTextBox](PsTextBox), the PsControls control
+- [tkApp](tkApp), [tkHost](tkHost), [tkTheme](tkTheme), [tkPopupMenu](tkPopupMenu), [tkVScrollBar](tkVScrollBar)

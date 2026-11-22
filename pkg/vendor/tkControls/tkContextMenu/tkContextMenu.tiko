@@ -1,0 +1,174 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkContextMenu -- a component, not a control: a hidden, zero-size child widget that owns a
+' tkPopupMenu and opens it as a right-click menu. Attach it to widgets (tkContextMenu_Attach): the
+' right button's release over one of them -- or over anything inside it -- and the Menu key or
+' Shift+F10 on the focused one open the menu instead of reaching the control, so it replaces a
+' control's own menu. Fill the menu with tkPopupMenu (tkContextMenu_GetMenu). The Popup callback runs
+' before it shows, told which widget it opens for; the Command callback gets the id chosen, from a
+' submenu too. Being a widget, it has a handle and a parent and goes when its parent goes, taking
+' its menu and every attachment with it. Disabled, it opens nothing. Setters are silent.
+#module "tkContextMenu"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkPopupMenu" public
+using tkHost
+using tkTheme
+using tkPopupMenu
+using tkPaint
+
+public type CTX_PopupCallbackSub as sub( byval hCtx as TK_WIDGET ptr, byval hSource as TK_WIDGET ptr )
+public type CTX_CommandCallbackSub as sub( byval hCtx as TK_WIDGET ptr, byval id as long )
+
+public type TKCONTEXTMENU_STATE
+    hWin     as TK_WIDGET ptr
+    hMenu    as TK_MENU ptr
+    hSource  as TK_WIDGET ptr             ' the widget it last opened for
+    Popup    as CTX_PopupCallbackSub
+    Command  as CTX_CommandCallbackSub
+end type
+
+private function GetCtxPointer( byval h as TK_WIDGET ptr ) as TKCONTEXTMENU_STATE ptr
+    if h = 0 then return 0
+    return cast( TKCONTEXTMENU_STATE ptr, h->pData )
+end function
+
+' Which component owns which menu: a TK_MENU carries no pointer of its own.
+dim shared as TK_MENU ptr gMenus( any )
+dim shared as TK_WIDGET ptr gOwners( any )
+dim shared as long gnOwned
+
+private sub Own_( byval hMenu as TK_MENU ptr, byval w as TK_WIDGET ptr )
+    for i as long = 0 to gnOwned - 1
+        if gMenus( i ) = 0 then gMenus( i ) = hMenu : gOwners( i ) = w : exit sub
+    next
+    redim preserve gMenus( 0 to gnOwned ), gOwners( 0 to gnOwned )
+    gMenus( gnOwned ) = hMenu : gOwners( gnOwned ) = w
+    gnOwned += 1
+end sub
+
+private sub Disown_( byval hMenu as TK_MENU ptr )
+    for i as long = 0 to gnOwned - 1
+        if gMenus( i ) = hMenu then gMenus( i ) = 0 : gOwners( i ) = 0
+    next
+end sub
+
+private function OwnerOf_( byval hMenu as TK_MENU ptr ) as TK_WIDGET ptr
+    for i as long = 0 to gnOwned - 1
+        if gMenus( i ) = hMenu then return gOwners( i )
+    next
+    return 0
+end function
+
+' The menu's choice, from any level (the root's select callback hears its submenus).
+private sub OnSelect( byval hPopup as TK_MENU ptr, byval id as long )
+    dim as TK_WIDGET ptr w = OwnerOf_( hPopup )
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( w )
+    if (p <> 0) andalso (p->Command <> 0) then p->Command( w, id )
+end sub
+
+' Opens at (x, y) in the surface's window pixels, for hSource.
+private sub Open_( byval p as TKCONTEXTMENU_STATE ptr, byval hSource as TK_WIDGET ptr, byval x as long, byval y as long )
+    if tkWidget_IsEnabled( p->hWin ) = false then exit sub
+    p->hSource = hSource
+    if p->Popup then p->Popup( p->hWin, hSource )
+    if tkPopupMenu_GetItemCount( p->hMenu ) = 0 then exit sub
+    tkPopupMenu_Show( p->hMenu, x, y )
+end sub
+
+private function tkContextMenu_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_CONTEXTMENU
+        Open_( p, m->pOther, cint( m->x ), cint( m->y ) )
+        return true
+    case TKM_SHOW
+        ' a component is never shown, whatever asks
+        if m->bFlag then tkWidget_Show( w, false )
+        return true
+    case TKM_THEMECHANGED
+        tkPopupMenu_ApplyTheme( p->hMenu, tkTheme_Of( w ) )
+        return true
+    case TKM_SCALECHANGED
+        tkPopupMenu_Rescale( p->hMenu, m->fOld, m->fNew )
+        return true
+    case TKM_DESTROY
+        tkWidget_ClearContextMenuRefs( w )
+        Disown_( p->hMenu )
+        tkPopupMenu_Destroy( p->hMenu )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+public function tkContextMenu_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKCONTEXTMENU_STATE ptr p = new TKCONTEXTMENU_STATE
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @tkContextMenu_Proc, p )
+    p->hWin = w
+    p->hMenu = tkPopupMenu_Create( w->pHost, ctrlId )
+    Own_( p->hMenu, w )
+    tkPopupMenu_SetSelectCallback( p->hMenu, @OnSelect )
+    tkWidget_Show( w, false )
+    return w
+end function
+
+' The menu to fill with tkPopupMenu_AddItem and the rest; the component owns it.
+public function tkContextMenu_GetMenu( byval h as TK_WIDGET ptr ) as TK_MENU ptr
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( h )
+    return iif( p <> 0, p->hMenu, cast( TK_MENU ptr, 0 ) )
+end function
+
+' hTarget's right-click menu (and its children's, unless they have their own). One surface only.
+public sub tkContextMenu_Attach( byval h as TK_WIDGET ptr, byval hTarget as TK_WIDGET ptr )
+    if (GetCtxPointer( h ) = 0) orelse (hTarget = 0) then exit sub
+    tkWidget_SetContextMenu( hTarget, h )
+end sub
+
+public sub tkContextMenu_Detach( byval hTarget as TK_WIDGET ptr )
+    tkWidget_SetContextMenu( hTarget, 0 )
+end sub
+
+' Opens it from code at (x, y), the surface's window pixels, for hSource (0: none).
+public sub tkContextMenu_Show( byval h as TK_WIDGET ptr, byval x as long, byval y as long, byval hSource as TK_WIDGET ptr = 0 )
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( h )
+    if p then Open_( p, hSource, x, y )
+end sub
+
+' Opens it from code under hSource's bottom-left corner, for hSource.
+public sub tkContextMenu_ShowFor( byval h as TK_WIDGET ptr, byval hSource as TK_WIDGET ptr )
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( h )
+    if (p = 0) orelse (hSource = 0) then exit sub
+    dim as TKRECT a
+    tkWidget_AbsRect( hSource, a )
+    Open_( p, hSource, a.left, a.bottom )
+end sub
+
+' The widget it last opened for (0 before it has).
+public function tkContextMenu_GetSource( byval h as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( h )
+    return iif( p <> 0, p->hSource, cast( TK_WIDGET ptr, 0 ) )
+end function
+
+public function tkContextMenu_IsOpen( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( h )
+    return (p <> 0) andalso tkPopupMenu_IsOpen( p->hMenu )
+end function
+
+public sub tkContextMenu_SetPopupCallback( byval h as TK_WIDGET ptr, byval usersub as CTX_PopupCallbackSub )
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( h )
+    if p then p->Popup = usersub
+end sub
+
+public sub tkContextMenu_SetCommandCallback( byval h as TK_WIDGET ptr, byval usersub as CTX_CommandCallbackSub )
+    dim as TKCONTEXTMENU_STATE ptr p = GetCtxPointer( h )
+    if p then p->Command = usersub
+end sub

@@ -48,6 +48,7 @@ snippet's output matters it is shown in `'' →` comments.
 | One file | `tiko app.tiko` → `app.exe` (Windows) or `./app` |
 | Optimised | `tiko -O2 app.tiko` |
 | Debug + runtime checks | `tiko -g -exx app.tiko` (bounds, null pointers) |
+| Memory errors | `tiko -g -fsanitize=address app.tiko`, or `tiko build --profile asan`: use-after-free, double free, overflow (after tiko 0.1.6) |
 | Thread-safe runtime | `tiko -mt app.tiko`, or `#cmdline "-mt"` in the source |
 | Name the output | `-o name` (exact, so `-o name.exe` on Windows) |
 | Define a symbol | `-d NAME=value` |
@@ -84,6 +85,8 @@ options  = ["-mt"]
 | `tiko run [target] [-- args]` | builds an executable target and runs it |
 | `tiko check` | reports every error and warning, writes nothing |
 | `tiko clean` | removes what `tiko build` wrote |
+| `tiko test [dirs]` | builds the project's tests into one program and runs it (after tiko 0.1.6) |
+| `tiko doc [dirs]` | writes the modules' API pages into `out/doc/` (after tiko 0.1.6) |
 
 Diagnostics look like `file.tiko(5,35): error TKO0698: message`, then a caret excerpt.
 Fix the first error first.
@@ -129,8 +132,8 @@ print strings.Format( "{} items, total {:.2f}", cart.Count( ), Total( cart ) )
 
 | Type | Notes |
 | --- | --- |
-| `int8 int16 int32 int64` | signed, size in the name |
-| `uint8 uint16 uint32 uint64` | unsigned; `ubyte` = `uint8` |
+| `int8 int16 int32 int64 int128` | signed, size in the name |
+| `uint8 uint16 uint32 uint64 uint128` | unsigned; `ubyte` = `uint8`; the 128-bit pair is C's `__int128` |
 | `float32 float64` | a bare literal `1.5` is `float64` |
 | `boolean` | `true` / `false` |
 | `integer` / `uinteger` | pointer-sized (64-bit). A bare `1` literal is `integer`. `long` is 32-bit |
@@ -681,9 +684,9 @@ Import with `#import "std/<name>"` and call as `<name>.Function( )`.
 | `std/logs` | `Logger`, sinks, levels, structured fields |
 | `std/net`, `std/http`, `std/tls` | TCP and UDP, `http.Fetch`, TLS |
 | `std/tui` | terminal UI toolkit |
-| `vendor/sqlite3`, `vendor/cJSON` | C libraries shipped with the toolchain, used through their C API |
+| `vendor/sqlite3`, `vendor/cJSON`, `vendor/pcre2` | C libraries shipped with the toolchain, used through their C API |
 | `vendor/tkControls`, `vendor/SDL3`, `vendor/raylib6` | cross-platform GUI and graphics |
-| `vendor/PsControls`, `sys/win` | Windows-only GUI and the Windows API |
+| `sys/win` | the Windows API |
 
 Each feature has a reference page in the [Feature Index](Feature-Index).
 
@@ -871,6 +874,17 @@ print cbool( len( PLATFORM ) > 0 ); EDITION; " "; cbool( __LINE__ > 0 )
   is never compiled, so it can hide errors.
 
 ## Testing
+
+After tiko 0.1.6, a test is a `test "name" ... end test` block in a file named `*_test.tiko`.
+Beside a module, starting `#module "<that module>"`, it reaches the module's private names;
+anywhere else it is a program of its own that uses the module through `#import`. Either way it
+does `#import "std/testing"` and checks with `testing.ExpectEq( got, want )`, `testing.Expect`,
+`testing.ExpectNear` or `testing.Require` (which stops the test), and each failure names its file
+and line. `tiko test` builds and runs them all; a normal build drops test blocks. A test in a
+program's main file is never run: put the code under test in a module.
+See [tiko test](Category-Tiko-Test).
+
+With tiko 0.1.6 and earlier, use fbcunit:
 
 ```freebasic
 #include once "fbcunit.bi"

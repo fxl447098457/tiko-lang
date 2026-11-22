@@ -1,0 +1,322 @@
+'' abiint128.tiko -- win64's int128 convention, ahead of the aggregate pass (abi.tiko).
+
+#import "std/containers"
+#include once "codegen/abi.ti"
+
+namespace Tko.Codegen
+
+using Tko.Mir
+
+'' The pass's own state: one function at a time, the block being rebuilt, and the new
+'' slots' allocas, held aside until every block is rebuilt (abi.tiko's Rewriter says why).
+type I128Ctx_
+    as MirModule ptr    m
+    as MirFunction ptr  f
+    as MirInstVec       outp
+    as AbiStats ptr     st
+    as MirInstVec       pendingAllocas
+end type
+
+private function LocalVal( byval slot as int32 ) as MirValue
+    dim as MirValue v
+    v.kind = cast( uint8, MV_LOCAL )
+    v.ty = cast( uint8, MT_PTR )
+    v.id = slot
+    return v
+end function
+
+private function TempVal( byval id as uint32, byval ty as MirType ) as MirValue
+    dim as MirValue v
+    v.kind = cast( uint8, MV_TEMP )
+    v.ty = cast( uint8, ty )
+    v.id = id
+    return v
+end function
+
+private sub FlushAllocas( byref r as I128Ctx_ )
+    if r.pendingAllocas.Count = 0 then return
+    dim as MirInstVec merged
+    for i as int32 = 0 to r.pendingAllocas.Count - 1
+        merged.Push( r.pendingAllocas[i] )
+    next
+    for i as int32 = 0 to r.f->blocks[0].insts.Count - 1
+        merged.Push( r.f->blocks[0].insts[i] )
+    next
+    r.f->blocks[0].insts.Clear( )
+    for i as int32 = 0 to merged.Count - 1
+        r.f->blocks[0].insts.Push( merged[i] )
+    next
+    r.pendingAllocas.Clear( )
+end sub
+
+'' ---------------------------------------------------------- win64 int128
+''
+'' WIN64 PASSES __int128 BY ADDRESS AND RETURNS IT IN XMM0, as '<2 x i64>'. Probed
+'' 2026-11-19, clang 23, x86_64-pc-windows-msvc AND x86_64-w64-mingw32 alike:
+''
+''     __int128 addi( __int128 a, __int128 b )
+''       -> define <2 x i64> @addi( ptr align 16 %0, ptr align 16 %1 )
+''
+'' A raw IR 'i128' is NOT that: LLVM's backend passes it in RCX:RDX and returns it in
+'' RAX:RDX (same probe, 'define i128 @addr( i128, i128 )'), so a tiko procedure called
+'' from C, or calling C, would read the wrong registers. The libcalls (__divti3 & co.)
+'' already use the pointer/XMM0 shape -- the backend emits those itself.
+''
+'' So on win64, and only there, BEFORE the aggregate pass: every i128 parameter becomes a
+'' pointer to a fresh 16-aligned copy the caller owns, and every i128 result travels as
+'' '<2 x i64>' -- a bitcast, the same 128 bits. SysV and AAPCS64 pass a raw i128 exactly
+'' as clang does and need nothing. Call sites first, against the original signatures;
+'' then each body; then the signatures.
+
+'' A fresh 'alloca i128, align 16', for one argument's copy.
+private function NewI128Slot_( byref r as I128Ctx_, byref names as Tko.Interner ) as int32
+    dim as MirLocal l
+    l.name = names.GetString( "$abi" & str( r.f->locals.Count ) )
+    l.ty = cast( uint8, MT_I128 )
+    l.size = 16
+    l.sym = 0
+    r.f->locals.Push( l )
+    dim as int32 slot = r.f->locals.Count - 1
+    dim as MirInst a
+    a.op = cast( uint16, M_ALLOCA )
+    a.ty = cast( uint8, MT_PTR )
+    a.imm = slot
+    a.result = r.f->nextTemp
+    r.f->nextTemp += 1
+    r.pendingAllocas.Push( a )
+    return slot
+end function
+
+private function HasI128Sig_( byval f as MirFunction ptr ) as boolean
+    if f = nullptr then return false
+    if cast( MirType, f->retTy ) = MT_I128 then return true
+    for i as int32 = 0 to f->paramTys.Count - 1
+        if cast( MirType, f->paramTys[i] ) = MT_I128 then return true
+    next
+    return false
+end function
+
+'' One call against its callee's ORIGINAL signature: each i128 argument stored into its own
+'' slot and passed by the slot's address; an i128 result received as '<2 x i64>' and cast
+'' back under the temp every later use already names.
+private sub Win64I128Call_ _
+    ( byref r as I128Ctx_, byref ins as MirInst, byval callee as MirFunction ptr, _
+      byref names as Tko.Interner )
+
+    dim as boolean anyArg = false
+    for i as int32 = 0 to ins.count - 1
+        if i >= callee->paramTys.Count then exit for
+        if cast( MirType, callee->paramTys[i] ) = MT_I128 then anyArg = true
+    next
+    if anyArg then
+        '' THE RUN IS COPIED, never patched: a run another instruction still names must not
+        '' change under it (RewriteCallArgs).
+        dim as int32 newFirst = r.m->argPool.Count \ 2
+        for i as int32 = 0 to ins.count - 1
+            dim as int32 k = (ins.first + i) * 2
+            dim as MirValue av
+            av.kind = cast( uint8, r.m->argPool[k] )
+            av.id = r.m->argPool[k + 1]
+            dim as boolean wide = false
+            if i < callee->paramTys.Count then wide = (cast( MirType, callee->paramTys[i] ) = MT_I128)
+            if wide andalso (av.kind <> cast( uint8, MV_NONE )) then
+                av.ty = cast( uint8, MT_I128 )
+                dim as int32 slot = NewI128Slot_( r, names )
+                dim as MirInst s
+                s.op = cast( uint16, M_STORE )
+                s.ty = cast( uint8, MT_VOID )
+                s.a = LocalVal( slot )
+                s.b = av
+                r.outp.Push( s )
+                r.m->argPool.Push( cast( uint32, MV_LOCAL ) )
+                r.m->argPool.Push( cast( uint32, slot ) )
+                r.st->indirectParams += 1
+            else
+                r.m->argPool.Push( cast( uint32, av.kind ) )
+                r.m->argPool.Push( av.id )
+            end if
+        next
+        ins.first = newFirst
+    end if
+
+    if (cast( MirType, callee->retTy ) = MT_I128) andalso (cast( MirType, ins.ty ) = MT_I128) then
+        dim as uint32 oldResult = ins.result
+        dim as MirInst c = ins
+        c.ty = cast( uint8, MT_V2I64 )
+        c.result = r.f->nextTemp
+        r.f->nextTemp += 1
+        r.outp.Push( c )
+        dim as MirInst bc
+        bc.op = cast( uint16, M_BITCAST )
+        bc.ty = cast( uint8, MT_I128 )
+        bc.a = TempVal( c.result, MT_V2I64 )
+        bc.result = oldResult
+        r.outp.Push( bc )
+        return
+    end if
+    '' A DISCARDED i128 RESULT still comes back in XMM0, and the call must say the callee's
+    '' type: 'call void' against 'define <2 x i64>' is a different function type.
+    if (cast( MirType, callee->retTy ) = MT_I128) andalso (cast( MirType, ins.ty ) = MT_VOID) then
+        ins.ty = cast( uint8, MT_V2I64 )
+        ins.result = r.f->nextTemp
+        r.f->nextTemp += 1
+    end if
+    r.outp.Push( ins )
+end sub
+
+private sub Win64I128Calls_( byref r as I128Ctx_, byref names as Tko.Interner )
+    for bi as int32 = 0 to r.f->blocks.Count - 1
+        dim as MirBlock ptr b = @r.f->blocks[bi]
+        r.outp.Clear( )
+        for i as int32 = 0 to b->insts.Count - 1
+            dim as MirInst ins = b->insts[i]
+            dim as MirOp op = cast( MirOp, ins.op )
+            dim as MirFunction ptr callee = nullptr
+            select case op
+            case M_CALL, M_CALL_RTL
+                dim as int32 ci = cast( int32, ins.callee )
+                if (ci >= 0) andalso (ci < r.m->functions.Count) then callee = r.m->functions[ci]
+            case M_CALL_IND
+                dim as int32 si = cast( int32, ins.callee ) - 1
+                if (si >= 0) andalso (si < r.m->functions.Count) then callee = r.m->functions[si]
+            end select
+            if HasI128Sig_( callee ) then
+                Win64I128Call_( r, ins, callee, names )
+            else
+                r.outp.Push( ins )
+            end if
+        next
+        b->insts.Clear( )
+        for i as int32 = 0 to r.outp.Count - 1
+            b->insts.Push( r.outp[i] )
+        next
+    next
+    FlushAllocas( r )
+end sub
+
+'' THE CALLEE'S HALF, against its original signature: an i128 parameter is now the address
+'' of the caller's copy, so the body reads it once, at entry, under a new temp, and every
+'' use of the parameter names that temp; each 'ret i128' becomes a bitcast and a 'ret
+'' <2 x i64>'.
+private sub Win64I128Body_( byref r as I128Ctx_ )
+    dim as containers.Array( of int32 ) loaded      '' per parameter: its temp, or -1
+    dim as boolean any_ = false
+    for i as int32 = 0 to r.f->paramTys.Count - 1
+        loaded.Push( -1 )
+        if cast( MirType, r.f->paramTys[i] ) = MT_I128 then any_ = true
+    next
+    dim as boolean retWide = (cast( MirType, r.f->retTy ) = MT_I128)
+    if (any_ = false) andalso (retWide = false) then return
+    if r.f->blocks.Count = 0 then return
+
+    dim as MirInstVec entry
+    for i as int32 = 0 to r.f->paramTys.Count - 1
+        if cast( MirType, r.f->paramTys[i] ) <> MT_I128 then continue for
+        dim as MirValue pv
+        pv.kind = cast( uint8, MV_PARAM )
+        pv.ty = cast( uint8, MT_PTR )
+        pv.id = cast( uint32, i )
+        dim as MirInst l
+        l.op = cast( uint16, M_LOAD )
+        l.ty = cast( uint8, MT_I128 )
+        l.a = pv
+        l.result = r.f->nextTemp
+        r.f->nextTemp += 1
+        entry.Push( l )
+        loaded[i] = cast( int32, l.result )
+    next
+
+    for bi as int32 = 0 to r.f->blocks.Count - 1
+        dim as MirBlock ptr b = @r.f->blocks[bi]
+        for i as int32 = 0 to b->insts.Count - 1
+            dim as MirInst ptr ins = @b->insts[i]
+            for side as int32 = 0 to 1
+                dim as MirValue ptr v = iif( side = 0, @ins->a, @ins->b )
+                if v->kind <> cast( uint8, MV_PARAM ) then continue for
+                dim as int32 pi = cast( int32, v->id )
+                if (pi < 0) orelse (pi >= loaded.Count) then continue for
+                if loaded[pi] < 0 then continue for
+                *v = TempVal( cast( uint32, loaded[pi] ), MT_I128 )
+            next
+            dim as MirOp op = cast( MirOp, ins->op )
+            if (op = M_CALL) orelse (op = M_CALL_RTL) orelse (op = M_CALL_IND) then
+                for k as int32 = 0 to ins->count - 1
+                    dim as int32 ki = (ins->first + k) * 2
+                    if (ki + 1) >= r.m->argPool.Count then exit for
+                    if r.m->argPool[ki] <> cast( uint32, MV_PARAM ) then continue for
+                    dim as int32 pi = cast( int32, r.m->argPool[ki + 1] )
+                    if (pi < 0) orelse (pi >= loaded.Count) then continue for
+                    if loaded[pi] < 0 then continue for
+                    r.m->argPool[ki] = cast( uint32, MV_TEMP )
+                    r.m->argPool[ki + 1] = cast( uint32, loaded[pi] )
+                next
+            end if
+        next
+        if b->cond.kind = cast( uint8, MV_PARAM ) then
+            dim as int32 pi = cast( int32, b->cond.id )
+            if (pi >= 0) andalso (pi < loaded.Count) then
+                if loaded[pi] >= 0 then b->cond = TempVal( cast( uint32, loaded[pi] ), MT_I128 )
+            end if
+        end if
+        if retWide andalso (b->term = cast( uint8, MTERM_RET )) andalso _
+           (b->cond.kind <> cast( uint8, MV_NONE )) then
+            dim as MirInst bc
+            bc.op = cast( uint16, M_BITCAST )
+            bc.ty = cast( uint8, MT_V2I64 )
+            bc.a = b->cond
+            bc.a.ty = cast( uint8, MT_I128 )
+            bc.result = r.f->nextTemp
+            r.f->nextTemp += 1
+            b->insts.Push( bc )
+            b->cond = TempVal( bc.result, MT_V2I64 )
+        end if
+    next
+
+    if entry.Count > 0 then
+        dim as MirInstVec merged
+        for i as int32 = 0 to entry.Count - 1
+            merged.Push( entry[i] )
+        next
+        for i as int32 = 0 to r.f->blocks[0].insts.Count - 1
+            merged.Push( r.f->blocks[0].insts[i] )
+        next
+        r.f->blocks[0].insts.Clear( )
+        for i as int32 = 0 to merged.Count - 1
+            r.f->blocks[0].insts.Push( merged[i] )
+        next
+    end if
+end sub
+
+sub Win64Int128 _
+    ( byref m as MirModule, byref names as Tko.Interner, _
+      byref target as TargetDescription, byref st as AbiStats )
+
+    dim as boolean any_ = false
+    for fi as int32 = 0 to m.functions.Count - 1
+        if HasI128Sig_( m.functions[fi] ) then any_ = true
+    next
+    if any_ = false then return
+
+    for fi as int32 = 0 to m.functions.Count - 1
+        dim as MirFunction ptr f = m.functions[fi]
+        if f = nullptr then continue for
+        if f->isDefinition = false then continue for
+        dim as I128Ctx_ r
+        r.m = @m
+        r.f = f
+        r.st = @st
+        Win64I128Calls_( r, names )
+        Win64I128Body_( r )
+    next
+    for fi as int32 = 0 to m.functions.Count - 1
+        dim as MirFunction ptr f = m.functions[fi]
+        if HasI128Sig_( f ) = false then continue for
+        for i as int32 = 0 to f->paramTys.Count - 1
+            if cast( MirType, f->paramTys[i] ) = MT_I128 then f->paramTys[i] = cast( uint8, MT_PTR )
+        next
+        if cast( MirType, f->retTy ) = MT_I128 then f->retTy = cast( uint8, MT_V2I64 )
+        st.functionsRewritten += 1
+    next
+end sub
+
+end namespace

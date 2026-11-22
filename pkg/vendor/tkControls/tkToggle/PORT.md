@@ -43,7 +43,10 @@ types are unchanged. The handle is `TK_WIDGET ptr`.
 to measure), no tooltip, no animation, no tri-state. PsPlatform's Left/Right = off/on was not
 taken: vendor's README rules arrows out.
 
-**Added:** `tkToggle_GetHot`, `tkToggle_GetPressed`, `tkToggle_GetID` (test probes).
+**Added:** `tkToggle_GetHot`, `tkToggle_GetPressed`, `tkToggle_GetID` (test probes). For the form
+designer: a tooltip through tkTipHost (`SetTooltipText` / `GetTooltipText`, `GetTooltipHandle`, the
+three delays), the border following the theme's BorderWidth until `SetBorderThickness` (which now
+pins it), and `PaintDefault` for a paint callback. PsToggle has none of them.
 
 **Vendor bugs found (fixed here):**
 - **A held Space/Enter re-flipped the switch at the typematic rate** — `WM_KEYDOWN` auto-repeat

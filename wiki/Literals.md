@@ -60,6 +60,8 @@ If an integer literal suffix is not given, the number field size required to hol
 - "`LL`", are considered as signed 64 bit integers. ([`LongInt`](Longint))
 - "`ULL`", are considered as unsigned 64 bit integers. ([`ULongInt`](Ulongint))
 
+ **tiko:** a literal too big for 64 bits needs no suffix: it is 128-bit by itself. A decimal literal is [`Int128`](Category-Fixed-Width-Types#128-bit-integers) up to 2^127 - 1 and `UInt128` above; a `&H`, `&O` or `&B` literal past 64 bits is `Int128`. A literal with an `LL` or `ULL` suffix stays 64 bits, and past that it is truncated with warning `TKO0205`.
+
 Negative (-) and positive (+) signs that prefix a numeric literal, are not part of the numeric literal. expressions (like "`-1L`") are parsed as the negate operator applied to the value represented by the positive literal ("`1L`"), which may involve implicit type conversions. Same behavior when an explicit "`+`" sign precedes the integer literal.
 
  The prefixes, suffixes, and hexadecimal letter digits are all case-insensitive.

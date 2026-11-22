@@ -5,7 +5,7 @@
 using containers
 using outcome
 '' std/tls: tlsunix -- the OpenSSL 3 engine, loaded at run time (C long is integer: LP64).  libssl.so.3 and
-'' libcrypto.so.3 are opened with DYLIBLOAD on the first handshake and never
+'' libcrypto.so.3 are opened with dlopen on the first handshake and never
 '' closed; nothing is linked, so a program that never shakes hands never needs them.
 '' The SSL object talks to two memory BIOs and this file pumps them
 '' through the transport fs.Stream, as tlswin.tiko pumps SSPI's buffers.
@@ -61,20 +61,35 @@ private function hSym( byval lib_ as any ptr, byref nm as const string, byref ok
     return p
 end function
 
-'' OPENSSL 3, LOADED AT RUN TIME. On macOS from Homebrew (docs/tiko-macos M7, D-M7-1): Apple
-'' Silicon's prefix, then Intel's, then the bare name for dyld's own search -- libcrypto and
-'' libssl as a PAIR from one place. NEVER /usr/lib/libssl.dylib: that is LibreSSL behind an
-'' unversioned name, and dyld aborts a process that loads it so.
+'' OPENSSL 3, LOADED AT RUN TIME -- through dlopen itself, NEVER DYLIBLOAD.  DYLIBLOAD keeps
+'' fbc's filename table, whose "./%s" entries load a bare name from the CURRENT DIRECTORY when
+'' the system has no copy; loading a library runs its constructors, so a program started in a
+'' folder someone else can write (a cloned repo, Downloads, /tmp) would run their libcrypto on
+'' its first handshake.  dlopen of a name with no slash searches only the loader's own path
+'' (LD_LIBRARY_PATH, rpath, the cache, the system directories), never the current one.
+''
+'' On macOS from Homebrew (docs/tiko-macos M7, D-M7-1): Apple Silicon's prefix, then Intel's,
+'' then MacPorts' -- ABSOLUTE PATHS ONLY, because dyld's search for a bare leaf name includes
+'' the current directory.  libcrypto and libssl as a PAIR from one place.  NEVER
+'' /usr/lib/libssl.dylib: that is LibreSSL behind an unversioned name, and dyld aborts a
+'' process that loads it so.
+extern "c"
+    declare function tko_dlopen alias "dlopen" ( byval n as const zstring ptr, byval flags as long ) as any ptr
+    declare function tko_dlclose alias "dlclose" ( byval h as any ptr ) as long
+end extern
+const TKO_RTLD_LAZY = 1                 '' the same on Linux and Darwin, and what DYLIBLOAD passes
+
 #ifdef __FB_DARWIN__
 const TKO_LIBSSL_NAME = "OpenSSL 3 (brew install openssl@3)"
 private function hLoadLibs( ) as boolean
-    dim as string dirs( 0 to 2 ) = { "/opt/homebrew/opt/openssl@3/lib/", "/usr/local/opt/openssl@3/lib/", "" }
+    dim as string dirs( 0 to 2 ) = { "/opt/homebrew/opt/openssl@3/lib/", "/usr/local/opt/openssl@3/lib/", "/opt/local/lib/" }
     for i as long = 0 to 2
-        tko_libcrypto = dylibload( dirs( i ) & "libcrypto.3.dylib" )
+        dim as string pc = dirs( i ) & "libcrypto.3.dylib", ps = dirs( i ) & "libssl.3.dylib"
+        tko_libcrypto = tko_dlopen( strptr( pc ), TKO_RTLD_LAZY )
         if( tko_libcrypto = nullptr ) then continue for
-        tko_libssl = dylibload( dirs( i ) & "libssl.3.dylib" )
+        tko_libssl = tko_dlopen( strptr( ps ), TKO_RTLD_LAZY )
         if( tko_libssl <> nullptr ) then return TRUE
-        dylibfree( tko_libcrypto )
+        tko_dlclose( tko_libcrypto )
         tko_libcrypto = nullptr
     next
     return FALSE
@@ -82,9 +97,9 @@ end function
 #else
 const TKO_LIBSSL_NAME = "libssl.so.3"
 private function hLoadLibs( ) as boolean
-    tko_libcrypto = dylibload( "libcrypto.so.3" )
+    tko_libcrypto = tko_dlopen( "libcrypto.so.3", TKO_RTLD_LAZY )
     if( tko_libcrypto = nullptr ) then return FALSE
-    tko_libssl = dylibload( "libssl.so.3" )
+    tko_libssl = tko_dlopen( "libssl.so.3", TKO_RTLD_LAZY )
     return ( tko_libssl <> nullptr )
 end function
 #endif
@@ -316,11 +331,22 @@ function TlsEngOpen( byref s as TlsStream, byref cfg as const TlsConfig, byref o
         tko_SSL_set_connect_state( e->ssl )
         dim as string host = s.hName
         if( ( len( host ) >= 2 ) andalso ( left( host, 1 ) = "[" ) ) then host = mid( host, 2, len( host ) - 2 )
+        '' A SILENT 0 FROM EITHER SETTER WOULD TURN THE NAME CHECK OFF, and the chain alone would
+        '' then accept any certificate a trusted CA issued.  OpenSSL cannot parse an IPv6 zone
+        '' ("fe80::1%eth0"), which names a local interface and is never in a certificate: it is
+        '' cut off first, and a setter that still refuses fails the handshake.
+        dim as long setOk = 1
         if( TlsIsIpLiteral( host ) ) then
-            if( cfg.InsecureSkipVerify = FALSE ) then tko_X509_VERIFY_PARAM_set1_ip_asc( tko_SSL_get0_param( e->ssl ), strptr( host ) )
+            dim as long zp = instr( host, "%" )
+            if( zp > 0 ) then host = left( host, zp - 1 )
+            if( cfg.InsecureSkipVerify = FALSE ) then setOk = tko_X509_VERIFY_PARAM_set1_ip_asc( tko_SSL_get0_param( e->ssl ), strptr( host ) )
         else
             tko_SSL_ctrl( e->ssl, 55, 0, strptr( host ) )             '' SSL_set_tlsext_host_name: SNI
-            if( cfg.InsecureSkipVerify = FALSE ) then tko_SSL_set1_host( e->ssl, strptr( host ) )
+            if( cfg.InsecureSkipVerify = FALSE ) then setOk = tko_SSL_set1_host( e->ssl, strptr( host ) )
+        end if
+        if( setOk <> 1 ) then
+            hFreeEng( e )
+            return TlsFail( TLS_CERT_NAME_MISMATCH, 0, op, s.hName, "the name cannot be checked" )
         end if
     end if
 

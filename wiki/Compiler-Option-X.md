@@ -2,7 +2,7 @@
 
 # Compiler Option: -x
 
-> **In tiko.** tiko takes `-x`: the linked executable, DLL or library is written to the path as given, with no extension added; `-x` may stand anywhere on the line, the last one wins, and it wins over `-o`; with `-c` it is ignored and each object keeps its own name; a `#cmdline "-x ..."` in the source wins over the command line's; `-x` with no name is `TKO0101`. tiko's `-o` names the linked output too, when there is no `-x`. In a `tiko.toml` target's `options`, the path is relative to `tiko.toml` ([tiko build](Category-Tiko-Build)).
+> **In tiko.** tiko takes `-x`: the linked executable, DLL or library is written to the path as given, with no extension added; `-x` may stand anywhere on the line, the last one wins, and it wins over `-o`; with `-c` it is ignored and each object keeps its own name; a `#cmdline "-x ..."` in the source wins over the command line's, and must be relative and not use `..` (`TKO0178`); `-x` with no name is `TKO0101`. tiko's `-o` names the linked output too, when there is no `-x`. In a `tiko.toml` target's `options`, the path is relative to `tiko.toml` ([tiko build](Category-Tiko-Build)).
 
 Set executable/library path/name
 

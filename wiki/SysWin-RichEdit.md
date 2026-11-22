@@ -11,7 +11,7 @@ module gives three ways to work with one:
 - **[CRichEditCtx](CRichEditCtx)**, a class that creates the control in a [CWindow](CWindow) and
   wraps nearly every rich edit message, the document's files and RTF, and the control's
   `ITextDocument2` interface. Most programs need only this.
-- **[RichEdit](SysWin-RichEdit-Control)**, a namespace of functions that send the same messages
+- **[RichEd](SysWin-RichEdit-Control)**, a namespace of functions that send the same messages
   to any rich edit control, given its handle.
 - **The Text Object Model (TOM)**: `CTextRange2`, `CTextSelection2`, `CTextFont2`, `CTextPara2`,
   `CTextRow` and `CTextStory` wrap the TOM interfaces for ranges of text, the selection, fonts,
@@ -25,10 +25,6 @@ of `CRichEditCtx.Range` or `CTextRange2.GetFont`, and do not release that pointe
 
 **Character positions** count characters from 0 at the start of the text. A range runs from its
 start to just before its end, so `Range( 0, 5 )` covers the first five characters.
-
-**The `RichEdit` namespace and the module name.** The namespace has the module's name, and a bare
-`RichEdit.` names the module itself. Write the functions with the module in front:
-`richedit.RichEdit.SetSel( hRichEdit, 0, 5 )`.
 
 `sys/win/richedit` imports `sys/win`, `sys/win/com`, `sys/win/gdiplus` and `sys/win/gui` itself;
 a program that creates its window with `CWindow` imports `sys/win/gui` too.
@@ -71,7 +67,7 @@ function main() as long
     dim font as CTextFont2 = CTextFont2( range.GetFont() )
     font.SetBold( tomTrue )
     ' a RichEdit function on the control's handle
-    richedit.RichEdit.SetZoom( pRichEdit.hRichEdit, 120, 100 )
+    RichEd.SetZoom( pRichEdit.hRichEdit, 120, 100 )
     pRichEdit.SetModify( 0 )
     SetFocus( pRichEdit.hRichEdit )
     return pWindow.DoEvents( SW_NORMAL )
@@ -113,4 +109,3 @@ A larger program, with files of each encoding, images, RTF and printing, is in t
 
 - [Category: sys/win](Category-Sys-Win)
 - [CWindow](CWindow) for the window the control lives in
-- [CPrint](CPrint) for printing the contents of a rich edit control

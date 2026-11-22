@@ -1,0 +1,97 @@
+'' match -- the first PCRE2 program: compile a pattern, report a bad one, find the first match
+'' and its groups, then every match in the text, then the same with the JIT. After pcre2demo.c,
+'' PCRE2's own demonstration program.
+''
+'' Build it with 'tiko match.tiko'.
+''
+'' PCRE2 is BSD-licensed (pkg/vendor/pcre2/LICENSE); so is this.
+
+'' PCRE2 linked DYNAMICALLY: pcre2.dll is copied beside the program (on Linux the program gets
+'' pcre2_linux_x86_64.so beside it). Write 'link static' instead to build PCRE2 into the program.
+#import "vendor/pcre2" link dynamic
+
+'' The pattern compiled, or nullptr after saying where and why it is wrong. A pattern and a
+'' subject are bytes -- a PCRE2_SPTR -- so a string goes in as strptr( s ), with its length.
+function Compile( byref pattern as const string, byval options as uint32 = 0 ) as pcre2_code ptr
+    dim as int32 errorCode
+    dim as PCRE2_SIZE errorOffset
+    dim as pcre2_code ptr re = pcre2_compile( strptr( pattern ), len( pattern ), options, _
+                                              @errorCode, @errorOffset, nullptr )
+    if re = nullptr then
+        dim as zstring * 256 message
+        pcre2_get_error_message( errorCode, cast( PCRE2_UCHAR ptr, @message ), sizeof( message ) )
+        print "  """; pattern; """ at offset "; errorOffset; ": "; message
+    end if
+    return re
+end function
+
+'' Group n of the last match: the ovector holds a start and an end offset per group, in bytes
+'' from the start of the subject. A group that took no part is PCRE2_UNSET.
+function Group( byref subject as const string, byval md as pcre2_match_data ptr, _
+                byval n as uint32 ) as string
+    dim as PCRE2_SIZE ptr ov = pcre2_get_ovector_pointer( md )
+    if ov[2 * n] = PCRE2_UNSET then return "(unset)"
+    return mid( subject, ov[2 * n] + 1, ov[2 * n + 1] - ov[2 * n] )
+end function
+
+print "A bad pattern:"
+Compile( "(\d+" )
+Compile( "a{2,1}" )
+
+dim as string subject = "Orders 1041-17 and 2202-3, then 7-0815."
+dim as pcre2_code ptr re = Compile( "(\d+)-(\d+)" )
+
+'' Match data holds the ovector. Sized from the pattern, it has room for every group.
+dim as pcre2_match_data ptr md = pcre2_match_data_create_from_pattern( re, nullptr )
+
+'' pcre2_match returns 1 + the highest group that matched, PCRE2_ERROR_NOMATCH (-1) for no match,
+'' or another negative error code.
+print
+print "The first match:"
+dim as int32 rc = pcre2_match( re, strptr( subject ), len( subject ), 0, 0, md, nullptr )
+print "  rc ="; rc
+for n as uint32 = 0 to rc - 1
+    print "  group "; n; ": "; Group( subject, md, n )
+next
+
+'' Every match: pcre2_next_match says where the next attempt starts and with which options --
+'' after an empty match it must not find the same empty match again.
+print
+print "Every match:"
+dim as PCRE2_SIZE start = 0
+dim as uint32 options = 0
+do while pcre2_match( re, strptr( subject ), len( subject ), start, options, md, nullptr ) > 0
+    dim as PCRE2_SIZE ptr ov = pcre2_get_ovector_pointer( md )
+    print "  "; Group( subject, md, 0 ); " at bytes "; ov[0]; " to "; ov[1]
+    if pcre2_next_match( md, @start, @options ) = 0 then exit do
+loop
+
+'' Empty matches: x* matches nothing before every character that is not an x.
+print
+print "Every match of x* in ""axxb"":"
+dim as string axxb = "axxb"
+dim as pcre2_code ptr xs = Compile( "x*" )
+dim as pcre2_match_data ptr xmd = pcre2_match_data_create_from_pattern( xs, nullptr )
+start = 0 : options = 0
+do while pcre2_match( xs, strptr( axxb ), len( axxb ), start, options, xmd, nullptr ) > 0
+    dim as PCRE2_SIZE ptr ov = pcre2_get_ovector_pointer( xmd )
+    print "  """; Group( axxb, xmd, 0 ); """ at "; ov[0]
+    if pcre2_next_match( xmd, @start, @options ) = 0 then exit do
+loop
+pcre2_match_data_free( xmd )
+pcre2_code_free( xs )
+
+'' The JIT compiles the pattern to machine code once; pcre2_match then runs that code. It is
+'' worth it for a pattern used many times.
+print
+dim as uint32 haveJit
+pcre2_config( PCRE2_CONFIG_JIT, @haveJit )
+print "JIT available: "; haveJit; ", pcre2_jit_compile:"; pcre2_jit_compile( re, PCRE2_JIT_COMPLETE )
+dim as int32 count = 0
+for i as int32 = 1 to 100000
+    if pcre2_match( re, strptr( subject ), len( subject ), 0, 0, md, nullptr ) > 0 then count += 1
+next
+print "matched"; count; " times"
+
+pcre2_match_data_free( md )
+pcre2_code_free( re )

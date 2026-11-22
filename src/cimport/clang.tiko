@@ -7,6 +7,11 @@
     '' /usr/lib/llvm-N/bin, and libclang sits under that N, not beside the link.
     extern "c"
         declare function realpath( byval path as zstring ptr, byval resolved as zstring ptr ) as zstring ptr
+        '' dlopen ITSELF, not dylibload: a candidate is a full path, and fbc's dylibload
+        '' (the seed's runtime included) tries a path that would not load again as
+        '' 'lib<path>' and './<path>' -- in the current directory (security review, Nov
+        '' 2026). dylibsymbol and dylibfree take the handle as dlsym and dlclose would.
+        declare function tko_dlopen alias "dlopen" ( byval path as zstring ptr, byval flags as long ) as any ptr
     end extern
 #endif
 
@@ -73,11 +78,23 @@ private sub Candidates_( byref clangExe as string, cand() as string, byref n as 
         cand( n ) = cdir & "../lib/libclang.so.1" : n += 1
         cand( n ) = cdir & "../lib/libclang.so" : n += 1
     end if
-    for v as int32 = 21 to CLANG_MIN_MAJOR step -1
+    '' THE HOST'S MULTIARCH DIRECTORY. On aarch64 Linux (linux-arm64, docs/tiko-linux-arm64 L3)
+    '' apt.llvm.org's libclang 23 is ONLY /usr/lib/aarch64-linux-gnu/libclang-23.so.1 -- there
+    '' is no /usr/lib/llvm-23/lib/libclang.so.1 (probed in the Lima VM, Ubuntu 24.04) -- so the
+    '' directory follows the host, and the versions start at the newest installed there. The
+    '' x86-64 list is what it was.
+    #if defined( __FB_ARM__ )
+        const MULTIARCH_ = "aarch64-linux-gnu"
+        const NEWEST_ = 23
+    #else
+        const MULTIARCH_ = "x86_64-linux-gnu"
+        const NEWEST_ = 21
+    #endif
+    for v as int32 = NEWEST_ to CLANG_MIN_MAJOR step -1
         cand( n ) = "/usr/lib/llvm-" & v & "/lib/libclang.so.1" : n += 1
-        cand( n ) = "/usr/lib/x86_64-linux-gnu/libclang-" & v & ".so.1" : n += 1
+        cand( n ) = "/usr/lib/" & MULTIARCH_ & "/libclang-" & v & ".so.1" : n += 1
     next
-    cand( n ) = "/usr/lib/x86_64-linux-gnu/libclang.so.1" : n += 1
+    cand( n ) = "/usr/lib/" & MULTIARCH_ & "/libclang.so.1" : n += 1
 #endif
 end sub
 
@@ -142,7 +159,11 @@ function ClangLoad( byref api as ClangApi, byref clangExe as string ) as boolean
     dim as string tried_
     for i as int32 = 0 to n - 1
         if FileExists_( cand( i ) ) then
+#ifdef __FB_WIN32__
             api.handle = dylibload( cand( i ) )
+#else
+            api.handle = tko_dlopen( strptr( cand( i ) ), 1 )   '' RTLD_LAZY
+#endif
             if api.handle <> nullptr then
                 api.libPath = cand( i )
                 exit for

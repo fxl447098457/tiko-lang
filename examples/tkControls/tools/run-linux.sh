@@ -8,6 +8,8 @@
 # .exe names). TIKO_PKG is the copy's pkg/, whose vendor/tkControls fonts and libscintk.so
 # vendorfetch.sh makes there. Needs SDL3 + SDL3_ttf + SDL3_image: the system's, or linux-lib/
 # (tools/build-linux-libs.sh), or TK_LINUX_LIB.
+# TK_DRIVERS narrows the SDL video drivers (default "x11 wayland"): a headless box under Xvfb
+# has X11 only (docs/tiko-linux-arm64 L4, the Lima VM).
 # The examples folder this script lives in, and its tiko-lang checkout (main or a worktree).
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 TREE=$(cd "$SRC/../.." && pwd)
@@ -28,7 +30,8 @@ rm -rf "$W"; mkdir -p "$W"
 echo "source: $SRC  build: $W"
 mkdir -p "$W/examples/tkControls" "$W/build"
 ( cd "$SRC" && tar --exclude='./out' --exclude='*/out' --exclude='*.exe' --exclude='*.dll' \
-      --exclude='*.bmp' --exclude='*.ttf' --exclude='./linux-lib*' -cf - . ) | ( cd "$W/examples/tkControls" && tar -xf - )
+      --exclude='*.bmp' --exclude='Inter-*.ttf' --exclude='CascadiaMono-*.ttf' \
+      --exclude='FluentSystemIcons-*.ttf' --exclude='./linux-lib*' -cf - . ) | ( cd "$W/examples/tkControls" && tar -xf - )
 ( cd "$TREE" && tar --exclude='pkg/vendor/*/lib' --exclude='pkg/vendor/tkControls/fonts' \
       --exclude='*/scintk/bin' --exclude='*/scintk/out' -cf - pkg ) | ( cd "$W" && tar -xf - )
 cp "$TREE/build/vendorfetch.sh" "$W/build/"
@@ -40,6 +43,12 @@ case " ${names[*]} " in
     *" tkStatic "*|"  ")
         TIKO_VENDOR_CACHE=${TIKO_VENDOR_CACHE:-$HOME/.cache/tko-vendorfetch} sh "$W/build/vendorfetch.sh" --module SDL3 \
             || { echo "vendorfetch.sh failed: no static SDL3"; exit 1; } ;;
+esac
+# tkContacts keeps its data in SQLite: vendor/sqlite3's library (built from source once, then cached).
+case " ${names[*]} " in
+    *" tkContacts "*|"  ")
+        TIKO_VENDOR_CACHE=${TIKO_VENDOR_CACHE:-$HOME/.cache/tko-vendorfetch} sh "$W/build/vendorfetch.sh" --module sqlite3 \
+            || { echo "vendorfetch.sh failed: no sqlite3"; exit 1; } ;;
 esac
 export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir EGL_LOG_LEVEL=fatal
 [ -n "$LIB" ] && export LD_LIBRARY_PATH=$LIB
@@ -54,7 +63,7 @@ for n in "${names[@]}"; do
     if ! out=$(cd "$d" && "$TIKO" build ${LIB:+--options "-p $LIB"} 2>&1); then
         echo "$n: BUILD FAILED"; echo "$out" | head -20; bad=$((bad+1)); continue
     fi
-    for drv in x11 wayland; do
+    for drv in ${TK_DRIVERS:-x11 wayland}; do
         for r in $(seq 1 "$runs"); do
             res=$(cd "$d" && SDL_VIDEO_DRIVER=$drv timeout 300 ./selftest.exe 2>&1 | grep -v ZINK); rc=$?
             rc=${PIPESTATUS[0]}

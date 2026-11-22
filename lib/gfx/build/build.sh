@@ -3,7 +3,7 @@
 #
 #   build/build.sh [Debug|Release|RelWithDebInfo] [target ...]
 #
-# THREE TARGETS: windows-x86_64, linux-x86_64 and macos-arm64 (docs/graphics
+# FOUR TARGETS: windows-x86_64, linux-x86_64, macos-arm64 and linux-arm64 (docs/graphics
 # RFC-0012, phase P1). Any host builds any of them -- the library is one `tiko -c`
 # per target, and nothing here needs the target's SDK -- and with no target named
 # the host's own is built. driver/window.ti picks the platform: the Win32 window on
@@ -50,7 +50,8 @@ shift 2>/dev/null || true
 LLVMBIN=""
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) HOSTTARGET=windows-x86_64; EXE=.exe ;;
-    Linux)                HOSTTARGET=linux-x86_64;   EXE="" ;;
+    Linux)                HOSTTARGET=linux-x86_64;   EXE=""
+                          [ "$(uname -m)" = aarch64 ] && HOSTTARGET=linux-arm64 ;;
     Darwin)               HOSTTARGET=macos-arm64;    EXE=""
                           [ -d /opt/homebrew/opt/llvm/bin ] && LLVMBIN=/opt/homebrew/opt/llvm/bin/ ;;
     *) die "unsupported host '$(uname -s)' -- this builds on Windows, Linux or macOS" ;;
@@ -93,8 +94,8 @@ esac
 
 for target in $TARGETS; do
     case "$target" in
-        windows-x86_64|linux-x86_64|macos-arm64) ;;
-        *) die "unsupported target '$target' (windows-x86_64, linux-x86_64, macos-arm64)" ;;
+        windows-x86_64|linux-x86_64|macos-arm64|linux-arm64) ;;
+        *) die "unsupported target '$target' (windows-x86_64, linux-x86_64, macos-arm64, linux-arm64)" ;;
     esac
     if [ -n "${TIKO_ORACLE_FBC:-}" ] && [ "$target" != "windows-x86_64" ]; then
         die "the fbc oracle builds windows-x86_64 only, not '$target'"

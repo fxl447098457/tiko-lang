@@ -38,7 +38,8 @@ first: `<base>_<os>_<arch><ext>`, `<base>_<os><ext>`, `<base>_<arch><ext>`,
 `<base><ext>`.
 
 `<os>` is the target's: `windows`, `linux` or `macos`. `<arch>` is `x86_64`
-or `arm64`. A library built for macos-arm64 is therefore `<base>_macos_arm64`.
+or `arm64`. A library built for macos-arm64 is therefore `<base>_macos_arm64`, and one for
+linux-arm64 `<base>_linux_arm64`.
 
 `<ext>` is `.a`/`.lib` for `static`; `.dll.a`/`.lib`/`.dll`, `.dylib` or `.so`
 for `dynamic`, by target.

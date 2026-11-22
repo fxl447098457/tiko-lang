@@ -11,9 +11,18 @@ are the text box's; the drop-down is a [tkCalendar](tkCalendar) in a popup, with
 "Today: ..." band underneath.
 
 Your program owns the text format: a format callback turns a date into text and a parse callback
-turns text back into a date. Without them the field uses ISO `yyyy-MM-dd`. Typed text commits on
-Enter or when focus leaves the field; text that does not parse silently reverts. The
-date-changed callback runs only for a real change by the user. The setters are silent.
+turns text back into a date. Without a format callback the field writes ISO `yyyy-MM-dd`; without
+a parse callback typed text is never accepted, so only the calendar sets the date.
+`tkDatePicker_FormatIso` and `tkDatePicker_ParseIso` are the ISO pair, for callbacks to use or fall
+back on. Typed text commits on Enter or when focus leaves the field; text that does not parse
+silently reverts. The date-changed callback runs only for a real change by the user. The setters
+are silent.
+
+For a form designer, whose rows hold numbers, `tkDatePicker_SetDateParts( h, y, m, d )` sets the
+date and `tkDatePicker_SetMinDate` / `SetMaxDate` set one end of the range (a year of 0 removes
+it). The border follows the theme's `BorderWidth` until `SetBorderThickness`. A paint callback
+replaces the editing box's drawing and a day-paint callback a calendar day's;
+`tkDatePicker_PaintDefault( p )` and `tkDatePicker_PaintDayDefault( d )` draw the stock ones first.
 
 F4, Down or Alt+Down opens the calendar. While it is open its own keys work (arrows, Page
 Up/Page Down, Home/End, Enter picks), one click on a day picks it, and Escape or a click outside
@@ -62,33 +71,197 @@ tkDatePicker_GetIdealSize( due, w, h )
 tkWidget_SetPos( due, tkHost_Scale( host, 20 ), tkHost_Scale( host, 20 ), w, h )
 ```
 
-## Coming from PsDatePicker
+## How it works
 
-[PsDatePicker](PsDatePicker) is the Win32 twin; its page remains the behaviour reference for
-everything not listed here.
+### Format and Parse must round-trip
 
-- Names: `PsDatePicker_*` → `tkDatePicker_*`, `PSDATEPICKER_*` types → `TKDATEPICKER_*`.
-  `DTP_*` constants, the `DTP_*Callback*` types and `CDTP_DEFAULT_*` keep their names. Dates are
-  `TKDATE` (from [tkCalendar](tkCalendar)) instead of `SYSTEMTIME`. The handle is
-  `TK_WIDGET ptr`.
-- `tkDatePicker_Create( hParent, CtrlID )` takes a `TK_WIDGET ptr` parent; for a top-level
-  control pass `tkHost_Root( host )`.
-- The drop-down is a [tkCalendar](tkCalendar), so it has that control's look, captions and
-  keyboard. `tkDatePicker_GetCalendarHandle` returns it only while it is open, and 0 otherwise.
-- The popup is rebuilt from the picker's settings at every open.
-- The icon is drawn from rectangles until you give a glyph font (`tkDatePicker_SetIconFont` or
-  the glyph argument of `ApplyFonts`); then it draws `TK_ICON_CALENDAR` from the bundled icon
-  font. Fonts are `TTF_Font ptr`.
-- The date-changed callback fires only for a real change, not for re-picking the same day.
-- The tooltip is the calendar's, with [tkTooltip](tkTooltip) timing, and appears only when a
-  tooltip callback is set. `tkDatePicker_GetTooltipHandle` returns a `TK_TIP ptr`; there is no
-  tooltip mode.
-- The message callback sees `TKM_*` messages, and the field's messages arrive as the picker's.
-- Scale changes reach the control as `TKM_SCALECHANGED` and close an open calendar; there is no
-  `Rescale` call.
-- No equivalent: `FilterMessage`, `TestPrepareCalendar`, `DTP_CM_*`, `DTP_HIT_*`, PsRegistry.
-- Added: `tkDatePicker_SetToday` (pin "today" for the ring and the band), `GetPopup`,
-  `GetFooterHandle` and `GetIconHot`.
+This is the one wiring mistake that produces no error. On a commit the control hands your Parse
+callback whatever is in the field; when Parse returns false the field silently reverts to the
+last text the control wrote, which looks exactly as if the user typed nothing. So if Format
+writes `"Jul 24, 2026"` and Parse only understands digits, every commit after the calendar or a
+setter wrote the field fails and reverts. Check that `Parse( Format( d ) ) = d` for a few dates
+when you wire the pair, or use `tkDatePicker_FormatIso` / `tkDatePicker_ParseIso` together.
+`ParseIso` accepts year, month and day separated by `-`, `/` or `.`, with up to four digits each.
+
+### Focus is the field's
+
+Keyboard focus belongs to the embedded [tkTextBox](tkTextBox), not to the picker widget: ask
+`tkDatePicker_HasFocus`. A click on the frame outside the icon focuses the field, and the
+field selects its whole text when it takes focus. `tkDatePicker_GetTextBoxHandle` returns the
+field for `tkTextBox_*` styling; leave its border and margins alone, because the picker owns both.
+
+### Programmatic setters are silent
+
+`SetDate`, `SetDateParts`, `ClearDate`, `SetRange`, `SetMinDate` / `SetMaxDate` and
+`ReformatText` never call the date-changed callback. It runs only for the user: a typed commit
+(Enter, or focus leaving the field) or a pick in the calendar, and only when the value really
+changed. That is what lets a setter be called from inside your own handler.
+
+The drop-down callback is the exception: it reports the calendar opening and closing, so it
+fires for `tkDatePicker_DropDown` and `tkDatePicker_CloseUp` too.
+
+### The layout is derived
+
+The frame, field, divider and icon rects are worked out from the control's size; you read them
+back with `GetFrameRect`, `GetFieldRect` and `GetIconRect`, which return false until the control
+has been given a non-empty size.
+
+```
+icon    = the right nIconWidth pixels, full height
+divider = nDividerThick pixels immediately left of the icon
+field   = from left + nCornerRadius to the divider,
+          inset top and bottom by nBorderThick
+```
+
+The field is inset by the corner radius so the frame's rounded left corners show around the
+text box's square one; the text box is moved to the field rect at every layout.
+`tkDatePicker_HitTest` returns 1 for a point in the icon cell and 0 for anything else.
+
+### The calendar is a popup the control owns
+
+The calendar is a [tkCalendar](tkCalendar) in a popup surface, placed under the control with
+the left edges aligned. It is built at every open and destroyed at every close, so
+`tkDatePicker_GetCalendarHandle`, `GetPopup` and `GetFooterHandle` return 0 while it is closed.
+Every open seeds it from the picker: font, week start, month count, today ring, range, the
+selected date, and the days view showing the selected date's month (or today's when there is
+no date). Only one picker's calendar is open at a time; opening one closes another.
+
+While it is open the calendar has the keyboard: its arrows, Page Up/Page Down, Home/End and
+Enter (which picks), and the wheel over it pages the months. F4, Alt+Up or Alt+Down closes it,
+as do Escape, a press outside it (which still reaches whatever it landed on) and focus leaving
+the application. A press on the icon that closed the calendar does not reopen it.
+
+A pick (a day click, Enter, or the Today band) closes the calendar first, with the drop-down
+callback's closing edge, and then writes the field and calls the date-changed callback. A day
+outside the range does nothing.
+
+`tkDatePicker_SetToday( h, st )` pins the date the calendar treats as today, for the ring and
+the band; `bPin = false` returns to the local date.
+
+### Sizes
+
+The icon width, field padding, vertical padding, corner radius and Today band height are scaled
+for the surface when the control is created, and rescaled when the scale changes (which also
+closes an open calendar). Every setter takes pixels as given: scale them with `tkHost_Scale`.
+The border and divider are hairlines and are never scaled. Until `SetCornerRadius` or
+`SetBorderThickness` is called, both follow the theme's shape (its `CornerRadius`, scaled, and
+its `BorderWidth`).
+
+## Behaviour and limits
+
+- `SetMonthCount` takes 1 or 2; anything else is clamped. `SetWeekStart` takes `DTP_MONDAY`,
+  and anything else means `DTP_SUNDAY`. Both take effect at the next open.
+- The range clamps rather than refuses. `SetDate` and a typed commit clamp into `[min, max]`,
+  `SetRange` re-clamps the current date silently, and an inverted pair is swapped. Days outside
+  the range are inert in the calendar.
+- Empty is a legal value unless `SetAllowEmpty( h, false )`; then committing an empty field
+  reverts it to the last valid text. `ClearDate` works either way: the setting governs the
+  user, not you.
+- `SetShowTodayFooter` on an open calendar adds or removes the band and resizes the popup in
+  place. The band shows `"Today: "` plus your Format of today, hot-tracks, and picks today on a
+  click; when today is outside the range it is dimmed and inert. There is no keyboard route to
+  it.
+- `SetEnabled( h, false )` disables the picker and its field, closes an open calendar and
+  clears the icon's hover.
+- `SetFont` is used by the field, the calendar and the band; the control never frees a font.
+  The icon is drawn from rectangles until an icon font is set (`SetIconFont`, or the glyph
+  font of `ApplyFonts`); it then draws the icon glyph, `TK_ICON_CALENDAR` by default, in that
+  font. `SetIconFont( h, 0 )` returns to the drawn icon.
+- `GetIdealSize` measures the field's current text, or `"Wednesday, September 30, 2222"` when
+  it is empty, and adds the corner inset, padding, divider and icon; the height is one text
+  line plus vertical padding and border. It is valid before the control has been sized.
+- There is a tooltip only over the calendar's days, and only when a tooltip callback is set.
+
+## Colours
+
+`TKDATEPICKER_COLORS` is a flat struct. It is filled from the theme when the control is created
+and whenever the theme changes, until `SetColors` pins it; `UnpinColors` returns it to the
+theme. Read-modify-write it with `GetColors` / `SetColors`, which also repaints the field and
+an open calendar. `tkDatePicker_ThemeColors( t )` gives the struct a theme maps to.
+
+| Field | Theme role | Paints |
+| --- | --- | --- |
+| `BackColor` | `Window` | The client behind the rounded frame |
+| `BorderColor` / `FocusBorderColor` / `BorderColorDisabled` | `Border` / `FocusRing` / `BorderDisabled` | The frame outline: at rest, while the field has focus, disabled |
+| `DividerColor` / `DividerColorDisabled` | `Divider` / `BorderDisabled` | The hairline between field and icon |
+| `FieldBackColor` / `FieldBackColorDisabled` | `Surface` / `SurfaceDisabled` | The frame and field fill |
+| `FieldForeColor` / `FieldForeColorDisabled` | `Text` / `TextDisabled` | The date text, drawn by the field |
+| `IconColor` / `IconBackColorHot` | `Surface` / `SurfaceHot` | The icon cell at rest (flat, like the field) and while hovered or pressed |
+| `IconGlyphColor` / `IconGlyphColorHot` / `IconGlyphColorDisabled` | `Text` / `TextHot` / `TextDisabled` | The icon |
+| `CalBackColor` / `CalBorderColor` | `Popup` / `Border` | The popup's background and one-pixel outline |
+| `TitleColor` / `TitleColorHot` | `TextHot` / `TextStrong` | The calendar's title and captions; the title under the mouse |
+| `NavGlyphColor` / `NavGlyphColorHot` / `NavGlyphColorDisabled` | `Text` / `TextHot` / `TextDisabled` | The chevrons; disabled when nothing in range lies that way |
+| `WeekdayColor` | `TextDim` | The weekday header row |
+| `DayColor` / `DayColorWeekend` | `PopupText` / `AccentHot` | A day number, ordinary and weekend |
+| `DayColorAdjacent` | `TextDim` | A day of the neighbouring month, which can still be picked |
+| `DayColorDisabled` | `TextDisabled` | A day outside the range, inert |
+| `DayBackColorHot` / `DayForeColorHot` | `SurfaceHot` / `TextHot` | The day under the mouse |
+| `DayBackColorSelected` / `DayForeColorSelected` | `Selected` / `SelectedText` | The selected day |
+| `TodayRingColor` | `Accent` | The ring on today's cell |
+| `TodayFooterColor` / `TodayFooterColorHot` / `TodayFooterColorDisabled` | `TextDim` / `TextHot` / `TextDisabled` | The Today band's caption: at rest, hovered, today out of range |
+
+`FocusBorderColor` is also the calendar's focus ring. Keep `DayColorAdjacent` and
+`DayColorDisabled` clearly apart: an adjacent day can be picked and a disabled one cannot, and
+in a short range most of the month is one or the other.
+
+The built-in editing-box painter fills the client with `BackColor`, fills the rounded frame,
+fills the icon cell (rounded on its outer corners only), draws the divider and the icon, and
+draws the outline last.
+
+## Callbacks
+
+- **Parse**, `DTP_ParseCallbackFunc( hCtrl, sText, pDate )`: called on a commit with the
+  field's text. Fill `*pDate` and return true, or return false to make the field revert. Empty
+  text never reaches it (see `SetAllowEmpty`), and the date it returns is clamped afterwards.
+  Without one, typed text is never accepted.
+- **Format**, `DTP_FormatCallbackSub( hCtrl, pDate, sOut )`: called whenever the control
+  writes the field (a setter, a pick, a successful parse, `ReformatText`, and
+  `SetFormatCallback` itself, which re-renders at once) and for the Today band's caption.
+  Without one the field is ISO `yyyy-MM-dd`.
+- **Date changed**, `DTP_DateChangedCallbackSub( hCtrl, pDate, bHasDate )`: user action only,
+  and only for a real change. `bHasDate` is false when the user cleared the field, and `pDate`
+  then still holds the previous value: test the flag, not the pointer.
+- **Drop-down**, `DTP_DropDownCallbackSub( hCtrl, isOpen )`: opening and closing, programmatic
+  ones included. The opening edge runs before the calendar is built or seeded, which makes it
+  the place to set a range or month count that depends on current state. If the popup cannot
+  be made, the closing edge follows at once so the pair still matches.
+- **Paint**, `DTP_PaintCallbackSub( p )`: replaces the editing-box painter (frame, divider,
+  icon). The client is already filled with `BackColor`, and the field draws its text on top of
+  whatever you paint in `rcField`. `tkDatePicker_PaintDefault( p )` draws the stock box first.
+  `TKDATEPICKER_PAINTINFO` carries the rects and the enabled, focused, open, icon-hot and
+  icon-pressed states.
+- **Day paint**, `DTP_DayPaintCallbackSub( p )`: draws one calendar day cell instead of the
+  built-in painter; `tkDatePicker_PaintDayDefault( p )` draws the stock cell first.
+  `TKDATEPICKER_DAYPAINTINFO` names the picker (not the calendar) in `hCtrl`, the cell in
+  calendar pixels, its date and day number, the panel (`monthIndex`, 0 or 1), and the
+  adjacent, weekend, today, selected, hot, disabled and enabled flags.
+- **Message**, `DTP_MessageCallbackFunc( m )`: sees the picker's `TKM_*` messages and the
+  field's, all reported with the picker in `hCtrl`; return true to suppress the control's own
+  handling. The return value is ignored for `TKM_SIZE`, `TKM_MOUSELEAVE`, `TKM_LBUTTONUP`,
+  `TKM_ENABLE` and the field's `TKM_KILLFOCUS` (which commits the typed text), because the
+  control's state has already moved. Keys the field leaves unclaimed arrive as the picker's
+  `TKM_KEYDOWN`.
+- **Tooltip**, `DTP_TooltipCallbackFunc( t )`: fill `outText` for the day under the mouse and
+  return true, or return false (or leave it empty) for no tip. `isValid` is false when the
+  mouse is not over a day. Setting it is what turns tooltips on; the tip uses
+  [tkTooltip](tkTooltip) timing, and `tkDatePicker_GetTooltipHandle` returns its `TK_TIP ptr`
+  while the calendar is open.
+
+## Date helpers and test probes
+
+The date helpers are pure functions, safe before any control exists: `IsLeapYear` (proleptic
+Gregorian), `DaysInMonth`, `DateToSerial` / `SerialToDate` (a day count, so month and year
+rollovers are plain arithmetic), `DowSunday` (0 = Sunday ... 6 = Saturday), `LeadingCells`
+(0-6 cells of the previous month at the start of the grid for a week start), `MakeDate`,
+`AddMonths` (whole months, the day clamped to the target month: 31 Jan + 1 month is the end of
+February) and `DecadeBase` (2021 → 2020).
+
+`tkDatePicker_TestCalendarTones` (distinct colours over the open calendar), `TestFooterTones`
+(the same inside the Today band, 0 when there is none) and `TestPartBrightness( h, nPart )`
+(the brightest pixel of a part: 0 the previous chevron, 1 the next, `100 + k` day cell *k* of
+the first panel) render the open calendar so a test can check that a replaced day painter or a
+disabled part really draws as intended. They take the picker and return 0 (or -1 for
+`TestPartBrightness`) while the calendar is closed.
 
 ## Public declarations
 
@@ -295,6 +468,13 @@ sub tkDatePicker_SetDayPaintCallback( byval hCtrl as TK_WIDGET ptr, byval usersu
 sub tkDatePicker_SetMessageCallback( byval hCtrl as TK_WIDGET ptr, byval userfunc as DTP_MessageCallbackFunc )
 sub tkDatePicker_SetTooltipCallback( byval hCtrl as TK_WIDGET ptr, byval userfunc as DTP_TooltipCallbackFunc )
 function tkDatePicker_GetTooltipHandle( byval hCtrl as TK_WIDGET ptr ) as TK_TIP ptr
+function tkDatePicker_FormatIso( byval pDate as TKDATE ptr ) as ustring
+function tkDatePicker_ParseIso( byval sText as ustring, byval pDate as TKDATE ptr ) as boolean
+sub tkDatePicker_SetDateParts( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+sub tkDatePicker_SetMinDate( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+sub tkDatePicker_SetMaxDate( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+sub tkDatePicker_PaintDefault( byval pi as TKDATEPICKER_PAINTINFO ptr )
+sub tkDatePicker_PaintDayDefault( byval d as TKDATEPICKER_DAYPAINTINFO ptr )
 function tkDatePicker_TestCalendarTones( byval hCtrl as TK_WIDGET ptr ) as long
 function tkDatePicker_TestPartBrightness( byval hCtrl as TK_WIDGET ptr, byval nPart as long ) as long
 function tkDatePicker_TestFooterTones( byval hCtrl as TK_WIDGET ptr ) as long
@@ -304,4 +484,4 @@ function tkDatePicker_TestFooterTones( byval hCtrl as TK_WIDGET ptr ) as long
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsDatePicker](PsDatePicker), the PsControls control
+- [tkCalendar](tkCalendar), [tkTextBox](tkTextBox), [tkTooltip](tkTooltip)

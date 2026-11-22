@@ -46,12 +46,12 @@ dir/base_<arch><ext>
 dir/base<ext>
 ```
 
-| | windows-x86_64 | linux-x86_64 | macos-arm64 |
-|---|---|---|---|
-| `<os>` | `windows` | `linux` | `macos` |
-| `<arch>` | `x86_64` | `x86_64` | `arm64` |
-| `<ext>`, `static` | `.a`, `.lib` | `.a` | `.a` |
-| `<ext>`, `dynamic` | `.dll.a`, `.lib`, `.dll` | `.so` | `.dylib` |
+| | windows-x86_64 | linux-x86_64 | linux-arm64 | macos-arm64 |
+|---|---|---|---|---|
+| `<os>` | `windows` | `linux` | `linux` | `macos` |
+| `<arch>` | `x86_64` | `x86_64` | `arm64` | `arm64` |
+| `<ext>`, `static` | `.a`, `.lib` | `.a` | `.a` | `.a` |
+| `<ext>`, `dynamic` | `.dll.a`, `.lib`, `.dll` | `.so` | `.so` | `.dylib` |
 
 Every ending for the kind is tried at each step, and the first file that exists is used. It is passed to the linker by its exact file name.
 

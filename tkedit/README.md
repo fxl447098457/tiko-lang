@@ -29,8 +29,10 @@ brings the window to the front) and exits; `[ui] single_instance = false` gives 
   breakpoint, F6 builds with -g and runs to it; F10 / F11 / Shift+F11 step, Ctrl+F10 runs to the
   caret, Shift+F6 stops. The Output pane's Debug tab shows Locals, Globals and Watch beside the
   Call Stack and every Breakpoint; resting the mouse on a name shows its value.
-- **Configuring:** Ctrl+Comma opens settings.toml, Ctrl+K keybindings.toml, Ctrl+Shift+T the theme.
-  Saving one applies it. Every key is listed in `docs/tkEdit/KEYS.md`.
+- **Configuring:** Ctrl+Comma opens settings.toml, Ctrl+Shift+T the theme; saving one applies it.
+  Ctrl+K opens Keyboard Shortcuts: filter the commands, Modify (or double-click) one to press its
+  new chord, OK to apply and save it to keybindings.toml (which can still be edited as text).
+  Every key is listed in `docs/tkEdit/KEYS.md`.
 
 ## Layout
 

@@ -35,7 +35,9 @@ fail( ) { echo "fetch-seed: FAILED -- $*" >&2; exit 1; }
 if [ -z "$HOST" ]; then
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*) HOST=windows ;;
-        Linux)                HOST=linux ;;
+        Linux)                HOST=linux
+                              # aarch64 is its own host, never the x86-64 'linux' seed.
+                              [ "$(uname -m)" = "aarch64" ] && HOST=linux-arm64 ;;
         Darwin)               HOST=macos ;;
         *) fail "unknown host $(uname -s); pass --host" ;;
     esac
@@ -43,6 +45,9 @@ fi
 [ -n "$DEST" ] || DEST="$HERE/cache"
 
 LINE=$(grep -v '^[[:space:]]*#' "$HERE/seed.lock" | awk -v h="$HOST" '$1 == h' | head -1)
+if [ -z "$LINE" ] && [ "$HOST" = "linux-arm64" ]; then
+    fail "seed.lock has no linux-arm64 line (seed-10 was the first to have one): bootstrap with --seed <a stage0 cross-built on Windows by build/crossstage0.sh>"
+fi
 [ -n "$LINE" ] || fail "seed.lock has no line for host '$HOST'"
 set -- $LINE
 TAG=$2; ASSET=$3; WANT=$4; COMMIT=$5
@@ -95,7 +100,7 @@ if [ "$TOP" = "tiko-lang" ]; then mv "$OUTD/tiko-lang" "$OUTD/tiko-$HOST" || fai
 if [ -f "$OUTD/$TOP/tiko.exe" ]; then C="$OUTD/$TOP/tiko.exe"; else C="$OUTD/$TOP/bin/tiko"; fi
 [ -f "$C" ] || fail "no compiler in the unpacked seed ($OUTD/$TOP)"
 # Run it only on its own host: a seed fetched for the other one cannot start here.
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ME=windows ;; Linux) ME=linux ;; Darwin) ME=macos ;; *) ME=other ;; esac
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ME=windows ;; Linux) ME=linux; [ "$(uname -m)" = "aarch64" ] && ME=linux-arm64 ;; Darwin) ME=macos ;; *) ME=other ;; esac
 if [ "$ME" = "$HOST" ]; then
     echo "fetch-seed: $($C --version 2>&1 | head -1)"
 else

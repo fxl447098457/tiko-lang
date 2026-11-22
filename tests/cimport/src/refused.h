@@ -18,3 +18,8 @@ struct ref_late { int k; _Alignas(16) int v; };
 
 /* an inline function has no symbol: it claims its name, and is not in the rename ledger */
 static inline int time(int x) { return x; }
+
+/* a bit-field of __int128 -- clang takes one, tiko does not: refused, and a pointer to it
+   is a pointer to the record introduced by an alias */
+struct ref_wbits { __int128 x : 5; int y; };
+void ref_wide(struct ref_wbits *p);

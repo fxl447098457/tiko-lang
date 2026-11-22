@@ -1083,6 +1083,5 @@ Microsoft Learn: [SetWindowTheme](https://learn.microsoft.com/en-us/windows/win3
 
 - [sys/win/gui](SysWin-Gui)
 - [CWindow](CWindow) for `AddControl( "Button", ... )` and the other button kinds
-- [CXpButton](CXpButton) for an owner-drawn button with images in every state
 - [Label](SysWin-Gui-Label) for static text and images
 - [Dark mode](SysWin-Dark-Mode)

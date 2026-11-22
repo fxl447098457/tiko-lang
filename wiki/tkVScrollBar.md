@@ -10,7 +10,7 @@ not scroll anything itself, so use it beside content you already draw: a list, a
 preview. For a panel that scrolls child content for you, see [tkScrollPanel](tkScrollPanel).
 
 It is a thin module over [tkScrollBar](tkScrollBar), which describes the behaviour both bars
-share: paging and auto-repeat, the minimum thumb, the wheel, theme colours and the porting notes.
+share: the range model, paging and auto-repeat, the minimum thumb, the wheel and theme colours.
 `tkVScrollBar_SetDividerColor` is its own: a one-pixel line down the bar's left edge, separating
 it from the content.
 
@@ -55,11 +55,30 @@ tkVScrollBar_SetScrollCallback( gVS, @VS_Scroll )
 `tkVScrollBar_SetRange` and `tkVScrollBar_SetPos` are silent; only the user's actions call the
 scroll callback.
 
-## Coming from PsVScrollBar
+## How it behaves
 
-`PsVScrollBar_*` → `tkVScrollBar_*` and `CVSCROLL_*` → `TKVSCROLL_*`; the callback type names are
-unchanged and the handle is `TK_WIDGET ptr`. The rest of the differences are listed on
-[tkScrollBar](tkScrollBar). [PsVScrollBar](PsVScrollBar) remains the behaviour reference.
+The full description is on [tkScrollBar](tkScrollBar); in short, for the vertical bar:
+
+- `pos` is the index of the topmost visible unit, a whole number clamped to
+  `0 .. total - page`. When everything fits there is no thumb and `tkVScrollBar_NeedsThumb` is
+  false: hiding the bar then is your decision, and the bar never sizes, places or hides itself.
+- The thumb spans the bar's full width; its height is proportional to `page / total`, but never
+  less than `TKVSCROLL_MIN_THUMB` (scaled).
+- Dragging the thumb takes the mouse capture. A track click pages by exactly `page` toward the
+  click and repeats while held (`TKVSCROLL_REPEAT_DELAY`, then every `TKVSCROLL_REPEAT_MS` ms)
+  until the thumb reaches the cursor. `tkVScrollBar_IsDragging` is true while either is live.
+- Only the vertical wheel is taken; a horizontal swipe passes on to the parent. One notch moves
+  the wheel step, or 3 units when the step is 0; partial notches accumulate.
+  `tkVScrollBar_HandleWheelDelta` takes 120ths of a notch, and a **positive** delta scrolls
+  **up**, decreasing the position: pass `wheelY * 120` unchanged.
+- The bar takes no focus and no keys. Home, End, PgUp and PgDn are yours, via
+  `tkVScrollBar_SetPos`.
+- Colours follow the theme (track `Window`, thumb `Border`, active thumb `TextDisabled`,
+  divider `Divider`) until `tkVScrollBar_SetColors` or `tkVScrollBar_SetDividerColor` pins
+  them; `tkVScrollBar_UnpinColors` hands them back. The divider is off until you show it with
+  `tkVScrollBar_SetDividerColor( hSB, clr )`.
+- A paint callback draws the whole bar instead of the built-in painter; call
+  `tkVScrollBar_PaintDefault( p )` in it to draw the stock bar first.
 
 ## Public declarations
 
@@ -100,6 +119,7 @@ sub tkVScrollBar_SetDividerColor( byval hSB as TK_WIDGET ptr, byval clr as ulong
 function tkVScrollBar_GetDividerColor( byval hSB as TK_WIDGET ptr ) as ulong
 sub tkVScrollBar_ApplyTheme( byval hSB as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
 sub tkVScrollBar_UnpinColors( byval hSB as TK_WIDGET ptr )
+sub tkVScrollBar_PaintDefault( byval p as TKVSCROLLBAR_PAINTINFO ptr )
 sub tkVScrollBar_SetPaintCallback( byval hSB as TK_WIDGET ptr, byval usersub as VScrollPaintCallbackSub )
 sub tkVScrollBar_SetScrollCallback( byval hSB as TK_WIDGET ptr, byval usersub as VScrollCallbackSub )
 ```
@@ -108,4 +128,4 @@ sub tkVScrollBar_SetScrollCallback( byval hSB as TK_WIDGET ptr, byval usersub as
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsVScrollBar](PsVScrollBar), the PsControls control
+- [tkScrollBar](tkScrollBar), [tkHScrollBar](tkHScrollBar), [tkScrollPanel](tkScrollPanel)

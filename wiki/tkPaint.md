@@ -8,7 +8,7 @@ tkPaint is the drawing surface every tkControls control paints through. You do n
 
 Every shape is anti-aliased, with straight edges on whole pixels kept crisp. Colours are state on the object (back for fills, pen for strokes, fore for text) and are `ulong` values in `&hAARRGGBB` form: `tkRGB( r, g, b )`, `tkRGBA( r, g, b, a )`, `tkColor_WithAlpha`, `tkColor_Lerp`. Fonts are `TTF_Font ptr`, borrowed, never owned.
 
-The module also holds the small types the whole family uses: `TKRECT` and `TKPOINT` (Win32's `RECT` semantics: right and bottom exclusive) with the `tkRect_*` helpers, and the UTF-8 text measurers `tkText_*`.
+The module also holds the small types the whole family uses: `TKRECT` and `TKPOINT` (right and bottom exclusive: `(10, 5, 40, 20)` covers x 10..39, y 5..19) with the `tkRect_*` helpers, and the UTF-8 text measurers `tkText_*`.
 
 ## Importing
 
@@ -39,37 +39,44 @@ sub Main_Paint( byval f as TK_FORM ptr, byval b as TK_PAINT ptr )
 end sub
 ```
 
+## The frame and the state
+
+The host paints the whole window every frame, parents before children, and presents it once; there is no buffer of your own and nothing to begin or end. Each widget's paint gets a fresh `TK_PAINT`: back colour opaque black, fore and pen colour white, a solid pen, and the host's default font. Whatever you set lasts until you change it, within that one paint.
+
+- **Back colour** feeds every fill: `PaintRect`, `PaintRoundRect`, `PaintEllipse`, `PaintPolygon`, `PaintPie`, `PaintPieRing`, and the interiors of `PaintBorderRect`, `PaintRoundBorderRect` and `PaintRectFactory`.
+- **Pen colour** feeds every stroke: their borders, `PaintRoundOutline`, the rims of `PaintEllipse`, `PaintPolygon`, `PaintPie` and `PaintPieRing`, and `PaintPolyline`, `PaintCurve` and `PaintLine`.
+- **Fore colour** feeds `PaintText` and `PaintTextEx`. `PaintChar` takes its colour as an argument and leaves the fore colour alone; `PaintGradientRect` takes its two stops as arguments and uses neither back nor pen.
+- Alpha is part of the colour and blends with what is already drawn, text included.
+- `SetFont( 0 )` is ignored, so a font can be replaced but not cleared. The text methods draw nothing without a font.
+
+Hover and selection styling is yours: decide the state, set the colours, then paint. To clear a widget, fill its own rect, `0, 0, w->cw, w->ch`, at the top of the paint.
+
+## Shapes and pens
+
+- **Fills cover what is under them.** `PaintBorderRect`, `PaintRoundBorderRect` and `PaintRectFactory` fill first and then stroke, so used as a frame over content they erase it. `PaintRoundOutline` strokes without filling: use it for a focus ring or a frame. `PaintGradientRect` never strokes; frame it afterwards with `PaintRoundOutline`.
+- **Curvature is the corner ellipse's diameter**, halved internally, and clamped to half the shape's width and height, so an over-large value gives a stadium. `0` gives square corners. A pill is a rounded rect whose curvature equals its height.
+- **Where a stroke lands:** `PaintRoundOutline`, the bordered rects and `PaintEllipse`'s rim sit inside the rect, so a border is on the rect's edge at any width and needs no deflating. `PaintPolygon`'s outline and the pie rims are centred on the path.
+- **Pen widths are pixels as given**, except `PaintPie`, `PaintPieRing`, `PaintPolyline` and `PaintCurve`, which scale theirs by the surface's scale (never below 1). A width of 0 or less draws no stroke; `PaintRoundOutline` and `PaintLine` then draw nothing at all.
+- `PaintLine` draws an axis-aligned rule as a crisp filled rect, centred on the line and stopping short of the end point; a diagonal is an anti-aliased line through the centres of both end pixels.
+- `SetPenDashStyle` applies to `PaintPolyline` and `PaintCurve`; the pattern is in pen-width units, and an unknown value means `TK_PENDASH_SOLID`. A solid polyline or curve wider than 1.5 pixels gets round joins.
+- `PaintPolygon` fills any simple polygon, convex or not, closing it for you; its points are pixel centres. Fewer than 3 points draw nothing.
+- `PaintPie` and `PaintPieRing` take angles in degrees, clockwise from the positive x axis. A zero sweep draws nothing; a sweep of 360 or more is the whole ellipse. The ring's hole is `nInnerRatio` of the radius, clamped to 0..0.9; a hole under a pixel draws a plain pie.
+- `PaintCurve` draws a cardinal spline through the points, `nTension` clamped to 0..1; with fewer than 3 points it is a polyline.
+- Empty rects and missing pointers are skipped silently.
+
 ## Text
 
-- `PaintText` draws one line, vertically centred unless `TK_DT_TOP` or `TK_DT_BOTTOM`; `TK_DT_ELLIPSIS` cuts it with "…" when it does not fit.
-- `PaintTextEx` breaks at newlines and, with `TK_DT_WORDBREAK`, wraps to the rect's width; the block sits at the top unless `TK_DT_VCENTER` or `TK_DT_BOTTOM`. `tkText_MeasureWrapped` gives the height it needs.
-- `PaintChar( glyph, rc, clr )` draws one icon-font glyph unclipped, in its own colour (see [tkHost](tkHost)'s `TK_ICON_*`).
-- Text is clipped to its rect unless `TK_DT_NOCLIP`. String offsets for `tkText_IndexToX`, `XToIndex`, `NextOffset` and `PrevOffset` are UTF-8 byte offsets.
+- `PaintText` draws one line, vertically centred unless `TK_DT_TOP` or `TK_DT_BOTTOM`; `TK_DT_ELLIPSIS` cuts it with "…" when it does not fit. It never wraps, and `&` is drawn as itself.
+- `PaintTextEx` breaks at newlines and, with `TK_DT_WORDBREAK`, wraps to the rect's width, dropping spaces at the break and cutting a word wider than the line where it stops fitting. Each line takes the horizontal alignment; the block sits at the top unless `TK_DT_VCENTER` or `TK_DT_BOTTOM`. `tkText_MeasureWrapped` gives the height it needs, and `tkText_Wrap` the line offsets.
+- `PaintChar( glyph, rc, clr )` draws one icon-font glyph in the current font, left-aligned, vertically centred and unclipped, in its own colour (see [tkHost](tkHost)'s `TK_ICON_*`). Set the icon font first.
+- Text is drawn with no background, and clipped to its rect unless `TK_DT_NOCLIP`.
+- `tkText_Height` is the one line height layout should use; `tkText_LineSkip` is the baseline-to-baseline distance. String offsets for `tkText_IndexToX`, `XToIndex`, `NextOffset` and `PrevOffset` are UTF-8 byte offsets on codepoint boundaries. `IndexToX` is the caret position before an offset; `XToIndex` is the offset whose caret is nearest x.
 
 ## Clipping and images
 
-`SetClipRect` / `ResetClip` narrow the clip until reset; `PushClip` / `PopClip` nest. `PaintImage( tex, rc, fit )` draws an `SDL_Texture` by `TK_IMGFIT_ASPECT`, `_STRETCH` or `_CENTER`; for an image file, use [tkImage](tkImage)'s `tkImage_Paint`, which makes the texture for you.
+Every call is clipped to the widget, and to any ancestor that clips its children. `SetClipRect` narrows that to a rect until `ResetClip`; each call replaces the last. `PushClip` intersects with the clip in force and `PopClip` restores it, nesting up to eight deep; `ResetClip` also empties that stack.
 
-## Coming from PsBufferPaint
-
-| [PsBufferPaint](PsBufferPaint) | tkPaint |
-| --- | --- |
-| `PsPaintBuffer` | `TK_PAINT` (handed to you, never declared) |
-| `RECT`, `POINT` | `TKRECT`, `TKPOINT` |
-| `COLORREF`, `BGR( r, g, b )` | `ulong` `&hAARRGGBB`, `tkRGB( r, g, b )` |
-| `DT_*` | `TK_DT_*` |
-| `PS_PENDASH_*`, `PS_IMGFIT_*` | `TK_PENDASH_*`, `TK_IMGFIT_*` |
-| `LinearGradientMode*` | `TK_GRADIENT_*` |
-
-- The drawing methods keep their names, parameters and conventions: curvature is a diameter, outlines sit inside the rect, `PaintPie`'s pen is centred on the rim, and pie, ring, polyline and curve pens scale with the DPI.
-- No double buffer and no Begin/End bracket of your own: the host paints the whole frame and presents it once.
-- Alpha is part of the colour, so there are no `Set...ColorA` methods; text honours alpha too.
-- Everything, text included, goes through SDL_Renderer; there is no GDI / GDI+ split and no `SetSmoothingMode` (always anti-aliased).
-- Fonts are `TTF_Font ptr`; `PaintImage` takes an `SDL_Texture ptr`.
-- Added: `PushClip` / `PopClip`, `TK_DT_TOP` / `TK_DT_BOTTOM` for `PaintText`, wrapping in `PaintTextEx`, the `tkRect_*`, `tkColor_*` and `tkText_*` helpers.
-- Dropped: `SetupBitmap`, `getMemDC`, the `rcClient*` fields, `PaintClientRect` (fill your own rect, `0, 0, w->cw, w->ch`), `PaintIconButton`, and the free functions `isMouseOverRECT`, `isMouseOverWindow` and `PaintRect( hDC, ... )`.
-
-The [PsBufferPaint](PsBufferPaint) page remains the behaviour reference for everything not listed here.
+`PaintImage( tex, rc, fit )` draws an `SDL_Texture`, clipped to `rc`: `TK_IMGFIT_ASPECT` fits it inside, centred, with its proportions kept, `_STRETCH` fills `rc` exactly, `_CENTER` draws it centred at natural size. For an image file, use [tkImage](tkImage)'s `tkImage_Paint`, which makes the texture for you.
 
 ## Public declarations
 
@@ -208,4 +215,3 @@ function tkText_MeasureWrapped( byval f as TTF_Font ptr, byref s as ustring, byv
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsBufferPaint](PsBufferPaint), the PsControls module

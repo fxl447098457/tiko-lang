@@ -1,0 +1,215 @@
+'' fold128.tiko -- see fold128.ti
+
+#import "std/containers"
+#include once "symbols/fold128.ti"
+#include once "symbols/check.ti"
+
+namespace Tko.Check
+
+function I128Of( byval lo as uint64, byval hi as uint64 ) as I128
+    dim as I128 r
+    r.lo = lo
+    r.hi = hi
+    return r
+end function
+
+function I128Add( byref a as I128, byref b as I128 ) as I128
+    dim as I128 r
+    r.lo = a.lo + b.lo
+    r.hi = a.hi + b.hi
+    if r.lo < a.lo then r.hi += 1
+    return r
+end function
+
+function I128Neg( byref a as I128 ) as I128
+    dim as I128 r = I128Of( not a.lo, not a.hi )
+    r.lo += 1
+    if r.lo = 0 then r.hi += 1
+    return r
+end function
+
+function I128Sub( byref a as I128, byref b as I128 ) as I128
+    dim as I128 nb = I128Neg( b )
+    return I128Add( a, nb )
+end function
+
+'' Schoolbook over 32-bit limbs; only the low 128 bits of the product are kept.
+function I128Mul( byref a as I128, byref b as I128 ) as I128
+    dim as uint64 x(0 to 3) = { a.lo and &hFFFFFFFFull, a.lo shr 32, a.hi and &hFFFFFFFFull, a.hi shr 32 }
+    dim as uint64 y(0 to 3) = { b.lo and &hFFFFFFFFull, b.lo shr 32, b.hi and &hFFFFFFFFull, b.hi shr 32 }
+    dim as uint64 z(0 to 3)
+    for i as int32 = 0 to 3
+        dim as uint64 carry = 0
+        for j as int32 = 0 to 3 - i
+            dim as uint64 t = x(i) * y(j) + z(i + j) + carry
+            z(i + j) = t and &hFFFFFFFFull
+            carry = t shr 32
+        next
+    next
+    return I128Of( z(0) or (z(1) shl 32), z(2) or (z(3) shl 32) )
+end function
+
+function I128IsZero( byref a as I128 ) as boolean
+    return (a.lo = 0) andalso (a.hi = 0)
+end function
+
+function I128IsNeg( byref a as I128 ) as boolean
+    return (a.hi and &h8000000000000000ull) <> 0
+end function
+
+function I128Shl( byref a as I128, byval n as int32 ) as I128
+    n = n and 127
+    if n = 0 then return a
+    if n >= 64 then return I128Of( 0, a.lo shl (n - 64) )
+    return I128Of( a.lo shl n, (a.hi shl n) or (a.lo shr (64 - n)) )
+end function
+
+function I128Shr( byref a as I128, byval n as int32, byval arith as boolean ) as I128
+    n = n and 127
+    if n = 0 then return a
+    dim as uint64 fill = 0
+    if arith andalso I128IsNeg( a ) then fill = &hFFFFFFFFFFFFFFFFull
+    if n >= 64 then
+        dim as uint64 lo = a.hi shr (n - 64)
+        if (n > 64) andalso (fill <> 0) then lo or= fill shl (128 - n)
+        if n = 64 then lo = a.hi
+        return I128Of( lo, fill )
+    end if
+    dim as uint64 hi = a.hi shr n
+    if fill <> 0 then hi or= fill shl (64 - n)
+    return I128Of( (a.lo shr n) or (a.hi shl (64 - n)), hi )
+end function
+
+function I128Cmp( byref a as I128, byref b as I128, byval signed_ as boolean ) as int32
+    if signed_ then
+        dim as boolean na = I128IsNeg( a ), nb = I128IsNeg( b )
+        if na <> nb then return iif( na, -1, 1 )
+    end if
+    if a.hi <> b.hi then return iif( a.hi < b.hi, -1, 1 )
+    if a.lo <> b.lo then return iif( a.lo < b.lo, -1, 1 )
+    return 0
+end function
+
+'' Unsigned long division a bit at a time: 128 rounds of shift and subtract.
+private sub DivModU_( byref a as I128, byref b as I128, byref q as I128, byref r as I128 )
+    q = I128Of( 0, 0 )
+    r = I128Of( 0, 0 )
+    for i as int32 = 127 to 0 step -1
+        r = I128Shl( r, 1 )
+        dim as uint64 bit_
+        if i >= 64 then bit_ = (a.hi shr (i - 64)) and 1 else bit_ = (a.lo shr i) and 1
+        r.lo or= bit_
+        if I128Cmp( r, b, false ) >= 0 then
+            r = I128Sub( r, b )
+            if i >= 64 then q.hi or= (1ull shl (i - 64)) else q.lo or= (1ull shl i)
+        end if
+    next
+end sub
+
+function I128DivMod _
+    ( byref a as I128, byref b as I128, byval signed_ as boolean, _
+      byref q as I128, byref r as I128 ) as boolean
+
+    if I128IsZero( b ) then return false
+    if signed_ = false then
+        DivModU_( a, b, q, r )
+        return true
+    end if
+    dim as boolean na = I128IsNeg( a ), nb = I128IsNeg( b )
+    dim as I128 ua = a, ub = b
+    if na then ua = I128Neg( a )
+    if nb then ub = I128Neg( b )
+    DivModU_( ua, ub, q, r )
+    if na <> nb then q = I128Neg( q )
+    if na then r = I128Neg( r )
+    return true
+end function
+
+'' ------------------------------------------------------- ConstVal at 128 bits
+
+private function None128_( ) as ConstVal
+    dim as ConstVal r
+    return r
+end function
+
+'' A FreeBASIC truth value: -1 or 0, at 64 bits.
+private function Bool128_( byval b as boolean ) as ConstVal
+    dim as ConstVal r
+    r.known = true
+    r.bits = 64
+    r.value = iif( b, -1ll, 0ll )
+    return r
+end function
+
+'' A VALUE AT 128 BITS, from any width: an unsigned one zero-extends, a signed one
+'' sign-extends, a 128-bit one is itself.
+function Const128Wide( byref v as ConstVal ) as I128
+    if v.bits = 128 then return I128Of( cast( uint64, v.value ), cast( uint64, v.hi ) )
+    if (v.bits = 32) andalso v.uns then return I128Of( cast( uint64, cast( uint32, v.value ) ), 0 )
+    if v.uns then return I128Of( cast( uint64, v.value ), 0 )
+    return I128Of( cast( uint64, v.value ), iif( v.value < 0, &hFFFFFFFFFFFFFFFFull, 0ull ) )
+end function
+
+function Const128Of( byref x as I128, byval uns as boolean ) as ConstVal
+    dim as ConstVal r
+    r.known = true
+    r.bits = 128
+    r.value = cast( int64, x.lo )
+    r.hi = cast( int64, x.hi )
+    r.uns = uns
+    return r
+end function
+
+'' ---------------------------------------------------------------- int128 operators
+''
+'' tiko's int128 / uint128 FOLD AS THEY RUN: LLVM's i128 semantics, the arithmetic written out
+'' in fold128.tiko. The result is unsigned only when an operand of the result's width is
+'' (IntResult_'s rule one size up); a comparison is an INTEGER truth value.
+function Fold128Unary( byval op as Tko.TokenKind, byref v as ConstVal ) as ConstVal
+    dim as I128 x = Const128Wide( v )
+    select case op
+    case Tko.TK_MINUS : return Const128Of( I128Neg( x ), false )      '' negation is signed (check.tiko)
+    case Tko.TK_PLUS  : return v
+    case Tko.KW_NOT   : return Const128Of( I128Of( not x.lo, not x.hi ), v.uns )
+    end select
+    return None128_( )
+end function
+
+function Fold128Binary( byval op as Tko.TokenKind, byref l as ConstVal, byref r as ConstVal ) as ConstVal
+    dim as I128 a = Const128Wide( l ), b = Const128Wide( r )
+    dim as boolean uw = ((l.bits = 128) andalso l.uns) orelse ((r.bits = 128) andalso r.uns)
+    dim as I128 q, m
+    select case op
+    case Tko.TK_PLUS  : return Const128Of( I128Add( a, b ), uw )
+    case Tko.TK_MINUS : return Const128Of( I128Sub( a, b ), uw )
+    case Tko.TK_STAR  : return Const128Of( I128Mul( a, b ), uw )
+    case Tko.TK_BACKSLASH
+        if I128DivMod( a, b, uw = false, q, m ) = false then return None128_( )
+        return Const128Of( q, uw )
+    case Tko.KW_MOD
+        if I128DivMod( a, b, uw = false, q, m ) = false then return None128_( )
+        return Const128Of( m, uw )
+    case Tko.KW_AND : return Const128Of( I128Of( a.lo and b.lo, a.hi and b.hi ), uw )
+    case Tko.KW_OR  : return Const128Of( I128Of( a.lo or b.lo, a.hi or b.hi ), uw )
+    case Tko.KW_XOR : return Const128Of( I128Of( a.lo xor b.lo, a.hi xor b.hi ), uw )
+    case Tko.KW_EQV : return Const128Of( I128Of( a.lo eqv b.lo, a.hi eqv b.hi ), uw )
+    case Tko.KW_IMP : return Const128Of( I128Of( a.lo imp b.lo, a.hi imp b.hi ), uw )
+    '' THE COUNT IS THE RIGHT OPERAND'S LOW WORD, masked to 127 as the emitter masks it; SHR
+    '' is arithmetic over a signed left operand.
+    case Tko.KW_SHL : return Const128Of( I128Shl( a, cast( int32, b.lo and 127 ) ), (l.bits = 128) andalso l.uns )
+    case Tko.KW_SHR
+        dim as boolean lu = (l.bits = 128) andalso l.uns
+        return Const128Of( I128Shr( a, cast( int32, b.lo and 127 ), lu = false ), lu )
+    case Tko.TK_EQ : return Bool128_( I128Cmp( a, b, uw = false ) = 0 )
+    case Tko.TK_NE : return Bool128_( I128Cmp( a, b, uw = false ) <> 0 )
+    case Tko.TK_LT : return Bool128_( I128Cmp( a, b, uw = false ) < 0 )
+    case Tko.TK_GT : return Bool128_( I128Cmp( a, b, uw = false ) > 0 )
+    case Tko.TK_LE : return Bool128_( I128Cmp( a, b, uw = false ) <= 0 )
+    case Tko.TK_GE : return Bool128_( I128Cmp( a, b, uw = false ) >= 0 )
+    case Tko.KW_ANDALSO : return Bool128_( (I128IsZero( a ) = false) andalso (I128IsZero( b ) = false) )
+    case Tko.KW_ORELSE  : return Bool128_( (I128IsZero( a ) = false) orelse (I128IsZero( b ) = false) )
+    end select
+    return None128_( )
+end function
+
+end namespace

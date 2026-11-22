@@ -39,6 +39,8 @@ probes (`CountRenderedTones`, `HashRenderedPart`, through the real paint path).
   `pImage` is a `tkImageFile ptr` (draw it with `tkImage_Paint`).
 - Fonts are `TTF_Font ptr`, borrowed; with no text font the host's default measures and paints.
 - `GetTooltipHandle` returns the `TK_TIP ptr`. Added `GetHotItem`, `GetPressedItem`.
+- Added `PaintItemDefault( p )`: the stock item, for an item-paint callback (the form designer's
+  Paint event).
 
 **Dropped as Win32-only:** `FilterMessage`; `SetControlNotifyCallback` /
 `TKTOOLBAR_CONTROLNOTIFY` and the forwarding of a child's `WM_COMMAND` / `WM_NOTIFY` /

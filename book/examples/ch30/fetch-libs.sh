@@ -6,6 +6,9 @@
 #                               on macOS:              the macos-arm64 files -- SQLite only:
 #                               raylib, GLFW and SDL link Apple's frameworks, which tiko
 #                               cannot link yet, so their listings are Windows and Linux
+#                               on aarch64 Linux:      the linux-arm64 files -- SQLite only, as
+#                               on macOS: the raylib, GLFW and SDL listings are
+#                               windows-x86_64 and linux-x86_64 (their metas say so)
 #
 # Run it once on each platform you build for; both can share one tree, because
 # every library file carries its target in its name. Nothing it writes is
@@ -30,7 +33,7 @@ SDL_VER=3.4.18
 
 case "$(uname -s)" in
   MINGW*|MSYS*) target=windows_x86_64 ;;
-  Linux)        target=linux_x86_64 ;;
+  Linux)        target=linux_x86_64; [[ "$(uname -m)" == aarch64 ]] && target=linux_arm64 ;;
   Darwin)       target=macos_arm64 ;;
   *) echo "fetch-libs: unsupported platform $(uname -s)" >&2; exit 1 ;;
 esac
@@ -137,6 +140,8 @@ linux() {
   gcc -shared -Wl,-soname,libsqlite3.so.0 -o vendor/sqlite/sqlite3_$target.so \
       "$b/sqlite3.o" -lm
   cp vendor/sqlite/sqlite3_$target.so libsqlite3.so.0
+  # linux-arm64 stops here: the rest are x86-64 downloads, for listings that are not its.
+  [[ "$target" == linux_arm64 ]] && return 0
 
   echo "== raylib $RAYLIB_VER"
   a="$(unpack "$(fetch https://github.com/raysan5/raylib/releases/download/$RAYLIB_VER/raylib-${RAYLIB_VER}_linux_amd64.tar.gz \
@@ -199,7 +204,7 @@ macos() {
 
 case "$target" in
   windows_x86_64) windows ;;
-  linux_x86_64)   linux ;;
+  linux_x86_64|linux_arm64) linux ;;
   macos_arm64)    macos ;;
 esac
 echo "fetch-libs: done for $target"

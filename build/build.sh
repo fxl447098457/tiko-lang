@@ -20,14 +20,14 @@ CFG=${1:-Debug}
 # '--no-dll': the compiler without it -- for the gate, bootstrap and packaging, which
 # have no use for an editor's scanner and should not pay for one.
 DLL=0
-LIB=0
+SCANLIB=0  # never LIB: vcvars64.bat exports it, the linker's library folders
 NODLL=0
 TESTRUNNER=0
 ORACLE=0
 for a in "$@"; do
     case "$a" in
         --dll)         DLL=1 ;;
-        --lib)         LIB=1 ;;
+        --lib)         SCANLIB=1 ;;
         --no-dll)      NODLL=1 ;;
         --test-runner) TESTRUNNER=1 ;;
         --oracle)      ORACLE=1 ;;
@@ -280,7 +280,7 @@ build_lib( ) {
     [ -f "$ROOT/$_out" ] || { echo "build: no $_out" >&2; exit 1; }
 }
 
-if [ "$LIB" = "1" ]; then
+if [ "$SCANLIB" = "1" ]; then
     build_lib
     echo "build: ok"
     exit 0

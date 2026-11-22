@@ -1,0 +1,229 @@
+' contactdb -- the program's data: one SQLite database of contacts, their photos beside it, and
+' an export to CSV. The forms never see SQL; they call the procedures here.
+'
+'   <folder>/contacts.db       the database (made on first OpenData)
+'   <folder>/photos/<id>.png   a contact's photo, copied in when one is chosen
+#module "contactdb"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
+#import "vendor/sqlite3"
+using containers
+
+' One person.
+public type Contact
+    Id as int64                  ' 0 until saved
+    FirstName as ustring
+    LastName as ustring
+    Company as ustring
+    Street as ustring
+    City as ustring
+    Region as ustring
+    PostalCode as ustring
+    Country as ustring
+    Phone as ustring
+    Mobile as ustring
+    Email as ustring
+    Notes as ustring
+    Photo as ustring             ' its file name in photos/; "" for none
+    declare function FullName( ) as ustring
+end type
+
+' "First Last", or whichever of them there is.
+function Contact.FullName( ) as ustring
+    return trim( FirstName & " " & LastName )
+end function
+
+' The database's columns, in Contact's order after Id.
+const as string COLUMNS = "first_name, last_name, company, street, city, region, postal_code, country, phone, mobile, email, notes, photo"
+const as long NCOLUMNS = 13
+
+dim shared as sqlite3 ptr db
+dim shared as ustring gFolder
+
+' What SQLite says went wrong with the last call on the connection.
+function LastError( ) as ustring
+    dim as string msg = *sqlite3_errmsg( db )
+    return msg
+end function
+
+' Run SQL that returns no rows: "" or SQLite's reason.
+function RunSql( byref sql as ustring ) as ustring
+    if sqlite3_exec( db, sql, nullptr, nullptr, nullptr ) <> SQLITE_OK then return LastError( )
+    return ""
+end function
+
+' A column of the current row as text. SQLite's text is UTF-8; a string holding UTF-8 becomes a
+' ustring correctly.
+function ColText( byval st as sqlite3_stmt ptr, byval col as int32 ) as ustring
+    dim as string bytes
+    var p = sqlite3_column_text( st, col )
+    if p <> nullptr then bytes = *cast( zstring ptr, p )
+    return bytes
+end function
+
+' Contact's text fields by number, 0 to NCOLUMNS - 1, in COLUMNS' order.
+function FieldOf( byref c as Contact, byval i as long ) byref as ustring
+    select case i
+    case 0  : return c.FirstName
+    case 1  : return c.LastName
+    case 2  : return c.Company
+    case 3  : return c.Street
+    case 4  : return c.City
+    case 5  : return c.Region
+    case 6  : return c.PostalCode
+    case 7  : return c.Country
+    case 8  : return c.Phone
+    case 9  : return c.Mobile
+    case 10 : return c.Email
+    case 11 : return c.Notes
+    end select
+    return c.Photo
+end function
+
+' Open (or make) the database in folder. "" when it is open, else why not.
+public function OpenData( byref folder as const ustring ) as ustring
+    if db then sqlite3_close( db ) : db = nullptr
+    gFolder = folder
+    fs.CreateDirAll( fs.PathJoin( folder, "photos" ) )
+    dim as ustring path = fs.PathJoin( folder, "contacts.db" )
+    if sqlite3_open( path, @db ) <> SQLITE_OK then
+        dim as ustring e = LastError( )
+        sqlite3_close( db ) : db = nullptr
+        return e
+    end if
+    return RunSql( "create table if not exists contact( id integer primary key, " _
+        & "first_name text not null default '', last_name text not null default '', " _
+        & "company text not null default '', street text not null default '', " _
+        & "city text not null default '', region text not null default '', " _
+        & "postal_code text not null default '', country text not null default '', " _
+        & "phone text not null default '', mobile text not null default '', " _
+        & "email text not null default '', notes text not null default '', " _
+        & "photo text not null default '' )" )
+end function
+
+public sub CloseData( )
+    if db then sqlite3_close( db )
+    db = nullptr
+end sub
+
+' Every contact, sorted by name.
+public function LoadAll( byref list as Array( of Contact ) ) as ustring
+    list.Clear( )
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, "select id, " & COLUMNS & " from contact order by last_name, first_name", _
+                           -1, @st, nullptr ) <> SQLITE_OK then return LastError( )
+    do while sqlite3_step( st ) = SQLITE_ROW
+        dim as Contact c
+        c.Id = sqlite3_column_int64( st, 0 )
+        for i as long = 0 to NCOLUMNS - 1
+            FieldOf( c, i ) = ColText( st, i + 1 )
+        next
+        list.Push( c )
+    loop
+    sqlite3_finalize( st )
+    return ""
+end function
+
+' One contact by its id: false when there is none.
+public function Load( byval id as int64, byref c as Contact ) as boolean
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, "select id, " & COLUMNS & " from contact where id = ?", -1, @st, nullptr ) <> SQLITE_OK then return false
+    sqlite3_bind_int64( st, 1, id )
+    dim as boolean found = (sqlite3_step( st ) = SQLITE_ROW)
+    if found then
+        c.Id = sqlite3_column_int64( st, 0 )
+        for i as long = 0 to NCOLUMNS - 1
+            FieldOf( c, i ) = ColText( st, i + 1 )
+        next
+    end if
+    sqlite3_finalize( st )
+    return found
+end function
+
+' Insert a new contact (Id 0, which then gets its id) or update one. Values go in as parameters,
+' never pasted into the SQL.
+public function Save( byref c as Contact ) as ustring
+    dim as ustring sql
+    if c.Id = 0 then
+        sql = "insert into contact( " & COLUMNS & " ) values( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )"
+    else
+        sql = "update contact set first_name = ?, last_name = ?, company = ?, street = ?, city = ?, " _
+            & "region = ?, postal_code = ?, country = ?, phone = ?, mobile = ?, email = ?, notes = ?, " _
+            & "photo = ? where id = ?"
+    end if
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, sql, -1, @st, nullptr ) <> SQLITE_OK then return LastError( )
+    for i as long = 0 to NCOLUMNS - 1
+        ' an empty ustring reaches C as a null pointer, which SQLite stores as NULL: bind "" for it
+        if len( FieldOf( c, i ) ) then
+            sqlite3_bind_text( st, i + 1, FieldOf( c, i ), -1, SQLITE_TRANSIENT )
+        else
+            sqlite3_bind_text( st, i + 1, "", 0, SQLITE_STATIC )
+        end if
+    next
+    if c.Id then sqlite3_bind_int64( st, NCOLUMNS + 1, c.Id )
+    dim as long rc = sqlite3_step( st )
+    sqlite3_finalize( st )
+    if rc <> SQLITE_DONE then return LastError( )
+    if c.Id = 0 then c.Id = sqlite3_last_insert_rowid( db )
+    return ""
+end function
+
+' Delete a contact and its photo.
+public function Remove( byval id as int64 ) as ustring
+    dim as Contact c
+    if Load( id, c ) andalso (len( c.Photo ) > 0) then fs.RemoveFile( fs.PathJoin( gFolder, "photos", c.Photo ) )
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, "delete from contact where id = ?", -1, @st, nullptr ) <> SQLITE_OK then return LastError( )
+    sqlite3_bind_int64( st, 1, id )
+    dim as long rc = sqlite3_step( st )
+    sqlite3_finalize( st )
+    if rc <> SQLITE_DONE then return LastError( )
+    return ""
+end function
+
+' The full path of a contact's photo; "" when it has none.
+public function PhotoPath( byref c as Contact ) as ustring
+    if len( c.Photo ) = 0 then return ""
+    return fs.PathJoin( gFolder, "photos", c.Photo )
+end function
+
+' Give a saved contact the image at source as its photo (copied into photos/), or none ("").
+' Call Save afterwards to keep the change.
+public function SetPhoto( byref c as Contact, byref source as const ustring ) as ustring
+    if len( c.Photo ) then fs.RemoveFile( fs.PathJoin( gFolder, "photos", c.Photo ) )
+    c.Photo = ""
+    if len( source ) = 0 then return ""
+    dim as ustring name_ = c.Id & lcase( fs.PathExtension( source ) )
+    if fs.CopyFile( source, fs.PathJoin( gFolder, "photos", name_ ), true ).IsOk( ) = false then
+        return fs.PathFileName( source ) & ": can't be copied"
+    end if
+    c.Photo = name_
+    return ""
+end function
+
+' Every contact to a CSV file, a header row first. "" when written, else why not.
+public function ExportCsv( byref path as const ustring ) as ustring
+    dim as Array( of Contact ) list
+    dim as ustring e = LoadAll( list )
+    if len( e ) then return e
+    dim as fs.File f
+    if f.Create( path ).IsOk( ) = false then return fs.PathFileName( path ) & ": can't be written"
+    dim as strings.CsvWriter w = strings.CsvWriter( f )
+    dim as Array( of ustring ) row
+    for each h as ustring in strings.Split( "First name,Last name,Company,Street,City,Region,Postal code,Country,Phone,Mobile,Email,Notes", "," )
+        row.Push( h )
+    next
+    w.WriteRow( row )
+    for each c as Contact in list
+        row.Clear( )
+        for i as long = 0 to NCOLUMNS - 2            ' every field but the photo
+            row.Push( FieldOf( c, i ) )
+        next
+        w.WriteRow( row )
+    next
+    if w.Finish( ).IsOk( ) = false then return fs.PathFileName( path ) & ": can't be written"
+    return ""
+end function

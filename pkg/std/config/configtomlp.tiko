@@ -34,9 +34,30 @@ type TomlParser_
     as TomlValue ptr root
     as TomlValue ptr cur
     as TomlPending_ pending
+    as long depth                       '' the level, under the root, of what is being filled
+    as long curDepth                    '' the level of p.cur, from its [header]
 end type
 
+'' NESTING IS BOUNDED: TpValue_ recurses once per '[' or '{', so without a limit about
+'' 100 KB of '[' overflows the stack and ends the process -- a crash, not an error, for
+'' anyone who parses TOML they did not write.  No real document nests this deep.
+''
+'' THE LIMIT IS ON THE TREE, not on the brackets. Each part of a dotted key or of a
+'' [header] is a table one level down too, and 'a.a.a...a = 1' built a tree 100,000 deep
+'' with no bracket at all -- which the recursive walks over the finished tree (the flag
+'' clear, the copy, the destructor) then overflowed the stack on (security review, Nov
+'' 2026). So 'depth' is the level of the table or array being filled, every way of going
+'' down adds to it, and nothing deeper than TKF_MAX_DEPTH is ever made.
+const TKF_MAX_DEPTH = 128
+
 '' -------------------------------------------------------------- cursor
+
+'' Down 'add' levels for what a dotted key creates, or fail if that is too deep.
+function TpDeeper_( byref p as TomlParser_, byval add as long ) as boolean
+    if( p.depth + add > TKF_MAX_DEPTH ) then return TpFail_( p, CFG_SYNTAX, "nested too deeply" )
+    p.depth += add
+    return TRUE
+end function
 
 function TpCh_( byref p as TomlParser_, byval at as long ) as long
     if( at >= p.n ) then return -1
@@ -578,7 +599,10 @@ function TpInline_( byref p as TomlParser_, byref v as TomlValue ) as boolean
         p.i += 1
         TpWs_( p )
         dim as TomlValue e
+        dim as long d0 = p.depth
+        if( TpDeeper_( p, keys.Count( ) - 1 ) = FALSE ) then return FALSE
         if( TpValue_( p, e ) = FALSE ) then return FALSE
+        p.depth = d0
         if( TpInsert_( p, @v, keys, e, at ) = FALSE ) then return FALSE
         if( TpBlank_( p ) = FALSE ) then return FALSE
         dim as long c = TpCh_( p, p.i )
@@ -602,10 +626,17 @@ function TpValue_( byref p as TomlParser_, byref v as TomlValue ) as boolean
         if( TpString_( p, s ) = FALSE ) then return FALSE
         v = TomlValue.FromString( s )
         return TRUE
-    case 91
-        return TpArray_( p, v )
-    case 123
-        return TpInline_( p, v )
+    case 91, 123
+        if( p.depth >= TKF_MAX_DEPTH ) then return TpFail_( p, CFG_SYNTAX, "nested too deeply" )
+        p.depth += 1
+        dim as boolean ok_
+        if( c = 91 ) then
+            ok_ = TpArray_( p, v )
+        else
+            ok_ = TpInline_( p, v )
+        end if
+        p.depth -= 1
+        return ok_
     case -1, 10, 13, 35, 44, 93, 125
         return TpFail_( p, CFG_SYNTAX, "expected a value" )
     end select
@@ -660,8 +691,13 @@ function TpHeader_( byref p as TomlParser_ ) as boolean
     end if
     dim as TomlValue ptr t = p.root
     dim as long last = keys.Count( ) - 1
+    '' The header's table's level: one per part, two through an array of tables.
+    dim as long lvl = iif( aot, 2, 1 )
     for k as long = 0 to last - 1
+        lvl += 1
         dim as TomlValue ptr c = t->Find( keys[k] )
+        if( ( c <> 0 ) andalso ( c->hKind = TOML_ARRAY ) andalso ( ( c->hFlags and TKF_AOT ) <> 0 ) ) then lvl += 1
+        if( lvl > TKF_MAX_DEPTH ) then return TpFail_( p, CFG_SYNTAX, "nested too deeply", at )
         if( c = 0 ) then
             c = t->AddKid_( keys[k], TomlValue.NewTable( ) )
         elseif( ( c->hFlags and TKF_FROZEN ) <> 0 ) then
@@ -673,6 +709,8 @@ function TpHeader_( byref p as TomlParser_ ) as boolean
         end if
         t = c
     next
+    if( lvl > TKF_MAX_DEPTH ) then return TpFail_( p, CFG_SYNTAX, "nested too deeply", at )
+    p.curDepth = lvl
     dim as TomlValue ptr c = t->Find( keys[last] )
     dim as ustring nm = TpKeyText_( keys, last )
     if( aot ) then
@@ -718,7 +756,10 @@ function TpDocument_( byref p as TomlParser_ ) as boolean
             p.i += 1
             TpWs_( p )
             dim as TomlValue v
+            p.depth = p.curDepth
+            if( TpDeeper_( p, keys.Count( ) - 1 ) = FALSE ) then return FALSE
             if( TpValue_( p, v ) = FALSE ) then return FALSE
+            p.depth = 0
             if( TpInsert_( p, p.cur, keys, v, at ) = FALSE ) then return FALSE
             if( TpEndLine_( p ) = FALSE ) then return FALSE
         end if

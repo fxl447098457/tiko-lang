@@ -19,6 +19,8 @@
 - One engine, with V and H as thin modules (PsPlatform's PsScrollBar idea).
 - The system lines-per-notch has no SDL query, so it is 3 (Windows' default).
 - `IsDragging` and `GetThumbRect` exist on both bars (vendor had IsDragging on H only).
+- The paint info names its bar (`hScrollBar`), and `PaintDefault( p )` (on both bars) draws the
+  stock bar from inside a paint callback (the form designer's Paint event).
 
 **Dropped:** the hover poll timer; `WM_SHOWWINDOW` → `TKM_SHOW`; PsRegistry; `Rescale` →
 `TKM_SCALECHANGED`.

@@ -9,7 +9,9 @@ keeps one small icon font instead of shipping the 2.9 MB Fluent one.
 
 With no codepoints: F63D (question), F4A3 (info), F369 (close), F2AA / F2B0 (chevron left /
 right: the tab strip's scroll buttons), F582 / F373 (open / contract_down_left: the Form Designer's
-float and dock), F3DD (edit: its event rows' go-to-the-code). A codepoint PsIcons already maps
+float and dock), F3DD (edit: its event rows' go-to-the-code), F68F (search: the Keyboard Shortcuts
+filter), E824 (more_horizontal: the inspector's "..." that opens the Resource Center), F32B (copy: the Theme
+dialog's Clone). A codepoint PsIcons already maps
 is left alone. Both fonts are 500 units per em with TrueType outlines; anything else is refused.
 Needs fontTools (pip install fonttools). Same licence as the rest of PsIcons: MIT, Fluent's.
 """
@@ -18,7 +20,7 @@ import sys
 
 from fontTools.ttLib import TTFont
 
-DEFAULT = [0xF63D, 0xF4A3, 0xF369, 0xF2AA, 0xF2B0, 0xF582, 0xF373, 0xF3DD]
+DEFAULT = [0xF63D, 0xF4A3, 0xF369, 0xF2AA, 0xF2B0, 0xF582, 0xF373, 0xF3DD, 0xF68F, 0xE824, 0xF32B]
 
 
 def main():
@@ -48,7 +50,11 @@ def main():
             order.append(name)
             ps.setGlyphOrder(order)
             ps['glyf'][name] = glyph
-            ps['hmtx'][name] = fl['hmtx'][name]
+            # the left bearing as the outline has it: Fluent stores 0 (its head flags tell FreeType to
+            # leave the outline be); PsIcons' don't, so FreeType moves the outline to the stored
+            # bearing -- 0 would draw the glyph left by its real bearing (2026-11-14)
+            glyph.recalcBounds(ps['glyf'])
+            ps['hmtx'][name] = (fl['hmtx'][name][0], glyph.xMin)
         for t in ps['cmap'].tables:
             if t.isUnicode():
                 t.cmap[cp] = name

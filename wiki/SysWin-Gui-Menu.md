@@ -1122,12 +1122,9 @@ Microsoft Learn: [SetMenuDefaultItem](https://learn.microsoft.com/en-us/windows/
 function GetDefaultItem( byval hMenu as HMENU, byval gmdiFlags as UINT = 0, byval fByPosition as boolean = true ) as long
 ```
 
-Finds the default item of a menu and returns its **position plus one**, so the first item gives
-1 and a menu with no default gives 0. The result is a position whatever `fByPosition` says.
-`gmdiFlags = 0` stands for `GMDI_GOINTOPOPUPS`. When `fByPosition` is `true` (the default),
-disabled default items are found too.
+Finds the default item of a menu and returns its position. `gmdiFlags = 0` stands for `GMDI_GOINTOPOPUPS`. When `fByPosition` is `true` (the default), disabled default items are found too.
 
-**Returns** the position of the default item plus one, or 0 when there is none.
+**Returns** the position of the default item.
 
 **Example**
 
@@ -1461,9 +1458,7 @@ Microsoft Learn: [MenuItemFromPoint](https://learn.microsoft.com/en-us/windows/w
 function GetCheckMarkWidth() as long
 ```
 
-Returns the size of the default check mark, the size a bitmap for
-[SetItemBitmaps](#setitembitmaps) should have. It reads `SM_CYMENUCHECK`, the height; Windows
-makes the check mark square, so the value is the width as well (15 at 96 DPI).
+Returns the width of the default check mark, the size a bitmap for [SetItemBitmaps](#setitembitmaps) should have.
 
 **Returns** the size in pixels.
 
@@ -1481,8 +1476,7 @@ Microsoft Learn: [GetSystemMetrics](https://learn.microsoft.com/en-us/windows/wi
 function GetCheckMarkHeight() as long
 ```
 
-Returns the size of the default check mark from `SM_CXMENUCHECK`, the width; see
-[GetCheckMarkWidth](#getcheckmarkwidth).
+Returns the height of the default check mark, the size a bitmap for [SetItemBitmaps](#setitembitmaps) should have.
 
 **Returns** the size in pixels.
 

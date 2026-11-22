@@ -6,104 +6,26 @@
 >
 > 📖 **In the book:** [Chapter 30, SQLite](https://tiko-lang.net/book/ch30-c-libraries.html#sqlite). Measured with SQLite 3.54.0 and tiko, on Windows and Linux.
 
-[SQLite](https://sqlite.org) is a complete SQL database in a library. There is no server, and a database is one ordinary file. This tutorial uses SQLite's own C interface from tiko, linked dynamically and statically, kept inside a project or installed for the whole machine.
+[SQLite](https://sqlite.org) is a complete SQL database in a library. There is no server, and a database is one ordinary file.
 
-> ℹ️ **tiko already ships SQLite.** `#import "vendor/sqlite3"` gives you SQLite's own C API with nothing on the command line (see [Vendor Packages](Vendor-Packages)). Use this tutorial when you need a different SQLite version or your own compile options.
+tiko ships SQLite 3.54.0 as a [vendor package](Vendor-Packages). One line gives a program SQLite's whole C API and links the library:
+
+```freebasic
+#import "vendor/sqlite3"
+```
+
+There is nothing to download, no header to translate, no `#foreignlib` and nothing on the command line, on Windows, Linux and macOS. More programs, from transactions to blobs and backups, are in the toolchain's `examples/sqlite3`.
 
 ---
 
-## 1. Download
-
-All files are on [sqlite.org/download.html](https://sqlite.org/download.html). The number in each file name is the version: 3.54.0 is `3540000`.
-
-| File | Contains | You need it for |
-|---|---|---|
-| `sqlite-amalgamation-3540000.zip` | `sqlite3.c`, `sqlite3.h` (the whole library as **one C file**) | the header, on every platform; a static library on Windows |
-| `sqlite-dll-win-x64-3540000.zip` | `sqlite3.dll`, `sqlite3.def` | the DLL, on Windows |
-| `sqlite-autoconf-3540000.tar.gz` | `sqlite3.c`, `sqlite3.h` and a Unix build script | building on Linux |
-
-## 2. Your project's layout
-
-When you are done, the project looks like this. The `vendor/` folder can hold both platforms' files at once, because each library file carries its target in its name:
-
-```
-myapp/
-  sqlite-quick.tiko
-  sqlite3.dll                                   (Windows: the DLL, beside the program)
-  libsqlite3.so.0                               (Linux: the .so, beside the program)
-  vendor/sqlite/
-    sqlite3.h
-    sqlite3_windows_x86_64.dll                  sqlite3.dll, renamed: tiko makes its import library
-    sqlite3-static_windows_x86_64.lib           static library
-    sqlite3_linux_x86_64.so                     shared library
-    sqlite3-static_linux_x86_64.a               static library
-```
-
-You only need the files for the platforms and the kind of link you use.
-
-## 3. Lay it out: Windows
-
-**The header.** Copy `sqlite3.h` from the amalgamation zip into `vendor/sqlite/`.
-
-**For dynamic linking.** The DLL zip contains `sqlite3.dll` and `sqlite3.def`, a list of the DLL's functions, but **no import library**. You don't need to make one:
-
-1. Copy `sqlite3.dll` to `vendor/sqlite/sqlite3_windows_x86_64.dll`.
-2. Copy `sqlite3.dll` again, unrenamed, next to where your program will be.
-
-When `#foreignlib SQLITE dynamic "vendor/sqlite/sqlite3"` finds only the `.dll`, tiko reads the DLL's exports and makes the import library while linking (run with `-v` to see the `llvm-dlltool` command). The import library names the DLL **as the DLL names itself**, `sqlite3.dll`, not by the renamed file, so the program loads the copy beside it.
-
-**Or make the import library yourself**, to keep one in the project. `llvm-dlltool`, which comes with LLVM, makes it from the `.def`:
-
-```bash
-llvm-dlltool -m i386:x86-64 -d sqlite3.def -D sqlite3.dll -l vendor/sqlite/sqlite3_windows_x86_64.lib
-```
-
-- `-m i386:x86-64`: a 64-bit import library
-- `-d sqlite3.def`: the list of functions
-- `-D sqlite3.dll`: **the DLL the program will load.** Don't leave this out (see below).
-- `-l ...`: the file to write
-
-A `.lib` with one of the names `#foreignlib` tries is found before the `.dll`, so when both are there, yours is used.
-
-> ⚠️ **Without a DLL name, the program cannot start.** `sqlite3.def` has no `LIBRARY` line, so an import library made without `-D` (for example with `llvm-lib /def:sqlite3.def`) records an **empty** DLL name. Everything links, and then the program dies on start with code `-1073741515`. Check with `llvm-readobj --coff-imports program.exe`: a `Name:` line with nothing after it is the problem.
-
-**For static linking.** Compile the amalgamation and archive it. This needs the Visual Studio Build Tools, for the C runtime headers, and takes about 20 seconds (`sqlite3.c` is 9.6 MB of C):
-
-```bash
-clang -c -O2 -o sqlite3.obj sqlite3.c
-llvm-lib /out:vendor/sqlite/sqlite3-static_windows_x86_64.lib sqlite3.obj
-```
-
-The static library is called `sqlite3-static` because on Windows a static `.lib` and an import `.lib` cannot share a name.
-
-## 4. Lay it out: Linux
-
-From the autoconf archive (or the amalgamation, which has the same `sqlite3.c`):
-
-```bash
-cp sqlite3.h vendor/sqlite/
-gcc -O2 -fPIC -c -o sqlite3.o sqlite3.c
-
-# static
-ar rcs vendor/sqlite/sqlite3-static_linux_x86_64.a sqlite3.o
-
-# shared, with the soname the program will ask for when it starts
-gcc -shared -Wl,-soname,libsqlite3.so.0 \
-    -o vendor/sqlite/sqlite3_linux_x86_64.so sqlite3.o -lm
-cp vendor/sqlite/sqlite3_linux_x86_64.so libsqlite3.so.0
-```
-
-`-fPIC` is needed for code that goes into a shared library. `-Wl,-soname,...` records the name the program will look for. Without it, the program would remember the path it was linked with, and work only when started from the build directory.
-
-## 5. The program, linked dynamically
+## 1. The program, linked dynamically
 
 This is SQLite's own *"SQLite In 5 Minutes Or Less"* program in tiko. It opens the database named by the first argument, runs the SQL in the second, and prints each row:
 
 ```freebasic
 '' SQLite's "SQLite In 5 Minutes Or Less" program: run one SQL string
 '' against a database and print each row the callback is given.
-#cinclude once "vendor/sqlite/sqlite3.h"
-#foreignlib SQLITE dynamic "vendor/sqlite/sqlite3"
+#import "vendor/sqlite3"
 
 '' Called once for each row of the result.
 function Callback cdecl( byval notUsed as any ptr, _
@@ -139,8 +61,6 @@ end if
 sqlite3_close( db )
 ```
 
-Build and run it from the project folder. On Windows:
-
 ```bash
 tiko sqlite-quick.tiko
 ./sqlite-quick :memory: "create table tbl1(one text, two int);
@@ -148,18 +68,6 @@ tiko sqlite-quick.tiko
     insert into tbl1 values('goodbye', 20);
     select * from tbl1"
 ```
-
-On Linux, the same, but run it with the project folder on `LD_LIBRARY_PATH`:
-
-```bash
-tiko sqlite-quick.tiko
-LD_LIBRARY_PATH=. ./sqlite-quick :memory: "create table tbl1(one text, two int);
-    insert into tbl1 values('hello!', 10);
-    insert into tbl1 values('goodbye', 20);
-    select * from tbl1"
-```
-
-Output:
 
 ```
 one = hello!
@@ -173,26 +81,22 @@ two = 20
 
 | Line | Why |
 |---|---|
-| `#cinclude once "vendor/sqlite/sqlite3.h"` | tiko reads SQLite's header with clang. Every SQLite function, type and constant becomes available, and you write no `declare`s. |
-| `#foreignlib SQLITE dynamic "vendor/sqlite/sqlite3"` | links `sqlite3_windows_x86_64.lib` or `sqlite3_linux_x86_64.so`, whichever matches the target, relative to **this file** |
+| `#import "vendor/sqlite3"` | every SQLite function, type and constant, unqualified, as SQLite documents them: `sqlite3_open`, `SQLITE_OK`. The header was translated once by [`tiko c2t`](C2t) and ships with the toolchain, so you write no `declare`s. With no `link`, SQLite is linked dynamically. |
 | `function Callback cdecl( ... )` | `sqlite3_exec` calls it once per row, so it must be `cdecl` and match C's `int (*)(void*, int, char**, char**)` exactly |
 | `dim db as sqlite3 ptr` / `@db` | `sqlite3` is opaque, so you only ever hold a pointer. C's `&db` is tiko's `@db`. |
 | `*sqlite3_errmsg( db )` | a `const char *` from C; `*` copies the text into a tiko string |
 | `sqlite3_free( errMsg )` | SQLite allocated the message, so SQLite frees it |
 
-> 💡 **No `LD_LIBRARY_PATH` needed:** add `#cmdline "-Wl -rpath,$ORIGIN"` (inside `#ifdef __FB_LINUX__`), and the program looks for `libsqlite3.so.0` beside itself first.
+**The library is copied beside the program** when it is built: `sqlite3.dll` on Windows, `sqlite3_linux_x86_64.so` on Linux, `sqlite3_macos_arm64.dylib` on macOS. On Linux and macOS the program is linked with a run path to its own folder, so it finds that copy with no `LD_LIBRARY_PATH`, wherever it is run from. It does not pick up the system's own `libsqlite3.so.0` (Ubuntu ships an older SQLite): ask with `select sqlite_version()`, and it answers `3.54.0`.
 
-> ⚠️ **On Linux, forgetting `LD_LIBRARY_PATH` may not fail.** Ubuntu has its own `libsqlite3.so.0` installed, and the program will quietly use that, an older version (3.45.1 on Ubuntu 24.04). Ask SQLite: `select sqlite_version()`.
-
-## 6. The program, linked statically
+## 2. Prepared statements, linked statically
 
 Real programs **prepare** a statement once with `?` placeholders and **bind** values to them. That is faster, and it is safe from SQL injection. This program does that, and links SQLite statically:
 
 ```freebasic
 '' Insert and query with prepared statements: the values travel as
 '' parameters, never as text pasted into the SQL. Linked statically.
-#cinclude once "vendor/sqlite/sqlite3.h"
-#foreignlib SQLITE static "vendor/sqlite/sqlite3-static"
+#import "vendor/sqlite3" link static
 
 sub Check( byval rc as int32, byval db as sqlite3 ptr )
     if rc <> SQLITE_OK andalso rc <> SQLITE_DONE then
@@ -216,9 +120,9 @@ dim ins as sqlite3_stmt ptr
 Check( sqlite3_prepare_v2( db, "insert into city values( ?, ? )", _
     -1, @ins, nullptr ), db )
 for i as int32 = 0 to 2
-    '' -1: the text ends at its zero byte. nullptr (SQLITE_STATIC):
-    '' the string outlives the statement's use of it.
-    Check( sqlite3_bind_text( ins, 1, names( i ), -1, nullptr ), db )
+    '' -1: the text ends at its zero byte. SQLITE_STATIC: the string
+    '' outlives the statement's use of it, so SQLite need not copy it.
+    Check( sqlite3_bind_text( ins, 1, names( i ), -1, SQLITE_STATIC ), db )
     Check( sqlite3_bind_int( ins, 2, pops( i ) ), db )
     Check( sqlite3_step( ins ), db )
     sqlite3_reset( ins )
@@ -249,46 +153,133 @@ St. John's: 110525
 Corner Brook: 19316
 ```
 
-Only the `#foreignlib` line differs from the dynamic program: `static`, and the static library's name. The program needs no DLL now. It is about 1.1 MB, compared with 38 KB plus a 3.5 MB DLL.
+Only the import differs from a dynamic program: `link static`. SQLite is then inside the program, which runs with nothing beside it: about 1.1 MB on Windows and 1.2 MB on Linux, compared with 40 KB plus a 3.5 MB DLL.
 
 **Details worth knowing:**
 
-- `sqlite3_bind_text`'s last argument says whether SQLite must copy the text. Pass `nullptr` (that is `SQLITE_STATIC`) when the string outlives the statement, as here. For `SQLITE_TRANSIENT` (copy it), write `cast( sqlite3_destructor_type, -1 )`. Both are C macros that cast a number to a function pointer, and `#cinclude` does not import that kind of macro.
+- `sqlite3_bind_text`'s last argument says whether SQLite must copy the text. `SQLITE_STATIC` says the string outlives the statement, as here; `SQLITE_TRANSIENT` says copy it, for a string that goes away first. In C both are macros that cast a number to a function pointer; `vendor/sqlite3` has them as constants, so you write them as in C.
 - `sqlite3_column_text` returns `const unsigned char *`, which tiko sees as `const ubyte ptr`. Cast it to `zstring ptr` to read it as text.
 - The names are `string`, tiko's byte string, because SQLite's `_text` functions take UTF-8 bytes.
 
-## 7. Installing SQLite for every program
+## 3. In a project
 
-**Linux:** use the distribution's package. It installs `sqlite3.h` into `/usr/include` and the library into the system's library directory:
+A [`tiko build`](Category-Tiko-Build) project needs nothing in its `tiko.toml` for SQLite: the import says it all. `tiko build`'s `copy_to` copies the shared library along with the program.
+
+## 4. Shipping the program
+
+- **Linked dynamically:** ship the library the build put beside the program (`sqlite3.dll`, `sqlite3_linux_x86_64.so` or `sqlite3_macos_arm64.dylib`).
+- **Linked statically:** the program alone.
+
+If `sqlite3.dll` is missing, the program exits at once with `-1073741515` and prints nothing. Windows also looks in the current directory, so test a copy from its own folder.
+
+## 5. Your own SQLite build
+
+Use this when you need a newer SQLite than the toolchain's, or SQLite built with compile options of your own. It replaces the import with the parts the vendor package does for you, and it is the pattern for every library that has no vendor package.
+
+### Download
+
+All files are on [sqlite.org/download.html](https://sqlite.org/download.html). The number in each file name is the version: 3.54.0 is `3540000`.
+
+| File | Contains | You need it for |
+|---|---|---|
+| `sqlite-amalgamation-3540000.zip` | `sqlite3.c`, `sqlite3.h` (the whole library as **one C file**) | the header, on every platform; a static library on Windows |
+| `sqlite-dll-win-x64-3540000.zip` | `sqlite3.dll`, `sqlite3.def` | the DLL, on Windows |
+| `sqlite-autoconf-3540000.tar.gz` | `sqlite3.c`, `sqlite3.h` and a Unix build script | building on Linux |
+
+The project keeps SQLite in `vendor/sqlite/`. Each library file carries its target in its name, so both platforms' files can share the folder:
+
+```
+myapp/
+  sqlite-quick.tiko
+  sqlite3.dll                                   (Windows: the DLL, beside the program)
+  libsqlite3.so.0                               (Linux: the .so, beside the program)
+  vendor/sqlite/
+    sqlite3.h
+    sqlite3_windows_x86_64.dll                  sqlite3.dll, renamed: tiko makes its import library
+    sqlite3-static_windows_x86_64.lib           static library
+    sqlite3_linux_x86_64.so                     shared library
+    sqlite3-static_linux_x86_64.a               static library
+```
+
+### Lay it out: Windows
+
+**The header.** Copy `sqlite3.h` from the amalgamation zip into `vendor/sqlite/`.
+
+**For dynamic linking.** The DLL zip has `sqlite3.dll` and `sqlite3.def`, but **no import library**, and you don't need one. Copy `sqlite3.dll` to `vendor/sqlite/sqlite3_windows_x86_64.dll`, and again, unrenamed, beside your program. When `#foreignlib SQLITE dynamic "vendor/sqlite/sqlite3"` finds only the `.dll`, tiko reads the DLL's exports and makes the import library while linking. The import library names the DLL **as the DLL names itself**, `sqlite3.dll`, so the program loads the copy beside it.
+
+To keep an import library in the project instead, make it with `llvm-dlltool`, and give it the DLL's name with `-D`:
 
 ```bash
-sudo apt install libsqlite3-dev
+llvm-dlltool -m i386:x86-64 -d sqlite3.def -D sqlite3.dll -l vendor/sqlite/sqlite3_windows_x86_64.lib
 ```
 
-Then a program needs no paths at all:
+> ⚠️ **Without `-D`, the program cannot start.** `sqlite3.def` has no `LIBRARY` line, so an import library made without it records an **empty** DLL name. Everything links, and then the program dies on start with code `-1073741515`. Check with `llvm-readobj --coff-imports program.exe`: a `Name:` line with nothing after it is the problem.
+
+**For static linking.** Compile the amalgamation and archive it. This needs the Visual Studio Build Tools, for the C runtime headers, and takes about 20 seconds (`sqlite3.c` is 9.6 MB of C):
+
+```bash
+clang -c -O2 -o sqlite3.obj sqlite3.c
+llvm-lib /out:vendor/sqlite/sqlite3-static_windows_x86_64.lib sqlite3.obj
+```
+
+The static library is called `sqlite3-static` because on Windows a static `.lib` and an import `.lib` cannot share a name.
+
+### Lay it out: Linux
+
+From the autoconf archive (or the amalgamation, which has the same `sqlite3.c`):
+
+```bash
+cp sqlite3.h vendor/sqlite/
+gcc -O2 -fPIC -c -o sqlite3.o sqlite3.c
+
+# static
+ar rcs vendor/sqlite/sqlite3-static_linux_x86_64.a sqlite3.o
+
+# shared, with the soname the program will ask for when it starts
+gcc -shared -Wl,-soname,libsqlite3.so.0 \
+    -o vendor/sqlite/sqlite3_linux_x86_64.so sqlite3.o -lm
+cp vendor/sqlite/sqlite3_linux_x86_64.so libsqlite3.so.0
+```
+
+`-fPIC` is needed for code that goes into a shared library. `-Wl,-soname,...` records the name the program will look for; without it, the program would remember the path it was linked with.
+
+### The program
+
+Replace the `#import` with SQLite's own header, read by `#cinclude`, and the library, linked by `#foreignlib`:
 
 ```freebasic
-#cinclude once "sqlite3.h"
-#foreignlib SQLITE dynamic "system:sqlite3"
+#cinclude once "vendor/sqlite/sqlite3.h"
+#foreignlib SQLITE dynamic "vendor/sqlite/sqlite3"
 ```
 
-This links the distribution's SQLite, which is 3.45.1 on Ubuntu 24.04. For a newer one, build it as in step 4 and copy `sqlite3.h` to `/usr/local/include` and the `.so` to `/usr/local/lib` as `libsqlite3.so.0`, with a `libsqlite3.so` link to it. Then run `sudo ldconfig`.
+or, statically:
 
-**Windows:** keep the layout from step 3 in a shared folder and use a [binding header](Using-C-Libraries-Tutorial#5-a-binding-header). The [raylib tutorial](Raylib-Tutorial#7-one-copy-for-every-program) walks through one.
+```freebasic
+#cinclude once "vendor/sqlite/sqlite3.h"
+#foreignlib SQLITE static "vendor/sqlite/sqlite3-static"
+```
 
-## 8. Troubleshooting
+Both paths are relative to **the file that holds them**, and `#foreignlib` picks the file that matches the target. Three things differ from the vendor package:
+
+- **`SQLITE_STATIC` and `SQLITE_TRANSIENT` are not imported**, because `#cinclude` does not import a macro that casts a number to a function pointer. Write `nullptr` for `SQLITE_STATIC` and `cast( sqlite3_destructor_type, -1 )` for `SQLITE_TRANSIENT`.
+- **On Linux, the program does not look beside itself.** Run it with `LD_LIBRARY_PATH=.`, or add `#cmdline "-Wl -rpath,$ORIGIN"` inside `#ifdef __FB_LINUX__`.
+- **On Linux, forgetting that may not fail.** The program asks for `libsqlite3.so.0`, and Ubuntu has its own installed; the program quietly uses that older version (3.45.1 on Ubuntu 24.04). Ask SQLite: `select sqlite_version()`.
+
+**Installed for every program.** On Linux, `sudo apt install libsqlite3-dev` installs `sqlite3.h` and the library where they are found by default, and a program needs no paths: `#cinclude once "sqlite3.h"` and `#foreignlib SQLITE dynamic "system:sqlite3"`. That is the distribution's SQLite. On Windows, keep `vendor/sqlite/` in a shared folder and use a [binding header](Using-C-Libraries-Tutorial#5-a-binding-header).
+
+## 6. Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `TKO0336: unable to import C header vendor/sqlite/sqlite3.h` | check the path; on Windows install the Visual Studio Build Tools |
-| `TKO0329: #foreignlib found no matching library file` | the file names in the list are what tiko looked for; rename yours to match |
-| `TKO0172: cannot make an import library for '...': it is not a 64-bit x86-64 DLL` | that is `sqlite-dll-win-x86`, the 32-bit download; take `win-x64` |
-| the program exits at once with `-1073741515` | `sqlite3.dll` is not beside the program, or the import library was made without `-D sqlite3.dll` |
-| `error while loading shared libraries: libsqlite3.so.0` | `LD_LIBRARY_PATH=.` or install SQLite |
-| wrong SQLite version reported on Linux | the system's copy was loaded; use `LD_LIBRARY_PATH=.` |
+| the program exits at once with `-1073741515` | `sqlite3.dll` is not beside the program (or, your own build, the import library was made without `-D sqlite3.dll`) |
+| `TKO0336: unable to import C header vendor/sqlite/sqlite3.h` (your own build) | check the path; on Windows install the Visual Studio Build Tools |
+| `TKO0329: #foreignlib found no matching library file` (your own build) | the file names in the list are what tiko looked for; rename yours to match |
+| `TKO0172: cannot make an import library for '...': it is not a 64-bit x86-64 DLL` (your own build) | that is `sqlite-dll-win-x86`, the 32-bit download; take `win-x64` |
+| `error while loading shared libraries: libsqlite3.so.0` (your own build) | `LD_LIBRARY_PATH=.`, an rpath of `$ORIGIN`, or install SQLite |
+| wrong SQLite version reported on Linux (your own build) | the system's copy was loaded; see above |
 
 ---
 
-**Next:** [raylib](Raylib-Tutorial) · [GLFW](GLFW-Tutorial) · [SDL3](SDL3-Tutorial)
+**Next:** [PCRE2](PCRE2-Tutorial) · [raylib](Raylib-Tutorial) · [GLFW](GLFW-Tutorial) · [SDL3](SDL3-Tutorial) · [Vendor Packages](Vendor-Packages)
 
 [Home](Home)

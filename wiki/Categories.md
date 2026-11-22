@@ -16,10 +16,12 @@ Looking for a function by what it does? The [Function Finder](Function-Finder) g
 - [Array Results](Category-Array-Results) — 1 pages
 - [Collection Initializers](Category-Collection-Initializers) — 1 pages
 - [Defer](Category-Defer) — 1 pages
+- [Match](Category-Match) — 1 pages
 - [Lambdas](Category-Lambdas) — 1 pages
 - [Block Strings](Category-Block-Strings) — 1 pages
 - [Partial Types](Category-Partial-Types) — 1 pages
 - [String Slices](Category-String-Slices) — 9 pages
+- [Array Slices](Category-Array-Slices) — 1 pages
 - [Embed](Category-Embed) — 1 pages
 - [Typed Variadics](Category-Typed-Variadics) — 1 pages
 - [Foreign Library Linking](Category-Foreign-Library-Linking) — 3 pages
@@ -59,12 +61,13 @@ Looking for a function by what it does? The [Function Finder](Function-Finder) g
 - [Finance](Category-Finance) — 151 pages
 - [Logging](Category-Logging) — 33 pages
 - [Terminal TUI Library](Category-Terminal-TUI-Library) — 257 pages
-- [PsControls](Category-PsControls) — 30 pages
 - [tkControls](Category-tkControls) — 38 pages
 - [sys/win](Category-Sys-Win) — 111 pages
 - [Goroutines and Channels](Category-Goroutines-and-Channels) — 13 pages
 - [LLVM Backend](Category-LLVM-Backend) — 1 pages
 - [tiko build](Category-Tiko-Build) — 1 pages
+- [tiko test](Category-Tiko-Test) — 1 pages
+- [tiko doc](Category-Tiko-Doc) — 1 pages
 - [__TIKO_COMPILER__](Category-Tiko-Compiler-Define) — 1 pages
 
 ## Compatibility reference (the FreeBASIC manual)

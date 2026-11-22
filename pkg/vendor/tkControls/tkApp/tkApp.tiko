@@ -57,6 +57,21 @@ end enum
 public const TKAPP_IDOK = 1
 public const TKAPP_IDCANCEL = 2
 
+' Where a form goes when it is first shown (tkForm_SetStartPosition). Wayland places windows
+' itself, so there every position is the system's.
+public enum
+    TKFORM_POS_DEFAULT = 0          ' the system's; an owned form starts centred over its owner
+    TKFORM_POS_CENTER_SCREEN
+    TKFORM_POS_CENTER_OWNER         ' a form with no owner: as CENTER_SCREEN
+end enum
+
+' tkForm_SetWindowState. Maximized needs a resizable window.
+public enum
+    TKFORM_STATE_NORMAL = 0
+    TKFORM_STATE_MAXIMIZED
+    TKFORM_STATE_MINIMIZED
+end enum
+
 public type TKAPP_OPTIONS
     FontDir        as ustring            ' "" = the bundled fonts' (see tkApp_DefaultFontDir)
     FontUIFile     as ustring = TK_FONT_UI
@@ -88,6 +103,12 @@ public type TK_FORM_
     fontPt(0 to TKFONT_COUNT - 1) as single
     fontFile(0 to TKFONT_COUNT - 1) as ustring
     Tag          as any ptr
+    nStartPos    as long                ' TKFORM_POS_*, used at the first show
+    nState       as long                ' TKFORM_STATE_*, asked for before the first show
+    minW         as long                ' size limits of the client, in design units; 0 = none
+    minH         as long
+    maxW         as long
+    maxH         as long
     OnSize_         as TKFORM_SizeSub
     OnPaint_        as TKFORM_PaintSub
     OnKeyDown_      as TKFORM_KeyFunc
@@ -163,9 +184,12 @@ private function FileThere( byref path as ustring ) as boolean
     return SDL_GetPathInfo( strptr( p8 ), 0 )
 end function
 
-' A bare file name is looked up in the font directory; anything with a separator is a path.
+' A bare file name is looked up in the font directory; anything with a separator is a path, and a
+' registered resource name ("res:Body", tkHost_AddResourceData / File) is itself.
 private function Resolve( byref f as ustring ) as ustring
     if len( f ) = 0 then return ""
+    dim as string f8 = f
+    if tkHost_HasResource( f8 ) then return f
     if (instr( f, "/" ) > 0) orelse (instr( f, "\" ) > 0) then return f
     return FontDir() & f
 end function
@@ -210,6 +234,67 @@ end function
 ' The glyph font file Init chose: GlyphFontFile, then the bundled TK_FONT_ICONS.
 public function tkApp_GlyphFace() as ustring
     return gGlyphFile
+end function
+
+#ifdef __FB_WIN32__
+' Win32 reached through GetProcAddress (as std/fs does): kernel32 is the one library every link has.
+extern "C"
+    declare function tka_LoadLibraryW stdcall alias "LoadLibraryW" ( byval name_ as const any ptr ) as any ptr
+    declare function tka_GetProcAddress stdcall alias "GetProcAddress" ( byval m as any ptr, byval name_ as const zstring ptr ) as any ptr
+end extern
+type TkaSpiFn as function stdcall ( byval action as ulong, byval param as ulong, byval pv as any ptr, byval winIni as ulong ) as long
+type TkaDpiFn as function stdcall ( ) as ulong
+type TkaLogFontW
+    lfHeight as long
+    lfWidth as long
+    lfEscapement as long
+    lfOrientation as long
+    lfWeight as long
+    lfFlags( 0 to 7 ) as ubyte          ' italic .. pitch and family
+    lfFaceName( 0 to 31 ) as ushort
+end type
+type TkaNcMetricsW                      ' NONCLIENTMETRICSW
+    cbSize as ulong
+    iMetrics( 0 to 4 ) as long          ' border, scroll width / height, caption width / height
+    lfCaptionFont as TkaLogFontW
+    iSmCaption( 0 to 1 ) as long
+    lfSmCaptionFont as TkaLogFontW
+    iMenu( 0 to 1 ) as long
+    lfMenuFont as TkaLogFontW
+    lfStatusFont as TkaLogFontW
+    lfMessageFont as TkaLogFontW
+    iPaddedBorderWidth as long
+end type
+#endif
+
+' The OS's normal UI font size in points (tkControls sizes fonts in points at 96 DPI, as Win32
+' does): Windows' message font (usually 9), macOS 13, elsewhere 10. A designer theme with no size
+' of its own asks this (docs/tkDesigner/GLYPHS.md, GV2).
+public function tkApp_SystemFontSize() as single
+#ifdef __FB_WIN32__
+    static as single cached = 0
+    if cached > 0 then return cached
+    cached = 9
+    dim as ustring u32 = "user32.dll"
+    dim as any ptr hu = tka_LoadLibraryW( strptr( u32 ) )
+    if hu = 0 then return cached
+    dim as TkaSpiFn pSpi = cast( TkaSpiFn, tka_GetProcAddress( hu, @"SystemParametersInfoW" ) )
+    dim as TkaDpiFn pDpi = cast( TkaDpiFn, tka_GetProcAddress( hu, @"GetDpiForSystem" ) )
+    if pSpi = 0 then return cached
+    dim as TkaNcMetricsW m
+    m.cbSize = sizeof( TkaNcMetricsW )
+    if pSpi( &h29, m.cbSize, @m, 0 ) = 0 then return cached       ' SPI_GETNONCLIENTMETRICS
+    dim as long dpi = 96
+    if pDpi then dpi = clng( pDpi( ) )
+    if dpi <= 0 then dpi = 96
+    dim as long hgt = abs( m.lfMessageFont.lfHeight )
+    if hgt > 0 then cached = csng( hgt ) * 72 / dpi
+    return cached
+#elseif defined( __FB_DARWIN__ )
+    return 13
+#else
+    return 10                            ' GLYPHS.md OQ2: the Linux desktop's own size, later
+#endif
 end function
 
 public function tkApp_Options() as TKAPP_OPTIONS
@@ -452,6 +537,43 @@ public function tkForm_FromHost( byval h as TK_HOST ptr ) as TK_FORM ptr
     return FormOf( h )
 end function
 
+' The size limits in window coordinates, at the form's scale now. The maximum is cleared first:
+' SDL refuses a minimum above the maximum in force.
+private sub ApplySizeLimits_( byval f as TK_FORM ptr )
+    dim as TK_HOST ptr h = f->host
+    dim as single k = h->fScale / h->fDensity
+    SDL_SetWindowMaximumSize( h->win, 0, 0 )
+    SDL_SetWindowMinimumSize( h->win, cint( f->minW * k ), cint( f->minH * k ) )
+    SDL_SetWindowMaximumSize( h->win, cint( f->maxW * k ), cint( f->maxH * k ) )
+end sub
+
+private sub ApplyState_( byval f as TK_FORM ptr )
+    select case f->nState
+    case TKFORM_STATE_MAXIMIZED : SDL_MaximizeWindow( f->host->win )
+    case TKFORM_STATE_MINIMIZED : SDL_MinimizeWindow( f->host->win )
+    case else                   : SDL_RestoreWindow( f->host->win )
+    end select
+end sub
+
+' Before the window first appears: its place, then its state (SDL holds a hidden window's
+' state until it is shown).
+private sub BeforeFirstShow_( byval f as TK_FORM ptr )
+    dim as SDL_Window ptr win = f->host->win
+    dim as long where = f->nStartPos
+    if (where = TKFORM_POS_CENTER_OWNER) andalso (f->pOwner = 0) then where = TKFORM_POS_CENTER_SCREEN
+    select case where
+    case TKFORM_POS_CENTER_SCREEN
+        SDL_SetWindowPosition( win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED )
+    case TKFORM_POS_CENTER_OWNER
+        dim as long ox, oy, ow, oh, w, hgt
+        SDL_GetWindowPosition( f->pOwner->host->win, @ox, @oy )
+        SDL_GetWindowSize( f->pOwner->host->win, @ow, @oh )
+        SDL_GetWindowSize( win, @w, @hgt )
+        SDL_SetWindowPosition( win, ox + (ow - w) \ 2, oy + (oh - hgt) \ 2 )
+    end select
+    if f->nState <> TKFORM_STATE_NORMAL then ApplyState_( f )
+end sub
+
 function FormProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
     dim as TK_FORM ptr f = cast( TK_FORM ptr, w->pData )
     if f = 0 then return false
@@ -475,6 +597,7 @@ function FormProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
         return false
     case TKM_SCALECHANGED
         ' the role fonts are host fonts: the host re-sized them already
+        ApplySizeLimits_( f )
         if f->OnScaleChanged_ then f->OnScaleChanged_( f, m->fOld, m->fNew )
         return true
     end select
@@ -599,6 +722,7 @@ end function
 ' Shows a form modelessly. The first call runs OnSize and focuses the first tab stop.
 public sub tkForm_Show( byval f as TK_FORM ptr )
     if f = 0 then exit sub
+    if f->bShown = false then BeforeFirstShow_( f )
     tkHost_Show( f->host )
     if f->bShown = false then
         f->bShown = true
@@ -611,6 +735,7 @@ end sub
 private function RunFormModal_( byval f as TK_FORM ptr ) as long
     f->bModal = true
     if f->bShown = false then
+        BeforeFirstShow_( f )
         f->bShown = true
         FormHostSize( f->host )
         if f->OnSize_ then f->OnSize_( f, f->wForm->cw, f->wForm->ch )
@@ -631,7 +756,6 @@ end function
 public function tkForm_ShowModalKeep( byval f as TK_FORM ptr ) as long
     if f = 0 then return 0
     dim as long r = RunFormModal_( f )
-    if f->host->pOwner then SDL_SetWindowModal( f->host->win, false )
     tkHost_Hide( f->host )
     f->bModal = false
     return r
@@ -662,10 +786,145 @@ public sub tkForm_Invalidate( byval f as TK_FORM ptr )
     if f then tkHost_Invalidate( f->host )
 end sub
 
+' ---- the window ----
+' TKFORM_POS_*: where the form goes when it is first shown. Later calls change nothing on screen.
+public sub tkForm_SetStartPosition( byval f as TK_FORM ptr, byval where as long )
+    if f = 0 then exit sub
+    if (where < TKFORM_POS_DEFAULT) orelse (where > TKFORM_POS_CENTER_OWNER) then where = TKFORM_POS_DEFAULT
+    f->nStartPos = where
+end sub
+
+public function tkForm_GetStartPosition( byval f as TK_FORM ptr ) as long
+    if f = 0 then return TKFORM_POS_DEFAULT
+    return f->nStartPos
+end function
+
+' Can the user resize the window? A top-level form starts resizable, an owned one fixed.
+public sub tkForm_SetResizable( byval f as TK_FORM ptr, byval bResizable as boolean )
+    if f then SDL_SetWindowResizable( f->host->win, bResizable )
+end sub
+
+public function tkForm_GetResizable( byval f as TK_FORM ptr ) as boolean
+    if f = 0 then return false
+    return (SDL_GetWindowFlags( f->host->win ) and SDL_WINDOW_RESIZABLE) <> 0
+end function
+
+' The smallest and largest client the user can size the window to, in design units (scaled with
+' the form, and again when its scale changes). 0 = no limit on that side.
+public sub tkForm_SetMinSize( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+    if f = 0 then exit sub
+    f->minW = iif( cx > 0, cx, 0 )
+    f->minH = iif( cy > 0, cy, 0 )
+    ApplySizeLimits_( f )
+end sub
+
+public sub tkForm_SetMaxSize( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+    if f = 0 then exit sub
+    f->maxW = iif( cx > 0, cx, 0 )
+    f->maxH = iif( cy > 0, cy, 0 )
+    ApplySizeLimits_( f )
+end sub
+
+public sub tkForm_GetMinSize( byval f as TK_FORM ptr, byref cx as long, byref cy as long )
+    cx = 0 : cy = 0
+    if f = 0 then exit sub
+    cx = f->minW : cy = f->minH
+end sub
+
+public sub tkForm_GetMaxSize( byval f as TK_FORM ptr, byref cx as long, byref cy as long )
+    cx = 0 : cy = 0
+    if f = 0 then exit sub
+    cx = f->maxW : cy = f->maxH
+end sub
+
+' TKFORM_STATE_*. Before the first show it is how the window first appears; after, it applies now.
+public sub tkForm_SetWindowState( byval f as TK_FORM ptr, byval nState as long )
+    if f = 0 then exit sub
+    if (nState < TKFORM_STATE_NORMAL) orelse (nState > TKFORM_STATE_MINIMIZED) then nState = TKFORM_STATE_NORMAL
+    f->nState = nState
+    if f->bShown then ApplyState_( f )
+end sub
+
+' What the window is now; before the first show, what it was asked to be.
+public function tkForm_GetWindowState( byval f as TK_FORM ptr ) as long
+    if f = 0 then return TKFORM_STATE_NORMAL
+    if f->bShown = false then return f->nState
+    dim as SDL_WindowFlags fl = SDL_GetWindowFlags( f->host->win )
+    if fl and SDL_WINDOW_MINIMIZED then return TKFORM_STATE_MINIMIZED
+    if fl and SDL_WINDOW_MAXIMIZED then return TKFORM_STATE_MAXIMIZED
+    return TKFORM_STATE_NORMAL
+end function
+
+public sub tkForm_SetAlwaysOnTop( byval f as TK_FORM ptr, byval bOnTop as boolean )
+    if f then SDL_SetWindowAlwaysOnTop( f->host->win, bOnTop )
+end sub
+
+public function tkForm_GetAlwaysOnTop( byval f as TK_FORM ptr ) as boolean
+    if f = 0 then return false
+    return (SDL_GetWindowFlags( f->host->win ) and SDL_WINDOW_ALWAYS_ON_TOP) <> 0
+end function
+
+#ifdef __FB_WIN32__
+type TkaSendFn as function stdcall ( byval hwnd as any ptr, byval msg as ulong, byval w as uinteger, byval l as integer ) as integer
+type TkaClassLongFn as function stdcall ( byval hwnd as any ptr, byval index as long ) as uinteger
+
+' SDL_SetWindowIcon sets the window's big icon as well as its small one, and the taskbar and Alt+Tab
+' show the big one: a form's own icon took the program's place there. The program's icon is the
+' window class's (SDL gives the class the exe's first icon, as Explorer shows it); when there is
+' one it goes back as the big icon, and the form's stays in the title bar. A program without an
+' icon keeps the form's in both.
+private sub KeepProgramIcon_( byval win as SDL_Window ptr )
+    static as TkaSendFn pSend
+    static as TkaClassLongFn pClass
+    static as boolean looked
+    if looked = false then
+        looked = true
+        dim as ustring u32 = "user32.dll"
+        dim as any ptr hu = tka_LoadLibraryW( strptr( u32 ) )
+        if hu then
+            pSend = cast( TkaSendFn, tka_GetProcAddress( hu, @"SendMessageW" ) )
+            pClass = cast( TkaClassLongFn, tka_GetProcAddress( hu, @"GetClassLongPtrW" ) )
+        end if
+    end if
+    if (pSend = 0) orelse (pClass = 0) then exit sub
+    dim as any ptr hwnd = SDL_GetPointerProperty( SDL_GetWindowProperties( win ), SDL_PROP_WINDOW_WIN32_HWND_POINTER, 0 )
+    if hwnd = 0 then exit sub
+    dim as uinteger hIcon = pClass( hwnd, -14 )          ' GCLP_HICON
+    if hIcon then pSend( hwnd, &h80, 1, hIcon )          ' WM_SETICON, ICON_BIG
+end sub
+#endif
+
+' The window's icon from an image file (any format SDL_image reads) or a registered resource name
+' (tkHost_AddResourceData / tkHost_AddResourceFile). FALSE when it can't be read.
+public function tkForm_SetIcon( byval f as TK_FORM ptr, byref file as ustring ) as boolean
+    if (f = 0) orelse (len( file ) = 0) then return false
+    dim as SDL_Surface ptr s = tkHost_LoadSurface( file )
+    if s = 0 then return false
+    dim as boolean ok = SDL_SetWindowIcon( f->host->win, s )
+    SDL_DestroySurface( s )
+#ifdef __FB_WIN32__
+    if ok then KeepProgramIcon_( f->host->win )
+#endif
+    return ok
+end function
+
 ' OnDestroy, then the surface (and every control on it) goes.
 public sub tkForm_Destroy( byval f as TK_FORM ptr )
     if (f = 0) orelse f->bDestroyed then exit sub
     f->bDestroyed = true
+    ' the forms it owns go first: SDL destroys a parent's child windows along with it, which would
+    ' leave theirs dangling for whoever destroys them next (tkApp_Shutdown, after the main form closed)
+    dim as boolean again = true
+    while again
+        again = false
+        for i as long = gnForms - 1 to 0 step -1
+            if (gForms(i)->pOwner = f) andalso (gForms(i)->bDestroyed = false) then
+                tkForm_Destroy( gForms(i) )
+                again = true
+                exit for
+            end if
+        next
+    wend
     if f->OnDestroy_ then f->OnDestroy_( f )
     ' THE HOST GOES FIRST, while the form is still listed: a control's callback during teardown
     ' can still find its form through tkForm_FromWidget.

@@ -7,6 +7,7 @@
 #include once "codegen/llvmrefs.ti"
 #include once "codegen/abi.ti"
 #include once "support/irtext.ti"
+#include once "support/dec128.ti"
 #include once "codegen/irsink.ti"
 
 namespace Tko.Codegen
@@ -59,22 +60,20 @@ type EmitCtx
     as boolean               curOpSet     '' false until the first instruction: then "" was printed
     '' '-g': the line tables, when asked for, and the line the next body line is on.
     as DebugInfo ptr         dbg
+    as boolean               asan         '' -fsanitize=address: each DEFINITION says sanitize_address, all clang's pass instruments
     as int32                  dbgLine
     '' WHICH HALF OF AN M_ALLOCA TO WRITE -- see EmitBlock's split: 0 both, 1 the 'alloca'
     '' line alone (hoisted to the top of the entry block), 2 everything but that line.
     as int32                  allocaPart
 end type
 
-'' Forward, because EmitGlobal dispatches to it and FreeBASIC resolves a private
-'' procedure only after it has been declared.
+'' Forward: FreeBASIC resolves a private procedure only after it has been declared --
+'' EmitVaArg_ (a fragment below) and SretAttr/ByvalAttr, called at 470 first.
 declare sub EmitVarGlobal _
     ( byref e as EmitCtx, byref g as MirGlobal, byref nm as string )
-'' Forward for the same reason: a CALL carries the sret attribute too, and call
-'' emission comes before the signature emission that defines it.
-declare function SretAttr _
-    ( byref e as EmitCtx, byval f as MirFunction ptr ) as string
-declare function ByvalAttr _
-    ( byref e as EmitCtx, byval f as MirFunction ptr, byval i as int32 ) as string
+declare sub EmitVaArg_( byref e as EmitCtx, byref res as string, byref ins as MirInst, byref ty as string )
+declare function SretAttr( byref e as EmitCtx, byval f as MirFunction ptr ) as string
+declare function ByvalAttr( byref e as EmitCtx, byval f as MirFunction ptr, byval i as int32 ) as string
 
 private sub Ice( byref e as EmitCtx, byref why as string )
     if len( e.ice ) > 0 then return
@@ -96,15 +95,14 @@ private function GlobalName( byref e as EmitCtx, byval nm as Tko.InternId ) as s
     return "@""" & e.names->Spelling( nm ) & """"
 end function
 
-'' A FRAME RECORD ON MACH-O. Apple's arm64 ABI has x29 point at a valid frame record, and
-'' clang puts "frame-pointer"="non-leaf" on every function it compiles there (Apple clang 21;
-'' Homebrew 23 writes non-leaf-no-reserve, and both accept non-leaf). IR handed to clang gets
-'' no such attribute unless it is written, so every tiko function saved x29 and never set it,
-'' and a macOS crash report showed the faulting frame and main with nothing between. clang
-'' writes none for COFF or ELF x86-64 at -O2, so neither does this (measured 2026-11-03).
-private function FrameAttr_( byref e as EmitCtx ) as string
-    if e.tgt->objFormat = OBJ_MACHO then return " ""frame-pointer""=""non-leaf"""
-    return ""
+'' A FRAME RECORD ON EVERY ARM64 TARGET. Apple's arm64 ABI has x29 point at a valid frame record,
+'' and clang puts "frame-pointer"="non-leaf" on every function there (Apple clang 21; Homebrew 23
+'' and aarch64-linux's clang 23 write non-leaf-no-reserve, which only frees x29 in leaves -- one
+'' spelling for both arm64 targets, docs/tiko-linux-arm64 D-L1-3). IR handed to clang gets none
+'' unless written: every tiko function saved x29 and never set it, so a macOS crash report showed
+'' the faulting frame and main, nothing between. None on x86-64, as clang -O2 (2026-11-03).
+private function FrameAttr_( byref e as EmitCtx ) as string   '' ...and -fsanitize=address's sanitize_address
+    return iif( e.tgt->layout.arch = Tko.ARCH_ARM64, " ""frame-pointer""=""non-leaf""", "" ) & iif( e.asan, " sanitize_address", "" )
 end function
 
 '' VALUES ARE NAMED, NOT NUMBERED. LLVM requires UNNAMED values to be numbered in
@@ -296,6 +294,7 @@ private function AlignOf _
     '' An array is aligned as its element.
     case MT_HFA_F32_1, MT_HFA_F32_2, MT_HFA_F32_3, MT_HFA_F32_4 : return 4
     case MT_HFA_F64_1, MT_HFA_F64_2, MT_HFA_F64_3, MT_HFA_F64_4, MT_A2_I64 : return 8
+    case MT_I128, MT_V2I64 : return 16
     end select
     dim as int32 a = e.tgt->layout.maxAlign
     if sizeBytes < a then
@@ -317,13 +316,11 @@ end function
 '' was copied with 'align 8' (audit F-74, CG-15). So it claims 1; x86 loses nothing.
 private function AggAccessAlign_ _
     ( byref e as EmitCtx, byval t as MirType, byval sizeBytes as int32, byref addr as MirValue ) as int32
-    if t <> MT_AGG then return AlignOf( e, t, sizeBytes )
-    if (addr.kind = cast( uint8, MV_LOCAL )) orelse (addr.kind = cast( uint8, MV_GLOBAL )) then
-        return AlignOf( e, t, sizeBytes )
-    end if
+    dim as boolean own = (addr.kind = cast( uint8, MV_LOCAL )) orelse (addr.kind = cast( uint8, MV_GLOBAL ))
+    if (t = MT_I128) andalso (own = false) then return 8   '' a computed address: 'field = 1' may misalign it
+    if (t <> MT_AGG) orelse own then return AlignOf( e, t, sizeBytes )
     return 1
 end function
-
 
 '' ---------------------------------------------------------------- instructions
 ''
@@ -349,6 +346,7 @@ private function IntTypeBits_( byref ty as string ) as int32
     case "i16" : return 16
     case "i32" : return 32
     case "i64" : return 64
+    case "i128" : return 128
     end select
     return 0
 end function
@@ -373,6 +371,23 @@ private sub EmitFloatToInt_ _
     dim as int32 w = IntTypeBits_( ty )
     if w = 0 then
         Line( e, res & " = " & iif( op = M_FPTOSI, "fptosi ", "fptoui " ) & src & " " & x & " to " & ty )
+        return
+    end if
+    if w = 128 then
+        const P127 = "0x47E0000000000000", N127 = "0xC7E0000000000000", P128 = "0x47F0000000000000", MIN128 = "-170141183460469231731687303715884105728"
+        Line( e, res & ".lo = fcmp oge " & src & " " & x & ", " & N127 )
+        Line( e, res & ".hi = fcmp olt " & src & " " & x & ", " & P127 )
+        Line( e, res & ".ok = and i1 " & res & ".lo, " & res & ".hi" )
+        Line( e, res & ".v = fptosi " & src & " " & x & " to i128" )
+        dim as string s128 = iif( op = M_FPTOSI, res, res & ".s" )
+        Line( e, s128 & " = select i1 " & res & ".ok, i128 " & res & ".v, i128 " & MIN128 )
+        if op = M_FPTOSI then return
+        Line( e, res & ".big = fcmp oge " & src & " " & x & ", " & P127 )
+        Line( e, res & ".top = fcmp olt " & src & " " & x & ", " & P128 )
+        Line( e, res & ".bok = and i1 " & res & ".big, " & res & ".top" )
+        Line( e, res & ".bv = fptoui " & src & " " & x & " to i128" )
+        Line( e, res & ".bs = select i1 " & res & ".bok, i128 " & res & ".bv, i128 " & MIN128 )
+        Line( e, res & " = select i1 " & res & ".big, i128 " & res & ".bs, i128 " & s128 )
         return
     end if
     if (op = M_FPTOSI) andalso (w <= 32) then
@@ -501,6 +516,44 @@ private function CallArgs _
     return r
 end function
 
+'' The type inside sret(...) is the object's byte array. clang also writes
+'' 'dead_on_unwind writable' -- optimisation permissions that depend on unwinding
+'' semantics tiko-lang does not have, left off rather than copied for resemblance.
+function SretAttr( byref e as EmitCtx, byval f as MirFunction ptr ) as string
+    if f->hasSretParam = false then return ""
+    if f->retSize <= 0 then return ""
+    return " sret(" & AggType( f->retSize ) & ") align " & _
+           str( AlignOf( e, MT_AGG, f->retSize ) )
+end function
+
+'' THE CALLING CONVENTION IN THE IR: 'x86_stdcallcc' on a win32 stdcall, nothing else --
+'' x86-64 collapsed the two; i386 keeps them apart over the mangler's decorated name
+'' (measured), matching at declare/define and every call like byval and sret.
+function CallConvAttr _
+    ( byref e as EmitCtx, byval f as MirFunction ptr ) as string
+
+    if (f = nullptr) orelse (e.tgt->layout.arch <> ARCH_X86_32) orelse _
+       (f->callConv <> TKO_CC_STDCALL) then return ""
+    return "x86_stdcallcc "
+end function
+
+'' Byval: identical on the signature and at the call site, like sret. The alignment is
+'' the class's ALIGN16, else natural -- EXCEPT i386's flat 4 (measured, 21.1.3).
+function ByvalAttr _
+    ( byref e as EmitCtx, byval f as MirFunction ptr, byval i as int32 ) as string
+
+    if (f = nullptr) orelse (i >= f->paramAttrs.Count) orelse _
+       (f->paramAttrs[i] <> TKO_PA_BYVAL) then return ""
+    dim as int32 sz = 0
+    if i < f->paramAggs.Count then sz = cast( int32, f->paramAggs[i] )
+    if sz <= 0 then return ""
+    return " byval(" & AggType( sz ) & ") align " & str( _
+        iif( e.tgt->layout.arch = ARCH_X86_32, 4, _
+             iif( (i < f->paramClasses.Count) andalso ((f->paramClasses[i] and TKO_EB_ALIGN16) <> 0), 16, AlignOf( e, MT_AGG, sz ) ) ) )
+end function
+
+'' --------------------------------------------------------------- the instruction
+
 private sub EmitInst( byref e as EmitCtx, byref ins as MirInst )
     dim as MirOp op = cast( MirOp, ins.op )
     e.curOpCode = op : e.curRes = ins.result : e.curOpSet = true
@@ -559,6 +612,7 @@ private sub EmitInst( byref e as EmitCtx, byref ins as MirInst )
                 e.constText[id] = IntAsPtr( ins.imm )
             else
                 e.constText[id] = str( ins.imm )
+                if rt = MT_I128 then e.constText[id] = Tko.Text.Dec128( cast( uint64, ins.immHi ), cast( uint64, ins.imm ), true )
             end if
         end if
 
@@ -592,6 +646,7 @@ private sub EmitInst( byref e as EmitCtx, byref ins as MirInst )
         '' claims more than the slot has (audit F-74, CG-15).
         dim as int32 sal = AlignOf( e, st, sz )
         if (st = MT_AGG) andalso (sal < e.tgt->layout.maxAlign) then sal = e.tgt->layout.maxAlign
+        if (st = MT_AGG) andalso e.m->align16 andalso (sz >= 16) andalso (sal < 16) then sal = 16   '' MirModule.align16
         if e.allocaPart <> 2 then
             Line( e, SlotName( slot ) & " = alloca " & LlvmType( st, sz ) & ", align " & str( sal ) )
         end if
@@ -911,7 +966,7 @@ private sub EmitInst( byref e as EmitCtx, byref ins as MirInst )
         Line( e, "call void @llvm.va_copy(ptr " & ValStr( e, ins.a ) & _
                  ", ptr " & ValStr( e, ins.b ) & ")" )
     case M_VA_ARG
-        Line( e, res & " = va_arg ptr " & ValStr( e, ins.a ) & ", " & ty )
+        EmitVaArg_( e, res, ins, ty )   '' llvmaggcopy.tiko: SysV's int128 is clang's sequence
 
     case else
         Ice( e, "no emission for opcode '" & OpName( op ) & "'" )
@@ -1066,61 +1121,6 @@ end sub
 '' callee must also return that pointer in RAX, and LLVM only knows to do that when the
 '' attribute is there -- measured against what clang emits for the same shape:
 ''
-''     declare dso_local void @r12(ptr dead_on_unwind writable sret(%struct.S12) align 4)
-''
-'' The type inside sret(...) is the object's, which here is its byte array. clang also
-'' writes 'dead_on_unwind' and 'writable'; both are optimisation permissions that depend
-'' on unwinding semantics tiko-lang does not have, so they are left off rather than
-'' copied for resemblance.
-function SretAttr( byref e as EmitCtx, byval f as MirFunction ptr ) as string
-    if f->hasSretParam = false then return ""
-    if f->retSize <= 0 then return ""
-    return " sret(" & AggType( f->retSize ) & ") align " & _
-           str( AlignOf( e, MT_AGG, f->retSize ) )
-end function
-
-'' BYVAL, for a SysV MEMORY-class aggregate.
-''
-'' Not a spelling of "pass a pointer": it says the argument travels ON THE STACK by
-'' value, which is what the SysV MEMORY class means. A plain pointer parameter would
-'' put an address in a register instead -- a different ABI, and one that links happily
-'' against a C callee and then reads the wrong bytes.
-''
-'' Like sret it must appear identically on the signature and at the call site, which is
-'' why both go through here.
-function ByvalAttr _
-    ( byref e as EmitCtx, byval f as MirFunction ptr, byval i as int32 ) as string
-
-    if f = nullptr then return ""
-    if i >= f->paramAttrs.Count then return ""
-    if f->paramAttrs[i] <> TKO_PA_BYVAL then return ""
-    dim as int32 sz = 0
-    if i < f->paramAggs.Count then sz = cast( int32, f->paramAggs[i] )
-    if sz <= 0 then return ""
-    dim as int32 al = AlignOf( e, MT_AGG, sz )
-    '' i386 HANDS EVERY STACK ARGUMENT A 4-ALIGNED SLOT: clang writes
-    '' 'byval(%struct.B24) align 4' even for a struct whose own alignment is 8
-    '' (measured, clang 21.1.3, i686-w64-windows-gnu, {long long x 3}) -- the struct's
-    '' own alignment would promise an 8-aligned area a C caller does not provide.
-    if e.tgt->layout.arch = ARCH_X86_32 then al = 4
-    return " byval(" & AggType( sz ) & ") align " & str( al )
-end function
-
-'' THE CALLING CONVENTION IN THE IR, 'x86_stdcallcc' and nothing else. On x86-64
-'' stdcall collapsed into cdecl -- both caller-cleanup -- so none was ever spelled
-'' here; i386 keeps them apart, clang spelling the stdcall one over the decorated
-'' name the mangler already writes. Measured, clang 21.1.3, i686-w64-windows-gnu:
-'' 'define x86_stdcallcc void @"\01_StdCall@8"(i32, i32)'. Like byval and sret it
-'' must read the same at declare/define and every call.
-private function CallConvAttr _
-    ( byref e as EmitCtx, byval f as MirFunction ptr ) as string
-
-    if f = nullptr then return ""
-    if e.tgt->layout.arch <> ARCH_X86_32 then return ""
-    if f->callConv <> TKO_CC_STDCALL then return ""
-    return "x86_stdcallcc "
-end function
-
 private function ParamList _
     ( byref e as EmitCtx, byval f as MirFunction ptr, byval named as boolean ) as string
 
@@ -1390,11 +1390,11 @@ end sub
 function EmitLlvm _
     ( byref m as MirModule, byref names as Tko.Interner, _
       byref target as TargetDescription, byval sm as Tko.SourceManager ptr, _
-      byval debugInfo as boolean, byval mainPath as string, byval dfe as DebugFrontend ptr ) as EmitResult
+      byval debugInfo as boolean, byval mainPath as string, byval dfe as DebugFrontend ptr, byval sanitizeAddress as boolean ) as EmitResult
 
     dim as EmitResult res
     dim as EmitCtx e
-    e.m = @m
+    e.m = @m : e.asan = sanitizeAddress
     e.names = @names
     e.tgt = @target
     if m.abiLowered = false then Ice( e, "the module reached the emitter without the ABI pass" )

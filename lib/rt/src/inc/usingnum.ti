@@ -1,0 +1,519 @@
+'' usingnum.ti -- PRINT USING's number formatter, as a TEMPLATE over its mantissa.
+''
+'' Instantiated twice by io/printusg.tiko: over a uint64 (fbc's, every macro below expanding
+'' to the expression it replaced, so the 64-bit entries are unchanged to the byte) and over
+'' a 128-bit pair for tiko's int128 / uint128. The host defines, before each #include:
+''
+''   UN_NAME           the routine's name           UN_T             the mantissa's type
+''   UN_NZ( x )        x <> 0                       UN_ISZ( x )      x = 0
+''   UN_SET( x, k )    x = the small constant k     UN_DIGITS( x )   decimal digits of x > 0
+''   UN_DIVP( x, n )   x / 10^n, rounded half up    UN_EQPOW( x, n ) x = 10^n
+''   UN_GEPOW( x, n )  x >= 10^n                    UN_MOD10( x )    x mod 10, as an int32
+''   UN_DIV10( x )     x \= 10, in place
+''
+'' No include guard: it is included once per instantiation.
+
+private function UN_NAME( byval fnum as int32, byval val_ as UN_T, _
+                               byval val_exp as int32, byval flags as int32, _
+                               byval mask as int32 ) as int32
+
+	dim as FB_PRINTUSGCTX ptr ctx = hCtx( )
+	dim as uint8 buffer(0 to BUFFERLEN)
+	dim as uint8 ptr p = any
+	dim as int32 val_digs = any, val_zdigs = any
+	dim as UN_T val0 = any
+	dim as int32 val_digs0 = any, val_exp0 = any
+	dim as int32 isneg_ = any, isfloat_ = any, issng_ = any
+	dim as int32 c = any, lc = any
+	dim as int32 doexit = any, padchar = any, intdigs = any, decdigs = any, expdigs = any
+	dim as int32 adddollar = any, addcommas = any, signatend = any, signatstart = any
+	dim as int32 plussign = any, toobig = any
+	dim as int32 intdigs2 = any, expsignchar = any, totdigs = any, decpoint = any
+	dim as int32 isamp = any, i = any
+	dim as uint64 chars_ = 0
+
+	if( ctx->chars = 0 ) then
+		ctx->ptr_ = ctx->fmtstr.data
+		ctx->chars = FB_STRSIZE( @ctx->fmtstr )
+	end if
+
+	hFmtStr( fnum )
+
+	padchar     = CHAR_SPACE
+	intdigs     = 0
+	decdigs     = -1            '' -1 means "no decimal point seen"
+	expdigs     = 0
+	adddollar   = 0
+	addcommas   = 0
+	signatend   = 0
+	signatstart = 0
+	plussign    = 0
+	toobig      = 0
+	isamp       = 0
+	lc = -1
+
+	if( ctx->ptr_ = nullptr ) then ctx->chars = 0
+
+	'' ---- parse the numeric field ----
+	while( ctx->chars > 0 )
+		'' A trailing sign or an '&' ends the field immediately.
+		if( signatend orelse isamp ) then exit while
+
+		c = ctx->ptr_[0]
+		doexit = 0
+
+		select case c
+		case 35                             '' '#'
+			if( expdigs <> 0 ) then
+				doexit = 1
+			elseif( decdigs <> -1 ) then
+				decdigs += 1
+			else
+				intdigs += 1
+			end if
+
+		case 46                             '' '.'
+			if( (decdigs <> -1) orelse (expdigs <> 0) ) then
+				doexit = 1
+			else
+				decdigs = 0
+			end if
+
+		case 42                             '' '*'
+			'' Two at the very start switch the padding to asterisks. The
+			'' FIRST one also counts as a digit position, and so does the
+			'' second -- "**#" is three positions wide, not one.
+			if( (intdigs = 0) andalso (decdigs = -1) ) then
+				padchar = CHAR_STAR
+				intdigs += 1
+			elseif( (intdigs = 1) andalso (lc = 42) ) then
+				intdigs += 1
+			else
+				doexit = 1
+			end if
+
+		case 36                             '' '$'
+			if( lc = 42 ) then
+				'' "**$" -- the dollar follows the two asterisks.
+				adddollar = 1
+			elseif( (intdigs = 0) andalso (decdigs = -1) ) then
+				if( adddollar = 0 ) then
+					adddollar = 1
+				else
+					'' The SECOND '$' is a digit position; the first is not.
+					intdigs += 1
+				end if
+			else
+				doexit = 1
+			end if
+
+		case 44                             '' ','
+			if( (decdigs <> -1) orelse (expdigs <> 0) ) then
+				doexit = 1
+			else
+				addcommas = 1
+				intdigs += 1
+			end if
+
+		case 43, 45                         '' '+' / '-'
+			if( signatstart ) then
+				doexit = 1
+			elseif( (intdigs = 0) andalso (decdigs = -1) ) then
+				if( c = 43 ) then plussign = 1
+				signatstart = 1
+			elseif( (expdigs = 0) orelse (expdigs >= MIN_EXPDIGS) ) then
+				'' At the end -- but only when the carets so far are either
+				'' none or a real exponent. Otherwise they are literal text.
+				if( c = 43 ) then plussign = 1
+				signatend = 1
+			else
+				doexit = 1
+			end if
+
+		case 94                             '' '^'
+			if( expdigs < MAX_EXPDIGS ) then
+				expdigs += 1
+			else
+				doexit = 1
+			end if
+
+		case 38                             '' '&' -- STR-like, natural form
+			if( (intdigs = 0) andalso (decdigs = -1) andalso (signatstart = 0) ) then
+				isamp = 1
+			else
+				doexit = 1
+			end if
+
+		case else
+			doexit = 1
+		end select
+
+		if( doexit ) then exit while
+
+		ctx->ptr_ += 1
+		ctx->chars -= 1
+		lc = c
+	wend
+
+	'' ---- classify the value ----
+	isneg_ = iif( (flags and VAL_ISNEG) <> 0, 1, 0 )
+	isfloat_ = iif( (flags and VAL_ISFLOAT) <> 0, 1, 0 )
+	issng_ = iif( (flags and VAL_ISSNG) <> 0, 1, 0 )
+
+	if( (flags and (VAL_ISINF or VAL_ISIND or VAL_ISNAN)) <> 0 ) then
+		if( (flags and VAL_ISINF) <> 0 ) then
+			chars_ = CHARS_INF
+		elseif( (flags and VAL_ISIND) <> 0 ) then
+			chars_ = CHARS_IND
+		elseif( (flags and VAL_ISNAN) <> 0 ) then
+			chars_ = CHARS_NAN
+		end if
+		'' 1.1234 is a PLACEHOLDER whose digits are replaced by the text
+		'' above, one character per digit position. The value is never
+		'' printed; only its shape matters.
+		UN_SET( val_, 11234 )
+		val_exp = -4
+	end if
+
+	if( isamp andalso ((flags and VAL_ISBOOL) <> 0) ) then
+		'' "&" on a BOOLEAN prints true/false through the same digit
+		'' machinery, again using the mantissa only to count characters.
+		if( UN_NZ( val_ ) ) then
+			chars_ = CHARS_TRUE
+			UN_SET( val_, 1234 )
+			isneg_ = 0
+		else
+			chars_ = CHARS_FALSE
+			UN_SET( val_, 12345 )
+		end if
+		val_exp = 0
+	end if
+
+	if( UN_NZ( val_ ) ) then val_digs = UN_DIGITS( val_ ) else val_digs = 0
+	val_zdigs = 0
+
+	'' ---- "&": choose the field from the VALUE, not the format ----
+	if( isamp ) then
+		if( issng_ ) then
+			if( val_digs > SNG_AUTODIGS ) then
+				val_ = UN_DIVP( val_, val_digs - SNG_AUTODIGS )
+				val_exp += val_digs - SNG_AUTODIGS
+				val_digs = SNG_AUTODIGS
+			end if
+
+			if( UN_ISZ( val_ ) ) then
+				val_digs = 0
+				val_exp = -decdigs
+			elseif( UN_EQPOW( val_, val_digs ) ) then
+				'' Rounding up carried into the next power of ten.
+				UN_SET( val_, 1 )
+				val_exp += val_digs
+				val_digs = 1
+			end if
+		end if
+
+		if( isfloat_ ) then
+			while( (val_digs > 1) andalso (UN_MOD10( val_ ) = 0) )
+				UN_DIV10( val_ )
+				val_digs -= 1
+				val_exp += 1
+			wend
+		end if
+
+		if( val_digs + val_exp > 0 ) then
+			intdigs = val_digs + val_exp
+		else
+			intdigs = 1
+		end if
+
+		if( val_exp < 0 ) then decdigs = -val_exp
+
+		if( isfloat_ ) then
+			'' Switch to scientific when fixed point would be unreasonable.
+			if( (intdigs > 16) orelse (issng_ andalso (intdigs > 7)) orelse _
+			    (val_digs + val_exp - 1 < -MIN_EXPDIGS) ) then
+				intdigs = 1
+				decdigs = val_digs - 1
+				expdigs = 2 + hNumDigits( abs( val_digs + val_exp - 1 ) )
+				if( expdigs < MIN_EXPDIGS + 1 ) then expdigs = MIN_EXPDIGS
+			end if
+		end if
+
+		if( isneg_ ) then signatstart = 1
+	end if
+
+	'' Crop to what the buffer can hold, taking it out of the decimals first.
+	if( intdigs + 1 + decdigs > MAX_DIGS ) then
+		decdigs -= ((intdigs + 1 + decdigs) - MAX_DIGS)
+		if( decdigs < -1 ) then
+			intdigs -= (-1 - decdigs)
+			decdigs = -1
+		end if
+	end if
+
+	if( decdigs <= -1 ) then
+		decpoint = 0
+		decdigs = 0
+	else
+		decpoint = 1
+	end if
+
+	'' ---- emit, backwards ----
+	p = @buffer(BUFFERLEN)
+	ADD_CHAR( 0 )
+
+	if( signatend ) then
+		if( isneg_ ) then
+			ADD_CHAR( CHAR_MINUS )
+		else
+			ADD_CHAR( iif( plussign, CHAR_PLUS, CHAR_SPACE ) )
+		end if
+	elseif( isneg_ andalso (signatstart = 0) ) then
+		'' An implicit '-' STEALS A DIGIT POSITION, which is why a negative
+		'' number in a "###" field has one fewer digit than a positive one.
+		signatstart = 1
+		intdigs -= 1
+	end if
+
+	'' ---- fixed point ----
+	if( expdigs < MIN_EXPDIGS ) then
+		'' Carets that never reached MIN_EXPDIGS are literal text, emitted
+		'' here because the buffer is being filled from the right.
+		while( expdigs > 0 )
+			ADD_CHAR( 94 )                  '' '^'
+			expdigs -= 1
+		wend
+
+		val0 = val_
+		val_digs0 = val_digs
+		val_exp0 = val_exp
+
+		if( val_exp < -decdigs ) then
+			'' Scale and ROUND so that val_exp reaches -decdigs exactly.
+			val_exp += (-decdigs - val_exp0)
+			val_digs -= (-decdigs - val_exp0)
+			val_ = UN_DIVP( val_, -decdigs - val_exp0 )
+
+			if( UN_ISZ( val_ ) ) then
+				val_digs = 0
+				val_exp = -decdigs
+			elseif( UN_EQPOW( val_, val_digs ) ) then
+				UN_SET( val_, 1 )
+				val_exp += val_digs
+				val_digs = 1
+			end if
+		end if
+
+		intdigs2 = val_digs + val_exp
+		if( intdigs2 < 0 ) then intdigs2 = 0
+		if( addcommas ) then intdigs2 += (intdigs2 - 1) \ 3
+
+		'' Compare the two representations and take whichever needs fewer
+		'' digits. MIN_EXPDIGS is the allowance for the exponent itself.
+		if( intdigs2 > intdigs + MIN_EXPDIGS ) then
+			expdigs = MIN_EXPDIGS
+			toobig = 1
+			val_ = val0
+			val_digs = val_digs0
+			val_exp = val_exp0
+			val_zdigs = 0
+		else
+			if( intdigs2 > intdigs ) then
+				'' Slightly too wide: widen the field and mark it with '%'
+				'' rather than truncating the number.
+				intdigs = intdigs2
+				toobig = 1
+			end if
+
+			if( val_exp > -decdigs ) then
+				'' Trailing zeroes implied by the exponent become explicit.
+				val_zdigs = val_exp - -decdigs
+				val_exp = -decdigs
+			end if
+		end if
+	end if
+
+	'' ---- floating point ----
+	if( expdigs > 0 ) then
+		addcommas = 0                       '' commas are unused in f-p form
+
+		if( (intdigs = -1) orelse ((intdigs = 0) andalso (decdigs = 0)) ) then
+			intdigs += 1
+			'' QB could prepend two independent '%'s; one is enough.
+			toobig = 1
+		end if
+
+		totdigs = intdigs + decdigs         '' the two are treated alike
+		val_exp += decdigs                  '' move the point to the end
+
+		'' A POSITIVE NUMBER WITH NO EXPLICIT SIGN BLANKS ITS FIRST DIGIT, so
+		'' positives and negatives line up -- QB behaviour, and the reason a
+		'' "&" value is exempt.
+		if( (isamp = 0) andalso (isneg_ = 0) andalso _
+		    (signatstart = 0) andalso (signatend = 0) ) then
+			if( (intdigs >= 1) andalso (totdigs > 1) ) then totdigs -= 1
+		end if
+
+		if( UN_ISZ( val_ ) ) then
+			val_exp = 0
+			val_zdigs = decdigs
+		elseif( val_digs < totdigs ) then
+			val_zdigs = totdigs - val_digs
+			val_exp -= val_zdigs
+		elseif( val_digs > totdigs ) then
+			val_ = UN_DIVP( val_, val_digs - totdigs )
+			val_exp += (val_digs - totdigs)
+			val_digs = totdigs
+			val_zdigs = 0
+			if( UN_GEPOW( val_, val_digs ) ) then
+				UN_DIV10( val_ )
+				val_exp += 1
+			end if
+		else
+			val_zdigs = 0
+		end if
+
+		if( val_exp < 0 ) then
+			expsignchar = CHAR_MINUS
+			val_exp = -val_exp
+		else
+			expsignchar = CHAR_PLUS
+		end if
+
+		while( expdigs > 3 )
+			ADD_CHAR( CHAR_ZERO + (val_exp mod 10) )
+			val_exp \= 10
+			expdigs -= 1
+		wend
+
+		if( val_exp > 9 ) then
+			'' More exponent digits than the field allows. QB cropped these;
+			'' fbc emits them all and adds a '%'.
+			do
+				ADD_CHAR( CHAR_ZERO + (val_exp mod 10) )
+				val_exp \= 10
+			loop while( val_exp > 9 )
+			ADD_CHAR( CHAR_ZERO + val_exp )
+			ADD_CHAR( CHAR_TOOBIG )
+		else
+			ADD_CHAR( CHAR_ZERO + val_exp )
+		end if
+
+		expdigs -= 1
+		ADD_CHAR( expsignchar )
+		ADD_CHAR( CHAR_EXP_SINGLE )         '' QB used 'D' for doubles
+		expdigs -= 2
+	end if
+
+	'' INF/IND/NAN whose text does not fit the field.
+	if( (chars_ <> 0) andalso (val_digs < 5) andalso ((flags and VAL_ISBOOL) = 0) ) then
+		'' QB would not add the '%', and "#" would then print an
+		'' innocent-looking "1". QB also corrupted the string data when
+		'' truncated, so deviating here is deliberate.
+		toobig = 1
+		if( val_digs > 1 ) then
+			chars_ = CHARS_TRUNC shr (8 * (5 - val_digs))
+		else
+			chars_ = 0
+		end if
+	end if
+
+	'' ---- decimals ----
+	if( decpoint ) then
+		while( decdigs > 0 )
+			if( val_zdigs > 0 ) then
+				ADD_CHAR( CHAR_ZERO )
+				val_zdigs -= 1
+			elseif( val_digs > 0 ) then
+				if( chars_ <> 0 ) then
+					'' One character of "#INF"/"true"/... per digit position.
+					ADD_CHAR( chars_ and &hff )
+					chars_ shr= 8
+				else
+					ADD_CHAR( CHAR_ZERO + UN_MOD10( val_ ) )
+				end if
+				UN_DIV10( val_ )
+				val_digs -= 1
+			else
+				ADD_CHAR( CHAR_ZERO )
+			end if
+			decdigs -= 1
+		wend
+		ADD_CHAR( CHAR_DOT )
+	end if
+
+	'' ---- integer part ----
+	'' The comma test is `(i and 3) = 3`, NOT `i mod 3`, because i counts
+	'' emitted positions INCLUDING the commas themselves -- every fourth
+	'' position is a comma, which is every third digit.
+	i = 0
+	do
+		if( addcommas andalso ((i and 3) = 3) andalso (val_digs > 0) ) then
+			ADD_CHAR( CHAR_COMMA )
+		elseif( val_zdigs > 0 ) then
+			ADD_CHAR( CHAR_ZERO )
+			val_zdigs -= 1
+		elseif( val_digs > 0 ) then
+			if( chars_ <> 0 ) then
+				ADD_CHAR( chars_ and &hff )
+				chars_ shr= 8
+			else
+				ADD_CHAR( CHAR_ZERO + UN_MOD10( val_ ) )
+			end if
+			UN_DIV10( val_ )
+			val_digs -= 1
+		else
+			'' A field with at least one position always shows a leading 0.
+			if( (i = 0) andalso (intdigs > 0) ) then
+				ADD_CHAR( CHAR_ZERO )
+			else
+				exit do
+			end if
+		end if
+		i += 1
+		intdigs -= 1
+	loop
+
+	'' Block form, not single-line: ADD_CHAR expands to a SCOPE, which a
+	'' single-line IF cannot contain -- the error lands on the function's
+	'' `end function` as "expected END IF", thirty lines away.
+	if( adddollar ) then
+		ADD_CHAR( CHAR_DOLLAR )
+	end if
+
+	if( signatstart ) then
+		if( isneg_ ) then
+			ADD_CHAR( CHAR_MINUS )
+		else
+			'' padchar, not a space: under "**" a positive sign position is
+			'' filled with an asterisk.
+			ADD_CHAR( iif( plussign, CHAR_PLUS, padchar ) )
+		end if
+	end if
+
+	while( intdigs > 0 )
+		ADD_CHAR( padchar )
+		intdigs -= 1
+	wend
+
+	while( toobig > 0 )
+		ADD_CHAR( CHAR_TOOBIG )
+		toobig -= 1
+	wend
+
+	'' p points one BELOW the first character written, so step forward once.
+	p += 1
+	tkrt_PrintFixString( fnum, cptr( zstring ptr, p ), 0 )
+
+	hFmtStr( fnum )
+
+	if( (mask and (FB_PRINT_NEWLINE or FB_PRINT_PAD)) <> 0 ) then
+		tkrt_PrintVoid( fnum, mask and (FB_PRINT_NEWLINE or FB_PRINT_PAD) )
+	end if
+
+	if( (mask and FB_PRINT_ISLAST) <> 0 ) then
+		tkrt_StrDelete( @ctx->fmtstr )
+	end if
+
+	return tkrt_ErrorSetNum( FB_RTERROR_OK )
+end function

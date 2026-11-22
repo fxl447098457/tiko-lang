@@ -46,7 +46,7 @@ was compiled and run on windows-x86_64, and the output shown is the real output.
 - The toolchain ships two packages:
   - **`std`**, the standard library: strings, files, containers, dates, concurrency and more. It is
     written in tiko.
-  - **`vendor`**, popular C libraries — SQLite, raylib, SDL3, cJSON — ready to use, with the
+  - **`vendor`**, popular C libraries — SQLite, raylib, SDL3, cJSON, PCRE2 — ready to use, with the
     library files included.
 
 You do not install, download or configure either of them. If tiko is installed, `std` and `vendor`
@@ -395,6 +395,7 @@ the whole library.
 | `vendor/raylib6` | raylib, games and graphics (with `vendor/raylib6/raymath`, `vendor/raylib6/rlgl`) |
 | `vendor/SDL3` | SDL 3, windows, input, audio (with `vendor/SDL3/image`, `/ttf`, `/mixer`) |
 | `vendor/cJSON` | cJSON, reading and writing JSON (with `vendor/cJSON/utils`) |
+| `vendor/pcre2` | PCRE2, Perl-compatible regular expressions ([tutorial](PCRE2-Tutorial)) |
 
 The full list, with the versions and the link modes each one ships, is on
 [Vendor Packages](Vendor-Packages).

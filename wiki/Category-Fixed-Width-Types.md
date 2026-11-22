@@ -4,7 +4,7 @@
 
 ## The names
 
-Ten type names that say their width, each the same type as another built-in name:
+Twelve type names that say their width. Ten are the same type as another built-in name; `int128` and `uint128` are types of their own (see [128-bit integers](#128-bit-integers)):
 
 | tiko | Same type as | Bytes | Range |
 |---|---|---|---|
@@ -18,6 +18,8 @@ Ten type names that say their width, each the same type as another built-in name
 | `uint64` | [ULongInt](Ulongint) | 8 | 0 to 18446744073709551615 |
 | `float32` | [Single](Single) | 4 | IEEE 754 single precision |
 | `float64` | [Double](Double) | 8 | IEEE 754 double precision |
+| `int128` | (its own type) | 16 | -170141183460469231731687303715884105728 to 170141183460469231731687303715884105727 |
+| `uint128` | (its own type) | 16 | 0 to 340282366920938463463374607431768211455 |
 
 The sizes are the same on every target.
 
@@ -34,7 +36,7 @@ print red; total; ratio
 
 ## They are the same types
 
-Each name is a typedef, not a new type: `int32` *is* `long`. Values mix freely with no conversion, a procedure that takes `long` accepts an `int32`, and an overload on `int64` is the overload on `longint`. The names leave no trace in the ABI, so a procedure's linker symbol is the one it gets with the names they stand for:
+Each name up to `float64` is a typedef, not a new type: `int32` *is* `long`. Values mix freely with no conversion, a procedure that takes `long` accepts an `int32`, and an overload on `int64` is the overload on `longint`. The names leave no trace in the ABI, so a procedure's linker symbol is the one it gets with the names they stand for:
 
 ```freebasic
 namespace N
@@ -64,6 +66,24 @@ This prints `4 8 5 7`. Because tiko ignores case, `INT32` and `int32` are the sa
 A name used *above* the program's declaration is fine when the declaration gives it the type tiko does, as `win/basetsd.bi` does: `dim as int32 n` and then `#include "windows.bi"` compiles, and so does a module whose interface uses `int32`, imported by a program that includes `windows.bi`, and so does an alias such as `type base_id as int32` used above it. Above a declaration of a *different* type, such as a `type uint8 as integer` written below a `dim as uint8`, the use is error `TKO0784` (`TKO0811` through an alias): the code above it would otherwise change meaning.
 
 **The program's declaration replaces the name throughout the program**, not just in its own file. `jpeglib.bi` declares `type INT32 as clong`, which is 8 bytes on Linux x86-64. A Linux program that includes it therefore gets an 8-byte `int32`.
+
+## 128-bit integers
+
+`int128` and `uint128` are full integer types, 16 bytes wide and 16-byte aligned, on every target:
+
+```freebasic
+dim as int128 big = cast( int128, 1 ) shl 100
+dim as uint128 most = 340282366920938463463374607431768211455
+print big * 3 + 7; " "; hex( most ); " "; most \ big
+```
+
+- **Arithmetic** is every integer operator, wrapping modulo 2^128. An expression with an `int128` operand is `int128` (`uint128` if an unsigned operand of that width is), as a `longint` operand makes it `longint`.
+- **Literals** past 64 bits need no suffix. A decimal literal is `int128` up to 2^127 - 1 and `uint128` above; a `&h`, `&o` or `&b` literal past 64 bits is `int128`. A literal with an `LL` or `ULL` suffix is still 64 bits, and past that it is truncated with warning `TKO0205`, as is any literal past 128 bits.
+- **Constants** fold at 128 bits: `const K as int128 = cast( int128, 1 ) shl 100` and `const K2 = K * 3 + 7` are exact, in a `dim shared` initialiser, a UDT literal, `DATA` and `str( K2 )`. `#if` arithmetic stays 64-bit, and a literal past 64 bits there is error `TKO0308`.
+- **Conversions** to and from `double` and `single` go both ways; a float out of range becomes the type's minimum.
+- **Text**: `print`, `str`, `wstr`, `write`, `print using`, `hex`, `oct`, `bin` and their wide forms, `input` and `read` all take the full 128 bits.
+- **C**: `int128` is C's `__int128`, with the same size, alignment and calling convention on Windows and Linux, including in `...` arguments and through `cva_arg`. In C++ symbols it mangles as `n` and `uint128` as `o`.
+- **Not yet**: an `int128` or `uint128` bit field is error `TKO1100`.
 
 ## What is not included
 

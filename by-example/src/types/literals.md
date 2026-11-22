@@ -30,8 +30,13 @@ fit in 32 signed bits, but does fit in 32 unsigned ones, so it gets the type
 `uinteger`. Arithmetic with an unsigned operand is unsigned, so
 `3000000000 - 3000000001` wraps round to 18446744073709551615 instead of
 giving -1. A suffix fixes it: with `LL` on both literals the subtraction is
-done in `int64`. Literals above 4294967295 are `integer` again.
+done in `int64`. Literals above 4294967295 are `integer` again, and the
+same happens one size up: 9223372036854775808 to 18446744073709551615 is
+`uinteger`.
 ```
+
+Past 64 bits a literal is 128-bit, with no suffix, and the rule repeats a
+third time: a decimal literal is `int128` up to 2^127 - 1 and `uint128` above.
 
 ### Activities
 

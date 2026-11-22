@@ -36,6 +36,8 @@ theme roles; rescale of the padding.
   next paint, mouse event or `IsMenuOpen`.
 - `CPM_NOTIFY_*` / `SetNotifyWindow` → the dropdown's select and closed callbacks.
 - Added `GetColors` (vendor has none) and `GetHotIndex`.
+- Added `PaintItemDefault( p )`: the stock item, for an item-paint callback (the form designer's
+  Paint event).
 
 **Dropped as Win32-only:** `FilterMessage`, the 100 ms hot-track poll (`IDT_CMENUBAR_HOTTRACK`,
 `PSMENUBAR_HOTTRACK_MS`), `WM_ERASEBKGND`, `CS_DBLCLKS`, `WM_ACTIVATEAPP` advice (the host

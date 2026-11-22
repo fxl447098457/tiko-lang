@@ -4,48 +4,23 @@
 
 > 📘 **Start with:** [Using C Libraries](Using-C-Libraries-Tutorial), the ideas these steps rely on.
 >
-> 📖 **In the book:** [Chapter 30, raylib](https://tiko-lang.net/book/ch30-c-libraries.html#raylib). Measured with raylib 6.0, on Windows and Linux.
+> 📖 **In the book:** [Chapter 30, raylib](https://tiko-lang.net/book/ch30-c-libraries.html#raylib). `vendor/raylib6` (raylib 6.2) measured on Windows and Linux; your own build (step 7) measured with raylib 6.0.
 
-[raylib](https://www.raylib.com) is a library for making games. It has one header and 600 functions with plain names, and nothing to set up before your first window. It covers 2D and 3D drawing, textures, fonts, keyboard, mouse, gamepads and sound. raylib publishes ready-built packages for both of tiko's platforms, so nothing has to be compiled.
+[raylib](https://www.raylib.com) is a library for making games. It has one header and 600 functions with plain names, and nothing to set up before your first window. It covers 2D and 3D drawing, textures, fonts, keyboard, mouse, gamepads and sound.
+
+tiko ships raylib as a [vendor package](Vendor-Packages). One line gives a program all of raylib's API and links the library:
+
+```freebasic
+#import "vendor/raylib6"
+```
+
+There is nothing to download, no header to translate, no `#foreignlib` and nothing on the command line. raylib's own examples, ported to tiko, are in the toolchain's `examples/raylib6`.
+
+> ⚠️ **Windows and Linux only.** `vendor/raylib6` is not available on macOS yet; importing it there stops with `TKO0309: #error: "vendor/raylib6 on macOS needs framework linking, not yet supported"`.
 
 ---
 
-## 1. Download
-
-Go to [github.com/raysan5/raylib/releases](https://github.com/raysan5/raylib/releases), open release **6.0**, and download:
-
-| File | For | Contains |
-|---|---|---|
-| `raylib-6.0_win64_msvc16.zip` | Windows | `include/raylib.h` (+ `raymath.h`, `rlgl.h`)<br>`lib/raylib.lib` (**static**, 5.3 MB)<br>`lib/raylibdll.lib` (**import library**)<br>`lib/raylib.dll` |
-| `raylib-6.0_linux_amd64.tar.gz` | Linux | the same headers<br>`lib/libraylib.a` (**static**)<br>`lib/libraylib.so.6.0.0`, plus links `libraylib.so.600` and `libraylib.so` |
-
-Ignore the `win32` (32-bit), `mingw-w64` (another toolchain), `arm64`, `macos` and `webassembly` packages.
-
-## 2. Copy the files into your project
-
-The project keeps raylib in `vendor/raylib/`. Rename the **link-time** files so that each carries its target. Both platforms can then share the folder, and one `#foreignlib` line finds the right file on each.
-
-**From the Windows zip:**
-
-| Copy | To |
-|---|---|
-| `include/raylib.h` | `vendor/raylib/raylib.h` |
-| `lib/raylib.lib` | `vendor/raylib/raylib_windows_x86_64.lib` |
-| `lib/raylibdll.lib` | `vendor/raylib/raylibdll_windows_x86_64.lib` |
-| `lib/raylib.dll` | `raylib.dll`, **beside your program** (do not rename) |
-
-**From the Linux tarball:**
-
-| Copy | To |
-|---|---|
-| `include/raylib.h` | `vendor/raylib/raylib.h` (the same file) |
-| `lib/libraylib.a` | `vendor/raylib/raylib_linux_x86_64.a` |
-| `lib/libraylib.so.6.0.0` | `vendor/raylib/raylibdll_linux_x86_64.so` |
-| `lib/libraylib.so.6.0.0` | `libraylib.so.600`, **beside your program** (the soname; do not change it) |
-
-On Linux use `cp -L` (or copy the real file `libraylib.so.6.0.0`), so that you copy the library and not a link to it.
-
-## 3. Your first window (static link)
+## 1. Your first window
 
 This is raylib's first example, `core_basic_window`:
 
@@ -53,16 +28,7 @@ This is raylib's first example, `core_basic_window`:
 '' raylib's first example, core_basic_window: open a window and draw a
 '' line of text until it is closed. A number on the command line stops
 '' it after that many frames instead.
-#cinclude once "vendor/raylib/raylib.h"
-#ifdef __FB_WIN32__
-    #foreignlib RAYLIB static "vendor/raylib/raylib", _
-        "system:winmm", "system:gdi32", "system:user32", _
-        "system:shell32"
-#else
-    #foreignlib RAYLIB static "vendor/raylib/raylib", _
-        "system:GL", "system:m", "system:pthread", "system:dl", _
-        "system:rt", "system:X11"
-#endif
+#import "vendor/raylib6"
 
 const ScreenWidth = 800
 const ScreenHeight = 450
@@ -92,84 +58,45 @@ tiko raylib-window.tiko
 ./raylib-window
 ```
 
-An 800×450 window opens with *"Congrats! You created your first window!"* in grey. Close it, and the program prints how many frames it drew. Give it a number, as in `./raylib-window 60`, and it stops by itself after that many frames.
+An 800×450 window opens with *"Congrats! You created your first window!"* in grey. Close it, and the program prints how many frames it drew. Give it a number, as in `./raylib-window 60`, and it stops by itself after that many frames:
 
-**What is new compared with the C example:**
+```
+drew 60 frames
+```
 
-- **The `#foreignlib` line differs by platform**, because a static raylib needs the operating system's libraries too, and they differ:
-  - Windows: `winmm` (timers), `gdi32`, `user32`, `shell32`
-  - Linux: OpenGL (`GL`), `m`, `pthread`, `dl`, `rt` and `X11`, the list raylib's documentation gives
+**What the import does:**
 
-  `#ifdef __FB_WIN32__` chooses between them.
-- **`SetTraceLogLevel( LOG_WARNING )`**: raylib reports everything it does on standard output, about forty lines when a window opens. Leave it out to see them.
-- **`RAYWHITE` and `LIGHTGRAY`** are C macros that build a `Color` struct. `#cinclude` turns them into tiko definitions that build the same `Color`, and `DrawText` takes the `Color` **by value**, as in C.
+- **raylib's names, unqualified**: `InitWindow`, `DrawText`, `KEY_RIGHT`, `Vector2`, as raylib documents them. They come from `raylib.h`, translated once by [`tiko c2t`](C2t) and shipped with the toolchain.
+- **The library, linked dynamically** when no `link` is given, and **copied beside the program**: `raylib.dll` on Windows, `libraylib.so.620` on Linux. On Linux the program is linked with a run path of `$ORIGIN`, so it finds the copy beside it with no `LD_LIBRARY_PATH`. The program is 29 KB; `raylib.dll` is 1.8 MB.
+- **`RAYWHITE` and `LIGHTGRAY`** are C macros that build a `Color` struct. The translation has them as `type<Color>(245, 245, 245, 255)` and so on, and `DrawText` takes the `Color` **by value**, as in C.
 
-## 4. The same window, linked dynamically
+`SetTraceLogLevel( LOG_WARNING )` is raylib's, not tiko's: raylib reports everything it does on standard output, about forty lines when a window opens. Leave it out to see them.
 
-Replace the directives at the top with:
+## 2. Linked statically
+
+Change the import, nothing else:
 
 ```freebasic
-#cinclude once "vendor/raylib/raylib.h"
-#foreignlib RAYLIB dynamic "vendor/raylib/raylibdll"
+#import "vendor/raylib6" link static
 ```
 
-The DLL brings its own system libraries, so none are listed. The program shrinks from 608 KB to 27 KB, and needs `raylib.dll` (Windows) or `libraylib.so.600` (Linux) at run time:
+raylib is then inside the program, which runs with nothing beside it: 491 KB on Windows, 945 KB on Linux. The link adds the system libraries a static raylib needs by itself:
 
-```bash
-tiko raylib-dll.tiko
-./raylib-dll                          # Windows: raylib.dll beside it
-LD_LIBRARY_PATH=. ./raylib-dll        # Linux
-```
+| Target | What the link adds |
+|---|---|
+| Windows | `winmm` (timers), `gdi32`, `user32`, `shell32` |
+| Linux | OpenGL (`GL`), `m`, `pthread`, `dl`, `rt` and `X11` |
 
-If the library cannot be found, Windows exits with `-1073741515` and prints nothing, while Linux says `error while loading shared libraries: libraylib.so.600` and exits with 127.
+On Linux, a static program still needs the system's OpenGL and X11 libraries when it runs, as any desktop program does.
 
-## 5. A binding header
+## 3. Keyboard input
 
-Repeating the `#cinclude` line and the platform-specific `#foreignlib` lines in every program gets old. Put them in a file of their own, `vendor/raylib.ti`:
-
-```freebasic
-'' raylib.ti -- raylib 6.0 for tiko: its header, and the library to
-'' link, in one file a program includes. Both paths are relative to
-'' this file, so the folder it sits in can live anywhere: inside one
-'' project, or in a single place that every program shares.
-#pragma once
-
-#cinclude once "raylib/raylib.h"
-
-#ifdef __FB_WIN32__
-    #foreignlib RAYLIB static "raylib/raylib", _
-        "system:winmm", "system:gdi32", "system:user32", _
-        "system:shell32"
-#else
-    #foreignlib RAYLIB static "raylib/raylib", _
-        "system:GL", "system:m", "system:pthread", "system:dl", _
-        "system:rt", "system:X11"
-#endif
-```
-
-Its paths are relative to **itself**: `#foreignlib` always resolves that way, and `#cinclude` looks beside the file that names the header. So the folder works wherever it lives.
-
-## 6. A project that uses it
-
-`game/tiko.toml` says where the bindings are, relative to `tiko.toml`:
-
-```toml
-# A program that uses raylib without saying where raylib is: the
-# -i below names the folder of bindings, relative to this file.
-[package]
-name = "game"
-
-[target.game]
-main    = "main.tiko"
-options = ["-i", "../vendor"]
-```
-
-`game/main.tiko` is raylib's example `core_input_keys`. Move the ball with the arrow keys:
+`core_input_keys` moves a ball with the arrow keys:
 
 ```freebasic
 '' raylib's example core_input_keys: move a ball with the arrow keys.
 '' A number on the command line stops it after that many frames.
-#include once "raylib.ti"
+#import "vendor/raylib6"
 
 const ScreenWidth = 800
 const ScreenHeight = 450
@@ -202,137 +129,141 @@ print "ball at "; str( ball.x ); ", "; str( ball.y ); _
 ```
 
 ```bash
-cd game
-tiko build game
-./out/debug/game
+tiko raylib-keys.tiko
+./raylib-keys 30
+```
+
+```
+ball at 400, 225 after 30 frames
 ```
 
 `ball` is a `Vector2`, a C struct of two floats. `type( ... )` fills it, and it is passed to `DrawCircleV` by value. `KEY_RIGHT` and the other key names come from a C `enum` in `raylib.h`.
 
-## 7. One copy for every program
+## 4. raymath and rlgl
 
-**Windows** has no standard place for C libraries, so make one, such as `C:\tiko-libs`:
+raylib's two other headers are modules of their own, as they are headers of their own in C:
 
-```
-C:\tiko-libs\raylib.ti
-C:\tiko-libs\raylib\raylib.h
-C:\tiko-libs\raylib\raylib_windows_x86_64.lib
-C:\tiko-libs\raylib\raylibdll_windows_x86_64.lib
-```
+| Import | What it is |
+|---|---|
+| `#import "vendor/raylib6/raymath"` | vector, matrix and quaternion arithmetic: `Vector2Add`, `Vector3Normalize`, `MatrixRotateY` |
+| `#import "vendor/raylib6/rlgl"` | raylib's immediate-mode layer over OpenGL: `rlPushMatrix`, `rlTranslatef`, `rlBegin`, `rlVertex3f` |
 
-Every project then writes `#include once "raylib.ti"` and adds `options = ["-i", "C:/tiko-libs"]` to its `tiko.toml`, or passes `-i C:\tiko-libs` on the command line. When linking dynamically, also copy `raylib.dll` beside each program, or add the folder holding it to `PATH`.
-
-**Linux**: recent distributions package raylib as `libraylib-dev` (Ubuntu 24.04 does not). Otherwise install the prebuilt tarball under `/usr/local`:
-
-```bash
-sudo cp include/*.h /usr/local/include/
-sudo cp -P lib/libraylib.* /usr/local/lib/
-sudo ldconfig
-```
-
-Programs then need no paths:
+Each brings `vendor/raylib6` with it, so one import is enough:
 
 ```freebasic
-#cinclude once "raylib.h"
-#foreignlib RAYLIB dynamic "system:raylib"
+'' raymath, raylib's vector and matrix library: no window needed.
+#import "vendor/raylib6/raymath"
+
+dim a as Vector2 = type( 3, 4 )
+dim b as Vector2 = type( 1, 2 )
+dim c as Vector2 = Vector2Add( a, b )
+print "a + b = "; str( c.x ); ", "; str( c.y )
+print "|a|   = "; str( Vector2Length( a ) )
+dim n as Vector3 = Vector3Normalize( type<Vector3>( 0, 0, 5 ) )
+print "norm  = "; str( n.x ); ", "; str( n.y ); ", "; str( n.z )
 ```
 
-## 8. A binding module
+```
+a + b = 4, 6
+|a|   = 5
+norm  = 0, 0, 1
+```
 
-Instead of a header, raylib can be a **module** that programs `#import`. The module says `public #cinclude`, which makes raylib's names the names of every program that imports it:
+raymath's functions are `inline` in C; raylib's libraries export every one of them, so here each is an ordinary call into the library.
+
+**The link mode is chosen on `vendor/raylib6`**, the module that links. For a static program that uses raymath, write both imports:
 
 ```freebasic
-'' raylib as a module. 'public #cinclude' makes raylib.h's names the
-'' names of every program that imports the module, and the module's
-'' own #foreignlib links the library into each of them. Both paths are
-'' relative to this file.
-#module "raylib"
+#import "vendor/raylib6" link static
+#import "vendor/raylib6/raymath"
+```
 
-public #cinclude once "../../vendor/raylib/raylib.h"
+`link` on raymath or rlgl themselves is `TKO0155`, because they link nothing of their own.
 
+## 5. In a project
+
+A [`tiko build`](Category-Tiko-Build) project needs nothing in its `tiko.toml` for raylib: the import says it all.
+
+```toml
+[package]
+name = "game"
+
+[target.game]
+main = "main.tiko"
+```
+
+`tiko build`'s `copy_to` copies the shared library along with the program.
+
+## 6. Shipping the program
+
+- **Linked dynamically:** ship `raylib.dll` (Windows) or `libraylib.so.620` (Linux) beside the program. The build already put it there.
+- **Linked statically:** the program alone.
+
+If the shared library is missing, Windows exits with `-1073741515` and prints nothing (from Git Bash: `error while loading shared libraries: raylib.dll`, exit 127), while Linux says `error while loading shared libraries: libraylib.so.620`. Windows also looks in the current directory, so test a copy from its own folder.
+
+## 7. Your own raylib build
+
+Use this when you need a different raylib version from the one `vendor/raylib6` ships, or raylib built with your own options. It replaces the import with the parts the vendor package does for you.
+
+**Get it** from [github.com/raysan5/raylib/releases](https://github.com/raysan5/raylib/releases):
+
+| File | For | Contains |
+|---|---|---|
+| `raylib-6.0_win64_msvc16.zip` | Windows | `include/raylib.h` (+ `raymath.h`, `rlgl.h`)<br>`lib/raylib.lib` (**static**, 5.3 MB)<br>`lib/raylibdll.lib` (**import library**)<br>`lib/raylib.dll` |
+| `raylib-6.0_linux_amd64.tar.gz` | Linux | the same headers<br>`lib/libraylib.a` (**static**)<br>`lib/libraylib.so.6.0.0`, plus links `libraylib.so.600` and `libraylib.so` |
+
+**Copy the files into your project**, renaming the link-time files so that each carries its target. Both platforms can then share the folder, and one `#foreignlib` line finds the right file on each:
+
+| Copy | To |
+|---|---|
+| `include/raylib.h` | `vendor/raylib/raylib.h` |
+| `lib/raylib.lib` (Windows) | `vendor/raylib/raylib_windows_x86_64.lib` |
+| `lib/raylibdll.lib` (Windows) | `vendor/raylib/raylibdll_windows_x86_64.lib` |
+| `lib/raylib.dll` (Windows) | `raylib.dll`, **beside your program** |
+| `lib/libraylib.a` (Linux) | `vendor/raylib/raylib_linux_x86_64.a` |
+| `lib/libraylib.so.6.0.0` (Linux) | `vendor/raylib/raylibdll_linux_x86_64.so`, and `libraylib.so.600` **beside your program** |
+
+On Linux use `cp -L` (or copy the real file `libraylib.so.6.0.0`), so that you copy the library and not a link to it.
+
+**Then replace the `#import`** with raylib's own header, read by `#cinclude`, and the library, linked by `#foreignlib`. Statically, with the system libraries step 2 lists:
+
+```freebasic
+#cinclude once "vendor/raylib/raylib.h"
 #ifdef __FB_WIN32__
-    #foreignlib RAYLIB static "../../vendor/raylib/raylib", _
+    #foreignlib RAYLIB static "vendor/raylib/raylib", _
         "system:winmm", "system:gdi32", "system:user32", _
         "system:shell32"
 #else
-    #foreignlib RAYLIB static "../../vendor/raylib/raylib", _
+    #foreignlib RAYLIB static "vendor/raylib/raylib", _
         "system:GL", "system:m", "system:pthread", "system:dl", _
         "system:rt", "system:X11"
 #endif
 ```
 
-```toml
-# A program that imports raylib as a module: the -i below names the
-# folder that holds module folders, relative to this file.
-[package]
-name = "modgame"
-
-[target.modgame]
-main    = "main.tiko"
-options = ["-i", "../modules"]
-```
+Or dynamically, where the DLL brings its own system libraries:
 
 ```freebasic
-'' raylib's core_basic_window once more, through the raylib module:
-'' one #import, and every raylib name is the program's own.
-'' A number on the command line stops it after that many frames.
-#import "raylib"
-
-dim maxFrames as int32 = valint( command( 1 ) )  '' 0: until closed
-
-SetTraceLogLevel( LOG_WARNING )
-InitWindow( 800, 450, "raylib [core] example - basic window" )
-SetTargetFPS( 60 )
-
-dim frames as int32 = 0
-do until WindowShouldClose( )
-    BeginDrawing( )
-    ClearBackground( RAYWHITE )
-    DrawText( "Congrats! You created your first window!", _
-        190, 200, 20, LIGHTGRAY )
-    EndDrawing( )
-    frames += 1
-    if frames = maxFrames then exit do
-loop
-CloseWindow( )
-print "drew "; str( frames ); " frames"
-```
-
-```bash
-cd modgame
-tiko build modgame
-./out/debug/modgame 60
-```
-
-```
-drew 60 frames
-```
-
-The names are bare (`InitWindow`, not `raylib.InitWindow`), as `#cinclude` makes them, because a C header's `#define`s and struct macros cannot live in a namespace. To install the module for every program, put its folder in a directory named by `TIKO_PATH` (`set TIKO_PATH=C:\tiko-modules` on Windows, `export TIKO_PATH=~/tiko-modules` on Linux) and give the module's paths to its own library files.
-
-## 9. Linux: finding `libraylib.so.600` without `LD_LIBRARY_PATH`
-
-Record the program's own directory as an **rpath**:
-
-```freebasic
-#cmdline "-x raylib-rpath -Wl -rpath,$ORIGIN"
 #cinclude once "vendor/raylib/raylib.h"
 #foreignlib RAYLIB dynamic "vendor/raylib/raylibdll"
 ```
 
-The program then finds `libraylib.so.600` beside it wherever it is copied. In a shell, quote the option: `tiko raylib-dll.tiko -Wl '-rpath,$ORIGIN'`.
+To keep those lines out of every program, put them in a **binding header** or a **binding module**, as [Using C Libraries](Using-C-Libraries-Tutorial#5-a-binding-header) shows; a binding module is exactly what `vendor/raylib6` is.
 
-## 10. Troubleshooting
+## 8. Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `undefined symbol: __declspec(dllimport) DragQueryFileW` linking statically on Windows | a system library is missing (that one is `shell32`); the full list is `winmm`, `gdi32`, `user32`, `shell32` |
-| `undefined reference to 'XOpenDisplay'` linking statically on Linux | add `"system:X11"` (and the rest of the list in step 3) |
+| `TKO0140: cannot find module 'vendor/raylib'` | the package is `vendor/raylib6` |
+| `TKO0309: #error: "vendor/raylib6 on macOS needs framework linking, not yet supported"` | raylib is not available on macOS yet |
+| `undefined reference to 'fmod@GLIBC_2.38'` on Linux | toolchain 0.1.5 or older: its raylib shared library needs glibc 2.38; use a newer toolchain, or `#import "vendor/raylib6" link static` |
+| `TKO0155: 'link static' on '#import "vendor/raylib6/raymath"': package 'vendor' links nothing` | put `link` on `#import "vendor/raylib6"` instead (step 4) |
 | a long list of `INFO:` lines | `SetTraceLogLevel( LOG_WARNING )` before `InitWindow` |
-| `TKO0329` with `raylib.a` among the names tried | rename the Linux archive to `raylib_linux_x86_64.a`; untagged, Windows would try it before `raylib.lib` |
+| `undefined symbol: __declspec(dllimport) DragQueryFileW` linking statically on Windows (your own build) | a system library is missing (that one is `shell32`); the full list is `winmm`, `gdi32`, `user32`, `shell32` |
+| `undefined reference to 'XOpenDisplay'` linking statically on Linux (your own build) | add `"system:X11"` (and the rest of the list in step 2) |
+| `TKO0329` with `raylib.a` among the names tried (your own build) | rename the Linux archive to `raylib_linux_x86_64.a`; untagged, Windows would try it before `raylib.lib` |
 
 ---
 
-**Next:** [GLFW](GLFW-Tutorial) · [SDL3](SDL3-Tutorial) · **Back:** [SQLite](SQLite-Tutorial)
+**Next:** [GLFW](GLFW-Tutorial) · [SDL3](SDL3-Tutorial) · **Back:** [SQLite](SQLite-Tutorial) · [Vendor Packages](Vendor-Packages)
 
 [Home](Home)

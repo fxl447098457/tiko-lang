@@ -1,0 +1,703 @@
+'' semmatch.tiko -- what 'match' needs types for (docs/tiko-comparison RFC-0001-match): TKO1250-1257.
+''
+'' parser/match.tiko desugars a match before anything has a type, and leaves a RECORD on the arena
+'' (AstArena.matchRecs) keyed by the variable that holds the subject's copy, '__tko_m<N>'. Asked of
+'' every N_VAR_ITEM by semwalk.tiko; on that variable's declaration the subject's type is known, and
+'' the record is judged against it:
+''
+''   - a pattern that cannot fit the subject: a tuple pattern over a non-tuple (1257), 'Name( ... )'
+''     over another type (1252), the wrong number of fields (1253), a type pattern over something
+''     that is not a pointer to a class (1254), 'starts' over a non-string (1255);
+''   - a binding that hides a constant or enum member (1256, a warning);
+''   - EXHAUSTIVENESS (1250) and REACHABILITY (1251, a warning), by Maranget's usefulness check over
+''     the patterns' constructors: boolean (TRUE, FALSE), a named enum (its members' VALUES -- two
+''     may share one), a tuple or UDT (one constructor, its elements or fields), and everything else
+''     open, covered only by a wildcard. A guarded arm covers nothing. A value that is not TRUE /
+''     FALSE or an enum member is OPAQUE: it covers nothing either, and never makes a later arm
+''     unreachable.
+''
+'' Record grammar (parser/match.tiko Record_):
+''     name|S or E|loc|arm;arm;...        arm = g|u loc ':' pat('/'pat)*
+''     pat = W | B<name>~ | V<text>~ | R<lo>~<hi>~ | O | T(pat,...) | U<name>~<loc>~(pat,...)
+''         | C<class>~<bind>~ | S<bind>~          text '?' = not a plain name or integer
+
+#import "std/containers"
+#include once "symbols/sem.ti"
+#include once "diag/diagids.ti"
+#include once "symbols/check.ti"
+#include once "types/udtlayout.ti"
+#include once "support/text.ti"
+
+namespace Tko.Sem
+
+#include once "symbols/visctx.ti"
+#include once "symbols/semcalls.ti"
+
+enum MShapeKind_
+    MSK_OPEN = 0
+    MSK_BOOL
+    MSK_ENUM
+    MSK_PROD
+end enum
+
+type MShape_
+    as int32 kind
+    as TypeId t
+    as int32 k0, nk                 '' ENUM: its values in evals / enames; PROD: child shapes in skids
+    as ScopeId inner                '' ENUM: the members' scope
+    as boolean tuple_
+end type
+
+enum MPatKind_
+    MPW = 0                         '' a wildcard
+    MPC                             '' a constructor: TRUE / FALSE, an enum value, a tuple or UDT
+    MPX                             '' opaque: matches something, covers nothing
+end enum
+
+type MPat_
+    as int32 kind
+    as int64 ctor
+    as int32 k0, nk                 '' children, in pkids
+end type
+
+type MMat_
+    as int32 w, h
+    as containers.Array( of int32 ) cells
+end type
+
+type MCtx_
+    as containers.Array( of MShape_ ) shapes
+    as containers.Array( of int32 ) skids
+    as containers.Array( of int64 ) evals
+    as StrVec enames
+    as containers.Array( of MPat_ ) pats
+    as containers.Array( of int32 ) pkids
+    as int32 wild
+    as boolean bad
+    as ScopeId scope_
+    as SourceLoc armLoc
+end type
+
+'' ----------------------------------------------------------------------- shapes
+
+private function Core_( byref c as Ctx, byval t as TypeId ) as TypeId
+    if t = TYPE_NONE then return t
+    t = c.types->Unqualify( t )
+    if c.types->Kind( t ) = TK_REFERENCE then t = c.types->Unqualify( c.types->Inner( t ) )
+    return t
+end function
+
+private function TypeSym_( byref c as Ctx, byval t as TypeId ) as Symbol ptr
+    dim as InternId tn = c.types->NameOf( t )
+    if tn = 0 then return nullptr
+    dim as ScopeId ds = cast( ScopeId, c.types->DeclScopeOf( t ) )
+    dim as SymbolId ts = c.syms->LookupLocalTyped( ds, tn, true )
+    if ts = SYMBOL_NONE then ts = c.syms->LookupTyped( ds, tn, true )
+    return c.syms->SymbolAt( ts )
+end function
+
+private function ShapeOf_( byref c as Ctx, byref mc as MCtx_, byval t0 as TypeId ) as int32
+    dim as TypeId t = Core_( c, t0 )
+    for i as int32 = 0 to mc.shapes.Count - 1
+        if mc.shapes[i].t = t then return i
+    next
+    dim as MShape_ sh
+    sh.t = t
+    sh.kind = MSK_OPEN
+    mc.shapes.Push( sh )
+    dim as int32 me = mc.shapes.Count - 1
+    if t = TYPE_NONE then return me
+    select case c.types->Kind( t )
+    case TK_BUILTIN
+        if c.types->BuiltinOf( t ) = TY_BOOLEAN then mc.shapes[me].kind = MSK_BOOL
+    case TK_ENUM
+        dim as Symbol ptr es = TypeSym_( c, t )
+        if (es = nullptr) orelse (es->inner = SCOPE_NONE) then return me
+        dim as int32 k0 = mc.evals.Count
+        dim as SymbolId mid_ = c.syms->ScopeAt( es->inner )->firstSym
+        while mid_ <> SYMBOL_NONE
+            dim as Symbol ptr ms = c.syms->SymbolAt( mid_ )
+            if ms = nullptr then exit while
+            if ms->kind = cast( uint8, SYM_ENUMCONST ) then
+                dim as boolean seen = false
+                for i as int32 = k0 to mc.evals.Count - 1
+                    if mc.evals[i] = ms->payload then seen = true
+                next
+                if seen = false then
+                    mc.evals.Push( ms->payload )
+                    mc.enames.Push( c.names->Spelling( ms->name ) )
+                end if
+            end if
+            mid_ = ms->nextInScope
+        wend
+        if mc.evals.Count > k0 then
+            mc.shapes[me].kind = MSK_ENUM
+            mc.shapes[me].k0 = k0
+            mc.shapes[me].nk = mc.evals.Count - k0
+            mc.shapes[me].inner = es->inner
+        end if
+    case TK_UDT
+        dim as Symbol ptr us = TypeSym_( c, t )
+        if (us = nullptr) orelse (us->inner = SCOPE_NONE) then return me
+        dim as InternId baseNm = c.names->Fold( c.names->GetString( "base" ) )
+        dim as containers.Array( of TypeId ) fts
+        dim as SymbolId fid = c.syms->ScopeAt( us->inner )->firstSym
+        while fid <> SYMBOL_NONE
+            dim as Symbol ptr f = c.syms->SymbolAt( fid )
+            if f = nullptr then exit while
+            if (f->kind = cast( uint8, SYM_FIELD )) andalso ((f->flags and SYMF_STATIC) = 0) andalso _
+               ((f->flags and SYMF_SUPERSEDED) = 0) andalso (f->name <> baseNm) then
+                fts.Push( f->type_ )
+            end if
+            fid = f->nextInScope
+        wend
+        dim as containers.Array( of int32 ) ks
+        for i as int32 = 0 to fts.Count - 1
+            ks.Push( ShapeOf_( c, mc, fts[i] ) )
+        next
+        mc.shapes[me].kind = MSK_PROD
+        mc.shapes[me].k0 = mc.skids.Count
+        mc.shapes[me].nk = ks.Count
+        mc.shapes[me].tuple_ = (left( c.names->Spelling( c.types->NameOf( t ) ), 5 ) = "$tup:")
+        for i as int32 = 0 to ks.Count - 1
+            mc.skids.Push( ks[i] )
+        next
+    end select
+    return me
+end function
+
+private function Ctors_( byref mc as MCtx_, byval sh as int32 ) as int32
+    select case mc.shapes[sh].kind
+    case MSK_BOOL : return 2
+    case MSK_ENUM : return mc.shapes[sh].nk
+    case MSK_PROD : return 1
+    end select
+    return 0
+end function
+
+private function CtorAt_( byref mc as MCtx_, byval sh as int32, byval i as int32 ) as int64
+    select case mc.shapes[sh].kind
+    case MSK_BOOL : return i
+    case MSK_ENUM : return mc.evals[mc.shapes[sh].k0 + i]
+    end select
+    return 0
+end function
+
+private function Arity_( byref mc as MCtx_, byval sh as int32 ) as int32
+    if mc.shapes[sh].kind = MSK_PROD then return mc.shapes[sh].nk
+    return 0
+end function
+
+'' --------------------------------------------------------------- the record's text
+
+private function Upto_( byref s as string, byref pos as int32, byval ch as string ) as string
+    dim as int32 e = instr( pos, s, ch )
+    if e = 0 then e = len( s ) + 1
+    dim as string r = mid( s, pos, e - pos )
+    pos = e + 1
+    return r
+end function
+
+private function NewPat_( byref mc as MCtx_, byval kind as int32, byval ctor as int64 = 0 ) as int32
+    dim as MPat_ m
+    m.kind = kind
+    m.ctor = ctor
+    mc.pats.Push( m )
+    return mc.pats.Count - 1
+end function
+
+'' 'Red', 'Light.Red', 'NS.Light.Red' or an integer, as a value of the enum shape 'sh'.
+private function EnumValue_( byref c as Ctx, byref mc as MCtx_, byval sh as int32, byref text as string, _
+                             byref v as int64 ) as boolean
+    if (len( text ) = 0) orelse (text = "?") then return false
+    dim as string first_ = left( text, 1 )
+    if (first_ = "-") orelse ((first_ >= "0") andalso (first_ <= "9")) then
+        v = vallng( text )
+        for i as int32 = 0 to mc.shapes[sh].nk - 1
+            if mc.evals[mc.shapes[sh].k0 + i] = v then return true
+        next
+        return false
+    end if
+    dim as int32 dot = instrrev( text, "." )
+    dim as string seg = mid( text, dot + 1 )
+    dim as SymbolId ms = c.syms->LookupLocal( mc.shapes[sh].inner, c.names->Fold( c.names->GetString( seg ) ) )
+    dim as Symbol ptr m = c.syms->SymbolAt( ms )
+    if (m = nullptr) orelse (m->kind <> cast( uint8, SYM_ENUMCONST )) then return false
+    v = m->payload
+    return true
+end function
+
+private sub Shadow_( byref c as Ctx, byref mc as MCtx_, byref bn as string )
+    if len( bn ) = 0 then exit sub
+    dim as SymbolId sid = c.syms->Lookup( mc.scope_, c.names->Fold( c.names->GetString( bn ) ) )
+    dim as Symbol ptr s = c.syms->SymbolAt( sid )
+    if s = nullptr then exit sub
+    if (s->kind = cast( uint8, SYM_CONSTANT )) orelse (s->kind = cast( uint8, SYM_ENUMCONST )) then
+        c.diags->Report( TKO1256, PointRange( mc.armLoc ), bn )
+    end if
+end sub
+
+private function IsStringy_( byref c as Ctx, byval t as TypeId ) as boolean
+    t = Core_( c, t )
+    if t = TYPE_NONE then return true
+    if c.types->Kind( t ) <> TK_BUILTIN then return false
+    select case c.types->BuiltinOf( t )
+    case TY_STRING, TY_ZSTRING, TY_WSTRING, TY_USTRING, TY_FIXSTR
+        return true
+    end select
+    return false
+end function
+
+private function LastSeg_( byref s as string ) as string
+    return Tko.Text.LowerAscii( mid( s, instrrev( s, "." ) + 1 ) )
+end function
+
+declare function Conv_( byref c as Ctx, byref mc as MCtx_, byref s as string, byref pos as int32, _
+                        byval sh as int32 ) as int32
+
+'' '(' pat ',' ... ')' -- each against its child shape; sh < 0 reads them and judges nothing.
+private sub ConvKids_( byref c as Ctx, byref mc as MCtx_, byref s as string, byref pos as int32, _
+                       byval sh as int32, byref out_ as containers.Array( of int32 ) )
+    pos += 1                                            '' '('
+    dim as int32 i = 0
+    while (pos <= len( s )) andalso (mid( s, pos, 1 ) <> ")")
+        dim as int32 ksh = -1
+        if (sh >= 0) andalso (i < mc.shapes[sh].nk) then ksh = mc.skids[mc.shapes[sh].k0 + i]
+        out_.Push( Conv_( c, mc, s, pos, ksh ) )
+        i += 1
+        if mid( s, pos, 1 ) = "," then pos += 1
+    wend
+    pos += 1                                            '' ')'
+end sub
+
+'' One encoded pattern at 'pos', judged against shape 'sh' (-1: read it, judge nothing).
+function Conv_( byref c as Ctx, byref mc as MCtx_, byref s as string, byref pos as int32, _
+                byval sh as int32 ) as int32
+    dim as string ch = mid( s, pos, 1 )
+    pos += 1
+    dim as TypeId t = TYPE_NONE
+    if sh >= 0 then t = mc.shapes[sh].t
+    select case ch
+    case "W"
+        return mc.wild
+    case "B"
+        dim as string bn = Upto_( s, pos, "~" )
+        if sh >= 0 then Shadow_( c, mc, bn )
+        return mc.wild
+    case "V"
+        dim as string text = Upto_( s, pos, "~" )
+        if sh < 0 then return mc.wild
+        if mc.shapes[sh].kind = MSK_BOOL then
+            if LastSeg_( text ) = "true" then return NewPat_( mc, MPC, 1 )
+            if LastSeg_( text ) = "false" then return NewPat_( mc, MPC, 0 )
+        elseif mc.shapes[sh].kind = MSK_ENUM then
+            dim as int64 v
+            if EnumValue_( c, mc, sh, text, v ) then return NewPat_( mc, MPC, v )
+        end if
+        return NewPat_( mc, MPX )
+    case "R"
+        Upto_( s, pos, "~" ) : Upto_( s, pos, "~" )
+        return NewPat_( mc, MPX )
+    case "O"
+        return NewPat_( mc, MPX )
+    case "S"
+        dim as string bn = Upto_( s, pos, "~" )
+        if sh < 0 then return mc.wild
+        Shadow_( c, mc, bn )
+        if IsStringy_( c, t ) = false then
+            c.diags->Report( TKO1255, PointRange( mc.armLoc ), c.types->Name( t ) )
+            mc.bad = true
+        end if
+        return NewPat_( mc, MPX )
+    case "C"
+        Upto_( s, pos, "~" )
+        dim as string bn = Upto_( s, pos, "~" )
+        if sh < 0 then return mc.wild
+        Shadow_( c, mc, bn )
+        dim as boolean ok = false
+        if t <> TYPE_NONE then
+            if c.types->Kind( t ) = TK_POINTER then
+                ok = (c.types->Kind( Core_( c, c.types->Inner( t ) ) ) = TK_UDT)
+            end if
+        else
+            ok = true
+        end if
+        if ok = false then
+            c.diags->Report( TKO1254, PointRange( mc.armLoc ), c.types->Name( t ) )
+            mc.bad = true
+        end if
+        return NewPat_( mc, MPX )
+    case "T", "U"
+        dim as string nm
+        dim as SourceLoc at = mc.armLoc
+        if ch = "U" then
+            nm = Upto_( s, pos, "~" )
+            at = cast( SourceLoc, valuint( Upto_( s, pos, "~" ) ) )
+        end if
+        dim as int32 ksh = -1
+        if sh >= 0 then
+            dim as boolean fits = (mc.shapes[sh].kind = MSK_PROD)
+            if fits then
+                if ch = "T" then
+                    fits = mc.shapes[sh].tuple_
+                else
+                    fits = (mc.shapes[sh].tuple_ = false) andalso _
+                           (LastSeg_( nm ) = LastSeg_( c.names->Spelling( c.types->NameOf( t ) ) ))
+                end if
+            end if
+            if t = TYPE_NONE then
+                fits = false
+            elseif fits = false then
+                if ch = "T" then
+                    c.diags->Report( TKO1257, PointRange( at ), c.types->Name( t ) )
+                else
+                    c.diags->Report( TKO1252, PointRange( at ), nm, c.types->Name( t ) )
+                end if
+                mc.bad = true
+            end if
+            if fits then ksh = sh
+        end if
+        dim as containers.Array( of int32 ) ks
+        ConvKids_( c, mc, s, pos, ksh, ks )
+        if ksh < 0 then return mc.wild
+        if ks.Count <> mc.shapes[sh].nk then
+            c.diags->Report( TKO1253, PointRange( at ), c.types->Name( t ), _
+                             str( mc.shapes[sh].nk ), str( ks.Count ) )
+            mc.bad = true
+            return mc.wild
+        end if
+        dim as int32 pi = NewPat_( mc, MPC, 0 )
+        mc.pats[pi].k0 = mc.pkids.Count
+        mc.pats[pi].nk = ks.Count
+        for i as int32 = 0 to ks.Count - 1
+            mc.pkids.Push( ks[i] )
+        next
+        return pi
+    end select
+    return mc.wild
+end function
+
+'' ------------------------------------------------------------- the usefulness check
+
+private sub Row_( byref m as MMat_, byval r as int32, byref out_ as containers.Array( of int32 ) )
+    out_.SetCount( 0 )
+    for i as int32 = 0 to m.w - 1
+        out_.Push( m.cells[r * m.w + i] )
+    next
+end sub
+
+'' The vector 'q' specialised by constructor 'ctor' of shape 'sh': its head's children (or as many
+'' wildcards), then its tail. False when the head is another constructor or opaque.
+private function SpecRow_( byref mc as MCtx_, byref q as containers.Array( of int32 ), byval sh as int32, _
+                           byval ctor as int64, byval opaqueIsWild as boolean, _
+                           byref out_ as containers.Array( of int32 ) ) as boolean
+    out_.SetCount( 0 )
+    dim as MPat_ h = mc.pats[q[0]]
+    dim as int32 a = Arity_( mc, sh )
+    if (h.kind = MPC) then
+        if (mc.shapes[sh].kind <> MSK_PROD) andalso (h.ctor <> ctor) then return false
+        for i as int32 = 0 to h.nk - 1
+            out_.Push( mc.pkids[h.k0 + i] )
+        next
+        for i as int32 = h.nk to a - 1
+            out_.Push( mc.wild )
+        next
+    elseif (h.kind = MPW) orelse opaqueIsWild then
+        for i as int32 = 1 to a
+            out_.Push( mc.wild )
+        next
+    else
+        return false
+    end if
+    for i as int32 = 1 to q.Count - 1
+        out_.Push( q[i] )
+    next
+    return true
+end function
+
+private sub Spec_( byref mc as MCtx_, byref m as MMat_, byval sh as int32, byval ctor as int64, byref out_ as MMat_ )
+    out_.w = Arity_( mc, sh ) + m.w - 1
+    out_.h = 0
+    out_.cells.SetCount( 0 )
+    dim as containers.Array( of int32 ) r, s
+    for i as int32 = 0 to m.h - 1
+        Row_( m, i, r )
+        if SpecRow_( mc, r, sh, ctor, false, s ) then
+            for k as int32 = 0 to s.Count - 1
+                out_.cells.Push( s[k] )
+            next
+            out_.h += 1
+        end if
+    next
+end sub
+
+private sub Default_( byref mc as MCtx_, byref m as MMat_, byref out_ as MMat_ )
+    out_.w = m.w - 1
+    out_.h = 0
+    out_.cells.SetCount( 0 )
+    for i as int32 = 0 to m.h - 1
+        if mc.pats[m.cells[i * m.w]].kind = MPW then
+            for k as int32 = 1 to m.w - 1
+                out_.cells.Push( m.cells[i * m.w + k] )
+            next
+            out_.h += 1
+        end if
+    next
+end sub
+
+'' Do the heads of 'm' name every constructor of 'sh'? (Never, for an open shape.)
+private function Complete_( byref mc as MCtx_, byref m as MMat_, byval sh as int32 ) as boolean
+    dim as int32 n = Ctors_( mc, sh )
+    if n = 0 then return false
+    for k as int32 = 0 to n - 1
+        dim as int64 cv = CtorAt_( mc, sh, k )
+        dim as boolean got = false
+        for i as int32 = 0 to m.h - 1
+            dim as MPat_ h = mc.pats[m.cells[i * m.w]]
+            if (h.kind = MPC) andalso ((mc.shapes[sh].kind = MSK_PROD) orelse (h.ctor = cv)) then
+                got = true
+                exit for
+            end if
+        next
+        if got = false then return false
+    next
+    return true
+end function
+
+private sub Cols_( byref mc as MCtx_, byref cols as containers.Array( of int32 ), byval sh as int32, _
+                   byref out_ as containers.Array( of int32 ) )
+    out_.SetCount( 0 )
+    if mc.shapes[sh].kind = MSK_PROD then
+        for i as int32 = 0 to mc.shapes[sh].nk - 1
+            out_.Push( mc.skids[mc.shapes[sh].k0 + i] )
+        next
+    end if
+    for i as int32 = 1 to cols.Count - 1
+        out_.Push( cols[i] )
+    next
+end sub
+
+'' Is there a value 'q' matches that no row of 'm' does? (Maranget, "Warnings for pattern
+'' matching", 2007.) An opaque head in 'q' is read as a wildcard: it may match anything.
+private function Useful_( byref mc as MCtx_, byref m as MMat_, byref q as containers.Array( of int32 ), _
+                          byref cols as containers.Array( of int32 ), byval depth as int32 ) as boolean
+    if cols.Count = 0 then return (m.h = 0)
+    if depth > 64 then return true
+    dim as int32 sh = cols[0]
+    dim as MPat_ h = mc.pats[q[0]]
+    dim as containers.Array( of int32 ) c2
+    Cols_( mc, cols, sh, c2 )
+    if h.kind = MPC then
+        dim as MMat_ sm
+        dim as containers.Array( of int32 ) sq
+        Spec_( mc, m, sh, h.ctor, sm )
+        SpecRow_( mc, q, sh, h.ctor, true, sq )
+        return Useful_( mc, sm, sq, c2, depth + 1 )
+    end if
+    if Complete_( mc, m, sh ) then
+        for k as int32 = 0 to Ctors_( mc, sh ) - 1
+            dim as int64 cv = CtorAt_( mc, sh, k )
+            dim as MMat_ sm
+            dim as containers.Array( of int32 ) sq
+            Spec_( mc, m, sh, cv, sm )
+            SpecRow_( mc, q, sh, cv, true, sq )
+            if Useful_( mc, sm, sq, c2, depth + 1 ) then return true
+        next
+        return false
+    end if
+    dim as MMat_ dm
+    Default_( mc, m, dm )
+    dim as containers.Array( of int32 ) tq, tc
+    for i as int32 = 1 to q.Count - 1
+        tq.Push( q[i] )
+    next
+    for i as int32 = 1 to cols.Count - 1
+        tc.Push( cols[i] )
+    next
+    return Useful_( mc, dm, tq, tc, depth + 1 )
+end function
+
+private function Render_( byref c as Ctx, byref mc as MCtx_, byval sh as int32, byval ctor as int64, _
+                          byref kids as StrVec, byval k0 as int32 ) as string
+    select case mc.shapes[sh].kind
+    case MSK_BOOL
+        return iif( ctor <> 0, "TRUE", "FALSE" )
+    case MSK_ENUM
+        for i as int32 = 0 to mc.shapes[sh].nk - 1
+            if mc.evals[mc.shapes[sh].k0 + i] = ctor then return mc.enames[mc.shapes[sh].k0 + i]
+        next
+    case MSK_PROD
+        dim as string r
+        for i as int32 = 0 to mc.shapes[sh].nk - 1
+            if i > 0 then r &= ", "
+            r &= kids[k0 + i]
+        next
+        if mc.shapes[sh].tuple_ then return "(" & r & ")"
+        return c.types->Name( mc.shapes[sh].t ) & "( " & r & " )"
+    end select
+    return "any"
+end function
+
+'' A value no row of 'm' matches, one string per column -- false when there is none.
+private function Missing_( byref c as Ctx, byref mc as MCtx_, byref m as MMat_, _
+                           byref cols as containers.Array( of int32 ), byref out_ as StrVec, _
+                           byval depth as int32 ) as boolean
+    out_.SetCount( 0 )
+    if cols.Count = 0 then return (m.h = 0)
+    if depth > 64 then return false
+    dim as int32 sh = cols[0]
+    dim as int32 a = Arity_( mc, sh )
+    if Complete_( mc, m, sh ) then
+        dim as containers.Array( of int32 ) c2
+        Cols_( mc, cols, sh, c2 )
+        for k as int32 = 0 to Ctors_( mc, sh ) - 1
+            dim as int64 cv = CtorAt_( mc, sh, k )
+            dim as MMat_ sm
+            Spec_( mc, m, sh, cv, sm )
+            dim as StrVec sub_
+            if Missing_( c, mc, sm, c2, sub_, depth + 1 ) then
+                out_.Push( Render_( c, mc, sh, cv, sub_, 0 ) )
+                for i as int32 = a to sub_.Count - 1
+                    out_.Push( sub_[i] )
+                next
+                return true
+            end if
+        next
+        return false
+    end if
+    dim as MMat_ dm
+    Default_( mc, m, dm )
+    dim as containers.Array( of int32 ) tc
+    for i as int32 = 1 to cols.Count - 1
+        tc.Push( cols[i] )
+    next
+    dim as StrVec sub_
+    if Missing_( c, mc, dm, tc, sub_, depth + 1 ) = false then return false
+    '' The head: a constructor no row names, when the shape has a finite set; 'any' otherwise.
+    dim as string head = "any"
+    dim as int32 n = Ctors_( mc, sh )
+    if (mc.shapes[sh].kind = MSK_BOOL) orelse (mc.shapes[sh].kind = MSK_ENUM) then
+        for k as int32 = 0 to n - 1
+            dim as int64 cv = CtorAt_( mc, sh, k )
+            dim as boolean got = false
+            for i as int32 = 0 to m.h - 1
+                dim as MPat_ h = mc.pats[m.cells[i * m.w]]
+                if (h.kind = MPC) andalso (h.ctor = cv) then got = true
+            next
+            if got = false then
+                dim as StrVec none_
+                head = Render_( c, mc, sh, cv, none_, 0 )
+                exit for
+            end if
+        next
+    end if
+    out_.Push( head )
+    for i as int32 = 0 to sub_.Count - 1
+        out_.Push( sub_[i] )
+    next
+    return true
+end function
+
+'' ------------------------------------------------------------------------ the check
+
+'' The variable a dim item declares (semoptcheck.tiko's OptItemSym_).
+private function ItemSym_( byref c as Ctx, byval id as NodeId ) as Symbol ptr
+    dim as Symbol ptr s = c.syms->SymbolAt( c.info->RefOf( id ) )
+    if (s <> nullptr) andalso (s->kind = cast( uint8, SYM_VARIABLE )) then return s
+    s = c.syms->SymbolAt( c.syms->LookupTyped( c.info->ScopeOf( id ), c.ast->StmtOf( id )->name, false ) )
+    if (s <> nullptr) andalso (s->kind = cast( uint8, SYM_VARIABLE )) then return s
+    for si as int32 = 1 to c.syms->symbols.Count - 1
+        if (c.syms->symbols[si].payload = cast( uint32, id )) andalso _
+           (c.syms->symbols[si].kind = cast( uint8, SYM_VARIABLE )) then return c.syms->SymbolAt( cast( SymbolId, si ) )
+    next
+    return nullptr
+end function
+
+sub CheckMatchItem_ ( byref c as Ctx, byval id as NodeId )
+    if c.ast->matchRecs.Count = 0 then exit sub
+    dim as string nm = c.names->Spelling( c.names->Fold( c.ast->StmtOf( id )->name ) )
+    if left( nm, 7 ) <> "__tko_m" then exit sub
+    dim as string rec
+    for i as int32 = 0 to c.ast->matchRecs.Count - 1
+        if left( c.ast->matchRecs[i], len( nm ) + 1 ) = nm & "|" then rec = c.ast->matchRecs[i] : exit for
+    next
+    if len( rec ) = 0 then exit sub
+    dim as Symbol ptr vs = ItemSym_( c, id )
+    if (vs = nullptr) orelse (vs->type_ = TYPE_NONE) then exit sub
+
+    dim as MCtx_ mc
+    mc.wild = NewPat_( mc, MPW )
+    mc.scope_ = vs->parent
+    dim as int32 root = ShapeOf_( c, mc, vs->type_ )
+
+    dim as int32 pos = 1
+    Upto_( rec, pos, "|" )
+    Upto_( rec, pos, "|" )
+    dim as SourceLoc at = cast( SourceLoc, valuint( Upto_( rec, pos, "|" ) ) )
+
+    '' Each arm: (guarded, loc, its alternatives as patterns).
+    dim as containers.Array( of int32 ) armAlt0, armNalt, alts
+    dim as containers.Array( of uint8 ) armG
+    dim as containers.Array( of SourceLoc ) armLoc
+    while pos <= len( rec )
+        dim as string arm = Upto_( rec, pos, ";" )
+        dim as int32 ap = 1
+        armG.Push( iif( left( arm, 1 ) = "g", 1, 0 ) )
+        ap = 2
+        mc.armLoc = cast( SourceLoc, valuint( Upto_( arm, ap, ":" ) ) )
+        armLoc.Push( mc.armLoc )
+        armAlt0.Push( alts.Count )
+        do
+            if ap > len( arm ) then exit do
+            '' A top-level range over an enum covers the members its bounds enclose.
+            if (mid( arm, ap, 1 ) = "R") andalso (mc.shapes[root].kind = MSK_ENUM) then
+                dim as int32 rp = ap + 1
+                dim as string lo = Upto_( arm, rp, "~" ), hi = Upto_( arm, rp, "~" )
+                dim as int64 lv, hv
+                if EnumValue_( c, mc, root, lo, lv ) andalso EnumValue_( c, mc, root, hi, hv ) then
+                    for k as int32 = 0 to mc.shapes[root].nk - 1
+                        dim as int64 v = mc.evals[mc.shapes[root].k0 + k]
+                        if (v >= lv) andalso (v <= hv) then alts.Push( NewPat_( mc, MPC, v ) )
+                    next
+                else
+                    alts.Push( NewPat_( mc, MPX ) )
+                end if
+                ap = rp
+            else
+                alts.Push( Conv_( c, mc, arm, ap, root ) )
+            end if
+            if mid( arm, ap, 1 ) = "/" then ap += 1 else exit do
+        loop
+        armNalt.Push( alts.Count - armAlt0[armAlt0.Count - 1] )
+    wend
+    if mc.bad then exit sub
+
+    '' Reachability, arm by arm, against the unguarded arms above it; then exhaustiveness.
+    dim as MMat_ m
+    m.w = 1
+    dim as containers.Array( of int32 ) cols
+    cols.Push( root )
+    for a as int32 = 0 to armAlt0.Count - 1
+        dim as boolean useful = (armNalt[a] = 0)
+        for i as int32 = 0 to armNalt[a] - 1
+            dim as containers.Array( of int32 ) q
+            q.Push( alts[armAlt0[a] + i] )
+            if Useful_( mc, m, q, cols, 0 ) then useful = true : exit for
+        next
+        if useful = false then c.diags->Report( TKO1251, PointRange( armLoc[a] ) )
+        if armG[a] = 0 then
+            for i as int32 = 0 to armNalt[a] - 1
+                m.cells.Push( alts[armAlt0[a] + i] )
+                m.h += 1
+            next
+        end if
+    next
+    dim as StrVec w
+    if Missing_( c, mc, m, cols, w, 0 ) then
+        dim as string what = "any other value"
+        if (w.Count > 0) andalso (w[0] <> "any") then what = w[0]
+        c.diags->Report( TKO1250, PointRange( at ), what )
+    end if
+end sub
+
+end namespace

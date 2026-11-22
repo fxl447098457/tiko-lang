@@ -5,15 +5,151 @@ separate question, and the sooner you find out the cheaper the answer is. A fail
 minute. A wrong number found in a report a month later costs the month.
 
 This chapter is about the tools that shorten that distance. **Tests** check behaviour you have
-decided on, every time you build. **Tracing** and a **debugger** show you what a program did when a
+decided on, every time you run `tiko test`. **Tracing** and a **debugger** show you what a program did when a
 test, or a user, finds it doing something else. And the compiler's own options — its warnings, its
 diagnostics file and its ways of showing you the code it generated — are tools too.
 
+## Unit tests with tiko test
+
+A test checks one thing you have decided the code must do. In tiko a test is a block of its own,
+written beside the code it checks, and one command finds every test in a project, builds them into
+a program and runs it:
+
+```text
+tiko test
+```
+
+```admonish warning title="Status in this version"
+`tiko test`, `test` blocks and std/testing arrive after tiko 0.1.6, the toolchain this book is pinned
+to. The listings in this section were compiled and run with the development toolchain; the book's
+harness reports them as blocked (`pin-0.1.6`) until the pin moves to a release that has them.
+```
+
+### A test, and what it checks
+
+Here is a small project: a stack of `int32` in a module, and the tests that pin its behaviour down.
+The module first, `stacks/stacks.tiko`:
+
+```tiko
+{{#include ../examples/ch19/tested/stacks/stacks.tiko}}
+```
+
+The tests a client of the module would write sit in the project's own directory, in a file whose
+name ends `_test.tiko`:
+
+```tiko
+{{#include ../examples/ch19/tested/stack_api_test.tiko}}
+```
+
+`tiko test`, in the project's directory:
+
+```text
+{{#include ../examples/ch19/tested/stack_api_test.out}}
+```
+
+- **`test "name"` … `end test`** is one test. Its body is ordinary code, and it is a procedure of
+  its own: what it declares is its own, and every test starts with a fresh `Stack`.
+- **`testing.ExpectEq( a, b )`** checks that `a = b`. When it does not, the failure names the file
+  and line the check is written on, and both sides: the expression as written, and the value it
+  had. A literal is shown once.
+- **A failed `Expect` does not stop its test.** The test carries on, so one run reports every
+  failed check, not just the first.
+- **The exit code is 1** when anything failed — the third test is wrong on purpose — which is what
+  a build script or a CI job checks.
+
+The checks are macros, which is why they are written `testing.ExpectEq` and never bare: only a
+macro sees the line it is written on. The ones you will use most:
+
+| Check | Passes when |
+|---|---|
+| `testing.Expect( c )`, `testing.ExpectFalse( c )` | `c` is true, or false |
+| `testing.ExpectEq( a, b )`, `testing.ExpectNe( a, b )` | `a = b`, or `a <> b` |
+| `testing.ExpectNear( a, b, eps )` | `a` is within `eps` of `b` |
+| `testing.Require( c )`, `testing.RequireEq( a, b )` | as `Expect` and `ExpectEq`, and the test **stops** when they fail |
+| `testing.Fail( "why" )` | never: marks a line that must not be reached |
+| `testing.Skip( "why" )` | the test stops here and is counted as skipped |
+
+Use `Require` when the rest of the test means nothing without it: a pointer that must not be null
+before you follow it, a file that must have opened before you read it.
+
+### Tests inside a module
+
+The fourth test in that run came from somewhere else. A `_test.tiko` file **inside a module's
+directory** begins with the module's own `#module` line and is part of the module — but only in a
+test build:
+
+```tiko
+{{#include ../examples/ch19/tested/stacks/stacks_test.tiko}}
+```
+
+`NextSize_` has no `public`: no program that imports `stacks` can call it. A test inside the module
+can, because it *is* the module. These are **white-box** tests, for the internals that matter on
+their own; the file outside the module holds **black-box** tests, which see only what any client
+sees. A normal `tiko build` leaves every `_test.tiko` file out of its module altogether, and parses
+and drops every `test` block, so tests cost the shipped program nothing.
+
+A `test` block may also sit in one of the module's ordinary files, beside the procedure it checks.
+`tiko test` finds those too.
+
+### Running a selection
+
+```text
+tiko test --filter pops          only the tests whose names hold "pops"
+tiko test stacks                 only the tests under that directory
+tiko test -- --list              print the tests and stop
+```
+
+`tiko test` builds its program the way `tiko build` builds any other — the first run compiles, a
+second with nothing changed compiles nothing — under the `debug` profile, so `-exx` is on: a null
+pointer or an index out of range inside a test is a runtime error with its line, not a quietly
+wrong number.
+
+### A test that ends the program
+
+tiko has no exceptions to catch, so a test that ends the program — a runtime error, an `end`, a
+crash — ends every test after it too. `tiko test` does not let it. It runs the program, and when a
+test stops it, reports that test and starts the program again from the next one. A test that runs
+too long is stopped the same way:
+
+```tiko
+{{#include ../examples/ch19/stopping/sensors_test.tiko}}
+```
+
+`tiko test --timeout 1`:
+
+```text
+{{#include ../examples/ch19/stopping/sensors_test.out}}
+```
+
+`ParseReading` ends the program on a reading it cannot believe — exit code 3 — and
+`WaitForSensor` never returns. Each is reported, and the last test still runs. Without
+`--timeout`, a test may run for 120 seconds.
+
+````admonish danger title="Pitfall"
+**A test in the program's main file never runs.** This project's tests are in `main.tiko`:
+
+```tiko
+{{#include ../examples/ch19/forgotten/main.tiko}}
+```
+
+`tiko test`:
+
+```text
+{{#include ../examples/ch19/forgotten/main.out}}
+```
+
+The test is wrong — `Twice( 2 )` is 4, not 5 — and nothing says so. A normal build drops every
+`test` block, and `tiko test` looks for tests only in modules and in `_test.tiko` files, never in a
+program's main file, whose top-level code would run as well. The only sign is the warning, and
+exit code 0. Put the code under test in a module, and its tests beside it.
+````
+
 ## Unit tests with fbcunit
 
-tiko ships a unit-test library, fbcunit. A test is a block of code that checks something with an
-assertion; tests are grouped into suites; one call runs them all and prints a summary. No module
-fronts the library, so it is reached with `#include`:
+FreeBASIC's own unit-test library, fbcunit, ships with tiko too, and code written for it compiles
+unchanged. Prefer `tiko test` for new code; this section is for the tests you already have. A test
+is a block of code that checks something with an assertion; tests are grouped into suites; one call
+runs them all and prints a summary. No module fronts the library, so it is reached with `#include`:
 
 ```tiko
 {{#include ../examples/ch19/firsttests.tiko}}
@@ -225,6 +361,70 @@ Locals tab of the output pane lists `rs`, `sum` and `i`. There `rs` is `(1 to 3)
 so the zero-based pitfall above does not apply. A string shows its text, `u"north"`, without the
 bookkeeping, and a watch takes the program's spelling, `rs(2).sensor`.
 
+## Memory errors with -fsanitize=address
+
+`-exx` catches an index past an array's bounds and a null pointer. It cannot catch memory that was
+freed and then used: the pointer still holds a real address, and the program reads whatever is
+there now. **AddressSanitizer** can. Build with **`-fsanitize=address`** and every procedure checks
+each memory access against a map of what the program may touch, and freed blocks are held back
+from reuse, so a stale pointer lands on poisoned memory instead of someone else's data.
+
+```admonish warning title="Status in this version"
+`-fsanitize=address` arrives after tiko 0.1.6, the toolchain this book is pinned to. The listing in
+this section was compiled and run with the development toolchain; the book's harness reports it as
+blocked (`pin-0.1.6`) until the pin moves to a release that has it.
+```
+
+```tiko
+{{#include ../examples/ch19/freed.tiko}}
+```
+
+```text
+{{#include ../examples/ch19/freed.out}}
+```
+
+The listing names its options itself, so `tiko freed.tiko` builds it checked. Without the
+`#cmdline` line the same program prints a second reading, a meaningless number such as
+`1.228383301872162e-311`, and exits 0 as if nothing had happened. Checked, it stops at the read,
+exits 1 (macOS aborts it instead, exit 134), and prints its report on standard error. Trimmed to
+the lines that matter:
+
+```text
+==11612==ERROR: AddressSanitizer: heap-use-after-free on address 0x1206dbfa0070 ...
+READ of size 8 at 0x1206dbfa0070 thread T0
+    #0 0x7ff6a82c1136 in main freed.tiko:12
+freed by thread T0 here:
+    #1 0x7ff6a82c10f2 in main freed.tiko:11
+previously allocated by thread T0 here:
+    #1 0x7ff6a82c102e in main freed.tiko:8
+```
+
+**The report answers all three questions** a stale pointer raises: where it was used, where the
+block was freed, and where it was allocated. `-g` is what puts line numbers in it; without `-g` it
+names procedures only. The same build catches the other memory errors a program can make:
+
+| Bug | Report |
+|---|---|
+| Reading or writing a block after `delete` or `deallocate` | `heap-use-after-free` |
+| Freeing a block twice | `attempting double-free` |
+| A pointer past either end of an `allocate`d block | `heap-buffer-overflow` |
+| A local array or record reached past its end through a pointer | `stack-buffer-overflow` |
+| The address of a local, used after its procedure returned | `stack-use-after-return` |
+
+A project gets all of it from one option: **`tiko build --profile asan`** uses a built-in profile,
+`-g -exx -O1 -fsanitize=address`, and builds into `out/asan/` beside the debug build (Chapter 31).
+Code that has to know is told: `__TIKO_ASAN__` is defined, as `1`, in a checked build.
+
+The runtime that does the checking is clang's, from the LLVM tiko already uses. On Windows its DLL,
+`clang_rt.asan_dynamic-x86_64.dll`, is copied beside the program; on Ubuntu, install the
+`libclang-rt-<version>-dev` package that matches clang.
+
+```admonish danger title="Pitfall"
+**It checks your program's memory, not tiko's runtime.** Every `new`, `delete`, `allocate` and
+string the program makes goes through the checked allocator, so a mistake in how the program uses
+memory is caught. A bug inside a runtime routine is not.
+```
+
 ## Warnings and the diagnostics workflow
 
 An error stops the build. A **warning** does not: the program is built, and it runs. That is
@@ -359,6 +559,9 @@ The full list, with the front end's own `--dump-*` options, is Appendix C.
 
 ## What it costs
 
+- **`tiko test` builds one more program**, with `-exx` on: slower than a release build, and the
+  point — a test that reads out of bounds should fail, not pass by luck. A test that ends the
+  program costs a restart, and each restart runs every module's initialisation again.
 - **Tests are code you maintain.** They pay for themselves when they check behaviour callers
   depend on, and cost you when they pin down details nobody relies on. Test through the public
   surface.
@@ -367,11 +570,22 @@ The full list, with the front end's own `--dump-*` options, is Appendix C.
 - **`-g` makes the executable larger**: the debug information is stored beside the code. Keep it
   in every development build. Optimisation works against it — variables live in registers and
   lines are reordered — so debug an unoptimised build.
+- **`-fsanitize=address` makes a program slower and larger**, and it uses more memory: freed
+  blocks wait before they are reused, and every access is checked. It is a build for finding bugs,
+  not one to ship.
 - **`-Werror` costs a little friction**, paid when the warning appears rather than when the bug it
   predicted does.
 
 ## Summary
 
+- A test is `test "name"` … `end test`; `tiko test` finds, builds and runs every test of a
+  project. Checks are std/testing's macros, written `testing.ExpectEq( a, b )`; a failure names its
+  file and line, and a failed `Expect` lets the test go on while `Require` stops it.
+- A `_test.tiko` file in a module's directory is part of the module in a test build only, and can
+  test its private names; one elsewhere tests through the public surface. Normal builds drop every
+  test.
+- A test that ends the program, or runs past `--timeout`, is reported, and the rest still run.
+- **A test in a program's main file never runs.**
 - fbcunit: `#include once "fbcunit.bi"`, `SUITE`/`TEST` blocks, `CU_ASSERT*` macros, and
   `fbcu.run_tests( )`, whose result becomes the exit code. A suite is a namespace; name it after a
   behaviour.
@@ -384,6 +598,9 @@ The full list, with the front end's own `--dump-*` options, is Appendix C.
   `.pdb`.
 - tkEdit's debugger (`F9`, `F6`) reads the same DWARF and names elements by the program's own
   subscripts.
+- `-fsanitize=address` (with `-g`), or `tiko build --profile asan`, stops a program at a
+  use-after-free, a double free, an overflow or a returned local's address, and names the line of
+  the use, the free and the allocation.
 - A warning can be a wrong answer: `-Werror` fails the build on one, `-Wno-TKOnnnn` silences one
   by id, `--diagnostics-file` gives tools the records.
 - `--dump-udt`, `--emit-ir`, `--emit-asm`, `--keep-temps` and `-v` show what the compiler made of
@@ -400,3 +617,5 @@ The full list, with the front end's own `--dump-*` options, is Appendix C.
 4. Reorder `Packet`'s fields so that `--dump-udt` reports a size of 8. Why not 6?
 5. Run `readings.tiko` under lldb and print the element `rs( 3 )` the program means. Which
    expression did you need?
+6. Add a `test` block to `stacks.tiko` itself, beside `Stack.Pop`, checking that popping the only
+   item leaves the stack empty. Run `tiko test` and find your test in the output.

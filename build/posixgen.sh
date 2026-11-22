@@ -6,7 +6,8 @@
 #                                and pkg/sys/posix/linux-x86_64-posix.ti (the same bytes)
 #   build/posixgen.sh --check    regenerate into a temporary file and diff, writing nothing
 #
-# RUN IT ON THE TARGET'S OWN HOST -- WSL for linux-x86_64, the Mac for macos-arm64 -- with that
+# RUN IT ON THE TARGET'S OWN HOST -- WSL for linux-x86_64, the Mac for macos-arm64, the Lima VM
+# on the Mac for linux-arm64 (docs/tiko-linux-arm64) -- with that
 # host's C compiler and C library: the values are measured, never typed in. Commit both
 # outputs. tiko-rt includes the first (inc/sysbind.ti); the std modules include the second as a
 # private header (pkg/sys/posix/posix.ti). Two copies because the packaged toolchain ships pkg/
@@ -21,6 +22,7 @@ CHECK=0
 
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)  TARGET=linux-x86_64 ;;
+    Linux-aarch64) TARGET=linux-arm64 ;;
     Darwin-arm64)  TARGET=macos-arm64 ;;
     *) echo "posixgen: no tiko target for host $(uname -s)-$(uname -m)" >&2; exit 2 ;;
 esac

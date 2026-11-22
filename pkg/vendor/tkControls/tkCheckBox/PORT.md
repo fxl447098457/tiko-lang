@@ -57,7 +57,9 @@
 - `tkCheckBox_DrawVectorBox( b, rcCell, isChecked, clrBox, clrBack )`, `tkCheckBox_VectorSquare`,
   `tkCheckBox_VectorPen` -- public so a paint callback (or a sibling such as tkOptionButton) can
   draw the built-in box;
-- probes `tkCheckBox_GetHot`, `GetPressed` (the live gesture), `GetTextSize`.
+- probes `tkCheckBox_GetHot`, `GetPressed` (the live gesture), `GetTextSize`;
+- `tkCheckBox_PaintDefault( p )`: the stock drawing, for a paint callback (the form designer's
+  Paint event).
 
 **Vendor bug found (fixed here):**
 - **Sliding off did not un-flash.** The README promises that while a press is live "sliding off

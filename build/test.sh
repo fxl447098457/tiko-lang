@@ -159,8 +159,8 @@ rt_overlay( ) {
 mkdir -p "$ROOT/build/obj"
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) rt_overlay windows-x86_64 windows ;;
-    Linux)                rt_overlay linux-x86_64 linux ;;
-    Darwin)               rt_overlay macos-arm64 macos ;;
+    Linux)                if [ "$(uname -m)" = "aarch64" ]; then rt_overlay linux-arm64 linux-arm64
+                          else rt_overlay linux-x86_64 linux; fi ;;
     Darwin)               rt_overlay macos-arm64 macos ;;
 esac
 

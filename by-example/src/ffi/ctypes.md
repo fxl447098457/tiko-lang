@@ -15,10 +15,16 @@ platform, and the difference is the point.
 {{#include ../../examples/ffi/ctypes.windows-x86_64.out}}
 ```
 
-**Output** on Linux:
+**Output** on Linux x86-64:
 
 ```text
 {{#include ../../examples/ffi/ctypes.linux-x86_64.out}}
+```
+
+**Output** on Linux arm64:
+
+```text
+{{#include ../../examples/ffi/ctypes.linux-arm64.out}}
 ```
 
 **Output** on macOS:

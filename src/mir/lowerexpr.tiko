@@ -75,7 +75,7 @@ end function
 '' BOOLEAN is MT_I8 as well, so every caller checks that separately.
 private function IsIntMirTy_( byval t as MirType ) as boolean
     select case t
-    case MT_I8, MT_I16, MT_I32, MT_I64
+    case MT_I8, MT_I16, MT_I32, MT_I64, MT_I128
         return true
     end select
     return false
@@ -113,6 +113,25 @@ private function LowerMainArg_ _
     outv.ty = cast( uint8, mt )
     outv.id = which
     return true
+end function
+
+'' A UDT COMPARED WITH A POINTER: its pointer 'operator cast' for the OTHER side's pointer type,
+'' called, in OUTV; the cast's result type, or TYPE_NONE when UDTSIDE is no UDT, OTHER no
+'' pointer, or the UDT has no pointer cast. See LowerExpr's comparison.
+private function UdtPtrCmpCast_ _
+    ( byref c as Ctx, byval udtSide as Tko.NodeId, byval other as Tko.NodeId, _
+      byref outv as MirValue ) as Tko.TypeId
+
+    if IsUdtValue_( c, udtSide ) = false then return Tko.TYPE_NONE
+    dim as Tko.TypeId ot = c.types->Unqualify( c.info->TypeOf_( other ) )
+    if c.types->Kind( ot ) = Tko.TK_REFERENCE then ot = c.types->Unqualify( c.types->Inner( ot ) )
+    if c.types->Kind( ot ) <> Tko.TK_POINTER then return Tko.TYPE_NONE
+    dim as Tko.TypeId ut = c.types->Unqualify( c.info->TypeOf_( udtSide ) )
+    if c.types->Kind( ut ) = Tko.TK_REFERENCE then ut = c.types->Unqualify( c.types->Inner( ut ) )
+    dim as Tko.SymbolId pick = Tko.Check.PtrCastPick( *c.syms, *c.types, *c.names, ut, ot )
+    if pick = Tko.SYMBOL_NONE then return Tko.TYPE_NONE
+    if UserCastToPtr_( c, udtSide, outv, ot ) = false then return Tko.TYPE_NONE
+    return c.syms->SymbolAt( pick )->type_
 end function
 
 function LowerExpr _
@@ -216,6 +235,8 @@ function LowerExpr _
         dim as Tko.LiteralPayload ptr lp = _
             c.ast->LiteralOf( id )
         if mt = MT_VOID then mt = MT_I64
+        '' AN int128 LITERAL past 64 bits carries its high half (Literal.intHi).
+        if mt = MT_I128 then return ConstInt128( c, cast( int64, lp->intValue ), cast( int64, lp->intHi ), mt )
         return ConstInt( c, cast( int64, lp->intValue ), mt )
 
     case Tko.N_FLOAT_LIT
@@ -911,6 +932,24 @@ function LowerExpr _
         '' Each UDT side takes the cast closest to the OTHER side's type -- NumericCastPick.
         dim as boolean lCast = UserCastToNum_( c, bp->lhs, l, c.info->TypeOf_( bp->rhs ) )
         dim as boolean rCast = UserCastToNum_( c, bp->rhs, r, c.info->TypeOf_( bp->lhs ) )
+        '' ...AND A UDT AGAINST A POINTER compares by its POINTER cast, the one fbc picks for that
+        '' pointer (PtrCastPick): measured on fbc-modern 1.20, 2026-11-13, over [long ptr, double
+        '' ptr] 'x = pl' and 'pd <> x' take the exact one, over [long ptr, any ptr] 'x = pb' (a
+        '' byte ptr) the 'any ptr' one. With no number cast the object itself reached icmp and the
+        '' build stopped on TKO0993 ("an operand with no kind").
+        dim as Tko.TypeId lPtrT = Tko.TYPE_NONE
+        dim as Tko.TypeId rPtrT = Tko.TYPE_NONE
+        dim as boolean ptrCmp = (tk = Tko.TK_EQ) orelse (tk = Tko.TK_NE) orelse (tk = Tko.TK_LT) orelse _
+                               (tk = Tko.TK_GT) orelse (tk = Tko.TK_LE) orelse (tk = Tko.TK_GE)
+        if ptrCmp andalso (lCast = false) andalso (rCast = false) then
+            lPtrT = UdtPtrCmpCast_( c, bp->lhs, bp->rhs, l )
+            if lPtrT <> Tko.TYPE_NONE then
+                lCast = true
+            else
+                rPtrT = UdtPtrCmpCast_( c, bp->rhs, bp->lhs, r )
+                if rPtrT <> Tko.TYPE_NONE then rCast = true
+            end if
+        end if
 
         dim as boolean noType = (c.info->TypeOf_( id ) = Tko.TYPE_NONE)
         dim as boolean noCast = (lCast = false) andalso (rCast = false)
@@ -950,6 +989,8 @@ function LowerExpr _
         '' type, not the result's: a comparison yields an integer either way.
         dim as Tko.TypeId lt = c.info->TypeOf_( bp->lhs )
         dim as Tko.TypeId rt = c.info->TypeOf_( bp->rhs )
+        if lPtrT <> Tko.TYPE_NONE then lt = lPtrT
+        if rPtrT <> Tko.TYPE_NONE then rt = rPtrT
         '' A UDT SIDE CAST TO BOOLEAN IS A BOOLEAN OPERAND, so the boolean rules below apply to
         '' it: measured, 'b = -1' and 'b = pb' are true and 'b = ubyte 255' false over 'operator
         '' cast( ) as boolean' returning true; typed as the UDT it compared its stored 1.
@@ -1215,7 +1256,8 @@ function LowerExpr _
             dim as Tko.ScopeId dsc = c.info->ScopeOf( id )
             if dsc = Tko.SCOPE_NONE then dsc = c.procScope
             if dsc = Tko.SCOPE_NONE then dsc = c.modScope
-            dim as Tko.Check.ConstVal dcv = Tko.Check.ConstOf( *c.ast, id, *c.srcMgr, *c.names, c.types->target.pointerBits, c.syms, dsc )
+            dim as Tko.Check.ConstVal dcv = Tko.Check.ConstOf128( *c.ast, id, *c.srcMgr, *c.names, c.types->target.pointerBits, c.syms, dsc )
+            if dcv.known andalso (mt = MT_I128) then return ConstInt128( c, dcv.value, cast( int64, Tko.Check.Const128Wide( dcv ).hi ), mt )
             if dcv.known then return ConstInt( c, dcv.value, mt )
         end if
         dim as MirInst ins

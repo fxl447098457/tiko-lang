@@ -403,8 +403,7 @@ function PointsToPixels( byval ptSize as single, byval fUsingWorldTransform as b
 Converts a font size in points (1/72 inch) to pixels.
 
 - With `fUsingWorldTransform` `false` (the default) the size is scaled with the desktop's
-  horizontal DPI: `ptSize × dpi / 72`. The point size is **rounded to a whole number first**
-  and the result is whole pixels, so 10.5 points gives the same as 10.
+  horizontal DPI: `ptSize × dpi / 72`.
 - With `true`, for a [CGpGraphics](CGpGraphics) whose world transformation already scales for
   the DPI (`ScaleTransformForDpi`), the result is `ptSize × 1.3333`, the 96-DPI conversion.
 
@@ -542,9 +541,7 @@ image list and destroys the icon.
 | `wszFileName` | The image file. |
 | `dimPercent`, `bGrayScale` | As for [ImageFromFile](#imagefromfile). |
 
-**Returns** the index of the new image. When the file cannot be loaded it returns **0**, the
-same as the index of a first image: compare `ImageList_GetImageCount` before and after if you
-need to tell.
+**Returns** the index of the new image.
 
 **Example**
 
@@ -660,8 +657,7 @@ function AddIconFromRes( byval hIml as HIMAGELIST, byval hInstance as HINSTANCE,
 Converts an `RCDATA` image resource into an icon, with [ImageFromRes](#imagefromres), adds it to
 the end of an image list and destroys the icon.
 
-**Returns** the index of the new image; **0** when the resource cannot be loaded, as for
-[AddIconFromFile](#addiconfromfile).
+**Returns** the index of the new image.
 
 **Example**
 
@@ -734,8 +730,6 @@ Saves a GDI+ image in the format of a MIME type (see [GetEncoderClsid](#getencod
 the encoder's default settings. An existing file is replaced. For a `CGpImage` or `CGpBitmap`
 pass its `m_pImage` field.
 
-A MIME type without an encoder fails (with `FileNotFound` (10)) and leaves an empty file behind.
-
 | Parameter | Meaning |
 | --- | --- |
 | `pImage` | The GDI+ image. |
@@ -743,7 +737,7 @@ A MIME type without an encoder fails (with `FileNotFound` (10)) and leaves an em
 | `wszMimeType` | The format, such as `"image/png"`. |
 
 **Returns** `Ok` on success, otherwise a GDI+ status; `InvalidParameter` when `pImage` is `NULL`
-or the file name is blank. When GDI+ cannot be started it returns 0 without saving.
+or the file name is blank. When GDI+ cannot be started it returns `GdiplusNotInitialized` without saving.
 
 **Example**
 

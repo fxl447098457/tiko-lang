@@ -1070,6 +1070,30 @@ public type TKCODEEDIT_ContextMenuSub as sub( byval hEdit as TK_WIDGET ptr, byva
 ' the host's to resize. Scintilla has already restyled its fonts.
 public type TKCODEEDIT_ScaleSub as sub( byval hEdit as TK_WIDGET ptr, byval fOld as single, byval fNew as single )
 
+' The notifications a form designer offers as events of their own, each from the one notify stream
+' (which still reaches tkCodeEdit_SetNotifyCallback's sub first).
+public type TKCODEEDIT_ChangeSub as sub( byval hEdit as TK_WIDGET ptr )
+public type TKCODEEDIT_CharAddedSub as sub( byval hEdit as TK_WIDGET ptr, byval ch as long )
+public type TKCODEEDIT_UpdateUISub as sub( byval hEdit as TK_WIDGET ptr, byval updated as long )
+public type TKCODEEDIT_DirtySub as sub( byval hEdit as TK_WIDGET ptr, byval isDirty as boolean )
+public type TKCODEEDIT_MarginClickSub as sub( byval hEdit as TK_WIDGET ptr, byval margin as long, _
+                                              byval position as longint, byval modifiers as long )
+public type TKCODEEDIT_DoubleClickSub as sub( byval hEdit as TK_WIDGET ptr, byval position as longint, byval nLine as longint )
+
+' tkCodeEdit_SetWrapMode / SetEOLMode: Scintilla's own values.
+public enum
+    TKCE_WRAP_NONE = 0
+    TKCE_WRAP_WORD
+    TKCE_WRAP_CHAR
+    TKCE_WRAP_WHITESPACE
+end enum
+
+public enum
+    TKCE_EOL_CRLF = 0
+    TKCE_EOL_CR
+    TKCE_EOL_LF
+end enum
+
 ' Scintilla's TickReasons as widget timer ids.
 const TKCE_TICK_BASE = TK_TIMER_APP
 
@@ -1086,11 +1110,22 @@ type TKCE_STATE
     NotifyCallback as TKCODEEDIT_NotifySub
     ContextMenuCallback as TKCODEEDIT_ContextMenuSub
     ScaleCallback  as TKCODEEDIT_ScaleSub
+    ChangeCallback      as TKCODEEDIT_ChangeSub
+    CharAddedCallback   as TKCODEEDIT_CharAddedSub
+    UpdateUICallback    as TKCODEEDIT_UpdateUISub
+    DirtyCallback       as TKCODEEDIT_DirtySub
+    MarginClickCallback as TKCODEEDIT_MarginClickSub
+    DoubleClickCallback as TKCODEEDIT_DoubleClickSub
+    bLineNumbers   as boolean            ' margin 0 sized for line numbers, again on a font or scale change
     ' measurements: the last re-render of the view and their count
     fLastPaintMs as double
     nPaints      as long
     nBlits       as long
 end type
+
+' The font file every editor's styles resolve to (scintk keeps one, process-wide): "" until the
+' first editor, which starts it at the bundled mono face -- without one nothing is drawn or measured.
+dim shared as string gFontPathNow
 
 private function CE( byval h as TK_WIDGET ptr ) as TKCE_STATE ptr
     if h = 0 then return 0
@@ -1123,7 +1158,27 @@ private sub CeNotify cdecl ( byval user as any ptr, byval n as const TKCE_NOTIFI
     dim as TKCE_STATE ptr t = user
     if (t = 0) orelse (n = 0) then exit sub
     if t->NotifyCallback then t->NotifyCallback( t->hWin, n )
+    select case n->code
+    case SCN_MODIFIED
+        if (n->modificationType and (SC_MOD_INSERTTEXT or SC_MOD_DELETETEXT)) <> 0 then
+            if t->ChangeCallback then t->ChangeCallback( t->hWin )
+        end if
+    case SCN_CHARADDED
+        if t->CharAddedCallback then t->CharAddedCallback( t->hWin, n->ch )
+    case SCN_UPDATEUI
+        if t->UpdateUICallback then t->UpdateUICallback( t->hWin, n->updated )
+    case SCN_SAVEPOINTREACHED
+        if t->DirtyCallback then t->DirtyCallback( t->hWin, false )
+    case SCN_SAVEPOINTLEFT
+        if t->DirtyCallback then t->DirtyCallback( t->hWin, true )
+    case SCN_MARGINCLICK
+        if t->MarginClickCallback then t->MarginClickCallback( t->hWin, n->margin, n->position, n->modifiers )
+    case SCN_DOUBLECLICK
+        if t->DoubleClickCallback then t->DoubleClickCallback( t->hWin, n->position, n->line_ )
+    end select
 end sub
+
+declare sub CeLineNumbers( byval t as TKCE_STATE ptr )
 
 private function CeClipGet cdecl ( byval user as any ptr ) as const zstring ptr
     dim as TKCE_STATE ptr t = user
@@ -1699,6 +1754,7 @@ private function CeProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as bo
         ' fonts restyle at the new DPI (this editor's own: SciTk_SetEditorDpi); pixel margins are
         ' the host's, told through ScaleCallback
         gLib.SetEditorDpi( t->pSci, cint( 96 * m->fNew ) )
+        CeLineNumbers( t )
         t->bDirty = true
         tkWidget_Invalidate( w )
         if t->ScaleCallback then t->ScaleCallback( w, m->fOld, m->fNew )
@@ -1768,6 +1824,11 @@ public function tkCodeEdit_Create( byval hParent as TK_WIDGET ptr, byval CtrlID 
     gLib.Send( t->pSci, SCI_USEPOPUP, SC_POPUP_ALL, 0 )
     gLib.SetEditorDpi( t->pSci, cint( 96 * hParent->pHost->fScale ) )
     gLib.SetCallTipHost( t->pSci, @gTipHost, t )
+    if len( gFontPathNow ) = 0 then
+        gFontPathNow = tkHost_FontDir( ) & TK_FONT_MONO
+        gLib.SetFontPath( strptr( gFontPathNow ) )
+    end if
+    t->sFontPath = gFontPathNow
     return w
 end function
 
@@ -1813,11 +1874,13 @@ public sub tkCodeEdit_SetFont( byval hEdit as TK_WIDGET ptr, byref sFile as cons
     if t = 0 then exit sub
     t->sFontPath = sFile
     t->nFontPt = nPoints
+    gFontPathNow = sFile
     gLib.SetFontPath( strptr( t->sFontPath ) )
     tkCodeEdit_SendText( hEdit, SCI_STYLESETFONT, STYLE_DEFAULT, "tkCodeEdit" )
     tkCodeEdit_Send( hEdit, SCI_STYLESETSIZE, STYLE_DEFAULT, nPoints )
     ' STYLE_DEFAULT alone changes nothing drawn: CLEARALL copies it into every style
     tkCodeEdit_Send( hEdit, SCI_STYLECLEARALL )
+    CeLineNumbers( t )
 end sub
 
 ' A lexer by name ("tiko"). FALSE when scintk has no such lexer.
@@ -1902,6 +1965,164 @@ end sub
 public sub tkCodeEdit_SetContextMenuCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_ContextMenuSub )
     dim as TKCE_STATE ptr t = CE( hEdit )
     if t then t->ContextMenuCallback = pfn
+end sub
+
+' ---- settings by name: SCI_* messages a form designer can hold as rows ----------------------------
+public sub tkCodeEdit_SetReadOnly( byval hEdit as TK_WIDGET ptr, byval bReadOnly as boolean )
+    tkCodeEdit_Send( hEdit, SCI_SETREADONLY, iif( bReadOnly, 1, 0 ) )
+end sub
+
+public function tkCodeEdit_GetReadOnly( byval hEdit as TK_WIDGET ptr ) as boolean
+    return tkCodeEdit_Send( hEdit, SCI_GETREADONLY ) <> 0
+end function
+
+public sub tkCodeEdit_SetTabWidth( byval hEdit as TK_WIDGET ptr, byval nWidth as long )
+    tkCodeEdit_Send( hEdit, SCI_SETTABWIDTH, iif( nWidth < 1, 1, nWidth ) )
+end sub
+
+public function tkCodeEdit_GetTabWidth( byval hEdit as TK_WIDGET ptr ) as long
+    return tkCodeEdit_Send( hEdit, SCI_GETTABWIDTH )
+end function
+
+' 0 = the tab width.
+public sub tkCodeEdit_SetIndentWidth( byval hEdit as TK_WIDGET ptr, byval nWidth as long )
+    tkCodeEdit_Send( hEdit, SCI_SETINDENT, iif( nWidth < 0, 0, nWidth ) )
+end sub
+
+public function tkCodeEdit_GetIndentWidth( byval hEdit as TK_WIDGET ptr ) as long
+    return tkCodeEdit_Send( hEdit, SCI_GETINDENT )
+end function
+
+public sub tkCodeEdit_SetUseTabs( byval hEdit as TK_WIDGET ptr, byval bUseTabs as boolean )
+    tkCodeEdit_Send( hEdit, SCI_SETUSETABS, iif( bUseTabs, 1, 0 ) )
+end sub
+
+public function tkCodeEdit_GetUseTabs( byval hEdit as TK_WIDGET ptr ) as boolean
+    return tkCodeEdit_Send( hEdit, SCI_GETUSETABS ) <> 0
+end function
+
+' TKCE_EOL_*: what Enter inserts. Text already there keeps its line ends.
+public sub tkCodeEdit_SetEOLMode( byval hEdit as TK_WIDGET ptr, byval nMode as long )
+    if (nMode < TKCE_EOL_CRLF) orelse (nMode > TKCE_EOL_LF) then exit sub
+    tkCodeEdit_Send( hEdit, SCI_SETEOLMODE, nMode )
+end sub
+
+public function tkCodeEdit_GetEOLMode( byval hEdit as TK_WIDGET ptr ) as long
+    return tkCodeEdit_Send( hEdit, SCI_GETEOLMODE )
+end function
+
+' TKCE_WRAP_*.
+public sub tkCodeEdit_SetWrapMode( byval hEdit as TK_WIDGET ptr, byval nMode as long )
+    if (nMode < TKCE_WRAP_NONE) orelse (nMode > TKCE_WRAP_WHITESPACE) then exit sub
+    tkCodeEdit_Send( hEdit, SCI_SETWRAPMODE, nMode )
+end sub
+
+public function tkCodeEdit_GetWrapMode( byval hEdit as TK_WIDGET ptr ) as long
+    return tkCodeEdit_Send( hEdit, SCI_GETWRAPMODE )
+end function
+
+' Margin 0 wide enough for five digits in the line-number style, kept so on a font or scale change.
+private sub CeLineNumbers( byval t as TKCE_STATE ptr )
+    if (t = 0) orelse (t->pSci = 0) then exit sub
+    dim as long w = 0
+    if t->bLineNumbers then w = tkCodeEdit_SendText( t->hWin, SCI_TEXTWIDTH, STYLE_LINENUMBER, "_99999" )
+    tkCodeEdit_Send( t->hWin, SCI_SETMARGINWIDTHN, 0, w )
+end sub
+
+public sub tkCodeEdit_SetLineNumbers( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKCE_STATE ptr t = CE( hEdit )
+    if t = 0 then exit sub
+    t->bLineNumbers = bShow
+    CeLineNumbers( t )
+end sub
+
+public function tkCodeEdit_GetLineNumbers( byval hEdit as TK_WIDGET ptr ) as boolean
+    dim as TKCE_STATE ptr t = CE( hEdit )
+    if t = 0 then return false
+    return t->bLineNumbers
+end function
+
+public sub tkCodeEdit_SetIndentGuides( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+    tkCodeEdit_Send( hEdit, SCI_SETINDENTATIONGUIDES, iif( bShow, SC_IV_LOOKBOTH, SC_IV_NONE ) )
+end sub
+
+public function tkCodeEdit_GetIndentGuides( byval hEdit as TK_WIDGET ptr ) as boolean
+    return tkCodeEdit_Send( hEdit, SCI_GETINDENTATIONGUIDES ) <> SC_IV_NONE
+end function
+
+public sub tkCodeEdit_SetHighlightCurrentLine( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+    tkCodeEdit_Send( hEdit, SCI_SETCARETLINEVISIBLE, iif( bShow, 1, 0 ) )
+end sub
+
+public function tkCodeEdit_GetHighlightCurrentLine( byval hEdit as TK_WIDGET ptr ) as boolean
+    return tkCodeEdit_Send( hEdit, SCI_GETCARETLINEVISIBLE ) <> 0
+end function
+
+public sub tkCodeEdit_SetViewWhitespace( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+    tkCodeEdit_Send( hEdit, SCI_SETVIEWWS, iif( bShow, SCWS_VISIBLEALWAYS, SCWS_INVISIBLE ) )
+end sub
+
+public function tkCodeEdit_GetViewWhitespace( byval hEdit as TK_WIDGET ptr ) as boolean
+    return tkCodeEdit_Send( hEdit, SCI_GETVIEWWS ) <> SCWS_INVISIBLE
+end function
+
+public sub tkCodeEdit_SetViewEOL( byval hEdit as TK_WIDGET ptr, byval bShow as boolean )
+    tkCodeEdit_Send( hEdit, SCI_SETVIEWEOL, iif( bShow, 1, 0 ) )
+end sub
+
+public function tkCodeEdit_GetViewEOL( byval hEdit as TK_WIDGET ptr ) as boolean
+    return tkCodeEdit_Send( hEdit, SCI_GETVIEWEOL ) <> 0
+end function
+
+' Points added to every style's size (Ctrl+wheel moves it too).
+public sub tkCodeEdit_SetZoom( byval hEdit as TK_WIDGET ptr, byval nPoints as long )
+    tkCodeEdit_Send( hEdit, SCI_SETZOOM, cast( uinteger, cast( integer, nPoints ) ) )
+end sub
+
+public function tkCodeEdit_GetZoom( byval hEdit as TK_WIDGET ptr ) as long
+    return clng( tkCodeEdit_Send( hEdit, SCI_GETZOOM ) )
+end function
+
+' The lexer's first keyword list, words separated by spaces. Set the lexer first.
+public sub tkCodeEdit_SetKeywords( byval hEdit as TK_WIDGET ptr, byval sWords as ustring )
+    tkCodeEdit_SendText( hEdit, SCI_SETKEYWORDS, 0, sWords )
+end sub
+
+' ---- the notifications as events of their own ----
+public sub tkCodeEdit_SetChangeCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_ChangeSub )
+    dim as TKCE_STATE ptr t = CE( hEdit )
+    if t then t->ChangeCallback = pfn
+end sub
+
+public sub tkCodeEdit_SetCharAddedCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_CharAddedSub )
+    dim as TKCE_STATE ptr t = CE( hEdit )
+    if t then t->CharAddedCallback = pfn
+end sub
+
+public sub tkCodeEdit_SetUpdateUICallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_UpdateUISub )
+    dim as TKCE_STATE ptr t = CE( hEdit )
+    if t then t->UpdateUICallback = pfn
+end sub
+
+' The document left its save point (true) or came back to it (false): SCI_SETSAVEPOINT marks it.
+public sub tkCodeEdit_SetDirtyCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_DirtySub )
+    dim as TKCE_STATE ptr t = CE( hEdit )
+    if t then t->DirtyCallback = pfn
+end sub
+
+public sub tkCodeEdit_SetMarginClickCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_MarginClickSub )
+    dim as TKCE_STATE ptr t = CE( hEdit )
+    if t = 0 then exit sub
+    t->MarginClickCallback = pfn
+    ' a margin reports clicks only when it is sensitive: all five, with a handler
+    for i as long = 0 to 4
+        tkCodeEdit_Send( hEdit, SCI_SETMARGINSENSITIVEN, i, iif( pfn <> 0, 1, 0 ) )
+    next
+end sub
+
+public sub tkCodeEdit_SetDoubleClickCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_DoubleClickSub )
+    dim as TKCE_STATE ptr t = CE( hEdit )
+    if t then t->DoubleClickCallback = pfn
 end sub
 
 public sub tkCodeEdit_SetScaleCallback( byval hEdit as TK_WIDGET ptr, byval pfn as TKCODEEDIT_ScaleSub )

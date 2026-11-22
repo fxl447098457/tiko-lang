@@ -26,8 +26,10 @@ runs them all and prints a summary.
   `true` only if every assertion passed. `end iif( …, 0, 1 )` turns that into
   the program's exit code, which is what a build script or a CI job checks.
 
-There is no separate test command: a test program is an ordinary program, built
-with `tiko firsttests.tiko` and run like any other.
+A test program written this way is an ordinary program, built with
+`tiko firsttests.tiko` and run like any other. fbcunit is the library
+FreeBASIC code already uses; for new code, `test` blocks and
+[tiko test](tikotest.md) find, build and run a project's tests in one command.
 
 Name a suite after the behaviour it checks, `clamping`, not after the
 procedure it tests, `Clamp`. A suite is a namespace, and inside a suite called

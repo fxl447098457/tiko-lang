@@ -34,7 +34,6 @@ Jump to: [Start a Windows program](#start-a-windows-program) · [Measure, move a
 | Function | What it does | From |
 |---|---|---|
 | [CTabPage](CTabPage) | Creates a window that serves as one page of a tab control. | `sys/win/gui` |
-| [CXpButton](CXpButton) | Creates a push button that draws itself, with images, toggle behaviour and custom colours. | `sys/win/gui` |
 | [CMaskedEdit](CMaskedEdit) | Creates an edit control that accepts input only in a set shape, such as a phone number. | `sys/win/gui` |
 | [Button](SysWin-Gui-Button) | Checks, clicks and labels push buttons, check boxes, radio buttons and split buttons. | `sys/win/gui` |
 | [Label](SysWin-Gui-Label) | Sets and reads the text, icon, bitmap, cursor or metafile of a static control. | `sys/win/gui` |
@@ -68,7 +67,6 @@ Jump to: [Start a Windows program](#start-a-windows-program) · [Measure, move a
 | Function | What it does | From |
 |---|---|---|
 | [Common dialogs](SysWin-Common-Dialogs) | Shows the open, save, folder and colour dialogs, and opens Control Panel applets. | `sys/win` |
-| [CPrint](CPrint) | Chooses a printer, measures its page, reads and changes its settings, and prints. | `sys/win/gui` |
 | [File dialogs](SysWin-Gui-File-Dialogs) | Shows the Windows Open and Save dialogs and reads the files the user picked. | `sys/win/gui` |
 | [CIFileDialogCustomize](CIFileDialogCustomize) | Adds check boxes, lists, buttons and other controls to an open or save dialog. | `sys/win/gui` |
 | [File dialog events](SysWin-Gui-File-Dialog-Events) | Handles the events of an open or save dialog and of the controls added to it. | `sys/win/gui` |

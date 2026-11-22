@@ -1,0 +1,275 @@
+'' testrun.tiko -- 'tiko test''s runner: the test program run, watched and started again (testdoc.ti).
+''
+'' A TEST CAN END THE PROGRAM. There is no unwinding in tiko: a runtime error -- a null or
+'' out-of-bounds access under -exx -- an 'end', or a crash stops the whole process, and with it
+'' every test after it. So the program does not report to the console here; it appends to a
+'' REPORT FILE, one line per event and closed after each (std/testing's RunMain, --report):
+''
+''     plan  <n>                         start <i> <name> <file> <line>
+''     fail  <i> <file> <line> <message> skip  <i> <why>
+''     end   <i> pass|fail|skip <ms>     done  <passed> <failed> <skipped>
+''
+'' and this reads it as it grows. A 'start' with no 'end' when the program exits is a test that
+'' ended it: reported as CRASHED with the exit code, and the program started again with
+'' '--from' the next one. A test that runs past --timeout (120 s unless given; 0 for none) is
+'' killed and reported TIMED OUT the same way. The order is the program's own and the same on
+'' every run, so '--from' resumes exactly after the one that stopped it.
+''
+'' TEXT: the program's own output goes to the console as it runs; each result is printed when
+'' its 'end' is read. JSON (--message-format json): the program's output goes to
+'' out/test/output.log instead, and each result is an event (RFC §6.3):
+''
+''     {"event":"test-plan","tests":N}
+''     {"event":"test-start","index":i,"name":..,"file":..,"line":..}
+''     {"event":"test-fail","index":i,"file":..,"line":..,"message":..}
+''     {"event":"test-end","index":i,"name":..,"status":"pass|fail|skip|crash|timeout","ms":..}
+''     {"event":"test-summary","passed":..,"failed":..,"skipped":..,"crashed":..,"timedOut":..,"ms":..}
+
+#import "std/containers"
+#import "std/fs"
+#include once "build/testdoc.ti"
+#include once "support/spawn.ti"
+#include once "driver/modresolve.ti"
+
+namespace Tko.Build
+
+type TestRun_
+    as int32 total = -1
+    as int32 cur = -1                     '' the test in flight: started, not ended
+    as float64 curStart
+    as string curName, curFile
+    as int32 curLine
+    as string curFails                    '' its failed checks, as printed
+    as string curWhy
+    as boolean done
+    as int32 passed, failed, skipped, crashed, timedOut
+    as boolean announced
+end type
+
+private function Unescape_( byref s as string ) as string
+    dim as string r = ""
+    dim as int32 i = 0
+    while i < len( s )
+        if (s[i] = 92) andalso (i + 1 < len( s )) then
+            select case s[i + 1]
+            case asc( "t" ) : r &= chr( 9 )
+            case asc( "n" ) : r &= chr( 10 )
+            case asc( "r" ) : r &= chr( 13 )
+            case else       : r &= chr( s[i + 1] )
+            end select
+            i += 2
+        else
+            r &= chr( s[i] )
+            i += 1
+        end if
+    wend
+    return r
+end function
+
+private sub Fields_( byref ln as string, byref outv as Tko.StrVec )
+    dim as int32 p = 1
+    do
+        dim as int32 e = instr( p, ln, chr( 9 ) )
+        if e = 0 then
+            outv.Push( Unescape_( mid( ln, p ) ) )
+            exit do
+        end if
+        outv.Push( Unescape_( mid( ln, p, e - p ) ) )
+        p = e + 1
+    loop
+end sub
+
+private function Fld_( byref v as Tko.StrVec, byval i as int32 ) as string
+    if i < v.Count then return v[i]
+    return ""
+end function
+
+'' The result line of one test, and what failed in it.
+private sub Result_( byref r as TestRun_, byref status_ as string, byval ms as int32, _
+                     byval code as int32, byref a as BuildArgs, byref obs as Observer, byref logTail as string )
+    select case status_
+    case "pass" : r.passed += 1
+    case "fail" : r.failed += 1
+    case "skip" : r.skipped += 1
+    case "crash" : r.crashed += 1
+    case "timeout" : r.timedOut += 1
+    end select
+    if obs.json then
+        dim as string extra_ = ""
+        if status_ = "crash" then extra_ = ",""exit"":" & code
+        if (len( logTail ) > 0) andalso ((status_ = "crash") orelse (status_ = "timeout")) then
+            extra_ &= ",""output"":" & JsonStr( logTail )
+        end if
+        EmitLine( obs, """event"":""test-end"",""index"":" & r.cur & ",""name"":" & JsonStr( r.curName ) & _
+                       ",""status"":""" & status_ & """,""ms"":" & ms & extra_ )
+    else
+        dim as string word_
+        select case status_
+        case "pass"    : word_ = "ok"
+        case "fail"    : word_ = "FAILED"
+        case "skip"    : word_ = "ignored (" & r.curWhy & ")"
+        case "crash"   : word_ = "CRASHED (exit code " & code & ")"
+        case "timeout" : word_ = "TIMED OUT (" & a.timeoutSec & " s)"
+        end select
+        print "test " & r.curName & " ... " & word_
+        if len( r.curFails ) > 0 then print r.curFails;
+    end if
+    r.cur = -1
+end sub
+
+private sub Line_( byref r as TestRun_, byref ln as string, byref a as BuildArgs, byref obs as Observer )
+    dim as Tko.StrVec f
+    Fields_( ln, f )
+    if f.Count = 0 then return
+    select case f[0]
+    case "plan"
+        if r.total < 0 then r.total = valint( Fld_( f, 1 ) )
+        if r.announced = false then
+            r.announced = true
+            if obs.json then
+                EmitLine( obs, """event"":""test-plan"",""tests"":" & r.total )
+            else
+                print "running " & r.total & iif( r.total = 1, " test", " tests" )
+            end if
+        end if
+    case "start"
+        r.cur = valint( Fld_( f, 1 ) )
+        r.curName = Fld_( f, 2 )
+        r.curFile = Fld_( f, 3 )
+        r.curLine = valint( Fld_( f, 4 ) )
+        r.curFails = ""
+        r.curWhy = ""
+        r.curStart = timer
+        EmitLine( obs, """event"":""test-start"",""index"":" & r.cur & ",""name"":" & JsonStr( r.curName ) & _
+                       ",""file"":" & JsonStr( r.curFile ) & ",""line"":" & r.curLine )
+    case "fail"
+        dim as string ff = Fld_( f, 2 ), msg = Fld_( f, 4 )
+        dim as int32 fl = valint( Fld_( f, 3 ) )
+        r.curFails &= "    " & BaseName( ff ) & ":" & fl & ": " & msg & chr( 10 )
+        EmitLine( obs, """event"":""test-fail"",""index"":" & valint( Fld_( f, 1 ) ) & ",""file"":" & _
+                       JsonStr( ff ) & ",""line"":" & fl & ",""message"":" & JsonStr( msg ) )
+    case "skip"
+        r.curWhy = Fld_( f, 2 )
+    case "end"
+        if r.cur >= 0 then Result_( r, Fld_( f, 2 ), valint( Fld_( f, 3 ) ), 0, a, obs, "" )
+    case "done"
+        r.done = true
+    end select
+end sub
+
+'' The report's complete lines from 'consumed' on; 'final' takes a last line with no LF too.
+private sub Drain_( byref r as TestRun_, byref rep as string, byref consumed as int32, _
+                    byval final as boolean, byref a as BuildArgs, byref obs as Observer )
+    dim as string t = ReadText( rep )
+    dim as int32 p = 1, n = 0
+    while p <= len( t )
+        dim as int32 e = instr( p, t, chr( 10 ) )
+        if (e = 0) andalso (final = false) then exit while
+        if e = 0 then e = len( t ) + 1
+        dim as string ln = mid( t, p, e - p )
+        if right( ln, 1 ) = chr( 13 ) then ln = left( ln, len( ln ) - 1 )
+        if n >= consumed then
+            Line_( r, ln, a, obs )
+            consumed += 1
+        end if
+        n += 1
+        p = e + 1
+    wend
+end sub
+
+'' The last 2 KB of the program's output, for an event about a test that stopped it.
+private function Tail_( byref path_ as string ) as string
+    dim as string t = ReadText( path_ )
+    if len( t ) > 2048 then t = mid( t, len( t ) - 2047 )
+    return t
+end function
+
+function RunTests _
+    ( byref a as BuildArgs, byref exe as string, byref work as string, _
+      byref ctx as Tko.CompilerContext, byref obs as Observer ) as int32
+
+    '' '--list' is the program's own business: run it once and let it print.
+    dim as string passArgs = ""
+    dim as boolean listing = false
+    for each x as string in a.filters
+        passArgs &= " --run " & Tko.Spawn.QuoteArg( x )
+    next
+    for each x as string in a.runArgs
+        passArgs &= " " & Tko.Spawn.QuoteArg( x )
+        if x = "--list" then listing = true
+    next
+    if listing then
+        dim as Tko.Spawn.Proc lp = Tko.Spawn.Start( exe, mid( passArgs, 2 ) )
+        if lp = 0 then
+            ctx.diags.ReportGlobal( Tko.TKO0111, "could not start " & exe )
+            return Tko.EXIT_TOOL_FAILED
+        end if
+        return Tko.Spawn.Wait( lp )
+    end if
+
+    dim as TestRun_ r
+    dim as int32 from_ = 0, attempt = 0
+    dim as float64 t0 = timer
+    dim as string logPath = work & "/output.log"
+    do
+        dim as string rep = work & "/report." & attempt & ".txt"
+        if fs.IsFile( rep ) then fs.RemoveFile( rep )
+        dim as string args_ = "--report " & Tko.Spawn.QuoteArg( Tko.Modules.AbsPath( rep ) ) & _
+                              " --from " & from_ & passArgs
+        dim as Tko.Spawn.Proc pr
+        if obs.json then
+            pr = Tko.Spawn.StartLogged( exe, args_, logPath )
+        else
+            pr = Tko.Spawn.Start( exe, args_ )
+        end if
+        if pr = 0 then
+            ctx.diags.ReportGlobal( Tko.TKO0111, "could not start " & exe )
+            return Tko.EXIT_TOOL_FAILED
+        end if
+        dim as int32 consumed = 0, code = -1
+        dim as boolean exited = false, killed = false
+        do
+            exited = Tko.Spawn.WaitFor( pr, 100, code )
+            Drain_( r, rep, consumed, exited, a, obs )
+            if exited then exit do
+            if (r.cur >= 0) andalso (a.timeoutSec > 0) then
+                if timer - r.curStart > a.timeoutSec then
+                    Tko.Spawn.Kill( pr )
+                    Drain_( r, rep, consumed, true, a, obs )
+                    killed = true
+                    exit do
+                end if
+            end if
+        loop
+        if fs.IsFile( rep ) then fs.RemoveFile( rep )
+        if r.done then exit do
+        if r.total < 0 then
+            ctx.diags.ReportGlobal( Tko.TKO1206, exe, str( code ) )
+            ctx.diags.Flush( )
+            return Tko.EXIT_USER_ERROR
+        end if
+        if r.cur < 0 then exit do                  '' it stopped between tests: nothing to resume
+        dim as int32 ms = clng( (timer - r.curStart) * 1000 )
+        dim as string outTail = iif( obs.json, Tail_( logPath ), "" )
+        from_ = r.cur + 1
+        Result_( r, iif( killed, "timeout", "crash" ), ms, code, a, obs, outTail )
+        if from_ >= r.total then exit do
+        attempt += 1
+    loop
+
+    dim as int32 ms = clng( (timer - t0) * 1000 )
+    dim as boolean allOk = (r.failed = 0) andalso (r.crashed = 0) andalso (r.timedOut = 0)
+    if obs.json then
+        EmitLine( obs, """event"":""test-summary"",""passed"":" & r.passed & ",""failed"":" & r.failed & _
+                       ",""skipped"":" & r.skipped & ",""crashed"":" & r.crashed & ",""timedOut"":" & _
+                       r.timedOut & ",""ms"":" & ms )
+    else
+        print
+        print "test result: " & iif( allOk, "ok", "FAILED" ) & ". " & r.passed & " passed; " & _
+              r.failed & " failed; " & r.crashed & " crashed; " & r.timedOut & " timed out; " & _
+              r.skipped & " skipped (" & (ms \ 1000) & "." & right( "00" & ((ms mod 1000) \ 10), 2 ) & " s)"
+    end if
+    return iif( allOk, Tko.EXIT_OK, Tko.EXIT_USER_ERROR )
+end function
+
+end namespace

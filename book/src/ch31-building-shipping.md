@@ -8,12 +8,13 @@ about the command line that does all of that, and about what a shipped program d
 
 ## Targets
 
-tiko builds for three targets, chosen with `-target`:
+tiko builds for four targets, chosen with `-target`:
 
 | Target | Builds | Default on |
 |---|---|---|
 | `windows-x86_64` | a Windows x86-64 executable, linked against Microsoft's Universal C Runtime | Windows |
-| `linux-x86_64` | a Linux x86-64 executable, linked against the system's C library | Linux |
+| `linux-x86_64` | a Linux x86-64 executable, linked against the system's C library | x86-64 Linux |
+| `linux-arm64` | a Linux arm64 (aarch64) executable, linked against the system's C library | arm64 Linux |
 | `macos-arm64` | a macOS executable for Apple Silicon, linked by Apple's linker against the macOS SDK | macOS |
 
 The compiler turns tiko into LLVM's intermediate form and hands it to **clang**, which produces
@@ -33,10 +34,16 @@ On Windows:
 {{#include ../examples/ch31/target.out}}
 ```
 
-On Linux:
+On Linux x86-64:
 
 ```text
 {{#include ../examples/ch31/target.linux-x86_64.out}}
+```
+
+On Linux arm64:
+
+```text
+{{#include ../examples/ch31/target.linux-arm64.out}}
 ```
 
 On macOS:
@@ -316,7 +323,9 @@ included, so the project builds the same whatever directory the command is typed
 The `debug` in `out/debug` is the **profile**: a named set of compiler options. `tiko build`
 uses `debug`, which is `-g -exx -O0`, a checked build, and so does `tiko run`. `--profile release`
 builds with `-O2` instead, into `out/release`, and the program above then prints
-`release build`. Both are built in; a `[profile.name]` table changes one or declares another:
+`release build`. Both are built in, and so is `asan`, `-g -exx -O1 -fsanitize=address`, for
+finding memory errors (Chapter 19; after tiko 0.1.6). A `[profile.name]` table changes one or
+declares another:
 
 ```toml
 [profile.fast]
@@ -341,7 +350,9 @@ compiled in parallel; `-j 4` sets how many at once.
 **`tiko check`** reports every error and warning a build would, and writes nothing — no program,
 no objects. A file the last build compiled cleanly is not looked at again, so after a build a
 check is quick. It is what an editor runs on save. **`tiko clean`** removes the program a build
-of the same profile wrote.
+of the same profile wrote. **`tiko test`** builds a project's tests into one program and runs it
+(Chapter 19), and **`tiko doc`** writes its modules' documentation (Chapter 15); both arrive after
+tiko 0.1.6, the toolchain this book is pinned to.
 
 ```admonish note title="For editors and tools"
 `tiko build --message-format json` reports a build as one JSON object per line — each file
@@ -394,7 +405,7 @@ and that licence's conditions apply.
 
 ## Summary
 
-- `-target windows-x86_64` (Windows' default), `linux-x86_64` or `macos-arm64`. `TIKO_CLANG`, `TIKO_LIBPATH` and
+- `-target windows-x86_64` (Windows' default), `linux-x86_64`, `linux-arm64` or `macos-arm64`. `TIKO_CLANG`, `TIKO_LIBPATH` and
   `TIKO_INCLUDE` point the compiler at other tools, runtimes and headers.
 - `-c` compiles to an object file; the first file named is main unless `-m` says otherwise; the
   other modules' top levels run first, as constructors.

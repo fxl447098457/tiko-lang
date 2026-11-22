@@ -1,0 +1,937 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' keysdlg -- the Keyboard Shortcuts dialog (Ctrl+K) and the Assign Shortcut dialog it opens, ported
+' from tiko-editor-tiko's frmKeyboard / frmKeyboardEdit onto vendor/tkControls.
+'
+' KEYBOARD SHORTCUTS: a filter box (a search glyph in its frame), a list of every bindable command
+' (Category, Description, Default Keys, User Keys), Modify and Reset on the left, OK and Cancel on
+' the right. It edits a COPY of the host's key map (Work); OK hands Work back and the host writes
+' keybindings.toml and applies it, Cancel drops it. The filter matches all four columns, so
+' "primary+f" answers "what is that bound to?". A row is found by its item data (the Work index),
+' never by its position: the filter moves rows.
+'
+' ASSIGN SHORTCUT (Modify, or a double click / Enter on a row): the command in bold over its
+' category, "Default Keys: X" with a Disable default toggle, a capture box that takes the next chord
+' pressed in it, Primary / Alt / Shift toggles and a key list (None, then tkc/keybind's vocabulary
+' in its order) to build one by hand, a message line (a refused key, or the command that already
+' has the chord), and Reset, OK, Cancel. Reset clears this command back to its default but does
+' not close: Cancel after it still changes nothing.
+'
+' The modifier is PRIMARY everywhere, as keybindings.toml says it: Ctrl on Windows and Linux, Cmd
+' on macOS (tkc/keybind). Key text is the file's text ("Primary+Shift+K"), not the menu's.
+'
+' Both are windows of their own first and modal second (Open, then RunModal), as the Form
+' Designer's dialogs are: the self-test drives them open.
+#module "keysdlg"
+
+#import "std/containers"
+#import "std/strings"
+#import "tkc/i18n"
+#import "tkc/cmdids"
+#import "tkc/keybind"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkToggle"
+#import "vendor/tkControls/tkKeys"
+#import "vendor/tkControls/tkTheme"
+using containers
+using tkApp
+using tkListTree
+using tkButton
+using tkLabel
+using tkTextBox
+using tkToggle
+using tkKeys
+using tkTheme
+using tkHost
+using tkPaint
+
+' design units (tiko-editor-tiko's frmKeyboard / frmKeyboardEdit)
+const as long KB_CLIENT_W = 720
+const as long KB_CLIENT_H = 432
+const as long KB_TITLE_H = 56
+const as long KB_FOOTER_H = 52
+const as long KB_MARGIN = 16
+const as long KB_BTN_W = 92
+const as long KB_BTN_H = 32
+const as long KB_FILTER_W = 320
+const as long KB_FILTER_H = 40
+const as long KB_FILTER_GLYPHW = 34
+
+const as long AS_CLIENT_W = 440
+const as long AS_CLIENT_H = 464
+const as long AS_MARGIN = 20
+const as long AS_ROW_H = 30
+const as long AS_CAPTURE_H = 46
+const as long AS_KEYLIST_H = 120
+const as long AS_FLASH_MS = 200
+const as long AS_CARET_MS = 530
+
+const as long TIMER_CARET = 1
+const as long TIMER_FLASH = 2
+
+' Fluent UI System Icons' search_20_regular, in tkEdit's PsIcons (tools/add-psicons.py)
+public const as ulong GLYPH_SEARCH = &hF68F
+
+type KeysDialog_ as KeysDialog
+
+' ================================================================ Assign Shortcut
+
+public type AssignDialog
+    Win as TK_FORM ptr
+    Owner as KeysDialog_ ptr
+    Index as long = -1              ' the row of Work being edited
+    ' the dialog's own model, copied in at Open, handed back by OK
+    EditKeys as ustring             ' canonical chord text, "" = none
+    EditPrimary as boolean
+    EditAlt as boolean
+    EditShift as boolean
+    EditDisabled as boolean
+    Why as ustring                  ' a refused key, in words; "" = none
+    CaptureFocus as boolean
+    CaretOn as boolean
+    FlashOn as boolean
+    Syncing as boolean
+    Accepted as boolean
+    IsModal as boolean
+
+    LblDesc as TK_WIDGET ptr
+    LblCat as TK_WIDGET ptr
+    LblDefault as TK_WIDGET ptr
+    LblDisable as TK_WIDGET ptr
+    TogDisable as TK_WIDGET ptr
+    Capture as TK_WIDGET ptr
+    TogPrimary as TK_WIDGET ptr
+    TogAlt as TK_WIDGET ptr
+    TogShift as TK_WIDGET ptr
+    LblPrimary as TK_WIDGET ptr
+    LblAlt as TK_WIDGET ptr
+    LblShift as TK_WIDGET ptr
+    KeyList as TK_WIDGET ptr
+    LblMsg as TK_WIDGET ptr
+    BtnReset as TK_WIDGET ptr
+    BtnOk as TK_WIDGET ptr
+    BtnCancel as TK_WIDGET ptr
+
+    declare sub Open( byval owner_ as KeysDialog_ ptr, byval idx as long )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub Finish( byval ok as boolean )
+    declare sub Layout( )
+    declare sub RefreshViews( )
+    declare sub ModelFromViews( )
+    declare sub DoReset( )
+    declare sub SyncCaret( )
+    declare sub ShowMessage( )
+    declare function TakeKey( byval m as TK_MSG ptr ) as boolean
+end type
+
+' ================================================================ Keyboard Shortcuts
+
+public type KeysDialog
+    Win as TK_FORM ptr
+    Work as keybind.KeyMap          ' the copy being edited
+    Filter as ustring
+    Conflict as Array( of boolean ) ' by Work index: its chord in force is another's too
+    KeyNames as Array( of ustring ) ' the key list's rows after None: the vocabulary, in order
+    KeyOf as Map( of long, long )   ' SDL keycode (unshifted) -> index in KeyNames
+    Assign as AssignDialog ptr
+    Accepted as boolean
+    IsModal as boolean
+
+    FilterFrame as TK_WIDGET ptr
+    FilterBox as TK_WIDGET ptr
+    List as TK_WIDGET ptr
+    BtnModify as TK_WIDGET ptr
+    BtnReset as TK_WIDGET ptr
+    BtnOk as TK_WIDGET ptr
+    BtnCancel as TK_WIDGET ptr
+
+    declare sub Open( byval owner as TK_FORM ptr, byref keys as keybind.KeyMap )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub Finish( byval ok as boolean )
+    declare sub Layout( )
+    declare sub BuildList( )
+    declare sub RefreshRows( )
+    declare sub RescanConflicts( )
+    declare function SelectedIndex( ) as long
+    declare function RowMatches( byval i as long ) as boolean
+    declare function CategoryText( byval i as long ) as ustring
+    declare function DescriptionText( byval i as long ) as ustring
+    declare function DefaultDisplay( byval i as long ) as ustring
+    declare function ConflictText( byref keys as const ustring, byval except as long ) as ustring
+    declare sub DoModify( )
+    declare sub DoReset( )
+    declare sub OpenAssign( )
+    declare sub FinishAssign( byval ok as boolean )
+end type
+
+' The owner to the front BEFORE a modal dialog's window is hidden (as tkd/itemsdlg does): hiding
+' the active window let Windows activate some other program's window now and then.
+private sub RaiseOwner_( byval f as TK_FORM ptr )
+    if (f <> 0) andalso (f->pOwner <> 0) then SDL_RaiseWindow( f->pOwner->host->win )
+end sub
+
+private function MakeButton_( byval parent as TK_WIDGET ptr, byref text as const ustring, _
+                              byval cb as BTN_ClickCallbackSub ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    dim as ustring t = text
+    tkButton_SetText( b, t )
+    tkButton_SetClickCallback( b, cb )
+    return b
+end function
+
+private function MakeLabel_( byval parent as TK_WIDGET ptr, byref text as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr l = tkLabel_Create( parent, 1 )
+    tkLabel_SetText( l, text )
+    tkLabel_SetVAlign( l, TK_DT_VCENTER )
+    tkLabel_SetEllipsis( l, true )
+    return l
+end function
+
+' ---------------------------------------------------------------- Keyboard Shortcuts: callbacks
+
+private function KeysOf_( byval w as TK_WIDGET ptr ) as KeysDialog ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub OnKeysButton( byval h as TK_WIDGET ptr, byval id as long )
+    dim as KeysDialog ptr d = KeysOf_( h )
+    if d = 0 then exit sub
+    select case h
+    case d->BtnModify : d->DoModify( )
+    case d->BtnReset  : d->DoReset( )
+    case d->BtnOk     : d->Finish( true )
+    case d->BtnCancel : d->Finish( false )
+    end select
+end sub
+
+private sub OnFilterChanged( byval h as TK_WIDGET ptr )
+    dim as KeysDialog ptr d = KeysOf_( h )
+    if d = 0 then exit sub
+    d->Filter = tkTextBox_GetText( h )
+    d->BuildList( )
+end sub
+
+' a double click, or Enter on a row
+private sub OnRowActivate( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as KeysDialog ptr d = KeysOf_( h )
+    if d then d->DoModify( )
+end sub
+
+' No tooltips: every cell is in plain view (with no callback the list would repeat the row's text).
+private function NoListTip( byval h as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ustring
+    return ""
+end function
+
+private function NoHeaderTip( byval h as TK_WIDGET ptr, byval idx as integer ) as ustring
+    return ""
+end function
+
+' The default row look, plus two states: a disabled default dimmed (with "(disabled)" after it),
+' and a chord another command also has in the error colour -- on User Keys when the row has its
+' own, otherwise on Default Keys.
+private sub PaintKeyRow( byval pi as TKLISTTREE_PAINTINFO ptr )
+    dim as KeysDialog ptr d = KeysOf_( pi->hList )
+    if d = 0 then
+        tkListTree_PaintRowDefault( pi )
+        exit sub
+    end if
+    dim as TK_PAINT ptr b = pi->b
+    dim as TKTHEME_COLORS t = tkTheme_RolesFor( pi->hList )
+    dim as ulong back_ = t.Window, fore = t.Text
+    if pi->isSelected then
+        back_ = t.Selected : fore = t.SelectedText
+    elseif pi->isHot then
+        back_ = t.SurfaceHot : fore = t.TextHot
+    end if
+    b->SetBackColor( back_ )
+    b->PaintRect( @pi->rc )
+    if pi->isFocused andalso pi->hasFocus then
+        dim as TKRECT rb = pi->rc
+        rb.right = rb.left + tkHost_Scale( pi->hList->pHost, 2 )
+        b->SetBackColor( t.FocusRing )
+        b->PaintRect( @rb )
+    end if
+    dim as long i = tkListTree_GetItemData( pi->hList, pi->itemID )
+    if (i < 0) orelse (i >= d->Work.Count( )) then exit sub
+    dim as keybind.KeyBinding kb = d->Work.Item( i )
+    dim as boolean clash = (i < d->Conflict.Count( )) andalso d->Conflict[i]
+    dim as boolean hasUser = len( kb.UserKeys ) > 0
+    dim as long pad = tkHost_Scale( pi->hList->pHost, 6 )
+    for c as integer = 0 to pi->columnCount - 1
+        dim as TKRECT rt = pi->cells[c].rc
+        rt.left += pad : rt.right -= pad
+        dim as ustring s = pi->cells[c].wszText
+        dim as ulong clr = fore
+        if c = 2 then
+            s = d->DefaultDisplay( i )
+            if kb.DefaultDisabled then clr = t.TextDisabled
+            if clash andalso (hasUser = false) then clr = t.Error
+        elseif (c = 3) andalso clash andalso hasUser then
+            clr = t.Error
+        end if
+        b->SetForeColor( clr )
+        b->PaintText( s, @rt, TK_DT_LEFT or TK_DT_VCENTER or TK_DT_ELLIPSIS )
+    next
+end sub
+
+' The filter's frame: one rounded field around the search glyph and the borderless box in it.
+private function FilterFrameProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    select case m->msg
+    case TKM_PAINT
+        dim as TKTHEME_COLORS t = tkTheme_RolesFor( w )
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        dim as long curve = tkHost_Scale( w->pHost, 8 )
+        m->pPaint->SetBackColor( t.Window )
+        m->pPaint->PaintRect( @rc )
+        m->pPaint->SetBackColor( t.Surface )
+        m->pPaint->PaintRoundRect( @rc, curve )
+        dim as TK_FORM ptr f = tkForm_FromWidget( w )
+        dim as TKRECT rg
+        tkRect_Set( rg, 0, 0, tkHost_Scale( w->pHost, KB_FILTER_GLYPHW ), w->ch )
+        if f then m->pPaint->SetFont( tkForm_Font( f, TKFONT_GLYPH ) )
+        m->pPaint->SetForeColor( t.TextDim )
+        m->pPaint->PaintText( wchr( GLYPH_SEARCH ), @rg, TK_DT_CENTER or TK_DT_VCENTER )
+        m->pPaint->SetPenColor( t.Border )
+        m->pPaint->PaintRoundOutline( @rc, curve, 1 )
+        return true
+    case TKM_LBUTTONDOWN
+        ' a click on the glyph puts the caret in the box
+        dim as KeysDialog ptr d = KeysOf_( w )
+        if d then tkHost_SetFocus( w->pHost, d->FilterBox )
+        return true
+    end select
+    return false
+end function
+
+' ---------------------------------------------------------------- Keyboard Shortcuts
+
+' A window of its own, not yet modal: the tests drive it this way, and RunModal adds the loop.
+sub KeysDialog.Open( byval owner as TK_FORM ptr, byref keys as keybind.KeyMap )
+    ' the copy: the same table, so the same rows in the same order
+    for i as long = 0 to keys.Count( ) - 1
+        Work.Item( i ).UserKeys = keys.Item( i ).UserKeys
+        Work.Item( i ).DefaultDisabled = keys.Item( i ).DefaultDisabled
+    next
+    ' the key list's rows, and which SDL key each is (tkKeys reads every vocabulary spelling)
+    KeyNames = Work.Vocab( ).Names( )
+    for k as long = 0 to KeyNames.Count( ) - 1
+        dim as string nm = KeyNames[k]
+        dim as TK_CHORD c
+        if tkKeys_Parse( nm, c ) then KeyOf.Put( c.key, k )
+    next
+
+    dim as ustring t = i18n.Tr( "keys.title", "Keyboard Shortcuts" )
+    Win = tkApp_NewForm( t, KB_CLIENT_W, KB_CLIENT_H, owner, tkForm_Host( owner )->fScaleForced )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    tkForm_OnClose( Win, function( byval f as TK_FORM ptr ) as boolean
+        RaiseOwner_( f )
+        return true
+    end function )
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    FilterFrame = tkWidget_CreateChild( root_, 1, @FilterFrameProc, @this )
+    FilterBox = tkTextBox_Create( FilterFrame, 2, false )
+    tkTextBox_SetBorderWidth( FilterBox, 0 )
+    tkTextBox_SetCueBannerText( FilterBox, i18n.Tr( "keys.filter", "Filter shortcuts..." ) )
+    tkTextBox_SetChangeCallback( FilterBox, @OnFilterChanged )
+
+    List = tkListTree_Create( root_, 3 )
+    tkListTree_ShowHeader( List, true )
+    tkListTree_ShowTwisty( List, false )
+    tkListTree_AddColumn( List, i18n.Tr( "keys.category", "Category" ), tkForm_Scale( Win, 100 ) )
+    tkListTree_AddColumn( List, i18n.Tr( "keys.description", "Description" ), tkForm_Scale( Win, 260 ) )
+    tkListTree_AddColumn( List, i18n.Tr( "keys.default_keys", "Default Keys" ), tkForm_Scale( Win, 150 ) )
+    tkListTree_AddColumn( List, i18n.Tr( "keys.user_keys", "User Keys" ), tkForm_Scale( Win, 150 ) )
+    tkListTree_SetFillColumn( List, 1 )
+    tkListTree_SetBorderWidth( List, 1 )
+    tkListTree_SetPaintCallback( List, @PaintKeyRow )
+    tkListTree_SetActivateCallback( List, @OnRowActivate )
+    tkListTree_SetTooltipCallback( List, @NoListTip )
+    tkListTree_SetHeaderTooltipCallback( List, @NoHeaderTip )
+
+    BtnModify = MakeButton_( root_, i18n.Tr( "keys.modify", "Modify" ), @OnKeysButton )
+    BtnReset = MakeButton_( root_, i18n.Tr( "keys.reset", "Reset" ), @OnKeysButton )
+    BtnOk = MakeButton_( root_, i18n.Tr( "button.ok", "OK" ), @OnKeysButton )
+    BtnCancel = MakeButton_( root_, i18n.Tr( "button.cancel", "Cancel" ), @OnKeysButton )
+
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        if f->Tag then cast( KeysDialog ptr, f->Tag )->Layout( )
+    end sub )
+    this.RescanConflicts( )
+    this.BuildList( )
+    tkForm_Show( Win )
+    this.Layout( )
+    tkHost_SetFocus( tkForm_Host( Win ), FilterBox )
+end sub
+
+function KeysDialog.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub KeysDialog.Close( )
+    if Assign then
+        Assign->Close( )
+        delete Assign
+        Assign = 0
+    end if
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+end sub
+
+sub KeysDialog.Finish( byval ok as boolean )
+    Accepted = ok
+    if IsModal then
+        RaiseOwner_( Win )
+        tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+    end if
+end sub
+
+sub KeysDialog.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long cw = root_->cw, ch = root_->ch
+    dim as long mx = tkForm_Scale( Win, KB_MARGIN ), gap = tkForm_Scale( Win, 8 )
+    dim as long titleH = tkForm_Scale( Win, KB_TITLE_H ), footerH = tkForm_Scale( Win, KB_FOOTER_H )
+    dim as long bw = tkForm_Scale( Win, KB_BTN_W ), bh = tkForm_Scale( Win, KB_BTN_H )
+    dim as long fh = tkForm_Scale( Win, KB_FILTER_H ), fw = tkForm_Scale( Win, KB_FILTER_W )
+    if fw > cw - 2 * mx then fw = cw - 2 * mx
+    tkWidget_SetPos( FilterFrame, mx, (titleH - fh) \ 2, fw, fh )
+    ' the box past the glyph, inset so it never paints over the frame
+    dim as long inset = tkForm_Scale( Win, 2 ), gx = tkForm_Scale( Win, KB_FILTER_GLYPHW )
+    tkWidget_SetPos( FilterBox, gx, inset, fw - gx - tkForm_Scale( Win, 8 ), fh - 2 * inset )
+    dim as long listH = ch - titleH - footerH
+    if listH < 0 then listH = 0
+    tkWidget_SetPos( List, mx, titleH, cw - 2 * mx, listH )
+    dim as long by = ch - footerH + (footerH - bh) \ 2
+    tkWidget_SetPos( BtnModify, mx, by, bw, bh )
+    tkWidget_SetPos( BtnReset, mx + bw + gap, by, bw, bh )
+    tkWidget_SetPos( BtnCancel, cw - mx - bw, by, bw, bh )
+    tkWidget_SetPos( BtnOk, cw - mx - 2 * bw - gap, by, bw, bh )
+end sub
+
+' A command's menu group, as the menu bar titles it in the interface's language.
+function KeysDialog.CategoryText( byval i as long ) as ustring
+    dim as ustring cat = Work.Commands( ).Info( Work.Item( i ).Id ).Category
+    return i18n.Tr( "menubar." & cat, cat )
+end function
+
+function KeysDialog.DescriptionText( byval i as long ) as ustring
+    dim as cmdids.CommandInfo ci = Work.Commands( ).Info( Work.Item( i ).Id )
+    return i18n.Tr( "commands." & ci.Name, ci.Description )
+end function
+
+' What Default Keys shows: the default, "(disabled)" after it when it is suppressed.
+function KeysDialog.DefaultDisplay( byval i as long ) as ustring
+    if (i < 0) orelse (i >= Work.Count( )) then return ""
+    dim as ustring s = Work.Item( i ).DefaultKeys
+    if Work.Item( i ).DefaultDisabled then
+        dim as ustring off_ = i18n.Tr( "keys.disabled", "(disabled)" )
+        if len( s ) then s &= " " & off_ else s = off_
+    end if
+    return s
+end function
+
+' Case-insensitive, across all four columns as they read.
+function KeysDialog.RowMatches( byval i as long ) as boolean
+    if len( Filter ) = 0 then return true
+    dim as ustring n = ucase( Filter )
+    if instr( ucase( this.CategoryText( i ) ), n ) then return true
+    if instr( ucase( this.DescriptionText( i ) ), n ) then return true
+    if instr( ucase( this.DefaultDisplay( i ) ), n ) then return true
+    if instr( ucase( Work.Item( i ).UserKeys ), n ) then return true
+    return false
+end function
+
+function KeysDialog.SelectedIndex( ) as long
+    if List = 0 then return -1
+    dim as long r = tkListTree_GetCurSel( List )
+    if r < 0 then return -1
+    dim as long i = tkListTree_GetItemData( List, r )
+    if (i < 0) orelse (i >= Work.Count( )) then return -1
+    return i
+end function
+
+' Refilled from Work through the filter; the selection kept by Work index, not by row.
+sub KeysDialog.BuildList( )
+    if List = 0 then exit sub
+    dim as long keep = this.SelectedIndex( )
+    tkListTree_BeginUpdate( List )
+    tkListTree_Clear( List )
+    dim as long sel = -1
+    for i as long = 0 to Work.Count( ) - 1
+        if this.RowMatches( i ) = false then continue for
+        dim as long r = tkListTree_AddString( List, this.CategoryText( i ), i )
+        if r < 0 then continue for
+        tkListTree_SetCellText( List, r, 1, this.DescriptionText( i ) )
+        tkListTree_SetCellText( List, r, 2, Work.Item( i ).DefaultKeys )
+        tkListTree_SetCellText( List, r, 3, Work.Item( i ).UserKeys )
+        if i = keep then sel = r
+    next
+    tkListTree_EndUpdate( List )
+    if (sel < 0) andalso (tkListTree_GetCount( List ) > 0) then sel = 0
+    if sel >= 0 then tkListTree_SetCurSel( List, sel )
+end sub
+
+' The rows' key cells again after an edit (the filter is not re-run: the row stays in view).
+sub KeysDialog.RefreshRows( )
+    this.RescanConflicts( )
+    for r as long = 0 to tkListTree_GetCount( List ) - 1
+        dim as long i = tkListTree_GetItemData( List, r )
+        if (i < 0) orelse (i >= Work.Count( )) then continue for
+        tkListTree_SetCellText( List, r, 2, Work.Item( i ).DefaultKeys )
+        tkListTree_SetCellText( List, r, 3, Work.Item( i ).UserKeys )
+    next
+    tkWidget_Invalidate( List )
+end sub
+
+sub KeysDialog.RescanConflicts( )
+    Conflict.Clear( )
+    for i as long = 0 to Work.Count( ) - 1
+        Conflict.Push( false )
+    next
+    for i as long = 0 to Work.Count( ) - 1
+        dim as ustring a = Work.Item( i ).Effective( )
+        if len( a ) = 0 then continue for
+        for j as long = i + 1 to Work.Count( ) - 1
+            if Work.Item( j ).Effective( ) = a then
+                Conflict[i] = true
+                Conflict[j] = true
+            end if
+        next
+    next
+end sub
+
+' "Conflict: Save (Primary+S)" for the first other command whose chord in force is keys; "" = none.
+function KeysDialog.ConflictText( byref keys as const ustring, byval except as long ) as ustring
+    if len( keys ) = 0 then return ""
+    for i as long = 0 to Work.Count( ) - 1
+        if i = except then continue for
+        if Work.Item( i ).Effective( ) = keys then
+            return strings.Format( i18n.Tr( "keys.conflict", "Conflict: {0} ({1})" ), this.DescriptionText( i ), keys )
+        end if
+    next
+    return ""
+end function
+
+' Back to the shipped default: no user keys, and the default on again.
+sub KeysDialog.DoReset( )
+    dim as long i = this.SelectedIndex( )
+    if i < 0 then exit sub
+    Work.Reset( Work.Item( i ).Id )
+    this.RefreshRows( )
+    tkHost_SetFocus( tkForm_Host( Win ), List )
+end sub
+
+' Assign Shortcut on the selected row, modally.
+sub KeysDialog.DoModify( )
+    this.OpenAssign( )
+    if Assign then this.FinishAssign( Assign->RunModal( ) )
+end sub
+
+sub KeysDialog.OpenAssign( )
+    dim as long i = this.SelectedIndex( )
+    if (i < 0) orelse (Assign <> 0) then exit sub
+    Assign = new AssignDialog
+    Assign->Open( @this, i )
+    if Assign->Win = 0 then
+        delete Assign
+        Assign = 0
+    end if
+end sub
+
+' OK: the dialog's keys and Disable default into Work's row.
+sub KeysDialog.FinishAssign( byval ok as boolean )
+    if Assign = 0 then exit sub
+    dim as AssignDialog ptr a = Assign
+    Assign = 0
+    if ok andalso (a->Index >= 0) then
+        dim as cmdids.Cmd id = Work.Item( a->Index ).Id
+        Work.SetUserKeys( id, a->EditKeys )
+        Work.SetDefaultDisabled( id, a->EditDisabled )
+    end if
+    a->Close( )
+    delete a
+    this.RefreshRows( )
+    if Win then tkHost_SetFocus( tkForm_Host( Win ), List )
+end sub
+
+' ---------------------------------------------------------------- Assign Shortcut: callbacks
+
+private function AssignOf_( byval w as TK_WIDGET ptr ) as AssignDialog ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub OnAssignButton( byval h as TK_WIDGET ptr, byval id as long )
+    dim as AssignDialog ptr a = AssignOf_( h )
+    if a = 0 then exit sub
+    select case h
+    case a->BtnReset  : a->DoReset( )
+    case a->BtnOk     : a->Finish( true )
+    case a->BtnCancel : a->Finish( false )
+    end select
+end sub
+
+private sub OnAssignToggle( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as AssignDialog ptr a = AssignOf_( h )
+    if a then a->ModelFromViews( )
+end sub
+
+private sub OnAssignKeyPick( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as AssignDialog ptr a = AssignOf_( h )
+    if a then a->ModelFromViews( )
+end sub
+
+' The capture box: takes the next chord pressed in it. Every key is claimed but Escape (the
+' dialog's way out) and a bare modifier (not a chord yet). It takes no text input, so no TKM_CHAR.
+private function CaptureProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as AssignDialog ptr a = w->pData
+    select case m->msg
+    case TKM_PAINT
+        dim as TKTHEME_COLORS t = tkTheme_RolesFor( w )
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        dim as long curve = tkHost_Scale( w->pHost, 6 )
+        m->pPaint->SetBackColor( t.Window )
+        m->pPaint->PaintRect( @rc )
+        m->pPaint->SetBackColor( t.Surface )
+        m->pPaint->PaintRoundRect( @rc, curve )
+        ' a refusal flash outranks focus; PaintRoundOutline strokes (a fill would erase the text)
+        dim as ulong pen = t.Border
+        dim as long thick = 1
+        if a->FlashOn then
+            pen = t.Error : thick = 2
+        elseif a->CaptureFocus then
+            pen = t.FocusRing : thick = 2
+        end if
+        m->pPaint->SetPenColor( pen )
+        m->pPaint->PaintRoundOutline( @rc, curve, thick )
+        dim as TK_FORM ptr f = tkForm_FromWidget( w )
+        dim as TTF_Font ptr boldF = iif( f <> 0, tkForm_Font( f, TKFONT_UI_BOLD ), cast( TTF_Font ptr, 0 ) )
+        m->pPaint->SetFont( boldF )
+        if len( a->EditKeys ) then
+            m->pPaint->SetForeColor( t.TextStrong )
+            m->pPaint->PaintText( a->EditKeys, @rc, TK_DT_CENTER or TK_DT_VCENTER )
+        else
+            ' the prompt and the caret's slot centred as one, the slot kept whether or not the
+            ' caret is drawn, so the words never shuffle as it blinks
+            dim as ustring s = i18n.Tr( "keys.press", "Press the new shortcut" )
+            dim as long tw = tkText_Width( boldF, s ), caretW = tkHost_Scale( w->pHost, 2 ), gapW = tkHost_Scale( w->pHost, 6 )
+            dim as long x0 = (w->cw - (tw + gapW + caretW)) \ 2
+            if x0 < 0 then x0 = 0
+            dim as TKRECT rt
+            tkRect_Set( rt, x0, 0, x0 + tw + 1, w->ch )
+            m->pPaint->SetForeColor( t.Text )
+            m->pPaint->PaintText( s, @rt, TK_DT_LEFT or TK_DT_VCENTER or TK_DT_NOCLIP )
+            if a->CaretOn then
+                dim as long barH = w->ch \ 2
+                dim as TKRECT rk
+                tkRect_Set( rk, x0 + tw + gapW, (w->ch - barH) \ 2, x0 + tw + gapW + caretW, (w->ch - barH) \ 2 + barH )
+                m->pPaint->SetBackColor( t.Accent )
+                m->pPaint->PaintRect( @rk )
+            end if
+        end if
+        return true
+    case TKM_SETFOCUS
+        a->CaptureFocus = true
+        a->CaretOn = true
+        a->SyncCaret( )
+        return true
+    case TKM_KILLFOCUS
+        a->CaptureFocus = false
+        a->SyncCaret( )
+        return true
+    case TKM_TIMER
+        if m->timerId = TIMER_CARET then
+            a->CaretOn = (a->CaretOn = false)
+        elseif m->timerId = TIMER_FLASH then
+            tkWidget_KillTimer( w, TIMER_FLASH )
+            a->FlashOn = false
+        end if
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONDOWN
+        tkHost_SetFocus( w->pHost, w )
+        return true
+    case TKM_KEYDOWN
+        return a->TakeKey( m )
+    case TKM_DESTROY
+        tkWidget_KillTimer( w, TIMER_CARET )
+        tkWidget_KillTimer( w, TIMER_FLASH )
+    end select
+    return false
+end function
+
+' ---------------------------------------------------------------- Assign Shortcut
+
+sub AssignDialog.Open( byval owner_ as KeysDialog_ ptr, byval idx as long )
+    Owner = owner_
+    Index = idx
+    dim as keybind.KeyBinding kb = Owner->Work.Item( idx )
+    EditDisabled = kb.DefaultDisabled
+    EditKeys = kb.UserKeys
+    dim as keybind.ChordResult cr = Owner->Work.Vocab( ).ParseChord( EditKeys )
+    if cr.IsOk( ) then
+        EditPrimary = cr.Value( ).Primary
+        EditAlt = cr.Value( ).Alt
+        EditShift = cr.Value( ).Shift
+    end if
+
+    dim as ustring t = i18n.Tr( "keys.assign_title", "Assign Shortcut" )
+    Win = tkApp_NewForm( t, AS_CLIENT_W, AS_CLIENT_H, Owner->Win, tkForm_Host( Owner->Win )->fScaleForced )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    tkForm_OnClose( Win, function( byval f as TK_FORM ptr ) as boolean
+        RaiseOwner_( f )
+        return true
+    end function )
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    LblDesc = MakeLabel_( root_, Owner->DescriptionText( idx ) )
+    tkLabel_SetFont( LblDesc, tkForm_Font( Win, TKFONT_UI_BOLD ) )
+    LblCat = MakeLabel_( root_, Owner->CategoryText( idx ) )
+    dim as ustring def_ = kb.DefaultKeys
+    if len( def_ ) = 0 then def_ = i18n.Tr( "keys.no_default", "(no default)" )
+    LblDefault = MakeLabel_( root_, strings.Format( i18n.Tr( "keys.default_line", "Default Keys: {}" ), def_ ) )
+    LblDisable = MakeLabel_( root_, i18n.Tr( "keys.disable_default", "Disable default" ) )
+    tkLabel_SetAlign( LblDisable, TK_DT_RIGHT )
+    TogDisable = tkToggle_Create( root_, 10 )
+    Capture = tkWidget_CreateChild( root_, 11, @CaptureProc, @this )
+    Capture->isFocusable = true
+    ' Primary, never Ctrl: the chord word keybindings.toml uses (Cmd on macOS)
+    TogPrimary = tkToggle_Create( root_, 12 )
+    LblPrimary = MakeLabel_( root_, "Primary" )
+    TogAlt = tkToggle_Create( root_, 13 )
+    LblAlt = MakeLabel_( root_, "Alt" )
+    TogShift = tkToggle_Create( root_, 14 )
+    LblShift = MakeLabel_( root_, "Shift" )
+    tkToggle_SetCheckChangedCallback( TogDisable, @OnAssignToggle )
+    tkToggle_SetCheckChangedCallback( TogPrimary, @OnAssignToggle )
+    tkToggle_SetCheckChangedCallback( TogAlt, @OnAssignToggle )
+    tkToggle_SetCheckChangedCallback( TogShift, @OnAssignToggle )
+    KeyList = tkListTree_Create( root_, 15 )
+    tkListTree_ShowTwisty( KeyList, false )
+    tkListTree_SetBorderWidth( KeyList, 1 )
+    tkListTree_SetPaintCallback( KeyList, @tkListTree_PaintRowDefault )
+    tkListTree_SetTooltipCallback( KeyList, @NoListTip )
+    tkListTree_AddString( KeyList, i18n.Tr( "keys.none", "None" ), -1 )
+    for k as long = 0 to Owner->KeyNames.Count( ) - 1
+        tkListTree_AddString( KeyList, Owner->KeyNames[k], k )
+    next
+    tkListTree_SetSelChangeCallback( KeyList, @OnAssignKeyPick )
+    LblMsg = MakeLabel_( root_, "" )
+    tkLabel_SetTextColor( LblMsg, tkTheme_RolesFor( root_ ).Error )
+    BtnReset = MakeButton_( root_, i18n.Tr( "keys.reset", "Reset" ), @OnAssignButton )
+    BtnOk = MakeButton_( root_, i18n.Tr( "button.ok", "OK" ), @OnAssignButton )
+    BtnCancel = MakeButton_( root_, i18n.Tr( "button.cancel", "Cancel" ), @OnAssignButton )
+
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        if f->Tag then cast( AssignDialog ptr, f->Tag )->Layout( )
+    end sub )
+    this.RefreshViews( )
+    tkForm_Show( Win )
+    this.Layout( )
+    tkHost_SetFocus( tkForm_Host( Win ), Capture )
+end sub
+
+function AssignDialog.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub AssignDialog.Close( )
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+end sub
+
+sub AssignDialog.Finish( byval ok as boolean )
+    Accepted = ok
+    if IsModal then
+        RaiseOwner_( Win )
+        tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+    end if
+end sub
+
+sub AssignDialog.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long cw = root_->cw, ch = root_->ch
+    dim as long mx = tkForm_Scale( Win, AS_MARGIN ), rowH = tkForm_Scale( Win, AS_ROW_H )
+    dim as long fullW = cw - 2 * mx, y = mx
+    tkWidget_SetPos( LblDesc, mx, y, fullW, rowH )
+    y += rowH
+    tkWidget_SetPos( LblCat, mx, y, fullW, rowH )
+    y += rowH + tkForm_Scale( Win, 10 )
+    ' "Default Keys: X" on the left, Disable default and its toggle on the right of the same line
+    dim as long tw, th
+    tkToggle_GetIdealSize( TogDisable, tw, th )
+    tkWidget_SetPos( TogDisable, cw - mx - tw, y + (rowH - th) \ 2, tw, th )
+    dim as long dw = tkForm_Scale( Win, 150 )
+    tkWidget_SetPos( LblDisable, cw - mx - tw - tkForm_Scale( Win, 8 ) - dw, y, dw, rowH )
+    tkWidget_SetPos( LblDefault, mx, y, fullW - tw - dw - tkForm_Scale( Win, 16 ), rowH )
+    y += rowH + tkForm_Scale( Win, 14 )
+    dim as long capH = tkForm_Scale( Win, AS_CAPTURE_H )
+    tkWidget_SetPos( Capture, mx, y, fullW, capH )
+    y += capH + tkForm_Scale( Win, 18 )
+    ' the three modifier toggles, each with its word after it
+    dim as long x = mx, capW = tkForm_Scale( Win, 62 )
+    dim as TK_WIDGET ptr togs( 0 to 2 ) = { TogPrimary, TogAlt, TogShift }
+    dim as TK_WIDGET ptr lbls( 0 to 2 ) = { LblPrimary, LblAlt, LblShift }
+    for k as long = 0 to 2
+        tkToggle_GetIdealSize( togs( k ), tw, th )
+        tkWidget_SetPos( togs( k ), x, y + (rowH - th) \ 2, tw, th )
+        tkWidget_SetPos( lbls( k ), x + tw + tkForm_Scale( Win, 6 ), y, capW, rowH )
+        x += tw + tkForm_Scale( Win, 6 ) + capW + tkForm_Scale( Win, 16 )
+    next
+    y += rowH + tkForm_Scale( Win, 6 )
+    dim as long klH = tkForm_Scale( Win, AS_KEYLIST_H )
+    tkWidget_SetPos( KeyList, mx, y, fullW, klH )
+    y += klH + tkForm_Scale( Win, 8 )
+    tkWidget_SetPos( LblMsg, mx, y, fullW, rowH )
+    dim as long bw = tkForm_Scale( Win, KB_BTN_W ), bh = tkForm_Scale( Win, KB_BTN_H )
+    dim as long by = ch - mx - bh
+    tkWidget_SetPos( BtnReset, mx, by, bw, bh )
+    tkWidget_SetPos( BtnCancel, cw - mx - bw, by, bw, bh )
+    tkWidget_SetPos( BtnOk, cw - mx - 2 * bw - tkForm_Scale( Win, 8 ), by, bw, bh )
+end sub
+
+' Model -> views. Silent: the setters are programmatic, and Syncing guards anyway.
+sub AssignDialog.RefreshViews( )
+    if Syncing then exit sub
+    Syncing = true
+    ' a chord owns the modifiers; no chord leaves them as the toggles say (Reset clears them itself)
+    dim as long sel = 0
+    if len( EditKeys ) then
+        dim as keybind.ChordResult cr = Owner->Work.Vocab( ).ParseChord( EditKeys )
+        if cr.IsOk( ) then
+            EditPrimary = cr.Value( ).Primary
+            EditAlt = cr.Value( ).Alt
+            EditShift = cr.Value( ).Shift
+            for k as long = 0 to Owner->KeyNames.Count( ) - 1
+                if Owner->KeyNames[k] = cr.Value( ).KeyName then sel = k + 1
+            next
+        end if
+    end if
+    tkToggle_SetChecked( TogPrimary, EditPrimary )
+    tkToggle_SetChecked( TogAlt, EditAlt )
+    tkToggle_SetChecked( TogShift, EditShift )
+    tkToggle_SetChecked( TogDisable, EditDisabled )
+    tkListTree_SetCurSel( KeyList, sel )
+    Syncing = false
+    this.ShowMessage( )
+    this.SyncCaret( )
+end sub
+
+' Views -> model: the toggles first (they stand with or without a key), then the picked key.
+sub AssignDialog.ModelFromViews( )
+    if Syncing then exit sub
+    EditPrimary = tkToggle_GetChecked( TogPrimary )
+    EditAlt = tkToggle_GetChecked( TogAlt )
+    EditShift = tkToggle_GetChecked( TogShift )
+    EditDisabled = tkToggle_GetChecked( TogDisable )
+    dim as long sel = tkListTree_GetCurSel( KeyList )
+    if (sel <= 0) orelse (sel > Owner->KeyNames.Count( )) then
+        EditKeys = ""
+    else
+        dim as keybind.Chord c
+        c.Primary = EditPrimary
+        c.Alt = EditAlt
+        c.Shift = EditShift
+        c.KeyName = Owner->KeyNames[sel - 1]
+        EditKeys = c.ToText( )
+    end if
+    Why = ""
+    this.RefreshViews( )
+end sub
+
+' Back to this command's default (no keys, default on), modifiers off. Does not close.
+sub AssignDialog.DoReset( )
+    EditKeys = ""
+    EditDisabled = false
+    EditPrimary = false
+    EditAlt = false
+    EditShift = false
+    Why = ""
+    this.RefreshViews( )
+    tkHost_SetFocus( tkForm_Host( Win ), Capture )
+end sub
+
+' The message line: a refused key wins over a conflict (news about what was just pressed).
+sub AssignDialog.ShowMessage( )
+    dim as ustring s = Why
+    if len( s ) = 0 then s = Owner->ConflictText( EditKeys, Index )
+    tkLabel_SetText( LblMsg, s )
+    if Capture then tkWidget_Invalidate( Capture )
+end sub
+
+' The caret blinks only while the box has the focus and is still empty.
+sub AssignDialog.SyncCaret( )
+    if Capture = 0 then exit sub
+    if CaptureFocus andalso (len( EditKeys ) = 0) then
+        tkWidget_SetTimer( Capture, TIMER_CARET, AS_CARET_MS )
+    else
+        tkWidget_KillTimer( Capture, TIMER_CARET )
+        CaretOn = false
+    end if
+    tkWidget_Invalidate( Capture )
+end sub
+
+' A key pressed in the capture box. TRUE = claimed.
+function AssignDialog.TakeKey( byval m as TK_MSG ptr ) as boolean
+    select case m->key
+    case SDLK_ESCAPE
+        return false                    ' the way out: the form ends the modal loop as Cancel
+    case SDLK_LCTRL, SDLK_RCTRL, SDLK_LSHIFT, SDLK_RSHIFT, SDLK_LALT, SDLK_RALT, SDLK_LGUI, SDLK_RGUI
+        return true                     ' not a chord yet
+    end select
+    dim as TK_CHORD c = tkKeys_FromMsg( m )
+    dim as boolean prim = (c.mods and tkKeys_Primary( )) <> 0
+    dim as boolean alt_ = (c.mods and TKKEY_ALT) <> 0
+    dim as boolean shift_ = (c.mods and TKKEY_SHIFT) <> 0
+    dim as long k = -1
+    Owner->KeyOf.TryGet( c.key, k )
+    dim as ustring why_
+    if k < 0 then
+        ' PrintScreen, F13, media keys: no name in keybindings.toml, so a binding that would never fire
+        why_ = i18n.Tr( "keys.not_a_key", "That key cannot be used as a shortcut." )
+    elseif (prim = false) andalso (alt_ = false) andalso (shift_ = false) andalso _
+           (((c.key >= asc( "a" )) andalso (c.key <= asc( "z" ))) orelse ((c.key >= asc( "0" )) andalso (c.key <= asc( "9" )))) then
+        ' a bare letter or digit would fire while typing (the key list still allows it)
+        why_ = i18n.Tr( "keys.needs_modifier", "A letter or digit needs Primary, Alt or Shift." )
+    end if
+    if len( why_ ) then
+        Why = why_
+        FlashOn = true
+        tkWidget_SetTimer( Capture, TIMER_FLASH, AS_FLASH_MS )
+        this.ShowMessage( )
+        return true
+    end if
+    dim as keybind.Chord ch
+    ch.Primary = prim
+    ch.Alt = alt_
+    ch.Shift = shift_
+    ch.KeyName = Owner->KeyNames[k]
+    EditKeys = ch.ToText( )
+    Why = ""
+    this.RefreshViews( )
+    return true
+end function

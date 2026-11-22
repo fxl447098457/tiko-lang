@@ -1,0 +1,532 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' glyphdlg -- the Glyph Picker (docs/tkDesigner/GLYPHS.md): the fonts on the left, every character the
+' selected one has in a grid on the right, a hex search above it. Opened from a glyph property's "...".
+'
+' The caller fills Fonts (ThemeIdx: the one shown first) and opens it on the value the property has.
+' On Select, Picked is the character and PickedFont the font it came from. "(none)" picks "".
+' Close picks nothing. Nothing is written here.
+#module "glyphdlg"
+
+#import "std/containers"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkVScrollBar"
+using containers
+using tkApp
+using tkListTree
+using tkButton
+using tkLabel
+using tkTextBox
+using tkVScrollBar
+using tkTheme
+using tkHost
+using tkPaint
+
+const as long WIN_CX = 760, WIN_CY = 520
+const as long GAP = 10, ROW_CY = 32, BTN_CX = 100, LIST_CX = 200
+const as long CELL = 40             ' a grid cell, design units
+const as single GRID_PT = 18        ' the grid's glyphs
+const as single BIG_PT = 40         ' the selected one, under the grid
+const as long GLYPH_CX = 40         ' a glyph button's width (design units)
+const as ulong GLYPH_ADD = &hF109   ' add (a plus)
+const as ulong GLYPH_DELETE = &hF34C ' remove (a bin)
+
+public type GlyphFontEntry
+    Label as ustring                ' what the list shows
+    Value as ustring                ' its key in a glyph value, "<key>:<hex>" (GLYPHS.md): "Fluent"
+    Path as ustring                 ' where it is opened from
+end type
+
+public type GlyphDialog_ as GlyphDialog
+' The project's list (GLYPHS.md V3): Add appends a font to d->Fonts and returns its index (-1 for
+' none); Remove takes d->Fonts[i] out, true when it went (the caller asks first when it is in use).
+public type GlyphAddFunc as function( byval owner as any ptr, byval d as GlyphDialog_ ptr ) as long
+public type GlyphRemoveFunc as function( byval owner as any ptr, byval d as GlyphDialog_ ptr, byval i as long ) as boolean
+
+public type GlyphDialog
+    Win as TK_FORM ptr
+    Owner as any ptr
+    OnAddFont as GlyphAddFunc       ' 0: no Add / Remove (outside a project)
+    OnRemoveFont as GlyphRemoveFunc
+    Fonts as Array( of GlyphFontEntry )
+    ThemeIdx as long                ' the font shown first
+    Picked as ustring               ' Select: the character, "" for (none)
+    PickedFont as long = -1         ' Select: the font it is from; -1 for (none)
+    Accepted as boolean
+    IsModal as boolean
+
+    FontIdx as long = -1            ' the font shown
+    Codes as Array( of ulong )      ' the code points it has, U+0020 .. U+FFFF
+    Sel as long = -1                ' an index into Codes
+    Hot as long = -1
+    Top as long                     ' the first grid row shown
+    GridFont as TTF_Font ptr
+    BigFont as TTF_Font ptr
+    Loading as boolean
+
+    List as TK_WIDGET ptr
+    LblSearch as TK_WIDGET ptr
+    TxtSearch as TK_WIDGET ptr
+    Grid as TK_WIDGET ptr
+    VBar as TK_WIDGET ptr
+    Big as TK_WIDGET ptr
+    LblCode as TK_WIDGET ptr
+    BtnAdd as TK_WIDGET ptr
+    BtnRemove as TK_WIDGET ptr
+    BtnNone as TK_WIDGET ptr
+    BtnSelect as TK_WIDGET ptr
+    BtnClose as TK_WIDGET ptr
+
+    declare sub Open( byval owner_ as TK_FORM ptr, byref current as const ustring )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub Finish( byval ok as boolean )
+    declare sub Layout( )
+    declare sub ShowFont( byval i as long, byval want as ulong )
+    declare sub FillFonts( byval selectIdx as long )
+    declare sub SelectCode( byval i as long )
+    declare function Cols( ) as long
+    declare function CellPx( ) as long
+    declare function VisRows( ) as long
+    declare sub SyncBar( )
+    declare sub Search( byref text as const ustring )
+    declare function KeyDown( byval m as TK_MSG ptr ) as boolean
+end type
+
+private function DlgOf( byval w as TK_WIDGET ptr ) as GlyphDialog ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub RaiseOwner_( byval f as TK_FORM ptr )
+    if (f <> 0) andalso (f->pOwner <> 0) then SDL_RaiseWindow( f->pOwner->host->win )
+end sub
+
+' "U+E824" for a code point.
+public function CodeText( byval cp as ulong ) as ustring
+    return "U+" & right( "000" & hex( cp ), iif( cp > &hFFFF, 6, 4 ) )
+end function
+
+' "E824", "U+E824", "u+e824", "0xE824" -> the code point; 0 when it is not hex.
+public function ParseCode( byref s as const ustring ) as ulong
+    dim as ustring t = ucase( trim( s ) )
+    if left( t, 2 ) = "U+" orelse left( t, 2 ) = "0X" then t = mid( t, 3 )
+    if (len( t ) = 0) orelse (len( t ) > 6) then return 0
+    for i as long = 1 to len( t )
+        dim as long a = asc( mid( t, i, 1 ) )
+        if ((a < 48) orelse (a > 57)) andalso ((a < 65) orelse (a > 70)) then return 0
+    next
+    return culng( valuint( "&h" & t ) )
+end function
+
+' ---- the grid ---------------------------------------------------------------------------------
+
+function GlyphDialog.CellPx( ) as long
+    return tkForm_Scale( Win, CELL )
+end function
+
+function GlyphDialog.Cols( ) as long
+    dim as long n = 1
+    if Grid then n = Grid->cw \ this.CellPx( )
+    return iif( n < 1, 1, n )
+end function
+
+function GlyphDialog.VisRows( ) as long
+    dim as long n = 1
+    if Grid then n = Grid->ch \ this.CellPx( )
+    return iif( n < 1, 1, n )
+end function
+
+sub GlyphDialog.SyncBar( )
+    if VBar = 0 then exit sub
+    dim as long rows = (Codes.Count( ) + this.Cols( ) - 1) \ this.Cols( ), vis = this.VisRows( )
+    if Top > rows - vis then Top = rows - vis
+    if Top < 0 then Top = 0
+    tkVScrollBar_SetRange( VBar, rows, vis, Top )
+    tkWidget_Invalidate( Grid )
+end sub
+
+private sub PaintGrid_( byval w as TK_WIDGET ptr, byval b as TK_PAINT ptr )
+    dim as GlyphDialog ptr d = w->pData
+    if d = 0 then exit sub
+    dim as TKTHEME_COLORS t = tkTheme_Get( )
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, w->cw, w->ch )
+    b->SetBackColor( t.Surface )
+    b->PaintRect( @rc )
+    if d->GridFont = 0 then exit sub
+    b->SetFont( d->GridFont )
+    dim as long cs = d->CellPx( ), cols = d->Cols( ), n = d->Codes.Count( )
+    for r as long = 0 to d->VisRows( )
+        if (d->Top + r) * cols >= n then exit for
+        for c as long = 0 to cols - 1
+            dim as long i = (d->Top + r) * cols + c
+            if i >= n then exit for
+            dim as TKRECT cr
+            tkRect_Set( cr, c * cs, r * cs, (c + 1) * cs, (r + 1) * cs )
+            dim as ulong back_ = t.Surface, fore = t.Text
+            if i = d->Sel then
+                back_ = t.Selected : fore = t.SelectedText
+            elseif i = d->Hot then
+                back_ = t.SurfaceHot
+            end if
+            if back_ <> t.Surface then
+                b->SetBackColor( back_ )
+                b->PaintRect( @cr )
+            end if
+            b->SetColors( fore, back_ )
+            b->PaintText( wchr( d->Codes[i] ), @cr, TK_DT_CENTER or TK_DT_VCENTER )
+        next
+    next
+    if (tkHost_GetFocus( w->pHost ) = w) andalso (d->Sel >= 0) then
+        ' the keyboard's place: an outline round the selected cell
+        dim as long r = d->Sel \ cols - d->Top, c = d->Sel mod cols
+        if (r >= 0) andalso (r <= d->VisRows( )) then
+            dim as TKRECT fr
+            tkRect_Set( fr, c * cs, r * cs, (c + 1) * cs, (r + 1) * cs )
+            b->SetForeColor( t.FocusRing )
+            b->PaintRoundOutline( @fr, 0, 1 )
+        end if
+    end if
+end sub
+
+private function HitCell_( byval d as GlyphDialog ptr, byval x as long, byval y as long ) as long
+    dim as long cs = d->CellPx( ), c = x \ cs, r = y \ cs
+    if (x < 0) orelse (y < 0) orelse (c >= d->Cols( )) then return -1
+    dim as long i = (d->Top + r) * d->Cols( ) + c
+    return iif( i < d->Codes.Count( ), i, -1 )
+end function
+
+private function GridProc_( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as GlyphDialog ptr d = w->pData
+    if d = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        PaintGrid_( w, m->pPaint )
+        return true
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        tkWidget_Invalidate( w )
+        return false
+    case TKM_LBUTTONDOWN
+        tkHost_SetFocus( w->pHost, w )
+        dim as long i = HitCell_( d, cint( m->x ), cint( m->y ) )
+        if i >= 0 then
+            d->SelectCode( i )
+            if m->clicks >= 2 then d->Finish( true )
+        end if
+        return true
+    case TKM_MOUSEMOVE
+        dim as long i = HitCell_( d, cint( m->x ), cint( m->y ) )
+        if i <> d->Hot then d->Hot = i : tkWidget_Invalidate( w )
+        return true
+    case TKM_MOUSELEAVE
+        if d->Hot >= 0 then d->Hot = -1 : tkWidget_Invalidate( w )
+        return true
+    case TKM_MOUSEWHEEL
+        d->Top -= cint( m->wheelY ) * 3
+        d->SyncBar( )
+        return true
+    case TKM_KEYDOWN
+        return d->KeyDown( m )
+    case TKM_CHAR
+        return true                              ' the keys it claims type nothing
+    end select
+    return false
+end function
+
+function GlyphDialog.KeyDown( byval m as TK_MSG ptr ) as boolean
+    dim as long n = Codes.Count( ), i = Sel, nc = this.Cols( )
+    select case m->key
+    case SDLK_LEFT : i -= 1
+    case SDLK_RIGHT : i += 1
+    case SDLK_UP : i -= nc
+    case SDLK_DOWN : i += nc
+    case SDLK_PAGEUP : i -= nc * this.VisRows( )
+    case SDLK_PAGEDOWN : i += nc * this.VisRows( )
+    case SDLK_HOME : i = 0
+    case SDLK_END : i = n - 1
+    case SDLK_RETURN, SDLK_KP_ENTER
+        this.Finish( true )
+        return true
+    case SDLK_ESCAPE
+        this.Finish( false )
+        return true
+    case else
+        return false
+    end select
+    if n = 0 then return true
+    if i < 0 then i = 0
+    if i >= n then i = n - 1
+    this.SelectCode( i )
+    return true
+end function
+
+' Code i selected: the grid scrolled to it, the big preview and the code under it.
+sub GlyphDialog.SelectCode( byval i as long )
+    if (i < 0) orelse (i >= Codes.Count( )) then i = -1
+    Sel = i
+    if i >= 0 then
+        dim as long r = i \ this.Cols( )
+        if r < Top then Top = r
+        if r >= Top + this.VisRows( ) then Top = r - this.VisRows( ) + 1
+        tkLabel_SetText( Big, wchr( Codes[i] ) )
+        tkLabel_SetText( LblCode, CodeText( Codes[i] ) )
+    else
+        tkLabel_SetText( Big, "" )
+        tkLabel_SetText( LblCode, "" )
+    end if
+    tkWidget_Enable( BtnSelect, i >= 0 )
+    this.SyncBar( )
+end sub
+
+' Font i in the grid, its every character from U+0020 (no surrogates); want selected when it has it.
+sub GlyphDialog.ShowFont( byval i as long, byval want as ulong )
+    if (i < 0) orelse (i >= Fonts.Count( )) then exit sub
+    FontIdx = i
+    dim as TK_HOST ptr h = tkForm_Host( Win )
+    GridFont = tkHost_OpenFont( h, Fonts[i].Path, GRID_PT )          ' the surface owns each
+    BigFont = tkHost_OpenFont( h, Fonts[i].Path, BIG_PT )
+    if BigFont then tkLabel_SetFont( Big, BigFont )
+    Codes.Clear( )
+    if GridFont then
+        for cp as ulong = &h20 to &hFFFF
+            if (cp >= &hD800) andalso (cp <= &hDFFF) then continue for
+            if TTF_FontHasGlyph( GridFont, cp ) = false then continue for
+            ' one with no ink (a space, an empty slot) would be a blank cell: left out
+            dim as long minx, maxx, miny, maxy, adv
+            if TTF_GetGlyphMetrics( GridFont, cp, @minx, @maxx, @miny, @maxy, @adv ) = false then continue for
+            if (maxx > minx) andalso (maxy > miny) then Codes.Push( cp )
+        next
+    end if
+    Top = 0 : Hot = -1
+    dim as long s = -1
+    for k as long = 0 to Codes.Count( ) - 1
+        if Codes[k] = want then s = k : exit for
+    next
+    this.SelectCode( s )
+end sub
+
+' The list again (after Add or Remove), font selectIdx shown, no glyph selected.
+sub GlyphDialog.FillFonts( byval selectIdx as long )
+    Loading = true
+    tkListTree_Clear( List )
+    for i as long = 0 to Fonts.Count( ) - 1
+        tkListTree_AddString( List, Fonts[i].Label, i )
+    next
+    if (selectIdx >= 0) andalso (selectIdx < Fonts.Count( )) then tkListTree_SetCurSel( List, selectIdx )
+    Loading = false
+    tkWidget_Enable( BtnRemove, Fonts.Count( ) > 0 )
+    if (selectIdx >= 0) andalso (selectIdx < Fonts.Count( )) then
+        this.ShowFont( selectIdx, 0 )
+    else
+        FontIdx = -1
+        Codes.Clear( )
+        this.SelectCode( -1 )
+    end if
+end sub
+
+' The search box: the code typed, selected when the font has it.
+sub GlyphDialog.Search( byref text as const ustring )
+    dim as ulong cp = ParseCode( text )
+    if cp = 0 then exit sub
+    for k as long = 0 to Codes.Count( ) - 1
+        if Codes[k] = cp then
+            this.SelectCode( k )
+            exit sub
+        end if
+    next
+end sub
+
+' ---- the dialog --------------------------------------------------------------------------------
+
+private sub OnButton_( byval h as TK_WIDGET ptr, byval id as long )
+    dim as GlyphDialog ptr d = DlgOf( h )
+    if d = 0 then exit sub
+    select case h
+    case d->BtnAdd
+        if d->OnAddFont = 0 then exit sub
+        dim as long i = d->OnAddFont( d->Owner, d )
+        if i >= 0 then d->FillFonts( i )
+    case d->BtnRemove
+        dim as long j = d->FontIdx
+        if (d->OnRemoveFont = 0) orelse (j < 0) orelse (j >= d->Fonts.Count( )) then exit sub
+        if d->OnRemoveFont( d->Owner, d, j ) then d->FillFonts( iif( j < d->Fonts.Count( ), j, d->Fonts.Count( ) - 1 ) )
+    case d->BtnSelect : d->Finish( true )
+    case d->BtnClose : d->Finish( false )
+    case d->BtnNone
+        d->Picked = "" : d->PickedFont = -1
+        d->Accepted = true
+        if d->IsModal then
+            RaiseOwner_( d->Win )
+            tkForm_EndModal( d->Win, 1 )
+        end if
+    end select
+end sub
+
+' A small button that is one glyph; tip is its word, shown on hover.
+private function MakeGlyphButton_( byval parent as TK_WIDGET ptr, byval cp as ulong, byref tip as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    tkButton_SetGlyphFont( b, tkForm_Font( tkForm_FromWidget( parent ), TKFONT_GLYPH_LARGE ) )   ' else it draws in the text font
+    tkButton_SetGlyphLeft( b, wchr( cp ) )
+    tkButton_SetTooltipText( b, tip )
+    tkButton_SetClickCallback( b, @OnButton_ )
+    return b
+end function
+
+private function NoTip_( byval h as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ustring
+    return ""
+end function
+
+private sub OnFontSel_( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as GlyphDialog ptr d = DlgOf( h )
+    if (d = 0) orelse d->Loading then exit sub
+    dim as ulong keep = 0
+    if d->Sel >= 0 then keep = d->Codes[d->Sel]
+    d->ShowFont( tkListTree_GetItemData( h, row ), keep )
+end sub
+
+private sub OnSearch_( byval h as TK_WIDGET ptr )
+    dim as GlyphDialog ptr d = DlgOf( h )
+    if d then d->Search( tkTextBox_GetText( h ) )
+end sub
+
+private sub OnScroll_( byval h as TK_WIDGET ptr, byval newPos as integer )
+    dim as GlyphDialog ptr d = DlgOf( h )
+    if d = 0 then exit sub
+    d->Top = newPos
+    tkWidget_Invalidate( d->Grid )
+end sub
+
+private function MakeButton_( byval parent as TK_WIDGET ptr, byref text as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    dim as ustring t = text
+    tkButton_SetText( b, t )
+    tkButton_SetClickCallback( b, @OnButton_ )
+    return b
+end function
+
+sub GlyphDialog.Open( byval owner_ as TK_FORM ptr, byref current as const ustring )
+    dim as single sc = 0
+    if owner_ then sc = tkForm_Host( owner_ )->fScaleForced
+    Win = tkApp_NewForm( i18n.Tr( "designer.glyph_title", "Glyph Picker" ), WIN_CX, WIN_CY, owner_, sc )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    tkForm_OnClose( Win, function( byval f as TK_FORM ptr ) as boolean
+        RaiseOwner_( f )
+        return true
+    end function )
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    Loading = true
+
+    List = tkListTree_Create( root_, 1 )
+    tkListTree_SetPaintCallback( List, @tkListTree_PaintRowDefault )   ' a tkListTree draws no row by itself
+    for i as long = 0 to Fonts.Count( ) - 1
+        tkListTree_AddString( List, Fonts[i].Label, i )
+    next
+    tkListTree_SetSelChangeCallback( List, @OnFontSel_ )
+    tkListTree_SetTooltipCallback( List, @NoTip_ )         ' the names show whole: no tooltip
+    ' the project's list: Add... a font file, Remove the selected font (GLYPHS.md GV6)
+    BtnAdd = MakeGlyphButton_( root_, GLYPH_ADD, i18n.Tr( "designer.glyph_add_font", "Add a font..." ) )
+    BtnRemove = MakeGlyphButton_( root_, GLYPH_DELETE, i18n.Tr( "designer.glyph_remove_font", "Remove the font" ) )
+    tkWidget_Show( BtnAdd, OnAddFont <> 0 )
+    tkWidget_Show( BtnRemove, OnRemoveFont <> 0 )
+    LblSearch = tkLabel_Create( root_, 1 )
+    tkLabel_SetText( LblSearch, i18n.Tr( "designer.glyph_search", "Code" ) )
+    TxtSearch = tkTextBox_Create( root_, 1 )
+    tkTextBox_SetCueBannerText( TxtSearch, "E824" )
+    tkTextBox_SetChangeCallback( TxtSearch, @OnSearch_ )
+    Grid = tkWidget_CreateChild( root_, 1, @GridProc_, @this )
+    Grid->isFocusable = true
+    VBar = tkVScrollBar_Create( root_, 1 )
+    tkVScrollBar_SetScrollCallback( VBar, @OnScroll_ )
+    Big = tkLabel_Create( root_, 1 )
+    tkLabel_SetAlign( Big, LBL_ALIGN_CENTER )
+    LblCode = tkLabel_Create( root_, 1 )
+    BtnNone = MakeButton_( root_, i18n.Tr( "designer.res_none", "(none)" ) )
+    BtnSelect = MakeButton_( root_, i18n.Tr( "designer.res_select", "Select" ) )
+    BtnClose = MakeButton_( root_, i18n.Tr( "designer.res_close", "Close" ) )
+
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        cast( GlyphDialog ptr, f->Tag )->Layout( )
+    end sub )
+    tkForm_Show( Win )
+    this.Layout( )
+    ' the theme's font, on the value the property has
+    dim as ulong want = 0
+    if len( current ) then want = asc( current )
+    dim as long first_ = iif( (ThemeIdx >= 0) andalso (ThemeIdx < Fonts.Count( )), ThemeIdx, 0 )
+    tkListTree_SetCurSel( List, first_ )
+    Loading = false
+    this.ShowFont( first_, want )
+    tkHost_SetFocus( tkForm_Host( Win ), Grid )
+end sub
+
+function GlyphDialog.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub GlyphDialog.Close( )
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+end sub
+
+' Select (the cell selected) or Close.
+sub GlyphDialog.Finish( byval ok as boolean )
+    if ok andalso (Sel < 0) then exit sub
+    if ok then
+        Picked = wchr( Codes[Sel] )
+        PickedFont = FontIdx
+    end if
+    Accepted = ok
+    if IsModal then
+        RaiseOwner_( Win )
+        tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+    end if
+end sub
+
+sub GlyphDialog.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long g = tkForm_Scale( Win, GAP ), rh = tkForm_Scale( Win, ROW_CY ), cw = root_->cw, ch = root_->ch
+    dim as long lw = tkForm_Scale( Win, LIST_CX ), bw = tkForm_Scale( Win, BTN_CX )
+    dim as long sbw = tkForm_Scale( Win, 12 ), bigH = tkForm_Scale( Win, 64 )
+    dim as long bottomY = ch - g - rh
+    dim as long gx = 2 * g + lw, gw = cw - gx - g - sbw
+    ' the list, Add and Remove under it (when the list is the project's)
+    dim as long gw2 = tkForm_Scale( Win, GLYPH_CX ), listH = bottomY - 2 * g
+    if OnAddFont then
+        listH -= rh + g
+        tkWidget_SetPos( BtnAdd, g, g + listH + g, gw2, rh )
+        tkWidget_SetPos( BtnRemove, 2 * g + gw2, g + listH + g, gw2, rh )
+    end if
+    tkWidget_SetPos( List, g, g, lw, listH )
+    tkWidget_SetPos( LblSearch, gx, g, tkForm_Scale( Win, 50 ), rh )
+    tkWidget_SetPos( TxtSearch, gx + tkForm_Scale( Win, 50 ) + g, g, tkForm_Scale( Win, 140 ), rh )
+    dim as long gy = 2 * g + rh, gh = bottomY - g - bigH - g - gy
+    ' whole cells across, the bar beside them
+    dim as long cs = this.CellPx( )
+    gw = (gw \ cs) * cs
+    tkWidget_SetPos( Grid, gx, gy, gw, gh )
+    tkWidget_SetPos( VBar, gx + gw, gy, sbw, gh )
+    tkWidget_SetPos( Big, gx, gy + gh + g, bigH * 2, bigH )
+    tkWidget_SetPos( LblCode, gx + bigH * 2 + g, gy + gh + g + (bigH - rh) \ 2, tkForm_Scale( Win, 120 ), rh )
+    ' (none), Select, Close along the right (author)
+    tkWidget_SetPos( BtnNone, cw - 3 * (g + bw), bottomY, bw, rh )
+    tkWidget_SetPos( BtnSelect, cw - 2 * (g + bw), bottomY, bw, rh )
+    tkWidget_SetPos( BtnClose, cw - g - bw, bottomY, bw, rh )
+    if Sel >= 0 then this.SelectCode( Sel ) else this.SyncBar( )
+end sub

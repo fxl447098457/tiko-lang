@@ -98,6 +98,7 @@ Grouped by task. [Text](Functions-Text) lists them beside the rest of the area.
 
 ## Also in this category
 
+- [Regular Expressions](PCRE2-Tutorial)
 - [String Functions](String-Functions)
 
 <!-- finder:end -->

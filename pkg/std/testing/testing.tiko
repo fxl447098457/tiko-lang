@@ -1,0 +1,260 @@
+#module "testing"
+'' std/testing: unit tests -- what 'test' blocks register with, and the program that runs them
+''
+''     #import "std/testing"
+''
+''     test "Tally counts separators"
+''         testing.ExpectEq( strings.Tally( "a,b,c", "," ), 2 )
+''         testing.Expect( strings.StartsWith( "Hello", "he", true ) )
+''     end test
+''
+'' 'tiko test' finds the tests of a project, builds them into one program and runs it: every
+'' '*_test.tiko' file, and every 'test' block in a module of the project. Outside a test build a
+'' 'test' block is parsed and dropped, so tests can sit beside the code they test.
+''
+'' THE ASSERTIONS are macros, used qualified -- testing.ExpectEq( a, b ) -- because only a macro
+'' sees the line it is written on: a failure names the file and line of the assertion, and the
+'' text of both expressions. See expect.tiko.
+''
+''     testing.Expect( c )                c is true
+''     testing.ExpectFalse( c )           c is false
+''     testing.ExpectEq( a, b )           a = b         (numbers, strings, ustrings, booleans, pointers)
+''     testing.ExpectNe( a, b )           a <> b
+''     testing.ExpectNear( a, b, eps )    abs( a - b ) <= eps
+''     testing.Require( c )               as Expect, and the test stops when it fails
+''     testing.RequireEq( a, b )          as ExpectEq, and the test stops when it fails
+''     testing.Fail( "why" )              a failure, and the test goes on
+''     testing.Skip( "why" )              the test stops here and counts as skipped
+''
+'' An Expect that fails marks the test failed and the test GOES ON, so one run reports every
+'' failed check. A test that ends the program -- a runtime error under -exx, 'end', a crash --
+'' is reported by 'tiko test' as crashed, and the run continues with the next test.
+''
+'' THE PROGRAM. 'tiko test' generates its main, which is one line: 'end testing.RunMain( )'. The
+'' arguments it takes (after 'tiko test --'):
+''
+''     --list               print the tests and stop
+''     --run <text>         only the tests whose name holds <text> (any case; may be repeated)
+''     --exact <name>       only the test called <name>
+''     --skip <text>        not the tests whose name holds <text> (may be repeated)
+''     --from <n>           start at the n-th test of those chosen, counting from 0
+''     --report <file>      write the results to <file> for 'tiko test', and print none here
+''
+'' Tests run in the order of their files' paths, then their lines -- the same order every run.
+
+type TestCase_
+    as string name_
+    as string file_
+    as long line_
+    as long seq_
+    as sub( ) body_
+end type
+
+dim shared as TestCase_ tests_( any )
+dim shared as long count_
+dim shared as string current_
+dim shared as long failures_
+dim shared as boolean wasSkipped_
+dim shared as string skipWhy_
+dim shared as string report_
+dim shared as long reportIdx_
+dim shared as string failLines_          '' the failures of the running test, printed after its result
+
+'' Called by the code 'test' blocks become, before main runs (parser/testblock.tiko).
+public sub RegisterTest( byref name_ as const string, byval body as sub( ), _
+                         byref file_ as const string, byval line_ as long )
+    if count_ > ubound( tests_ ) then redim preserve tests_( 0 to count_ * 2 + 15 )
+    tests_( count_ ).name_ = name_
+    tests_( count_ ).file_ = file_
+    tests_( count_ ).line_ = line_
+    tests_( count_ ).seq_ = count_
+    tests_( count_ ).body_ = body
+    count_ += 1
+end sub
+
+'' The name of the test that is running, or "" between tests.
+public function CurrentTestName( ) as string
+    return current_
+end function
+
+'' The file's name without its directory, for what a person reads.
+function BaseName_( byref p as const string ) as string
+    dim as long k = len( p )
+    while k > 0
+        dim as long c = asc( mid( p, k, 1 ) )
+        if (c = 47) orelse (c = 92) then exit while
+        k -= 1
+    wend
+    return mid( p, k + 1 )
+end function
+
+'' A report field: tab, newline and backslash escaped, so a record is one line.
+function Field_( byref s as const string ) as string
+    dim as string r = ""
+    for i as long = 0 to len( s ) - 1
+        select case s[i]
+        case 9  : r &= "\t"
+        case 10 : r &= "\n"
+        case 13 : r &= "\r"
+        case 92 : r &= "\\"
+        case else : r &= chr( s[i] )
+        end select
+    next
+    return r
+end function
+
+'' One record, appended and closed at once: a test that ends the program loses nothing before it.
+sub Record_( byref ln as const string )
+    if len( report_ ) = 0 then return
+    dim as long f = freefile
+    if open( report_ for append as #f ) <> 0 then return
+    print #f, ln
+    close #f
+end sub
+
+'' A failed check: counted, printed (or recorded), and the test goes on.
+sub Failed_( byref file_ as const string, byval line_ as long, byref msg as const string )
+    failures_ += 1
+    if len( report_ ) > 0 then
+        Record_( "fail" & chr( 9 ) & reportIdx_ & chr( 9 ) & Field_( file_ ) & chr( 9 ) & line_ & _
+                 chr( 9 ) & Field_( msg ) )
+    else
+        failLines_ &= "    " & BaseName_( file_ ) & ":" & line_ & ": " & msg & chr( 10 )
+    end if
+end sub
+
+sub Skipped_( byref why as const string )
+    wasSkipped_ = true
+    skipWhy_ = why
+end sub
+
+private function Contains_( byref s as const string, byref part as const string ) as boolean
+    return instr( lcase( s ), lcase( part ) ) > 0
+end function
+
+'' Runs the chosen tests; the program's exit code: 0 when none failed, 1 otherwise.
+public function RunMain( ) as long
+    dim as string runs( any ), skips( any ), exact_
+    dim as long from_ = 0
+    dim as boolean listOnly = false
+    dim as long ai = 1
+    while len( command( ai ) ) > 0
+        dim as string a = command( ai )
+        select case a
+        case "--list" : listOnly = true
+        case "--run", "--skip", "--exact", "--from", "--report"
+            ai += 1
+            dim as string v = command( ai )
+            select case a
+            case "--run"
+                redim preserve runs( 0 to ubound( runs ) + 1 )
+                runs( ubound( runs ) ) = v
+            case "--skip"
+                redim preserve skips( 0 to ubound( skips ) + 1 )
+                skips( ubound( skips ) ) = v
+            case "--exact"  : exact_ = v
+            case "--from"   : from_ = valint( v )
+            case "--report" : report_ = v
+            end select
+        end select
+        ai += 1
+    wend
+
+    '' THE ORDER: file, then line, then registration -- the same on every run of one program,
+    '' which is what lets 'tiko test' start again after a test that ended it (--from).
+    for i as long = 1 to count_ - 1
+        dim as TestCase_ t = tests_( i )
+        dim as long j = i - 1
+        while j >= 0
+            dim as boolean later = tests_( j ).file_ > t.file_
+            if tests_( j ).file_ = t.file_ then
+                later = (tests_( j ).line_ > t.line_) orelse _
+                        ((tests_( j ).line_ = t.line_) andalso (tests_( j ).seq_ > t.seq_))
+            end if
+            if later = false then exit while
+            tests_( j + 1 ) = tests_( j )
+            j -= 1
+        wend
+        tests_( j + 1 ) = t
+    next
+
+    dim as long chosen( any )
+    for i as long = 0 to count_ - 1
+        dim as boolean take = true
+        if len( exact_ ) > 0 then take = (tests_( i ).name_ = exact_)
+        if take andalso (ubound( runs ) >= 0) then
+            take = false
+            for r as long = 0 to ubound( runs )
+                if Contains_( tests_( i ).name_, runs( r ) ) then take = true
+            next
+        end if
+        for r as long = 0 to ubound( skips )
+            if Contains_( tests_( i ).name_, skips( r ) ) then take = false
+        next
+        if take then
+            redim preserve chosen( 0 to ubound( chosen ) + 1 )
+            chosen( ubound( chosen ) ) = i
+        end if
+    next
+    dim as long total = ubound( chosen ) + 1
+
+    if listOnly then
+        for k as long = 0 to total - 1
+            with tests_( chosen( k ) )
+                print BaseName_( .file_ ); ":"; trim( str( .line_ ) ); ": "; .name_
+            end with
+        next
+        return 0
+    end if
+
+    if len( report_ ) > 0 then
+        Record_( "tiko-test-report" & chr( 9 ) & "1" )
+        Record_( "plan" & chr( 9 ) & total )
+    else
+        print "running "; trim( str( total ) ); iif( total = 1, " test", " tests" )
+    end if
+
+    dim as long passed = 0, failed = 0, skipped = 0
+    dim as double t0 = timer
+    for k as long = from_ to total - 1
+        dim as long i = chosen( k )
+        current_ = tests_( i ).name_
+        failures_ = 0
+        wasSkipped_ = false
+        skipWhy_ = ""
+        failLines_ = ""
+        reportIdx_ = k
+        Record_( "start" & chr( 9 ) & k & chr( 9 ) & Field_( tests_( i ).name_ ) & chr( 9 ) & _
+                 Field_( tests_( i ).file_ ) & chr( 9 ) & tests_( i ).line_ )
+        dim as double ts = timer
+        tests_( i ).body_( )
+        dim as long ms = clng( (timer - ts) * 1000 )
+        dim as string status_
+        if failures_ > 0 then
+            status_ = "fail" : failed += 1
+        elseif wasSkipped_ then
+            status_ = "skip" : skipped += 1
+            Record_( "skip" & chr( 9 ) & k & chr( 9 ) & Field_( skipWhy_ ) )
+        else
+            status_ = "pass" : passed += 1
+        end if
+        Record_( "end" & chr( 9 ) & k & chr( 9 ) & status_ & chr( 9 ) & ms )
+        if len( report_ ) = 0 then
+            select case status_
+            case "pass" : print "test "; current_; " ... ok"
+            case "fail" : print "test "; current_; " ... FAILED" : print failLines_;
+            case else   : print "test "; current_; " ... ignored ("; skipWhy_; ")"
+            end select
+        end if
+        current_ = ""
+    next
+
+    Record_( "done" & chr( 9 ) & passed & chr( 9 ) & failed & chr( 9 ) & skipped )
+    if len( report_ ) = 0 then
+        print
+        print "test result: "; iif( failed = 0, "ok", "FAILED" ); ". "; _
+              trim( str( passed ) ); " passed; "; trim( str( failed ) ); " failed; "; _
+              trim( str( skipped ) ); " skipped ("; trim( str( clng( (timer - t0) * 1000 ) ) ); " ms)"
+    end if
+    return iif( failed = 0, 0, 1 )
+end function

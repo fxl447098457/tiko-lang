@@ -1695,26 +1695,17 @@ Microsoft Learn: [LVM_SETHOVERTIME](https://learn.microsoft.com/en-us/windows/wi
 ### GetCheckState
 
 ```freebasic
-function GetCheckState( byval hListView as HWND, byval i as long ) as UINT
+function GetCheckState( byval hListView as HWND, byval i as long ) as LONG
 ```
 
-Reads the check box of item `i` in a list view with `LVS_EX_CHECKBOXES`. The value is not a
-boolean, and both results are nonzero:
+Reads the check box of item `i` in a list view with `LVS_EX_CHECKBOXES`.
 
-| Check box | Returns |
-| --- | --- |
-| checked | `&hFFFFFFFF` (-1 as a `long`) |
-| unchecked | `&hFFFFFFFE` (-2 as a `long`) |
-
-An item with no check box at all (no `LVS_EX_CHECKBOXES`) also returns `&hFFFFFFFF`. Compare
-with `&hFFFFFFFF`; never test the result for truth.
-
-**Returns** `&hFFFFFFFF` when checked, `&hFFFFFFFE` when unchecked.
+**Returns** 1 when checked, 0 when unchecked, -1 on error.
 
 **Example**
 
 ```freebasic
-if ListView.GetCheckState( hCtrl, 0 ) = &hFFFFFFFF then print "item 0 is checked"
+if ListView.GetCheckState( hCtrl, 0 ) = 1 then print "item 0 is checked"
 ```
 
 Microsoft Learn: [LVM_GETITEMSTATE](https://learn.microsoft.com/en-us/windows/win32/controls/lvm-getitemstate)

@@ -47,6 +47,10 @@ Laying out values with `strings.Format` is covered in
 [Formatted print](../hello/format.md), and making your own types printable in
 [Display](../hello/display.md).
 
+Finding text by its shape rather than its exact characters, such as any date
+or any amount, takes a regular expression: see
+[Regular expressions](../libraries/pcre2.md), which uses `vendor/pcre2`.
+
 ### Activities
 
 1. Print your name and its length on one line.

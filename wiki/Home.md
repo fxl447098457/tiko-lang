@@ -23,10 +23,11 @@ tiko is a compiled, statically typed programming language for building fast, sel
 |---|---|
 | [Goroutines Tutorial](Modern-Goroutines-Tutorial) | Concurrency from the first `spawn` to cancellation |
 | [Interfaces Tutorial](Interfaces-Tutorial) | One program written twice, with an abstract base type and with interfaces and classes; then properties, generic interfaces and constraints |
+| [PCRE2 Tutorial](PCRE2-Tutorial) | Regular expressions from `vendor/pcre2`: find matches and groups, replace, keep a pattern from outside the program in bounds, and ship the program |
 | [Packages and Modules Tutorial](Packages-and-Modules-Tutorial) | `#import` the standard library, a C library from `vendor` with `link static` or `link dynamic`, and modules of your own |
 | [tiko c2t Tutorial](C2t-Tutorial) | Translate a C library's header with `tiko c2t`, then use it with `#include` and `#foreignlib` |
-| [Notepad Tutorial](Notepad-Tutorial) | A Windows text editor from PsControls and PsApp: menus, status bar, Find, unsaved-changes prompt, and a self-test that drives the window |
-| [Notepad2 Tutorial](Notepad2-Tutorial) | The same text editor from tkControls and tkApp, built from one source for Windows, Linux and macOS: SDL3 windows, the same commands, and the same self-test |
+| [Notepad Tutorial](Notepad2-Tutorial) | A text editor from tkControls and tkApp, built from one source for Windows, Linux and macOS: menus, status bar, Find, unsaved-changes prompt, and a self-test that drives the window |
+| [Contacts Tutorial](Contacts-Tutorial) | An address book drawn in tkEdit's Form Designer: menus, toolbar, status bar, a list, a modal entry form with tabs, a right-click menu, the Resource Center and project theme, SQLite storage and CSV export |
 
 ## The book
 
@@ -51,7 +52,7 @@ Every listing in the book is a real program, compiled and run on Windows, Linux 
 
 ## The language
 
-[Generics](Category-Generics) · [Interfaces](Category-Interfaces) · [Iterator Protocol](Category-Iterators) · [For Each](Category-For-Each) · [Tuples](Category-Tuples) · [Array Results](Category-Array-Results) · [Collection Initializers](Category-Collection-Initializers) · [Defer](Category-Defer) · [Lambdas](Category-Lambdas) · [Block Strings](Category-Block-Strings) · [Partial Types](Category-Partial-Types) · [Embed](Category-Embed) · [Typed Variadics](Category-Typed-Variadics) · [UString](Category-UString) · [Fixed-Width Types](Category-Fixed-Width-Types) · [Nullptr](Category-Nullptr) · [Goroutines and Channels](Category-Goroutines-and-Channels)
+[Generics](Category-Generics) · [Interfaces](Category-Interfaces) · [Iterator Protocol](Category-Iterators) · [For Each](Category-For-Each) · [Tuples](Category-Tuples) · [Array Results](Category-Array-Results) · [Collection Initializers](Category-Collection-Initializers) · [Defer](Category-Defer) · [Match](Category-Match) · [Lambdas](Category-Lambdas) · [Block Strings](Category-Block-Strings) · [Partial Types](Category-Partial-Types) · [Embed](Category-Embed) · [Typed Variadics](Category-Typed-Variadics) · [UString](Category-UString) · [Fixed-Width Types](Category-Fixed-Width-Types) · [Nullptr](Category-Nullptr) · [Goroutines and Channels](Category-Goroutines-and-Channels)
 
 ## The standard library
 
@@ -63,7 +64,7 @@ Every listing in the book is a real program, compiled and run on Windows, Linux 
 
 ## The toolchain
 
-[tiko build](Category-Tiko-Build) · [C Header Import](Category-C-Header-Import) · [Foreign Library Linking](Category-Foreign-Library-Linking) · [LLVM Backend](Category-LLVM-Backend) · [__TIKO_COMPILER__](Category-Tiko-Compiler-Define)
+[tiko build](Category-Tiko-Build) · [tiko test](Category-Tiko-Test) · [tiko doc](Category-Tiko-Doc) · [C Header Import](Category-C-Header-Import) · [Foreign Library Linking](Category-Foreign-Library-Linking) · [LLVM Backend](Category-LLVM-Backend) · [__TIKO_COMPILER__](Category-Tiko-Compiler-Define)
 
 ---
 

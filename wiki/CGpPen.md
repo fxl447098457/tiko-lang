@@ -534,16 +534,11 @@ Microsoft Learn: [Pen::SetTransform](https://learn.microsoft.com/en-us/windows/w
 function GetTransform( byval pMatrix as CGpMatrix ptr ) as GpStatus
 ```
 
-Is meant to copy the pen's transformation into the `CGpMatrix` that `pMatrix` points to. In this
-version it does not: it passes GDI+ the address of the matrix object's handle rather than the
-handle, so the call returns `InvalidParameter` and the matrix keeps the values it had. Keep your
-own `CGpMatrix` of what you set with [SetTransform](#settransform) if you need to read it back.
+Copies the pen's transformation into the `CGpMatrix` that `pMatrix` points to.
 
 | Parameter | Meaning |
 | --- | --- |
 | `pMatrix` | An existing matrix. |
-
-**Returns** `InvalidParameter` (2).
 
 **Example**
 
@@ -551,7 +546,7 @@ own `CGpMatrix` of what you set with [SetTransform](#settransform) if you need t
 dim pen as CGpPen = CGpPen( ARGB_BLUE, 2 )
 pen.RotateTransform( 30 )
 dim m as CGpMatrix
-print pen.GetTransform( @m ); " "; m.IsIdentity()   ' 2 true
+print pen.GetTransform( @m )
 ```
 
 Microsoft Learn: [Pen::GetTransform](https://learn.microsoft.com/en-us/windows/win32/api/gdipluspen/nf-gdipluspen-pen-gettransform)

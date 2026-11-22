@@ -108,11 +108,9 @@ Start with the [sys/win/gui overview](SysWin-Gui).
 | [CTabPage](CTabPage) | Creates a window that serves as one page of a tab control. |
 | [CDialog](CDialog) | Creates dialog boxes in memory, fills them with controls and shows them modal or modeless. |
 | [gui macros and helpers](SysWin-Gui-Procedures) | Extracts control ids, notification codes and pointers from window-message parameters. |
-| [CXpButton](CXpButton) | Creates a push button that draws itself, with images, toggle behaviour and custom colours. |
 | [CMaskedEdit](CMaskedEdit) | Creates an edit control that accepts input only in a set shape, such as a phone number. |
 | [CMemBmp](CMemBmp) | Creates an off-screen bitmap to draw on with GDI or GDI+, then save, print or display. |
 | [CGraphCtx](CGraphCtx) | Creates a graphic control: a child window that keeps and repaints what you draw on it. |
-| [CPrint](CPrint) | Chooses a printer, measures its page, reads and changes its settings, and prints. |
 | [File dialogs](SysWin-Gui-File-Dialogs) | Shows the Windows Open and Save dialogs and reads the files the user picked. |
 | [CIFileDialogCustomize](CIFileDialogCustomize) | Adds check boxes, lists, buttons and other controls to an open or save dialog. |
 | [File dialog events](SysWin-Gui-File-Dialog-Events) | Handles the events of an open or save dialog and of the controls added to it. |

@@ -216,6 +216,7 @@ public type CAL_ViewChangeCallbackSub as sub( byval hCtrl as TK_WIDGET ptr, byva
 public type TKCALENDAR_STATE
     hWin            as TK_WIDGET ptr
     bColorsPinned   as boolean
+    bShapePinned    as boolean                 ' a shape setter ran: the theme's shape leaves it alone
     idc_Calendar    as long
     isEnabled       as boolean = true
     isFocused       as boolean
@@ -1056,11 +1057,12 @@ private sub CAL_PaintMyDefault( byval b as TK_PAINT ptr, byval pColors as TKCALE
     b->PaintText( p->wszLabel, @p->rcCell, TK_DT_CENTER )
 end sub
 
+declare sub CAL_RenderDefault( byval pCal as TKCALENDAR_STATE ptr, byval pb as TK_PAINT ptr )
+
 private sub CAL_Render( byval pCal as TKCALENDAR_STATE ptr, byval pb as TK_PAINT ptr )
     if (pCal = 0) orelse (pb = 0) then exit sub
     if pCal->bLayoutDirty then pCal->LayoutCalendar()
 
-    dim as TKCALENDAR_COLORS ptr pc = @pCal->colors
     dim as boolean bEnabled = pCal->isEnabled
     dim as boolean bPrevOff = CAL_PrevDisabled( pCal )
     dim as boolean bNextOff = CAL_NextDisabled( pCal )
@@ -1091,6 +1093,17 @@ private sub CAL_Render( byval pCal as TKCALENDAR_STATE ptr, byval pb as TK_PAINT
         pCal->PaintCallback( @pinf )
         exit sub
     end if
+    CAL_RenderDefault( pCal, pb )
+end sub
+
+' What the control draws with no paint callback (and tkCalendar_PaintDefault).
+private sub CAL_RenderDefault( byval pCal as TKCALENDAR_STATE ptr, byval pb as TK_PAINT ptr )
+    if (pCal = 0) orelse (pb = 0) then exit sub
+    dim as TKCALENDAR_COLORS ptr pc = @pCal->colors
+    dim as boolean bEnabled = pCal->isEnabled
+    dim as boolean bPrevOff = CAL_PrevDisabled( pCal )
+    dim as boolean bNextOff = CAL_NextDisabled( pCal )
+    dim as long np = pCal->PanelCount()
 
     ' ---- nav band ----
     dim as TTF_Font ptr fTitle = CAL_TitleFontOf( pCal )
@@ -1489,6 +1502,27 @@ private function GetCalendarPointer( byval hCtrl as TK_WIDGET ptr ) as TKCALENDA
     return cast( TKCALENDAR_STATE ptr, hCtrl->pData )
 end function
 
+' A day-paint callback's way to draw the cell as it would have been drawn, then add to it.
+public sub tkCalendar_PaintDayDefault( byval p as TKCALENDAR_DAYPAINTINFO ptr )
+    if p = 0 then exit sub
+    dim as TKCALENDAR_STATE ptr pCal = GetCalendarPointer( p->hCtrl )
+    if pCal then CAL_PaintDayDefault( p->b, @pCal->colors, p, pCal->bShowTodayRing )
+end sub
+
+' A paint callback's way to draw the control's content as it would have been drawn (the frame
+' is drawn after the callback either way), then add to it.
+public sub tkCalendar_PaintDefault( byval p as TKCALENDAR_PAINTINFO ptr )
+    if p = 0 then exit sub
+    CAL_RenderDefault( GetCalendarPointer( p->hCtrl ), p->b )
+end sub
+
+' The same for a cell of the Months or Years view.
+public sub tkCalendar_PaintMonthYearDefault( byval p as TKCALENDAR_MYPAINTINFO ptr )
+    if p = 0 then exit sub
+    dim as TKCALENDAR_STATE ptr pCal = GetCalendarPointer( p->hCtrl )
+    if pCal then CAL_PaintMyDefault( p->b, @pCal->colors, p )
+end sub
+
 private function CAL_CallMessage( byval pCal as TKCALENDAR_STATE ptr, byval m as TK_MSG ptr ) as boolean
     if (pCal = 0) orelse (pCal->MessageCallback = 0) then return false
     dim as TKCALENDAR_MESSAGEINFO mi
@@ -1511,6 +1545,7 @@ end sub
 
 
 public declare sub tkCalendar_ApplyTheme( byval hCtrl as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+declare sub ApplyThemeShape( byval w as TK_WIDGET ptr )
 public declare function tkCalendar_ThemeColors( byref t as TKTHEME_COLORS ) as TKCALENDAR_COLORS
 
 private sub CAL_Rescale( byval pCal as TKCALENDAR_STATE ptr, byval fOld as single, byval fNew as single )
@@ -1656,6 +1691,7 @@ public function tkCalendar_Create( byval hParent as TK_WIDGET ptr, byval ctrlId 
     pCal->colors = tkCalendar_ThemeColors( tkTheme_Of( w ) )
     ' the theme's recipes for this type apply from the start, not just after a theme change
     tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @pCal->colors ), sizeof( TKCALENDAR_COLORS ) \ 4, "Calendar" )
+    ApplyThemeShape( w )
     return w
 end function
 
@@ -1730,6 +1766,50 @@ public sub tkCalendar_SetRange( byval hCtrl as TK_WIDGET ptr, byref stMin as TKD
         if CAL_InRange( pCal, pCal->stSelected ) = false then pCal->hasSelection = false
     end if
     CAL_Relayout( pCal )
+end sub
+
+' The selection, the range ends and the month shown, from their parts -- for a form designer,
+' whose rows hold numbers, not a TKDATE. A day past the month's end is its last; a year of 0
+' removes a range end.
+private function CAL_PartsOk( byval y as long, byval m as long, byval d as long ) as boolean
+    return (y >= 1) andalso (m >= 1) andalso (m <= 12) andalso (d >= 1)
+end function
+
+public sub tkCalendar_SetSelDateParts( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+    if CAL_PartsOk( y, m, d ) = false then exit sub
+    if d > tkCalendar_DaysInMonth( y, m ) then d = tkCalendar_DaysInMonth( y, m )
+    dim as TKDATE st = tkCalendar_MakeDate( y, m, d )
+    tkCalendar_SetSelDate( hCtrl, st )
+end sub
+
+public sub tkCalendar_SetMinDate( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+    dim as TKDATE stMin, stMax
+    dim as boolean hasMin, hasMax
+    tkCalendar_GetRange( hCtrl, stMin, stMax, hasMin, hasMax )
+    hasMin = CAL_PartsOk( y, m, d )
+    if hasMin then
+        if d > tkCalendar_DaysInMonth( y, m ) then d = tkCalendar_DaysInMonth( y, m )
+        stMin = tkCalendar_MakeDate( y, m, d )
+    end if
+    tkCalendar_SetRange( hCtrl, stMin, stMax, hasMin, hasMax )
+end sub
+
+public sub tkCalendar_SetMaxDate( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long, byval d as long )
+    dim as TKDATE stMin, stMax
+    dim as boolean hasMin, hasMax
+    tkCalendar_GetRange( hCtrl, stMin, stMax, hasMin, hasMax )
+    hasMax = CAL_PartsOk( y, m, d )
+    if hasMax then
+        if d > tkCalendar_DaysInMonth( y, m ) then d = tkCalendar_DaysInMonth( y, m )
+        stMax = tkCalendar_MakeDate( y, m, d )
+    end if
+    tkCalendar_SetRange( hCtrl, stMin, stMax, hasMin, hasMax )
+end sub
+
+public sub tkCalendar_SetAnchorMonth( byval hCtrl as TK_WIDGET ptr, byval y as long, byval m as long )
+    if CAL_PartsOk( y, m, 1 ) = false then exit sub
+    dim as TKDATE st = tkCalendar_MakeDate( y, m, 1 )
+    tkCalendar_SetAnchorDate( hCtrl, st )
 end sub
 
 public function tkCalendar_GetToday( byval hCtrl as TK_WIDGET ptr, byref st as TKDATE ) as boolean
@@ -1907,6 +1987,42 @@ public sub tkCalendar_SetWeekdayAbbrev( byval hCtrl as TK_WIDGET ptr, byval i as
     tkWidget_Invalidate( hCtrl )
 end sub
 
+' "January,February,..." -> the names one by one; an empty entry leaves that name. For a form
+' designer, whose rows hold text, not an array.
+private function CAL_CsvItem( byref csv as const ustring, byval idx as long ) as ustring
+    dim as long a = 1
+    for i as long = 1 to idx
+        a = instr( a, csv, "," )
+        if a = 0 then return ""
+        a += 1
+    next
+    dim as long b = instr( a, csv, "," )
+    if b = 0 then return trim( mid( csv, a ) )
+    return trim( mid( csv, a, b - a ) )
+end function
+
+public sub tkCalendar_SetMonthNamesText( byval hCtrl as TK_WIDGET ptr, byval sNames as ustring )
+    for m as long = 1 to 12
+        dim as ustring v = CAL_CsvItem( sNames, m - 1 )
+        if len( v ) then tkCalendar_SetMonthName( hCtrl, m, v )
+    next
+end sub
+
+public sub tkCalendar_SetMonthAbbrevsText( byval hCtrl as TK_WIDGET ptr, byval sNames as ustring )
+    for m as long = 1 to 12
+        dim as ustring v = CAL_CsvItem( sNames, m - 1 )
+        if len( v ) then tkCalendar_SetMonthAbbrev( hCtrl, m, v )
+    next
+end sub
+
+' Sunday first, whatever the week start.
+public sub tkCalendar_SetWeekdayAbbrevsText( byval hCtrl as TK_WIDGET ptr, byval sNames as ustring )
+    for i as long = 0 to 6
+        dim as ustring v = CAL_CsvItem( sNames, i )
+        if len( v ) then tkCalendar_SetWeekdayAbbrev( hCtrl, i, v )
+    next
+end sub
+
 public sub tkCalendar_SetMonthNames( byval hCtrl as TK_WIDGET ptr, sNames() as ustring )
     dim as long lo = lbound( sNames ), hi = ubound( sNames )
     for i as long = lo to hi
@@ -1995,6 +2111,7 @@ public sub tkCalendar_SetBorderThickness( byval hCtrl as TK_WIDGET ptr, byval nT
     dim as TKCALENDAR_STATE ptr pCal = GetCalendarPointer( hCtrl )
     if pCal = 0 then exit sub
     if nThickness < 0 then nThickness = 0
+    pCal->bShapePinned = true                   ' the theme's BorderWidth leaves it alone now
     if nThickness = pCal->nBorderThick then exit sub
     pCal->nBorderThick = nThickness
     CAL_Relayout( pCal )
@@ -2271,7 +2388,9 @@ end function
 
 public sub tkCalendar_ApplyTheme( byval hCtrl as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
     dim as TKCALENDAR_STATE ptr pCal = GetCalendarPointer( hCtrl )
-    if (pCal = 0) orelse pCal->bColorsPinned then exit sub
+    if pCal = 0 then exit sub
+    ApplyThemeShape( hCtrl )
+    if pCal->bColorsPinned then exit sub
     dim as TKTHEME_COLORS tr = tkTheme_Styled( hCtrl, t )
     pCal->colors = tkCalendar_ThemeColors( tr )
     tkTheme_ResolveInto( hCtrl, tr, cast( ulong ptr, @pCal->colors ), sizeof( TKCALENDAR_COLORS ) \ 4, "Calendar" )
@@ -2459,3 +2578,13 @@ public function tkCalendar_TestHashPart( byval hCtrl as TK_WIDGET ptr, byval nPa
     SDL_DestroySurface( s )
     return hv
 end function
+
+' The theme's shape, until a shape setter ran: the border's thickness (a calendar has no corners).
+private sub ApplyThemeShape( byval w as TK_WIDGET ptr )
+    dim as TKCALENDAR_STATE ptr pCal = GetCalendarPointer( w )
+    if (pCal = 0) orelse pCal->bShapePinned then exit sub
+    dim as TKTHEME_SHAPE sh = tkTheme_ShapeOf( w )
+    dim as long v = iif( sh.BorderWidth >= 0, sh.BorderWidth, CCAL_DEFAULT_BORDERTHICK )
+    if pCal->nBorderThick <> v then tkCalendar_SetBorderThickness( w, v )
+    pCal->bShapePinned = false
+end sub

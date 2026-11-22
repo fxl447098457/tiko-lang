@@ -10,7 +10,7 @@ code for it.
 {{#include ../../examples/preprocessor/platform.tiko}}
 ```
 
-This is the one kind of program whose output *should* differ between the two
+This is the one kind of program whose output *should* differ between
 targets.
 
 **Output on windows-x86_64**
@@ -25,6 +25,12 @@ targets.
 {{#include ../../examples/preprocessor/platform.linux-x86_64.out}}
 ```
 
+**Output on linux-arm64**
+
+```text
+{{#include ../../examples/preprocessor/platform.linux-arm64.out}}
+```
+
 **Output on macos-arm64**
 
 ```text
@@ -37,6 +43,7 @@ targets.
 | `__FB_LINUX__` | Linux |
 | `__FB_DARWIN__` | macOS |
 | `__FB_UNIX__` | Linux, macOS, and other Unix-like systems |
+| `__FB_ARM__` | arm64: `linux-arm64` and `macos-arm64` |
 | `__FB_64BIT__` | every 64-bit target, which today is every target |
 | `__TIKO_COMPILER__` | always, by tiko |
 

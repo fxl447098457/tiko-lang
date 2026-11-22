@@ -7,6 +7,12 @@
 ' tkTabControl -- a tkTabBar and one page per tab, of which one shows. A page is a tkPanel: parent a
 ' tab's controls to tkTabControl_GetPage( h, i ). The control is never a tab stop itself; its bar is.
 ' tkTabControl_SetCurSel is silent, and the callback runs only when the user changes the tab.
+' Its tabs are pages, not documents, so they have no close X unless tkTabControl_SetClosable asks
+' for one; the Close callback then says which tab's X was used, and the program decides.
+' A page can be hidden (tkTabControl_SetPageVisible): its tab leaves the strip, its controls stay.
+' Every index here is the PAGE's -- creation order, hidden pages counted -- never the tab's place in
+' the strip, which hiding and the user's drag-to-reorder change. Each tab's item data holds its
+' page's index, so tkTabBar_SetItemData on this control's bar is not for the program.
 #module "tkTabControl"
 
 #import "../tkHost" public
@@ -23,17 +29,29 @@ using tkPanel
 public const as long TKTABCONTROL_DEFAULT_TABHEIGHT = 30
 
 public type TC_SelChangeCallbackSub as sub( byval hTabControl as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+public type TC_CloseCallbackSub as sub( byval hTabControl as TK_WIDGET ptr, byval idx as long )
 
 public type TKTABCONTROL_STATE
     hWin          as TK_WIDGET ptr
     hBar          as TK_WIDGET ptr
     pages( any )  as TK_WIDGET ptr
+    texts( any )  as ustring          ' every page's caption, a hidden one's too
+    glyphs( any ) as ustring          ' and its glyph, drawn before the caption ("" for none)
+    hidden( any ) as boolean
     nPages        as long
     nTabHeight    as long = TKTABCONTROL_DEFAULT_TABHEIGHT
     SelChange     as TC_SelChangeCallbackSub
+    Close         as TC_CloseCallbackSub
+    bClosable     as boolean = false
+    pGlyphFont    as TTF_Font ptr     ' borrowed: the tabs' glyphs and X, as last set here
     declare function BarHeight() as long
     declare sub Layout()
     declare sub ShowOnly( byval idx as long )
+    declare function TabOf( byval page as long ) as long
+    declare function PageOf( byval tabIdx as long ) as long
+    declare sub Renumber( byval fromPage as long, byval delta as long )
+    declare sub RemoveTab( byval tabIdx as long )
+    declare function CurPage() as long
 end type
 
 private function GetTabControlPointer( byval h as TK_WIDGET ptr ) as TKTABCONTROL_STATE ptr
@@ -62,12 +80,57 @@ sub TKTABCONTROL_STATE.ShowOnly( byval idx as long )
     tkWidget_Invalidate( this.hWin )
 end sub
 
-' The bar's child callback: its parent is the control.
+' Where a page's tab sits in the strip; -1 when the page is hidden (or no such page).
+function TKTABCONTROL_STATE.TabOf( byval page as long ) as long
+    if (page < 0) orelse (page >= this.nPages) orelse this.hidden(page) then return -1
+    for t as long = 0 to tkTabBar_GetCount( this.hBar ) - 1
+        if tkTabBar_GetItemData( this.hBar, t ) = page then return t
+    next
+    return -1
+end function
+
+' The page a tab in the strip stands for; -1 for no tab.
+function TKTABCONTROL_STATE.PageOf( byval tabIdx as long ) as long
+    if tkTabBar_IsValidTab( this.hBar, tabIdx ) = false then return -1
+    return tkTabBar_GetItemData( this.hBar, tabIdx )
+end function
+
+' Pages from fromPage on moved by delta: their tabs follow.
+sub TKTABCONTROL_STATE.Renumber( byval fromPage as long, byval delta as long )
+    for t as long = 0 to tkTabBar_GetCount( this.hBar ) - 1
+        dim as long pg = tkTabBar_GetItemData( this.hBar, t )
+        if pg >= fromPage then tkTabBar_SetItemData( this.hBar, t, pg + delta )
+    next
+end sub
+
+' Takes a tab out of the strip. The current one's going selects its neighbour (the tab that slides
+' into its place, else the one before), silently: a tab control never shows no page while it has tabs.
+sub TKTABCONTROL_STATE.RemoveTab( byval tabIdx as long )
+    dim as boolean wasCur = (tkTabBar_GetCurSel( this.hBar ) = tabIdx)
+    if tkTabBar_DeleteTab( this.hBar, tabIdx ) = false then exit sub
+    if wasCur then
+        dim as long n = tkTabBar_GetCount( this.hBar )
+        if n > 0 then tkTabBar_SetCurSel( this.hBar, iif( tabIdx < n, tabIdx, n - 1 ) )
+    end if
+end sub
+
+function TKTABCONTROL_STATE.CurPage() as long
+    return this.PageOf( tkTabBar_GetCurSel( this.hBar ) )
+end function
+
+' The bar's child callback: its parent is the control. The bar's indices become pages.
 private sub OnBarSelChange( byval hBar as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
     dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( tkWidget_Parent( hBar ) )
     if p = 0 then exit sub
-    p->ShowOnly( idxNew )
-    if p->SelChange then p->SelChange( p->hWin, idxOld, idxNew )
+    dim as long pgNew = p->PageOf( idxNew ), pgOld = p->PageOf( idxOld )
+    p->ShowOnly( pgNew )
+    if p->SelChange then p->SelChange( p->hWin, pgOld, pgNew )
+end sub
+
+' The bar's close gesture (only a closable tab has one): the program decides what closing means.
+private sub OnBarClose( byval hBar as TK_WIDGET ptr, byval idx as long )
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( tkWidget_Parent( hBar ) )
+    if (p <> 0) andalso (p->Close <> 0) then p->Close( p->hWin, p->PageOf( idx ) )
 end sub
 
 private function tkTabControl_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
@@ -106,6 +169,7 @@ public function tkTabControl_Create( byval hParent as TK_WIDGET ptr, byval ctrlI
     p->hWin = w
     p->hBar = tkTabBar_Create( w, 1 )
     tkTabBar_SetSelChangeCallback( p->hBar, @OnBarSelChange )
+    tkTabBar_SetCloseCallback( p->hBar, @OnBarClose )
     return w
 end function
 
@@ -121,44 +185,98 @@ public function tkTabControl_InsertPage( byval h as TK_WIDGET ptr, byval idx as 
     dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
     if p = 0 then return -1
     if (idx < 0) orelse (idx > p->nPages) then idx = p->nPages
-    dim as long sel = tkTabBar_GetCurSel( p->hBar )
-    dim as long got = tkTabBar_InsertTab( p->hBar, idx, text )
-    if got < 0 then return -1
-    redim preserve p->pages( 0 to p->nPages )
-    for i as long = p->nPages to got + 1 step -1
-        p->pages(i) = p->pages(i - 1)
+    ' its tab goes after the tabs of the pages before it
+    dim as long at_ = 0
+    for t as long = 0 to tkTabBar_GetCount( p->hBar ) - 1
+        if tkTabBar_GetItemData( p->hBar, t ) < idx then at_ = t + 1
     next
-    p->pages(got) = tkPanel_Create( h, 100 + p->nPages )
-    p->nPages += 1
-    if sel < 0 then
-        tkTabBar_SetCurSel( p->hBar, 0 )
-        sel = 0
-    elseif got <= sel then
-        sel += 1
+    p->Renumber( idx, 1 )
+    dim as long got = tkTabBar_InsertTab( p->hBar, at_, text, idx )
+    if got < 0 then
+        p->Renumber( idx + 1, -1 )
+        return -1
     end if
+    tkTabBar_SetClosable( p->hBar, got, p->bClosable )
+    redim preserve p->pages( 0 to p->nPages )
+    redim preserve p->texts( 0 to p->nPages )
+    redim preserve p->glyphs( 0 to p->nPages )
+    redim preserve p->hidden( 0 to p->nPages )
+    for i as long = p->nPages to idx + 1 step -1
+        p->pages(i) = p->pages(i - 1)
+        p->texts(i) = p->texts(i - 1)
+        p->glyphs(i) = p->glyphs(i - 1)
+        p->hidden(i) = p->hidden(i - 1)
+    next
+    p->pages(idx) = tkPanel_Create( h, 100 + p->nPages )
+    p->texts(idx) = text
+    p->glyphs(idx) = ""
+    p->hidden(idx) = false
+    p->nPages += 1
+    if tkTabBar_GetCurSel( p->hBar ) < 0 then tkTabBar_SetCurSel( p->hBar, got )
     p->Layout( )
-    p->ShowOnly( tkTabBar_GetCurSel( p->hBar ) )
-    return got
+    p->ShowOnly( p->CurPage( ) )
+    return idx
 end function
 
 public function tkTabControl_AddPage( byval h as TK_WIDGET ptr, byref text as const ustring ) as long
     return tkTabControl_InsertPage( h, -1, text )
 end function
 
-' The tab and its page and everything on it. Not from inside that page's own callback.
+' The tab and its page and everything on it. Not from inside that page's own callback. Deleting the
+' current page selects its neighbour, silently.
 public function tkTabControl_DeletePage( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
     dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
     if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return false
-    if tkTabBar_DeleteTab( p->hBar, idx ) = false then return false
+    dim as long t = p->TabOf( idx )
+    if t >= 0 then p->RemoveTab( t )
+    p->Renumber( idx + 1, -1 )
     tkWidget_Destroy( p->pages(idx) )
     for i as long = idx to p->nPages - 2
         p->pages(i) = p->pages(i + 1)
+        p->texts(i) = p->texts(i + 1)
+        p->glyphs(i) = p->glyphs(i + 1)
+        p->hidden(i) = p->hidden(i + 1)
     next
     p->nPages -= 1
-    p->ShowOnly( tkTabBar_GetCurSel( p->hBar ) )
+    p->texts(p->nPages) = ""
+    p->glyphs(p->nPages) = ""
+    p->ShowOnly( p->CurPage( ) )
     return true
 end function
 
+' Hides a page's tab (and so the page), or brings it back where it was among the others. The page
+' and its controls stay; its caption and index too. Hiding the current page selects its neighbour,
+' silently; showing one leaves the selection where it is, unless there was none.
+public function tkTabControl_SetPageVisible( byval h as TK_WIDGET ptr, byval idx as long, byval bVisible as boolean ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return false
+    if bVisible = (p->hidden(idx) = false) then return true
+    if bVisible then
+        dim as long at_ = 0
+        for t as long = 0 to tkTabBar_GetCount( p->hBar ) - 1
+            if tkTabBar_GetItemData( p->hBar, t ) < idx then at_ = t + 1
+        next
+        dim as long got = tkTabBar_InsertTab( p->hBar, at_, p->texts(idx), idx )
+        if got < 0 then return false
+        tkTabBar_SetClosable( p->hBar, got, p->bClosable )
+        tkTabBar_SetGlyph( p->hBar, got, p->glyphs(idx) )
+        p->hidden(idx) = false
+        if tkTabBar_GetCurSel( p->hBar ) < 0 then tkTabBar_SetCurSel( p->hBar, got )
+    else
+        p->RemoveTab( p->TabOf( idx ) )
+        p->hidden(idx) = true
+    end if
+    p->ShowOnly( p->CurPage( ) )
+    return true
+end function
+
+public function tkTabControl_GetPageVisible( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return false
+    return p->hidden(idx) = false
+end function
+
+' Every page, the hidden ones too.
 public function tkTabControl_GetPageCount( byval h as TK_WIDGET ptr ) as long
     dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
     return iif( p <> 0, p->nPages, 0 )
@@ -173,26 +291,33 @@ end function
 
 public function tkTabControl_GetPageText( byval h as TK_WIDGET ptr, byval idx as long ) as ustring
     dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
-    if p = 0 then return ""
-    return tkTabBar_GetText( p->hBar, idx )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return ""
+    return p->texts(idx)
 end function
 
+' A hidden page's too: its tab has it when it comes back.
 public function tkTabControl_SetPageText( byval h as TK_WIDGET ptr, byval idx as long, byref text as const ustring ) as boolean
     dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
-    if p = 0 then return false
-    return tkTabBar_SetText( p->hBar, idx, text )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return false
+    p->texts(idx) = text
+    dim as long t = p->TabOf( idx )
+    if t >= 0 then tkTabBar_SetText( p->hBar, t, text )
+    return true
 end function
 
+' The page showing; -1 for none.
 public function tkTabControl_GetCurSel( byval h as TK_WIDGET ptr ) as long
     dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
-    return iif( p <> 0, tkTabBar_GetCurSel( p->hBar ), -1 )
+    return iif( p <> 0, p->CurPage( ), -1 )
 end function
 
-' SILENT: the callback runs only when the user changes the tab.
+' SILENT: the callback runs only when the user changes the tab. A hidden page is refused.
 public function tkTabControl_SetCurSel( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
     dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
-    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return false
-    if tkTabBar_SetCurSel( p->hBar, idx ) = false then return false
+    if p = 0 then return false
+    dim as long t = p->TabOf( idx )
+    if t < 0 then return false
+    if tkTabBar_SetCurSel( p->hBar, t ) = false then return false
     p->ShowOnly( idx )
     return true
 end function
@@ -209,6 +334,78 @@ public sub tkTabControl_SetTabHeight( byval h as TK_WIDGET ptr, byval nHeight as
     p->nTabHeight = nHeight
     p->Layout( )
     tkWidget_Invalidate( h )
+end sub
+
+' Whether every tab, and every one added later, shows a close X. FALSE by default.
+public function tkTabControl_GetClosable( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    return iif( p <> 0, p->bClosable, false )
+end function
+
+public sub tkTabControl_SetClosable( byval h as TK_WIDGET ptr, byval bClosable as boolean )
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if p = 0 then exit sub
+    p->bClosable = bClosable
+    for t as long = 0 to tkTabBar_GetCount( p->hBar ) - 1
+        tkTabBar_SetClosable( p->hBar, t, bClosable )
+    next
+end sub
+
+' A page's glyph, drawn in the glyph font before its caption; "" for none. Kept while the page is
+' hidden, as its caption is.
+public function tkTabControl_SetPageGlyph( byval h as TK_WIDGET ptr, byval idx as long, byref glyph as const ustring ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return false
+    p->glyphs(idx) = glyph
+    dim as long t = p->TabOf( idx )
+    if t >= 0 then tkTabBar_SetGlyph( p->hBar, t, glyph )
+    return true
+end function
+
+public function tkTabControl_GetPageGlyph( byval h as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nPages) then return ""
+    return p->glyphs(idx)
+end function
+
+' The font the tabs' glyphs and the close X are drawn in (borrowed). With none (0, the start), a tab
+' draws no glyph and its X is a multiplication sign in the caption font. The glyph
+' box before each caption grows to the font's height when that is taller than the default one, and
+' goes back to the default for a smaller font -- setting the bar's IconWidth after this overrides it.
+public sub tkTabControl_SetGlyphFont( byval h as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if p = 0 then exit sub
+    p->pGlyphFont = f
+    tkTabBar_SetGlyphFont( p->hBar, f )
+    dim as long w = tkHost_Scale( h->pHost, TKTABBAR_DEFAULT_ICONWIDTH )
+    if f then
+        dim as long fh = TTF_GetFontHeight( f )
+        if fh > w then w = fh
+    end if
+    tkTabBar_SetIconWidth( p->hBar, w )
+end sub
+
+public function tkTabControl_GetGlyphFont( byval h as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    return iif( p <> 0, p->pGlyphFont, cast( TTF_Font ptr, 0 ) )
+end function
+
+' The tab strip's font (borrowed); 0 is the host's default.
+public function tkTabControl_GetFont( byval h as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    return iif( p <> 0, tkTabBar_GetFont( p->hBar ), cast( TTF_Font ptr, 0 ) )
+end function
+
+public function tkTabControl_SetFont( byval h as TK_WIDGET ptr, byval f as TTF_Font ptr ) as boolean
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if p = 0 then return false
+    return tkTabBar_SetFont( p->hBar, f )
+end function
+
+' The user used a tab's close X (a closable tab's): the tab is not removed -- DeletePage does that.
+public sub tkTabControl_SetCloseCallback( byval h as TK_WIDGET ptr, byval usersub as TC_CloseCallbackSub )
+    dim as TKTABCONTROL_STATE ptr p = GetTabControlPointer( h )
+    if p then p->Close = usersub
 end sub
 
 public sub tkTabControl_SetSelChangeCallback( byval h as TK_WIDGET ptr, byval usersub as TC_SelChangeCallbackSub )

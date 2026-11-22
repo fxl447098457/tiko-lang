@@ -415,8 +415,7 @@ touch the control.
 | --- | --- |
 | `wszFileName` | The path of the file. |
 
-**Returns** the contents. On failure `""`, and `GetLastResult()` is 2 (`ERROR_FILE_NOT_FOUND`)
-whenever the file cannot be opened, whatever the reason, or the Windows error of a failed read.
+**Returns** the contents or "" on failure.
 
 **Example**
 
@@ -1905,8 +1904,7 @@ function Update( byval Value as long ) as HRESULT
 ```
 
 Brings the selection and the caret up to date after changes made through TOM; with `tomTrue` it
-also scrolls the caret into view. Unlike the other members it does not store its result for
-`GetLastResult()`.
+also scrolls the caret into view.
 
 | Parameter | Meaning |
 | --- | --- |

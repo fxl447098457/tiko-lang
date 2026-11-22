@@ -122,10 +122,6 @@ end function
 end main()
 ```
 
-`GetResultsString` joins the names with commas, so a selected file whose name contains a comma
-comes back from `ParseResults` in two pieces; [GetResults](#getresults) gives the names one by
-one.
-
 ## Members
 
 **CIOpenFileDialog**
@@ -158,9 +154,9 @@ one.
 | [GetResult](#getresult) | Returns the chosen item as an `IShellItem`. |
 | [GetResultString](#getresultstring) | Returns the name of the chosen item. |
 | [GetResults](#getresults) | Returns every chosen item as an `IShellItemArray`. |
-| [GetResultsString](#getresultsstring) | Returns the names of every chosen item, separated by commas. |
+| [GetResultsString](#getresultsstring) | Returns the names of every chosen item, separated by "\|". |
 | [GetResultsCount](#getresultscount) | Returns how many items were chosen. |
-| [ParseResults](#parseresults) | Returns one name from a comma-separated list. |
+| [ParseResults](#parseresults) | Returns one name from a "\|" separated list. |
 | [GetCurrentSelection](#getcurrentselection) | Returns the name of the item selected while the dialog is open. |
 | [GetSelectedItems](#getselecteditems) | Returns the items selected while the dialog is open. |
 | [SetEvents](#setevents) | Attaches an event handler that the destructor detaches. |
@@ -805,10 +801,8 @@ Microsoft Learn: [IFileOpenDialog::GetResults](https://learn.microsoft.com/en-us
 function GetResultsString( byval sigdnName as SIGDN = SIGDN_NORMALDISPLAY ) as ustring
 ```
 
-Returns the names of every item the user chose, joined with commas and no spaces, in the order
-the dialog gives them. Split the list with [ParseResults](#parseresults). A name that itself
-contains a comma cannot be told apart from two names; use [GetResults](#getresults) when that
-matters.
+Returns the names of every item the user chose, joined with "\|"and no spaces, in the order
+the dialog gives them. Split the list with [ParseResults](#parseresults).
 
 **Returns** the list, or an empty string when there is no result.
 
@@ -844,7 +838,7 @@ if pofd.ShowOpen( hwnd ) = S_OK then print pofd.GetResultsCount(); " chosen"
 function ParseResults( byref wszMainStr as const wstring, byval index as long ) as ustring
 ```
 
-Returns one name from a comma-separated list such as the one
+Returns one name from a "\|" separated list such as the one
 [GetResultsString](#getresultsstring) returns. It does not use the dialog: it only splits the
 string.
 
@@ -854,13 +848,13 @@ string.
 | `index` | Which name, counting from **1**. |
 
 **Returns** the name; an empty string when `index` is 0, negative or past the last name. For
-`"a.txt,b.txt,c.txt"`, index 2 gives `b.txt` and index 4 an empty string.
+`"a.txt|b.txt|c.txt"`, index 2 gives `b.txt` and index 4 an empty string.
 
 **Example**
 
 ```freebasic
 dim pofd as CIOpenFileDialog
-dim ustrRes as ustring = "a.txt,b.txt,c.txt"
+dim ustrRes as ustring = "a.txt|b.txt|c.txt"
 print pofd.ParseResults( ustrRes, 2 )   ' b.txt
 ```
 

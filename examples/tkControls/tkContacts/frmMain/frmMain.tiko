@@ -1,0 +1,225 @@
+' The half of the form you write. The rest is frmMain.design.tiko, generated from frmMain.tkform:
+' don't edit that one.
+'
+' The main window: every contact in a list, the selected one's photo and address beside it.
+' AddContact, EditContact, DeleteContact and ExportCsv are each bound to a menu item, a toolbar
+' button, a right-click menu item and (Add, Delete) a button: one handler, four ways in.
+#module "frmMain"
+
+#import "std/containers"
+#import "std/fs"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkPicture"
+#import "vendor/tkControls/tkStatusBar"
+#import "vendor/tkControls/tkMessageBox"
+#import "vendor/tkControls/tkFileDialog"
+#import "../askbox"
+#import "../contactdb"
+#import "../frmContact"
+using containers
+using tkApp
+using tkListTree
+using tkPicture
+using tkStatusBar
+using tkMessageBox
+using tkFileDialog
+using tkHost
+
+' The data entry dialog: built the first time it is shown, then hidden and shown again.
+dim shared as frmContact.Form dlgContact
+
+public partial type Form
+    DataFolder as ustring                    ' the database's folder: set it before Build, or
+                                             ' leave it "" for the user's data folder
+    People as Array( of contactdb.Contact )  ' the list's rows, in the same order
+    declare sub Reload( byval selectId as int64 = 0 )
+    declare function Selected( ) as long
+    declare sub ShowSelected( )
+    declare sub SetStatus( byref text as const ustring )
+    declare function EditInDialog( byref c as contactdb.Contact ) as boolean
+    declare function Ask( byref text as const ustring, byval icon as long, byval buttons as long ) as long
+end type
+
+sub Form.Form_Load( )
+    if len( DataFolder ) = 0 then
+        dim as ustring none
+        DataFolder = fs.PathJoin( fs.DataDir( ).ValueOr( none ), "tkContacts" )
+    end if
+    dim as ustring e = contactdb.OpenData( DataFolder )
+    if len( e ) then
+        SetStatus( "Can't open the database: " & e )
+        exit sub
+    end if
+    Reload( )
+end sub
+
+sub Form.Form_Destroy( )
+    contactdb.CloseData( )
+end sub
+
+' ---- the list --------------------------------------------------------------------------------------
+
+' Read every contact again, and select the one with selectId (or the first).
+sub Form.Reload( byval selectId as int64 = 0 )
+    dim as ustring e = contactdb.LoadAll( People )
+    if len( e ) then SetStatus( e )
+    dim as TK_WIDGET ptr h = lstContacts.Handle
+    tkListTree_Clear( h )
+    dim as long pick = 0
+    for i as long = 0 to People.Count( ) - 1
+        dim byref as contactdb.Contact c = People[i]
+        dim as integer row = tkListTree_AddString( h, c.FullName( ) )
+        tkListTree_SetCellText( h, row, 1, c.Phone )
+        tkListTree_SetCellText( h, row, 2, c.Email )
+        if c.Id = selectId then pick = i
+    next
+    if People.Count( ) then tkListTree_SetCurSel( h, pick )
+    tkStatusBar_SetText( sbMain.Handle, 0, People.Count( ) & iif( People.Count( ) = 1, " contact", " contacts" ) )
+    ShowSelected( )
+end sub
+
+' The selected row (the same index in People), or -1.
+function Form.Selected( ) as long
+    dim as long row = tkListTree_GetCurSel( lstContacts.Handle )
+    if (row < 0) orelse (row >= People.Count( )) then return -1
+    return row
+end function
+
+' The selected contact's photo, name and address beside the list.
+sub Form.ShowSelected( )
+    dim as long i = Selected( )
+    if i < 0 then
+        picPhoto.File = "res:nophoto"
+        lblName.Text = ""
+        lblDetails.Text = ""
+        exit sub
+    end if
+    dim byref as contactdb.Contact c = People[i]
+    dim as ustring photo = contactdb.PhotoPath( c )
+    if (len( photo ) = 0) orelse (tkPicture_SetFile( picPhoto.Handle, photo ) = false) then picPhoto.File = "res:nophoto"
+    lblName.Text = c.FullName( )
+    ' one line each, the empty ones left out
+    dim as Array( of ustring ) parts
+    parts.Push( c.Company ) : parts.Push( c.Street )
+    parts.Push( trim( c.City & " " & c.Region & " " & c.PostalCode ) ) : parts.Push( c.Country )
+    dim as ustring lines
+    for each s as ustring in parts
+        if len( s ) = 0 then continue for
+        if len( lines ) then lines &= wchr( 10 )
+        lines &= s
+    next
+    lblDetails.Text = lines
+end sub
+
+sub Form.lstContacts_SelChange( byval row as integer )
+    ShowSelected( )
+end sub
+
+' A double click or Enter on a row edits it.
+sub Form.lstContacts_Activate( byval row as integer )
+    EditContact( )
+end sub
+
+' A list shows each row's own text as its tooltip. In a list with columns that tip only repeats
+' what is on screen, so this handler leaves Text empty: no tooltips. Set Text to give one.
+sub Form.lstContacts_Tooltip( byval row as integer, byval col as integer, byref Text as ustring )
+end sub
+
+' A right click selects the row under the mouse before the right-click menu opens, so the menu's
+' Edit and Delete act on that row.
+sub Form.lstContacts_Message( byval m as TKLISTTREE_MESSAGEINFO ptr, byref Handled as boolean )
+    if (m->msg = TKM_RBUTTONDOWN) andalso (m->idx >= 0) then
+        tkListTree_SetCurSel( lstContacts.Handle, m->idx )
+        ShowSelected( )
+    end if
+end sub
+
+' ---- the commands --------------------------------------------------------------------------------
+
+' The dialog on c. True, with c changed (and saved), after OK.
+function Form.EditInDialog( byref c as contactdb.Contact ) as boolean
+    if dlgContact.IsOpen( ) = false then dlgContact.Build( Handle )
+    dlgContact.Edit( c )
+    if dlgContact.ShowModal( Handle ) <> 1 then return false
+    c = dlgContact.Person
+    dim as ustring e = contactdb.Save( c )                   ' a new contact gets its id here
+    if (len( e ) = 0) andalso dlgContact.PhotoChanged then
+        e = contactdb.SetPhoto( c, dlgContact.PhotoFile )   ' the photo is named by the id
+        if len( e ) = 0 then e = contactdb.Save( c )
+    end if
+    if len( e ) then
+        Ask( e, MBX_ICON_ERROR, MBX_BTN_OK )
+        return false
+    end if
+    return true
+end function
+
+sub Form.AddContact( )
+    dim as contactdb.Contact c
+    if EditInDialog( c ) then
+        Reload( c.Id )
+        SetStatus( "Added " & c.FullName( ) )
+    end if
+end sub
+
+sub Form.EditContact( )
+    dim as long i = Selected( )
+    if i < 0 then exit sub
+    dim as contactdb.Contact c = People[i]
+    if EditInDialog( c ) then
+        Reload( c.Id )
+        SetStatus( "Saved " & c.FullName( ) )
+    end if
+end sub
+
+sub Form.DeleteContact( )
+    dim as long i = Selected( )
+    if i < 0 then exit sub
+    dim as contactdb.Contact c = People[i]
+    if Ask( "Delete " & c.FullName( ) & "?", MBX_ICON_QUESTION, MBX_BTN_YESNO ) <> MBX_IDYES then exit sub
+    dim as ustring e = contactdb.Remove( c.Id )
+    if len( e ) then
+        Ask( e, MBX_ICON_ERROR, MBX_BTN_OK )
+        exit sub
+    end if
+    ' the row that takes its place stays selected
+    dim as int64 nextId = 0
+    if i + 1 < People.Count( ) then
+        nextId = People[i + 1].Id
+    elseif i > 0 then
+        nextId = People[i - 1].Id
+    end if
+    Reload( nextId )
+    SetStatus( "Deleted " & c.FullName( ) )
+end sub
+
+sub Form.ExportCsv( )
+    dim as ustring path = tkFileDialog_SaveFile( tkForm_Host( Handle ), "CSV files|*.csv|All files|*.*", "contacts.csv" )
+    if len( path ) = 0 then exit sub
+    if lcase( fs.PathExtension( path ) ) <> ".csv" then path &= ".csv"
+    dim as ustring e = contactdb.ExportCsv( path )
+    if len( e ) then
+        Ask( e, MBX_ICON_ERROR, MBX_BTN_OK )
+    else
+        SetStatus( "Exported " & People.Count( ) & " contacts to " & fs.PathFileName( path ) )
+    end if
+end sub
+
+sub Form.mnuMain_File_Exit( )
+    this.Close( )
+end sub
+
+sub Form.mnuMain_Help_AboutContacts( )
+    Ask( "Contacts" & wchr( 10 ) & "Made with tkEdit's Form Designer, tkControls and SQLite.", MBX_ICON_INFO, MBX_BTN_OK )
+end sub
+
+' ---- helpers ---------------------------------------------------------------------------------------
+
+sub Form.SetStatus( byref text as const ustring )
+    tkStatusBar_SetText( sbMain.Handle, 1, text )
+end sub
+
+function Form.Ask( byref text as const ustring, byval icon as long, byval buttons as long ) as long
+    return askbox.Ask( Handle, text, "Contacts", icon, buttons )
+end function

@@ -38,6 +38,7 @@
 - [__FB_LINUX__](Fb-Linux)
 - [__FB_MAIN__](Fb-Main)
 - [__FB_MIN_VERSION__](Fb-Min-Version)
+- [__TIKO_ASAN__](Compiler-Option-Fsanitize)
 - [__TIKO_COMPILER__](Category-Tiko-Compiler-Define)
 - [__FB_MT__](Fb-Mt)
 - [__FB_NETBSD__](Fb-Netbsd)

@@ -5,5 +5,5 @@ dim as byte ptr bp = ip
 sub takesb( byval p as byte ptr )
 end sub
 takesb( ip )
-dim as long n = 99999999999999999999999
+dim as long n = 99999999999999999999999ull
 print "unclosed

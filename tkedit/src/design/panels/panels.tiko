@@ -32,6 +32,7 @@
 #import "../catalog"
 #import "../edits"
 #import "../canvas"
+#import "../validate"
 using containers
 using tkApp
 using tkMeta
@@ -97,8 +98,12 @@ public type PanelRow
     Text as ustring    ' what the editor holds, as last applied
     Label as TK_WIDGET ptr
     Edit as TK_WIDGET ptr
-    Btn as TK_WIDGET ptr      ' an event row's "go to the code"
+    Btn as TK_WIDGET ptr      ' an event row's "go to the code"; a file row's "..." (the Resource Center)
     CY as long
+    Inline as boolean         ' on the row before's line, sharing its editor's width (no label of its own)
+    Glyph as boolean          ' a glyph property: its code in the box, its "..." the Glyph Picker
+    Preview as TK_WIDGET ptr  ' a glyph row's: the glyph, drawn in its font, before the box
+    GlyphSize as boolean      ' the GlyphFont property shown as GlyphSize: Normal, Large or points
 end type
 
 public type Palette
@@ -169,7 +174,10 @@ public type DesignPanels
     declare sub BuildTree( )
     declare sub FillToolbox( )
     declare sub AddRow( byref key_ as const ustring, byref caption as const ustring, byval kind_ as long, byref items as const ustring = "" )
+    declare sub AddFileButton( )
+    declare sub AddGlyphButton( )
     declare sub AddPropRow( byval p as TKMETA_PROP ptr )
+    ImagesHere as boolean     ' while the rows are made: the control takes an image (IconSize is ImageSize)
     declare sub AddEventRow( byref event_ as const ustring )
     declare sub UpdateValues( )
     declare function ValueOf( byref key_ as const ustring ) as ustring
@@ -297,7 +305,10 @@ private sub OnToolActivated( byval hList as TK_WIDGET ptr, byval row as integer 
     if (p = 0) orelse (p->C = 0) then exit sub
     dim as ustring tool_ = ToolAt_( hList, row )
     if len( tool_ ) = 0 then exit sub
-    if p->C->PlaceDefault( tool_ ) then tkHost_SetFocus( p->C->Glass->pHost, p->C->Glass )
+    ' placing a menu bar runs its editor, whose pencil may leave for the code: the panels are then
+    ' bound to no form (p->C = 0), and the keyboard stays with the code
+    dim as canvas.FormCanvas ptr c = p->C
+    if c->PlaceDefault( tool_ ) andalso (p->C = c) then tkHost_SetFocus( c->Glass->pHost, c->Glass )
 end sub
 
 private sub OnTreePicked( byval hList as TK_WIDGET ptr, byval row as integer )
@@ -341,9 +352,65 @@ private sub OnEventGo( byval h as TK_WIDGET ptr, byval idx as long, byval cid as
         if p->Rows[i].Btn = h then r = i
     next
     if r < 0 then exit sub
+    ' a name typed but not yet entered is what the button means: the button takes no focus, so
+    ' the box hasn't let it go
+    dim as ustring ev = mid( p->Rows[r].Key, 3 )
+    p->CommitRow( r )
     dim as ustring ctl
     if p->C->Selected.Count( ) then ctl = p->C->Selected[0]
-    p->C->OnWire( p->C->Host, p->C, ctl, mid( p->Rows[r].Key, 3 ), true )
+    p->C->OnWire( p->C->Host, p->C, ctl, ev, true )
+end sub
+
+' A file row's "...": the Resource Center picks an image, and the row takes "res:<name>" as if typed.
+private sub OnFileGo( byval h as TK_WIDGET ptr, byval idx as long, byval cid as long )
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if (p = 0) orelse (p->C = 0) orelse (p->C->OnPickResource = 0) then exit sub
+    dim as long r = -1
+    for i as long = 0 to p->Rows.Count( ) - 1
+        if p->Rows[i].Btn = h then r = i
+    next
+    if r < 0 then exit sub
+    dim as canvas.FormCanvas ptr c = p->C
+    dim as ustring key_ = p->Rows[r].Key, picked
+    if c->OnPickResource( c->Host, c, "image", tkTextBox_GetText( p->Rows[r].Edit ), key_, picked ) = false then exit sub
+    ' the Center's OK rebuilt the forms: the panels may be bound elsewhere, their rows made again
+    if p->C <> c then exit sub
+    r = -1
+    for i as long = 0 to p->Rows.Count( ) - 1
+        if p->Rows[i].Key = key_ then r = i
+    next
+    if r < 0 then exit sub
+    tkTextBox_SetText( p->Rows[r].Edit, picked )
+    p->CommitRow( r )
+end sub
+
+' A glyph property's "...": the Glyph Picker on the value it has; the pick goes in as it is. (Every
+' control with a glyph font draws its glyphs in the GLYPH one: codegen.GlyphRole.)
+private sub OnGlyphGo( byval h as TK_WIDGET ptr, byval idx as long, byval cid as long )
+    dim as DesignPanels ptr p = PanelsOf( h )
+    if (p = 0) orelse (p->C = 0) orelse (p->C->OnPickGlyph = 0) then exit sub
+    dim as long r = -1
+    for i as long = 0 to p->Rows.Count( ) - 1
+        if p->Rows[i].Btn = h then r = i
+    next
+    if r < 0 then exit sub
+    dim as canvas.FormCanvas ptr c = p->C
+    dim as ustring key_ = p->Rows[r].Key, picked
+    if c->OnPickGlyph( c->Host, c, p->ValueOf( key_ ), picked ) = false then exit sub
+    if p->C <> c then exit sub
+    r = -1
+    for i as long = 0 to p->Rows.Count( ) - 1
+        if p->Rows[i].Key = key_ then r = i
+    next
+    if r < 0 then exit sub
+    ' the pick as it is ("<font>:<hex>"): the box alone could not say which font
+    tkTextBox_SetText( p->Rows[r].Edit, GlyphShown( picked ) )
+    dim as ustring fault0 = p->Apply( key_, picked )
+    if len( fault0 ) then
+        if p->OnMessage then p->OnMessage( p->Owner, fault0 )
+        exit sub
+    end if
+    if r < p->Rows.Count( ) then p->Rows[r].Text = GlyphShown( picked )
 end sub
 
 ' The row that opens a control's menu, column, item or page editor -- or its Colors dialog.
@@ -367,8 +434,8 @@ public function ColorsSummary( byref c as FormControl ) as ustring
     dim as long n = c.Colors.Count( )
     if (len( c.StyleName ) = 0) andalso (n = 0) then return i18n.Tr( "designer.colors_theme", "Theme" )
     if n = 0 then return c.StyleName
-    if len( c.StyleName ) = 0 then return strings.Format( i18n.Tr( "designer.colors_count", "{} colours" ), n )
-    return strings.Format( i18n.Tr( "designer.colors_summary", "{} + {} colours" ), c.StyleName, n )
+    if len( c.StyleName ) = 0 then return strings.Format( i18n.Tr( "designer.colors_count", "{} colors" ), n )
+    return strings.Format( i18n.Tr( "designer.colors_summary", "{} + {} colors" ), c.StyleName, n )
 end function
 
 private sub OnFloatClicked( byval h as TK_WIDGET ptr, byval idx as long, byval cid as long )
@@ -691,18 +758,38 @@ sub DesignPanels.LayoutPane( byval sc as TK_WIDGET ptr, byval events as boolean 
     dim as long w = tkScrollPanel_GetPanelWidth( sc )
     if w <= 0 then w = sc->cw
     dim as long y = p_
-    for each r as PanelRow in Rows
-        if (left( r.Key, 2 ) = "E:") <> events then continue for
-        dim as long rh = tkHost_Scale( h, r.CY )
-        tkWidget_SetPos( r.Label, p_, y, lw - p_, rh - p_ )
-        dim as long bw = 0
-        if r.Btn then
-            dim as long bh
-            tkToolbar_GetIdealSize( r.Btn, bw, bh )
-            if bh > rh - p_ then bh = rh - p_
-            tkWidget_SetPos( r.Btn, w - p_ - bw, y + ((rh - p_ - bh) \ 2), bw, bh )
+    dim as long n = Rows.Count( )
+    for i as long = 0 to n - 1
+        dim as PanelRow ptr r = @Rows[i]
+        if (left( r->Key, 2 ) = "E:") <> events then continue for
+        if r->Inline then continue for                 ' placed with the row it follows
+        dim as long rh = tkHost_Scale( h, r->CY )
+        tkWidget_SetPos( r->Label, p_, y, lw - p_, rh - p_ )
+        ' a glyph row's preview: a square before the box
+        dim as long pv = 0
+        if r->Preview then
+            pv = rh - p_
+            tkWidget_SetPos( r->Preview, lw, y, pv, rh - p_ )
+            pv += p_
         end if
-        tkWidget_SetPos( r.Edit, lw, y, w - lw - p_ - bw, rh - p_ )
+        dim as long bw = 0
+        if r->Btn then
+            dim as long bh
+            tkToolbar_GetIdealSize( r->Btn, bw, bh )
+            if bh > rh - p_ then bh = rh - p_
+            tkWidget_SetPos( r->Btn, w - p_ - bw, y + ((rh - p_ - bh) \ 2), bw, bh )
+        end if
+        ' the rows inline after this one share its editor's width, a cell each
+        dim as long k = 0
+        while (i + k + 1 < n) andalso Rows[i + k + 1].Inline
+            k += 1
+        wend
+        dim as long ew = w - lw - p_ - bw - pv, cell = ew \ (k + 1)
+        tkWidget_SetPos( r->Edit, lw + pv, y, iif( k > 0, cell, ew ), rh - p_ )
+        for j as long = 1 to k
+            tkWidget_SetPos( Rows[i + j].Edit, lw + j * cell, y, cell, rh - p_ )
+            tkWidget_Show( Rows[i + j].Label, false )
+        next
         y += rh
     next
     tkScrollPanel_SetContentHeight( sc, y + p_ )
@@ -834,6 +921,15 @@ sub DesignPanels.AddRow( byref key_ as const ustring, byref caption as const ust
 end sub
 
 ' The Shown names of a "Shown=CONSTANT,..." list.
+' A ContextMenu row's choices: none, then each PopupMenu on the form.
+private function PopupNames_( byref doc as FormDoc ) as ustring
+    dim as ustring o
+    for each c as FormControl in doc.Controls
+        if c.TypeName = catalog.POPUP_TYPE then o &= "," & c.Name
+    next
+    return o
+end function
+
 private function EnumShown_( byref pairs as const ustring ) as ustring
     dim as ustring o, t = pairs & ","
     dim as long a = 1
@@ -861,16 +957,95 @@ sub DesignPanels.AddEventRow( byref event_ as const ustring )
     end with
 end sub
 
+' The last row added is a glyph's (GLYPHS.md GV8): the glyph drawn, its code in the box, then a
+' "..." that opens the Glyph Picker.
+sub DesignPanels.AddGlyphButton( )
+    with Rows[Rows.Count( ) - 1]
+        .Glyph = true
+        .Preview = tkLabel_Create( tkScrollPanel_GetPanel( Scroll ), 1 )
+        tkLabel_SetAlign( .Preview, LBL_ALIGN_CENTER )
+        .Btn = tkToolbar_Create( tkScrollPanel_GetPanel( Scroll ), 1 )
+        tkToolbar_SetGlyphFont( .Btn, tkForm_Font( tkForm_FromWidget( Scroll ), TKFONT_GLYPH ) )
+        tkToolbar_AddItem( .Btn, TBR_KIND_COMMAND, wchr( TK_ICON_MORE ), "", 0 )
+        tkToolbar_SetTooltipText( .Btn, 0, i18n.Tr( "designer.glyph_pick", "Pick a glyph" ) )
+        tkToolbar_SetClickCallback( .Btn, @OnGlyphGo )
+    end with
+end sub
+
+' The last row added gets a "..." that opens the Resource Center (a file property, the form's Icon).
+sub DesignPanels.AddFileButton( )
+    with Rows[Rows.Count( ) - 1]
+        .Btn = tkToolbar_Create( tkScrollPanel_GetPanel( Scroll ), 1 )
+        tkToolbar_SetGlyphFont( .Btn, tkForm_Font( tkForm_FromWidget( Scroll ), TKFONT_GLYPH ) )
+        tkToolbar_AddItem( .Btn, TBR_KIND_COMMAND, wchr( TK_ICON_MORE ), "", 0 )
+        tkToolbar_SetTooltipText( .Btn, 0, i18n.Tr( "designer.res_center", "Resource Center" ) )
+        tkToolbar_SetClickCallback( .Btn, @OnFileGo )
+    end with
+end sub
+
+' The order the inspector shows a control's properties in: tkControls' own, but GlyphFont (shown
+' as GlyphSize) right after the last glyph property and IconSize (shown as ImageSize) after the last
+' image one, so each sits with what it sizes. hasImages: whether the control takes an image.
+private function InspectorOrder_( byval m as TKMETA_CONTROL ptr, byref hasImages as boolean ) as Array( of long )
+    dim as Array( of long ) o
+    dim as long gf = -1, isz = -1, lastGlyph = -1, lastImage = -1
+    for i as long = 0 to m->NumProps - 1
+        select case m->Props( i ).Name
+        case "GlyphFont" : gf = i
+        case "IconSize" : isz = i
+        end select
+        if m->Props( i ).Kind = "glyph" then lastGlyph = i
+        if m->Props( i ).Kind = "file" then lastImage = i
+    next
+    hasImages = (lastImage >= 0)
+    for i as long = 0 to m->NumProps - 1
+        if ((i = gf) andalso (lastGlyph >= 0)) orelse ((i = isz) andalso (lastImage >= 0)) then continue for
+        o.Push( i )
+        if (i = lastGlyph) andalso (gf >= 0) then o.Push( gf )
+        if (i = lastImage) andalso (isz >= 0) then o.Push( isz )
+    next
+    return o
+end function
+
+' What the inspector calls a property: tkControls' name, but for what is plain to a designer --
+' GlyphFont is GlyphSize; a control with images calls its icon box ImageSize; IconGap is TextGap
+' (between the glyph or image and the text). The .tkform keeps tkControls' names.
+private function ShownName_( byval p as TKMETA_PROP ptr, byval hasImages as boolean ) as ustring
+    select case p->Name
+    case "GlyphFont" : return "GlyphSize"
+    case "IconSize" : if hasImages then return "ImageSize"
+    case "IconGap" : return "TextGap"
+    end select
+    return p->Name
+end function
+
 sub DesignPanels.AddPropRow( byval p as TKMETA_PROP ptr )
+    dim as ustring shown = ShownName_( p, ImagesHere )
     select case p->Kind
+    case "file"
+        this.AddRow( p->Name, p->Name, RowKind.RowText )
+        this.AddFileButton( )
+    case "glyph"
+        this.AddRow( p->Name, p->Name, RowKind.RowText )
+        this.AddGlyphButton( )
     case "bool" : this.AddRow( p->Name, p->Name, RowKind.RowCheck )
     case "enum" : this.AddRow( p->Name, p->Name, RowKind.RowCombo, EnumShown_( p->EnumPairs ) )
-    case "font" : this.AddRow( p->Name, p->Name, RowKind.RowCombo, ",UI,UI_SMALL,UI_BOLD,UI_LARGE,GLYPH,GLYPH_LARGE,MONO" )
+    case "font"
+        if p->Name = "GlyphFont" then
+            ' the glyph font is the project's GLYPH one; all that is left to choose is its size
+            ' (stored as GlyphFont: nothing, GLYPH_LARGE or the points, so older forms read as they are)
+            this.AddRow( p->Name, shown, RowKind.RowCombo, _
+                         i18n.Tr( "designer.glyph_size_normal", "Normal" ) & "," & i18n.Tr( "designer.glyph_size_large", "Large" ) & ",16,20,24,28,32,40,48,64" )
+            Rows[Rows.Count( ) - 1].GlyphSize = true
+        else
+            ' text roles only: the GLYPH font is the project's merged icons (GLYPHS.md V4), no letters
+            this.AddRow( p->Name, p->Name, RowKind.RowCombo, ",UI,UI_SMALL,UI_BOLD,UI_LARGE,MONO" )
+        end if
     case "list"
-        this.AddRow( p->Name, p->Name, RowKind.RowText )
+        this.AddRow( p->Name, shown, RowKind.RowText )
         tkTextBox_SetCueBannerText( Rows[Rows.Count( ) - 1].Edit, tkMeta_ListCue( p->EnumPairs ) )
         tkTextBox_SetCueBannerColor( Rows[Rows.Count( ) - 1].Edit, HintColor_( ) )
-    case else   : this.AddRow( p->Name, p->Name, RowKind.RowText )
+    case else   : this.AddRow( p->Name, shown, RowKind.RowText )
     end select
 end sub
 
@@ -879,6 +1054,7 @@ sub DesignPanels.BuildRows( )
         tkWidget_Destroy( r.Label )
         tkWidget_Destroy( r.Edit )
         if r.Btn then tkWidget_Destroy( r.Btn )
+        if r.Preview then tkWidget_Destroy( r.Preview )
     next
     Rows.Clear( )
     Updating = true
@@ -888,8 +1064,21 @@ sub DesignPanels.BuildRows( )
         this.AddRow( "@FormW", i18n.Tr( "designer.width", "Width" ), RowKind.RowText )
         this.AddRow( "@FormH", i18n.Tr( "designer.height", "Height" ), RowKind.RowText )
         this.AddRow( "@Translate", i18n.Tr( "designer.translate", "Translatable" ), RowKind.RowCheck )
-        this.AddEventRow( "Load" )
-        this.AddEventRow( "Close" )
+        ' the window: named as in code, as a control's properties are
+        this.AddRow( "@StartPosition", "StartPosition", RowKind.RowCombo, "Default,CenterScreen,CenterOwner" )
+        this.AddRow( "@WindowState", "WindowState", RowKind.RowCombo, "Normal,Maximized,Minimized" )
+        this.AddRow( "@Resizable", "Resizable", RowKind.RowCombo, ",true,false" )
+        this.AddRow( "@MinWidth", "MinWidth", RowKind.RowText )
+        this.AddRow( "@MinHeight", "MinHeight", RowKind.RowText )
+        this.AddRow( "@MaxWidth", "MaxWidth", RowKind.RowText )
+        this.AddRow( "@MaxHeight", "MaxHeight", RowKind.RowText )
+        this.AddRow( "@AlwaysOnTop", "AlwaysOnTop", RowKind.RowCheck )
+        this.AddRow( "@Icon", "Icon", RowKind.RowText )
+        this.AddFileButton( )
+        this.AddRow( "@FormCtx", "ContextMenu", RowKind.RowCombo, PopupNames_( C->Doc ) )
+        for e as long = 0 to catalog.FormEventCount( ) - 1
+            this.AddEventRow( catalog.FormEventName( e ) )
+        next
     else
         dim as long i0 = FindControl( C->Doc, C->Selected[0] )
         if i0 < 0 then
@@ -897,25 +1086,45 @@ sub DesignPanels.BuildRows( )
             exit sub
         end if
         dim as TKMETA_CONTROL ptr m0 = catalog.Find( C->Doc.Controls[i0].TypeName )
+        ' a component (a Timer) only has a place on the design surface: no size, anchors, dock or Visible
+        dim as boolean anyComponent = false
+        for k as long = 0 to n - 1
+            dim as long ik = FindControl( C->Doc, C->Selected[k] )
+            if ik >= 0 then
+                if catalog.IsComponent( C->Doc.Controls[ik].TypeName ) then anyComponent = true
+            end if
+        next
         if n = 1 then
             this.AddRow( "@Name", i18n.Tr( "designer.name", "Name" ), RowKind.RowText )
             if catalog.ItemsKindOf( m0->Name ) <> catalog.ItemsKind.ItemsNone then
                 this.AddRow( "@Items", i18n.Tr( "designer.edit_items", "Edit items" ), RowKind.RowButton )
             end if
             if m0->NumColorSlots > 0 then
-                this.AddRow( "@Colors", i18n.Tr( "designer.colors", "Colours" ), RowKind.RowButton )
+                this.AddRow( "@Colors", i18n.Tr( "designer.colors", "Colors" ), RowKind.RowButton )
                 tkButton_SetText( Rows[Rows.Count( ) - 1].Edit, ColorsSummary( C->Doc.Controls[i0] ) )
             end if
             this.AddRow( "@X", "X", RowKind.RowText )
             this.AddRow( "@Y", "Y", RowKind.RowText )
-            this.AddRow( "@W", i18n.Tr( "designer.width", "Width" ), RowKind.RowText )
-            this.AddRow( "@H", i18n.Tr( "designer.height", "Height" ), RowKind.RowText )
+            if anyComponent = false then
+                this.AddRow( "@W", i18n.Tr( "designer.width", "Width" ), RowKind.RowText )
+                this.AddRow( "@H", i18n.Tr( "designer.height", "Height" ), RowKind.RowText )
+            end if
         end if
-        this.AddRow( "@AL", i18n.Tr( "designer.anchor_left", "Anchor left" ), RowKind.RowCheck )
-        this.AddRow( "@AT", i18n.Tr( "designer.anchor_top", "Anchor top" ), RowKind.RowCheck )
-        this.AddRow( "@AR", i18n.Tr( "designer.anchor_right", "Anchor right" ), RowKind.RowCheck )
-        this.AddRow( "@AB", i18n.Tr( "designer.anchor_bottom", "Anchor bottom" ), RowKind.RowCheck )
-        this.AddRow( "@Dock", i18n.Tr( "designer.dock_mode", "Dock" ), RowKind.RowCombo, "none,top,bottom,left,right,fill" )
+        if anyComponent = false then
+            ' one Anchors line: L T R B, a row (and a key) each underneath
+            this.AddRow( "@AL", i18n.Tr( "designer.anchors", "Anchors (L,T,R,B)" ), RowKind.RowCheck )
+            tkCheckBox_SetText( Rows[Rows.Count( ) - 1].Edit, "L" )
+            this.AddRow( "@AT", "", RowKind.RowCheck )
+            tkCheckBox_SetText( Rows[Rows.Count( ) - 1].Edit, "T" )
+            Rows[Rows.Count( ) - 1].Inline = true
+            this.AddRow( "@AR", "", RowKind.RowCheck )
+            tkCheckBox_SetText( Rows[Rows.Count( ) - 1].Edit, "R" )
+            Rows[Rows.Count( ) - 1].Inline = true
+            this.AddRow( "@AB", "", RowKind.RowCheck )
+            tkCheckBox_SetText( Rows[Rows.Count( ) - 1].Edit, "B" )
+            Rows[Rows.Count( ) - 1].Inline = true
+            this.AddRow( "@Dock", i18n.Tr( "designer.dock_mode", "Dock" ), RowKind.RowCombo, "none,top,bottom,left,right,fill" )
+        end if
         dim as boolean anyCustom = false
         for k as long = 0 to n - 1
             dim as long ik = FindControl( C->Doc, C->Selected[k] )
@@ -925,8 +1134,10 @@ sub DesignPanels.BuildRows( )
         next
         if anyCustom = false then
             this.AddRow( "Enabled", "Enabled", RowKind.RowCheck )
-            this.AddRow( "Visible", "Visible", RowKind.RowCheck )
+            if anyComponent = false then this.AddRow( "Visible", "Visible", RowKind.RowCheck )
         end if
+        ' the PopupMenu a right-click on it opens
+        if anyComponent = false then this.AddRow( "@Ctx", "ContextMenu", RowKind.RowCombo, PopupNames_( C->Doc ) )
         if (n = 1) andalso (m0->Name = catalog.CUSTOM_TYPE) then
             this.AddRow( "@CType", i18n.Tr( "designer.custom_type", "Type" ), RowKind.RowText )
             this.AddRow( "@CModule", i18n.Tr( "designer.custom_module", "Module" ), RowKind.RowText )
@@ -938,7 +1149,8 @@ sub DesignPanels.BuildRows( )
             case "enum" : this.AddRow( m0->CreateArg, m0->CreateArg, RowKind.RowCombo, EnumShown_( m0->CreateArgEnum ) )
             end select
         end if
-        for p as long = 0 to m0->NumProps - 1
+        ImagesHere = false
+        for each p as long in InspectorOrder_( m0, ImagesHere )
             dim as boolean common_ = true
             for k as long = 1 to n - 1
                 dim as long ik = FindControl( C->Doc, C->Selected[k] )
@@ -974,6 +1186,7 @@ function DesignPanels.ControlValue( byval i as long, byref key_ as const ustring
     case "@H"    : return str( c_.H )
     case "@Dock" : return DockWord( c_.Dock )
     case "@CType" : return c_.CustomType
+    case "@Ctx"   : return c_.ContextMenu
     case "@CModule" : return c_.CustomModule
     case "@AL"   : if (c_.Anchor and TK_ANCHOR_LEFT) then return "true" else return "false"
     case "@AT"   : if (c_.Anchor and TK_ANCHOR_TOP) then return "true" else return "false"
@@ -995,6 +1208,12 @@ function DesignPanels.ControlValue( byval i as long, byref key_ as const ustring
     return SettingOr( c_.Props, key_, dflt )
 end function
 
+' A form's size limit as its row shows it: blank for none.
+private function LimitText_( byval v as long ) as ustring
+    if v = 0 then return ""
+    return str( v )
+end function
+
 ' What a row should show: the value, or "" when the selected controls differ.
 function DesignPanels.ValueOf( byref key_ as const ustring ) as ustring
     select case key_
@@ -1003,6 +1222,21 @@ function DesignPanels.ValueOf( byref key_ as const ustring ) as ustring
     case "@FormH"   : return str( C->Doc.ClientH )
     case "@Translate"
         if C->Doc.Translate then return "true" else return "false"
+    case "@StartPosition"
+        if len( C->Doc.StartPosition ) = 0 then return "Default"
+        return C->Doc.StartPosition
+    case "@WindowState"
+        if len( C->Doc.WindowState ) = 0 then return "Normal"
+        return C->Doc.WindowState
+    case "@Resizable" : return C->Doc.Resizable
+    case "@MinWidth"  : return LimitText_( C->Doc.MinW )
+    case "@MinHeight" : return LimitText_( C->Doc.MinH )
+    case "@MaxWidth"  : return LimitText_( C->Doc.MaxW )
+    case "@MaxHeight" : return LimitText_( C->Doc.MaxH )
+    case "@AlwaysOnTop"
+        if C->Doc.AlwaysOnTop then return "true" else return "false"
+    case "@Icon" : return C->Doc.Icon
+    case "@FormCtx" : return C->Doc.ContextMenu
     end select
     if (left( key_, 2 ) = "E:") andalso (C->Selected.Count( ) = 0) then return SettingOr( C->Doc.Events, mid( key_, 3 ) )
     dim as ustring out_
@@ -1036,8 +1270,25 @@ sub DesignPanels.UpdateValues( )
                 if ic >= 0 then tkButton_SetText( ed, ColorsSummary( C->Doc.Controls[ic] ) )
             end if
         case RowKind.RowText
+            if Rows[r].Glyph then
+                ' the glyph in the font the canvas draws it in: its own (the bundled icons for a plain one)
+                dim as TTF_Font ptr gf = C->GlyphFontFor( GlyphFontKey( v ), false )
+                if gf = 0 then gf = tkForm_Font( tkForm_FromWidget( ed ), TKFONT_GLYPH )
+                if Rows[r].Preview then
+                    tkLabel_SetFont( Rows[r].Preview, gf )
+                    tkLabel_SetText( Rows[r].Preview, GlyphChar( v ) )
+                end if
+                v = GlyphShown( v )
+            end if
             if (tkHost_GetFocus( ed->pHost ) <> ed) andalso (tkTextBox_GetText( ed ) <> v) then tkTextBox_SetText( ed, v )
         case RowKind.RowCombo
+            if Rows[r].GlyphSize then
+                if v = "GLYPH_LARGE" then
+                    v = i18n.Tr( "designer.glyph_size_large", "Large" )
+                elseif valint( v ) <= 0 then
+                    v = i18n.Tr( "designer.glyph_size_normal", "Normal" )
+                end if
+            end if
             tkComboBox_SetCurSel( ed, tkComboBox_FindItemByText( ed, v ) )
         case RowKind.RowCheck
             tkCheckBox_SetChecked( ed, v = "true" )
@@ -1081,7 +1332,18 @@ sub DesignPanels.CommitRow( byval r as long )
     if Rows[r].Kind = RowKind.RowButton then exit sub
     if v = Rows[r].Text then exit sub
     dim as ustring key_ = Rows[r].Key
-    dim as ustring fault = this.Apply( key_, v )
+    dim as ustring nv = v
+    if Rows[r].Glyph then nv = GlyphTyped( v, this.ValueOf( key_ ) )
+    if Rows[r].GlyphSize then
+        if v = i18n.Tr( "designer.glyph_size_large", "Large" ) then
+            nv = "GLYPH_LARGE"
+        elseif valint( v ) > 0 then
+            nv = str( valint( v ) )                    ' points
+        else
+            nv = ""
+        end if
+    end if
+    dim as ustring fault = this.Apply( key_, nv )
     if len( fault ) then
         if OnMessage then OnMessage( Owner, fault )
         Updating = true
@@ -1110,8 +1372,26 @@ private function ParseLong_( byref s as const ustring, byref v as long ) as bool
 end function
 
 ' One change, on a copy of the model: the canvas takes it if it leaves the form valid. "" = done.
+' Does anything on the form still call handler?
+private function HandlerUsed_( byref doc as FormDoc, byref handler as const ustring ) as boolean
+    dim as ustring want = lcase( handler )
+    for each s as Setting in doc.Events
+        if lcase( s.Value ) = want then return true
+    next
+    for each c as FormControl in doc.Controls
+        for each s as Setting in c.Events
+            if lcase( s.Value ) = want then return true
+        next
+        for each it as FormItem in c.Items
+            if lcase( it.Handler ) = want then return true
+        next
+    next
+    return false
+end function
+
 function DesignPanels.Apply( byref key_ as const ustring, byref text as const ustring ) as ustring
     dim as FormDoc trial = C->Doc
+    dim as ustring oldHandler, evParams          ' an Events row: what it called before, and with what
     dim as long v
     dim as boolean rebuild = true
     dim as long i = -1
@@ -1122,6 +1402,43 @@ function DesignPanels.Apply( byref key_ as const ustring, byref text as const us
         trial.Caption = text
     case "@Translate"
         trial.Translate = (text = "true")
+        rebuild = false
+    case "@StartPosition"
+        if text = "Default" then trial.StartPosition = "" else trial.StartPosition = text
+        rebuild = false
+    case "@WindowState"
+        if text = "Normal" then trial.WindowState = "" else trial.WindowState = text
+        rebuild = false
+    case "@Resizable"
+        trial.Resizable = text
+        rebuild = false
+    case "@MinWidth", "@MinHeight", "@MaxWidth", "@MaxHeight"
+        ' blank is no limit
+        v = 0
+        if len( trim( text ) ) then
+            if ParseLong_( trim( text ), v ) = false then return badNumber
+        end if
+        select case key_
+        case "@MinWidth"  : trial.MinW = v
+        case "@MinHeight" : trial.MinH = v
+        case "@MaxWidth"  : trial.MaxW = v
+        case "@MaxHeight" : trial.MaxH = v
+        end select
+        rebuild = false
+    case "@AlwaysOnTop"
+        trial.AlwaysOnTop = (text = "true")
+        rebuild = false
+    case "@Icon"
+        trial.Icon = trim( text )
+        rebuild = false
+    case "@FormCtx"
+        trial.ContextMenu = text
+        rebuild = false
+    case "@Ctx"
+        for each s_ as ustring in C->Selected
+            dim as long k = FindControl( trial, s_ )
+            if k >= 0 then trial.Controls[k].ContextMenu = text
+        next
         rebuild = false
     case "@FormW", "@FormH"
         if ParseLong_( text, v ) = false then return badNumber
@@ -1161,6 +1478,9 @@ function DesignPanels.Apply( byref key_ as const ustring, byref text as const us
             dim as ustring ev = mid( key_, 3 )
             if i >= 0 then
                 dim as long at_ = FindSetting( trial.Controls[i].Events, ev )
+                if at_ >= 0 then oldHandler = trial.Controls[i].Events[at_].Value
+                dim as TKMETA_EVENT ptr e = tkMeta_FindEvent( catalog.Find( trial.Controls[i].TypeName ), ev )
+                if e then evParams = e->Params
                 if len( text ) then
                     PutSetting( trial.Controls[i].Events, ev, text )
                 elseif at_ >= 0 then
@@ -1168,6 +1488,8 @@ function DesignPanels.Apply( byref key_ as const ustring, byref text as const us
                 end if
             else
                 dim as long at_ = FindSetting( trial.Events, ev )
+                if at_ >= 0 then oldHandler = trial.Events[at_].Value
+                evParams = catalog.FormEventParams( ev )
                 if len( text ) then
                     PutSetting( trial.Events, ev, text )
                 elseif at_ >= 0 then
@@ -1180,6 +1502,29 @@ function DesignPanels.Apply( byref key_ as const ustring, byref text as const us
             if len( bad ) then return bad
         end if
     end select
+    ' A handler the row no longer calls, and nothing else on the form does: its body in the code takes
+    ' the new name (when that has no body yet), else it goes as a deleted control's would -- an empty
+    ' body is removed, one with code keeps its declaration (an orphan) so the file still compiles.
+    ' a kept (orphaned) handler named again is called again: no longer an orphan
+    if (left( key_, 2 ) = "E:") andalso (len( text ) > 0) then
+        for k as long = trial.Orphans.Count( ) - 1 to 0 step -1
+            if lcase( trial.Orphans[k].Handler ) = lcase( text ) then trial.Orphans.Remove( k )
+        next
+    end if
+    if (len( oldHandler ) > 0) andalso (oldHandler <> text) andalso (HandlerUsed_( trial, oldHandler ) = false) then
+        dim as ustring bad = validate.FirstNewProblem( C->Doc, trial )
+        if len( bad ) then return bad                ' refused before the code is touched
+        dim as boolean renamed = false
+        if (len( text ) > 0) andalso (C->OnHandlerRenamed <> 0) then renamed = C->OnHandlerRenamed( C->Host, C, oldHandler, text )
+        if (renamed = false) andalso (C->OnHandlerGone <> 0) then
+            if C->OnHandlerGone( C->Host, C, oldHandler ) then
+                dim as FormOrphan o
+                o.Handler = oldHandler
+                o.Params = evParams
+                trial.Orphans.Push( o )
+            end if
+        end if
+    end if
     dim as ustring newName, oldName
     if key_ = "@Name" then
         newName = text

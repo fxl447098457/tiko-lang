@@ -57,6 +57,10 @@ def norm_ret(ret, structs):
 
 def norm_params(params):
     params = re.sub(r'sret\([^)]*\)( align \d+)?', 'sret', params)
+    # clang 23 marks a by-address aggregate 'align N dead_on_return': hints about the caller's
+    # copy, not where the argument travels (seen 2026-11-19, clang 23.1.5). alignstack(8) on an
+    # aarch64-linux HFA is NOT stripped: it is part of clang's signature, so tiko writes it.
+    params = re.sub(r'\balign \d+ dead_on_return\b', '', params)
     params = re.sub(r'\b(noundef|dead_on_unwind|writable|signext|zeroext)\b', '', params)
     params = re.sub(r'%[\w.$"]+', '', params)       # parameter names of a definition
     params = re.sub(r'\s+', ' ', params)

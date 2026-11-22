@@ -124,6 +124,9 @@ public enum
     TKM_DROPFILES            ' files dropped from the OS: m->text = their paths, LF-separated (UTF-8),
                              ' m->nStart = how many, m->x / y = the drop point; BUBBLES if refused
     TKM_DROPTEXT             ' text dropped from the OS: m->text, m->x / y; BUBBLES if refused
+    TKM_CONTEXTMENU          ' to a CONTEXT-MENU COMPONENT (tkWidget_SetContextMenu): m->pOther = the widget
+                             ' it opens for, m->x / y = where, in the surface's window pixels; m->bFlag =
+                             ' from the keyboard (the Menu key, Shift+F10)
 end enum
 
 public enum
@@ -160,6 +163,10 @@ end enum
 
 public type TK_HOST as TK_HOST_
 public type TK_WIDGET as TK_WIDGET_
+
+' A widget's mouse-move watcher (tkWidget_SetMouseMoveCallback): x, y in pixels from w's top-left,
+' buttons SDL's button mask, mods SDL's modifier keys.
+public type TK_MouseMoveSub as sub( byval w as TK_WIDGET ptr, byval x as long, byval y as long, byval buttons as long, byval mods as long )
 
 public type TK_MSG
     msg      as long
@@ -207,6 +214,7 @@ public type TK_WIDGET_
     isEnabled     as boolean = true
     isVisible     as boolean = true
     isFocusable   as boolean = false
+    nTabIndex     as long = 0           ' its place among its siblings in Tab order; 0 = none (tree order, after)
     bClipChildren as boolean = true
     bWantsText    as boolean = false    ' focus here starts SDL text input (and the IME)
     cursor        as long = TK_CURSOR_ARROW
@@ -215,6 +223,8 @@ public type TK_WIDGET_
     ' tkTheme's, opaque here: one plain (callocate'd) block each, freed by tkWidget_Destroy.
     pThemeScope   as any ptr            ' a theme for this subtree (tkTheme_ApplyTo); 0 = inherit
     pColorRecipe  as any ptr            ' per-field colour overrides (tkTheme_SetRecipe)
+    pContextMenu  as TK_WIDGET ptr      ' the component that is this widget's right-click menu, 0 = none
+    pOnMouseMove  as TK_MouseMoveSub    ' told of moves over it, and over descendants with none of their own
 end type
 
 public type TK_FONT
@@ -406,33 +416,102 @@ private sub SizeFont( byval h as TK_HOST ptr, byval f as TTF_Font ptr, byval pt 
     TTF_SetFontSizeDPI( f, pt, dpi, dpi )
 end sub
 
-' FONTS FROM MEMORY. A program that carries its fonts inside itself ('#embed') registers each under
-' a name, and every font tkHost, tkApp and tkCodeEdit open takes that name where it takes a file
-' path -- exactly that name, nothing derived from it. The convention is "mem:<file name>", so
-' tkApp's FontDir = "mem:" finds them by their usual file names. The bytes stay the caller's: they
-' must outlive every font opened from them (an '#embed' array lives as long as the program).
-dim shared as string gMemFontName()
-dim shared as const any ptr gMemFontData()
-dim shared as integer gMemFontSize()
+' RESOURCES: fonts and images known by a name. A program that carries them inside itself ('#embed')
+' registers each one's bytes; one that ships them beside itself registers each one's file. Every font
+' tkHost, tkApp and tkCodeEdit open, and every image tkImage, tkButton and tkForm_SetIcon load
+' (tkHost_LoadSurface), takes a registered name where it takes a file path -- exactly that name,
+' nothing derived from it. The conventions: "mem:<file name>" for a theme's fonts (tkApp's
+' FontDir = "mem:" finds them by their usual file names), "res:<Name>" for a project's resources
+' (the Form Designer's Resource Center). Bytes stay the caller's: they must outlive every font
+' opened from them (an '#embed' array lives as long as the program).
+dim shared as string gResName()
+dim shared as const any ptr gResData()
+dim shared as integer gResSize()
+dim shared as string gResFile()
 
-public sub tkHost_AddFontData( byref name_ as string, byval pData as const any ptr, byval nBytes as integer )
-    dim as long n = ubound( gMemFontName ) + 1
-    for i as long = 0 to n - 1
-        if gMemFontName(i) = name_ then
-            gMemFontData(i) = pData : gMemFontSize(i) = nBytes
-            return
-        end if
+private function ResIndex_( byref name_ as string ) as long
+    for i as long = 0 to ubound( gResName )
+        if gResName(i) = name_ then return i
     next
-    redim preserve gMemFontName( 0 to n ) : redim preserve gMemFontData( 0 to n ) : redim preserve gMemFontSize( 0 to n )
-    gMemFontName(n) = name_ : gMemFontData(n) = pData : gMemFontSize(n) = nBytes
+    return -1
+end function
+
+private function ResSlot_( byref name_ as string ) as long
+    dim as long k = ResIndex_( name_ )
+    if k >= 0 then return k
+    k = ubound( gResName ) + 1
+    redim preserve gResName( 0 to k ) : redim preserve gResData( 0 to k )
+    redim preserve gResSize( 0 to k ) : redim preserve gResFile( 0 to k )
+    gResName(k) = name_
+    return k
+end function
+
+' 'name_' stands for these bytes (registered again, it is replaced).
+public sub tkHost_AddResourceData( byref name_ as string, byval pData as const any ptr, byval nBytes as integer )
+    dim as long k = ResSlot_( name_ )
+    gResData(k) = pData : gResSize(k) = nBytes : gResFile(k) = ""
 end sub
 
-' TRUE when 'name_' was registered: a font open takes it as a font that is there.
+' 'name_' stands for this file (registered again, it is replaced).
+public sub tkHost_AddResourceFile( byref name_ as string, byref file as ustring )
+    dim as long k = ResSlot_( name_ )
+    gResData(k) = 0 : gResSize(k) = 0 : gResFile(k) = file
+end sub
+
+' 'name_' no longer stands for anything. A font already opened from it stays as it is.
+public sub tkHost_RemoveResource( byref name_ as string )
+    dim as long k = ResIndex_( name_ ), n = ubound( gResName )
+    if k < 0 then exit sub
+    if k < n then
+        gResName(k) = gResName(n) : gResData(k) = gResData(n)
+        gResSize(k) = gResSize(n) : gResFile(k) = gResFile(n)
+    end if
+    if n = 0 then
+        erase gResName, gResData, gResSize, gResFile
+    else
+        redim preserve gResName( 0 to n - 1 ) : redim preserve gResData( 0 to n - 1 )
+        redim preserve gResSize( 0 to n - 1 ) : redim preserve gResFile( 0 to n - 1 )
+    end if
+end sub
+
+' TRUE when 'name_' stands for something there: bytes, or a file that exists.
+public function tkHost_HasResource( byref name_ as string ) as boolean
+    dim as long k = ResIndex_( name_ )
+    if k < 0 then return false
+    if gResData(k) then return true
+    if len( gResFile(k) ) = 0 then return false
+    return SDL_GetPathInfo( strptr( gResFile(k) ), 0 )
+end function
+
+' The file a registered name stands for ("" for bytes, or a name not registered).
+public function tkHost_ResourceFile( byref name_ as string ) as string
+    dim as long k = ResIndex_( name_ )
+    if k < 0 then return ""
+    return gResFile(k)
+end function
+
+' A font's bytes under a name (tkHost_AddResourceData, by its older name).
+public sub tkHost_AddFontData( byref name_ as string, byval pData as const any ptr, byval nBytes as integer )
+    tkHost_AddResourceData( name_, pData, nBytes )
+end sub
+
+' TRUE when 'name_' was registered and is there: a font open takes it as a font that is there.
 public function tkHost_HasFontData( byref name_ as string ) as boolean
-    for i as long = 0 to ubound( gMemFontName )
-        if gMemFontName(i) = name_ then return true
-    next
-    return false
+    return tkHost_HasResource( name_ )
+end function
+
+' An image as a surface, from a registered name's bytes or file, or else from 'path' as a file:
+' every format SDL_image reads. 0 when there is nothing to read, or it is not an image.
+public function tkHost_LoadSurface( byref path as ustring ) as SDL_Surface ptr
+    if len( path ) = 0 then return 0
+    dim as string p8 = path
+    dim as long k = ResIndex_( p8 )
+    if k >= 0 then
+        if gResData(k) then return IMG_Load_IO( SDL_IOFromConstMem( gResData(k), gResSize(k) ), true )
+        p8 = gResFile(k)
+        if len( p8 ) = 0 then return 0
+    end if
+    return IMG_Load( strptr( p8 ) )
 end function
 
 ' A font file or a registered name, at 'pt' points (unscaled) and face 'face' of a collection.
@@ -440,13 +519,12 @@ end function
 public function tkHost_OpenFontFace( byref path as string, byval pt as single, byval face as long ) as TTF_Font ptr
     dim as SDL_PropertiesID props = SDL_CreateProperties()
     if props = 0 then return 0
-    dim as long k = -1
-    for i as long = 0 to ubound( gMemFontName )
-        if gMemFontName(i) = path then k = i : exit for
-    next
-    if k >= 0 then
-        SDL_SetPointerProperty( props, TTF_PROP_FONT_CREATE_IOSTREAM_POINTER, SDL_IOFromConstMem( gMemFontData(k), gMemFontSize(k) ) )
+    dim as long k = ResIndex_( path )
+    if (k >= 0) andalso (gResData(k) <> 0) then
+        SDL_SetPointerProperty( props, TTF_PROP_FONT_CREATE_IOSTREAM_POINTER, SDL_IOFromConstMem( gResData(k), gResSize(k) ) )
         SDL_SetBooleanProperty( props, TTF_PROP_FONT_CREATE_IOSTREAM_AUTOCLOSE_BOOLEAN, true )
+    elseif k >= 0 then
+        SDL_SetStringProperty( props, TTF_PROP_FONT_CREATE_FILENAME_STRING, strptr( gResFile(k) ) )
     else
         SDL_SetStringProperty( props, TTF_PROP_FONT_CREATE_FILENAME_STRING, strptr( path ) )
     end if
@@ -521,6 +599,12 @@ public function tkHost_Create( byref title as ustring, byval w as long, byval hg
     return h
 end function
 
+' Is h's window always on top? A window that belongs to one has to be too, or it opens BEHIND it
+' (Windows: a menu's drop-down under an always-on-top form, a message box under its owner).
+private function OnTop_( byval h as TK_HOST ptr ) as boolean
+    return (h <> 0) andalso (h->win <> 0) andalso ((SDL_GetWindowFlags( h->win ) and SDL_WINDOW_ALWAYS_ON_TOP) <> 0)
+end function
+
 ' A popup (TK_SURF_POPUP) or tooltip (TK_SURF_TOOLTIP) window of `owner`. x, y, w, h are OWNER
 ' window pixels; see tkHost_PlacePopup to compute them against an anchor. It is created
 ' hidden and EMPTY: add widgets to it, then tkHost_Show. Wayland cannot re-show an unmapped
@@ -536,6 +620,7 @@ public function tkHost_CreatePopup( byval owner as TK_HOST ptr, byval x as long,
     h->clrBack = owner->clrBack
     dim as Uint64 fl = SDL_WINDOW_HIGH_PIXEL_DENSITY or SDL_WINDOW_HIDDEN or extraFlags
     fl or= iif( kind = TK_SURF_TOOLTIP, SDL_WINDOW_TOOLTIP, SDL_WINDOW_POPUP_MENU )
+    if OnTop_( owner ) then fl or= SDL_WINDOW_ALWAYS_ON_TOP
     dim as single d = owner->fDensity
     h->win = SDL_CreatePopupWindow( owner->win, cint( x / d ), cint( y / d ), cint( w / d ), cint( hgt / d ), fl )
     if h->win = 0 then
@@ -567,6 +652,7 @@ public function tkHost_CreateDialog( byval owner as TK_HOST ptr, byref title as 
     if h->win = 0 then delete h : return 0
     if owner then
         SDL_SetWindowParent( h->win, owner->win )
+        if OnTop_( owner ) then SDL_SetWindowAlwaysOnTop( h->win, true )
         ' centre over the owner
         dim as long ox, oy, ow, oh
         SDL_GetWindowPosition( owner->win, @ox, @oy )
@@ -948,6 +1034,74 @@ public sub tkWidget_Show( byval w as TK_WIDGET ptr, byval bShow as boolean )
     tkWidget_Invalidate( w )
 end sub
 
+' ---- context menus: a component (tkContextMenu) a right-click or the Menu key opens. The
+' ---- release of the right button over w, or over anything inside it, goes to the component as
+' ---- TKM_CONTEXTMENU INSTEAD of to the control, so it replaces a control's own menu. --------
+public sub tkWidget_SetContextMenu( byval w as TK_WIDGET ptr, byval hMenu as TK_WIDGET ptr )
+    if w = 0 then exit sub
+    if (hMenu <> 0) andalso (hMenu->pHost <> w->pHost) then exit sub   ' one surface: it shows there
+    w->pContextMenu = hMenu
+end sub
+
+public function tkWidget_GetContextMenu( byval w as TK_WIDGET ptr ) as TK_WIDGET ptr
+    return iif( w <> 0, w->pContextMenu, cast( TK_WIDGET ptr, 0 ) )
+end function
+
+private sub ClearMenuRefs_( byval w as TK_WIDGET ptr, byval hMenu as TK_WIDGET ptr )
+    if w->pContextMenu = hMenu then w->pContextMenu = 0
+    dim as TK_WIDGET ptr k = w->pFirst
+    while k
+        ClearMenuRefs_( k, hMenu )
+        k = k->pNext
+    wend
+end sub
+
+' Every widget of hMenu's surface that has it as its context menu has none: a component calls this
+' as it goes, so nothing is left pointing at it.
+public sub tkWidget_ClearContextMenuRefs( byval hMenu as TK_WIDGET ptr )
+    if (hMenu = 0) orelse (hMenu->pHost = 0) then exit sub
+    dim as TK_WIDGET ptr r = tkHost_Root( hMenu->pHost )
+    if r then ClearMenuRefs_( r, hMenu )
+end sub
+
+' The first widget from w up its parents with a context menu, 0 for none. A disabled one on the way
+' stops the search, as it would have swallowed the click.
+private function ContextOwner_( byval w as TK_WIDGET ptr ) as TK_WIDGET ptr
+    while w
+        if tkWidget_IsEnabled( w ) = false then return 0
+        if w->pContextMenu then return w
+        w = w->pParent
+    wend
+    return 0
+end function
+
+private sub SendContextMenu_( byval owner as TK_WIDGET ptr, byval x as single, byval y as single, byval bKeyboard as boolean )
+    dim as TK_MSG m
+    m.msg = TKM_CONTEXTMENU
+    m.pOther = owner
+    m.x = x
+    m.y = y
+    m.bFlag = bKeyboard
+    tkWidget_Send( owner->pContextMenu, @m )
+end sub
+
+' Watches the mouse moving over w: over w itself, and over any descendant that has no watcher of
+' its own (the nearest one with a watcher is told). Independent of w's own proc; 0 clears it.
+public sub tkWidget_SetMouseMoveCallback( byval w as TK_WIDGET ptr, byval cb as TK_MouseMoveSub )
+    if w then w->pOnMouseMove = cb
+end sub
+
+' The nearest of w and its ancestors that watches the mouse is told of a move at window pixels px, py.
+private sub NotifyMouseMove_( byval w as TK_WIDGET ptr, byval px as single, byval py as single, byval buttons as long )
+    while (w <> 0) andalso (w->pOnMouseMove = 0)
+        w = w->pParent
+    wend
+    if w = 0 then exit sub
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    w->pOnMouseMove( w, cint( px - a.left ), cint( py - a.top ), buttons, clng( SDL_GetModState( ) ) )
+end sub
+
 public sub tkWidget_SetCursor( byval w as TK_WIDGET ptr, byval cursor as long )
     if w then w->cursor = cursor
 end sub
@@ -1278,16 +1432,54 @@ public function tkHost_CurrentCursor() as long
 end function
 
 ' Tab order = tree pre-order over focusable, enabled, visible widgets.
+' Tab order: a widget's children by their tab index (tkWidget_SetTabIndex), those without one after
+' them in tree (z) order; each child's own children right after it.
 private sub CollectFocusable( byval w as TK_WIDGET ptr, list() as TK_WIDGET ptr, byref n as long )
+    dim as TK_WIDGET ptr kids()
+    dim as long nk = 0
     dim as TK_WIDGET ptr c = w->pFirst
     while c
+        nk += 1
+        c = c->pNext
+    wend
+    if nk = 0 then exit sub
+    redim kids( 0 to nk - 1 )
+    nk = 0
+    c = w->pFirst
+    while c
+        kids( nk ) = c : nk += 1
+        c = c->pNext
+    wend
+    ' stable: an insertion sort on (the index, or none last)
+    for i as long = 1 to nk - 1
+        dim as TK_WIDGET ptr k = kids( i )
+        dim as long kk = iif( k->nTabIndex > 0, k->nTabIndex, &h7FFFFFFF ), j = i - 1
+        while (j >= 0) andalso (iif( kids( j )->nTabIndex > 0, kids( j )->nTabIndex, &h7FFFFFFF ) > kk)
+            kids( j + 1 ) = kids( j )
+            j -= 1
+        wend
+        kids( j + 1 ) = k
+    next
+    for i as long = 0 to nk - 1
+        c = kids( i )
         if c->isVisible andalso c->isEnabled then
             if c->isFocusable andalso (n <= ubound( list )) then list(n) = c : n += 1
             CollectFocusable( c, list(), n )
         end if
-        c = c->pNext
-    wend
+    next
 end sub
+
+' A widget's place among its siblings in Tab order (1 first); 0 takes it out of the numbering, after
+' the numbered ones in tree order. Its own focusable children follow it either way.
+public sub tkWidget_SetTabIndex( byval w as TK_WIDGET ptr, byval nIndex as long )
+    if w = 0 then exit sub
+    w->nTabIndex = iif( nIndex < 0, 0, nIndex )
+end sub
+
+public function tkWidget_GetTabIndex( byval w as TK_WIDGET ptr ) as long
+    if w = 0 then return 0
+    return w->nTabIndex
+end function
 
 public sub tkHost_FocusNext( byval h as TK_HOST ptr, byval bBack as boolean = false )
     if h = 0 then exit sub
@@ -1422,6 +1614,17 @@ private sub DispatchKey( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
     if (m.msg = TKM_KEYDOWN) andalso (h->OnPreKey <> 0) then
         if h->OnPreKey( h, @m ) then exit sub
     end if
+    ' the Menu key or Shift+F10 opens the focused widget's context menu (its own or a parent's),
+    ' below it, before the control itself would open one
+    if (m.msg = TKM_KEYDOWN) andalso ((m.key = SDLK_APPLICATION) orelse ((m.key = SDLK_F10) andalso ((m.mods and SDL_KMOD_SHIFT) <> 0))) then
+        dim as TK_WIDGET ptr owner = ContextOwner_( h->pFocus )
+        if owner then
+            dim as TKRECT a
+            tkWidget_AbsRect( h->pFocus, a )
+            SendContextMenu_( owner, a.left, a.bottom, true )
+            exit sub
+        end if
+    end if
     ' to the focused widget, bubbling up the parents while refused
     dim as TK_WIDGET ptr w = h->pFocus
     while w
@@ -1526,6 +1729,13 @@ private sub DispatchTo( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
             SetHot( h, w )
             if w andalso tkWidget_IsEnabled( w ) then SendMouse( w, TKM_MOUSEMOVE, px, py )
         end if
+        ' the watchers, after the widget itself; looked up again, since the delivery may have
+        ' destroyed what was there (a disabled widget still passes the move on to its parents)
+        if h->pCapture then
+            NotifyMouseMove_( h->pCapture, px, py, clng( e->motion.state ) )
+        else
+            NotifyMouseMove_( tkHost_HitTest( h, px, py ), px, py, clng( e->motion.state ) )
+        end if
         SyncCursor( h )
 
     case SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP
@@ -1556,7 +1766,17 @@ private sub DispatchTo( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
             h->pLastDown = w
         end if
         ' A disabled widget swallows the click: it reaches neither it nor anything beneath.
-        if w andalso tkWidget_IsEnabled( w ) then SendMouse( w, msg, px, py, clicks )
+        if w andalso tkWidget_IsEnabled( w ) then
+            ' the right button's release over a widget with a context menu (its own or a parent's)
+            ' opens that menu instead of reaching the control
+            dim as TK_WIDGET ptr owner = 0
+            if (msg = TKM_RBUTTONUP) andalso (h->pCapture = 0) then owner = ContextOwner_( w )
+            if owner then
+                SendContextMenu_( owner, px, py, false )
+            else
+                SendMouse( w, msg, px, py, clicks )
+            end if
+        end if
         SyncCursor( h )
 
     case SDL_EVENT_MOUSE_WHEEL
@@ -1774,7 +1994,15 @@ public function tkHost_RunModal( byval dlg as TK_HOST ptr ) as long
         RenderDirty()
     wend
     dim as long r = dlg->nModalResult
-    if dlg->pOwner then dlg->pOwner->bDirty = true
+    ' Hand activation back to the owner WHILE the dialog is still shown, as EndDialog does:
+    ' re-enable it, then activate it. Hiding the active dialog first lets the OS activate the
+    ' next window in z-order -- often another application's -- and the owner, still disabled
+    ' or merely behind, never gets it back.
+    if dlg->pOwner then
+        SDL_SetWindowModal( dlg->win, false )
+        if (SDL_GetWindowFlags( dlg->pOwner->win ) and SDL_WINDOW_HIDDEN) = 0 then SDL_RaiseWindow( dlg->pOwner->win )
+        dlg->pOwner->bDirty = true
+    end if
     return r
 end function
 

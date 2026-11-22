@@ -6,7 +6,7 @@ The reference is the official **fbc 1.20.0**, built from FreeBASIC's master bran
 
 The **diagnostic text** is tiko's own. Every message has a stable `TKOnnnn` id. fbc's error numbers survive only where a program can see them, through `ERR`.
 
-**What fbc 1.20 does not have is not a compatibility difference.** Generics, tuples, collection initializers, `defer`, lambdas, `ustring`, the fixed-width type names, `nullptr`, string slices (`s[lo to hi]`, `uslice`), typed variadic parameters (`xs() as const long ...`, fbc error 7), the C layout of `type T extern "c"` (fbc error 17), `spawn` and channels, `#cinclude` and `#import` are tiko's own. Code that uses them does not compile under fbc 1.20. `dim a as int8` is fbc error 14, and `defer x` is error 42. The [Feature Index](Feature-Index) lists them. This page is about the code that both compilers accept, or one of them should.
+**What fbc 1.20 does not have is not a compatibility difference.** Generics, tuples, collection initializers, `defer`, lambdas, `ustring`, the fixed-width type names, `nullptr`, string slices (`s[lo to hi]`, `uslice`), `match`, typed variadic parameters (`xs() as const long ...`, fbc error 7), the C layout of `type T extern "c"` (fbc error 17), `spawn` and channels, `#cinclude` and `#import` are tiko's own. Code that uses them does not compile under fbc 1.20. `dim a as int8` is fbc error 14, and `defer x` is error 42. The [Feature Index](Feature-Index) lists them. This page is about the code that both compilers accept, or one of them should.
 
 ## What does not compile under tiko
 
@@ -26,9 +26,13 @@ Each of these is a diagnostic, not a silent difference:
 
 **tiko defines `__TIKO_COMPILER__`, always `1`,** and fbc does not, so `#ifdef __TIKO_COMPILER__` is how a source tree asks "is this tiko?". `__TIKO_VERSION__` gives tiko's version (`0.1.0-dev`), and fbc has no such name. See [`__TIKO_COMPILER__`](Category-Tiko-Compiler-Define).
 
-**tiko declares ten fixed-width type names that fbc does not have:** `int8`, `uint8`, `int16`, `uint16`, `int32`, `uint32`, `int64`, `uint64`, `float32` and `float64`, typedefs for `byte` through `double`. They are not keywords. A program's own declaration of one of the names replaces tiko's with no diagnostic, so code that already uses them compiles and prints the same under both compilers: `win/basetsd.bi`'s `type INT32 as long`, a `type uint8 as integer`, a variable called `float32`. See [Fixed-Width Types](Category-Fixed-Width-Types).
+**tiko declares twelve fixed-width type names that fbc does not have:** `int8`, `uint8`, `int16`, `uint16`, `int32`, `uint32`, `int64`, `uint64`, `float32` and `float64`, typedefs for `byte` through `double`, and `int128` and `uint128`, 128-bit integer types of tiko's own. They are not keywords. A program's own declaration of one of the names replaces tiko's with no diagnostic, so code that already uses them compiles and prints the same under both compilers: `win/basetsd.bi`'s `type INT32 as long`, a `type uint8 as integer`, a variable called `float32`. See [Fixed-Width Types](Category-Fixed-Width-Types).
+
+**An integer literal past 64 bits with no suffix is a 128-bit integer in tiko.** fbc truncates it with warning 8, "Literal number too big, truncated": `print 18446744073709551616` prints `18446744073709551615` under fbc and `18446744073709551616` under tiko, which warns only past 128 bits (`TKO0205`). With an `LL` or `ULL` suffix the literal is 64 bits in both, truncated with the warning. In `#if`, tiko refuses such a literal (`TKO0308`) rather than truncating it. See [Fixed-Width Types](Category-Fixed-Width-Types#128-bit-integers).
 
 **tiko predeclares `nullptr`, which fbc does not have:** `const nullptr as any ptr = 0`. It is not a keyword. A program's own declaration of the name replaces tiko's with no diagnostic, whether it is a field, a namespace member, a local, a parameter, a `for` counter or a module-level name, so code that already uses it compiles and runs the same under both compilers. fbc's own `virtual/fbrtti.bi` has a field called `nullptr`. Code that uses tiko's `nullptr` needs `const nullptr as any ptr = 0` under `#ifndef __TIKO_COMPILER__` to compile under fbc. A generic infers its type argument from a pointer-typed constant in tiko (`Echo( nullptr )` makes `T` an `any ptr`). See [Nullptr](Category-Nullptr).
+
+**`match` is a contextual keyword in tiko and an ordinary name in fbc.** It is the keyword only when a subject follows it to the end of the line, the next line is an arm (`case …`, or `… => …`), and an `end match` closes it. Every way fbc uses it as a name keeps its meaning under tiko, measured with fbc 1.10.1: a variable (`match = 3`), a sub called paren-less (`match 10`, also inside a `select case` arm followed by `case`), a function (`match( 21 )`), a label, and `end match` as `END` with an exit code. Where the keyword applies, fbc has no such construct: `r = match code` is fbc error 3, "Expected End-of-Line". See [Match](Category-Match).
 
 **`defer` is a contextual keyword in tiko and an ordinary name in fbc 1.20.** It is the keyword only when a name, a keyword other than `as`, or the end of the statement follows. Everywhere else it stays usable as an identifier, and both compilers agree: a sub named `defer` is CALLED by `defer( 5 )`, `defer 5` and `defer -1`, and an array or a UDT named `defer` is used as one (`defer( 1 ) = 3`, `defer.field_ = 4`). Where the keyword applies, fbc 1.20 has no such statement:
 - `defer print "out"` runs at the end of the scope under tiko. fbc says error 42, "Variable not declared".
@@ -74,11 +78,13 @@ The constructor case is the one form fbc leaves out. Both compilers accept the s
 
 Across the vendored fbc suite, every line tiko gives `TKO0968` (22) or `TKO0970` (24) is one where fbc gives warning 5 or warning 2.
 
-**A linux-x86_64 program that links a shared library from `#foreignlib` gets a run path of `$ORIGIN`.** fbc writes none, so its program finds a `.so` beside it only through `LD_LIBRARY_PATH`; tiko's finds it there, and `LD_LIBRARY_PATH` still wins. A program that links no shared library from `#foreignlib` is linked exactly as before, and `-norpath` turns the run path off. See [Vendor Packages](Vendor-Packages).
+**A Linux program that links a shared library from `#foreignlib` gets a run path of `$ORIGIN`.** fbc writes none, so its program finds a `.so` beside it only through `LD_LIBRARY_PATH`; tiko's finds it there, and `LD_LIBRARY_PATH` still wins. A program that links no shared library from `#foreignlib` is linked exactly as before, and `-norpath` turns the run path off. See [Vendor Packages](Vendor-Packages).
 
-**Graphics links on `windows-x86_64` only.** libtkogfx is built for that ABI alone.
+**Graphics works on all four targets.** libtkogfx, tiko's graphics library, ships for `windows-x86_64`, `linux-x86_64`, `linux-arm64` and `macos-arm64`, so a `SCREEN` / `PSET` program builds and runs unchanged on each. On Windows it draws through GDI. On Linux it uses X11, loaded when a window opens: libtkogfx loads libX11 (and libXext, libXrandr if present) at run time, so the program links with no X11 library and needs an X display (XWayland included) only to open its window. On macOS it uses Cocoa, reached through the Objective-C runtime: a program that opens a window runs its `main( )` on a thread of its own while AppKit keeps the main thread. On every target, `GFX_NULL` or `FBGFX=null` draws with no window at all. fbc's OpenGL driver and Linux framebuffer (`FBDev`) driver are not provided.
 
-**`macos-arm64` is a tiko target, named `-target macos-arm64`.** `-target darwin` is refused (`TKO0103`). It defines `__FB_DARWIN__`, `__FB_UNIX__`, `__FB_ARM__` and `__FB_64BIT__`, and not `__FB_X86__`, so code under `#ifdef __FB_X86__` is left out there. `WSTRING` is 4 bytes, as on Linux. There is no graphics library.
+**`macos-arm64` is a tiko target, named `-target macos-arm64`.** `-target darwin` is refused (`TKO0103`). It defines `__FB_DARWIN__`, `__FB_UNIX__`, `__FB_ARM__` and `__FB_64BIT__`, and not `__FB_X86__`, so code under `#ifdef __FB_X86__` is left out there. `WSTRING` is 4 bytes, as on Linux. Graphics draws through Cocoa (above).
+
+**`linux-arm64` is a tiko target, named `-target linux-arm64`**, the default on aarch64 Linux. It defines `__FB_LINUX__`, `__FB_UNIX__`, `__FB_ARM__` and `__FB_64BIT__`, and not `__FB_X86__` or `__FB_ASM__`. It follows Linux's generic AAPCS64 ABI, not Apple's: C `long` is 8 bytes, `WSTRING` is 4 bytes, and `cva_list` is 32 bytes. Graphics draws through X11, as on x86-64 Linux (above).
 
 **`#pragma msbitfields` is accepted and does nothing.** In fbc 1.20 it stops a bitfield from sharing a unit with the ordinary field before it: `short s : 4, byte c, long i : 7` is 8 bytes with `i` at bit 32, where both compilers say 4 bytes and bit 24 without it. tiko keeps the 4-byte layout under the pragma. It is not MSVC's rule either -- fbc still packs `byte a : 3, long b : 5` into one byte, where MSVC uses 8 -- and `type T extern "c"` is how tiko lays a type out as C does.
 
@@ -92,7 +98,7 @@ Across the vendored fbc suite, every line tiko gives `TKO0968` (22) or `TKO0970`
 ## How it is verified
 
 - fbc's own test corpus is vendored (2,709 `.bas` files) and run differentially: programs, fbcunit suites and the test sources are each built by both compilers and compared.
-- tiko compiles itself to a byte-identical fixpoint on windows-x86_64, linux-x86_64 and macos-arm64.
+- tiko compiles itself to a byte-identical fixpoint on windows-x86_64, linux-x86_64, linux-arm64 and macos-arm64.
 
 ## Licensing
 

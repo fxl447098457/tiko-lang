@@ -1,6 +1,7 @@
 '' toolchain.tiko -- see the header.
 
 #import "std/containers"
+#import "std/fs"
 #include once "codegen/toolchain.ti"
 
 namespace Tko.Codegen
@@ -139,6 +140,31 @@ function FindTools _
         if FileExists_( toolDir & "llvm-rc-" & ver & EXE_ ) then t.rcExe = toolDir & "llvm-rc-" & ver & EXE_
         if FileExists_( toolDir & "llvm-dlltool-" & ver & EXE_ ) then t.dlltoolExe = toolDir & "llvm-dlltool-" & ver & EXE_
     end if
+    '' COMPILER-RT'S BUILTINS (ToolPaths.rtBuiltinsLib), from '<llvm>\lib\clang\<major>\lib\windows' --
+    '' the directory 'clang --rtlib=compiler-rt -print-libgcc-file-name' names
+    '' for the msvc triple (clang 23, 2026-11-19), found by looking rather than by running
+    '' clang once more per build.
+    #ifdef __FB_WIN32__
+        dim as string resRoot = toolDir & "..\lib\clang\"
+        dim as string sub_ = dir( resRoot & "*", &h10 )
+        while len( sub_ ) > 0
+            if (sub_ <> ".") andalso (sub_ <> "..") then
+                dim as string cand = resRoot & sub_ & "\lib\windows\clang_rt.builtins-x86_64.lib"
+                '' FORWARD SLASHES: a long link goes through a response file, which reads a
+                '' backslash as an escape (driver/link-response-file).
+                if FileExists_( cand ) then
+                    for ci as int32 = 0 to len( cand ) - 1
+                        if cand[ci] = asc( "\" ) then cand[ci] = asc( "/" )
+                    next
+                    t.rtBuiltinsLib = cand
+                    dim as string adir = left( cand, instrrev( cand, "/" ) )
+                    if FileExists_( adir & "clang_rt.asan_dynamic-x86_64.dll" ) andalso _
+                       FileExists_( adir & "clang_rt.asan_dynamic_runtime_thunk-x86_64.lib" ) then t.asanRtDir = adir
+                end if
+            end if
+            sub_ = dir( )
+        wend
+    #endif
     '' TIKO_AR, WHEN SET, IS THE ARCHIVER -- as it already is to build/toolchain.sh, vendorfetch.sh
     '' and the runtime's build, which CI sets it for. Not second-guessed, as TIKO_CLANG is not.
     if len( environ( "TIKO_AR" ) ) > 0 then t.arExe = environ( "TIKO_AR" )
@@ -208,30 +234,24 @@ end function
 '' LLVM. A one-static module in the retainedNodes form is compiled back to IR; the
 '' DIGlobalVariable survives only where that form is the accepted one. The driver asks
 '' once per compilation, and only for a '-g' build with a static local in it.
-private function ProbeTempDir_( ) as string
-    dim as string d = environ( "TMPDIR" )
-    if len( d ) = 0 then d = environ( "TEMP" )
-    if len( d ) = 0 then d = environ( "TMP" )
-    #ifdef __FB_WIN32__
-        if len( d ) = 0 then d = "."
-    #else
-        if len( d ) = 0 then d = "/tmp"
-    #endif
-    while (len( d ) > 1) andalso ((right( d, 1 ) = "/") orelse (right( d, 1 ) = "\"))
-        d = left( d, len( d ) - 1 )
-    wend
-    return d
-end function
-
 function DebugStaticsInSubprogram( byref triple as string ) as boolean
     dim as boolean wants = false
     dim as string clang_ = FoundClang( )
     if len( clang_ ) = 0 then return false
     dim as string nl = chr( 10 )
-    dim as string base_ = ProbeTempDir_( ) & "/tiko-diprobe-" & hex( cast( ulong, timer * 1000 ) )
-    dim as string src_ = base_ & ".ll", out_ = base_ & ".out.ll"
+    '' IN A DIRECTORY OF ITS OWN: CreateTempDir makes it exclusively, under a random name,
+    '' and only its owner can write in it. The files were '/tmp/tiko-diprobe-<ms>.ll' and
+    '' clang's '.out.ll' beside it -- a name another user could guess and plant a symlink
+    '' at (security review, Nov 2026).
+    dim as fs.FsResultUStr td = fs.CreateTempDir( "tiko-diprobe" )
+    if td.IsOk( ) = false then return false
+    dim as string dir_ = td.Value( )
+    dim as string src_ = dir_ & "/p.ll", out_ = dir_ & "/p.out.ll"
     dim as int32 fh = freefile
-    if open( src_ for output as #fh ) <> 0 then return false
+    if open( src_ for output as #fh ) <> 0 then
+        fs.RemoveDirAll( dir_ )
+        return false
+    end if
     print #fh, "@f.x = internal global i32 0, align 4, !dbg !0" & nl & _
                "define i32 @f() !dbg !2 {" & nl & _
                "  %v = load i32, ptr @f.x, align 4" & nl & _
@@ -267,8 +287,7 @@ function DebugStaticsInSubprogram( byref triple as string ) as boolean
             close #fh
         end if
     end if
-    kill src_
-    kill out_
+    fs.RemoveDirAll( dir_ )
     return wants
 end function
 
@@ -391,6 +410,22 @@ function ArchiveLib _
     return Exec_( t, t.arExe, cmd )
 end function
 
+'' -fsanitize=address's compile half. The IR's 'sanitize_address' attributes are what clang
+'' instruments; the flag runs the pass. 'use-after-return=always' gives every frame a fake stack,
+'' so a returned local's address is caught -- except in a function holding inline asm (tiko's
+'' x86-64 division by a variable), where ASan turns that part off.
+sub RequireAsanRuntime( byref t as ToolPaths, byval msvc as boolean )
+    if (t.sanitizeAddress = false) orelse (msvc = false) orelse (len( t.asanRtDir ) > 0) orelse (t.found = false) then return
+    t.found = false
+    t.why = "-fsanitize=address needs clang's AddressSanitizer runtime (clang_rt.asan_dynamic-x86_64.dll and " & _
+            "clang_rt.asan_dynamic_runtime_thunk-x86_64.lib) beside clang_rt.builtins, and this LLVM has none"
+end sub
+
+private function AsanCompileFlags_( byref t as ToolPaths ) as string
+    if t.sanitizeAddress = false then return ""
+    return " -fsanitize=address -fsanitize-address-use-after-return=always"
+end function
+
 private function CompileIrArgs_ _
     ( byref t as ToolPaths, byref target as TargetDescription, _
       byref irPath as string, byref objPath as string ) as string
@@ -429,7 +464,7 @@ private function CompileIrArgs_ _
     '' '-dll': objects meant for a shared library later, as fbc's '-pic' -- measured with
     '' 'fbc -v', it reaches the same clang flag (lib/rt/build/build.sh's pic archives).
     if (t.buildDll orelse t.pic) andalso (target.objFormat <> OBJ_COFF) then cmd += " -fPIC"
-    return cmd
+    return cmd & AsanCompileFlags_( t )
 end function
 
 function CompileIr _
@@ -466,6 +501,7 @@ function CompileIrAsm _
         Q( irPath ) & " -o " & Q( asmPath )
     if (t.optLevel > 0) andalso (t.optLevel <= 3) then cmd += " -O" & t.optLevel
     if (t.buildDll orelse t.pic) andalso (target.objFormat <> OBJ_COFF) then cmd += " -fPIC"
+    cmd += AsanCompileFlags_( t )
     dim as int32 rc = Exec_( t, t.clangExe, cmd )
     if keepTemps = false then
         if rc = 0 then kill( irPath )
@@ -518,6 +554,19 @@ function LinkExe _
     dim as boolean macho = (target.objFormat = OBJ_MACHO)
     dim as string cmd = "-target " & target.triple & " -fuse-ld=lld"
     dim as boolean viaLld = true
+    '' AN EXPLICIT SYSROOT, when the environment names one (TIKO_SYSROOT). A clang.cfg
+    '' beside clang pins a --sysroot of its own, and the option it carries wins over the
+    '' driver's gcc discovery while a command-line -target wins over the cfg's --target:
+    '' measured, a cfg with 'sysroot=D:/tiko-test/mingw64' made every win32 link answer
+    '' 'unable to find -lmingw32' -- the 64-bit root has no i686 libraries. A --sysroot
+    '' HERE comes after the cfg's and wins; unset, nothing changes and the driver keeps
+    '' discovering the sysroot from the gcc on PATH, which is how the CI mingw lanes and
+    '' every stock install work. The MSVC flavor names its roots with /winsysroot and is
+    '' not touched; Mach-O has TIKO_SDKROOT below.
+    dim as string sysrootEnv = environ( "TIKO_SYSROOT" )
+    if (len( sysrootEnv ) > 0) andalso (macho = false) andalso (target.layout.isMsvc = false) then
+        cmd += " --sysroot=" & Q( sysrootEnv )
+    end if
     '' ...WHERE THERE IS ONE. Ubuntu's clang package does not carry lld, and on such a
     '' host every link died with clang's 'invalid linker name in argument
     '' -fuse-ld=lld'. Beside clang or on the system path it is used; otherwise clang
@@ -637,6 +686,9 @@ function LinkExe _
     '' ON MACH-O AT THE LINK, AND NEVER AFTER IT: ld64 signs an arm64 image ad hoc as its last
     '' step, and a 'strip' run on the result invalidates that signature. ld64's own spellings:
     '' -S drops the debug-map stabs, -x the local symbols.
+    '' -fsanitize=address ON AN ELF OR MACH-O LINK: clang's driver adds the runtime itself --
+    '' whole-archive libclang_rt.asan on Linux, the dylib and its rpaths on macOS ('clang -###').
+    if t.sanitizeAddress andalso (target.layout.isMsvc = false) then cmd += " -fsanitize=address"
     if macho then
         if t.stripSymbols then cmd += " -Wl,-S -Wl,-x"
     elseif (target.layout.isMsvc = false) andalso t.stripSymbols then
@@ -1028,6 +1080,14 @@ function LinkExe _
         cmd += " -nostdlib -lucrtbase -lkernel32"
         cmd += " -lwinspool -lgdi32 -luser32 -ladvapi32 -lwinmm -lmsimg32 -lversion -limm32 -lws2_32"
         cmd += " -Xlinker /INCLUDE:tkort_msvc_init_"
+        '' -fsanitize=address: the DYNAMIC runtime and its thunk, as clang's driver links them for
+        '' a /MD program ('clang -### -fsanitize=address -D_DLL', clang 23) -- the DLL is copied
+        '' beside the output (driver modbuild.tiko). The SEH interceptor is what reports a fault.
+        if t.sanitizeAddress andalso (len( t.asanRtDir ) > 0) then
+            cmd += " " & Q( t.asanRtDir & "clang_rt.asan_dynamic-x86_64.lib" )
+            cmd += " -Xlinker " & Q( "-wholearchive:" & t.asanRtDir & "clang_rt.asan_dynamic_runtime_thunk-x86_64.lib" )
+            cmd += " -Xlinker -include:__asan_seh_interceptor"
+        end if
     elseif target.objFormat = OBJ_COFF then
         '' THE C RUNTIME MUST COME FROM THE SAME TOOLCHAIN AS libfb, and that is not
         '' clang's default sysroot. fbc's crt2.o is built SJLJ (winlibs64-sjlj-9.3.0);
@@ -1089,6 +1149,11 @@ function LinkExe _
     for i as int32 = 0 to t.linkerOpts.Count - 1
         cmd += " -Xlinker " & Q( t.linkerOpts[i] )
     next
+    '' int128's helpers on the msvc link (ToolPaths.rtBuiltinsLib): an archive, after everything,
+    '' so it answers only what the program and libfb leave undefined.
+    if (target.objFormat = OBJ_COFF) andalso (instr( target.triple, "msvc" ) > 0) andalso (len( t.rtBuiltinsLib ) > 0) then
+        cmd += " " & Q( t.rtBuiltinsLib )
+    end if
     '' NOT LINKED WITHOUT fbrt0.o (review RT-03), but '-v' still shows the line -- the driver
     '' tests read it on hosts with no sysroot to link against.
     if rt0Missing then

@@ -417,7 +417,8 @@ private sub CaseValueKind_ _
     if vStr = false then
         select case c.types->BuiltinOf( u )
         case TY_BYTE, TY_UBYTE, TY_SHORT, TY_USHORT, TY_LONG, TY_ULONG, _
-             TY_INTEGER, TY_UINTEGER, TY_LONGINT, TY_ULONGINT, TY_SINGLE, TY_DOUBLE
+             TY_INTEGER, TY_UINTEGER, TY_LONGINT, TY_ULONGINT, TY_SINGLE, TY_DOUBLE, _
+             TY_INT128, TY_UINT128
         case else
             return
         end select
@@ -617,7 +618,8 @@ sub CheckSelectCaseKinds_ ( byref c as Ctx, byval id as NodeId )
     if subjStr = false then
         select case c.types->BuiltinOf( su )
         case TY_BYTE, TY_UBYTE, TY_SHORT, TY_USHORT, TY_LONG, TY_ULONG, _
-             TY_INTEGER, TY_UINTEGER, TY_LONGINT, TY_ULONGINT, TY_SINGLE, TY_DOUBLE
+             TY_INTEGER, TY_UINTEGER, TY_LONGINT, TY_ULONGINT, TY_SINGLE, TY_DOUBLE, _
+             TY_INT128, TY_UINT128
         case else
             return
         end select
@@ -1298,6 +1300,47 @@ sub CheckUdtCompare_ ( byref c as Ctx, byval id as NodeId )
     if (lUdt orelse rUdt) = false then return
     if c.info->RefOf( id ) <> SYMBOL_NONE then return
     if CmpOpMayApply_( c, opnm, lt, rt ) then return
+    '' A UDT AGAINST A NUMBER OR AN ENUM compares by a number from its casts -- a numeric one
+    '' or a BYREF z/wstring -- as '+ - * /' do (UdtCastOperands_). Measured on fbc-modern 1.20,
+    '' 2026-11-13: with casts to string, ustring, zstring ptr or any ptr alone, 'n = 5',
+    '' '5 <> n', 'n < i' and 'n >= 5.0' are each error 20, and so is 'n = k' for an enum k;
+    '' tiko let them through and stopped on TKO0994, the comparison never lowered. sys/win/com's
+    '' CInt96 (casts to CURRENCY, VARIANT, STRING) with its 'operator =' private was the case.
+    '' Against a POINTER a pointer cast compares, and fbc takes it.
+    if lUdt xor rUdt then
+        dim as TypeId ut = iif( lUdt, lt, rt )
+        dim as TypeId ot = iif( lUdt, rt, lt )
+        dim as boolean numSide = ((c.types->Kind( ot ) = TK_BUILTIN) orelse (c.types->Kind( ot ) = TK_ENUM)) andalso (OperandClass_( c, ot ) = 1)
+        if numSide andalso PlainUdtOperand_( c, ut ) then
+            dim as boolean uN, uS, uC
+            UdtCastKinds_( c, ut, uN, uS, uC )
+            if (uN orelse uC) = false then
+                Report0820_( c, id, opnm )
+                return
+            end if
+        end if
+        '' ...AND AGAINST A POINTER by its pointer cast, PtrCastPick's (lowering calls the same one).
+        '' Measured, same day: over 'long ptr' alone 'x = pd' (a double ptr) is 20 and 'x = pa' (any
+        '' ptr) compares; over [long ptr, double ptr] 'x = pa' is 98; with no pointer cast a numeric
+        '' one compares and a string one alone is 20.
+        if (c.types->Kind( ot ) = TK_POINTER) andalso PlainUdtOperand_( c, ut ) then
+            select case Tko.Check.PtrCastFit( *c.ast, *c.syms, *c.types, *c.names, ut, ot )
+            case 1
+                Report0820_( c, id, opnm )
+                return
+            case 2
+                c.diags->Report( TKO0660, PointRange( c.ast->Loc( id ) ), "operator cast" )
+                return
+            case -1
+                dim as boolean pN, pS, pC
+                UdtCastKinds_( c, ut, pN, pS, pC )
+                if (pN orelse pC) = false then
+                    Report0820_( c, id, opnm )
+                    return
+                end if
+            end select
+        end if
+    end if
     '' A conversion operator on the UDT may turn it into something comparable.
     if lUdt then
         if StructorOf_( c, lt, "cast" ) <> nullptr then return

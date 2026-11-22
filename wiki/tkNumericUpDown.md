@@ -13,6 +13,12 @@ the mouse wheel step too, and a button at its limit draws as disabled.
 The value-changed callback runs at once for buttons, keys and the wheel, and on commit (Enter or
 focus loss) for typed text. Every setter is silent. Read-only blocks typing but not stepping.
 
+`tkNumericUpDown_SetTooltipText` gives the control a tooltip, shown while the pointer rests on any
+part of it, the value field included; `SetHoverTime`, `SetAutoPopTime` and `SetReshowTime` set its
+delays, and `GetTooltipHandle` reaches the tkTooltip itself. The border follows the theme's
+`BorderWidth` until `SetBorderThickness` is called. A paint callback replaces the drawing; call
+`tkNumericUpDown_PaintDefault( p )` in it to draw the stock control first and add to it.
+
 ## Importing
 
 ```freebasic
@@ -48,30 +54,153 @@ tkNumericUpDown_GetIdealSize( zoom, w, h )         ' measured from both ends of 
 tkWidget_SetPos( zoom, tkHost_Scale( host, 20 ), tkHost_Scale( host, 20 ), w, h )
 ```
 
-## Coming from PsNumericUpDown
+## The value field
 
-[PsNumericUpDown](PsNumericUpDown) is the Win32 twin; its page remains the behaviour reference
-for everything not listed here.
+`tkNumericUpDown_Create( hParent, CtrlID )` makes the control as a child of `hParent` (for a
+top-level control pass `tkHost_Root( host )`); `tkNumericUpDown_GetID` returns `CtrlID`. The
+value cell is a [tkTextBox](tkTextBox) child widget: borderless, in numeric mode, centred, with an
+empty field reading as zero. `tkNumericUpDown_GetTextBoxHandle` returns it, and any `tkTextBox_*`
+setter applies to it except `SetValue`, `SetDecimalPlaces` and `SetBorderWidth` and its focus,
+Enter and message callbacks, which the spinner owns. Typing, selection, the clipboard and the
+right-click menu are the text box's own.
 
-- Names: `PsNumericUpDown_*` → `tkNumericUpDown_*`, `PSNUMERICUPDOWN_*` → `TKNUMERICUPDOWN_*`,
-  `CNUD_DEFAULT_*` → `TKNUD_DEFAULT_*`. `NUD_PART_*` and the `NUD_*Callback*` types keep their
-  names. The handle is `TK_WIDGET ptr`.
-- `tkNumericUpDown_Create( hParent, CtrlID )` takes a `TK_WIDGET ptr` parent; for a top-level
-  control pass `tkHost_Root( host )`.
-- The value cell is a [tkTextBox](tkTextBox) child widget; `tkNumericUpDown_GetTextBoxHandle`
-  returns it. Its focus, Enter and message callbacks belong to the spinner, so leave them alone.
-- Disabling the spinner (`tkNumericUpDown_SetEnabled` or `tkWidget_Enable`) disables the field
-  with it.
-- `tkNumericUpDown_HitTest( h, x, y )` takes widget pixels rather than a `POINT`.
-- `TKNUMERICUPDOWN_MESSAGEINFO` carries `msg` (a `TKM_*` code), `x`, `y`, `key`, `mods` and
-  `wheelY`. Messages relayed from the field arrive with `hCtrl` set to the spinner.
-- Fonts are `TTF_Font ptr` (`tkNumericUpDown_SetFont`); there is no glyph font, the "−" and "+"
-  are drawn as bars.
-- Colours start from the current [tkTheme](tkTheme) palette.
-- Scale changes reach the control as `TKM_SCALECHANGED`; there is no `Rescale` call.
-- No equivalent: `FilterMessage`, PsRegistry.
-- Added: `tkNumericUpDown_GetID`, `GetHotPart`, `GetPressedPart` and `IsRepeating`, for custom
-  painters.
+- The control itself is not a tab stop; the field is. `tkNumericUpDown_HasFocus` asks the field,
+  and giving the control the focus passes it to the field.
+- Arriving by Tab selects the whole number, so the first keystroke replaces it. Clicking a button
+  focuses the field without selecting it.
+- Focus recolours the frame (`FocusBorderColor`); there is no separate ring, so the size does not
+  change when focus arrives.
+- `tkNumericUpDown_SetFont` hands the font to the field; it is borrowed, so keep it alive. There
+  is no glyph font: the "−" and "+" are drawn bars. With no font set, the host's default font
+  is measured.
+
+## Value, range and stepping
+
+- Every value, whatever its route, is **snapped to the decimal grid** (half away from zero), not
+  merely rounded for display, and then **clamped** into the range. The range never wraps. The
+  default range is ±1,000,000, so an unconfigured control does not visibly clamp.
+- A step starts from what is in the field, not from the last committed value: typing `50` and
+  pressing "+" gives `51`. Typed text that is out of range is clamped on the way in.
+- `tkNumericUpDown_SetRange` swaps an inverted pair rather than rejecting it, and re-clamps the
+  value. `tkNumericUpDown_SetDecimalPlaces` floors a negative count at 0, re-snaps the value onto
+  the new grid (`16.25` at 2 places becomes `16` at 0), and at 0 places the field refuses a
+  decimal point. Set the decimal places and the range before the value: both rewrite it.
+- `SetIncrement` (buttons, arrows, one wheel notch) and `SetLargeIncrement` (Page Up/Page Down)
+  store the magnitude, so "−" always goes down. The large increment defaults to 10.
+- `tkNumericUpDown_GetValue` returns the **committed** value: while the user is typing it still
+  reports the last committed number, and so does the buttons' at-a-limit look.
+
+## Mouse and keyboard
+
+- **The step happens on the button press**, not the release, so sliding off a pressed button
+  does not undo it. A double click is two presses.
+- Holding a button repeats after the delay, then at the interval (`SetAutoRepeat`, 400 and 60 ms
+  by default). The repeat pauses when the pointer leaves the button and resumes after the full
+  delay when it comes back, and it stops dead at a limit. Either timing at or below zero turns
+  repeating off and stops a running one.
+- In the field, Up and Down step by the increment and Page Up / Page Down by the large
+  increment. Home and End are not claimed; they move the caret.
+- The wheel, over the field or a button, steps one increment per notch; partial notches
+  accumulate.
+- The right button over the buttons is reported to the message callback and never acted on.
+  `tkNumericUpDown_HitTest` reports `NUD_PART_VALUE` but the control never acts on it: the field
+  covers that cell and takes its own mouse input.
+- **Read-only** (`SetReadOnly`) blocks typing only; the buttons, keys and wheel still step.
+  **Disabling** (`tkNumericUpDown_SetEnabled` or `tkWidget_Enable`) disables the field with it,
+  clears the hover, cancels a press and its repeat, and hides the tooltip.
+
+## Notifications
+
+The value-changed callback reports **user** action only, after the value has been snapped,
+clamped and displayed, so `tkNumericUpDown_GetValue` already equals `nValue`. It fires only when
+the value really changed.
+
+| Input | When the callback fires |
+|---|---|
+| "−" / "+" press, each repeat tick | at once |
+| Up / Down, Page Up / Page Down, the wheel | at once |
+| Typing | on commit only: Enter, or focus leaving the field |
+| `SetValue`, `SetRange`, `SetDecimalPlaces`, `StepUp`, `StepDown` | never |
+
+Typing `16` therefore never reports the transient `1`, and the commit is also when typed text is
+clamped, snapped and reformatted (`5.` becomes `5.00`). Because setters are silent, calling
+`SetValue` inside the callback does not recurse. `StepUp` / `StepDown` do exactly what the
+buttons do, minus the notification.
+
+## Layout
+
+The control derives nine rects from its size:
+
+```
+  rcFrame    = the whole control (the outline is stroked inside it, over the cells)
+  rcMinus    = left edge .. + buttonWidth, full height
+  rcDiv1     = rcMinus.right .. + dividerThickness
+  rcPlus     = right edge - buttonWidth .. right edge, full height
+  rcDiv2     = rcPlus.left - dividerThickness .. rcPlus.left
+  rcValue    = rcDiv1.right .. rcDiv2.left, inset top and bottom by border + vertical padding
+  rcMinusBar = glyphLength x glyphThickness, centred in rcMinus
+  rcPlusBarH / rcPlusBarV = the same bar, both centred on rcPlus's centre
+```
+
+- The button cells are not inset by the border; only `rcValue` is, and the field sits exactly on
+  it. When the control is too short for the vertical padding, `rcValue` is inset by the border
+  alone.
+- Too narrow for both buttons and dividers, the value cell collapses to zero width (it never
+  inverts) and the field is hidden; the buttons keep their width and clip at the edge.
+- `tkNumericUpDown_GetIdealSize` measures both ends of the range at the current decimal places
+  and takes the wider, so `-1000` costs more than `999`. It is valid before the control has been
+  sized:
+
+  ```
+  width  = 2*buttonWidth + 2*dividerThickness + padLeft + padRight + widestEnd
+  height = fontHeight + 2*vertPadding + 2*borderThickness
+  ```
+
+- Setters take pixels and clamp negatives to 0; `SetGlyphSize` floors both values at 1. A corner
+  radius of 0 gives square corners, a border of 0 no frame, a divider of 0 no dividers (and no
+  space for them).
+- The defaults are scaled at creation and rescaled when the display scale changes, the glyph
+  thickness included (it is an icon stroke); the border and the dividers are hairlines and keep
+  their thickness. The corner radius and the border follow the theme's shape (`CornerRadius`,
+  `BorderWidth`) until `SetCornerRadius` or `SetBorderThickness` sets them.
+- Layout is lazy: setters mark it stale, and the next paint or rect query recomputes it. The rect
+  queries return FALSE until the control has a size.
+
+## Colours and theme
+
+The colours start from the current [tkTheme](tkTheme) palette (`tkNumericUpDown_ThemeColors`,
+plus the theme's own recipes for the control) and follow theme changes;
+`tkNumericUpDown_SetColors` pins them, and `tkNumericUpDown_UnpinColors` hands them back. The four
+`Value*` fields are handed to the field rather than painted here, and re-applied when the enabled
+state changes; the field's selection and cue colours come from the theme.
+
+- `ButtonBackColor` equals `ValueBackColor` by default, so at rest the control reads as one flat
+  rounded cell divided by hairlines.
+- A button cell: disabled (the control disabled **or** this button at its limit) > pressed (held
+  with the pointer still on it) > hot > idle.
+- The outline: disabled > focused > idle.
+
+The built-in painter fills the control with `BackColor` (seen outside the rounded corners), fills
+the frame as a rounded rect in the value background, fills each button cell as a rounded rect
+extended past its divider and clipped to its cell (so only its outer rounding shows), draws the
+dividers and the glyph bars as plain rects, and strokes the outline last.
+
+## Callbacks
+
+**Paint.** The paint callback replaces the frame, the cells, the dividers and the glyphs, never
+the number: the field paints that over `rcValue`. The control is already filled with `BackColor`;
+call `tkNumericUpDown_PaintDefault( p )` to draw the stock control and add to it. Use the rects as
+given; `pressedPart` is set only while the pointer is still on the pressed button, and `bAtMin` /
+`bAtMax` say which button to draw disabled. `PaintBorderRect` and `PaintRoundBorderRect` fill
+before they stroke, so as a frame they flood everything beneath; use `PaintRoundOutline` (radius
+0 for square).
+
+**Message.** One stream covers the whole control: its own mouse messages, the wheel, the right
+button, the repeat's `TKM_TIMER` ticks and `TKM_ENABLE`, plus the field's key, character, mouse, wheel and focus
+messages, relayed with `hCtrl` set to the spinner. Returning TRUE suppresses the control's
+handling of a left press, the wheel and the field's messages, so a host can repurpose the arrow
+keys, Page Up/Page Down or the wheel. It is ignored for `TKM_LBUTTONUP`, which ends a press, and
+`TKM_KILLFOCUS`, which commits typing.
 
 ## Public declarations
 
@@ -224,10 +353,17 @@ sub tkNumericUpDown_ApplyFonts( byval hCtrl as TK_WIDGET ptr, byval fText as TTF
 sub tkNumericUpDown_SetPaintCallback( byval hCtrl as TK_WIDGET ptr, byval usersub as NUD_PaintCallbackSub )
 sub tkNumericUpDown_SetMessageCallback( byval hCtrl as TK_WIDGET ptr, byval userfunc as NUD_MessageCallbackFunc )
 sub tkNumericUpDown_SetValueChangedCallback( byval hCtrl as TK_WIDGET ptr, byval usersub as NUD_ValueChangedCallbackSub )
+sub tkNumericUpDown_PaintDefault( byval pi as TKNUMERICUPDOWN_PAINTINFO ptr )
+sub tkNumericUpDown_SetTooltipText( byval hCtrl as TK_WIDGET ptr, byval Text as ustring )
+function tkNumericUpDown_GetTooltipText( byval hCtrl as TK_WIDGET ptr ) as ustring
+function tkNumericUpDown_GetTooltipHandle( byval hCtrl as TK_WIDGET ptr ) as TK_TIP ptr
+sub tkNumericUpDown_SetHoverTime( byval hCtrl as TK_WIDGET ptr, byval ms as long )
+sub tkNumericUpDown_SetAutoPopTime( byval hCtrl as TK_WIDGET ptr, byval ms as long )
+sub tkNumericUpDown_SetReshowTime( byval hCtrl as TK_WIDGET ptr, byval ms as long )
 ```
 
 ### See also
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsNumericUpDown](PsNumericUpDown), the PsControls control
+- [tkTextBox](tkTextBox), the value field

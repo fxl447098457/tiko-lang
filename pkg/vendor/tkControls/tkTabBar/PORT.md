@@ -31,6 +31,8 @@ the previous colour and pin; rescale with the border floored at 1.
   hot or active tab, a focus ring when the bar has focus. Its colours are the new
   `TKTABBAR_COLORS` fields (theme roles Surface / SurfaceHot / Window / Selected / TextDim /
   TextHot / TextStrong / Accent / FocusRing). `SetGlyphFont` supplies the X and the icons.
+- `PaintTabDefault( p )`: the built-in painter's tab, for a paint callback (the form designer's
+  Paint event).
 - `SetGlyph` / `GetGlyph`: a per-tab left icon for the built-in painter.
 - `SetClosable` / `GetClosable`: a tab that refuses both close gestures (the rect stays reserved,
   so nothing shifts).

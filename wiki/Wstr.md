@@ -32,6 +32,8 @@ Declare Function WStr ( ByVal n As ULongInt ) As WString
 
 Returns the wide-character representation of the numeric or string expression.
 
+ **tiko:** `WStr` also takes an [`Int128` or `UInt128`](Category-Fixed-Width-Types#128-bit-integers), at full width.
+
 ## Remarks
 
 ### Usage

@@ -1213,15 +1213,8 @@ function MakeTransparent() as GpStatus
 ```
 
 Redraws the bitmap as `PixelFormat32bppARGB` with the pixels of `transparentColor` left out.
-In this release the left-out pixels are not transparent: the new bitmap is filled with opaque
-light grey (`ARGB_LightGray`, `&hFFD3D3D3`) first, so they come out light grey. The second form
-takes the colour of the bottom-left pixel; when that pixel already has some transparency it
-changes nothing and returns `Ok`.
 
 An image read from an `.ico` file is refused with `NotImplemented` (6).
-
-For real transparency, draw the bitmap through a colour key instead:
-[CGpImageAttributes.SetColorKey](CGpImageAttributes#setcolorkey-clearcolorkey).
 
 **Returns** `Ok` on success, otherwise the error.
 
@@ -1229,7 +1222,7 @@ For real transparency, draw the bitmap through a colour key instead:
 
 ```freebasic
 dim sprite as CGpBitmap = "sprite.bmp"
-sprite.MakeTransparent( ARGB_Magenta )      ' magenta pixels become &hFFD3D3D3
+sprite.MakeTransparent( ARGB_Magenta )
 ```
 
 ### ConvertFormat

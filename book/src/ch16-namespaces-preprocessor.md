@@ -366,7 +366,7 @@ platform symbols tiko defines:
 | Symbol | Defined on |
 |---|---|
 | `__FB_WIN32__` | Windows |
-| `__FB_LINUX__`, `__FB_UNIX__` | Linux |
+| `__FB_LINUX__`, `__FB_UNIX__` | Linux, with `__FB_ARM__` too on `linux-arm64` |
 | `__FB_DARWIN__`, `__FB_UNIX__`, `__FB_ARM__` | macOS |
 | `__FB_64BIT__` | every 64-bit target |
 | `__FB_MSVC__` | the `windows-x86_64` target |

@@ -33,3 +33,6 @@
 - PsRegistry.
 
 **Added:** `tkButton_GetHot`, `tkButton_GetPressed`, `tkButton_GetTextWidth` (test probes).
+`tkButton_SetIconGap`, `SetIconSize`, `SetFocusRing`, `Get` / `SetBorderWidth` (the border also follows
+the theme's BorderWidth until set) and `tkButton_PaintDefault` (the stock drawing, for a paint callback):
+for the form designer. PsButton keeps none of them.

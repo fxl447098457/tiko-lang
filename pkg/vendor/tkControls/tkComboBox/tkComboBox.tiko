@@ -30,12 +30,14 @@
 #import "../tkPopupMenu" public
 #import "../tkVScrollBar" public
 #import "../tkTextBox"
+#import "../tkTooltip" public
 using tkHost
 using tkPaint
 using tkTheme
 using tkPopupMenu
 using tkVScrollBar
 using tkTextBox
+using tkTooltip
 
 public enum
     CBO_TEXT_ALWAYS = 0
@@ -142,6 +144,8 @@ public type TKCOMBOBOX_STATE
     isOpen          as boolean
     bColorsPinned   as boolean
     bShapePinned   as boolean                ' a shape setter ran: the theme's shape leaves it alone
+    wszTooltip      as ustring
+    tip             as TKTIPHOST_STATE          ' the tooltip, created with the combo (tkTipHost)
     colors          as TKCOMBOBOX_COLORS
     pTextFont       as TTF_Font ptr               ' borrowed
     nPadLeft        as long
@@ -586,6 +590,7 @@ end function
 private function CbDropDown( byval p as TKCOMBOBOX_STATE ptr ) as boolean
     if p->isEnabled = false then return false
     if p->isOpen then return true
+    tkTipHost_Pop( @p->tip )
     if p->DropDownCallback then p->DropDownCallback( p->hWin, true )
     if p->itemCount <= 0 then
         if p->DropDownCallback then p->DropDownCallback( p->hWin, false )
@@ -774,6 +779,7 @@ private function CbProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as bo
 
     case TKM_LBUTTONDOWN
         if p->isEnabled = false then return true
+        tkTipHost_Pop( @p->tip )
         tkHost_SetFocus( h, w )                 ' focus whatever the host then decides
         if CbCall( p, m ) then return true
         ' the list opens on the DOWN; no capture: from here the popup owns the interaction
@@ -856,6 +862,7 @@ private function CbProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as bo
         if p->isEnabled = false then
             p->isHot = false
             CbCloseList( p )
+            tkTipHost_Pop( @p->tip )
         end if
         tkWidget_Invalidate( w )
         return true
@@ -868,6 +875,7 @@ private function CbProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as bo
             p->pList = 0
             tkHost_Close( pop )
         end if
+        tkTipHost_Destroy( @p->tip )
         delete p
         w->pData = 0
         return true
@@ -906,6 +914,13 @@ end sub
 ' ==========================================================================================
 ' Public API -- vendor's surface, HWND replaced by the widget pointer
 ' ==========================================================================================
+' The tip's text: the combo's own; its edit box counts, being a child.
+private function CbTipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKCOMBOBOX_STATE ptr p = CB( a )
+    if p = 0 then return ""
+    return p->wszTooltip
+end function
+
 public function tkComboBox_Create( byval hParent as TK_WIDGET ptr, byval CtrlID as long ) as TK_WIDGET ptr
     if hParent = 0 then return 0
     dim as TK_HOST ptr hh = hParent->pHost
@@ -931,6 +946,7 @@ public function tkComboBox_Create( byval hParent as TK_WIDGET ptr, byval CtrlID 
     ' the theme's recipes for this type apply from the start, not just after a theme change
     tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKCOMBOBOX_COLORS ) \ 4, "ComboBox" )
     CbDeriveListColors( p )
+    tkTipHost_Ensure( @p->tip, w, @CbTipText )
     ApplyThemeShape( w )
     return w
 end function
@@ -1385,7 +1401,43 @@ public sub tkComboBox_SetBorderThickness( byval hCombo as TK_WIDGET ptr, byval n
     dim as TKCOMBOBOX_STATE ptr p = CB( hCombo )
     if p = 0 then exit sub
     p->nBorderThick = iif( nThickness < 0, 0, nThickness )
+    p->bShapePinned = true                      ' the theme's BorderWidth leaves it alone now
     tkWidget_Invalidate( hCombo )
+end sub
+
+' The tooltip shown while the pointer rests on the combo (its edit box too); "" = none.
+public sub tkComboBox_SetTooltipText( byval hCombo as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKCOMBOBOX_STATE ptr p = CB( hCombo )
+    if p then p->wszTooltip = Text
+end sub
+
+public function tkComboBox_GetTooltipText( byval hCombo as TK_WIDGET ptr ) as ustring
+    dim as TKCOMBOBOX_STATE ptr p = CB( hCombo )
+    if p = 0 then return ""
+    return p->wszTooltip
+end function
+
+' The combo's tkTooltip, for any tkTooltip_* call (title, glyph, style, colours). Owned here.
+public function tkComboBox_GetTooltipHandle( byval hCombo as TK_WIDGET ptr ) as TK_TIP ptr
+    dim as TKCOMBOBOX_STATE ptr p = CB( hCombo )
+    if p = 0 then return 0
+    return tkTipHost_Tip( @p->tip )
+end function
+
+' The three delays, stored as well as pushed (tkTipHost).
+public sub tkComboBox_SetHoverTime( byval hCombo as TK_WIDGET ptr, byval ms as long )
+    dim as TKCOMBOBOX_STATE ptr p = CB( hCombo )
+    if p then tkTipHost_SetDelay( @p->tip, TK_TIPDELAY_INITIAL, ms )
+end sub
+
+public sub tkComboBox_SetAutoPopTime( byval hCombo as TK_WIDGET ptr, byval ms as long )
+    dim as TKCOMBOBOX_STATE ptr p = CB( hCombo )
+    if p then tkTipHost_SetDelay( @p->tip, TK_TIPDELAY_AUTOPOP, ms )
+end sub
+
+public sub tkComboBox_SetReshowTime( byval hCombo as TK_WIDGET ptr, byval ms as long )
+    dim as TKCOMBOBOX_STATE ptr p = CB( hCombo )
+    if p then tkTipHost_SetDelay( @p->tip, TK_TIPDELAY_RESHOW, ms )
 end sub
 
 public sub tkComboBox_GetFocusRing( byval hCombo as TK_WIDGET ptr, byref nGap as long, byref nThickness as long )
@@ -1522,6 +1574,13 @@ public sub tkComboBox_SetPlaceholderText( byval hCombo as TK_WIDGET ptr, byval T
 end sub
 
 ' ---- callbacks -----------------------------------------------------------------------------
+' A paint callback's way to draw the combo as it would have been drawn, then add to it.
+public sub tkComboBox_PaintDefault( byval pi as TKCOMBOBOX_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKCOMBOBOX_STATE ptr p = CB( pi->hCombo )
+    if p then CbRenderDefault( p, pi->b, pi )
+end sub
+
 public sub tkComboBox_SetPaintCallback( byval hCombo as TK_WIDGET ptr, byval usersub as CBO_PaintCallbackSub )
     dim as TKCOMBOBOX_STATE ptr p = CB( hCombo )
     if p = 0 then exit sub
@@ -1608,5 +1667,7 @@ private sub ApplyThemeShape( byval w as TK_WIDGET ptr )
     dim as long v
     v = iif( sh.CornerRadius >= 0, tkHost_Scale( w->pHost, sh.CornerRadius * 2 ), tkHost_Scale( w->pHost, TKCOMBOBOX_DEFAULT_CURVATURE ) )
     if p->nCurvature <> v then tkComboBox_SetCornerCurvature( w, v )
+    v = iif( sh.BorderWidth >= 0, sh.BorderWidth, TKCOMBOBOX_DEFAULT_BORDERTHICK )
+    if p->nBorderThick <> v then tkComboBox_SetBorderThickness( w, v )
     p->bShapePinned = false
 end sub

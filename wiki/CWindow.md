@@ -1329,7 +1329,7 @@ function SetCtlColors( byval cID as long, byval foreColor as COLORREF, byval bac
 Gives a control a text colour and a background colour, and redraws it. CWindow applies them by
 answering the `WM_CTLCOLOREDIT`, `WM_CTLCOLORLISTBOX` and `WM_CTLCOLORSTATIC` messages that edit,
 list box and static controls send to their parent, so the control must be a child of the object's
-window. Push buttons are not coloured this way ([CXpButton](CXpButton) is a button that can be).
+window. Push buttons are not coloured this way.
 The identifier form looks among the window's children. Calling again replaces the colours.
 
 **Returns** `true`; `false` when the control does not exist.
@@ -1658,8 +1658,7 @@ function Stabilize() as boolean
 
 Stops the user from closing the window: removes **Close** and the separator above it from the
 system menu, which also disables the close button, and ignores the close command that Alt+F4 and
-the button send. The program can still close the window with `WM_CLOSE` or `DestroyWindow`. Call
-it once: each call removes the last two items of the menu.
+the button send. The program can still close the window with `WM_CLOSE` or `DestroyWindow`.
 
 **Returns** `true`; `false` when the window has no system menu.
 

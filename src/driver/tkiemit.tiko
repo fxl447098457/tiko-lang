@@ -25,6 +25,7 @@
 #include once "pp/pp.ti"
 #include once "symbols/mangle.ti"
 #include once "symbols/modsym.ti"
+#include once "symbols/checkslice.ti"
 #include once "support/text.ti"
 
 namespace Tko.Modules
@@ -56,6 +57,10 @@ type TkiWriter_
     as Tko.StrVec ptr          spaces
     '' Per token: the qualifier a name a 'using' reached is written with (Qualify_).
     as Tko.StrVec              qual
+    '' Per token: the literal a HEADER'S CONSTANT is written as (HeaderConstText_), and by
+    '' FileId, 1 for a header the unit read -- not the module's own files.
+    as Tko.StrVec              lit
+    as containers.Array( of uint8 )      hdrMark
     '' Token by source location, for the declarations' tokens: open addressing, key loc + 1.
     as containers.Array( of uint32 )    hkey
     as containers.Array( of int32 )     hval
@@ -129,6 +134,7 @@ end sub
 '' 'esc.Url', where esc is an import's alias: '__tko_mod_acme_text_esc.Url'.
 private function Rewritten_( byref w as TkiWriter_, byval i as int32 ) as string
     dim as string sp = Tko.PpSpell( w.ctx->sources, w.ctx->names, w.ctx->ppLits, (*w.toks)[i] )
+    if (len( w.lit[i] ) > 0) andalso (Kind_( w, i - 1 ) <> Tko.TK_DOT) then return w.lit[i]
     if len( w.qual[i] ) > 0 then
         if Kind_( w, i - 1 ) <> Tko.TK_DOT then return w.qual[i] & "." & sp
     end if
@@ -707,10 +713,53 @@ private function TokAt_( byref w as TkiWriter_, byval loc as uint32 ) as int32
     return -1
 end function
 
+'' A HEADER'S CONSTANT IS WRITTEN AS ITS LITERAL, when it is an untyped 'const' of one
+'' literal: windef.bi's 'const NULL = 0' and 'const MAX_PATH = 260' are declared only
+'' '#ifndef' the name, and crt/stddef.bi defines the MACRO NULL only '#ifndef' it. A module
+'' that read windows.bi first spelled 'NULL'; an importer that read crt first -- through
+'' vendor/SDL3's public header -- holds the macro, so windef.bi never declares the const,
+'' and interface text is not macro-expanded: TKO0675, or a name left unresolved. What the
+'' module meant is the value it saw. Measured in fbc: an untyped const has its literal's
+'' type exactly (0, 260, &hFFFFFFFF, 4294967296, 1.5, -1), so the literal IS the name. A
+'' typed const, or one of an expression or a string, keeps its name. "" for anything else.
+private function HeaderConstText_( byref w as TkiWriter_, byval sid as Tko.SymbolId ) as string
+    dim as Tko.Symbol ptr s = w.syms->SymbolAt( sid )
+    if s = nullptr then return ""
+    if s->kind <> cast( uint8, Tko.SYM_CONSTANT ) then return ""
+    if ((s->flags and Tko.SYMF_BUILTIN) <> 0) orelse (s->payload = 0) then return ""
+    dim as uint32 f = cast( uint32, w.ctx->sources.Decode( s->loc ).file )
+    if f >= cast( uint32, w.hdrMark.Count ) then return ""
+    if w.hdrMark[f] = 0 then return ""
+    dim as Tko.NodeId item = cast( Tko.NodeId, s->payload )
+    if w.ast->Kind( item ) <> Tko.N_VAR_ITEM then return ""
+    dim as Tko.StmtPayload ptr ip = w.ast->StmtOf( item )
+    if ip->a <> Tko.NODE_NONE then return ""
+    dim as Tko.NodeId v = ip->b
+    dim as boolean neg = false
+    if w.ast->Kind( v ) = Tko.N_UNARY then
+        if cast( Tko.TokenKind, w.ast->UnaryOf( v )->op ) <> Tko.TK_MINUS then return ""
+        neg = true
+        v = w.ast->UnaryOf( v )->operand
+    end if
+    if (w.ast->Kind( v ) <> Tko.N_INT_LIT) andalso (w.ast->Kind( v ) <> Tko.N_FLOAT_LIT) then return ""
+    '' The literal's own token, spelled as it was written: a number keeps its radix and its
+    '' suffix, and with them its type. The header's declaration is indexed as the module's are.
+    dim as int32 lt = TokAt_( w, cast( uint32, w.ast->Loc( v ) ) )
+    if lt < 0 then return ""
+    dim as Tko.TokenKind lk = Kind_( w, lt )
+    if (lk <> Tko.TK_INT_LIT) andalso (lk <> Tko.TK_FLOAT_LIT) then return ""
+    dim as string t = Tko.PpSpell( w.ctx->sources, w.ctx->names, w.ctx->ppLits, (*w.toks)[lt] )
+    if len( t ) = 0 then return ""
+    '' '(-1)': a bare '-1' after '^' is not the name it stands for.
+    if neg then return "(-" & t & ")"
+    return t
+end function
+
 private sub Qualify_( byref w as TkiWriter_ )
     dim as int32 n = 0
     for i as int32 = 0 to w.toks->Count - 1
         w.qual.Push( "" )
+        w.lit.Push( "" )
         if w.endAt[i] > i then n += w.endAt[i] - i
     next
     dim as int32 sz = 16
@@ -778,11 +827,32 @@ private sub Qualify_( byref w as TkiWriter_ )
                 sid = w.syms->LookupTyped( look, w.ctx->names.Fold( nm ), true )
             end if
         end if
+        '' 'span( of T )' IS WRITTEN '__tko_span( of T )': 'span' is contextual, and an importer's
+        '' own type of that name would capture it (docs/tiko-slices RFC-0003 §1).
+        if (sid = Tko.SYMBOL_NONE) andalso (w.ast->Kind( nd ) = Tko.N_TYPEREF) then
+            if Tko.Slices.IsSpanType( w.ctx->types, w.info->TypeOf_( nd ) ) andalso (Tko.Text.LowerAscii( w.ctx->names.Spelling( nm ) ) = "span") then
+                dim as int32 st_ = TokAt_( w, cast( uint32, w.ast->Loc( nd ) ) )
+                for j as int32 = st_ to st_ + 6
+                    if (st_ < 0) orelse (j >= w.toks->Count) then exit for
+                    if Kind_( w, j ) <> Tko.TK_IDENT then continue for
+                    if Tko.Text.LowerAscii( Tko.PpSpell( w.ctx->sources, w.ctx->names, w.ctx->ppLits, (*w.toks)[j] ) ) <> "span" then continue for
+                    dim as int32 k = j
+                    while k >= 0
+                        w.lit[k] = "__tko_span"
+                        k = w.locNext[k]
+                    wend
+                    exit for
+                next
+            end if
+        end if
         if sid = Tko.SYMBOL_NONE then continue for
-        dim as string q = Qualifier_( w, sid, from_ )
-        if len( q ) = 0 then continue for
         dim as int32 t = TokAt_( w, cast( uint32, w.ast->Loc( nd ) ) )
         if t < 0 then continue for
+        dim as string lv = ""
+        if InModule_( w, t ) then lv = HeaderConstText_( w, sid )
+        dim as string q = ""
+        if len( lv ) = 0 then q = Qualifier_( w, sid, from_ )
+        if (len( q ) = 0) andalso (len( lv ) = 0) then continue for
         '' The node starts at its first token -- 'const', '..' -- and the name is a few on.
         dim as string want = Tko.Text.LowerAscii( w.ctx->names.Spelling( nm ) )
         for j as int32 = t to t + 6
@@ -792,6 +862,7 @@ private sub Qualify_( byref w as TkiWriter_ )
                 dim as int32 k = j
                 while k >= 0
                     w.qual[k] = q
+                    w.lit[k] = lv
                     k = w.locNext[k]
                 wend
                 exit for
@@ -961,7 +1032,10 @@ private function RequiredHeaders_ _
             for c as int32 = 0 to pr->modConsRoot.Count - 1
                 if cast( int32, pr->modConsRoot[c] ) <> k then continue for
                 if len( pr->modConsText[c] ) = 0 then
-                    req &= "#tki undef " & pr->modConsName[c] & !"\n"
+                    req &= "#tki undef " & pr->modConsName[c]
+                    '' ...and the file that then made it the header's own (ppmodhdr.tiko).
+                    if len( pr->modConsOwn[c] ) > 0 then req &= " """ & pr->modConsOwn[c] & """"
+                    req &= !"\n"
                 else
                     req &= "#tki define " & pr->modConsText[c] & !"\n"
                 end if
@@ -1021,6 +1095,15 @@ private function Joins_( byref w as TkiWriter_ ) as string
     return r
 end function
 
+private sub MarkHeaders_( byref w as TkiWriter_, byref files as Tko.IdVec )
+    for each m as uint32 in files
+        while cast( uint32, w.hdrMark.Count ) <= m
+            w.hdrMark.Push( 0 )
+        wend
+        w.hdrMark[m] = 1
+    next
+end sub
+
 function WriteInterface _
     ( byref ctx as Tko.CompilerContext, byref toks as Tko.TokenVec, _
       byref ast as Tko.AstArena, byref syms as Tko.SymbolTable, _
@@ -1038,6 +1121,14 @@ function WriteInterface _
             w.modMark.Push( 0 )
         wend
         w.modMark[m] = 1
+    next
+    '' The headers the unit read, its own and imported modules' public ones (HeaderConstText_).
+    if pr <> nullptr then
+        MarkHeaders_( w, pr->modHdrFile )
+        MarkHeaders_( w, pr->pubHdrFile )
+    end if
+    for each m as uint32 in ctx.unit.modFiles
+        if m < cast( uint32, w.hdrMark.Count ) then w.hdrMark[m] = 0
     next
     for j as int32 = 0 to toks.Count - 1
         w.endAt.Push( 0 )

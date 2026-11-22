@@ -706,7 +706,7 @@ Microsoft Learn: [BrushProperties](https://learn.microsoft.com/en-us/windows/win
 ### D2D1_BitmapBrushProperties
 
 ```freebasic
-function D2D1_BitmapBrushProperties( byval extendModeX as D2D1_EXTEND_MODE = D2D1_EXTEND_MODE_CLAMP, byval extendModeY as D2D1_EXTEND_MODE = D2D1_EXTEND_MODE_CLAMP, byref interpolationMode as D2D1_BITMAP_INTERPOLATION_MODE = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR ) as D2D1_BITMAP_BRUSH_PROPERTIES
+function D2D1_BitmapBrushProperties( byval extendModeX as D2D1_EXTEND_MODE = D2D1_EXTEND_MODE_CLAMP, byval extendModeY as D2D1_EXTEND_MODE = D2D1_EXTEND_MODE_CLAMP, byval interpolationMode as D2D1_BITMAP_INTERPOLATION_MODE = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR ) as D2D1_BITMAP_BRUSH_PROPERTIES
 ```
 
 Returns how a bitmap brush paints beyond its bitmap in each direction (`D2D1_EXTEND_MODE_CLAMP`,
@@ -900,8 +900,8 @@ Microsoft Learn: [RenderTargetProperties](https://learn.microsoft.com/en-us/wind
 ### D2D1_HwndRenderTargetProperties
 
 ```freebasic
-function D2D1_HwndRenderTargetProperties overload( byval hwnd as HWND, byref pixelSize as D2D1_SIZE_U = D2D1_SizeU(0, 0), byval presentOptions as D2D1_PRESENT_OPTIONS = D2D1_PRESENT_OPTIONS_NONE ) as D2D1_HWND_RENDER_TARGET_PROPERTIES
-function D2D1_HwndRenderTargetProperties overload( byval hwnd as HWND, byref pixelWidth as UINT32 = 0, byref pixelHeight as UINT32 = 0, byval presentOptions as D2D1_PRESENT_OPTIONS = D2D1_PRESENT_OPTIONS_NONE ) as D2D1_HWND_RENDER_TARGET_PROPERTIES
+function D2D1_HwndRenderTargetProperties overload( byval hwnd as HWND, byval pixelSize as D2D1_SIZE_U = D2D1_SizeU(0, 0), byval presentOptions as D2D1_PRESENT_OPTIONS = D2D1_PRESENT_OPTIONS_NONE ) as D2D1_HWND_RENDER_TARGET_PROPERTIES
+function D2D1_HwndRenderTargetProperties overload( byval hwnd as HWND, byval pixelWidth as UINT32 = 0, byval pixelHeight as UINT32 = 0, byval presentOptions as D2D1_PRESENT_OPTIONS = D2D1_PRESENT_OPTIONS_NONE ) as D2D1_HWND_RENDER_TARGET_PROPERTIES
 ```
 
 Returns the window a window render target draws into, its size in **pixels** (usually the
@@ -928,7 +928,7 @@ Microsoft Learn: [HwndRenderTargetProperties](https://learn.microsoft.com/en-us/
 ### D2D1_LayerParameters
 
 ```freebasic
-function D2D1_LayerParameters( byref contentBounds as D2D1_RECT_F = D2D1_InfiniteRect(), byval geometricMask as ID2D1Geometry ptr = NULL, byval maskAntialiasMode as D2D1_ANTIALIAS_MODE = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, byref maskTransform as D2D1_MATRIX_3X2_F = D2D1_IdentityMatrix(), byref opacity as FLOAT = 1.0, byval opacityBrush as ID2D1Brush ptr = NULL, byval layerOptions as D2D1_LAYER_OPTIONS = D2D1_LAYER_OPTIONS_NONE ) as D2D1_LAYER_PARAMETERS
+function D2D1_LayerParameters( byref contentBounds as D2D1_RECT_F = D2D1_InfiniteRect(), byval geometricMask as ID2D1Geometry ptr = NULL, byval maskAntialiasMode as D2D1_ANTIALIAS_MODE = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, byref maskTransform as D2D1_MATRIX_3X2_F = D2D1_IdentityMatrix(), byval opacity as FLOAT = 1.0, byval opacityBrush as ID2D1Brush ptr = NULL, byval layerOptions as D2D1_LAYER_OPTIONS = D2D1_LAYER_OPTIONS_NONE ) as D2D1_LAYER_PARAMETERS
 ```
 
 Returns the parameters of `PushLayer`: what is drawn until the matching `PopLayer` is kept

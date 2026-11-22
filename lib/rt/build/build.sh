@@ -298,6 +298,13 @@ build_one( ) {
         # triple only by accident of which headers it reaches for.
         cabi=""
         case "$target" in windows-x86_64) cabi="-D TKORT_MSVC" ;; esac
+        # INLINE ATOMICS ON linux-arm64, whichever clang builds it (docs/tiko-linux-arm64 L3).
+        # Ubuntu's clang turns on -moutline-atomics by default (it finds libgcc's
+        # __aarch64_ldadd4_acq_rel and friends), a clang with no aarch64 sysroot -- Windows' --
+        # does not, so atomic.c came out as calls in the VM and as LL/SC here. Pinned to LL/SC:
+        # it runs on every ARMv8, needs no helper library, and the cross-built runtime and the
+        # native one are then the same code.
+        case "$target" in linux-arm64) cabi="-mno-outline-atomics" ;; esac
         if ! "$CLANG" --target="$ctgt" -O2 $CDBG $CMAP -std=c99 -Wall -Wextra $cabi $cpic \
                 -c "$csrc" -o "$cobj"; then
             rt_die "$target/$thread: $(basename "$csrc") failed to compile"

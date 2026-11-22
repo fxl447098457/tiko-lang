@@ -54,21 +54,296 @@ tkWidget_SetPos( gTree, 16, 16, 300, 240 )
 
 For a report, add columns with `tkListTree_AddColumn`, call `tkListTree_ShowHeader( h, true )` and fill cells with `tkListTree_SetCellText`. Column 0 is the row's text. The toolchain's `examples/tkControls/tkListTree/` shows a grouped list, a report and a tree side by side.
 
-## Coming from PsListTree
+## How it works
 
-The [PsListTree](PsListTree) page remains the behaviour reference for everything not listed here: the row model, groups and trees, selection, the keyboard, batch updates, drag reorder and label editing all work the same way.
+### The control and its parts
 
-- `PsListTree_*` → `tkListTree_*`; `PSLISTTREE_*` types → `TKLISTTREE_*`.
-- The unprefixed callback types take an `LT_` prefix: `PaintCallbackSub` → `LT_PaintCallbackSub`, `SelChangeCallbackSub` → `LT_SelChangeCallbackSub`, and so on for every callback.
-- `tkListTree_Create( parent, id )` takes a `TK_WIDGET ptr` parent and returns the control as a `TK_WIDGET ptr`.
-- Fonts are `TTF_Font ptr` (`SetFont`, `SetHeaderFont`, `SetTwistyFont`).
-- `TKLISTTREE_MESSAGEINFO.hList` is the control, not the row surface. It carries surface-local `x`, `y`, `clicks` and `wheelY` instead of wParam and lParam; a double click is `TKM_LBUTTONDOWN` with `clicks = 2`.
-- The twisty is a drawn chevron until you give it a glyph font with `tkListTree_SetTwistyFont`.
-- The mouse wheel scrolls 3 rows a notch, at most a page. A wheel against the end is left unclaimed, so a parent can scroll.
-- Tooltips use the tkControls tooltip; `tkListTree_GetTooltipHandle` returns a `TK_TIP ptr`. The tooltip callback supplies the text, else the row text is shown.
-- The editor is created on the first edit and hidden, not destroyed, when an edit ends.
-- Added: `tkListTree_PaintRowDefault`, a ready-made row painter you can call from your paint callback (without a paint callback the rows stay blank, as before); `hList` and `hasFocus` in `TKLISTTREE_PAINTINFO`; `tkListTree_GetSurface`, `tkListTree_GetEditor`, `tkListTree_GetItemHeightPx`, `tkListTree_IsDragging`.
-- No equivalent: `FilterMessage` (Enter and Escape reach the editor on their own), the `WM_CHAR` swallowing helpers, `SetTooltipMode` / `GetTooltipMode` / `GetPsTooltipHandle`, `ProbeRenderedPixel` (use the [tkTest](tkTest) pixel probes), `PositionWindows`, PsRegistry and `Rescale` (a scale change re-derives the metrics itself).
+`tkListTree_Create` returns the container, and every `tkListTree_*` procedure takes it. It
+holds the row surface (which takes the focus, the keys and the mouse), the scrollbar and the
+header band; they take the ids `CtrlID`, `CtrlID + 1` and `CtrlID + 2`, and the editor
+`CtrlID + 3`. Focus given to the container goes straight to the rows. `GetSurface`,
+`GetScrollBar`, `GetHeader` and `GetEditor` return the parts for direct calls; never pass one
+of them to a `tkListTree_*` procedure.
+
+### Row indices are model indices
+
+Rows are addressed by the order they were added, whatever is on screen. Collapsing does not
+renumber anything, and hidden rows keep working with every row procedure, selection included.
+Everything you receive (`TKLISTTREE_PAINTINFO.itemID`, `TKLISTTREE_MESSAGEINFO.idx`,
+`GetCurSel`, `GetSelItems`, `GetTopIndex`) is a model index. `GetCount` is every row;
+`GetVisibleCount` is the rows on show, which differ exactly when something is collapsed.
+
+### Groups and trees
+
+Every row has a tree level (0 = top level), and the tree lives in plain row order: a node's
+subtree is the run of deeper rows right after it, so parent, child count and "has children"
+are derived. Collapsing a node hides its whole subtree, at any depth.
+
+- `AddNode( h, parentRow, text )` appends a child after the parent's existing subtree
+  (`parentRow = -1` for a new top-level node); `InsertNode` places one at a child position
+  (clamped; past the end appends). `GetLevel`, `GetParent`, `GetChildCount` and `HasChildren`
+  read the shape.
+- The flat group is the depth-1 case: `AddHeader` adds a level-0 row flagged as a header, and
+  `AddString` / `InsertString` rows after a header (or after one of its items) become its
+  level-1 children. Legacy groups do not nest; use `AddNode` for depth.
+- A header is otherwise an ordinary row: selectable, returned by `GetSelItems`, carrying
+  `itemData`. `IsHeader` tells them apart.
+- `CollapseRow`, `ExpandRow`, `ToggleRow` and `SetNodeCollapsed` act on anything that can fold
+  (a header, or any node with children) and return false for a leaf; `CollapseAll` /
+  `ExpandAll` do every node in one refresh. All are silent.
+- `DeleteString` deletes one row; to remove a subtree, delete its descendants too. `Clear`
+  removes every row and resets the caret and anchor.
+
+### Selection lives on the rows
+
+Selection is a flag on each row, so it survives a collapse and a hidden row can be selected.
+
+| Mode | How to get it | Mouse |
+| --- | --- | --- |
+| Single | both flags off (the default) | A click selects exactly one row |
+| Extended | `SetExtendedSelect( h, true )` | Shift extends a range from the anchor, Ctrl (Cmd on macOS) toggles one row |
+| Multiple | `SetMultiSelect( h, true )` | Every click toggles one row, checklist style |
+
+Turning either mode on turns the other off. `GetCurSel` is the focused row (the caret), which
+is not "the selection" once several rows can be selected: use `GetSelItems` for that.
+`SetCurSel( h, row )` focuses, selects only that row, sets the anchor and scrolls it into view;
+an invalid index clears the selection and the caret and returns -1.
+
+### Painting
+
+One paint of the surface fills it with the back colour and then calls your paint callback
+once per visible row. Rows below the last are not painted, so an empty list needs no special
+case. **With no paint callback no rows are drawn**; `tkListTree_PaintRowDefault( p )` is a
+ready-made painter to call from yours (selected, then hot, then plain colours from the theme,
+a focus bar on the caret row while the list has focus, `+` / `-` before a header's caption,
+and every cell ellipsised in its own rect).
+
+`p->rc` and the cell rects are surface-local. The control does not clip between cells and
+never sorts. In report mode, fill `p->rc` first so selection and hover span the row, then
+draw each cell in `cells[i].rc`.
+
+### The scrollbar manages itself
+
+The control creates a [tkVScrollBar](tkVScrollBar), keeps its range in step with the visible
+rows, and hides it whenever the rows fit, when the surface takes the full width back. Only its
+look is yours: `SetScrollBarWidth`, `SetScrollBarColors`, `SetScrollBarDividerColor`,
+`SetScrollBarPaintCallback`, or `GetScrollBar` for direct calls.
+
+The wheel is handled on the surface: 3 rows a notch, at most a page, with partial notches
+accumulated. A wheel that cannot move the list further is left unclaimed, so a parent can
+scroll.
+
+### Columns
+
+With no columns the list paints as one column and the painter sees `columnCount = 0`. Define
+columns (`AddColumn`, `InsertColumn`) and item rows arrive with a `cells` array giving each
+column's span; header rows never get cells. The column model lives in the embedded
+[tkColumnHeader](tkColumnHeader) (widths, minimums and the fill column); the
+`tkListTree_*Column*` procedures delegate to it. The band starts hidden: columns lay out and
+rows paint in columns either way, and `ShowHeader( h, true )` adds the interactive strip. It
+spans the full width, over the scrollbar strip, so column geometry does not shift when the bar
+hides. `GetColumnRect` gives a column's rect in surface-local x, the same x the message
+callback carries, which is how to tell which column a click landed in.
+
+- **Column 0 is the row's text.** `GetText` / `SetText` and the cell procedures with `col = 0`
+  address the same storage; columns 1..N are sparse per row, and a cell never set reads `""`.
+  Inserting or deleting a column shifts every row's cells across that alias (insert at 0 and
+  each row's text becomes its column 1).
+- **Column definitions and cell text are independent.** Rows can be filled before or after the
+  columns exist, and `ClearColumns` keeps the cell text.
+- **A spanned row** (`SetRowSpanColumns( h, row, true )`) paints as one cell across the whole
+  band, for a note or a "no results" line among columned rows. Its text stays in column 0; the
+  painter gets `isSpanned = true`, `columnCount = 1` and a `cells[0]` from column 0's (indented)
+  left to the last column's right. A spanned row is exempt from the column shift.
+- `SetColumnWidth` is silent; only a user drag or an autosize calls the column-resize
+  callback. Subscribe with `tkListTree_SetColumnResizeCallback`, never on the header itself:
+  the control uses the header's width-changed slot to repaint the rows.
+
+### Non-selectable rows
+
+`SetRowSelectable( h, row, false )` makes a row impossible to select or focus by any path: a
+click changes nothing (the message callback still sees it), the keys step past it, `SetCurSel`
+returns -1, `SetSel( ..., true )` returns false, and a Shift range skips it. Marking the current
+or a selected row clears its selection and drops the caret, silently. The painter gets
+`isSelectable` to grey the row if you like.
+
+### Batch updates
+
+Every structural change rebuilds the visible map and repaints. Wrap a bulk load in
+`BeginUpdate` / `EndUpdate` (they nest) and it costs one rebuild. `SetText` and `SetCellText`
+repaint only their row, and inside a batch that touched nothing else `EndUpdate` repaints just
+those rows; any structural change in the batch makes it a full refresh. `Refresh` rebuilds
+and repaints; `InvalidateRow` / `InvalidateRows` repaint rows whose look depends on something
+outside the control (a no-op for a hidden or off-screen row); `UpdateNow` paints whatever is
+pending at once. `SetItemData`, `SetItemDataExtra` and `SetBackColor` do not repaint.
+
+### Programmatic changes are silent
+
+`SetCurSel`, `SetSel`, `SelectAll`, `Clear`, `MoveRows`, `SetColumnWidth` and the fold setters
+fire no callback. SelChange, ExpandCollapse, Activate, DragDrop and the label-edit callbacks
+report what the user did, so a setter is safe inside them.
+
+### Units
+
+| Setting | Unit | Default |
+| --- | --- | ---: |
+| Row height (`SetRowHeight`) | Unscaled: the control scales it | 22 |
+| Header height (`SetHeaderHeight`) | Unscaled | 24 |
+| Scrollbar width (`SetScrollBarWidth`) | Unscaled | 12 |
+| Indent and twisty width | Unscaled | 16 / 16 |
+| Column widths and minimums | Pixels, as given | 100 / 0 |
+| Border width (`SetBorderWidth`) | Pixels, never scaled: a hairline | 0 |
+
+Hand an unscaled setting a value you have already scaled and it is scaled twice.
+`GetItemHeightPx` returns the row height in pixels.
+
+### Keyboard
+
+The surface handles these and they never reach the message callback:
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Move the caret one visible row |
+| Page Up / Page Down | One page |
+| Home / End | First / last visible row |
+| Left | Collapse an expanded node; otherwise jump to its parent |
+| Right | Expand a collapsed node; otherwise step to its first child |
+| Space | Toggle the caret row's selection (multiple, extended), or select it (single) |
+| F2 | Edit the caret row, when label editing is on |
+| Enter | Edit (with `SetEnterEdits`), else activate (with an Activate callback) |
+
+Shift and Ctrl modify the moves as they modify a click; in multiple mode the arrows move the
+caret without selecting. Every move keeps the caret row on screen and skips non-selectable
+rows. Tab and other keys reach the host. SelChange is the only way to observe keyboard
+navigation.
+
+### Hover, tooltips and focus
+
+One row is hot at a time, cleared when the pointer leaves. The tooltip text is your tooltip
+callback's (`""` for no tip), else the row's own text; it is asked again when the hot row
+changes. The initial delay is 250 ms; `SetHoverTime`, `SetAutoPopTime` and `SetReshowTime`
+change the delays, and `GetTooltipHandle` returns the `TK_TIP ptr` for
+[tkTooltip](tkTooltip) calls.
+
+A left press gives the rows the focus before anything else happens. If the list must not keep
+it (an autocomplete list over an editor, say), give it back from the message callback.
+
+### Drag reorder
+
+`SetDragReorder( h, true )` (off by default) lets the user drag rows within the list.
+
+- Press a row and move past a small threshold. If the pressed row is part of a
+  multi-selection, the whole selection moves, gathered at the drop in its original order;
+  otherwise just that row. Headers and non-selectable rows never drag.
+- A line shows the gap the rows will land in. Dropping on a header outlines it and puts the
+  block right after it, as its first rows, expanding it.
+- Near the top or bottom edge the list scrolls. Escape, or losing the mouse capture, cancels
+  with nothing moved. Only an active drag holds the capture.
+- CanDrop runs just before the move (return false to refuse) and DragDrop just after.
+  `tkListTree_MoveRows( h, srcRows(), insertBefore )` does the same move silently: the sources
+  are de-duplicated, kept in order, headers ignored, selection travels with each row, the block
+  becomes the caret and anchor, and the new first index is returned (-1 if nothing moved).
+- `SetDragIndicatorColor` sets the line and outline colour; `IsDragging` is true during a drag.
+
+### Twisties and indentation
+
+Both are off by default, so a flat or grouped list is unchanged. `SetTreeIndent( h, true )`
+indents column 0 by depth (`SetIndentWidth`), and `ShowTwisty( h, true )` reserves a band
+(`SetTwistyWidth`) and draws the expand/collapse mark after your painter runs: a drawn chevron,
+or the `SetTwistyGlyphs` glyphs once `SetTwistyFont` gives it a font, in `SetTwistyColor`.
+With the twisty on, clicking it folds the node without touching the selection and clicking
+the label selects; a legacy header folds on a click anywhere and leaves the selection alone.
+
+`p->indent` is the depth indent plus the twisty band: draw column-0 text at
+`p->rc.left + p->indent` when there are no cells (with columns, `cells[0].rc` is already
+indented). To draw your own mark, turn the twisty off and use `p->rcTwisty`, `p->level`,
+`p->hasChildren` and `p->isExpanded`.
+
+### In-place label editing
+
+`EnableLabelEdit( h, true )` turns it on. An edit starts on F2 on the caret row, on
+`BeginEdit`, with `SetClickToEdit( h, true )` on a click on the row that is already current,
+and with `SetEnterEdits( h, true )` on Enter (which then no longer activates). Enter commits,
+Escape cancels, and focus leaving the editor commits. Because the editor sits over a row,
+scrolling, resizing the list or a fold setter commits it first.
+
+- F2, Enter and click-to-edit all open the column `SetEditColumn` names (default 0). `BeginEdit(
+  h, row, col )` can open any column; to edit another column from a click, find it with
+  `GetColumnRect` in the message callback. Column 0's editor starts past the indent and the
+  twisty.
+- The editor is a [tkTextBox](tkTextBox), created on the first edit and hidden between edits.
+  It uses the list's font, and the theme's colours or those of `SetEditColors` (which a
+  theme change replaces unless the list's colours are pinned). `SetEditTextInset` lines its
+  text up with your painter's cell inset; `SetEditSelectAll( h, false )` puts the caret at the
+  end instead of selecting everything.
+- BeginLabelEdit can veto an edit before it starts; EndLabelEdit gets the new text on a commit
+  and can refuse it (the row keeps its text). Neither runs for a cancel. `GetEditCol` still
+  reports the column while EndLabelEdit runs, so a host can refuse edits of other columns.
+- `BeginEdit` returns false when editing is off, the row is non-selectable or hidden, or the
+  veto refuses; `EndEdit( h, bCommit )` returns true when the model was written.
+
+## Colours
+
+There is no colour struct: every row pixel is your painter's. What the control paints itself
+follows the theme until a setter pins it (`SetBackColor`, `SetBorderColor`,
+`SetTwistyColor`, `SetDragIndicatorColor`, `SetScrollBarColors`); `UnpinColors` hands them
+back.
+
+| Setting | Theme role | Paints |
+| --- | --- | --- |
+| `SetBackColor` | `Window` | The whole surface, behind and below the rows |
+| `SetBorderColor` | `Border` | The frame, when the border width is not 0 |
+| `SetTwistyColor` | `TextDim` | The twisty |
+| `SetDragIndicatorColor` | `Accent` | The drop line and header outline |
+| `SetScrollBarColors` | `Window`, `Border`, `TextDisabled` | The track, thumb and active thumb |
+| `SetEditColors` | `Surface`, `Text`, `Border`, `FocusRing` | The editor |
+| `SetHeaderBackColor` | the header's own | The column band |
+
+The border width follows the theme's `BorderWidth` until `SetBorderWidth` is called; the rows,
+scrollbar and band are inset by it. The paint callback gets the state flags and resolves them:
+at most one row is hot; hot and selected can both be true; `isFocused` marks the caret row and
+is independent of selection; `hasFocus` says the rows have the keyboard focus.
+
+## Callbacks
+
+- **Paint**, `LT_PaintCallbackSub( p )`: one row, called for every visible row on every
+  repaint, so keep it cheap. The surface is already filled and the list's font selected.
+  `TKLISTTREE_PAINTINFO` carries the control (`hList`), the model index, the row rect, the hot,
+  selected, focused, has-focus, header, collapsed, spanned and selectable flags, the caption,
+  the tree fields (`level`, `hasChildren`, `isExpanded`, `indent`, `rcTwisty`, empty for a
+  leaf or with the twisty off) and `columnCount` / `cells`. `cells` is control-owned scratch,
+  valid only during the call.
+- **Message**, `LT_MessageCallbackFunc( m )`: an observer of the surface's mouse messages,
+  with surface-local `x` / `y`, `clicks`, `wheelY`, `idx` (the model row, or -1) and the Ctrl
+  and Shift state. `TKM_MOUSEMOVE` carries the row under the pointer and `TKM_MOUSELEAVE`
+  -1. `TKM_LBUTTONDOWN`, `TKM_LBUTTONUP` and `TKM_RBUTTONDOWN` arrive only over a row, and for
+  the press the control's own handling (focus, selection, fold) has already run. The wheel
+  arrives only when it scrolled the list. The return value changes nothing, except for a
+  double click (`TKM_LBUTTONDOWN` with `clicks = 2`), where true stops the activation.
+- **Tooltip**, `LT_TooltipCallbackFunc( h, row, col ) as ustring`: the tip for a row, asked
+  only when one is about to show. `col` is the column the pointer was over: 0 with no columns,
+  -1 past the last.
+- **SelChange**, `LT_SelChangeCallbackSub( h, row )`: the user moved the caret, by click or
+  key; `row` is the new caret row, and `GetCurSel` already agrees. It does not fire when the
+  caret did not actually move.
+- **Activate**, `LT_ActivateCallbackSub( h, row )`: the row's default action, a double click or
+  Enter on the caret row. Setting it is what makes the list claim Enter; `SetEnterEdits` wins
+  over it. A non-selectable row is never activated. With `PreventDoubleClick( h, true )` a
+  double click is an ordinary click (it selects, or folds a header) and neither it nor the
+  release after it is reported.
+- **ExpandCollapse**, `LT_ExpandCollapseCallbackSub( h, row, bExpanded )`: the user folded a
+  node, with the twisty, a header click, or Left / Right.
+- **BeginLabelEdit** / **EndLabelEdit**: see In-place label editing.
+- **CanDrop**, `LT_CanDropCallbackFunc( p ) as boolean`: just before a user drop; false refuses
+  it. `TKLISTTREE_DROPINFO` (source rows, insert position, whether it is on a header, the target
+  row and its `TKLISTTREE_ROWINFO`) is valid only during the call; do not change the model from
+  inside.
+- **DragDrop**, `LT_DragDropCallbackSub( h, newFirstRow, count )`: just after a user drop; walk
+  `newFirstRow .. newFirstRow + count - 1` to resync parallel data.
+- **Header callbacks** (`SetColumnClickCallback`, `SetColumnAutoSizeCallback`,
+  `SetHeaderPaintCallback`, `SetHeaderTooltipCallback`) and `SetHeaderBackColor` /
+  `SetHeaderFont` pass straight to the [tkColumnHeader](tkColumnHeader); those callbacks get
+  the header widget, not the list. Passing 0 to any callback setter clears it.
 
 ## Public declarations
 
@@ -323,4 +598,4 @@ sub tkListTree_PaintRowDefault( byval pi as TKLISTTREE_PAINTINFO ptr )
 
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
-- [PsListTree](PsListTree), the PsControls control
+- [tkColumnHeader](tkColumnHeader), [tkVScrollBar](tkVScrollBar), [tkTextBox](tkTextBox), [tkTooltip](tkTooltip)

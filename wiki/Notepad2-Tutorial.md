@@ -1,14 +1,12 @@
-[Home](Home) › [tkControls](Category-tkControls) › **Notepad2 Tutorial**
+[Home](Home) › [tkControls](Category-tkControls) › **Notepad Tutorial**
 
-# Notepad2 Tutorial
+# Notepad Tutorial
 
 > 📘 **Start with:** [tkControls](Category-tkControls) and [tkApp](tkApp), the controls and the framework these steps use.
->
-> 🪟 **The same program on PsControls:** the [Notepad Tutorial](Notepad-Tutorial). This page follows it step by step, so the two can be read side by side.
 
-This tutorial builds **`tpad`** again, the plain-text editor of the [Notepad Tutorial](Notepad-Tutorial): a menu bar, the text, a scroll bar, a status bar with the line and column, Find, and a question before unsaved work is thrown away. This time it is built on **tkControls**, which draw into SDL3 windows, so **one source builds and runs on Windows, Linux and macOS**.
+This tutorial builds **`tpad`**, a plain-text editor in the shape of Notepad: a menu bar, the text, a scroll bar, a status bar with the line and column, Find, and a question before unsaved work is thrown away. It is built on **tkControls**, which draw into SDL3 windows, so **one source builds and runs on Windows, Linux and macOS**. The program is about 900 lines of tiko, a fifth of them a self-test.
 
-Most of the program does not change. The document module is the same file, word for word. The `Editor`, the commands and the one `Execute` are the same. What changes is what a window is made of: widgets instead of window handles, SDL events instead of Win32 messages. The program is about 900 lines of tiko, a fifth of them a self-test, and the self-test begins by printing exactly what the PsControls one prints. Three things are new, because they only show up on other systems or in other languages: a text control that counts in bytes, a file dialog that does not stop the program, and a Quit that comes from the system.
+It is built in layers. The document, a file as the editor sees it, is a module that knows nothing about windows. The window is an `Editor`: the controls, the menus and the keys, all of which end in one `Execute`. The two places a person answers, a message box and a file dialog, are reached through procedure pointers, so a self-test can drive the real window with nobody at it. Three things need care on the way, because they only show up on some systems or in some languages: a text control that counts in bytes, a file dialog that does not stop the program, and a Quit that comes from the system.
 
 ![tpad on tkControls with a short file open, in the dark theme.](Notepad2-Tutorial.png)
 
@@ -26,7 +24,7 @@ tpad/
     expected.txt            what the self-test prints
 ```
 
-The toolchain ships it as `examples/tkControls/tpad`. `textfile` and `offsets` import no controls at all, `pad` is the window, and `tpad.tiko` starts it.
+The toolchain ships it as `examples/tkControls/tpad`. `textfile` and `offsets` import no controls at all, so they compile, and can be tested, without a window. `pad` is the window, and `tpad.tiko` starts it.
 
 ```toml
 # tpad on tkControls: `tiko build tpad` writes tpad.exe
@@ -38,11 +36,11 @@ main   = "tpad.tiko"
 output = "tpad.exe"
 ```
 
-There is no `UNICODE` define, no resource file and no manifest. SDL3's strings are UTF-8 on every system, and SDL3 makes the window DPI-aware itself.
+Nothing else is needed: SDL3's strings are UTF-8 on every system, and SDL3 makes the window DPI-aware itself.
 
 ## 2. The document
 
-The module keeps text with **one LF per line break**, so an offset in a `Document` is an offset in the text control. It is the Notepad Tutorial's `textfile` unchanged: nothing in it knew which controls would show it.
+The module keeps text with **one LF per line break**. The text control counts a line break as one too, so an offset in a `Document` and an offset in the control agree on where lines end; how they count the characters in between is the subject of [Two ways of counting](#two-ways-of-counting). Nothing in the module knows which controls will show it.
 
 ```freebasic
 #module "textfile"
@@ -50,9 +48,6 @@ The module keeps text with **one LF per line break**, so an offset in a `Documen
 #import "std/strings"
 '' Nothing here knows about windows: this module is the part of tpad
 '' that compiles, and is tested, on every target.
-''
-'' Unchanged from the Notepad Tutorial (the PsControls tpad): the
-'' document never knew which control family would show it.
 
 public enum LineEnding
     CrLf
@@ -77,7 +72,7 @@ public function ToLf( byref s as const ustring ) as ustring
 end function
 ```
 
-`TextOf` in the window module still passes the control's text through `ToLf`, so the rule holds whatever the control hands back.
+`TextOf` in the window module passes the control's text through `ToLf` before anything searches or measures it, so the rule holds whatever the control hands back.
 
 Loading and saving keep a file the way it was written: its line ending, and its byte-order mark if it had one. `fs.ReadAllText` removes a mark and turns bytes that are not UTF-8 into U+FFFD, so the module reads the first three bytes itself and records a lossy load. `fs.WriteAtomic` replaces the old file only when the new one is complete.
 
@@ -247,10 +242,6 @@ using tkMessageBox
 using tkButton
 using tkCheckBox
 
-'' The window of tpad, the Notepad Tutorial's editor, on tkControls: the
-'' same Editor, the same commands, the same one Execute. What changed is
-'' only what a window is made of.
-
 '' Every command the menus and the keyboard can give.
 public enum Cmd
     CmdNew = 1000
@@ -304,7 +295,9 @@ function EditorOf( byval w as TK_WIDGET ptr ) as Editor ptr
 end function
 ```
 
-Everything about one window is an `Editor`, allocated with `new`, and **the form's `Tag` points at it**. A control is a `TK_WIDGET ptr`, and the `Editor` keeps one for each control it talks to: there is no `f->Item( id )` to look a control up by its id. A control's callback receives only the control; `tkForm_FromWidget` finds the form, and its `Tag` finds the `Editor`. The Find box works the same way with a `FindBox`.
+Everything about one window is an `Editor`, allocated with `new`, and **the form's `Tag` points at it**. A control is a `TK_WIDGET ptr`, and the `Editor` keeps one for each control it talks to, so nothing is looked up by id. A control's callback receives only the control; `tkForm_FromWidget` finds the form, and its `Tag` finds the `Editor`. The window's state needs no `dim shared`. The Find box works the same way with a `FindBox`.
+
+`Cmd` lists every command the program has. The menus, the keys and the self-test all give one of these numbers, and section 5 shows the one place each is carried out.
 
 `ask` and `pick` are the two places a person answers: a message box and a file dialog. They are procedure pointers so that a test can answer instead.
 
@@ -319,7 +312,7 @@ end function
 
 '' SDL's file dialogs are asynchronous: the answer arrives in a callback,
 '' perhaps on another thread. PickFile waits for it, pumping, so its
-'' caller sees a plain function -- as a modal Win32 dialog was.
+'' caller sees a plain function.
 type PickWait
     as SDL_AtomicInt answered   '' 0 waiting, 1 answered
     as zstring ptr path         '' SDL's copy of the answer, or null
@@ -384,7 +377,7 @@ Because of that other thread, the callback touches nothing but C memory: it copi
 
 ```freebasic
 '' What the message callback saw is acted on once the box has moved its
-'' caret: tkApp_RunOnUI does what PostMessage did.
+'' caret.
 sub CaretMoved( byval payload as any ptr )
     ShowStatus( payload )
 end sub
@@ -412,8 +405,8 @@ sub BuildText( byval f as TK_FORM ptr, byval ed as Editor ptr )
             return false
         end function )
 
-    '' The control draws no scroll bar unless asked; like the tutorial,
-    '' tpad gives it one of its own and wires the two together.
+    '' The control draws no scroll bar unless asked; tpad gives it one of
+    '' its own and wires the two together.
     ed->scroll = tkVScrollBar_Create( tkForm_Widget( f ), 102 )
     tkTextBox_SetScrollChangedCallback( ed->text, _
         sub( byval h as TK_WIDGET ptr )
@@ -528,9 +521,9 @@ sub BuildMenus( byval f as TK_FORM ptr, byval ed as Editor ptr )
     tkPopupMenu_AddItem( m, CmdFind, "Find...", PrimaryKey & "F" )
     tkPopupMenu_AddItem( m, CmdFindNext, "Find Next", "F3" )
 
-    '' There is no accelerator table: the text box handles Ctrl+Z, X, C,
-    '' V and A (Cmd on macOS) and leaves every other key unclaimed, so the
-    '' keys only tpad knows bubble up to the form.
+    '' The text box handles Ctrl+Z, X, C, V and A (Cmd on macOS) and
+    '' leaves every other key unclaimed, so the keys only tpad knows
+    '' bubble up to the form.
     tkForm_OnKeyDown( f, _
         function( byval f as TK_FORM ptr, byval key as long, _
                   byval mods as long ) as boolean
@@ -673,7 +666,7 @@ sub FindAgain( byval ed as Editor ptr )
         ed->ask( ed->form, "Cannot find """ & ed->findWhat & """", MBX_BTN_OK )
         exit sub
     end if
-    '' SetSel scrolls the caret into view itself (no EM_SCROLLCARET).
+    '' SetSel scrolls the caret into view itself.
     tkTextBox_SetSel( ed->text, offsets.BytesIn( body, at ), _
         offsets.BytesIn( body, at + len( ed->findWhat ) ) )
     ShowStatus( ed )
@@ -711,8 +704,7 @@ sub AskWhatToFind( byval ed as Editor ptr )
     box.what = tkTextBox_Create( tkForm_Widget( f ), 104 )
     tkTextBox_SetText( box.what, ed->findWhat )
     tkTextBox_SetSelectOnFocus( box.what, true )
-    '' Enter in the search is the default button's job in Win32; here the
-    '' single-line box reports Enter, and that is Find Next.
+    '' The single-line box reports Enter, and that is Find Next.
     tkTextBox_SetEnterPressedCallback( box.what, _
         sub( byval h as TK_WIDGET ptr )
             FindBox_Accept( tkForm_FromWidget( h )->Tag )
@@ -820,8 +812,8 @@ using tkTextBox
 using tkStatusBar
 using tkMessageBox
 
-'' tpad, the Notepad Tutorial's editor, on tkControls (SDL3 + SDL_ttf):
-'' the same program on Windows, Linux and macOS.
+'' tpad on tkControls (SDL3 + SDL_ttf): the same program on Windows,
+'' Linux and macOS.
 ''
 ''   tpad [file]                 run it
 ''   tpad --selftest             drive the real window, print what it saw
@@ -882,10 +874,10 @@ The first build compiles the tkControls modules the program imports; later build
 
 ## 8. Testing the window with nobody at it
 
-`tpad --selftest` drives the real window and prints what it saw. The message box and the file dialog are scripted through `ask` and `pick`; keys and typed text are SDL events, pushed onto the queue where the system would put them:
+`tpad --selftest` drives the real window and prints what it saw. Only the person is replaced: the menus, the text box, the status bar and the file on disk are the real ones. The message box and the file dialog are scripted through `ask` and `pick`, and keys and typed text are SDL events, pushed onto the queue where the system would put them. `ImpatientPick` plays a person who tries to close the window while the file dialog is up.
 
 ```freebasic
-'' ---- the self-test (the Notepad Tutorial's, with SDL events for Win32 messages) ----
+'' ---- the self-test ----
 
 '' The person, scripted: what the test answers to each question.
 function ScriptedAsk( byval f as TK_FORM ptr, byref text as ustring, _
@@ -1011,8 +1003,7 @@ function SelfTest( byval ed as pad.Editor ptr ) as long
     pad.Execute( ed, pad.CmdNew )
     Report( ed )
 
-    '' Win32 sent WM_DPICHANGED; here the surface's scale doubles and
-    '' SDL says so.
+    '' The surface's scale doubles, and SDL says so.
     print "== moved to a monitor at twice the DPI"
     h->fScaleForced = 2 * h->fScale
     dim as SDL_Event e
@@ -1057,7 +1048,7 @@ function SelfTest( byval ed as pad.Editor ptr ) as long
 end function
 ```
 
-Its output is the same on Windows, Linux and macOS. Up to the section on text that is not ASCII it is, line for line, the same as the [Notepad Tutorial](Notepad-Tutorial#8-testing-the-window-with-nobody-at-it)'s; the sections from there on are the three things new in this program:
+Its output is the same on Windows, Linux and macOS, and the project keeps it as `expected.txt`, so a change that alters what the window does shows up as a difference. The sections from text that is not ASCII on test the three things this page warned about: offsets in bytes, a dialog that does not block, and a Quit from the system.
 
 ```text
 == a new window
@@ -1121,30 +1112,8 @@ Its output is the same on Windows, Linux and macOS. Up to the section on text th
 - **Pump after every event.** `SDL_PushEvent` only queues it; `tkApp_Pump` hands it to the window, as the loop would.
 - **Look at the window too.** The self-test checks commands, callbacks and files, not pixels: `tpad --shot` is for that.
 
-## 9. What changed from the PsControls tpad
-
-| [Notepad Tutorial](Notepad-Tutorial) (PsControls) | Here (tkControls) |
-| --- | --- |
-| `PsApplication`, `PsForm`, `f->hWindow`, `f->Item( id )` | `tkApp_Init`, `TK_FORM`, `tkForm_Widget( f )`; the `Editor` keeps its widget pointers |
-| `PsForm.FromHwnd( h )->Tag` | `tkForm_FromWidget( w )->Tag` |
-| `PostMessageW( WM_CARETMOVED )`, handled in `OnMessage` | `tkApp_RunOnUI( @CaretMoved, ed )` |
-| An accelerator table | `tkForm_OnKeyDown`: keys the text box leaves unclaimed reach the form |
-| `CISaveFileDialog` and `CIOpenFileDialog` | `SDL_ShowSaveFileDialog` and `SDL_ShowOpenFileDialog`, waited for by `PickFile`, with `picking` guarding the window meanwhile |
-| Selection offsets that match `ustring` units | UTF-8 byte offsets, converted by `offsets` |
-| Closing the window | Closing the window, and `SDL_EVENT_QUIT` through `QuitHook` |
-| `SetWindowTextW` and `GetWindowTextW` | `SDL_SetWindowTitle` and `SDL_GetWindowTitle`, in UTF-8 |
-| `EM_SCROLLCARET` after `SetSel` | Nothing: `tkTextBox_SetSel` scrolls the caret into view |
-| A status bar paint callback | Nothing: `tkStatusBar` draws its panels |
-| `OnDpiChanged` puts the monospaced font back | Nothing: a scale change keeps each control's font |
-| The Find box's default button takes Enter | The search box's Enter callback |
-| `IDYES`, `IDNO` | `MBX_IDYES`, `MBX_IDNO`; the same `MBX_BTN_*` |
-| `tpad.rc` and a manifest | Nothing: SDL3 makes the window DPI-aware |
-| `WM_KEYDOWN` and `WM_CHAR` in the self-test | `SDL_EVENT_KEY_DOWN` and `SDL_EVENT_TEXT_INPUT` |
-| `WM_DPICHANGED` in the self-test | A doubled scale and `SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED` |
-
 ### See also
 
-- [Notepad Tutorial](Notepad-Tutorial): the same program on PsControls
 - [tkApp](tkApp)
 - [tkTextBox](tkTextBox), [tkStatusBar](tkStatusBar), [tkMenuBar](tkMenuBar), [tkMessageBox](tkMessageBox)
 - [SDL3 Tutorial](SDL3-Tutorial)

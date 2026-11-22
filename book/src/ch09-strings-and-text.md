@@ -261,7 +261,9 @@ never to do is assume.
 `#import "std/strings"` brings in around forty-five operations that the language itself does not
 have. The ones above are the everyday set; the module also carries `Extract`, `Remain`, `Tally`,
 `InsertAt`, `DeleteAt`, `Shrink`, `VerifySet`, the `*Chars` family that works on sets of characters
-rather than substrings, and `Unescape`/`Unwrap` to undo their opposites.
+rather than substrings, and `Unescape`/`Unwrap` to undo their opposites. Searching for a shape
+rather than for fixed text, such as any date or any amount, takes a regular expression, which is
+`vendor/pcre2` (Chapter 28).
 
 `Split` hands back an `Array( of ustring )` — the container Chapter 24 covers. Here it is only
 asked for `.Count( )` and `[ i ]`, which is all you need to walk it.

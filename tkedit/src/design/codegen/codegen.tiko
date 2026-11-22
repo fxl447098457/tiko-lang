@@ -15,6 +15,7 @@
 #import "vendor/tkControls/tkMeta"
 #import "vendor/tkControls/tkLayout"
 #import "vendor/tkControls/tkToolbar"
+#import "vendor/tkControls/tkIconPanel"
 #import "../model"
 #import "../catalog"
 #import "../colorval"
@@ -22,6 +23,7 @@ using containers
 using tkMeta
 using tkLayout
 using tkToolbar
+using tkIconPanel
 using tkTheme
 using tkHost
 using tkPaint
@@ -67,12 +69,49 @@ private function EnumConst_( byref pairs as const ustring, byref shown as const 
     return mid( t, a, instr( a, t, "," ) - a )
 end function
 
+' A control's glyph font role: GLYPH, or GLYPH_LARGE when its GlyphSize is Large (an older file's
+' other roles, and a size in points, read as GLYPH).
+public function GlyphRole( byref c as FormControl ) as ustring
+    if SettingOr( c.Props, "GlyphFont" ) = "GLYPH_LARGE" then return "GLYPH_LARGE"
+    return "GLYPH"
+end function
+
+' A control's GlyphSize in points; 0 when it is Normal or Large (a role).
+public function GlyphPoints( byref c as FormControl ) as long
+    dim as ustring v = SettingOr( c.Props, "GlyphFont" )
+    if len( v ) = 0 then return 0
+    for i as long = 1 to len( v )
+        dim as long a = asc( mid( v, i, 1 ) )
+        if (a < 48) orelse (a > 57) then return 0
+    next
+    return valint( v )
+end function
+
+' The project's glyph numbering for the Generate that follows (appGlyphs.tkglyphs [codes], GLYPHS.md
+' V4): Key "<font>:<hex>", Value its code in the merged glyphs.ttf. Empty: a glyph is written at its
+' source font's code.
+dim shared as Array( of Setting ) gGlyphCodes_
+
+public sub SetGlyphCodes( byref codes as Array( of Setting ) )
+    gGlyphCodes_ = codes
+end sub
+
 private function ValueExpr_( byref v as const ustring, byref kind_ as const ustring, byref pairs as const ustring ) as ustring
     select case kind_
     case "bool", "int", "float" : return v
     case "enum"                 : return EnumConst_( pairs, v )
     case "color"                : return v & "ul"
-    case "font"                 : return "tkForm_Font( Wnd, TKFONT_" & v & " )"
+    case "font"                 : return "tkForm_Font( Handle, TKFONT_" & v & " )"
+    case "glyph"
+        ' "<font>:<hex>": its character in the project's merged font (appGlyphs), else the source font's
+        dim as ulong cp = GlyphCode( v )
+        if cp then
+            dim as ustring want = ucase( GlyphRef( GlyphFontKey( v ), cp ) )
+            for each s as Setting in gGlyphCodes_
+                if ucase( s.Key ) = want then return "wchr( &h" & ucase( s.Value ) & " )"
+            next
+            return "wchr( &h" & hex( cp ) & " )"
+        end if
     end select
     return Literal_( v )
 end function
@@ -135,6 +174,23 @@ private function ToolbarKindName_( byref kind_ as const ustring ) as ustring
     return "TBR_KIND_COMMAND"
 end function
 
+' The value an icon panel item's kind stands for (a toggle when none is given, as the vendor's is).
+public function IconKindValue( byref kind_ as const ustring ) as long
+    select case kind_
+    case "command"   : return IP_KIND_COMMAND
+    case "separator" : return IP_KIND_SEPARATOR
+    end select
+    return IP_KIND_TOGGLE
+end function
+
+private function IconKindName_( byref kind_ as const ustring ) as ustring
+    select case kind_
+    case "command"   : return "IP_KIND_COMMAND"
+    case "separator" : return "IP_KIND_SEPARATOR"
+    end select
+    return "IP_KIND_TOGGLE"
+end function
+
 ' Entries are given ids from here, so a dispatcher can tell them from a control's own.
 const as long ITEM_ID_BASE = 1000
 
@@ -148,7 +204,7 @@ end function
 
 private function AnyShortcut_( byref doc as FormDoc ) as boolean
     for each c as FormControl in doc.Controls
-        if catalog.ItemsKindOf( c.TypeName ) = catalog.ItemsKind.ItemsMenu then
+        if catalog.IsMenuKind( catalog.ItemsKindOf( c.TypeName ) ) then
             for each it as FormItem in c.Items
                 if len( it.Key ) then return true
             next
@@ -158,14 +214,27 @@ private function AnyShortcut_( byref doc as FormDoc ) as boolean
 end function
 
 ' The select cases that call each entry's handler. The menu ids are the entry's place in the whole
-' form, so one key table can reach every menu.
+' form, so one key table can reach every menu; a status bar's Click says which panel by its index,
+' and its handlers are told the clicks.
 private sub ItemCases_( byref c as FormControl, byval baseId as long, byref o as ustring )
+    dim as boolean status_ = (catalog.ItemsKindOf( c.TypeName ) = catalog.ItemsKind.ItemsStatus)
     for i as long = 0 to c.Items.Count( ) - 1
         if len( c.Items[i].Handler ) then
-            o &= "    case " & (baseId + i) & " : f->" & c.Items[i].Handler & "( )" & NL
+            if status_ then
+                o &= "    case " & i & " : f->" & c.Items[i].Handler & "( clicks )" & NL
+            else
+                o &= "    case " & (baseId + i) & " : f->" & c.Items[i].Handler & "( )" & NL
+            end if
         end if
     next
 end sub
+
+' Does event ev of control c reach its entries' handlers?
+private function Dispatches_( byref c as FormControl, byref ev as const ustring ) as boolean
+    if HasItemHandlers_( c ) = false then return false
+    dim as ustring want = catalog.ItemDispatchEvent( catalog.ItemsKindOf( c.TypeName ) )
+    return (len( want ) > 0) andalso (want = ev)
+end function
 
 ' Where a control's entries start numbering.
 private function ItemBase_( byref doc as FormDoc, byval idx as long ) as long
@@ -180,6 +249,12 @@ end function
 private function FirstParam_( byref sig as const ustring ) as ustring
     dim as long a = instr( sig, " " ) + 1
     return mid( sig, a, instr( a, sig, " " ) - a )
+end function
+
+' The control an event's callback is about: the metadata's expression, else its first parameter.
+private function WidgetOf_( byref ev as TKMETA_EVENT ) as ustring
+    if len( ev.Widget ) then return ev.Widget
+    return FirstParam_( ev.Sig )
 end function
 
 private function TabHeight_( byref c as FormControl ) as long
@@ -324,6 +399,25 @@ private function UsedModules_( byref doc as FormDoc ) as Array( of ustring )
         next
         if seen = false then mods.Push( mo )
     next
+    ' a type another module owns (catalog.ForeignType*): its module in scope too
+    for each c as FormControl in doc.Controls
+        dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
+        for each s as Setting in c.Events
+            dim as TKMETA_EVENT ptr e = tkMeta_FindEvent( m, s.Key )
+            if e = 0 then continue for
+            dim as ustring sig = ucase( e->Sig ) & " "
+            for t as long = 0 to catalog.ForeignTypeCount( ) - 1
+                if instr( sig, " " & catalog.ForeignTypePrefix( t ) ) then
+                    dim as ustring fm = catalog.ForeignTypeModule( t )
+                    dim as boolean seen = false
+                    for each mo as ustring in mods
+                        if mo = fm then seen = true
+                    next
+                    if seen = false then mods.Push( fm )
+                end if
+            next
+        next
+    next
     for i as long = 1 to mods.Count( ) - 1
         dim as ustring v = mods[i]
         dim as long j = i - 1
@@ -339,10 +433,10 @@ end function
 ' Each handler once, in the order of first use: one handler may serve several events.
 private sub HandlerDecls_( byref doc as FormDoc, byref o as ustring )
     dim as Array( of Setting ) all
-    dim as long i = FindSetting( doc.Events, "Load" )
-    if i >= 0 then PutSetting( all, doc.Events[i].Value, "" )
-    i = FindSetting( doc.Events, "Close" )
-    if i >= 0 then PutSetting( all, doc.Events[i].Value, "byref Cancel as boolean" )
+    for e as long = 0 to catalog.FormEventCount( ) - 1
+        dim as long i = FindSetting( doc.Events, catalog.FormEventName( e ) )
+        if i >= 0 then PutSetting( all, doc.Events[i].Value, catalog.FormEventParams( catalog.FormEventName( e ) ) )
+    next
     for c as long = 0 to doc.Controls.Count( ) - 1
         dim as TKMETA_CONTROL ptr m = catalog.Find( doc.Controls[c].TypeName )
         for each s as Setting in doc.Controls[c].Events
@@ -350,8 +444,9 @@ private sub HandlerDecls_( byref doc as FormDoc, byref o as ustring )
         next
     next
     for c as long = 0 to doc.Controls.Count( ) - 1
+        dim as ustring itemParams = catalog.ItemHandlerParams( catalog.ItemsKindOf( doc.Controls[c].TypeName ) )
         for each it as FormItem in doc.Controls[c].Items
-            if len( it.Handler ) then PutSetting( all, it.Handler, "" )
+            if len( it.Handler ) then PutSetting( all, it.Handler, itemParams )
         next
     next
     for each or_ as FormOrphan in doc.Orphans
@@ -369,22 +464,32 @@ private sub Thunks_( byref doc as FormDoc, byref o as ustring )
         dim as long kindIt = catalog.ItemsKindOf( k.TypeName )
         for e as long = 0 to m->NumEvents - 1
             dim as long i = FindSetting( k.Events, m->Events( e ).Name )
-            ' a menu's Command and a toolbar's Click also reach the handler of the entry that fired
-            dim as boolean dispatches = HasItemHandlers_( k ) andalso _
-                (((kindIt = catalog.ItemsKind.ItemsMenu) andalso (m->Events( e ).Name = "Command")) orelse _
-                 ((kindIt = catalog.ItemsKind.ItemsToolbar) andalso (m->Events( e ).Name = "Click")))
+            ' a menu's Command, a toolbar's and a status bar's Click also reach the handler of the
+            ' entry that fired (a status bar names its panel by index)
+            dim as boolean dispatches = Dispatches_( k, m->Events( e ).Name )
             if dispatches then
                 o &= "private sub Thunk_" & k.Name & "_" & m->Events( e ).Name & Parens_( m->Events( e ).Sig ) & NL
-                o &= "    dim as Form ptr f = tkForms_ObjectOf( " & FirstParam_( m->Events( e ).Sig ) & " )" & NL
+                o &= "    dim as Form ptr f = tkForms_ObjectOf( " & WidgetOf_( m->Events( e ) ) & " )" & NL
                 o &= "    if f = 0 then exit sub" & NL
-                o &= "    select case id" & NL
+                o &= "    select case " & iif( kindIt = catalog.ItemsKind.ItemsStatus, "idx", "id" ) & NL
                 ItemCases_( k, ItemBase_( doc, c ), o )
                 o &= "    end select" & NL
                 if i >= 0 then o &= "    f->" & k.Events[i].Value & Parens_( m->Events( e ).Args ) & NL
                 o &= "end sub" & NL & NL
+            elseif (i >= 0) andalso (len( m->Events( e ).Returns ) > 0) then
+                ' a callback that answers: the handler sets its byref result, which starts at the default
+                dim as TKMETA_EVENT ptr ev = @m->Events( e )
+                o &= "private function Thunk_" & k.Name & "_" & ev->Name & Parens_( ev->Sig ) & " as " & ev->Returns & NL
+                o &= "    dim as " & ev->Returns & " " & ev->Result
+                if len( ev->ResultInit ) then o &= " = " & ev->ResultInit
+                o &= NL
+                o &= "    dim as Form ptr f = tkForms_ObjectOf( " & WidgetOf_( *ev ) & " )" & NL
+                o &= "    if f then f->" & k.Events[i].Value & Parens_( ev->Args ) & NL
+                o &= "    return " & ev->Result & NL
+                o &= "end function" & NL & NL
             elseif i >= 0 then
                 o &= "private sub Thunk_" & k.Name & "_" & m->Events( e ).Name & Parens_( m->Events( e ).Sig ) & NL
-                o &= "    dim as Form ptr f = tkForms_ObjectOf( " & FirstParam_( m->Events( e ).Sig ) & " )" & NL
+                o &= "    dim as Form ptr f = tkForms_ObjectOf( " & WidgetOf_( m->Events( e ) ) & " )" & NL
                 o &= "    if f then f->" & k.Events[i].Value & Parens_( m->Events( e ).Args ) & NL
                 o &= "end sub" & NL & NL
             end if
@@ -396,23 +501,31 @@ private sub Thunks_( byref doc as FormDoc, byref o as ustring )
         o &= "    if tkKeys_Parse( s, c ) then return tkKeys_Format( c )" & NL
         o &= "    return s" & NL
         o &= "end function" & NL & NL
-        o &= "private sub Thunk_Keys( byval h as TK_HOST ptr, byval cmd as long )" & NL
-        o &= "    dim as TK_FORM ptr fm = tkForm_FromHost( h )" & NL
-        o &= "    if fm = 0 then exit sub" & NL
-        o &= "    dim as Form ptr f = fm->Tag" & NL
-        o &= "    if f = 0 then exit sub" & NL
-        o &= "    select case cmd" & NL
+        ' a shortcut whose entry has no handler yet gets no case; with none at all there is no select,
+        ' since tiko refuses one without a case (TKO0418)
+        dim as ustring cases
         for c as long = 0 to doc.Controls.Count( ) - 1
-            if catalog.ItemsKindOf( doc.Controls[c].TypeName ) = catalog.ItemsKind.ItemsMenu then
+            if catalog.IsMenuKind( catalog.ItemsKindOf( doc.Controls[c].TypeName ) ) then
                 dim as long b = ItemBase_( doc, c )
                 for i as long = 0 to doc.Controls[c].Items.Count( ) - 1
                     if (len( doc.Controls[c].Items[i].Key ) > 0) andalso (len( doc.Controls[c].Items[i].Handler ) > 0) then
-                        o &= "    case " & (b + i) & " : f->" & doc.Controls[c].Items[i].Handler & "( )" & NL
+                        cases &= "    case " & (b + i) & " : f->" & doc.Controls[c].Items[i].Handler & "( )" & NL
                     end if
                 next
             end if
         next
-        o &= "    end select" & NL
+        o &= "private sub Thunk_Keys( byval h as TK_HOST ptr, byval cmd as int32 )" & NL
+        if len( cases ) then
+            o &= "    dim as TK_FORM ptr fm = tkForm_FromHost( h )" & NL
+            o &= "    if fm = 0 then exit sub" & NL
+            o &= "    dim as Form ptr f = fm->Tag" & NL
+            o &= "    if f = 0 then exit sub" & NL
+            o &= "    select case cmd" & NL
+            o &= cases
+            o &= "    end select" & NL
+        else
+            o &= "    ' no shortcut's entry has a handler yet" & NL
+        end if
         o &= "end sub" & NL & NL
     end if
     dim as long i = FindSetting( doc.Events, "Close" )
@@ -425,6 +538,69 @@ private sub Thunks_( byref doc as FormDoc, byref o as ustring )
         o &= "    return Cancel = false" & NL
         o &= "end function" & NL & NL
     end if
+    i = FindSetting( doc.Events, "Resize" )
+    if i >= 0 then
+        o &= "private sub Thunk_Form_Resize( byval w as TK_FORM ptr, byval cx as int32, byval cy as int32 )" & NL
+        o &= "    dim as Form ptr f = w->Tag" & NL
+        o &= "    if f then f->" & doc.Events[i].Value & "( cx, cy )" & NL
+        o &= "end sub" & NL & NL
+    end if
+    i = FindSetting( doc.Events, "KeyDown" )
+    if i >= 0 then
+        o &= "private function Thunk_Form_KeyDown( byval w as TK_FORM ptr, byval keyCode as int32, byval mods as int32 ) as boolean" & NL
+        o &= "    dim as Form ptr f = w->Tag" & NL
+        o &= "    if f = 0 then return false" & NL
+        o &= "    dim as boolean Handled = false" & NL
+        o &= "    f->" & doc.Events[i].Value & "( keyCode, mods, Handled )" & NL
+        o &= "    return Handled" & NL
+        o &= "end function" & NL & NL
+    end if
+    i = FindSetting( doc.Events, "Paint" )
+    if i >= 0 then
+        o &= "private sub Thunk_Form_Paint( byval w as TK_FORM ptr, byval pPaint as TK_PAINT ptr )" & NL
+        o &= "    dim as Form ptr f = w->Tag" & NL
+        o &= "    if f then f->" & doc.Events[i].Value & "( pPaint )" & NL
+        o &= "end sub" & NL & NL
+    end if
+    i = FindSetting( doc.Events, "Destroy" )
+    if i >= 0 then
+        o &= "private sub Thunk_Form_Destroy( byval w as TK_FORM ptr )" & NL
+        o &= "    dim as Form ptr f = w->Tag" & NL
+        o &= "    if f then f->" & doc.Events[i].Value & "( )" & NL
+        o &= "end sub" & NL & NL
+    end if
+    i = FindSetting( doc.Events, "ThemeChanged" )
+    if i >= 0 then
+        o &= "private sub Thunk_Form_ThemeChanged( byval w as TK_FORM ptr )" & NL
+        o &= "    dim as Form ptr f = w->Tag" & NL
+        o &= "    if f then f->" & doc.Events[i].Value & "( )" & NL
+        o &= "end sub" & NL & NL
+    end if
+    ' MouseMove watches the form's own widget: over the form, and over controls with none of their own
+    i = FindSetting( doc.Events, "MouseMove" )
+    if i >= 0 then
+        o &= "private sub Thunk_Form_MouseMove( byval w as TK_WIDGET ptr, byval x as int32, byval y as int32, byval buttons as int32, byval mods as int32 )" & NL
+        o &= "    dim as Form ptr f = tkForms_ObjectOf( w )" & NL
+        o &= "    if f then f->" & doc.Events[i].Value & "( x, y, buttons, mods )" & NL
+        o &= "end sub" & NL & NL
+    end if
+end sub
+
+' The window's settings the form gives, each only when it isn't the run-time default.
+private sub WindowCode_( byref doc as FormDoc, byref o as ustring )
+    select case doc.StartPosition
+    case "CenterScreen" : o &= "    tkForm_SetStartPosition( Handle, TKFORM_POS_CENTER_SCREEN )" & NL
+    case "CenterOwner"  : o &= "    tkForm_SetStartPosition( Handle, TKFORM_POS_CENTER_OWNER )" & NL
+    end select
+    if len( doc.Resizable ) then o &= "    tkForm_SetResizable( Handle, " & doc.Resizable & " )" & NL
+    if (doc.MinW <> 0) orelse (doc.MinH <> 0) then o &= "    tkForm_SetMinSize( Handle, " & doc.MinW & ", " & doc.MinH & " )" & NL
+    if (doc.MaxW <> 0) orelse (doc.MaxH <> 0) then o &= "    tkForm_SetMaxSize( Handle, " & doc.MaxW & ", " & doc.MaxH & " )" & NL
+    select case doc.WindowState
+    case "Maximized" : o &= "    tkForm_SetWindowState( Handle, TKFORM_STATE_MAXIMIZED )" & NL
+    case "Minimized" : o &= "    tkForm_SetWindowState( Handle, TKFORM_STATE_MINIMIZED )" & NL
+    end select
+    if doc.AlwaysOnTop then o &= "    tkForm_SetAlwaysOnTop( Handle, true )" & NL
+    if len( doc.Icon ) then o &= "    tkForm_SetIcon( Handle, " & Literal_( doc.Icon ) & " )" & NL
 end sub
 
 ' The statements that fill a control with its entries.
@@ -443,7 +619,7 @@ private sub ItemsCode_( byref doc as FormDoc, byval idx as long, byref o as ustr
             if i < c.Items.Count( ) - 1 then hasKids = (c.Items[i + 1].Level > it.Level)
             if it.Level = 0 then
                 if hasKids then
-                    o &= "        menus( 0 ) = tkPopupMenu_Create( tkForm_Host( Wnd ) )" & NL
+                    o &= "        menus( 0 ) = tkPopupMenu_Create( tkForm_Host( Handle ) )" & NL
                     o &= "        tkMenuBar_SetDropDown( " & h & ", tkMenuBar_AddItem( " & h & ", " & TextExpr_( doc, c.Name & "." & i, it.Text ) & ", " & (base_ + i) & " ), menus( 0 ) )" & NL
                 else
                     o &= "        tkMenuBar_AddItem( " & h & ", " & TextExpr_( doc, c.Name & "." & i, it.Text ) & ", " & (base_ + i) & " )" & NL
@@ -455,20 +631,48 @@ private sub ItemsCode_( byref doc as FormDoc, byval idx as long, byref o as ustr
                 if len( it.Key ) then accel = ", KeyLabel( " & Literal_( it.Key ) & " )"
                 o &= "        tkPopupMenu_AddItem( menus( " & (it.Level - 1) & " ), " & (base_ + i) & ", " & TextExpr_( doc, c.Name & "." & i, it.Text ) & accel & " )" & NL
                 if hasKids then
-                    o &= "        menus( " & it.Level & " ) = tkPopupMenu_Create( tkForm_Host( Wnd ) )" & NL
+                    o &= "        menus( " & it.Level & " ) = tkPopupMenu_Create( tkForm_Host( Handle ) )" & NL
                     o &= "        tkPopupMenu_SetItemSubMenu( menus( " & (it.Level - 1) & " ), " & (base_ + i) & ", menus( " & it.Level & " ) )" & NL
+                end if
+            end if
+        next
+        o &= "    end scope" & NL
+    case catalog.ItemsKind.ItemsPopup
+        ' a right-click menu: level 0 is the menu that opens, each deeper level a submenu of the item above
+        if c.Items.Count( ) = 0 then exit sub
+        o &= "    scope" & NL
+        o &= "        dim as TK_MENU ptr menus( 0 to 2 )" & NL
+        o &= "        menus( 0 ) = tkContextMenu_GetMenu( " & h & " )" & NL
+        for i as long = 0 to c.Items.Count( ) - 1
+            dim as FormItem it = c.Items[i]
+            dim as boolean hasKids = false
+            if i < c.Items.Count( ) - 1 then hasKids = (c.Items[i + 1].Level > it.Level)
+            if it.Text = "-" then
+                o &= "        tkPopupMenu_AddSeparator( menus( " & it.Level & " ) )" & NL
+            else
+                dim as ustring accel
+                if len( it.Key ) then accel = ", KeyLabel( " & Literal_( it.Key ) & " )"
+                o &= "        tkPopupMenu_AddItem( menus( " & it.Level & " ), " & (base_ + i) & ", " & TextExpr_( doc, c.Name & "." & i, it.Text ) & accel & " )" & NL
+                if hasKids andalso (it.Level < 2) then
+                    o &= "        menus( " & (it.Level + 1) & " ) = tkPopupMenu_Create( tkForm_Host( Handle ) )" & NL
+                    o &= "        tkPopupMenu_SetItemSubMenu( menus( " & it.Level & " ), " & (base_ + i) & ", menus( " & (it.Level + 1) & " ) )" & NL
                 end if
             end if
         next
         o &= "    end scope" & NL
     case catalog.ItemsKind.ItemsToolbar
         for i as long = 0 to c.Items.Count( ) - 1
-            o &= "    tkToolbar_AddItem( " & h & ", " & ToolbarKindName_( c.Items[i].Kind ) & ", " & Literal_( c.Items[i].Glyph ) & ", " & TextExpr_( doc, c.Name & "." & i, c.Items[i].Text ) & ", " & (base_ + i) & " )" & NL
+            o &= "    tkToolbar_AddItem( " & h & ", " & ToolbarKindName_( c.Items[i].Kind ) & ", " & ValueExpr_( c.Items[i].Glyph, "glyph", "" ) & ", " & TextExpr_( doc, c.Name & "." & i, c.Items[i].Text ) & ", " & (base_ + i) & " )" & NL
+        next
+    case catalog.ItemsKind.ItemsIcons
+        for i as long = 0 to c.Items.Count( ) - 1
+            o &= "    tkIconPanel_AddItem( " & h & ", " & IconKindName_( c.Items[i].Kind ) & ", " & ValueExpr_( c.Items[i].Glyph, "glyph", "" ) & ", " & (base_ + i) & " )" & NL
         next
     case catalog.ItemsKind.ItemsStatus
         for i as long = 0 to c.Items.Count( ) - 1
             o &= "    tkStatusBar_AddPanel( " & h & ", " & TextExpr_( doc, c.Name & "." & i, c.Items[i].Text ) & " )" & NL
             if c.Items[i].Width then o &= "    tkStatusBar_SetPanelMinWidth( " & h & ", " & i & ", " & c.Items[i].Width & " )" & NL
+            if c.Items[i].Stretch then o &= "    tkStatusBar_SetPanelStretch( " & h & ", " & i & ", true )" & NL
         next
     case catalog.ItemsKind.ItemsColumns
         for i as long = 0 to c.Items.Count( ) - 1
@@ -479,7 +683,14 @@ private sub ItemsCode_( byref doc as FormDoc, byval idx as long, byref o as ustr
         next
     case catalog.ItemsKind.ItemsList
         for i as long = 0 to c.Items.Count( ) - 1
-            o &= "    tkComboBox_AddItem( " & h & ", " & TextExpr_( doc, c.Name & "." & i, c.Items[i].Text ) & " )" & NL
+            o &= "    " & catalog.ItemsAddProc( c.TypeName ) & "( " & h & ", " & TextExpr_( doc, c.Name & "." & i, c.Items[i].Text ) & " )" & NL
+        next
+    case catalog.ItemsKind.ItemsTabs
+        for i as long = 0 to c.Items.Count( ) - 1
+            o &= "    tkTabBar_AddTab( " & h & ", " & TextExpr_( doc, c.Name & "." & i, c.Items[i].Text ) & " )" & NL
+            if len( c.Items[i].Glyph ) then
+                o &= "    tkTabBar_SetGlyph( " & h & ", " & i & ", " & ValueExpr_( c.Items[i].Glyph, "glyph", "" ) & " )" & NL
+            end if
         next
     end select
 end sub
@@ -511,7 +722,7 @@ private sub CreateControl_( byref doc as FormDoc, byval idx as long, byref sz as
     dim as FormControl c = doc.Controls[idx]
     dim as TKMETA_CONTROL ptr m = catalog.Find( c.TypeName )
 
-    dim as ustring parent_ = "tkForm_Widget( Wnd )"
+    dim as ustring parent_ = "tkForm_Widget( Handle )"
     if len( c.Parent ) then
         dim as FormControl pc = doc.Controls[FindControl( doc, c.Parent )]
         parent_ = ChildParent_( pc, catalog.Find( pc.TypeName )->ContainerKind, c.Page )
@@ -523,15 +734,30 @@ private sub CreateControl_( byref doc as FormDoc, byval idx as long, byref sz as
     end if
     o &= " )" & NL
 
-    o &= "    tkLayout_Add( Layout, " & c.Name & ".Handle, " & c.X & ", " & c.Y & ", " & c.W & ", " & c.H
-    if (c.Anchor <> TK_ANCHOR_DEFAULT) orelse (c.Dock <> TK_DOCK_NONE) then o &= ", " & AnchorExpr_( c.Anchor )
-    if c.Dock <> TK_DOCK_NONE then o &= ", " & DockExpr_( c.Dock )
-    o &= " )" & NL
+    ' a component (a Timer) is never shown: nothing to lay out
+    if m->Visual then
+        o &= "    tkLayout_Add( Layout, " & c.Name & ".Handle, " & c.X & ", " & c.Y & ", " & c.W & ", " & c.H
+        if (c.Anchor <> TK_ANCHOR_DEFAULT) orelse (c.Dock <> TK_DOCK_NONE) then o &= ", " & AnchorExpr_( c.Anchor )
+        if c.Dock <> TK_DOCK_NONE then o &= ", " & DockExpr_( c.Dock )
+        o &= " )" & NL
+        ' Tab order set in the designer (Design > Tab Order): each control its place among its siblings
+        dim as boolean anyTab = false
+        for each x as FormControl in doc.Controls
+            if x.TabIndex > 0 then anyTab = true
+        next
+        if anyTab then
+            dim as Array( of long ) ranks = TabRanks( doc )
+            o &= "    tkHost.tkWidget_SetTabIndex( " & c.Name & ".Handle, " & ranks[idx] & " )" & NL
+        end if
+    end if
 
     ' A tab control's pages exist before its properties are set, and before its children.
     if m->ContainerKind = TKMETA_CONTAINER_PAGES then
         for p as long = 0 to c.Pages.Count( ) - 1
             o &= "    tkTabControl_AddPage( " & c.Name & ".Handle, " & TextExpr_( doc, c.Name & ".Page" & p, c.Pages[p] ) & " )" & NL
+            if len( PageGlyph( c, p ) ) then
+                o &= "    tkTabControl_SetPageGlyph( " & c.Name & ".Handle, " & p & ", " & ValueExpr_( PageGlyph( c, p ), "glyph", "" ) & " )" & NL
+            end if
         next
     end if
 
@@ -540,6 +766,8 @@ private sub CreateControl_( byref doc as FormDoc, byval idx as long, byref sz as
     for each s as Setting in c.Props
         if (s.Key = "Enabled") orelse (s.Key = "Visible") then
             o &= "    " & c.Name & "." & s.Key & " = " & s.Value & NL
+        elseif s.Key = "GlyphFont" then
+            ' below: every control with a glyph font gets the GLYPH role (GLYPHS.md, Glyph size)
         elseif s.Key <> m->CreateArg then
             dim as TKMETA_PROP ptr p = tkMeta_FindProp( m, s.Key )
             if p->Kind = "list" then
@@ -552,16 +780,35 @@ private sub CreateControl_( byref doc as FormDoc, byval idx as long, byref sz as
         end if
     next
 
+    ' its glyphs (and tkControls' own icons it draws) in the GLYPH font: GlyphSize Large is GLYPH_LARGE,
+    ' a size in points the GLYPH font's file opened at it (the form's surface keeps it)
+    if tkMeta_FindProp( m, "GlyphFont" ) then
+        if GlyphPoints( c ) > 0 then
+            ' and the icon box as tall as the font, so the glyph isn't clipped -- unless it has its own size
+            dim as boolean fit = (tkMeta_FindProp( m, "IconSize" ) <> 0) andalso (FindSetting( c.Props, "IconSize" ) < 0)
+            ' (a tab bar's glyph box is one width)
+            dim as boolean fitW = (tkMeta_FindProp( m, "IconWidth" ) <> 0) andalso (FindSetting( c.Props, "IconWidth" ) < 0)
+            o &= "    scope" & NL
+            o &= "        dim as TTF_Font ptr gf_ = tkHost.tkHost_OpenFont( tkForm_Host( Handle ), tkApp_GlyphFace( ), " & GlyphPoints( c ) & " )" & NL
+            o &= "        " & c.Name & ".GlyphFont = gf_" & NL
+            if fit then o &= "        " & c.Name & ".IconSize( TTF_GetFontHeight( gf_ ), TTF_GetFontHeight( gf_ ) )" & NL
+            if fitW then o &= "        " & c.Name & ".IconWidth = TTF_GetFontHeight( gf_ )" & NL
+            o &= "    end scope" & NL
+        else
+            o &= "    " & c.Name & ".GlyphFont = tkForm_Font( Handle, TKFONT_" & GlyphRole( c ) & " )" & NL
+        end if
+    end if
+
     ColorsCode_( c, m, o )
 
     for e as long = 0 to m->NumEvents - 1
         dim as boolean wired = (FindSetting( c.Events, m->Events( e ).Name ) >= 0)
-        if HasItemHandlers_( c ) then
-            if ((catalog.ItemsKindOf( c.TypeName ) = catalog.ItemsKind.ItemsMenu) andalso (m->Events( e ).Name = "Command")) orelse _
-               ((catalog.ItemsKindOf( c.TypeName ) = catalog.ItemsKind.ItemsToolbar) andalso (m->Events( e ).Name = "Click")) then wired = true
-        end if
+        if Dispatches_( c, m->Events( e ).Name ) then wired = true
         if wired then
             o &= "    " & m->Events( e ).SetName & "( " & c.Name & ".Handle, @Thunk_" & c.Name & "_" & m->Events( e ).Name & " )" & NL
+        elseif len( m->Events( e ).Fallback ) then
+            ' unbound, the control still needs one (a ListTree draws no row by itself)
+            o &= "    " & m->Events( e ).SetName & "( " & c.Name & ".Handle, @" & m->Events( e ).Fallback & " )" & NL
         end if
     next
 
@@ -624,7 +871,7 @@ public function Generate( byref doc as FormDoc, byref moduleName as const ustrin
     dim as boolean needsMenu = false
     dim as boolean needsKeys = AnyShortcut_( doc )
     for i as long = 0 to doc.Controls.Count( ) - 1
-        if (catalog.ItemsKindOf( doc.Controls[i].TypeName ) = catalog.ItemsKind.ItemsMenu) andalso (doc.Controls[i].Items.Count( ) > 0) then needsMenu = true
+        if catalog.IsMenuKind( catalog.ItemsKindOf( doc.Controls[i].TypeName ) ) andalso (doc.Controls[i].Items.Count( ) > 0) then needsMenu = true
     next
     for i as long = 0 to doc.Controls.Count( ) - 1
         dim as TKMETA_CONTROL ptr m = catalog.Find( doc.Controls[i].TypeName )
@@ -671,17 +918,24 @@ public function Generate( byref doc as FormDoc, byref moduleName as const ustrin
 
     o &= "sub Form.Build( byval owner as TK_FORM ptr = nullptr )" & NL
     o &= "    OpenWindow( " & TextExpr_( doc, "Caption", doc.Caption ) & ", " & doc.ClientW & ", " & doc.ClientH & ", owner )" & NL
-    o &= "    if Wnd = 0 then exit sub" & NL
-    o &= "    tkLayout_AddContainer( Layout, tkForm_Widget( Wnd ), " & doc.ClientW & ", " & doc.ClientH & " )" & NL
+    o &= "    if Handle = 0 then exit sub" & NL
+    WindowCode_( doc, o )
+    o &= "    tkLayout_AddContainer( Layout, tkForm_Widget( Handle ), " & doc.ClientW & ", " & doc.ClientH & " )" & NL
     for i as long = 0 to doc.Controls.Count( ) - 1
         CreateControl_( doc, i, sz, o )
     next
-    if FindSetting( doc.Events, "Close" ) >= 0 then o &= "    tkForm_OnClose( Wnd, @Thunk_Form_Close )" & NL
+    if FindSetting( doc.Events, "Close" ) >= 0 then o &= "    tkForm_OnClose( Handle, @Thunk_Form_Close )" & NL
+    if FindSetting( doc.Events, "Resize" ) >= 0 then o &= "    ResizeHook = @Thunk_Form_Resize" & NL
+    if FindSetting( doc.Events, "KeyDown" ) >= 0 then o &= "    tkForm_OnKeyDown( Handle, @Thunk_Form_KeyDown )" & NL
+    if FindSetting( doc.Events, "Paint" ) >= 0 then o &= "    tkForm_OnPaint( Handle, @Thunk_Form_Paint )" & NL
+    if FindSetting( doc.Events, "Destroy" ) >= 0 then o &= "    DestroyHook = @Thunk_Form_Destroy" & NL
+    if FindSetting( doc.Events, "ThemeChanged" ) >= 0 then o &= "    tkForm_OnThemeChanged( Handle, @Thunk_Form_ThemeChanged )" & NL
+    if FindSetting( doc.Events, "MouseMove" ) >= 0 then o &= "    tkWidget_SetMouseMoveCallback( tkForm_Widget( Handle ), @Thunk_Form_MouseMove )" & NL
     if AnyShortcut_( doc ) then
         o &= "    scope" & NL
         o &= "        dim as TK_KEYMAP ptr keys = tkKeys_MapCreate( )" & NL
         for c as long = 0 to doc.Controls.Count( ) - 1
-            if catalog.ItemsKindOf( doc.Controls[c].TypeName ) = catalog.ItemsKind.ItemsMenu then
+            if catalog.IsMenuKind( catalog.ItemsKindOf( doc.Controls[c].TypeName ) ) then
                 dim as long b = ItemBase_( doc, c )
                 for k as long = 0 to doc.Controls[c].Items.Count( ) - 1
                     if len( doc.Controls[c].Items[k].Key ) then
@@ -690,9 +944,14 @@ public function Generate( byref doc as FormDoc, byref moduleName as const ustrin
                 next
             end if
         next
-        o &= "        tkKeys_Attach( tkForm_Host( Wnd ), keys, @Thunk_Keys )" & NL
+        o &= "        tkKeys_Attach( tkForm_Host( Handle ), keys, @Thunk_Keys )" & NL
         o &= "    end scope" & NL
     end if
+    ' context menus, once every control and every PopupMenu exists
+    for each c as FormControl in doc.Controls
+        if len( c.ContextMenu ) then o &= "    tkContextMenu_Attach( " & c.ContextMenu & ".Handle, " & c.Name & ".Handle )" & NL
+    next
+    if len( doc.ContextMenu ) then o &= "    tkContextMenu_Attach( " & doc.ContextMenu & ".Handle, tkForm_Widget( Handle ) )" & NL
     o &= "    tkLayout_Apply( Layout )" & NL
     dim as long i = FindSetting( doc.Events, "Load" )
     if i >= 0 then o &= "    " & doc.Events[i].Value & "( )" & NL

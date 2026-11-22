@@ -4,11 +4,13 @@
 
 > **In tiko.** Owner-drawn controls on **SDL3 and SDL_ttf**, for **Windows, Linux and macOS**, written in tiko. They ship with the toolchain as modules of the `vendor` package, source only: `#import "vendor/tkControls/tkButton"` and nothing on the command line.
 
-tkControls is the cross-platform twin of [PsControls](Category-PsControls): the same controls, the same callbacks and the same silent setters, drawn into SDL windows instead of Win32 ones. One program builds and runs on all three systems unchanged. The two families are separate and never share names: `tkButton_SetText` here, `PsButton_SetText` there.
+Each control is driven through procedures and callbacks: setters change it silently, and only what the user does fires a callback. One program builds and runs on all three systems unchanged.
 
 Every control draws itself. There is no system control underneath, so a window looks the same on every machine and can be themed to any palette, dark ones included.
 
-To draw a window instead of coding it, see the [Form Designer](Form-Designer).
+To draw a window instead of coding it, see the [Form Designer](Form-Designer). To give a program a
+colour scheme, styles and light/dark switching, see the [Themes Tutorial](Themes-Tutorial). The
+[Contacts Tutorial](Contacts-Tutorial) builds a complete program in the designer, with SQLite.
 
 ## Importing a control
 
@@ -29,7 +31,7 @@ Every module imports [tkHost](tkHost), the widget core, and through it `vendor/S
 
 A module that comes in through another one's import is named only after that one's `using`: write `using tkButton` before `using tkHost`, and `using tkHost` before `using tkPaint`. The other order stops with `TKO0923`.
 
-Runnable demos and a self-test for every control are in the toolchain's `examples/tkControls/`, one folder each, built with [`tiko build`](Category-Tiko-Build). `examples/tkControls/tpad` is the program of the [Notepad2 Tutorial](Notepad2-Tutorial): the [Notepad Tutorial](Notepad-Tutorial)'s text editor rebuilt on tkControls, running on Windows, Linux and macOS.
+Runnable demos and a self-test for every control are in the toolchain's `examples/tkControls/`, one folder each, built with [`tiko build`](Category-Tiko-Build). `examples/tkControls/tpad` is the program of the [Notepad Tutorial](Notepad2-Tutorial): a text editor running on Windows, Linux and macOS.
 
 ## The application framework
 
@@ -82,9 +84,10 @@ The toolchain's `examples/tkControls/tkApp` is a starter to copy: a form with a 
 | Command surfaces | [tkMenuBar](tkMenuBar), [tkToolbar](tkToolbar), [tkIconPanel](tkIconPanel), [tkStatusBar](tkStatusBar) |
 | Containers and layout | [tkPanel](tkPanel), [tkGroupBox](tkGroupBox), [tkTabControl](tkTabControl), [tkSplitter](tkSplitter) |
 | Scrolling | [tkScrollPanel](tkScrollPanel), [tkVScrollBar](tkVScrollBar), [tkHScrollBar](tkHScrollBar) |
-| Popups and feedback | [tkMessageBox](tkMessageBox), [tkColorPicker](tkColorPicker), [tkFileDialog](tkFileDialog), [tkTooltip](tkTooltip), [tkProgressBar](tkProgressBar) |
+| Popups and feedback | [tkMessageBox](tkMessageBox), [tkColorPicker](tkColorPicker), [tkFileDialog](tkFileDialog), [tkTooltip](tkTooltip), [tkProgressBar](tkProgressBar), [tkSpinner](tkSpinner) |
 | Static display | [tkLabel](tkLabel), [tkPicture](tkPicture) |
 | Data display | [tkChart](tkChart) |
+| Components | [tkTimer](tkTimer), [tkContextMenu](tkContextMenu) |
 
 ## Support modules
 
@@ -105,21 +108,19 @@ The toolchain's `examples/tkControls/tkApp` is a starter to copy: a form with a 
 
 [tkCodeEdit](tkCodeEdit) hosts **scintk**, a Scintilla build for tkControls, loaded at run time and copied beside the program as `scintk.dll` or `libscintk.so` when the program imports tkCodeEdit.
 
-## Coming from PsControls
+## How a control is made
 
-The controls keep PsControls' names with a `tk` prefix: `PsButton_*` is `tkButton_*`, `PSBUTTON_*` is `TKBUTTON_*`, and `PsApp`'s `PsApplication` / `PsForm` become `tkApp_*` / `tkForm_*` procedures over a `TK_FORM ptr`. What changes is what Win32 provided:
+Each control's procedures are named `tk<Name>_*` (`tkButton_SetText`) and its constants `TK<NAME>_*` (`TKBUTTON_*`); a form is a `TK_FORM ptr` driven by `tkApp_*` and `tkForm_*` procedures.
 
-- A control is a `TK_WIDGET ptr`, not an `HWND`, and `Create` takes the parent widget and an id. A form's own widget is `tkForm_Widget( f )`.
-- Fonts are `TTF_Font ptr` (SDL_ttf), not `HFONT`; images load through SDL_image.
-- Colours are `ulong` ARGB (`tkRGB( r, g, b )`), not `COLORREF`.
-- Messages are `TKM_*`, shaped like the `WM_*` ones they replace; there is no message pump to filter and no `PsRegistry`.
-- Scale replaces DPI: a form reports `tkForm_OnScaleChanged` when it moves to a monitor with a different scale.
-
-Each control's page lists its own differences. The PsControls page of the same control remains the behaviour reference for everything else.
+- A control is a `TK_WIDGET ptr`, and `Create` takes the parent widget and an id. A form's own widget is `tkForm_Widget( f )`.
+- Fonts are `TTF_Font ptr` (SDL_ttf); images load through SDL_image.
+- Colours are `ulong` ARGB (`tkRGB( r, g, b )`).
+- A widget's messages are `TKM_*`.
+- A form reports `tkForm_OnScaleChanged` when it moves to a monitor with a different scale.
 
 ## Requirements
 
-- **Windows or Linux** (x86-64), or **macOS** on Apple Silicon.
+- **Windows** (x86-64), **Linux** (x86-64 or arm64), or **macOS** on Apple Silicon.
 - **SDL3, SDL3_ttf and SDL3_image.** On Windows the toolchain ships them and copies them beside the program. On Linux the program links the system's libraries: install the distribution's SDL3 development packages. On macOS it links Homebrew's: `brew install sdl3 sdl3_ttf sdl3_image`. See [Vendor Packages](Vendor-Packages).
 
 ## Licence
@@ -128,9 +129,7 @@ Each control's page lists its own differences. The PsControls page of the same c
 
 ### See also
 
-- [PsControls](Category-PsControls)
 - [Vendor Packages](Vendor-Packages)
 - [SDL3 Tutorial](SDL3-Tutorial)
-- [Notepad2 Tutorial](Notepad2-Tutorial)
-- [Notepad Tutorial](Notepad-Tutorial)
+- [Notepad Tutorial](Notepad2-Tutorial)
 - [tiko build](Category-Tiko-Build)

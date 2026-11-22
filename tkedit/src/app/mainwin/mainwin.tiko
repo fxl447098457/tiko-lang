@@ -17,11 +17,12 @@
 ' an empty untitled one (Blank) that no tab, list or status line shows -- the start panel stands
 ' in its pane's place instead, a few commands with their keys (tka/startpanel, author 2026-11-02).
 '
-' Configuration is files only (D15): settings.toml, keybindings.toml and the theme are opened as
+' Configuration is files (D15): settings.toml, keybindings.toml and the theme are opened as
 ' buffers like any text, and saving one re-applies it at once. A file that does not parse leaves
 ' the previous values in force and says why in the status line's message panel. settings.toml is
 ' rewritten to list every key at its value in force when tkEdit starts and before it is opened;
-' keybindings.toml every command at its chord, the same way.
+' keybindings.toml every command at its chord, the same way. Ctrl+K edits the shortcuts in a
+' dialog (tka/keysdlg) whose OK writes keybindings.toml and applies it.
 #module "mainwin"
 
 #import "std/containers"
@@ -62,10 +63,16 @@
 #import "tkd/itemsdlg"
 #import "tkd/themecenter"
 #import "tkd/colorsdlg"
+#import "tkd/resdlg"
+#import "tkd/resfile"
+#import "tkd/glyphdlg"
+#import "tkd/glyphfile"
+#import "tkd/model"
 #import "tkd/themefile"
 #import "tka/editor"
 #import "tka/explorer"
 #import "tka/findstrip"
+#import "tka/keysdlg"
 #import "tka/outputpane"
 #import "tka/popuplist"
 #import "tka/startpanel"
@@ -156,6 +163,7 @@ const OUTPUT_MIN_CY = 80                  ' unscaled
 const TABMENU_OTHERS = 9001               ' the tab menu's rows that are no command of the table
 const TABMENU_LEFT = 9002
 const TABMENU_RIGHT = 9003
+const DESIGNMENU_DELETE = 9010            ' the designer menu's row that is no command of the table
 const ID_SIDE = 117                       ' the explorer ([ui] explorer)
 const ID_SIDEBAR = 118                    ' the bar between it and everything else
 const SIDE_MIN_PANES_CX = 200             ' what the explorer leaves the editors, unscaled
@@ -172,7 +180,7 @@ public enum StatusPanel explicit
     Position            ' Ln, Col; a click opens Go to Line, or closes it
     Project             ' "Project": a click opens the project's options file as text (no project: makes one first)
     Settings            ' "Settings": a click opens settings.toml
-    Keys                ' "Keys": a click opens keybindings.toml
+    Keys                ' "Keys": a click opens the Keyboard Shortcuts dialog
     Build               ' the build configuration; a click picks one, and makes it settings.toml's default
     Encoding            ' a click picks one
     LineEnding          ' a click converts
@@ -218,9 +226,13 @@ end type
 ' The person, as the window asks them things: a message box, a file dialog. The self-test
 ' answers from a script instead.
 public type AskProc as function( byval f as TK_FORM ptr, byref text as const ustring, byval buttons as long ) as long
+' A self-test's Glyph Picker: given the dialog's fonts, says which one (fi) and which character.
+public type GlyphPickProc as sub( byval w as any ptr, byref dlg as glyphdlg.GlyphDialog, byref fi as long, byref picked as ustring )
 public type PickProc as function( byval f as TK_FORM ptr, byval kind as long, byref suggest as const ustring ) as ustring
 public const PICK_OPEN_MANY = 100        ' a Pick kind: open several files; the paths one per line
-public const PICK_COMPILER = 101         ' a Pick kind: the tiko compiler (tiko.exe on Windows)
+public const PICK_RESOURCES = 101        ' a Pick kind: images and fonts for the Resource Center, one per line
+public const PICK_COMPILER = 102        ' a Pick kind: the tiko compiler (tiko.exe on Windows)
+public const PICK_FONT = 103            ' a Pick kind: a font file (the Glyph Picker's Add)
 public type DocRef as documents.Document ptr
 ' Starting a program (Run): argv[0] is the program. The self-test records instead.
 public type LaunchProc as function( byref argv as const Array( of ustring ), byref workDir as const ustring ) as boolean
@@ -380,7 +392,16 @@ private function PickNow( byval f as TK_FORM ptr, byval kind as long, byref sugg
         if platform.CurrentOs( ) = platform.Os.Windows then cf = i18n.Tr( "dialog.filter_compiler", "tiko compiler" ) & "|exe"
         return tkFileDialog_OpenFile( tkForm_Host( f ), cf, where )
     end if
-    if kind = PICK_OPEN_MANY then
+    if kind = PICK_FONT then
+        filters = i18n.Tr( "dialog.filter_fonts", "Fonts" ) & "|ttf;otf|" & i18n.Tr( "dialog.filter_all", "All files" ) & "|*"
+        return tkFileDialog_OpenFile( tkForm_Host( f ), filters, where )
+    end if
+    if kind = PICK_RESOURCES then
+        ' All files first (author): the Center takes any file a program may ship
+        filters = i18n.Tr( "dialog.filter_all", "All files" ) & "|*|" & _
+                  i18n.Tr( "dialog.filter_resources", "Images and fonts" ) & "|png;jpg;jpeg;bmp;ico;gif;webp;tga;svg;ttf;otf"
+    end if
+    if (kind = PICK_OPEN_MANY) orelse (kind = PICK_RESOURCES) then
         dim as Array( of ustring ) paths
         if tkFileDialog_Wait( TKFD_OPEN, tkForm_Host( f ), filters, where, true, paths ) = false then return ""
         dim as ustring all_ = ""
@@ -431,6 +452,10 @@ public type Window
     ConfigDir as ustring                ' settings.toml, keybindings.toml, session.toml, themes/
     Ask as AskProc
     Pick as PickProc
+    GlyphPick as GlyphPickProc          ' 0 = the Glyph Picker dialog; a self-test answers in its place
+    GlyphList as glyphfile.GlyphDoc     ' while the Glyph Picker is up: the project's list it edits
+    GlyphListChanged as boolean
+    GlyphsReady as boolean              ' PrepareForms built the glyphs: its WriteGenerated calls need not
     Launch as LaunchProc
 
     ' ---- the App state
@@ -550,6 +575,7 @@ public type Window
     StartMax as boolean                 ' Show maximizes it (session.toml said so)
     editMenu as TK_MENU ptr             ' a view's right-click menu
     tabMenu as TK_MENU ptr              ' a tab's right-click menu
+    designMenu as TK_MENU ptr           ' the form designer's right-click menu
     accel as TK_KEYMAP ptr
     diskTimer as long
     inboxTimer as long                  ' reads <config>/inbox while this window is the first tkEdit
@@ -604,6 +630,9 @@ public type Window
     declare function NewConsoleProject( byref folder as const ustring ) as boolean
     declare function NewFormProject( byref folder as const ustring ) as boolean
     ItemsDlg as itemsdlg.ItemsEditor ptr
+    KeysDlg as keysdlg.KeysDialog ptr
+    declare sub OpenKeys( )                                      ' the Keyboard Shortcuts dialog, not yet modal
+    declare sub FinishKeys( byval apply_ as boolean )
     ThemeDlg as themecenter.ThemeDialog ptr
     declare sub OpenThemeCenter( )
     declare sub OpenThemeCenterOn( byref path as const ustring, byval forEditor as boolean )
@@ -615,13 +644,30 @@ public type Window
     ItemsName as ustring
     declare sub OpenItems( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
     declare sub FinishItems( byval apply_ as boolean )
-    declare sub EditItems( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
+    declare sub EditItems( byval c as canvas.FormCanvas ptr, byref name_ as const ustring, byval seed as boolean = false )
+    declare sub ApplyAppIcon( byref doc as resfile.ResourceDoc, byref tkresPath as const ustring )
+    declare function AskParent( byref what as const ustring, byval n as long, byref parent as const ustring, byref page as const ustring ) as boolean
     ColorsDlg as colorsdlg.ColorsDialog ptr
     ColorsOf as canvas.FormCanvas ptr
     ColorsName as ustring
     declare sub OpenColors( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
     declare sub FinishColors( byval apply_ as boolean )
     declare sub EditColors( byval c as canvas.FormCanvas ptr, byref name_ as const ustring )
+    ResDlg as resdlg.ResourceDialog ptr
+    ResRegistered as Array( of ustring )        ' the "res:" names this process has given tkHost
+    ResPickCanvas as canvas.FormCanvas ptr      ' while a "..." has the Center up: its form, and the
+    ResPickProp as ustring                      ' property of its selection (or the form) picked for
+    declare function EditResources( byref kind_ as const ustring, byref current as const ustring, byref picked as ustring, _
+                                    byval owner_ as TK_FORM ptr = 0 ) as boolean
+    declare sub ApplyResources( byref dlg as resdlg.ResourceDialog )
+    declare function ResourceUsers( byref nm as const ustring ) as ustring
+    declare function PickGlyph( byref current as const ustring, byref picked as ustring ) as boolean
+    declare function GlyphsPath( ) as ustring
+    declare function GlyphFontPaths( ) as Array( of model.Setting )
+    declare function GlyphUsers( byref key_ as const ustring ) as ustring
+    declare sub SaveGlyphList( )
+    declare sub BuildGlyphs( )
+    declare sub RegisterProjectResources( )
     SaveNote as ustring
     declare function DocOfCanvas( byval c as canvas.FormCanvas ptr ) as DocRef
     declare function OpenQuietly( byref path as const ustring ) as DocRef
@@ -629,16 +675,24 @@ public type Window
     declare sub PutCodeText( byval d as DocRef, byref newText as const ustring )
     declare sub WireHandler( byval c as canvas.FormCanvas ptr, byref name_ as const ustring, byref event_ as const ustring, byval jump as boolean )
     declare function HandlerGone( byval c as canvas.FormCanvas ptr, byref handler as const ustring ) as boolean
+    declare function HandlerRenamed( byval c as canvas.FormCanvas ptr, byref oldName as const ustring, byref newName as const ustring ) as boolean
     declare sub ControlRenamed( byval c as canvas.FormCanvas ptr, byref oldName as const ustring, byref newName as const ustring )
     declare sub ReconcileDesigner( byval d as DocRef )
     declare function WriteGenerated( byval d as DocRef ) as boolean
     declare function WriteThemeGenerated( byref path as const ustring, byref text as const ustring ) as boolean
+    declare function ResourcesPath( ) as ustring
+    declare function WriteResourcesGenerated( byref path as const ustring, byref text as const ustring ) as boolean
+    declare sub CopyResourceFiles( byref exePath as const ustring )
     declare function PrepareForms( ) as boolean
     declare sub ToggleFormView( )
+    declare function HasFormPartner( byval d as DocRef ) as boolean
+    declare function OpenCodeDocOf( byval formDoc as DocRef ) as DocRef
     declare sub AddFormOverlay( byval d as DocRef, byref o as parser.ScanOptions )
     Palettes as panels.DesignPanels
     declare sub BuildMenus( )                                    ' the menu bar's text and shortcuts
     declare sub SetShowMenu( byval onOff as boolean )            ' now, and kept in settings.toml
+    declare function KeepTheme( byref nm as const ustring, byref mode as const ustring ) as boolean
+    declare function AskOver( byval f as TK_FORM ptr, byref text as const ustring, byval buttons as long ) as long
     declare sub SetShowExplorer( byval onOff as boolean )        ' likewise
 
     ' ---- configuration
@@ -657,6 +711,7 @@ public type Window
                                  byval lenTyped as long )
     declare sub LabelEditMenu( )
     declare sub LabelTabMenu( )
+    declare sub LabelDesignMenu( )
     declare sub SyncSettingsFile( )
     declare sub ApplyStatusPanels( )
     declare sub SyncKeysFile( )
@@ -693,6 +748,7 @@ public type Window
     declare sub RenameActive( )
     declare sub DuplicateActive( )
     declare sub ShowTabMenu( byval idx as long, byval x as long, byval y as long )
+    declare sub ShowDesignMenu( byval c as canvas.FormCanvas ptr, byval x as long, byval y as long )
     declare function SaveAll( ) as boolean
     declare sub ToggleSplit( byval mode as session.SplitMode )
     declare sub FocusPane( byval second as boolean )
@@ -814,6 +870,18 @@ private function AskPerson( byval f as TK_FORM ptr, byref text as const ustring,
     return r
 end function
 
+' A question over one of tkEdit's dialogs: Ask assumes its form's Tag is the Window (a dialog's is
+' the dialog), so the box is made here, in the dialog's own fonts. A test's scripted Ask still answers.
+function Window.AskOver( byval f as TK_FORM ptr, byref text as const ustring, byval buttons as long ) as long
+    if (f = 0) orelse (Ask <> @AskPerson) then return Ask( iif( f <> 0, f, form ), text, buttons )
+    dim as TK_WIDGET ptr box = NewAskBox( tkForm_Widget( f ), text, buttons )
+    if box = 0 then return 0
+    modalDepth += 1                              ' timers still fire in the modal loop: CheckInbox waits
+    dim as long r = tkMessageBox_DoModal( box )
+    modalDepth -= 1
+    return r
+end function
+
 private function WindowOfHost( byval h as TK_HOST ptr ) as Window ptr
     dim as TK_FORM ptr f = tkForm_FromHost( h )
     if f = 0 then return 0
@@ -911,6 +979,18 @@ function Window.Create( byval forcedScale as single ) as boolean
         for each id as Cmd in t.InGroup( cast( MenuGroup, idx ) )
             tkPopupMenu_SetItemEnabled( hPopup, clng( id ), mw->CanRun( id ) )
         next
+        ' Lock Controls is checked while everything it acts on is locked
+        if idx = clng( MenuGroup.Design ) then
+            dim as DocRef d = mw->Active( )
+            dim as boolean locked_ = false, tabMode = false
+            if (d <> 0) andalso (mw->ShowsStart( ) = false) andalso (d->Designer <> 0) then
+                locked_ = edits.AllLocked( d->Designer->Doc, d->Designer->Selected )
+                tabMode = d->Designer->TabOrderMode
+            end if
+            tkPopupMenu_SetItemChecked( hPopup, clng( Cmd.FormLockControls ), locked_ )
+            ' and Tab Order while its mode is on
+            tkPopupMenu_SetItemChecked( hPopup, clng( Cmd.FormTabOrder ), tabMode )
+        end if
         ' one row starts a session and continues a stopped one (tiko-editor-tiko's)
         if idx = clng( MenuGroup.Debug ) then
             dim as ustring cap = i18n.Tr( "commands.StartDebugging", "Start Debugging" )
@@ -1018,6 +1098,30 @@ function Window.Create( byval forcedScale as single ) as boolean
         case else : mw->Execute( cast( Cmd, id ) )
         end select
         mw->FocusEditor( )
+    end sub )
+
+    ' the form designer's right-click menu: the selection's commands through Execute
+    designMenu = tkPopupMenu_Create( tkForm_Host( form ) )
+    tkPopupMenu_AddItem( designMenu, clng( Cmd.Cut ), "" )
+    tkPopupMenu_AddItem( designMenu, clng( Cmd.Copy ), "" )
+    tkPopupMenu_AddItem( designMenu, clng( Cmd.Paste ), "" )
+    tkPopupMenu_AddItem( designMenu, DESIGNMENU_DELETE, "" )
+    tkPopupMenu_AddSeparator( designMenu )
+    tkPopupMenu_AddItem( designMenu, clng( Cmd.SelectAll ), "" )
+    tkPopupMenu_AddSeparator( designMenu )
+    tkPopupMenu_AddItem( designMenu, clng( Cmd.FormBringToFront ), "" )
+    tkPopupMenu_AddItem( designMenu, clng( Cmd.FormSendToBack ), "" )
+    tkPopupMenu_SetSelectCallback( designMenu, sub( byval hPopup as TK_MENU ptr, byval id as long )
+        dim as Window ptr mw = WindowOfHost( hPopup->pOwner )
+        if mw = 0 then exit sub
+        dim as DocRef d = mw->Active( )
+        if id = DESIGNMENU_DELETE then
+            if (d <> 0) andalso (d->Designer <> 0) then d->Designer->DeleteSelection( )
+        elseif (id = clng( Cmd.Paste )) andalso (d <> 0) andalso (d->Designer <> 0) then
+            d->Designer->PasteAt( d->Designer->MenuX, d->Designer->MenuY )     ' where the right click was
+        else
+            mw->Execute( cast( Cmd, id ) )
+        end if
     end sub )
 
     Out.Create( root, ID_OUTPUT, @this )
@@ -1204,6 +1308,7 @@ end sub
 
 sub Window.Destroy( )
     this.CloseTestForm( )
+    if KeysDlg then this.FinishKeys( false )
     Palettes.Destroy( )
     if diskTimer then tkApp_KillTimer( diskTimer )
     diskTimer = 0
@@ -1238,6 +1343,8 @@ sub Window.Destroy( )
     editMenu = 0
     if tabMenu then tkPopupMenu_Destroy( tabMenu )
     tabMenu = 0
+    if designMenu then tkPopupMenu_Destroy( designMenu )
+    designMenu = 0
     for pane as long = 0 to 1                    ' unwrapped: HoverProc finds its Window through the form
         if hbar( pane ) then hbar( pane )->proc = hbarProc
     next
@@ -1683,7 +1790,10 @@ function Window.IsImplemented( byval id as Cmd ) as boolean
     case Cmd.FormAlignLefts, Cmd.FormAlignCenters, Cmd.FormAlignRights, Cmd.FormAlignTops, Cmd.FormAlignMiddles, _
          Cmd.FormAlignBottoms, Cmd.FormSameWidth, Cmd.FormSameHeight, Cmd.FormSameSize, Cmd.FormBringToFront, _
          Cmd.FormSendToBack, Cmd.FormSnapToGrid, Cmd.FormFloatToolbox, Cmd.FormFloatProperties, Cmd.FormToggleView, _
-         Cmd.FormTest, Cmd.FormNewForm, Cmd.FormTheme, Cmd.FormPreviewVariant
+         Cmd.FormTest, Cmd.FormNewForm, Cmd.FormTheme, Cmd.FormResources, Cmd.FormPreviewVariant, _
+         Cmd.FormHSpaceEqual, Cmd.FormHSpaceIncrease, Cmd.FormHSpaceDecrease, Cmd.FormHSpaceRemove, _
+         Cmd.FormVSpaceEqual, Cmd.FormVSpaceIncrease, Cmd.FormVSpaceDecrease, Cmd.FormVSpaceRemove, _
+         Cmd.FormCenterHorz, Cmd.FormCenterVert, Cmd.FormLockControls, Cmd.FormTabOrder
         return true
     case Cmd.Undo, Cmd.Redo, Cmd.Cut, Cmd.Copy, Cmd.Paste, Cmd.SelectAll, Cmd.SelectLine, _
          Cmd.DeleteLine, Cmd.DuplicateLine, Cmd.MoveLineUp, Cmd.MoveLineDown, Cmd.NewLineBelowCurrent, _
@@ -1733,7 +1843,7 @@ function Window.CanRun( byval id as Cmd ) as boolean
         if (id = Cmd.FileRename) andalso ProjOpen andalso fs.PathEquals( d->Path, Proj.Path ) then return false
         return true
     case Cmd.ProjectClose : return ProjOpen
-    case Cmd.FormTheme : return ProjOpen
+    case Cmd.FormTheme, Cmd.FormResources : return ProjOpen
     end select
     if this.ShowsStart( ) = false then return true
     ' no file open: only what would still do something
@@ -1741,7 +1851,7 @@ function Window.CanRun( byval id as Cmd ) as boolean
     case Cmd.FileNew, Cmd.FileOpen, Cmd.Settings, Cmd.KeyboardShortcuts, Cmd.ThemeFile, Cmd.AppExit, _
          Cmd.ShowMenu, Cmd.ShowExplorer, Cmd.OutputPane, Cmd.FormNewForm, Cmd.BuildConfig
         return true
-    case Cmd.FormTheme : return ProjOpen
+    case Cmd.FormTheme, Cmd.FormResources : return ProjOpen
     case Cmd.ProjectSaveAs, Cmd.SearchSymbol, Cmd.FindInProject, Cmd.Compile, Cmd.BuildExecute, Cmd.RebuildAll, Cmd.RunArguments
         return ProjOpen
     case Cmd.StartDebugging : return ProjOpen orelse DbgOn
@@ -1771,7 +1881,7 @@ function Window.DesignerActs( byval id as Cmd ) as boolean
     dim as DocRef d = this.Active( )
     dim as boolean noForm = (d = 0) orelse this.ShowsStart( )
     if noForm = false then noForm = (d->Designer = 0)
-    if noForm then return (id = Cmd.FormNewForm) orelse (id = Cmd.FormTheme) orelse (Keys.Commands( ).Info( id ).Group <> MenuGroup.Form)   ' New Form makes one; the theme is the project's
+    if noForm then return (id = Cmd.FormNewForm) orelse (id = Cmd.FormTheme) orelse (id = Cmd.FormResources) orelse (Keys.Commands( ).Info( id ).Group <> MenuGroup.Design)   ' New Form makes one; the theme is the project's
     select case id
     case Cmd.Undo, Cmd.Redo, Cmd.Cut, Cmd.Copy, Cmd.Paste, Cmd.SelectAll, _
          Cmd.SearchSymbol, Cmd.FindInProject, Cmd.GoBack, Cmd.GoForward
@@ -1820,6 +1930,18 @@ function Window.DesignerCommand( byval id as Cmd ) as boolean
     case Cmd.FormSameSize : d->Designer->Align( edits.AlignMode.SameSize )
     case Cmd.FormBringToFront : d->Designer->ToFront( )
     case Cmd.FormSendToBack : d->Designer->ToBack( )
+    case Cmd.FormHSpaceEqual : d->Designer->Space( false, edits.SpaceMode.SpaceEqual )
+    case Cmd.FormHSpaceIncrease : d->Designer->Space( false, edits.SpaceMode.SpaceIncrease )
+    case Cmd.FormHSpaceDecrease : d->Designer->Space( false, edits.SpaceMode.SpaceDecrease )
+    case Cmd.FormHSpaceRemove : d->Designer->Space( false, edits.SpaceMode.SpaceRemove )
+    case Cmd.FormVSpaceEqual : d->Designer->Space( true, edits.SpaceMode.SpaceEqual )
+    case Cmd.FormVSpaceIncrease : d->Designer->Space( true, edits.SpaceMode.SpaceIncrease )
+    case Cmd.FormVSpaceDecrease : d->Designer->Space( true, edits.SpaceMode.SpaceDecrease )
+    case Cmd.FormVSpaceRemove : d->Designer->Space( true, edits.SpaceMode.SpaceRemove )
+    case Cmd.FormCenterHorz : d->Designer->Center( false )
+    case Cmd.FormCenterVert : d->Designer->Center( true )
+    case Cmd.FormLockControls : d->Designer->ToggleLock( )
+    case Cmd.FormTabOrder : d->Designer->SetTabOrderMode( d->Designer->TabOrderMode = false )
     case Cmd.FormSnapToGrid
         d->Designer->SnapToGrid = (d->Designer->SnapToGrid = false)
         tkWidget_Invalidate( d->Designer->Frame )
@@ -1871,8 +1993,8 @@ function Window.Execute( byval id as Cmd ) as boolean
         if this.FindOpen( this.SettingsFile( ) ) = 0 then this.SyncSettingsFile( )   ' never under an open buffer
         this.OpenFile( this.SettingsFile( ) )
     case Cmd.KeyboardShortcuts
-        if this.FindOpen( this.KeysFile( ) ) = 0 then this.SyncKeysFile( )           ' never under an open buffer
-        this.OpenFile( this.KeysFile( ) )
+        this.OpenKeys( )
+        if KeysDlg then this.FinishKeys( KeysDlg->RunModal( ) )
     case Cmd.ThemeFile
         ' tkEdit's own theme in the Theme Center, a copy in the config folder (made the first time)
         dim as ustring f = this.EditableThemeFile( )
@@ -1969,6 +2091,9 @@ function Window.Execute( byval id as Cmd ) as boolean
     case Cmd.FormToggleView : this.ToggleFormView( )
     case Cmd.FormNewForm : this.NewForm( "" )
     case Cmd.FormTheme : this.OpenThemeCenter( )
+    case Cmd.FormResources
+        dim as ustring none
+        this.EditResources( "", "", none )
     case Cmd.FoldToggle : v->FoldToggle( false )
     case Cmd.FoldBelow : v->FoldToggle( true )
     case Cmd.FoldAll : v->FoldAll( true )
@@ -1990,9 +2115,98 @@ private function MenuTitle( byval g as MenuGroup ) as ustring
     case MenuGroup.View : return i18n.Tr( "menubar.View", "View" )
     case MenuGroup.Build : return i18n.Tr( "menubar.Build", "Build" )
     case MenuGroup.Debug : return i18n.Tr( "menubar.Debug", "Debug" )
-    case MenuGroup.Form : return i18n.Tr( "menubar.Form", "Form" )
+    case MenuGroup.Design : return i18n.Tr( "menubar.Design", "Design" )
     end select
     return GroupName( g )
+end function
+
+' The menus' submenus: the Design menu's after VB6's Format menu (author 2026-11-14), the others'
+' so that no menu outgrows a small laptop screen (author 2026-11-21). Which one a command's row is
+' in (0 = a row of the menu itself; a submenu's rows are a run of its group's table order), each
+' submenu's title, and a row's short text there ("" = its command's own name).
+public const MENU_SUB_ID = &h7F00                ' + n: a submenu's title row (no command has it)
+
+public function MenuSub( byval id as Cmd ) as long
+    select case id
+    case Cmd.FormAlignLefts, Cmd.FormAlignCenters, Cmd.FormAlignRights, _
+         Cmd.FormAlignTops, Cmd.FormAlignMiddles, Cmd.FormAlignBottoms : return 1
+    case Cmd.FormSameWidth, Cmd.FormSameHeight, Cmd.FormSameSize : return 2
+    case Cmd.FormBringToFront, Cmd.FormSendToBack : return 3
+    case Cmd.FormHSpaceEqual, Cmd.FormHSpaceIncrease, Cmd.FormHSpaceDecrease, Cmd.FormHSpaceRemove : return 4
+    case Cmd.FormVSpaceEqual, Cmd.FormVSpaceIncrease, Cmd.FormVSpaceDecrease, Cmd.FormVSpaceRemove : return 5
+    case Cmd.FormCenterHorz, Cmd.FormCenterVert : return 6
+    ' File
+    case Cmd.ProjectSaveAs, Cmd.ProjectClose : return 7
+    case Cmd.Settings, Cmd.KeyboardShortcuts, Cmd.ThemeFile : return 8
+    ' Edit
+    case Cmd.SelectLine, Cmd.DeleteLine, Cmd.DuplicateLine, Cmd.MoveLineUp, Cmd.MoveLineDown, _
+         Cmd.NewLineBelowCurrent : return 9
+    case Cmd.CommentBlock, Cmd.UncommentBlock, Cmd.IndentBlock, Cmd.UnindentBlock : return 10
+    case Cmd.ToUpperCase, Cmd.ToLowerCase, Cmd.ToMixedCase : return 11
+    ' Search
+    case Cmd.GoToLine, Cmd.GoToDefinition, Cmd.GoBack, Cmd.GoForward, _
+         Cmd.GoToNextFunction, Cmd.GoToPrevFunction : return 12
+    case Cmd.BookmarkToggle, Cmd.BookmarkNext, Cmd.BookmarkPrev, Cmd.BookmarkClearAll, Cmd.BookmarksList : return 13
+    ' View
+    case Cmd.SplitLeftRight, Cmd.SplitTopBottom, Cmd.CycleFocus : return 14
+    case Cmd.ZoomIn, Cmd.ZoomOut, Cmd.ZoomReset : return 15
+    case Cmd.FoldToggle, Cmd.FoldBelow, Cmd.FoldAll, Cmd.UnfoldAll : return 16
+    end select
+    return 0
+end function
+
+' Is command id a row of its group's menu? Three Design commands are not (author 2026-11-21): the
+' palettes' own float buttons float them, and Preview Light / Dark is a key to bind. They still run.
+public function InMenu( byval id as Cmd ) as boolean
+    select case id
+    case Cmd.FormPreviewVariant, Cmd.FormFloatToolbox, Cmd.FormFloatProperties : return false
+    end select
+    return true
+end function
+
+private function MenuSubTitle( byval n as long ) as ustring
+    select case n
+    case 1 : return i18n.Tr( "menubar.align", "Align" )
+    case 2 : return i18n.Tr( "menubar.same_size", "Make Same Size" )
+    case 3 : return i18n.Tr( "menubar.order", "Order" )
+    case 4 : return i18n.Tr( "menubar.h_spacing", "Horizontal Spacing" )
+    case 5 : return i18n.Tr( "menubar.v_spacing", "Vertical Spacing" )
+    case 6 : return i18n.Tr( "menubar.center_form", "Center in Form" )
+    case 7 : return i18n.Tr( "menubar.project", "Project" )
+    case 8 : return i18n.Tr( "menubar.options", "Options" )
+    case 9 : return i18n.Tr( "menubar.line", "Line" )
+    case 10 : return i18n.Tr( "menubar.block", "Block" )
+    case 11 : return i18n.Tr( "menubar.case", "Case" )
+    case 12 : return i18n.Tr( "menubar.go_to", "Go To" )
+    case 13 : return i18n.Tr( "menubar.bookmarks", "Bookmarks" )
+    case 14 : return i18n.Tr( "menubar.split", "Split" )
+    case 15 : return i18n.Tr( "menubar.zoom", "Zoom" )
+    case 16 : return i18n.Tr( "menubar.folding", "Folding" )
+    end select
+    return ""
+end function
+
+private function MenuSubRow( byval id as Cmd ) as ustring
+    select case id
+    case Cmd.FormAlignLefts : return i18n.Tr( "menubar.lefts", "Lefts" )
+    case Cmd.FormAlignCenters : return i18n.Tr( "menubar.centers", "Centers" )
+    case Cmd.FormAlignRights : return i18n.Tr( "menubar.rights", "Rights" )
+    case Cmd.FormAlignTops : return i18n.Tr( "menubar.tops", "Tops" )
+    case Cmd.FormAlignMiddles : return i18n.Tr( "menubar.middles", "Middles" )
+    case Cmd.FormAlignBottoms : return i18n.Tr( "menubar.bottoms", "Bottoms" )
+    case Cmd.FormSameWidth : return i18n.Tr( "menubar.width", "Width" )
+    case Cmd.FormSameHeight : return i18n.Tr( "menubar.height", "Height" )
+    case Cmd.FormSameSize : return i18n.Tr( "menubar.both", "Both" )
+    case Cmd.FormBringToFront : return i18n.Tr( "menubar.to_front", "Bring to Front" )
+    case Cmd.FormSendToBack : return i18n.Tr( "menubar.to_back", "Send to Back" )
+    case Cmd.FormHSpaceEqual, Cmd.FormVSpaceEqual : return i18n.Tr( "menubar.make_equal", "Make Equal" )
+    case Cmd.FormHSpaceIncrease, Cmd.FormVSpaceIncrease : return i18n.Tr( "menubar.increase", "Increase" )
+    case Cmd.FormHSpaceDecrease, Cmd.FormVSpaceDecrease : return i18n.Tr( "menubar.decrease", "Decrease" )
+    case Cmd.FormHSpaceRemove, Cmd.FormVSpaceRemove : return i18n.Tr( "menubar.remove", "Remove" )
+    case Cmd.FormCenterHorz : return i18n.Tr( "menubar.horizontally", "Horizontally" )
+    case Cmd.FormCenterVert : return i18n.Tr( "menubar.vertically", "Vertically" )
+    end select
+    return ""
 end function
 
 ' One menu per group, rows in table order with the chord in force beside each, a separator where
@@ -2014,8 +2228,29 @@ sub Window.BuildMenus( )
             m = tkMenuBar_GetDropDown( menuBar, g )
             tkPopupMenu_Clear( m )
         end if
+        ' a run of rows of one submenu goes into it, under its own title row
+        dim as TK_MENU ptr sm = 0
+        dim as long smN = 0
         for each id as Cmd in t.InGroup( cast( MenuGroup, g ) )
+            if InMenu( id ) = false then continue for
             dim as cmdids.CommandInfo ci = t.Info( id )
+            dim as long n = MenuSub( id )
+            if n <> smN then
+                smN = n : sm = 0
+                if n then
+                    if ci.SepBefore andalso (tkPopupMenu_GetItemCount( m ) > 0) then tkPopupMenu_AddSeparator( m )
+                    tkPopupMenu_AddItem( m, MENU_SUB_ID + n, MenuSubTitle( n ) )
+                    sm = tkPopupMenu_Create( h )
+                    tkPopupMenu_SetItemSubMenu( m, MENU_SUB_ID + n, sm )
+                end if
+            end if
+            if sm then
+                if ci.SepBefore andalso (tkPopupMenu_GetItemCount( sm ) > 0) then tkPopupMenu_AddSeparator( sm )
+                dim as ustring rowText = MenuSubRow( id )
+                if len( rowText ) = 0 then rowText = i18n.Tr( "commands." & ci.Name, ci.Description )
+                tkPopupMenu_AddItem( sm, clng( id ), rowText, this.ShortcutText( id ), this.IsImplemented( id ) = false )
+                continue for
+            end if
             if ci.SepBefore andalso (tkPopupMenu_GetItemCount( m ) > 0) then tkPopupMenu_AddSeparator( m )
             tkPopupMenu_AddItem( m, clng( id ), i18n.Tr( "commands." & ci.Name, ci.Description ), _
                                  this.ShortcutText( id ), this.IsImplemented( id ) = false )
@@ -2026,6 +2261,27 @@ end sub
 ' Ctrl+Shift+M: the menu bar comes or goes now, and settings.toml's [ui] show_menu says so from now
 ' on (an open copy reloads). A settings.toml that does not parse is the person's to fix: the
 ' choice holds for this run only.
+' The theme tkEdit wears and its variant (dark | light): Prefs now, and settings.toml's theme and
+' theme_mode for next time (the Theme dialog's Save). False, with a message, when settings.toml
+' doesn't parse.
+function Window.KeepTheme( byref nm as const ustring, byref mode as const ustring ) as boolean
+    Prefs.Theme = nm
+    Prefs.ThemeMode = mode
+    dim as settings.SettingsResult r = settings.LoadSettings( this.SettingsFile( ) )
+    if r.IsOk( ) = false then
+        this.SetMessage( strings.Format( i18n.Tr( "message.theme_not_kept", "{} does not parse: the theme is not kept for next time" ), settings.SETTINGS_FILE ) )
+        return false
+    end if
+    dim as settings.EditorSettings st = r.Value( )
+    st.Theme = nm
+    st.ThemeMode = mode
+    if settings.WriteFile( this.SettingsFile( ), st ) then
+        dim as DocRef d = this.FindOpen( this.SettingsFile( ) )
+        if d then d->Reload( )
+    end if
+    return true
+end function
+
 sub Window.SetShowMenu( byval onOff as boolean )
     if (menuBar <> 0) andalso (onOff = false) then tkMenuBar_CloseMenu( menuBar )
     Prefs.ShowMenu = onOff
@@ -2206,6 +2462,7 @@ sub Window.ReloadLanguage( )
     if (len( note ) > 0) andalso (len( Message ) = 0) then Message = note
     this.LabelEditMenu( )
     this.LabelTabMenu( )
+    this.LabelDesignMenu( )
     this.BuildMenus( )
     Finder.Relabel( )
     Out.Relabel( )
@@ -2251,6 +2508,17 @@ sub Window.LabelEditMenu( )
     tkPopupMenu_SetItemText( editMenu, clng( Cmd.CommentBlock ), i18n.Tr( "menu.CommentBlock", "Comment Block" ) )
     tkPopupMenu_SetItemText( editMenu, clng( Cmd.UncommentBlock ), i18n.Tr( "menu.UncommentBlock", "UnComment Block" ) )
     tkPopupMenu_SetItemText( editMenu, clng( Cmd.SelectAll ), i18n.Tr( "menu.SelectAll", "Select All" ) )
+end sub
+
+sub Window.LabelDesignMenu( )
+    if designMenu = 0 then exit sub
+    tkPopupMenu_SetItemText( designMenu, clng( Cmd.Cut ), i18n.Tr( "menu.Cut", "Cut" ) )
+    tkPopupMenu_SetItemText( designMenu, clng( Cmd.Copy ), i18n.Tr( "menu.Copy", "Copy" ) )
+    tkPopupMenu_SetItemText( designMenu, clng( Cmd.Paste ), i18n.Tr( "menu.Paste", "Paste" ) )
+    tkPopupMenu_SetItemText( designMenu, DESIGNMENU_DELETE, i18n.Tr( "designer.delete", "Delete" ) )
+    tkPopupMenu_SetItemText( designMenu, clng( Cmd.SelectAll ), i18n.Tr( "menu.SelectAll", "Select All" ) )
+    tkPopupMenu_SetItemText( designMenu, clng( Cmd.FormBringToFront ), i18n.Tr( "commands.FormBringToFront", "Bring to Front" ) )
+    tkPopupMenu_SetItemText( designMenu, clng( Cmd.FormSendToBack ), i18n.Tr( "commands.FormSendToBack", "Send to Back" ) )
 end sub
 
 sub Window.LabelTabMenu( )
@@ -2336,6 +2604,40 @@ sub Window.SyncKeysFile( )
     if t.IsOk( ) = false then exit sub
     if fs.IsFile( this.KeysFile( ) ) andalso (fs.ReadAllText( this.KeysFile( ) ).ValueOr( "" ) = t.Value( )) then exit sub
     k.Save( this.KeysFile( ) )
+end sub
+
+' Ctrl+K: the Keyboard Shortcuts dialog on a copy of the key map. It's the caller's to run or drive.
+sub Window.OpenKeys( )
+    if KeysDlg then exit sub
+    KeysDlg = new keysdlg.KeysDialog
+    KeysDlg->Open( form, Keys )
+    if KeysDlg->Win = 0 then
+        delete KeysDlg
+        KeysDlg = 0
+    end if
+end sub
+
+' OK: the dialog's key map written to keybindings.toml (every command at its chord, as SyncKeysFile
+' writes it) and applied at once; an open copy of the file reloads. Cancel: nothing changes.
+sub Window.FinishKeys( byval apply_ as boolean )
+    if KeysDlg = 0 then exit sub
+    dim as keysdlg.KeysDialog ptr dlg = KeysDlg
+    KeysDlg = 0
+    dim as ustring fault
+    if apply_ then
+        dim as keybind.TextResult r = dlg->Work.Save( this.KeysFile( ) )
+        if r.IsOk( ) = false then fault = r.Failure( )
+    end if
+    dlg->Close( )
+    delete dlg
+    if apply_ andalso (len( fault ) = 0) then
+        this.ReloadKeys( )
+        dim as DocRef d = this.FindOpen( this.KeysFile( ) )
+        if d then d->Reload( )
+    elseif len( fault ) then
+        this.SetMessage( keybind.KEYBINDINGS_FILE & ": " & fault )
+    end if
+    this.FocusEditor( )
 end sub
 
 ' keybindings.toml: the key map and the accelerators; warnings and chords
@@ -2493,6 +2795,8 @@ sub Window.AfterSave( byval d as DocRef )
     elseif right( p, 8 ) = ".tktheme" then
         this.WriteThemeGenerated( d->Path, d->Text( ) )
         this.RefreshFormThemes( )               ' the project's: the forms wear it as saved
+    elseif right( p, 6 ) = ".tkres" then
+        this.WriteResourcesGenerated( d->Path, d->Text( ) )
     elseif p = lcase( this.SettingsFile( ) ) then
         this.ReloadSettings( )
     elseif p = lcase( this.KeysFile( ) ) then
@@ -2959,21 +3263,45 @@ function Window.OpenText( byref path as const ustring ) as boolean
         if d->Designer then
             d->Designer->Host = @this
             d->Designer->ThemePath = this.ProjectThemePath( )
+            d->Designer->PkgDir = this.PkgDir( )
+            d->Designer->GlyphPaths = this.GlyphFontPaths( )
             d->Designer->ApplyProjectTheme( )
             d->Designer->OnWire = sub( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref n as const ustring, byref e as const ustring, byval jump as boolean )
                 cast( Window ptr, o )->WireHandler( c, n, e, jump )
             end sub
             d->Designer->OnEditItems = sub( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref n as const ustring, byref e as const ustring, byval jump as boolean )
-                cast( Window ptr, o )->EditItems( c, n )
+                cast( Window ptr, o )->EditItems( c, n, e = "new" )
             end sub
             d->Designer->OnEditColors = sub( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref n as const ustring, byref e as const ustring, byval jump as boolean )
                 cast( Window ptr, o )->EditColors( c, n )
+            end sub
+            d->Designer->OnPickResource = function( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref k as const ustring, _
+                                                    byref cur as const ustring, byref prop as const ustring, byref picked as ustring ) as boolean
+                dim as Window ptr w = o
+                ' a Remove in the Center leaves out the property being picked for: Select replaces it
+                w->ResPickCanvas = c : w->ResPickProp = prop
+                dim as boolean ok = w->EditResources( k, cur, picked )
+                w->ResPickCanvas = 0 : w->ResPickProp = ""
+                return ok
+            end function
+            d->Designer->OnPickGlyph = function( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref cur as const ustring, byref picked as ustring ) as boolean
+                return cast( Window ptr, o )->PickGlyph( cur, picked )
+            end function
+            d->Designer->OnAskParent = function( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref what as const ustring, _
+                                                 byval n as long, byref parent as const ustring, byref page as const ustring ) as boolean
+                return cast( Window ptr, o )->AskParent( what, n, parent, page )
+            end function
+            d->Designer->OnContextMenu = sub( byval o as any ptr, byval c as canvas.FormCanvas ptr, byval x as long, byval y as long )
+                cast( Window ptr, o )->ShowDesignMenu( c, x, y )
             end sub
             d->Designer->OnRenamed = sub( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref a as const ustring, byref b as const ustring )
                 cast( Window ptr, o )->ControlRenamed( c, a, b )
             end sub
             d->Designer->OnHandlerGone = function( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref h as const ustring ) as boolean
                 return cast( Window ptr, o )->HandlerGone( c, h )
+            end function
+            d->Designer->OnHandlerRenamed = function( byval o as any ptr, byval c as canvas.FormCanvas ptr, byref a as const ustring, byref b as const ustring ) as boolean
+                return cast( Window ptr, o )->HandlerRenamed( c, a, b )
             end function
         end if
     end if
@@ -3181,6 +3509,23 @@ sub Window.DuplicateActive( )
     end if
     this.OpenText( path )
     Side.Rescan( )
+end sub
+
+' A right click on the design surface (the canvas has already selected what it landed on): rows
+' that need a selection grey without one, Paste greys unless the clipboard holds copied controls.
+sub Window.ShowDesignMenu( byval c as canvas.FormCanvas ptr, byval x as long, byval y as long )
+    if (designMenu = 0) orelse (c = 0) then exit sub
+    dim as boolean sel = c->Selected.Count( ) > 0
+    tkPopupMenu_SetItemEnabled( designMenu, clng( Cmd.Cut ), sel )
+    tkPopupMenu_SetItemEnabled( designMenu, clng( Cmd.Copy ), sel )
+    tkPopupMenu_SetItemEnabled( designMenu, clng( Cmd.Paste ), c->CanPaste( ) )
+    tkPopupMenu_SetItemEnabled( designMenu, DESIGNMENU_DELETE, sel )
+    tkPopupMenu_SetItemEnabled( designMenu, clng( Cmd.SelectAll ), c->Doc.Controls.Count( ) > 0 )
+    tkPopupMenu_SetItemEnabled( designMenu, clng( Cmd.FormBringToFront ), sel )
+    tkPopupMenu_SetItemEnabled( designMenu, clng( Cmd.FormSendToBack ), sel )
+    dim as TKRECT a
+    tkWidget_AbsRect( c->Glass, a )
+    tkPopupMenu_Show( designMenu, a.left + x, a.top + y )
 end sub
 
 ' A right click on a tab makes it the active buffer, as tiko-editor's does, and every row then acts
@@ -4017,6 +4362,7 @@ function Window.OpenProject( byref path as const ustring ) as boolean
     Proj = r.Value( )
     Proj.Path = fs.AbsolutePath( Proj.Path ).ValueOr( Proj.Path )
     ProjOpen = true
+    this.RegisterProjectResources( )             ' "res:<name>" on the canvas, as in the program
     ' the editor's options for it: kept from before, else new ones (the current build)
     dim as project.OptionsResult o = project.LoadOptions( project.OptionsPath( ConfigDir, Proj.Path ) )
     dim as project.ProjectOptions none_
@@ -4182,6 +4528,7 @@ function Window.CloseProject( ) as boolean
     this.SaveProject( )
     if this.CloseAll( ) = false then return false
     ProjOpen = false
+    this.RegisterProjectResources( )             ' its names taken back
     dim as project.Manifest none_
     Proj = none_
     dim as project.ProjectOptions noOpts
@@ -4443,6 +4790,7 @@ sub Window.FinishBuild( )
     if len( LastExe ) then LastExe = fs.PathToNative( LastExe )          ' tiko's events write /
     dim as boolean ok = (code = 0) andalso (counts.Errors = 0)
     BuildSucceeded = ok
+    if ok then this.CopyResourceFiles( LastExe )            ' the resources not built in, beside it
     ' the program's size, for the log's summary and the message (a successful build's only)
     dim as longint exeBytes = -1
     if ok andalso (len( LastExe ) > 0) then
@@ -4581,7 +4929,13 @@ sub Window.RunProgram( byref exe as const ustring )
             argv.Push( a )
         next
     else
-        argv = platform.TerminalArgv( exe, args, dir_, fs.PathJoin( ConfigDir, "run" ) )
+        ' a Windows GUI program never writes to the console it's started from: say so there
+        dim as ustring note
+        if platform.IsWindowsGuiExe( exe ) then
+            dim as ustring t = i18n.Tr( "build.gui_no_console", "{} is a GUI program (subsystem = 'gui'): its print output does not show in this window. Set subsystem = 'console' in tiko.toml to see it." )
+            note = strings.Format( t, fs.PathFileName( exe ) )
+        end if
+        argv = platform.TerminalArgv( exe, args, dir_, fs.PathJoin( ConfigDir, "run" ), note )
         if argv.Count( ) = 0 then
             this.SetBuildMessage( i18n.Tr( "build.no_terminal", "no terminal program was found to run it in: set $TERMINAL" ) )
             exit sub
@@ -4604,13 +4958,18 @@ function Window.DebugStopped( ) as boolean
     return DbgOn andalso DbgPaused andalso gDbgE.active andalso (gDbgE.running = false)
 end function
 
-' Windows: lldb-dap 21 loads python310.dll and never answers without it, so it is looked for first
-' (tiko-editor-tiko's check): beside lldb-dap, then on the PATH. "" = found.
+' Windows: lldb-dap never answers without the Python DLL liblldb.dll imports, so it is looked for
+' first (tiko-editor-tiko's check): beside lldb-dap, then on the PATH. WHICH DLL is read from
+' liblldb.dll itself: python310.dll for LLVM 21, python3.dll (any Python 3) for LLVM 23 -- a name
+' fixed here stopped every session the day LLVM moved on. "" = found, or nothing to look for.
 private function DebugPythonMissing( byref adapter as const ustring ) as ustring
     if platform.CurrentOs( ) <> platform.Os.Windows then return ""
-    if fs.IsFile( fs.PathJoin( fs.PathParent( adapter ), "python310.dll" ) ) then return ""
-    if len( platform.FindOnPath( "python310.dll" ) ) then return ""
-    return i18n.Tr( "debug.no_python", "the debugger needs Python 3.10 (64-bit) on the PATH: lldb-dap loads its python310.dll" )
+    dim as string a8 = adapter
+    dim as ustring dll = Engine_PythonDll( a8 )
+    if len( dll ) = 0 then return ""
+    if fs.IsFile( fs.PathJoin( fs.PathParent( adapter ), dll ) ) then return ""
+    if len( platform.FindOnPath( dll ) ) then return ""
+    return strings.Format( i18n.Tr( "debug.no_python", "the debugger needs a 64-bit Python 3 on the PATH: lldb-dap loads its {}" ), dll )
 end function
 
 ' Start Debugging's build succeeded: a session on its program. Every breakpoint of every open
@@ -4897,9 +5256,14 @@ sub Window.ShowOutput( byval visible as boolean )
     if visible = false then this.FocusEditor( )
 end sub
 
-' Ctrl+Tilde: pane 1, pane 2 (when split), the output pane (when shown), round again.
+' Ctrl+Tilde: pane 1, pane 2 (when split), the output pane (when shown), round again. On a form or
+' its code file, while the other one is there, it goes between the two instead.
 sub Window.CycleFocus( )
     dim as boolean inOut = this.OutputHasFocus( )
+    if (inOut = false) andalso this.HasFormPartner( this.Active( ) ) then
+        this.ToggleFormView( )
+        exit sub
+    end if
     dim as boolean split_ = (Split <> session.SplitMode.None) andalso (Pane2 <> 0)
     if inOut then
         this.FocusPane( false )
@@ -5029,7 +5393,12 @@ end function
 ' A buffer's scan: its unsaved text when modified, else the file. Untitled buffers are not scanned.
 sub Window.QueueScan( byval d as DocRef )
     if (d = 0) orelse (Scanner.running = false) orelse (len( d->Path ) = 0) then exit sub
-    if documents.IsFormFile( d->Path ) then exit sub     ' TOML, not tiko
+    if documents.IsFormFile( d->Path ) then
+        ' TOML, not tiko: the form's code file instead, if it's open, so its completions know the
+        ' controls just added (it sees the form through its overlay)
+        d = this.OpenCodeDocOf( d )
+        if d = 0 then exit sub
+    end if
     dim as parser.ScanOptions o
     for each inc as ustring in Prefs.Includes
         o.Includes.Push( inc )
@@ -5227,7 +5596,7 @@ sub Window.CodeTips( byval hEdit as TK_WIDGET ptr, byval ch as long )
         if (ch = 62) andalso (right( before, 2 ) <> "->") then exit sub    ' a comparison's ">"
         dim as ustring word, qual
         SplitQualified( left( before, len( before ) - iif( ch = 62, 2, 1 ) ), word, qual )
-        if len( word ) then this.OpenCompletions( v, Db.MemberItems( word, d->Path, ln ), 0 )
+        if len( word ) then this.OpenCompletions( v, Db.MemberItems( word, d->Path, ln, qual ), 0 )
         exit sub
     end if
     if ch = 32 then
@@ -5281,7 +5650,11 @@ sub Window.ShowCompletionsAt( byval v as editor.CodeView ptr, byval d as DocRef,
     if len( word ) < minLen then exit sub
     dim as Array( of symboldb.Completion ) items
     if len( qual ) then
-        items = Db.MemberItems( qual, d->Path, v->CaretLine( ) )
+        ' the qualifier's own qualifier, for a chain: this.Timer1.En_
+        dim as long sepLen = iif( mid( before, len( before ) - len( word ), 1 ) = ".", 1, 2 )
+        dim as ustring q2, outer
+        SplitQualified( left( before, len( before ) - len( word ) - sepLen ), q2, outer )
+        items = Db.MemberItems( qual, d->Path, v->CaretLine( ), outer )
     elseif AfterTypeIntro( left( before, len( before ) - len( word ) ) ) then
         items = this.TypeCompletions( word )
     else

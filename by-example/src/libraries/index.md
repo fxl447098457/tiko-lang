@@ -1,10 +1,11 @@
 # Libraries
 
-Three libraries cover jobs most programs end up doing. **`std/logs`** records
+Four libraries cover jobs most programs end up doing. **`std/logs`** records
 what a program did, with levels, typed fields and several destinations.
 **`std/tui`** draws full-screen terminal interfaces. **`vendor/sqlite3`** puts
-the SQLite database an `#import` away. This first example is the shortest
-useful log.
+the SQLite database an `#import` away, and **`vendor/pcre2`** does the same
+for PCRE2's regular expressions. This first example is the shortest useful
+log.
 
 ```tiko
 {{#include ../../examples/libraries/overview.tiko}}
@@ -33,6 +34,7 @@ The pages that follow:
 - [The default logger](default-logger.md): the logging macros.
 - [Terminal UI](tui.md) and [Layout and widgets](tui-layout.md).
 - [SQLite](sqlite.md) and [Prepared statements](sqlite-bind.md).
+- [Regular expressions](pcre2.md) and [Search and replace](pcre2-replace.md).
 
 ### Activities
 

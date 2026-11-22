@@ -102,15 +102,15 @@ The usual inference rule still applies inside: an untyped integer literal is an 
 
 ## Reading The Wrong Side Raises
 
-Value( ) on a failure and Failure( ) on a success BOTH raise FB_RTERROR_ILLEGALFUNCTIONCALL. With no handler installed the program stops:
+Value( ) on a failure and Failure( ) on a success BOTH raise FB_RTERROR_ILLEGALFUNCTIONCALL. With no handler installed the program stops, naming the line that made the call:
 
 ```freebasic
-Aborting due to runtime error 1 (illegal function call) at line 115 of ...\pkg\std\outcome\result.tiko()
+Aborting due to runtime error 1 (illegal function call) at line 9 of demo.tiko(), Value( ) of a failed Result
 ```
 
 The symmetry is deliberate. Asking why something failed when it did not fail is the same class of mistake as reading a value that is not there, and it is the one a one-sided implementation would let through silently.
 
-IsOk( ) is the guard and costs nothing. ValueOr( ) is the branch-free alternative for the value side and never raises.
+IsOk( ) is the guard and costs nothing. ValueOr( ) is the branch-free alternative for the value side and never raises. Where the compiler can see that no IsOk( ) check covers a Value( ) or Failure( ) on every path to it, it warns, `TKO1150` (see [Optional](Category-Optional#empty-access-raises) for what it follows).
 
 Both accessors return BYREF, so they can be written through:
 

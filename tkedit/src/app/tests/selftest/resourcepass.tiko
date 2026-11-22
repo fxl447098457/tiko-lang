@@ -1,0 +1,344 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' resourcepass -- the Resource Center in a new GUI project, through Form > Resource Center... and its
+' modal loop: an image added (the file picker scripted), OK writes appResources and its module and
+' names it to this process; a Button's ImageLeft set to it; renamed in the Center, the form follows.
+#module "selftest"
+
+#import "std/containers"
+#import "std/fs"
+#import "tkc/cmdids"
+#import "tka/documents"
+#import "tka/mainwin"
+#import "tkd/canvas"
+#import "tkd/resdlg"
+#import "tkd/glyphdlg"
+#import "tkd/fontwriter"
+#import "tkd/edits"
+#import "tkd/model"
+#import "tkd/panels"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkScrollPanel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkTest"
+using containers
+using cmdids
+using tkApp
+using tkHost
+using tkTest
+using tkPaint
+using model
+using tkListTree
+using tkScrollPanel
+using tkTextBox
+using tkLabel
+using tkComboBox
+using tkButton
+
+dim shared as long gResStep, gResTries, gResTones
+dim shared as ustring gResFaults
+dim shared as ustring gResRename
+dim shared as boolean gResAppBox        ' step 4: the Application icon box showed for the image
+
+private function resfile_Find_( byval dlg as resdlg.ResourceDialog ptr, byref nm as const ustring ) as long
+    for i as long = 0 to dlg->Doc.Items.Count( ) - 1
+        if dlg->Doc.Items[i].Name = nm then return i
+    next
+    return -1
+end function
+
+' Posted before the Center opens: once its modal loop runs, the step's work is done from inside it.
+private sub DriveResources( byval payload as any ptr )
+    dim as mainwin.Window ptr w = payload
+    gResTries += 1
+    if (w->ResDlg = 0) orelse (w->ResDlg->IsModal = false) then
+        if gResTries < 100000 then tkApp_RunOnUI( @DriveResources, payload )
+        exit sub
+    end if
+    dim as resdlg.ResourceDialog ptr dlg = w->ResDlg
+    select case gResStep
+    case 1 : dlg->AddPressed( )                  ' the picker is scripted (gPickPath)
+    case 2
+        ' its row is drawn (a tkListTree with no paint callback shows a blank list)
+        dim as TK_HOST ptr dh = tkForm_Host( dlg->Win )
+        tkHost_RenderTo( dh, false )
+        dim as TKRECT a
+        tkWidget_AbsRect( dlg->List, a )
+        dim as ulong c0
+        dim as long hh = tkListTree_GetHeaderHeight( dlg->List )   ' below the header: only the rows
+        gResTones = tkTest_TonesIn( dh, a.left, a.top + hh, a.right - a.left, a.bottom - a.top - hh, c0 )
+        gResFaults = dlg->NameFault( "a b" ) & "|" & dlg->NameFault( "1a" ) & "|" & dlg->NameFault( "ok_1" )
+        dlg->RenameSelected( gResRename )
+    case 3
+        ' Pick: the row of that name, then Select
+        dim as long want = resfile_Find_( dlg, gResRename )
+        for r as long = 0 to tkListTree_GetCount( dlg->List ) - 1
+            if tkListTree_GetItemData( dlg->List, r ) = want then tkListTree_SetCurSel( dlg->List, r )
+        next
+    case 4, 5
+        ' Manage: that image made the program's icon (4), then not (5)
+        dim as long want = resfile_Find_( dlg, gResRename )
+        for r as long = 0 to tkListTree_GetCount( dlg->List ) - 1
+            if tkListTree_GetItemData( dlg->List, r ) = want then tkListTree_SetCurSel( dlg->List, r )
+        next
+        dlg->ShowSelected( )
+        gResAppBox = tkWidget_IsVisible( dlg->ChkAppIcon )
+        dlg->AppIconToggled( gResStep = 4 )
+    end select
+    dlg->Finish( true )
+end sub
+
+private function OpenCenter( byref mw as mainwin.Window, byval stepNo as long ) as boolean
+    gResStep = stepNo
+    gResTries = 0
+    tkApp_RunOnUI( @DriveResources, @mw )
+    return mw.Execute( Cmd.FormResources )
+end function
+
+public sub ResourcePass( byref t as Tally, byval sc as single )
+    dim as mainwin.Window mw
+    mw.ConfigDir = FreshConfig( )
+    mw.Ask = @ScriptedAsk
+    mw.Pick = @ScriptedPick
+    t.Check( mw.Create( sc ), P( sc, "resources: main window created" ) )
+    if mw.form = 0 then exit sub
+    mw.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( mw.form )
+    tkTest_PumpFor( h, 150 )
+    dim as ustring dir_ = Files( )
+    dim as ustring proj = fs.PathJoin( dir_, "resproj" & cint( sc * 100 ) )
+    fs.RemoveDirAll( proj )
+    t.Check( mw.NewFormProject( proj ), P( sc, "resources: a new GUI project" ) )
+    tkTest_PumpFor( h, 100 )
+    dim as ustring resDir = fs.PathJoin( proj, "appResources" ), none
+    t.Check( fs.IsFile( fs.PathJoin( resDir, "appResources.tkres" ) ) andalso fs.IsFile( fs.PathJoin( resDir, "appResources.design.tiko" ) ), _
+        P( sc, "a new project has appResources" ) )
+    t.Check( instr( fs.ReadAllText( fs.PathJoin( proj, "main.tiko" ) ).ValueOr( none ), "appResources.Register( )" ) > 0, P( sc, "and its main registers them" ) )
+    t.Check( mw.CanRun( Cmd.FormResources ), P( sc, "Form > Resource Center... with a project open" ) )
+
+    ' ---- an image added
+    dim as SDL_Surface ptr red = SDL_CreateSurface( 6, 4, SDL_PIXELFORMAT_ARGB8888 )
+    SDL_FillSurfaceRect( red, 0, &hFFFF0000ul )
+    dim as string bmp = fs.PathJoin( dir_, "red.bmp" )
+    SDL_SaveBMP( red, strptr( bmp ) )
+    SDL_DestroySurface( red )
+    gPickPath = bmp
+    t.Check( OpenCenter( mw, 1 ), P( sc, "the Center opened, an image added, OK" ) )
+    dim as ustring tkres = fs.ReadAllText( fs.PathJoin( resDir, "appResources.tkres" ) ).ValueOr( none )
+    t.Check( instr( tkres, "name = ""red""" ) > 0, P( sc, "the .tkres has it, named from the file: " & tkres ) )
+    t.Check( fs.IsFile( fs.PathJoin( resDir, "files", "red.bmp" ) ), P( sc, "the file copied into files/" ) )
+    dim as ustring gen = fs.ReadAllText( fs.PathJoin( resDir, "appResources.design.tiko" ) ).ValueOr( none )
+    t.Check( instr( gen, "tkHost_AddResourceData( ""res:red""" ) > 0, P( sc, "the module builds it in" ) )
+    t.Check( tkHost_HasResource( "res:red" ), P( sc, "and this process knows it by name" ) )
+
+    ' ---- a Button wearing it
+    dim as DocRef d = mw.Active( )
+    dim as canvas.FormCanvas ptr c = 0
+    if d then c = d->Designer
+    t.Check( c <> 0, P( sc, "resources: the form on its surface" ) )
+    if c = 0 then
+        mw.Destroy( )
+        exit sub
+    end if
+    dim as FormDoc trial = c->Doc
+    edits.AddControl( trial, "Button", "", -1, 20, 20, 120, 32 )
+    dim as Array( of ustring ) names
+    names.Push( "Button1" )
+    edits.SetProperty( trial, names, "ImageLeft", "res:red" )
+    t.Check( len( c->ApplyEdit( trial, true, "" ) ) = 0, P( sc, "a Button with ImageLeft = res:red" ) )
+
+    ' ---- renamed in the Center: the form follows
+    gResRename = "brand"
+    t.Check( OpenCenter( mw, 2 ), P( sc, "the Center opened again, renamed, OK" ) )
+    t.Check( gResFaults = "Letters, digits and underscores only|Start with a letter|", P( sc, "a bad name says what is wrong, briefly: " & gResFaults ) )
+    t.Check( gResTones > 2, P( sc, "the Center's list draws its rows: " & gResTones & " tones" ) )
+    dim as long bi = FindControl( c->Doc, "Button1" )
+    dim as ustring img
+    if bi >= 0 then img = SettingOr( c->Doc.Controls[bi].Props, "ImageLeft" )
+    t.Check( img = "res:brand", P( sc, "the Button's ImageLeft follows the rename: " & img ) )
+    t.Check( tkHost_HasResource( "res:brand" ) andalso (tkHost_HasResource( "res:red" ) = false), P( sc, "this process knows the new name, not the old" ) )
+
+    ' ---- the program's icon: brand ticked, OK -> app.ico, app.rc and tiko.toml's line; unticked -> gone
+    dim as ustring ico = fs.PathJoin( resDir, "app.ico" ), rcf = fs.PathJoin( resDir, "app.rc" )
+    t.Check( OpenCenter( mw, 4 ) andalso gResAppBox, P( sc, "an image shows the Application icon box; ticked, OK" ) )
+    dim as ustring toml = fs.ReadAllText( fs.PathJoin( proj, "tiko.toml" ) ).ValueOr( none )
+    tkres = fs.ReadAllText( fs.PathJoin( resDir, "appResources.tkres" ) ).ValueOr( none )
+    t.Check( fs.IsFile( ico ) andalso fs.IsFile( rcf ) andalso (instr( toml, "resources = [""appResources/app.rc""]" ) > 0) _
+             andalso (instr( tkres, "app_icon = ""brand""" ) > 0), P( sc, "app.ico, app.rc, the tiko.toml line and app_icon written" ) )
+    t.Check( OpenCenter( mw, 5 ), P( sc, "unticked, OK" ) )
+    toml = fs.ReadAllText( fs.PathJoin( proj, "tiko.toml" ) ).ValueOr( none )
+    t.Check( (fs.IsFile( ico ) = false) andalso (fs.IsFile( rcf ) = false) andalso (instr( toml, "app.rc" ) = 0), P( sc, "and all three gone again" ) )
+    ' a Remove's warning names the control's property -- but not the one a "..." is picking for
+    c->SelectOnly( "Button1" )
+    dim as ustring users = mw.ResourceUsers( "brand" )
+    t.Check( instr( users, ": Button1.ImageLeft" ) > 0, P( sc, "brand's users: " & users ) )
+    mw.ResPickCanvas = c : mw.ResPickProp = "ImageLeft"
+    users = mw.ResourceUsers( "brand" )
+    mw.ResPickCanvas = 0 : mw.ResPickProp = ""
+    t.Check( len( users ) = 0, P( sc, "picking for Button1.ImageLeft, none other: " & users ) )
+
+    ' ---- the inspector's "..." on ImageLeft: the Center in Pick, the row takes res:brand
+    trial = c->Doc
+    edits.SetProperty( trial, names, "ImageLeft", "" )
+    c->ApplyEdit( trial, true, "" )
+    c->SelectOnly( "Button1" )
+    tkTest_PumpFor( h, 60 )
+    dim as panels.DesignPanels ptr ps = @mw.Palettes
+    dim as long fr = -1
+    for i as long = 0 to ps->Rows.Count( ) - 1
+        if ps->Rows[i].Key = "ImageLeft" then fr = i
+    next
+    t.Check( (fr >= 0) andalso (ps->Rows[fr].Btn <> 0), P( sc, "the ImageLeft row has a ""..."" button" ) )
+    t.Check( TTF_FontHasGlyph( tkForm_Font( mw.form, TKFONT_GLYPH ), TK_ICON_MORE ), P( sc, "the ""..."" glyph is in the glyph font" ) )
+    if (fr >= 0) andalso (ps->Rows[fr].Btn <> 0) then
+        tkScrollPanel_EnsureVisible( ps->Scroll, ps->Rows[fr].Btn )
+        tkTest_PumpFor( h, 30 )
+        gResStep = 3
+        gResTries = 0
+        tkApp_RunOnUI( @DriveResources, @mw )
+        tkTest_Click( h, tkTest_CX( ps->Rows[fr].Btn ), tkTest_CY( ps->Rows[fr].Btn ) )
+        tkTest_PumpFor( h, 100 )
+    end if
+    bi = FindControl( c->Doc, "Button1" )
+    img = ""
+    if bi >= 0 then img = SettingOr( c->Doc.Controls[bi].Props, "ImageLeft" )
+    t.Check( img = "res:brand", P( sc, "the ""..."" picks it into ImageLeft: " & img ) )
+    ' and the canvas's Button shows the image: red inside it
+    dim as long reds = 0
+    if (bi >= 0) andalso (bi < c->Widgets.Count( )) then
+        dim as TK_WIDGET ptr bw = c->Widgets[bi]
+        tkHost_RenderTo( bw->pHost, false )
+        dim as TKRECT rb
+        tkWidget_AbsRect( bw, rb )
+        for y as long = rb.top to rb.bottom - 1
+            for x as long = rb.left to rb.right - 1
+                if (tkTest_PixelAt( bw->pHost, x, y ) and &hFFFFFFul) = &hFF0000ul then reds += 1
+            next
+        next
+    end if
+    t.Check( reds > 0, P( sc, "the canvas's Button shows the image: " & reds & " red pixels" ) )
+
+    ' ---- the Glyph Picker on GlyphLeft (answered for the person): the character goes in, shown as
+    ' U+E824, and the Button's empty GlyphFont becomes GLYPH so the glyph draws in the glyph font
+    ' the bundled icons come from the compiler's toolchain (a shipped tkEdit has no fonts beside it)
+    mw.Prefs.Tiko = TestCompiler( )
+    mw.GlyphPick = sub( byval w as any ptr, byref dlg as glyphdlg.GlyphDialog, byref fi as long, byref picked as ustring )
+        fi = dlg.ThemeIdx
+        picked = wchr( &hE824 )
+    end sub
+    dim as long gr = -1
+    for i as long = 0 to ps->Rows.Count( ) - 1
+        if ps->Rows[i].Key = "GlyphLeft" then gr = i
+    next
+    if (gr >= 0) andalso (ps->Rows[gr].Btn <> 0) then
+        tkScrollPanel_EnsureVisible( ps->Scroll, ps->Rows[gr].Btn )
+        tkTest_PumpFor( h, 30 )
+        tkTest_Click( h, tkTest_CX( ps->Rows[gr].Btn ), tkTest_CY( ps->Rows[gr].Btn ) )
+        tkTest_PumpFor( h, 100 )
+    end if
+    mw.GlyphPick = 0
+    gr = -1
+    for i as long = 0 to ps->Rows.Count( ) - 1
+        if ps->Rows[i].Key = "GlyphLeft" then gr = i
+    next
+    bi = FindControl( c->Doc, "Button1" )
+    dim as ustring gl, gf, shown, drawn
+    if bi >= 0 then gl = SettingOr( c->Doc.Controls[bi].Props, "GlyphLeft" ) : gf = SettingOr( c->Doc.Controls[bi].Props, "GlyphFont" )
+    if gr >= 0 then
+        shown = tkTextBox_GetText( ps->Rows[gr].Edit )
+        if ps->Rows[gr].Preview then drawn = tkLabel_GetText( ps->Rows[gr].Preview )
+    end if
+    t.Check( (gl = "Fluent:E824") andalso (len( gf ) = 0) andalso (shown = "E824") andalso (drawn = wchr( &hE824 )), _
+             P( sc, "the Glyph Picker sets GlyphLeft " & gl & ", the box " & shown & ", the preview drawn; GlyphFont left alone " & gf ) )
+    ' the inspector's order and names: GlyphSize right after GlyphRight, ImageSize right after
+    ' ImageRight, TextGap for IconGap
+    dim as long iGR = -1, iGS = -1, iIR = -1, iIS = -1, iTG = -1
+    for i as long = 0 to ps->Rows.Count( ) - 1
+        select case ps->Rows[i].Key
+        case "GlyphRight" : iGR = i
+        case "GlyphFont" : if tkLabel_GetText( ps->Rows[i].Label ) = "GlyphSize" then iGS = i
+        case "ImageRight" : iIR = i
+        case "IconSize" : if tkLabel_GetText( ps->Rows[i].Label ) = "ImageSize" then iIS = i
+        case "IconGap" : if tkLabel_GetText( ps->Rows[i].Label ) = "TextGap" then iTG = i
+        end select
+    next
+    t.Check( (iGR >= 0) andalso (iGS = iGR + 1) andalso (iIR >= 0) andalso (iIS = iIR + 1) andalso (iTG >= 0), _
+             P( sc, "inspector: GlyphSize after GlyphRight, ImageSize after ImageRight, TextGap: " & iGR & " " & iGS & " " & iIR & " " & iIS & " " & iTG ) )
+    ' GlyphSize: a size in points chosen in the inspector is taken (stored as GlyphFont = "32")
+    dim as long sr = -1
+    for i as long = 0 to ps->Rows.Count( ) - 1
+        if ps->Rows[i].Key = "GlyphFont" then sr = i
+    next
+    if sr >= 0 then
+        tkComboBox_SetCurSel( ps->Rows[sr].Edit, tkComboBox_FindItemByText( ps->Rows[sr].Edit, "32" ) )
+        ps->CommitRow( sr )
+        tkTest_PumpFor( h, 30 )
+    end if
+    bi = FindControl( c->Doc, "Button1" )
+    dim as ustring gs32
+    if bi >= 0 then gs32 = SettingOr( c->Doc.Controls[bi].Props, "GlyphFont" )
+    t.Check( gs32 = "32", P( sc, "GlyphSize 32 taken from the inspector: " & gs32 ) )
+    ' AutoSize: a long caption with AutoSize on makes the Button its ideal size (its design W and H)
+    bi = FindControl( c->Doc, "Button1" )
+    dim as long w0 = 0, w1 = 0, iw = 0, ih = 0
+    if bi >= 0 then
+        w0 = c->Doc.Controls[bi].W
+        trial = c->Doc
+        edits.SetProperty( trial, names, "Text", "A much longer caption than this button had" )
+        edits.SetProperty( trial, names, "AutoSize", "true" )
+        c->ApplyEdit( trial, true, "" )
+        tkTest_PumpFor( h, 30 )
+        bi = FindControl( c->Doc, "Button1" )
+        w1 = c->Doc.Controls[bi].W
+        tkButton_GetIdealSize( c->WidgetOf( "Button1" ), iw, ih )
+    end if
+    ' its pixels at least the ideal width (a pixel short cuts the caption to "..."), and no more than
+    ' the next design unit up
+    dim as long cw1 = 0
+    if c->WidgetOf( "Button1" ) then cw1 = c->WidgetOf( "Button1" )->cw
+    t.Check( (w1 > w0) andalso (cw1 >= iw) andalso (c->ToPixels( w1 - 1 ) < iw), _
+             P( sc, "AutoSize: the Button grew to its ideal width: " & w0 & " -> " & w1 & ", " & cw1 & "px for an ideal " & iw & "px" ) )
+    ' the project's first glyph writes its font list (GLYPHS.md V3), the bundled fonts
+    dim as ustring tkg = fs.ReadAllText( fs.PathJoin( proj, "appGlyphs", "appGlyphs.tkglyphs" ) ).ValueOr( "" )
+    t.Check( (instr( tkg, "Fluent = { bundled = ""FluentSystemIcons-Regular.ttf"" }" ) > 0) andalso (instr( tkg, "Tabler = " ) > 0), _
+             P( sc, "appGlyphs.tkglyphs holds the project's glyph fonts" ) )
+    ' V4: the glyphs built -- numbered, one font, its module, main using it, the licence beside it, and
+    ' the form's code at the new number
+    mw.BuildGlyphs( )
+    dim as ustring gdir = fs.PathJoin( proj, "appGlyphs" )
+    tkg = fs.ReadAllText( fs.PathJoin( gdir, "appGlyphs.tkglyphs" ) ).ValueOr( "" )
+    t.Check( (instr( tkg, """Fluent:E824"" = ""E000""" ) > 0) andalso fontwriter.HasGlyph( fs.PathJoin( gdir, "glyphs.ttf" ), &hE000 ) _
+             andalso fontwriter.HasGlyph( fs.PathJoin( gdir, "glyphs.ttf" ), TK_ICON_CLOSE ), _
+             P( sc, "glyphs: Fluent:E824 numbered E000, in glyphs.ttf with tkControls' own icons (the close X)" ) )
+    ' main.tiko as tkEdit has it: an open buffer takes the change (saved with it), else the file
+    dim as ustring mainText = fs.ReadAllText( fs.PathJoin( proj, "main.tiko" ) ).ValueOr( "" )
+    for each dd as DocRef in mw.Docs
+        if (len( dd->Path ) > 0) andalso fs.PathEquals( dd->Path, fs.PathJoin( proj, "main.tiko" ) ) then mainText = dd->Text( )
+    next
+    t.Check( (instr( fs.ReadAllText( fs.PathJoin( gdir, "appGlyphs.design.tiko" ) ).ValueOr( "" ), "#embed gGlyphs_ ""glyphs.ttf""" ) > 0) _
+             andalso (instr( mainText, "appGlyphs.ApplyOptions( options )" ) > 0) _
+             andalso fs.IsFile( fs.PathJoin( gdir, "licenses", "FluentSystemIcons-LICENSE.txt" ) ), _
+             P( sc, "glyphs: the module, main.tiko using it, Fluent's licence" ) )
+    dim as ustring formGen
+    for each dd as DocRef in mw.Docs
+        if dd->Designer then
+            mw.WriteGenerated( dd )
+            formGen &= fs.ReadAllText( left( dd->Path, len( dd->Path ) - 7 ) & ".design.tiko" ).ValueOr( "" )
+        end if
+    next
+    t.Check( instr( formGen, "Button1.GlyphLeft = wchr( &hE000 )" ) > 0, P( sc, "glyphs: the form's code writes the new number" ) )
+
+    for each dd as DocRef in mw.Docs
+        dd->Main.SetSavePoint( )
+    next
+    mw.Destroy( )
+end sub

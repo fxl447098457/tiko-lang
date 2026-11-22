@@ -16,10 +16,10 @@ SpCast( of D, B )
 #import "std/memory"
 using memory
 
-type Shape extends Object
+class Shape
     as int32 id
     declare virtual destructor( )
-end type
+end class
 virtual destructor Shape( ) : end destructor
 
 type Circle extends Shape

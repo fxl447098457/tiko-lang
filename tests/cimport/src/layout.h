@@ -70,3 +70,15 @@ struct lay_pack8_bits {
     int b : 5;
 };
 #pragma pack(pop)
+
+/* __int128 is 16-aligned in tiko as in C, so a record holding one is not over-aligned: 'v'
+   at 16 and no pad, 'i' at 16 and tiko's own rounding reaches C's 32 -- no pad there
+   either. One that holds such a record is padded as before ('w' ends at 33, C's size 48),
+   a packed one is 'field = 4' at 20 bytes, and a union is 16. */
+struct lay_wide { char c; __int128 v; };
+struct lay_wide_tail { __int128 v; int i; };
+struct lay_holds_wide_tail { struct lay_wide_tail w; char c; };
+#pragma pack(push, 4)
+struct lay_wide_pack4 { char c; unsigned __int128 v; };
+#pragma pack(pop)
+union lay_wide_union { __int128 v; char c[3]; };

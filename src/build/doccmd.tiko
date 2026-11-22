@@ -1,0 +1,208 @@
+'' doccmd.tiko -- 'tiko doc': the API documentation of a project's modules (testdoc.ti).
+''
+''     tiko doc                     every module of the project (the manifest's directory, else here)
+''     tiko doc src/util pkg/x      those module directories, or the modules under those directories
+''     tiko doc -o docs/api         somewhere other than out/doc
+''
+'' EACH MODULE IS ONE '--emit-doc' RUN (driver/docmodel.tiko): built as an importer builds it --
+'' a cache hit when nothing changed -- and its pages written from its interface and its comments:
+'' <chain>.md, <chain>.html, and .parts/<chain>.json and .idx. THEN THE WHOLE: index.md and
+'' index.html listing the modules, doc.json ({"format":1,"modules":[ ... ]}) for tools, and
+'' search.js, the name index the pages search -- a script and not JSON, so the search works on
+'' pages opened straight from the disk, where a page cannot fetch a file. A module's '*_test.tiko'
+'' files are never part of it here.
+
+#import "std/containers"
+#import "std/fs"
+#include once "build/testdoc.ti"
+#include once "driver/driver.ti"
+#include once "driver/doc.ti"
+#include once "driver/modresolve.ti"
+#include once "support/text.ti"
+
+namespace Tko.Build
+
+private sub Fields_( byref ln as string, byref outv as Tko.StrVec )
+    dim as int32 p = 1
+    do
+        dim as int32 e = instr( p, ln, chr( 9 ) )
+        if e = 0 then
+            outv.Push( mid( ln, p ) )
+            exit do
+        end if
+        outv.Push( mid( ln, p, e - p ) )
+        p = e + 1
+    loop
+end sub
+
+private function Js_( byref s as string ) as string
+    dim as string r = """"
+    for i as int32 = 0 to len( s ) - 1
+        select case s[i]
+        case 34 : r &= "\"""
+        case 92 : r &= "\\"
+        case 60 : r &= "<"                  '' inside a <script>: no '</script>' can close it
+        case is < 32 : r &= " "
+        case else : r &= chr( s[i] )
+        end select
+    next
+    return r & """"
+end function
+
+'' The parts files of one kind, in name order.
+private sub Parts_( byref dir_ as string, byref ext as string, byref outv as Tko.StrVec )
+    dim as containers.Array( of fs.DirEntry ) es
+    if fs.ListDir( dir_, es ).IsOk( ) = false then return
+    for k as int32 = 0 to es.Count - 1
+        if es[k].IsFile( ) = false then continue for
+        dim as string nm = es[k].Name( )
+        if Tko.Text.LowerAscii( right( nm, len( ext ) ) ) <> ext then continue for
+        dim as int32 at = outv.Count
+        outv.Push( nm )
+        while at > 0
+            if Tko.Text.LowerAscii( outv[at - 1] ) <= Tko.Text.LowerAscii( nm ) then exit while
+            outv[at] = outv[at - 1]
+            at -= 1
+        wend
+        outv[at] = nm
+    next
+end sub
+
+'' The pages over every module: index.md, index.html, doc.json, search.js.
+private function WriteIndex_( byref outDir as string, byref ctx as Tko.CompilerContext ) as boolean
+    dim as string parts = Tko.Modules.JoinPath( outDir, ".parts" )
+    dim as Tko.StrVec idx, js
+    Parts_( parts, ".idx", idx )
+    Parts_( parts, ".json", js )
+    dim as string nl = chr( 10 )
+    dim as string md = "# API" & nl & nl & "| Module | Import | |" & nl & "|---|---|---|" & nl
+    dim as string ht = "<h1>API</h1>" & nl & "<table>" & nl
+    dim as string sj = "window.TIKO_DOC_INDEX=["
+    dim as boolean firstItem = true
+    for each f as string in idx
+        dim as string t = ReadText( Tko.Modules.JoinPath( parts, f ) )
+        dim as int32 p = 1
+        while p <= len( t )
+            dim as int32 e = instr( p, t, nl )
+            if e = 0 then e = len( t ) + 1
+            dim as string ln = mid( t, p, e - p )
+            p = e + 1
+            dim as Tko.StrVec fv
+            Fields_( ln, fv )
+            if (fv.Count >= 4) andalso (fv[0] = "module") then
+                dim as string nm = mid( fv[1], instrrev( fv[1], "." ) + 1 )
+                md &= "| [" & nm & "](" & fv[1] & ".md) | `#import """ & fv[2] & """` | " & fv[3] & " |" & nl
+                ht &= "<tr><td><a href=""" & Tko.Doc.HtmlEsc( fv[1] ) & ".html"">" & Tko.Doc.HtmlEsc( nm ) & _
+                      "</a></td><td><code>#import &quot;" & Tko.Doc.HtmlEsc( fv[2] ) & "&quot;</code></td><td>" & _
+                      Tko.Doc.HtmlEsc( fv[3] ) & "</td></tr>" & nl
+                sj &= iif( firstItem, "", "," ) & "{""m"":" & Js_( nm ) & ",""k"":""module"",""n"":" & Js_( nm ) & _
+                      ",""u"":" & Js_( fv[1] & ".html" ) & ",""s"":" & Js_( fv[3] ) & "}"
+                firstItem = false
+            elseif (fv.Count >= 5) andalso (fv[0] = "item") then
+                dim as string modName = left( fv[2], instr( fv[2], "." ) - 1 )
+                sj &= iif( firstItem, "", "," ) & "{""m"":" & Js_( modName ) & ",""k"":" & Js_( fv[1] ) & _
+                      ",""n"":" & Js_( fv[2] ) & ",""u"":" & Js_( fv[3] ) & ",""s"":" & Js_( fv[4] ) & "}"
+                firstItem = false
+            end if
+        wend
+    next
+    ht &= "</table>" & nl
+    dim as string dj = "{""format"":1,""generator"":""tiko " & Tko.TKO_VERSION_MAJOR & "." & _
+                       Tko.TKO_VERSION_MINOR & "." & Tko.TKO_VERSION_PATCH & """,""modules"":["
+    for k as int32 = 0 to js.Count - 1
+        dj &= iif( k > 0, ",", "" ) & ReadText( Tko.Modules.JoinPath( parts, js[k] ) )
+    next
+    dj &= "]}" & nl
+    dim as string files( 0 to 3 ) = { "index.md", "index.html", "doc.json", "search.js" }
+    dim as string texts( 0 to 3 )
+    texts( 0 ) = md
+    texts( 1 ) = Tko.Doc.Page( "API", ht, "" )
+    texts( 2 ) = dj
+    texts( 3 ) = sj & "];" & nl
+    for k as int32 = 0 to 3
+        dim as string fp = Tko.Modules.JoinPath( outDir, files( k ) )
+        if WriteTextIfChanged( fp, texts( k ) ) = false then
+            ctx.diags.ReportGlobal( Tko.TKO1208, fp )
+            return false
+        end if
+    next
+    return true
+end function
+
+function DocCommand _
+    ( byref a as BuildArgs, byval hasM as boolean, byref m as Tko.Modules.Manifest, _
+      byref mdir as string, byref ctx as Tko.CompilerContext, byref obs as Observer ) as int32
+
+    dim as string root = iif( hasM, mdir, "." )
+    dim as string outDir = a.outPath
+    if len( outDir ) = 0 then outDir = iif( hasM, Rel( mdir, "out/doc" ), "out/doc" )
+
+    '' THE MODULES: each directory word that is one, the modules under each that is not, else
+    '' every module of the project.
+    dim as Tko.StrVec dirs, scan_
+    for each w as string in a.words
+        if fs.IsDir( w ) = false then
+            ctx.diags.ReportGlobal( Tko.TKO1210, w )
+            ctx.diags.Flush( )
+            return Tko.EXIT_CMDLINE
+        end if
+        if IsModuleDir( w ) then
+            dirs.Push( w )
+        else
+            scan_.Push( w )
+        end if
+    next
+    if (a.words.Count = 0) then scan_.Push( root )
+    for each s as string in scan_
+        dim as Tko.StrVec ds
+        ProjectDirs( s, ds )
+        for each d as string in ds
+            if IsModuleDir( d ) then dirs.Push( d )
+        next
+    next
+    if dirs.Count = 0 then
+        dim as string where_ = ""
+        for each s as string in scan_
+            where_ &= iif( len( where_ ) > 0, ", ", "" ) & "'" & s & "'"
+        next
+        ctx.diags.ReportGlobal( Tko.TKO1209, where_ )
+        ctx.diags.Flush( )
+        return Tko.EXIT_OK
+    end if
+
+    dim as string parts = Tko.Modules.JoinPath( outDir, ".parts" )
+    if fs.IsDir( parts ) then fs.RemoveDirAll( parts )
+    dim as int32 rc = Tko.EXIT_OK
+    for each d as string in dirs
+        dim as Tko.StrVec dargs
+        for each x as string in a.extra
+            dargs.Push( x )
+        next
+        if len( a.target ) > 0 then
+            dargs.Push( "-target" )
+            dargs.Push( a.target )
+        end if
+        if len( a.diagFile ) > 0 then
+            dargs.Push( "--diagnostics-file" )
+            dargs.Push( a.diagFile )
+        end if
+        dargs.Push( "--emit-doc" )
+        dargs.Push( outDir )
+        dargs.Push( d )
+        obs.finished = false
+        dim as int32 one = Tko.Driver.Run( dargs, 0, nullptr, @obs )
+        EmitLine( obs, """event"":""doc"",""dir"":" & JsonStr( d ) & ",""exit"":" & one )
+        if one <> Tko.EXIT_OK then rc = one
+    next
+    if WriteIndex_( outDir, ctx ) = false then
+        ctx.diags.Flush( )
+        return Tko.EXIT_TOOL_FAILED
+    end if
+    EmitLine( obs, """event"":""doc-end"",""modules"":" & dirs.Count & ",""path"":" & JsonStr( outDir ) & _
+                   ",""exit"":" & rc )
+    if a.json = false then print "doc: " & dirs.Count & iif( dirs.Count = 1, " module", " modules" ) & _
+                                  " -> " & Tko.Modules.JoinPath( outDir, "index.html" )
+    return rc
+end function
+
+end namespace

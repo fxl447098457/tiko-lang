@@ -17,6 +17,9 @@ default_seed( ) {
     ds_root=$1
     if [ "$2" = "1" ]; then ds_host=windows; ds_rel="tiko-windows/tiko.exe"
     elif [ "$(uname -s)" = "Darwin" ]; then ds_host=macos; ds_rel="tiko-macos/bin/tiko"
+    # aarch64 Linux is ITS OWN HOST, never 'linux': that seed is x86-64 and would not run.
+    # seed-10 is the first seed with a linux-arm64 line (seed/fetch-seed.sh unpacks it here).
+    elif [ "$(uname -m)" = "aarch64" ]; then ds_host=linux-arm64; ds_rel="tiko-linux-arm64/bin/tiko"
     else                    ds_host=linux;   ds_rel="tiko-linux/bin/tiko"; fi
     ds_main=$(git -C "$ds_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
     [ -n "$ds_main" ] && ds_main=$(dirname "$ds_main")

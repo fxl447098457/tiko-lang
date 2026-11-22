@@ -102,6 +102,7 @@ fi
 if [ -z "$TARGET" ]; then
     if [ "$HOSTWIN" = "1" ]; then TARGET="windows-x86_64"
     elif [ "$(uname -s)" = "Darwin" ]; then TARGET="macos-arm64"
+    elif [ "$(uname -m)" = "aarch64" ]; then TARGET="linux-arm64"
     else TARGET="linux-x86_64"; fi
 fi
 # THE SEED'S NAME FOR THE TARGET. windows-x86_64 was win64-msvc until 2026-10-12, and a
@@ -127,6 +128,7 @@ if [ -z "$TIKO_BOOT_LIBDIRS" ]; then
         win64)        TIKO_BOOT_LIBDIRS="$ROOT/toolchains/tiko-windows/lib/win64"
                       [ -d "$ROOT/toolchains/tiko-windows/lib/win64-fb" ] && TIKO_BOOT_LIBDIRS="$TIKO_BOOT_LIBDIRS $ROOT/toolchains/tiko-windows/lib/win64-fb" ;;
         linux-x86_64) TIKO_BOOT_LIBDIRS="$ROOT/lib/rt/lib/linux-x86_64" ;;
+        linux-arm64)  TIKO_BOOT_LIBDIRS="$ROOT/lib/rt/lib/linux-arm64" ;;
         macos-arm64)  TIKO_BOOT_LIBDIRS="$ROOT/lib/rt/lib/macos-arm64" ;;
         *) echo "bootstrap: unknown target '$TARGET'" >&2; exit 2 ;;
     esac

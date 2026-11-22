@@ -57,30 +57,209 @@ gHost->OnSize = @Form_Size
 `tkSplitter_SetPos` and `tkSplitter_SetRange` are silent: they move or clamp the bar without
 calling the position callback, so repaint the panes yourself after calling them.
 
-## Coming from PsSplitter
+## Concepts
 
-The behaviour reference is [PsSplitter](PsSplitter); everything not listed here works the same.
+### The orientation is named for the bar's own axis
 
-- Names: `PsSplitter_*` → `tkSplitter_*`, `PSSPLITTER_*` → `TKSPLITTER_*`. The callback types
-  `SPL_PaintCallbackSub`, `SPL_MessageCallbackFunc` and `SPL_PosChangedCallbackSub` keep their
-  names. The handle is `TK_WIDGET ptr`.
-- `tkSplitter_Create( hParent, ctrlId [, nOrientation] )` takes a `TK_WIDGET ptr` parent; for a
-  top-level window pass `tkHost_Root( h )`. The bar is created at 0,0 with no size: place it
-  with `tkWidget_SetPos`.
-- The cursor is the widget's own, `TK_CURSOR_SIZEWE` or `TK_CURSOR_SIZENS`, and holds for the
-  whole drag. There is no `WM_SETCURSOR`; replace it with `tkWidget_SetCursor`.
-- `TKSPLITTER_MESSAGEINFO` carries `msg` (`TKM_LBUTTONDOWN`, `TKM_MOUSEMOVE`, `TKM_LBUTTONUP`),
-  widget-local `x` / `y` and `clicks` in place of `uMsg` / `wParam` / `lParam`. A double click
-  is `TKM_LBUTTONDOWN` with `clicks = 2`; claim it from the message callback for the
-  collapse-and-restore idiom.
-- Colours start from the current theme and follow it. `tkSplitter_SetColors` pins them;
-  `tkSplitter_UnpinColors` hands them back. `tkSplitter_ThemeColors` and
-  `TKSPLITTER_COLORS` give the theme mapping as a value.
-- Added: `tkSplitter_GetHotColor` and the constant `TKSPLITTER_MAX_UNBOUNDED`.
-- A disabled widget (`tkWidget_Enable`) ends any drag and drops its hover.
-- DPI changes rescale the position and range automatically; there is no `Rescale` call.
-- Gone: the hover-poll timer and its constants, `CS_DBLCLKS`, and PsRegistry. The control still
-  has no keyboard, no tooltip and no text.
+| Orientation | The bar is | It separates | It drags | Cursor | The position is |
+|---|---|---|---|---|---|
+| `TKSPLITTER_VERTICAL` | a vertical line | a **left** and a **right** pane | horizontally | `TK_CURSOR_SIZEWE` | the bar's **x** |
+| `TKSPLITTER_HORIZONTAL` | a horizontal line | a **top** and a **bottom** pane | vertically | `TK_CURSOR_SIZENS` | the bar's **y** |
+
+A vertical splitter does not split a window into a top and a bottom: it *is* a vertical bar,
+and it splits left from right.
+
+The orientation is passed to `tkSplitter_Create` and is fixed for the control's lifetime; any
+value other than `TKSPLITTER_HORIZONTAL` is taken as `TKSPLITTER_VERTICAL`. There is no setter.
+To switch split modes, destroy the control and create the other one.
+
+### The position is the bar's leading edge, in the parent's coordinates
+
+It is the *leading* edge, not the centre: the right pane of a vertical split starts at
+`nPos + barWidth`, not at `nPos`. The parent is the widget passed to `tkSplitter_Create` (for a
+top-level window, `tkHost_Root( h )`). `nMin`, `nMax` and the `newPos` your callback receives
+all live in the same space.
+
+### The size you give the bar is the grab area
+
+The splitter is created at 0,0 with no size; place and size it with `tkWidget_SetPos`. There is
+no separate hit margin: the whole widget is the bar. For a thin visual line inside a comfortable
+grab area, size the widget comfortably and draw the line from a paint callback.
+
+### The three drag phases
+
+A user drag produces one `BEGIN`, zero or more `MOVE`s, and one `END`, in that order, all
+through the position callback:
+
+| Phase | When | `newPos` | What a host typically does |
+|---|---|---|---|
+| `TKSPLITTER_PHASE_BEGIN` | The user just grabbed the bar, before it has moved at all. | The current, unchanged position | Start the gesture: suspend an expensive reflow, snapshot state |
+| `TKSPLITTER_PHASE_MOVE` | The position actually changed. Never fired when the clamped position is the same as before, so a drag held against a limit goes quiet. | The new position, already applied | Lay out the two panes; keep it cheap |
+| `TKSPLITTER_PHASE_END` | The drag ended: the button came up, or the capture was lost. | The final position | Commit: resume the reflow, save the position |
+
+`END` always arrives. Losing the capture mid-drag, hiding the splitter or disabling it ends the
+drag at the position the user dragged to; every intermediate position has already been applied,
+so there is nothing to undo. By the time `END` runs, `tkSplitter_IsDragging` already returns
+FALSE.
+
+By the time any phase fires, the control has already clamped the position and moved itself. Lay
+out the panes from the callback; do not move the bar.
+
+### Who owns what
+
+| Owned by the control | Owned by you |
+|---|---|
+| The bar's position along its drag axis | The bar's thickness, its cross-axis position and its extent |
+| Clamping to the range | Computing the range and pushing it in with `tkSplitter_SetRange` |
+| Cursor, hover, capture, the drag arithmetic | Everything on both sides of the bar |
+| Its own repaint | Repainting your panes |
+| — | Collapse / restore, if you want it |
+
+The control never derives the range from its parent's size, because it cannot know what else
+lives in that space. Recompute the limits whenever the window resizes and call
+`tkSplitter_SetRange`.
+
+### Programmatic changes are silent
+
+`tkSplitter_SetPos` and `tkSplitter_SetRange` clamp, move the bar and repaint, and fire nothing.
+You can call either one from inside the position callback without re-entering it, and a
+programmatic move must be followed by your own pane layout and repaint.
+
+### Moving the bar yourself
+
+If you move the widget yourself (a layout pass, a pane collapse), the control re-reads its
+position from the widget whenever it is queried or set, so `tkSplitter_GetPos` always agrees
+with where the bar actually is. That re-read is an observation: nothing is clamped and nothing
+is notified. A bar placed outside its range is reported honestly, and the next drag or
+`tkSplitter_SetPos` pulls it back in. The re-read is skipped while a drag is in progress, when
+the control is the one doing the moving.
+
+### Hover
+
+The bar paints in its hot colour while the mouse is over it, and the host's mouse-leave clears
+it. While a drag is live, hover is pinned TRUE, because under capture the cursor roams far
+outside the bar. When the drag ends, hover is re-derived from where the cursor finished. Hiding
+or disabling the splitter ends any drag and drops the hover, so the highlight cannot reappear
+stale.
+
+### Mouse capture
+
+The control takes the capture on the button-down, before your message callback runs, so a
+callback that claims the down still gets a clean, matched release. The message callback's
+return value is ignored for `TKM_LBUTTONUP`: a host allowed to suppress it would strand the
+capture.
+
+### Double-click
+
+A double click arrives as `TKM_LBUTTONDOWN` with `clicks = 2`. The control gives it the same
+capture-and-begin-drag handling as an ordinary down, and does nothing else with it. Collapse and
+restore are yours to implement: claim the double click from the message callback (return TRUE)
+and no drag starts. Inside that handler, `tkSplitter_SetPos` moves the bar silently, so lay out
+and repaint the panes yourself.
+
+The first click of a double click is a real click: it begins and ends a zero-length drag (one
+`BEGIN`, one `END`) before the double click arrives.
+
+### Pixels and scale
+
+Positions, limits and the bar's thickness are pixels in the parent's space; scale your literals
+with `tkHost_Scale`. When the host's scale changes, the control rescales its position and both
+limits (an unbounded maximum stays unbounded), re-clamps and moves the bar, silently. The
+control measures no text and owns no font.
+
+## Behaviour and limits
+
+- **It does not create, size or know about the panes.** Your callback lays them out.
+- **It does not compute its own limits.** Until `tkSplitter_SetRange` is called the range is
+  `0 .. TKSPLITTER_MAX_UNBOUNDED`.
+- **Limits are absolute pixel positions**, not fractions; nothing rescales when the parent
+  resizes, so re-push the range on every resize.
+- **An inverted range (`nMax < nMin`) pins the bar at `nMin`** rather than rejecting the call. A
+  window too small to hold both panes legitimately produces one.
+- **The control moves only along its drag axis.** Cross-axis position and size are read back
+  from the widget and preserved. Moving the bar sideways (a horizontal bar inside the right pane
+  of a vertical split) is your `tkWidget_SetPos`.
+- **No keyboard.** The splitter is never focusable and handles no keys; keyboard resizing is the
+  host's, through `tkSplitter_SetPos`.
+- **A flat fill only.** Grip dots, a hairline or an etched edge are a paint callback's job.
+- **No collapse, restore or snap of its own.** The control holds one number and no memory of a
+  previous one.
+- **No tooltip and no text.**
+- **The cursor is the widget's own**, `TK_CURSOR_SIZEWE` or `TK_CURSOR_SIZENS`, set at create
+  and held for the whole drag. Replace it with `tkWidget_SetCursor`.
+- **Disabled** (`tkWidget_Enable`), the splitter ends any drag, drops its hover and takes no
+  mouse input.
+
+## Colours
+
+The built-in painter uses two colours, held in `TKSPLITTER_COLORS`:
+
+| Colour | Paints | Theme role |
+|---|---|---|
+| `BackColor` | The whole bar, idle | `Divider` |
+| `HotColor` | The whole bar, while the mouse is over it **or** a drag is in progress | `TextDisabled` |
+
+The splitter takes its colours from the current theme when it is created (including any theme
+recipe for `"Splitter"`) and follows every theme change. `tkSplitter_SetColors` sets both
+colours and pins them, so a theme change leaves this splitter alone; `tkSplitter_UnpinColors`
+hands it back to the theme and applies the theme at once. `tkSplitter_GetColors` reads the pair
+in force, `tkSplitter_ThemeColors` gives the theme mapping as a value, and
+`tkSplitter_ApplyTheme` applies a given theme to an unpinned splitter.
+
+The painter picks one colour per repaint, hot or dragging over idle, and fills the whole bar
+with it. There is no separate dragging colour and no disabled colour. A paint callback ignores
+both colours.
+
+## Callbacks
+
+All three are optional and independent. Passing 0 clears a callback; clearing the paint
+callback restores the built-in painter.
+
+### Position changed
+
+```freebasic
+type SPL_PosChangedCallbackSub as sub( byval hSplitter as TK_WIDGET ptr, byval newPos as long, byval nPhase as long )
+```
+
+The user moved the splitter. `newPos` is the new leading edge in the parent's coordinates and
+`nPhase` is one of the three phases above. It does not fire for `tkSplitter_SetPos` or
+`tkSplitter_SetRange`. One callback can serve several splitters: `hSplitter` says which one,
+and `tkSplitter_GetOrientation` says which axis it moved on.
+
+### Paint
+
+```freebasic
+type SPL_PaintCallbackSub as sub( byval p as TKSPLITTER_PAINTINFO ptr )
+```
+
+Draws the whole bar instead of the built-in painter. Nothing is drawn for you first: paint every
+pixel through `p->b` inside `p->rcClient`. To draw the stock bar and add to it, call
+`tkSplitter_PaintDefault( p )` first.
+
+| Field | Meaning |
+|---|---|
+| `hSplitter` | The control, so the callback can query it |
+| `b` | The paint context for this repaint (borrowed, not owned) |
+| `rcClient` | The whole bar, widget-local |
+| `nOrientation` | `TKSPLITTER_VERTICAL` or `TKSPLITTER_HORIZONTAL`, so one callback can serve both |
+| `isHot` | The mouse is over the bar; stays TRUE for the whole of a drag |
+| `isDragging` | A drag is in progress |
+
+### Message
+
+```freebasic
+type SPL_MessageCallbackFunc as function( byval m as TKSPLITTER_MESSAGEINFO ptr ) as boolean
+```
+
+Observes the control's mouse messages as they arrive. `TKSPLITTER_MESSAGEINFO` carries
+`hSplitter`, `msg`, widget-local `x` / `y` and `clicks`. Return TRUE to suppress the control's
+own handling. It is called for these messages and no others:
+
+| Message | Effect of returning TRUE |
+|---|---|
+| `TKM_LBUTTONDOWN` | No drag starts and no `BEGIN` is sent. The capture is already taken and is released on the trailing up. With `clicks = 2`, this is the way to implement collapse / restore. |
+| `TKM_MOUSEMOVE` | Neither the drag update nor the hover update runs for this move. |
+| `TKM_LBUTTONUP` | Ignored. The up ends the drag and releases the capture regardless. |
 
 ## Public declarations
 
@@ -152,7 +331,9 @@ function tkSplitter_GetHotColor( byval hSplit as TK_WIDGET ptr ) as ulong
 sub tkSplitter_SetColors( byval hSplit as TK_WIDGET ptr, byval backclr as ulong, byval hotclr as ulong )
 function tkSplitter_ThemeColors( byref t as TKTHEME_COLORS ) as TKSPLITTER_COLORS
 sub tkSplitter_ApplyTheme( byval hSplit as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+sub tkSplitter_GetColors( byval hSplit as TK_WIDGET ptr, byval pColors as TKSPLITTER_COLORS ptr )
 sub tkSplitter_UnpinColors( byval hSplit as TK_WIDGET ptr )
+sub tkSplitter_PaintDefault( byval p as TKSPLITTER_PAINTINFO ptr )
 sub tkSplitter_SetPaintCallback( byval hSplit as TK_WIDGET ptr, byval usersub as SPL_PaintCallbackSub )
 sub tkSplitter_SetMessageCallback( byval hSplit as TK_WIDGET ptr, byval userfunc as SPL_MessageCallbackFunc )
 sub tkSplitter_SetPosChangedCallback( byval hSplit as TK_WIDGET ptr, byval usersub as SPL_PosChangedCallbackSub )
@@ -161,5 +342,4 @@ sub tkSplitter_SetPosChangedCallback( byval hSplit as TK_WIDGET ptr, byval users
 ### See also
 
 - [tkControls](Category-tkControls)
-- [tkApp](tkApp), [tkHost](tkHost)
-- [PsSplitter](PsSplitter), the PsControls control
+- [tkApp](tkApp), [tkHost](tkHost), [tkTheme](tkTheme)

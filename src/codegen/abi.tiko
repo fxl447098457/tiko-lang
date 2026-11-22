@@ -19,15 +19,20 @@ end function
 
 '' WIN64 OR SysV, AND NOTHING ELSE REACHES A CLASSIFIER. Every test in this file used to be
 '' 'abi = ABI_WIN64', with SysV as whatever was left -- so a third ABI would have been
-'' classified as SysV in eight places at once. ABI_AAPCS64_APPLE takes its own branch,
-'' ahead of every call to this; reaching here with it is a compiler bug.
+'' classified as SysV in eight places at once. AAPCS64 takes its own branch, ahead of
+'' every call to this; reaching here with it is a compiler bug.
+''
+'' BOTH AAPCS64s: Apple's (macos-arm64) and the generic one (linux-arm64) share the whole
+'' classifier -- the ABI lane passed 5810 of 5815 checks with Apple's IR retargeted to
+'' aarch64-linux, the 5 being cva_arg (docs/tiko-linux-arm64 FEASIBILITY). What differs is
+'' asked of AbiIsAppleAapcs_ by name: the narrow-integer extension attributes.
 private function AbiIsAapcs_( byref target as TargetDescription ) as boolean
-    return (target.abi = ABI_AAPCS64_APPLE)
+    return (target.abi = ABI_AAPCS64_APPLE) orelse (target.abi = ABI_AAPCS64)
 end function
 
-'' THE AAPCS64 HALF -- AapcsHfaType, AapcsArgType, AapcsRetType, AapcsSlotSize --
-'' is the abiaapcs unit beside this one: this file passed the 1500-line lint cap,
-'' and those four are the pieces only this unit's callers reach.
+private function AbiIsAppleAapcs_( byref target as TargetDescription ) as boolean
+    return (target.abi = ABI_AAPCS64_APPLE)
+end function
 
 private function AbiIsWin64_( byref target as TargetDescription ) as boolean
     select case target.abi
@@ -38,8 +43,8 @@ private function AbiIsWin64_( byref target as TargetDescription ) as boolean
     return false
 end function
 
-'' ABI_WIN32 TAKES ITS OWN BRANCH, ahead of every call to AbiIsWin64_, the way
-'' AAPCS64 does: the size-only question it answers is not win64's.
+'' ABI_WIN32 TAKES ITS OWN BRANCH, ahead of every AbiIsWin64_ call -- whose TargetIce
+'' would otherwise stop the build on it -- the way AAPCS64 does.
 private function AbiIsWin32_( byref target as TargetDescription ) as boolean
     return (target.abi = ABI_WIN32)
 end function
@@ -52,8 +57,7 @@ function ClassifyAggregate _
         return ABIC_DIRECT_INT
     end if
     if AbiIsWin32_( target ) then
-        '' EVERY AGGREGATE ON THE STACK, at every size: i386 cdecl has no register
-        '' classes to coerce into, and the signature spells 'ptr byval'.
+        '' EVERY AGGREGATE ON THE STACK, at every size: i386 cdecl has no register classes.
         return ABIC_INDIRECT
     end if
     if AbiIsWin64_( target ) then
@@ -121,23 +125,13 @@ private function RetDirect_ _
         return (t0 <> MT_VOID)
     end if
     if AbiIsWin32_( target ) then
-        '' ABI_WIN32, MEASURED, clang 21.1.3, 'i686-w64-windows-gnu', struct returns
-        '' of every size from 1 to 24 bytes:
-        ''
-        ''     1, 2, 4 bytes      the integer of the size (i8, i16, i32) -- except a
-        ''                        4-byte struct whose one field is float, which comes
-        ''                        back in st0 as 'float', so the class decides at 4 too
-        ''     3 bytes            sret (a hidden pointer), align 1
-        ''     5, 6, 7, 8 bytes   i64, whatever the fields are: {int,int} as i64,
-        ''                        {float,float} as i64, {float,int} as i64 -- packed
-        ''                        into edx:eax -- except ONE eightbyte of SSE covering
-        ''                        all eight bytes ({double}), which is 'double' in st0
-        ''     over 8 bytes       sret, at the struct's own alignment (measured 4 and 8)
-        ''
-        '' The class is the frontend's eightbyte walk, which runs for this target as
-        '' for SysV; with NO class recorded the size-only integer stands, as SysV's
-        '' fallback does. retTy2 stays MT_VOID always: nothing on i386 returns a
-        '' two-register PAIR that the i64 spelling does not cover.
+        '' ABI_WIN32, MEASURED, clang 21.1.3, i686-w64-windows-gnu, struct returns of
+        '' every size 1..24: 1/2/4 the size's integer, EXCEPT a 4-byte struct whose one
+        '' field is float -- 'float' in st0; 3 sret; 5-8 i64 packed into edx:eax, except
+        '' ONE SSE eightbyte over all eight ({double}) -- 'double' in st0; over 8 sret,
+        '' at the struct's own alignment. With NO class recorded the size-only integer
+        '' stands, as SysV's fallback does; retTy2 stays MT_VOID -- nothing on i386
+        '' returns a two-register PAIR the i64 spelling does not cover.
         dim as uint32 e0 = TKO_EB0( cls )
         if sz > 8 then return false
         if sz <= 2 then return (DirectIntType( sz ) <> MT_VOID)
@@ -159,8 +153,8 @@ private function RetDirect_ _
     end if
     t0 = DirectIntType( sz )
     if AbiIsWin64_( target ) then return (t0 <> MT_VOID)
-    if (sz > 16) orelse (cls = TKO_EB_MEMORY) then return false
-    if cls = 0 then return (t0 <> MT_VOID)
+    if (sz > 16) orelse (TKO_EB_CLS( cls ) = TKO_EB_MEMORY) then return false
+    if TKO_EB_CLS( cls ) = 0 then return (t0 <> MT_VOID)
     dim as int32 n0 = sz
     if n0 > 8 then n0 = 8
     t0 = SysvEightbyteType( TKO_EB0( cls ), n0 )
@@ -175,11 +169,11 @@ private function SysvReturnUnmodelled_ _
 
     '' AAPCS64 models every size.
     if AbiIsAapcs_( target ) then return false
-    '' So does ABI_WIN32: at most eight bytes, and RetDirect_ answers every size.
+    '' ABI_WIN32 models every size too -- RetDirect_ answers it.
     if AbiIsWin32_( target ) then return false
     if AbiIsWin64_( target ) then return false
     if (sz <= 0) orelse (sz > 16) then return false
-    return (cls = 0) andalso (DirectIntType( sz ) = MT_VOID)
+    return (TKO_EB_CLS( cls ) = 0) andalso (DirectIntType( sz ) = MT_VOID)
 end function
 
 '' A SysV register slot is WHOLE EIGHTBYTES: a register is loaded out of it and stored
@@ -188,8 +182,7 @@ private function RegSlotSize_( byval sz as int32, byref target as TargetDescript
     if AbiIsAapcs_( target ) then return AapcsSlotSize( sz )
     if AbiIsWin32_( target ) then
         '' ABI_WIN32: a direct return travels in the register(s) its size picks, and the
-        '' slot holds exactly the aggregate -- an i64 load of a 5-byte return reads the
-        '' three bytes past it in edx:eax's other half, not in a slot.
+        '' slot holds exactly the aggregate -- an i64 load of a 5-byte return reads past it.
         return sz
     end if
     if AbiIsWin64_( target ) then return sz
@@ -203,7 +196,7 @@ end function
 private function ArgSlotSize_( byval sz as int32, byref target as TargetDescription ) as int32
     if AbiIsAapcs_( target ) then return AapcsSlotSize( sz )
     if AbiIsWin32_( target ) then
-        '' ABI_WIN32: every aggregate argument is a byval copy, and the slot IS the copy.
+        '' ABI_WIN32: every aggregate argument is a byval copy; the slot IS the copy.
         return sz
     end if
     if AbiIsWin64_( target ) then return sz
@@ -478,12 +471,9 @@ private sub RewriteCallArgs _
         if AbiIsWin32_( *r.tgt ) then
             '' EVERY AGGREGATE ON THE STACK, at every size: the slot's address is the
             '' argument and the signature marks it byval. clang spells the small ones
-            '' flattened -- 'i32, i32' for {int,int}, one 'i64' for {long long} --
-            '' but on i386 cdecl a flattened argument and a byval copy put THE SAME
-            '' BYTES at the same stack offsets, so the two spellings interoperate in
-            '' both directions. Measured against clang 21.1.3 for aggregates of 1, 2,
-            '' 3, 4, 5, 7, 8, 12, 16, 20 and 24 bytes, and for float and double
-            '' fields of every shape it flattens.
+            '' flattened -- on i386 cdecl a flattened argument and a byval copy put THE
+            '' SAME BYTES at the same stack offsets, so the spellings interoperate both
+            '' ways (measured, clang 21.1.3, aggregates of 1..24 bytes).
             r.m->argPool.Push( cast( uint32, MV_LOCAL ) )
             r.m->argPool.Push( cast( uint32, slot ) )
             newCount += 1
@@ -509,7 +499,7 @@ private sub RewriteCallArgs _
 
         '' ---- SysV
         dim as uint32 packed = callee->paramClasses[i]
-        if (sz > 16) orelse (packed = TKO_EB_MEMORY) orelse (packed = 0) then
+        if (sz > 16) orelse (TKO_EB_CLS( packed ) = TKO_EB_MEMORY) orelse (TKO_EB_CLS( packed ) = 0) then
             '' MEMORY: the slot's address, and the signature marks it byval so it
             '' travels on the stack rather than as a pointer in a register.
             r.m->argPool.Push( cast( uint32, MV_LOCAL ) )
@@ -838,12 +828,16 @@ private sub RewriteSignature _
                 case else          : ex = TKO_PX_NONE
                 end select
             end if
-            '' EXCEPT ON APPLE ARM64, which packs a stack argument at its NATURAL size:
+            '' EXCEPT ON ARM64. Apple's packs a stack argument at its NATURAL size:
             '' with x0-x7 used up a bool goes at sp+0 and a following short at sp+2,
             '' where an i32 puts it at sp+4 and the callee reads 0. clang writes
             '' 'i8 zeroext' / 'i16 signext' there, and LLVM then extends the register and
-            '' packs the stack by Darwin's rules; ExtAttr spells it. The parameter stays
-            '' narrow, so neither half below widens nor truncates.
+            '' packs the stack by Darwin's rules; ExtAttr spells it. Generic AAPCS64
+            '' (linux-arm64) leaves a narrow argument's upper bits UNDEFINED, so clang keeps
+            '' the type narrow and writes NO attribute ('define i8 @fc(i8, i16)', clang 23 in
+            '' the VM; fbc's C is 'int8 F( int8, uint16 )' there): LLVM then gives it an
+            '' 8-byte stack slot by the generic rules. On both, the parameter stays narrow,
+            '' so neither half below widens nor truncates.
             if AbiIsAapcs_( target ) then wt = pt
             ptys.Push( cast( uint8, wt ) )
             paggs.Push( cast( uint32, sz ) )
@@ -867,8 +861,7 @@ private sub RewriteSignature _
         end if
 
         if AbiIsWin32_( target ) then
-            '' BYVAL, the SysV MEMORY spelling, at every size -- see RewriteCallArgs
-            '' for why the flattened spellings clang writes interoperate with it.
+            '' BYVAL at every size -- see RewriteCallArgs for the interoperability.
             ptys.Push( cast( uint8, MT_PTR ) )
             paggs.Push( cast( uint32, sz ) )
             pcls.Push( packed )
@@ -898,7 +891,7 @@ private sub RewriteSignature _
         end if
 
         '' ---- SysV
-        if (sz > 16) orelse (packed = TKO_EB_MEMORY) orelse (packed = 0) then
+        if (sz > 16) orelse (TKO_EB_CLS( packed ) = TKO_EB_MEMORY) orelse (TKO_EB_CLS( packed ) = 0) then
             ptys.Push( cast( uint8, MT_PTR ) )
             paggs.Push( cast( uint32, sz ) )
             pcls.Push( packed )
@@ -1027,10 +1020,11 @@ end sub
 '' i8/i16 result, which is where clang writes them for 'arm64-apple-macosx'. Measured,
 '' clang 23: '(ptr x 8, i1 zeroext, i16 zeroext, i8 signext, i16 signext)', and
 '' 'define zeroext i16 @rus()'. Every other target widens to i32 instead and gets "".
+'' linux-arm64 keeps the narrow type too but gets "": generic AAPCS64 does not extend.
 private function ExtWord_ _
     ( byref target as TargetDescription, byval ty as uint8, byval ex as uint8 ) as string
 
-    if AbiIsAapcs_( target ) = false then return ""
+    if AbiIsAppleAapcs_( target ) = false then return ""
     select case cast( MirType, ty )
     case MT_I8, MT_I16
     case else
@@ -1041,12 +1035,37 @@ private function ExtWord_ _
     return ""
 end function
 
+'' AN HFA ON GENERIC AAPCS64 IS 'alignstack(8)', because clang writes it: on every HFA
+'' argument, float or double, for aarch64-linux -- 53 of the 86 aapcsig signatures (clang
+'' 23.1.5, 2026-11-19) -- and on none for Apple, which packs the stack at natural alignment. It says
+'' what AAPCS64 says (a stack argument starts on an 8-byte boundary), but LLVM 23's aarch64-linux
+'' lowering already does that without it: probed, two [3 x float] after eight doubles land at
+'' sp+0 and sp+16 with or without the attribute, and so do [1 x float], float, [2 x float],
+'' [1 x float] -- the same offsets clang's C uses. So it changes no code today; it is written so
+'' the signature IS clang's (aapcsig compares them) and nothing is left to a backend default.
+'' Running coverage: aapcslane's 'p8hf' (float) and 'hfa9' (double) prefixes.
+private function HfaStackAttr_ _
+    ( byref target as TargetDescription, byval ty as uint8 ) as string
+
+    if target.abi <> ABI_AAPCS64 then return ""
+    select case cast( MirType, ty )
+    case MT_HFA_F32_1, MT_HFA_F32_2, MT_HFA_F32_3, MT_HFA_F32_4, _
+         MT_HFA_F64_1, MT_HFA_F64_2, MT_HFA_F64_3, MT_HFA_F64_4
+        return " alignstack(8)"
+    end select
+    return ""
+end function
+
+'' The attributes after a parameter's type, in a signature and at a call: a narrow integer's
+'' extension (ExtWord_) and a float HFA's stack alignment (HfaStackAttr_).
 function ExtAttr _
     ( byref target as TargetDescription, byval f as MirFunction ptr, byval i as int32 ) as string
 
     if f = nullptr then return ""
-    if (i < 0) orelse (i >= f->paramTys.Count) orelse (i >= f->paramExt.Count) then return ""
-    return ExtWord_( target, f->paramTys[i], f->paramExt[i] )
+    if (i < 0) orelse (i >= f->paramTys.Count) then return ""
+    dim as string hfa = HfaStackAttr_( target, f->paramTys[i] )
+    if i >= f->paramExt.Count then return hfa
+    return ExtWord_( target, f->paramTys[i], f->paramExt[i] ) & hfa
 end function
 
 '' ...and the result's, with its trailing space: 'define' & RetExtAttr & ' i8 @f'.
@@ -1146,18 +1165,22 @@ private sub SysvRegisterBudget_ _
         case MT_VOID
         case MT_F32, MT_F64
             if sse > 0 then sse -= 1
+        '' AN int128 TAKES TWO GPRs, or none: with one left it goes to the stack whole and the
+        '' register stays for what follows, as clang and LLVM pass one.
+        case MT_I128
+            if gpr >= 2 then gpr -= 2
         case MT_AGG
             dim as int32 sz = cast( int32, f->paramAggs[i] )
             if (sz <= 0) orelse (sz > 16) orelse (i >= f->paramClasses.Count) then continue for
             dim as uint32 packed = f->paramClasses[i]
-            if (packed = TKO_EB_MEMORY) orelse (packed = 0) then continue for
+            if (TKO_EB_CLS( packed ) = TKO_EB_MEMORY) orelse (TKO_EB_CLS( packed ) = 0) then continue for
             dim as int32 ng = 0, ns = 0
             if TKO_EB0( packed ) = TKO_EB_SSE then ns += 1 else ng += 1
             if sz > 8 then
                 if TKO_EB1( packed ) = TKO_EB_SSE then ns += 1 else ng += 1
             end if
             if (ng > gpr) orelse (ns > sse) then
-                f->paramClasses[i] = TKO_EB_MEMORY
+                f->paramClasses[i] = TKO_EB_MEMORY or (packed and TKO_EB_ALIGN16)
             else
                 gpr -= ng
                 sse -= ns
@@ -1416,12 +1439,13 @@ sub LowerModule _
       byref target as TargetDescription, byref st as AbiStats )
 
     select case target.abi
-    case ABI_WIN64, ABI_SYSV_AMD64, ABI_AAPCS64_APPLE, ABI_WIN32
+    case ABI_WIN64, ABI_SYSV_AMD64, ABI_AAPCS64_APPLE, ABI_AAPCS64, ABI_WIN32
     case else
         Tko.TargetIce( "abi LowerModule", target.id )
     end select
 
     DeclineInconsistentReturns( m, st )
+    if target.abi = ABI_WIN64 then Win64Int128( m, names, target, st )   '' abiint128.tiko
 
     '' WHICH AGGREGATES STILL FIT IN REGISTERS, every signature, before anything reads it.
     '' SysV's question alone: AAPCS64's arrays leave register exhaustion to the backend.
