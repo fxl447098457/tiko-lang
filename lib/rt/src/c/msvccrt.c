@@ -250,6 +250,16 @@ int _fltused = 0x9875;
 ** entry point, so the hook stays NULL there and nothing changes for it. */
 int ( __cdecl *tkort_dll_atexit )( tkort_pvfv fn ) = 0;
 
+/* WEAK, for the same reason the UCRT-header inlines above are. A static MSVC library
+** linked beside tiko-rt -- tkEdit's scintk_windows_x86_64.a, built /MT, whose
+** /DEFAULTLIB:libcmt directive lld-link honours -- brings Visual Studio's own atexit in
+** utility.obj, and a strong definition beside it is 'duplicate symbol: atexit' (measured,
+** tkedit's link). Weak, the library's copy wins where there is one -- registering with the
+** static CRT's table, which is the consistent choice while that CRT is in the link -- and
+** ours is used where there is not, over _crt_atexit below. The DLL hook still applies only
+** to the weak copy; an executable linking libcmt exits through libcmt's table, which is
+** what its vendor objects already assume. */
+__attribute__(( weak ))
 int __cdecl atexit( tkort_pvfv fn )
 {
     if( tkort_dll_atexit ) return tkort_dll_atexit( fn );

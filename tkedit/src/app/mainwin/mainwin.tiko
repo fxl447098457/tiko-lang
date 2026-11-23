@@ -182,6 +182,7 @@ public enum StatusPanel explicit
     Settings            ' "Settings": a click opens settings.toml
     Keys                ' "Keys": a click opens the Keyboard Shortcuts dialog
     Build               ' the build configuration; a click picks one, and makes it settings.toml's default
+    Target              ' the -target a build passes; a click picks one, and writes it to settings.toml
     Encoding            ' a click picks one
     LineEnding          ' a click converts
 end enum
@@ -194,6 +195,7 @@ public enum PickKind explicit
     Encoding
     LineEnding
     Build
+    Target
     Bookmarks
     Symbols             ' Ctrl+P: files and definitions
     Functions           ' F4: the procedures of the buffer, or of every open buffer
@@ -716,6 +718,7 @@ public type Window
     declare sub ApplyStatusPanels( )
     declare sub SyncKeysFile( )
     declare sub SetDefaultBuild( byref name_ as const ustring )
+    declare sub SetBuildTarget( byref name_ as const ustring )
     declare sub SetCompiler( byref path as const ustring )
     declare function EnsureCompiler( ) as boolean
     declare sub EnsureCompilerSoon( )
@@ -1662,6 +1665,7 @@ sub Window.FillStatus( byval bar as TK_WIDGET ptr, byval d as DocRef, byval focu
     tkStatusBar_SetText( bar, StatusPanel.Settings, i18n.Tr( "status.settings", "Settings" ) )
     tkStatusBar_SetText( bar, StatusPanel.Keys, i18n.Tr( "status.keys", "Keys" ) )
     tkStatusBar_SetText( bar, StatusPanel.Build, CurrentBuild )
+    tkStatusBar_SetText( bar, StatusPanel.Target, build.TargetFor( platform.CurrentOs( ), Prefs.BuildTarget ) )
     tkStatusBar_SetText( bar, StatusPanel.Encoding, docencoding.EncodingName( d->Enc.Encoding ) )
     dim as ustring eol = "CRLF"
     select case v->LineEnding( )
@@ -1707,6 +1711,7 @@ function Window.StatusTip( byval p as StatusPanel, byval second as boolean ) as 
     end if
     if p = StatusPanel.Settings then return this.ShortcutText( Cmd.Settings )
     if p = StatusPanel.Keys then return this.ShortcutText( Cmd.KeyboardShortcuts )
+    if p = StatusPanel.Target then return i18n.Tr( "status.target", "the -target a build passes; a click picks one" )
     if p <> StatusPanel.Buffer then return ""
     dim as DocRef d = Pane1
     if second then d = Pane2
@@ -1747,6 +1752,7 @@ function Window.NewStatusBar( byval root as TK_WIDGET ptr, byval id as long ) as
         case StatusPanel.Settings : mw->Execute( Cmd.Settings )
         case StatusPanel.Keys : mw->Execute( Cmd.KeyboardShortcuts )
         case StatusPanel.Build : mw->OpenChooser( PickKind.Build )
+        case StatusPanel.Target : mw->OpenChooser( PickKind.Target )
         case StatusPanel.Encoding : mw->OpenChooser( PickKind.Encoding )
         case StatusPanel.LineEnding : mw->OpenChooser( PickKind.LineEnding )
         end select
@@ -2594,6 +2600,47 @@ sub Window.SetDefaultBuild( byref name_ as const ustring )
         if d then d->Reload( )
     end if
 end sub
+
+' The -target every build passes (statusbar Target panel, PickKind.Target): name_ is "" for
+' the host's, else one of tiko's. Written to settings.toml's [compiler] target the way
+' SetDefaultBuild writes the default build -- settings.toml loads a file that parses, or the
+' choice stays in force for this session and says so.
+sub Window.SetBuildTarget( byref name_ as const ustring )
+    if (len( name_ ) > 0) andalso (build.IsTargetName( name_ ) = false) then
+        this.SetMessage( strings.Format( i18n.Tr( "message.target_unknown", "{0} is not a tiko target: win64, win32, windows-x86_64, linux-x86_64, linux-arm64 or macos-arm64" ), name_ ) )
+        exit sub
+    end if
+    Prefs.BuildTarget = name_
+    this.ShowStatus( )
+    dim as settings.SettingsResult r = settings.LoadSettings( this.SettingsFile( ) )
+    if r.IsOk( ) = false then
+        dim as ustring shown = name_
+    if len( shown ) = 0 then shown = "(host default)"
+    this.SetMessage( strings.Format( i18n.Tr( "message.target_not_saved", "{0} applies for this session: {1} does not parse" ), shown, settings.SETTINGS_FILE ) )
+        exit sub
+    end if
+    dim as settings.EditorSettings st = r.Value( )
+    st.BuildTarget = name_
+    if settings.WriteFile( this.SettingsFile( ), st ) then
+        dim as DocRef d = this.FindOpen( this.SettingsFile( ) )
+        if d then d->Reload( )
+    end if
+end sub
+
+' The targets the chooser offers, in tiko's own order (src/types/type.ti's TargetId enum).
+' TARGET_ROW_HOST_ is the chooser's first row -- "(host default)" -- and clears the override.
+public const TARGET_ROW_HOST_ = -1
+
+public function TargetChoices( ) as Array( of ustring )
+    dim as Array( of ustring ) a
+    a.Push( "windows-x86_64" )
+    a.Push( "win64" )
+    a.Push( "win32" )
+    a.Push( "linux-x86_64" )
+    a.Push( "linux-arm64" )
+    a.Push( "macos-arm64" )
+    return a
+end function
 
 ' keybindings.toml rewritten to list every command at the chord in force, unless it does already
 ' (first run: written). A file that does not load is the person's to fix, and is left alone.
@@ -4052,6 +4099,31 @@ sub Window.OpenChooser( byval kind as PickKind, byval atTop as boolean )
             end if
             rows.Push( Row( mark, Prefs.Builds[i].Name, Prefs.Builds[i].Options, i ) )
         next
+    case PickKind.Target
+        Chooser.Cue = i18n.Tr( "cue.target", "Select build target" )
+        Narrow( Chooser, popW )
+        ' (host default) FIRST, always a valid answer: it clears the override, and its
+        ' description says which of tiko's targets the host resolves to.
+        dim as ustring mark = " "
+        if Prefs.BuildTarget = "" then
+            mark = "*"
+            sel = 0
+        end if
+        rows.Push( Row( mark, i18n.Tr( "target.host", "(host default)" ), _
+                        build.TargetName( platform.CurrentOs( ) ), TARGET_ROW_HOST_ ) )
+        dim as Array( of ustring ) choices = TargetChoices( )
+        for i as long = 0 to choices.Count( ) - 1
+            mark = " "
+            if Prefs.BuildTarget = choices[i] then
+                mark = "*"
+                sel = i + 1
+            end if
+            rows.Push( Row( mark, choices[i], build.TargetFlavour( choices[i] ), i ) )
+        next
+        if (Prefs.BuildTarget <> "") andalso (build.IsTargetName( Prefs.BuildTarget ) = false) then
+            ' a settings.toml value that names no tiko target: the build goes to the host's
+            ' (TargetFor says so) and the chooser marks nothing -- picking one fixes it.
+        end if
     case PickKind.NewItem
         Chooser.Filter = false
         Chooser.Columns.Clear( )
@@ -4139,6 +4211,13 @@ sub Window.Chosen( byval tag as long )
         end select
     case PickKind.Build
         if (tag >= 0) andalso (tag < Prefs.Builds.Count( )) then this.SetDefaultBuild( Prefs.Builds[tag].Name )
+    case PickKind.Target
+        if tag = TARGET_ROW_HOST_ then
+            this.SetBuildTarget( "" )
+        else
+            dim as Array( of ustring ) choices = TargetChoices( )
+            if (tag >= 0) andalso (tag < choices.Count( )) then this.SetBuildTarget( choices[tag] )
+        end if
     case PickKind.Symbols, PickKind.Functions
         if (tag >= 0) andalso (tag < Hits.Count( )) then
             dim as SymHit hh = Hits[tag]
@@ -4687,7 +4766,7 @@ function Window.StartBuild( byval action as build.BuildAction, byval rebuild as 
     dim as Array( of ustring ) args, none_
     dim as ustring workDir
     if useTarget then
-        args = build.TargetArgs( target, Proj.Dir_( ), BuildFlags, none_, BuildDiagFile, os_ )
+        args = build.TargetArgs( target, Proj.Dir_( ), BuildFlags, none_, BuildDiagFile, os_, Prefs.BuildTarget )
         ' --profile editor is tiko-editor's managed profile; tiko refuses an unknown one (TKO0163)
         dim as ustring toml = fs.ReadAllText( Proj.Path ).ValueOr( "" )
         if instr( toml, "[profile.editor]" ) = 0 then
@@ -4704,7 +4783,7 @@ function Window.StartBuild( byval action as build.BuildAction, byval rebuild as 
     else
         dim as ustring src = d->Path
         BuildMain = src
-        args = build.BuildArgs( src, none_, none_, "", BuildFlags, BuildDiagFile, os_ )
+        args = build.BuildArgs( src, none_, none_, "", BuildFlags, BuildDiagFile, os_, Prefs.BuildTarget )
         workDir = fs.PathParent( src )
     end if
     if rebuild then
