@@ -268,15 +268,30 @@ build_dll( ) {
 # flags as the DLL. BUILD IT WITH THE COMPILER THAT BUILDS tkEdit (TIKO_SEED): the archive holds
 # that compiler's std module objects, and at tkEdit's link each std module is ONE copy -- one
 # from another compiler would be taken silently in place of tkEdit's own.
+#
+# THE FLAVOUR, TIKO_BUILD_FLAVOUR: 'msvc' (the default) builds for the MSVC ABI, and
+# 'mingw' for the MinGW ABI -- a SECOND archive, named ..._<flavour>.a, because the two are
+# different programs (the MinGW one carries MinGW's C runtime and no Visual Studio's).
+# tkEdit's foreignlib probe asks for the flavour's own name first.
 build_lib( ) {
     LIBFLAGS="$(echo "$FLAGS" | sed 's/-exx//') -mt"
     LIBSRC=$(echo "$SOURCES" | tail -n +2)
     case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) _os=windows ;; Darwin) _os=macos ;; *) _os=linux ;; esac
     case "$(uname -m)" in arm64|aarch64) _arch=arm64 ;; *) _arch=x86_64 ;; esac
-    _out="bin/parser_${_os}_${_arch}.a"
-    echo "build: $_out [$CFG] with $STAGE0"
+    _flav=msvc; _flavtag=; _target=
+    if [ "${TIKO_BUILD_FLAVOUR:-}" = mingw ]; then
+        _flav=mingw; _flavtag=_mingw
+        # THE TARGET IS TIKO'S OWN NAME, not the triple: '-target win64' is the MinGW
+        # x86-64 target, '-target win32' the 32-bit one.
+        case "${TIKO_MINGW_TARGET:-x86_64-w64-mingw32}" in
+            i686-*) _arch=x86; _target="-target win32" ;;
+            *) _arch=x86_64; _target="-target win64" ;;
+        esac
+    fi
+    _out="bin/parser_${_os}_${_arch}${_flavtag}.a"
+    echo "build: $_out [$CFG, $_flav] with $STAGE0"
     rm -f "$ROOT/$_out"
-    ( cd "$ROOT" && "$STAGE0" -lib $LIBSRC src/api/tikoparser.tiko -i src $LIBFLAGS -o "$_out" )
+    ( cd "$ROOT" && "$STAGE0" -lib $LIBSRC src/api/tikoparser.tiko -i src $LIBFLAGS $_target -o "$_out" )
     [ -f "$ROOT/$_out" ] || { echo "build: no $_out" >&2; exit 1; }
 }
 

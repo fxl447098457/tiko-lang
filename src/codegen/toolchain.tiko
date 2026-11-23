@@ -421,6 +421,53 @@ sub RequireAsanRuntime( byref t as ToolPaths, byval msvc as boolean )
             "clang_rt.asan_dynamic_runtime_thunk-x86_64.lib) beside clang_rt.builtins, and this LLVM has none"
 end sub
 
+'' A MinGW TARGET'S SYSROOT: the gcc that matches the triple, found on PATH, and the
+'' tree it lives in -- the directory above its bin. That is the tree clang's own driver
+'' would discover, and the CI's mingw lanes rely on it (their comment: 'clang.exe ...
+'' searches PATH for i686-w64-mingw32-gcc to name its sysroot').
+''
+'' NAMING IT HERE beats a clang.cfg's own --sysroot, which pins ONE tree and so cannot
+'' serve the other width: measured, a cfg with 'sysroot=D:/tiko-test/mingw64' made every
+'' win32 link answer 'unable to find -lmingw32' -- the 64-bit root has no i686 libraries
+'' -- and the 32-bit COMPILE took the 64-bit HEADERS, which is worse than a link error.
+'' The command line's --sysroot wins over the cfg's, so this one does too.
+private function MingwSysroot_( byref target as TargetDescription ) as string
+    if target.layout.isMsvc then return ""
+    if instr( target.triple, "windows" ) = 0 then return ""
+    '' THE GCC IS NAMED BY THE ARCHITECTURE, not by the triple: the win32 triple is
+    '' 'i686-w64-windows-gnu' and the gcc is 'i686-w64-mingw32-gcc'.
+    dim as string arch = iif( target.layout.pointerBits = 32, "i686", "x86_64" )
+    dim as string gcc = ""
+    #ifdef __FB_WIN32__
+        gcc = SearchPath_( arch & "-w64-mingw32-gcc.exe" )
+        if len( gcc ) = 0 then gcc = SearchPath_( "gcc.exe" )
+    #else
+        gcc = SearchPath_( arch & "-w64-mingw32-gcc" )
+        if len( gcc ) = 0 then gcc = SearchPath_( "gcc" )
+    #endif
+    if len( gcc ) = 0 then return ""
+    '' THE FILE NAME, then the 'bin' above it: the tree root is what remains.
+    dim as int32 at = instrrev( gcc, "/" )
+    if at = 0 then at = instrrev( gcc, "\" )
+    if at = 0 then return ""
+    dim as string bin_ = left( gcc, at - 1 )
+    dim as int32 at2 = instrrev( bin_, "/" )
+    if at2 = 0 then at2 = instrrev( bin_, "\" )
+    if at2 = 0 then return ""
+    dim as string root_ = left( bin_, at2 - 1 )
+    if len( root_ ) = 0 then return ""
+    return root_
+end function
+
+'' THE SYSROOT FOR A TARGET, and the order: the environment's own (TIKO_SYSROOT), then
+'' the tree the matching gcc lives in, then nothing -- which leaves clang to its own
+'' discovery, and the cfg's --sysroot with it.
+private function SysrootFor_( byref target as TargetDescription ) as string
+    dim as string env_ = environ( "TIKO_SYSROOT" )
+    if len( env_ ) > 0 then return env_
+    return MingwSysroot_( target )
+end function
+
 private function AsanCompileFlags_( byref t as ToolPaths ) as string
     if t.sanitizeAddress = false then return ""
     return " -fsanitize=address -fsanitize-address-use-after-return=always"
@@ -446,6 +493,11 @@ private function CompileIrArgs_ _
     dim as string cmd = _
         "-target " & target.triple & " -Wno-override-module -c " & _
         Q( irPath ) & " -o " & Q( objPath )
+    '' THE HEADERS MUST BE THE TARGET'S OWN: a clang.cfg's --sysroot names ONE tree, and
+    '' the 32-bit target would take the 64-bit headers -- a silent ABI mismatch, which is
+    '' worse than a link error. The command line's --sysroot wins over the cfg's.
+    dim as string sr = SysrootFor_( target )
+    if len( sr ) > 0 then cmd += " --sysroot=" & Q( sr )
     if (t.optLevel > 0) andalso (t.optLevel <= 3) then cmd += " -O" & t.optLevel
     '' ONE SECTION PER PROCEDURE AND PER GLOBAL, so the link can drop what nothing reaches
     '' (LinkExe's --gc-sections / /OPT:REF). Without them a unit is one .text, and a module
@@ -566,6 +618,11 @@ function LinkExe _
     dim as string sysrootEnv = environ( "TIKO_SYSROOT" )
     if (len( sysrootEnv ) > 0) andalso (macho = false) andalso (target.layout.isMsvc = false) then
         cmd += " --sysroot=" & Q( sysrootEnv )
+    elseif (macho = false) andalso (target.layout.isMsvc = false) then
+        '' ...and otherwise the tree the matching gcc lives in, which is the one clang's own
+        '' driver would use and the one a clang.cfg cannot name for both widths.
+        dim as string sr = MingwSysroot_( target )
+        if len( sr ) > 0 then cmd += " --sysroot=" & Q( sr )
     end if
     '' ...WHERE THERE IS ONE. Ubuntu's clang package does not carry lld, and on such a
     '' host every link died with clang's 'invalid linker name in argument
@@ -1108,6 +1165,22 @@ function LinkExe _
         '' two import libraries here would only make every MinGW link require files
         '' that some sysroots (MSYS2's MINGW32 among them) do not keep where clang
         '' looks. The C runtime's default -l's below are still needed.
+        ''
+        '' THE C++ RUNTIME IS STATIC, and that is what makes a MinGW program ONE FILE
+        '' again. The vendor's C++ (scintk) pulls libstdc++ in, and the DLL flavour of
+        '' it needs three files BESIDE the program: libstdc++-6.dll, libwinpthread-1.dll
+        '' and libgcc_s_seh-1.dll. Without them the program does not start at all --
+        '' STATUS_DLL_NOT_FOUND (0xC0000135), and the loader looks for them on the PATH,
+        '' so a double-click in Explorer finds none and the program vanishes (measured).
+        ''
+        '' THE ARCHIVES ARE NAMED, not '-lstdc++': the sysroot's own lib directory holds
+        '' the IMPORT library (libstdc++.dll.a) and the search finds it FIRST, so a plain
+        '' '-lstdc++' links the DLL flavour (measured: the program still imported
+        '' libstdc++-6.dll). '-Wl,-Bstatic' takes the static one
+        '' (mingw64/lib/libstdc++.a) and libwinpthread the static one
+        '' (mingw64/x86_64-w64-mingw32/lib/libwinpthread.a).
+        cmd += " -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic"
+        cmd += " -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -static-libgcc"
     elseif macho then
         '' MACH-O. libm and pthreads are inside libSystem, which clang's darwin driver always
         '' links; tgoto and tputs come from the SDK's ncurses, macOS's terminfo.

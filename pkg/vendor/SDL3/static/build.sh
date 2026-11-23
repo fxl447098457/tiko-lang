@@ -33,9 +33,23 @@ case $HOST in
     macos)   ARCH=arm64 ;;
     *) echo "SDL3 static: unknown host '$HOST'" >&2; exit 1 ;;
 esac
+# THE FLAVOUR, TIKO_VENDOR_FLAVOUR: 'msvc' (the default) builds the MSVC ABI against the
+# static C runtime (/MT), which is what needs Visual Studio's libvcruntime.lib and
+# oldnames.lib. 'mingw' builds the MinGW ABI with the MinGW-w64 GCC toolchain and its own
+# C runtime (msvcrt.dll) and needs no Visual Studio at all. The two archives are named
+# apart -- ..._<flavour>.a -- because they are different programs: the MSVC one carries
+# /DEFAULTLIB:libcmt.lib and the UCRT's internal __stdio_common_* entry points, neither of
+# which the MinGW C runtime has.
+FLAVOUR=${TIKO_VENDOR_FLAVOUR:-msvc}
+if [ "$HOST" = windows ] && [ "$FLAVOUR" = mingw ]; then
+    ARCH=${TIKO_VENDOR_ARCH:-x86_64}
+    FLAVOUR_TAG=_mingw
+else
+    FLAVOUR_TAG=
+fi
 OUT=$HERE/bin/$HOST
-OUTS="$OUT/SDL3_${HOST}_$ARCH.a $OUT/SDL3_ttf_${HOST}_$ARCH.a $OUT/SDL3_image_${HOST}_$ARCH.a"
-[ "$HOST" = windows ] && OUTS="$OUTS $OUT/SDL3.dll $OUT/SDL3_ttf.dll $OUT/SDL3_image.dll"
+OUTS="$OUT/SDL3_${HOST}_$ARCH$FLAVOUR_TAG.a $OUT/SDL3_ttf_${HOST}_$ARCH$FLAVOUR_TAG.a $OUT/SDL3_image_${HOST}_$ARCH$FLAVOUR_TAG.a"
+[ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ] && OUTS="$OUTS $OUT/SDL3.dll $OUT/SDL3_ttf.dll $OUT/SDL3_image.dll"
 
 # macOS has no sha256sum; its shasum is the same digest.
 digest() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
@@ -71,10 +85,19 @@ C=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
    -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
 case $HOST in
 windows)
+    if [ "$FLAVOUR" = mingw ]; then
+        # THE MinGW TOOLCHAIN: the MinGW-w64 GCC, which CMake drives natively (no
+        # toolchain file, no cross-compiling). TIKO_MINGW_ROOT is the tree that decides
+        # the width as well as the runtime: mingw64 or mingw32.
+        MG=${TIKO_MINGW_ROOT:?SDL3 static: the MinGW tree is TIKO_MINGW_ROOT}
+        C+=(-DCMAKE_C_COMPILER="$MG/bin/gcc.exe" -DCMAKE_CXX_COMPILER="$MG/bin/g++.exe"
+            -DCMAKE_RC_COMPILER="$MG/bin/windres.exe")
+    else
     CL=${TIKO_CLANG:-"C:/Program Files/LLVM/bin/clang.exe"}
     C+=(-DCMAKE_C_COMPILER="$CL" -DCMAKE_CXX_COMPILER="$(dirname "$CL")/clang++.exe"
         -DCMAKE_RC_COMPILER="$(dirname "$CL")/llvm-rc.exe"
-        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_POLICY_DEFAULT_CMP0091=NEW) ;;
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_POLICY_DEFAULT_CMP0091=NEW)
+    fi ;;
     # The RC compiler named, or CMake finds one on the PATH only -- and an LLVM install that leaves
     # its bin off the PATH (LLVM 23's did) fails every configure: "No CMAKE_RC_COMPILER".
     # CMP0091 NEW, or a project with an old cmake_minimum_required (HarfBuzz) ignores the runtime
@@ -112,7 +135,7 @@ step img "$SRCDIR_IMG" "${IMGX[@]}"
 # WINDOWS' DLLS: an SDL build of their own, shared only, so the static archive above never holds
 # dllexport objects; and an install prefix of their own (W/dll), because a shared SDL3_ttf's
 # import library has the static one's name. They link the static FreeType and HarfBuzz in W/inst.
-if [ "$HOST" = windows ]; then
+if [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ]; then
     # Windows paths: MSYS rewrites one path in an argument, not a ;-list of them.
     WM=$(cygpath -m "$W")
     D=(-DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$WM/dll" -DCMAKE_PREFIX_PATH="$WM/dll;$WM/inst")
@@ -130,25 +153,52 @@ for l in "$L_SDL" "$L_TTF" "$L_IMG" "$L_FT" "$L_HB"; do
 done
 
 # ONE ARCHIVE FOR SDL3_ttf, with FreeType and HarfBuzz inside: the module names one file.
-TTF=$OUT/SDL3_ttf_${HOST}_$ARCH.a
+TTF=$OUT/SDL3_ttf_${HOST}_$ARCH$FLAVOUR_TAG.a
 rm -f "$TTF"
 case $HOST in
 windows)
-    "$(dirname "$CL")/llvm-lib.exe" -out:"$(cygpath -m "$TTF")" "$(cygpath -m "$L_TTF")" "$(cygpath -m "$L_FT")" "$(cygpath -m "$L_HB")" >> "$LOG" 2>&1 ;;
+    if [ "$FLAVOUR" = mingw ]; then
+        # GNU ar does NOT MERGE ARCHIVES: 'ar rcs out.a a.a b.a' stores those two .a files
+        # AS MEMBERS of out.a, and the linker never looks inside them -- the result links
+        # nothing (measured: every TTF_* symbol undefined). The members are extracted and
+        # added one by one, each with its own prefix so two archives' objects cannot
+        # collide on a name.
+        rm -rf "$W/ttfmerge"; mkdir -p "$W/ttfmerge"; cd "$W/ttfmerge"
+        i=0
+        for a in "$L_TTF" "$L_FT" "$L_HB"; do
+            i=$((i + 1)); d="m$i"; mkdir -p "$d"
+            ( cd "$d" && ar x "$a" ) || { echo "SDL3 static: unpacking $a failed" >&2; exit 1; }
+            # CMake's Windows-GNU generator names its objects '.obj', not '.o'.
+            for o in "$d"/*.o "$d"/*.obj; do
+                [ -f "$o" ] && cp -f "$o" "${d}_$(basename "$o")"
+            done
+        done
+        # The file list is BUILT, not globbed on the ar line: a glob that matches
+        # nothing reaches ar as the pattern itself, and ar refuses it ('Invalid argument').
+        objs=
+        for o in m*_*.o m*_*.obj; do
+            [ -f "$o" ] && objs="$objs $o"
+        done
+        [ -n "$objs" ] || { echo "SDL3 static: no objects to merge into $TTF" >&2; exit 1; }
+        ar rcs "$TTF" $objs >> "$LOG" 2>&1
+        cd "$HERE"
+    else
+    "$(dirname "$CL")/llvm-lib.exe" -out:"$(cygpath -m "$TTF")" "$(cygpath -m "$L_TTF")" "$(cygpath -m "$L_FT")" "$(cygpath -m "$L_HB")" >> "$LOG" 2>&1
+    fi ;;
 linux)
     printf 'create %s\naddlib %s\naddlib %s\naddlib %s\nsave\nend\n' "$TTF" "$L_TTF" "$L_FT" "$L_HB" | ar -M >> "$LOG" 2>&1 ;;
 macos)
     libtool -static -o "$TTF" "$L_TTF" "$L_FT" "$L_HB" >> "$LOG" 2>&1 ;;
 esac
 [ -f "$TTF" ] || { echo "SDL3 static: combining SDL3_ttf failed ($LOG)" >&2; exit 1; }
-if [ "$HOST" = windows ]; then
+if [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ]; then
     for l in "$L_SDL" "$TTF" "$L_IMG"; do
         if grep -aq "MD_DynamicRelease" "$l"; then echo "SDL3 static: $(basename "$l") has /MD objects" >&2; exit 1; fi
     done
 fi
-cp -f "$L_SDL" "$OUT/SDL3_${HOST}_$ARCH.a"
-cp -f "$L_IMG" "$OUT/SDL3_image_${HOST}_$ARCH.a"
-if [ "$HOST" = windows ]; then
+cp -f "$L_SDL" "$OUT/SDL3_${HOST}_$ARCH$FLAVOUR_TAG.a"
+cp -f "$L_IMG" "$OUT/SDL3_image_${HOST}_$ARCH$FLAVOUR_TAG.a"
+if [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ]; then
     for d in SDL3 SDL3_ttf SDL3_image; do
         [ -f "$W/dll/bin/$d.dll" ] || { echo "SDL3 static: no $d.dll under $W/dll/bin" >&2; ls "$W/dll/bin" >&2; exit 1; }
         cp -f "$W/dll/bin/$d.dll" "$OUT/$d.dll"

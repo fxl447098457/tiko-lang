@@ -50,7 +50,32 @@ while [ $# -gt 0 ]; do
 done
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-        HOST=windows; TRIPLE=x86_64-pc-windows-msvc; VOS=windows; VARCH=x86_64
+        # THE FLAVOUR, TIKO_VENDOR_FLAVOUR: 'msvc' (the default) builds the vendor packages
+        # with the MSVC ABI and the static C runtime, which needs Visual Studio's
+        # libvcruntime.lib and oldnames.lib; 'mingw' builds them with the MinGW-w64
+        # toolchain and its own C runtime, and needs no Visual Studio at all. The two are
+        # different programs -- the MSVC archives carry /DEFAULTLIB:libcmt.lib and the
+        # UCRT's internal __stdio_common_* entry points -- so each has its own tables
+        # ([windows.N] and [windows-mingw.N]) and its own file names.
+        FLAVOUR=${TIKO_VENDOR_FLAVOUR:-msvc}
+        VOS=windows
+        TABLES=windows
+        SYSROOT_ARG=
+        if [ "$FLAVOUR" = mingw ]; then
+            TABLES=windows-mingw
+            VARCH=${TIKO_VENDOR_ARCH:-x86_64}
+            case "$VARCH" in
+                x86)   TABLES=windows-mingw-x86; TRIPLE=i686-w64-mingw32 ;;
+                *)     TRIPLE=x86_64-w64-mingw32 ;;
+            esac
+            # THE SYSROOT IS NAMED, because clang does not find the i686 one by itself:
+            # a clang.cfg beside it pins the 64-bit root, and the 64-bit root has no i686
+            # headers ('stdio.h' file not found, measured).
+            [ -n "${TIKO_MINGW_ROOT:-}" ] && SYSROOT_ARG="--sysroot=$TIKO_MINGW_ROOT"
+        else
+            TRIPLE=x86_64-pc-windows-msvc; VARCH=x86_64
+        fi
+        HOST=windows
         CLANG=${TIKO_CLANG:-"C:/Program Files/LLVM/bin/clang.exe"}
         AR=${TIKO_AR:-"$(dirname "$CLANG")/llvm-ar.exe"}
         [ -n "$CXX" ] || CXX="$(dirname "$CLANG")/clang++.exe"; export CXX ;;
@@ -140,6 +165,7 @@ entry( ) {
         done
         [ $# -eq 0 ] || die "$_mod [$_tab]: 'inputs' must be url sha256 pairs"
         export TIKO_VENDOR_INPUTS TIKO_VENDOR_HOST=$VOS TIKO_VENDOR_ARCH=$VARCH TIKO_VENDOR_CACHE=$CACHE
+        export TIKO_VENDOR_FLAVOUR=${FLAVOUR:-msvc}
         bash "$_scr" >/dev/null || die "$_mod [$_tab]: $(_get script) failed"
         [ -f "$_from" ] || die "$_mod [$_tab]: $(_get script) made no $(_get from)"
         mkdir -p "$(dirname "$_mdir/$_to")"
@@ -204,7 +230,7 @@ entry( ) {
         for _s in $(_get sources); do
             _o="$_x/$(basename "$_s" .c).o"
             # shellcheck disable=SC2046
-            "$CLANG" --target=$TRIPLE $(_get cflags) -c "$_dir/$_s" -o "$_o" || die "$_mod: clang failed on $_s"
+            "$CLANG" --target=$TRIPLE $SYSROOT_ARG $(_get cflags) -c "$_dir/$_s" -o "$_o" || die "$_mod: clang failed on $_s"
             _objs="$_objs $_o"
         done
         _st=$(_get static); _sh=$(_get shared)
@@ -223,7 +249,7 @@ entry( ) {
                 # -implib:, not /implib: -- MSYS would rewrite a leading slash as a path.
                 _imp="$(cygpath -m "$_x" 2>/dev/null || printf '%s' "$_x")/$(basename "$_sh" .dll).lib"
                 # shellcheck disable=SC2086
-                "$CLANG" --target=$TRIPLE -shared -fuse-ld=lld -o "$_mdir/$_sh" \
+                "$CLANG" --target=$TRIPLE $SYSROOT_ARG -shared -fuse-ld=lld -o "$_mdir/$_sh" \
                     -Wl,-implib:"$_imp" \
                     $_objs $(_get libs) || die "$_mod: linking $_sh failed"
             elif [ "$HOST" = macos ]; then
@@ -252,7 +278,7 @@ for _ft in "$ROOT"/pkg/vendor/*/fetch.toml; do
     [ -z "$ONLY" ] || [ "$ONLY" = "$_mod" ] || continue
     _mdir="$OUT/vendor/$_mod"
     mkdir -p "$_mdir"
-    for _tab in $(toml "$_ft" | cut -f1 | grep "^$HOST\." | sort -u); do
+    for _tab in $(toml "$_ft" | cut -f1 | grep "^${TABLES:-$HOST}\." | sort -u); do
         entry "$_mod" "$_mdir" "$_ft" "$_tab"
         _n=$(( _n + 1 ))
     done

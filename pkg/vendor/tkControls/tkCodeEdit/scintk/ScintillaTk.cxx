@@ -546,7 +546,11 @@ public:
 // instead. The first throw then crashed. tiko-rt does run C++ static constructors, so one
 // here initialises it before any entry point is called. The DLL build must not: its own
 // startup already has, and initialising twice is not supported.
-#if defined(_WIN32) && defined(SCITK_STATIC)
+// __vcrt_initialize IS libcmt's OWN, and only the MSVC ABI has it: the MinGW flavour's C++
+// runtime initialises itself, and the call there is an undefined reference (measured,
+// 'undefined symbol: __vcrt_initialize'). _MSC_VER is what tells the two apart -- clang
+// defines it for the MSVC target and not for the MinGW one.
+#if defined(_WIN32) && defined(_MSC_VER) && defined(SCITK_STATIC)
 extern "C" bool __cdecl __vcrt_initialize();
 [[maybe_unused]] static const bool g_vcrtReady = __vcrt_initialize();
 #endif

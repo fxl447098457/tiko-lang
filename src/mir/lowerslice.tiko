@@ -74,6 +74,36 @@ function SliceUnitBytes( byref c as Ctx, byval t as Tko.TypeId ) as int32
     return 0
 end function
 
+'' THE DESCRIPTOR'S WORD: the pointer width. Every descriptor is three words -- the data
+'' pointer, the length, the anchor -- and the word is the POINTER width, so on win32
+'' the length sits at 4 and the anchor at 8, not at 8 and 16. The 64-bit offsets were
+'' written down and the win32 target never existed to catch them (measured: 'sext i32
+'' %t38 to i64' and a bounds check whose i64 argument went to an i32 parameter,
+'' 'error: %t40 defined with type i64 but expected i32').
+function DescWord_( byref c as Ctx ) as int32
+    return c.types->target.pointerBits \ 8
+end function
+
+function DescLenOff_( byref c as Ctx ) as int32
+    return DescWord_( c )
+end function
+
+function DescAnchorOff_( byref c as Ctx ) as int32
+    return 2 * DescWord_( c )
+end function
+
+function DescLenTy_( byref c as Ctx ) as MirType
+    if c.types->target.pointerBits = 32 then return MT_I32
+    return MT_I64
+end function
+
+'' THE TEMPORARY FLAG is the length's SIGN BIT (FB_TEMPSTRBIT), so the mask is the
+'' length's width with its top bit clear.
+function DescLenMask_( byref c as Ctx ) as int64
+    if c.types->target.pointerBits = 32 then return &h7FFFFFFFull
+    return &h7FFFFFFFFFFFFFFFll
+end function
+
 '' THE STORAGE OF A SLICE-TYPED EXPRESSION: a variable's own address, or a value -- a call's
 '' result, another slice expression -- spilled to a temporary.
 function SliceStorage( byref c as Ctx, byval e as Tko.NodeId ) as MirValue
@@ -99,7 +129,7 @@ function LowerSliceLen _
     if SliceUnitBytes( c, c.info->TypeOf_( a ) ) = 0 then return false
     dim as MirValue sa = SliceStorage( c, a )
     if sa.kind = cast( uint8, MV_NONE ) then return false
-    outv = LowerExprLoad( c, Fld_( c, sa, 8 ), MT_I64 )
+    outv = LowerExprLoad( c, Fld_( c, sa, DescLenOff_( c ) ), DescLenTy_( c ) )
     return (outv.kind <> cast( uint8, MV_NONE ))
 end function
 
@@ -148,8 +178,8 @@ private function SourceParts_ _
         if sa.kind = cast( uint8, MV_NONE ) then return false
         EmitSliceChecks( c, src, sa, SliceUnitBytes( c, st ) )
         dataV = LowerExprLoad( c, Fld_( c, sa, 0 ), MT_PTR )
-        lenV = LowerExprLoad( c, Fld_( c, sa, 8 ), MT_I64 )
-        anchorV = LowerExprLoad( c, Fld_( c, sa, 16 ), MT_PTR )
+        lenV = LowerExprLoad( c, Fld_( c, sa, DescLenOff_( c ) ), DescLenTy_( c ) )
+        anchorV = LowerExprLoad( c, Fld_( c, sa, DescAnchorOff_( c ) ), MT_PTR )
     case Slices.SS_DESC
         '' A VARIABLE'S DESCRIPTOR IS THE ANCHOR; a temporary's -- a call, a concatenation --
         '' ends with the statement, so it anchors nothing (RFC-0002 §4).
@@ -169,16 +199,16 @@ private function SourceParts_ _
         if da.kind = cast( uint8, MV_NONE ) then return false
         dataV = LowerExprLoad( c, Fld_( c, da, 0 ), MT_PTR )
         '' THE LENGTH'S SIGN BIT IS THE TEMPORARY FLAG (FB_TEMPSTRBIT): masked, as FB_STRSIZE does.
-        dim as MirValue rawLen = LowerExprLoad( c, Fld_( c, da, 8 ), MT_I64 )
-        dim as MirValue mask = ConstInt( c, &h7FFFFFFFFFFFFFFFll, MT_I64 )
-        lenV = Op2_( c, M_AND, MT_I64, rawLen, mask )
+        dim as MirValue rawLen = LowerExprLoad( c, Fld_( c, da, DescLenOff_( c ) ), DescLenTy_( c ) )
+        dim as MirValue mask = ConstInt( c, DescLenMask_( c ), DescLenTy_( c ) )
+        lenV = Op2_( c, M_AND, DescLenTy_( c ), rawLen, mask )
         if temp_ = false then anchorV = da
     case Slices.SS_FIXED
         dataV = LowerAddr( c, u )
         if dataV.kind = cast( uint8, MV_NONE ) then return false
         dim as Tko.TypeId bt = c.types->Unqualify( st )
         if c.types->Kind( bt ) = Tko.TK_REFERENCE then bt = c.types->Unqualify( c.types->Inner( bt ) )
-        lenV = ConstInt( c, c.types->ElemCount( bt ), MT_I64 )
+        lenV = ConstInt( c, c.types->ElemCount( bt ), DescLenTy_( c ) )
     case Slices.SS_ZFIXED
         '' UP TO THE NUL, as LEN measures it (RFC-0001 §4) -- the same three runtime calls.
         dataV = LowerAddr( c, u )
@@ -190,7 +220,7 @@ private function SourceParts_ _
         la.Push( cast( uint32, dataV.kind ) ) : la.Push( cast( uint32, dataV.id ) )
         select case su
         case Slices.SU_NARROW
-            dim as MirValue nv = ConstInt( c, n, MT_I64 )
+            dim as MirValue nv = ConstInt( c, n, DescLenTy_( c ) )
             la.Push( cast( uint32, nv.kind ) ) : la.Push( cast( uint32, nv.id ) )
             lenV = EmitRtl( c, RTL_STR_LEN, la )
         case Slices.SU_UTF16
@@ -202,7 +232,7 @@ private function SourceParts_ _
     case Slices.SS_PTR
         dataV = LowerExpr( c, u )
         lenKnown = false
-        lenV = ConstInt( c, 0, MT_I64 )
+        lenV = ConstInt( c, 0, DescLenTy_( c ) )
     case else
         return false
     end select
@@ -243,9 +273,9 @@ sub EmitSliceChecks _
     if sa.kind = cast( uint8, MV_NONE ) then return
     if at = Tko.NODE_NONE then at = cast( Tko.NodeId, c.stmt.curStmtNode )
     dim as MirValue p = LowerExprLoad( c, Fld_( c, sa, 0 ), MT_PTR )
-    dim as MirValue n = LowerExprLoad( c, Fld_( c, sa, 8 ), MT_I64 )
-    dim as MirValue anc = LowerExprLoad( c, Fld_( c, sa, 16 ), MT_PTR )
-    dim as MirValue ub = ConstInt( c, unitBytes, MT_I64 )
+    dim as MirValue n = LowerExprLoad( c, Fld_( c, sa, DescLenOff_( c ) ), DescLenTy_( c ) )
+    dim as MirValue anc = LowerExprLoad( c, Fld_( c, sa, DescAnchorOff_( c ) ), MT_PTR )
+    dim as MirValue ub = ConstInt( c, unitBytes, DescLenTy_( c ) )
 
     '' THE INDEX FIRST: 0 <= i < len is one unsigned compare.
     if idx <> nullptr then
@@ -266,11 +296,11 @@ sub EmitSliceChecks _
     Terminate( c, MTERM_CONDBR, okB, chkB, Op2_( c, M_ICMP_EQ, MT_I8, anc, z ) )
     c.curBlock = chkB
     dim as MirValue d = LowerExprLoad( c, Fld_( c, anc, 0 ), MT_PTR )
-    dim as MirValue rawL = LowerExprLoad( c, Fld_( c, anc, 8 ), MT_I64 )
-    dim as MirValue mask = ConstInt( c, &h7FFFFFFFFFFFFFFFll, MT_I64 )
-    dim as MirValue l = Op2_( c, M_AND, MT_I64, rawL, mask )
-    dim as MirValue dEnd = Op2_( c, M_PTR_ADD, MT_PTR, d, Op2_( c, M_MUL, MT_I64, l, ub ) )
-    dim as MirValue pEnd = Op2_( c, M_PTR_ADD, MT_PTR, p, Op2_( c, M_MUL, MT_I64, n, ub ) )
+    dim as MirValue rawL = LowerExprLoad( c, Fld_( c, anc, DescLenOff_( c ) ), DescLenTy_( c ) )
+    dim as MirValue mask = ConstInt( c, DescLenMask_( c ), DescLenTy_( c ) )
+    dim as MirValue l = Op2_( c, M_AND, DescLenTy_( c ), rawL, mask )
+    dim as MirValue dEnd = Op2_( c, M_PTR_ADD, MT_PTR, d, Op2_( c, M_MUL, DescLenTy_( c ), l, ub ) )
+    dim as MirValue pEnd = Op2_( c, M_PTR_ADD, MT_PTR, p, Op2_( c, M_MUL, DescLenTy_( c ), n, ub ) )
     dim as MirValue lowOk = Op2_( c, M_ICMP_ULE, MT_I8, d, p )
     dim as MirValue highOk = Op2_( c, M_ICMP_ULE, MT_I8, pEnd, dEnd )
     Terminate( c, MTERM_CONDBR, okB, badB, Op2_( c, M_AND, MT_I8, lowOk, highOk ) )
@@ -320,7 +350,7 @@ function LowerSliceCast _
     EmitSliceChecks( c, Tko.NODE_NONE, self_, SliceUnitBytes( c, ot ) )
 
     dim as MirValue dataV = LowerExprLoad( c, Fld_( c, self_, 0 ), MT_PTR )
-    dim as MirValue lenV = LowerExprLoad( c, Fld_( c, self_, 8 ), MT_I64 )
+    dim as MirValue lenV = LowerExprLoad( c, Fld_( c, self_, DescLenOff_( c ) ), DescLenTy_( c ) )
     dim as containers.Array( of uint32 ) a
     select case su
     case Slices.SU_NARROW
@@ -338,21 +368,21 @@ function LowerSliceCast _
         if vs < 0 then return false
         dim as MirValue va = Local_( vs )
         Store_( c, Fld_( c, va, 0 ), dataV )
-        Store_( c, Fld_( c, va, 8 ), lenV )
-        dim as MirValue z = ConstInt( c, 0, MT_I64 )
-        Store_( c, Fld_( c, va, 16 ), z )
+        Store_( c, Fld_( c, va, DescLenOff_( c ) ), lenV )
+        dim as MirValue z = ConstInt( c, 0, DescLenTy_( c ) )
+        Store_( c, Fld_( c, va, DescAnchorOff_( c ) ), z )
         a.Push( cast( uint32, va.kind ) ) : a.Push( cast( uint32, va.id ) )
         a.Push( cast( uint32, lenV.kind ) ) : a.Push( cast( uint32, lenV.id ) )
         outv = EmitRtl( c, RTL_USTR_LEFT, a )
     case else
         dim as int32 wb = c.types->target.wcharBytes
-        dim as MirValue one = ConstInt( c, 1, MT_I64 )
-        dim as MirValue n1 = Op2_( c, M_ADD, MT_I64, lenV, one )
+        dim as MirValue one = ConstInt( c, 1, DescLenTy_( c ) )
+        dim as MirValue n1 = Op2_( c, M_ADD, DescLenTy_( c ), lenV, one )
         a.Push( cast( uint32, n1.kind ) ) : a.Push( cast( uint32, n1.id ) )
         dim as MirValue wp = EmitRtl( c, RTL_WSTR_ALLOC, a )
         if wp.kind = cast( uint8, MV_NONE ) then return false
-        dim as MirValue wbv = ConstInt( c, wb, MT_I64 )
-        dim as MirValue nbytes = Op2_( c, M_MUL, MT_I64, lenV, wbv )
+        dim as MirValue wbv = ConstInt( c, wb, DescLenTy_( c ) )
+        dim as MirValue nbytes = Op2_( c, M_MUL, DescLenTy_( c ), lenV, wbv )
         dim as containers.Array( of uint32 ) ma
         ma.Push( cast( uint32, wp.kind ) ) : ma.Push( cast( uint32, wp.id ) )
         ma.Push( cast( uint32, dataV.kind ) ) : ma.Push( cast( uint32, dataV.id ) )
@@ -440,7 +470,7 @@ function LowerSliceArg _
             dim as containers.Array( of uint32 ) ta
             if EmitStrTerm( c, ta, u, false ) andalso (ta.Count = 4) andalso (ta[2] = cast( uint32, MV_CONST_INT )) then
                 dataV.kind = cast( uint8, ta[0] ) : dataV.ty = cast( uint8, MT_PTR ) : dataV.id = ta[1]
-                lenV = ConstInt( c, cast( int64, ta[3] ) - 1, MT_I64 )   '' a literal's size counts its NUL (PushStrLiteralArg)
+                lenV = ConstInt( c, cast( int64, ta[3] ) - 1, DescLenTy_( c ) )   '' a literal's size counts its NUL (PushStrLiteralArg)
                 done = true
             end if
         end select
@@ -455,9 +485,9 @@ function LowerSliceArg _
             if ByvalStrTemp_( c, u, flav, tdesc, tslot ) = false then return false
             if tslot >= 0 then c.strTemps.Push( cast( uint32, tslot ) )
             dataV = LowerExprLoad( c, Fld_( c, tdesc, 0 ), MT_PTR )
-            dim as MirValue rawLen = LowerExprLoad( c, Fld_( c, tdesc, 8 ), MT_I64 )
-            dim as MirValue mask = ConstInt( c, &h7FFFFFFFFFFFFFFFll, MT_I64 )
-            lenV = Op2_( c, M_AND, MT_I64, rawLen, mask )
+            dim as MirValue rawLen = LowerExprLoad( c, Fld_( c, tdesc, DescLenOff_( c ) ), DescLenTy_( c ) )
+            dim as MirValue mask = ConstInt( c, DescLenMask_( c ), DescLenTy_( c ) )
+            lenV = Op2_( c, M_AND, DescLenTy_( c ), rawLen, mask )
         case else
             dim as MirValue wp
             if WideOperand_( c, u, wp ) = false then
@@ -475,8 +505,8 @@ function LowerSliceArg _
     if slot < 0 then return false
     dim as MirValue sa = Local_( slot )
     Store_( c, Fld_( c, sa, 0 ), dataV )
-    Store_( c, Fld_( c, sa, 8 ), lenV )
-    Store_( c, Fld_( c, sa, 16 ), anchorV )
+    Store_( c, Fld_( c, sa, DescLenOff_( c ) ), lenV )
+    Store_( c, Fld_( c, sa, DescAnchorOff_( c ) ), anchorV )
     outa = sa
     return true
 end function
@@ -495,7 +525,7 @@ function LowerSliceCtor _
         dim as Tko.NodeId ne = c.ast->ChildAt( cp->first, 1 )
         n = LowerExpr( c, ne )
         if n.kind = cast( uint8, MV_NONE ) then return false
-        n = CoerceTy( c, n, MT_I64, c.info->TypeOf_( ne ) )
+        n = CoerceTy( c, n, DescLenTy_( c ), c.info->TypeOf_( ne ) )
     else
         dim as containers.Array( of uint32 ) la
         la.Push( cast( uint32, p.kind ) ) : la.Push( cast( uint32, p.id ) )
@@ -511,8 +541,8 @@ function LowerSliceCtor _
     if slot < 0 then return false
     dim as MirValue sa = Local_( slot )
     Store_( c, Fld_( c, sa, 0 ), p )
-    Store_( c, Fld_( c, sa, 8 ), n )
-    Store_( c, Fld_( c, sa, 16 ), ConstInt( c, 0, MT_PTR ) )
+    Store_( c, Fld_( c, sa, DescLenOff_( c ) ), n )
+    Store_( c, Fld_( c, sa, DescAnchorOff_( c ) ), ConstInt( c, 0, MT_PTR ) )
     outv = LowerExprLoad( c, sa, MT_AGG, SizeOfType( c, t ) )
     return (outv.kind <> cast( uint8, MV_NONE ))
 end function
@@ -540,10 +570,10 @@ function LowerSliceCall _
     dim as MirValue lo = LowerExpr( c, loN )
     dim as MirValue hi = LowerExpr( c, hiN )
     if (lo.kind = cast( uint8, MV_NONE )) orelse (hi.kind = cast( uint8, MV_NONE )) then return false
-    lo = CoerceTy( c, lo, MT_I64, c.info->TypeOf_( loN ) )
-    hi = CoerceTy( c, hi, MT_I64, c.info->TypeOf_( hiN ) )
-    dim as MirValue one = ConstInt( c, 1, MT_I64 )
-    dim as MirValue hi1 = Op2_( c, M_ADD, MT_I64, hi, one )
+    lo = CoerceTy( c, lo, DescLenTy_( c ), c.info->TypeOf_( loN ) )
+    hi = CoerceTy( c, hi, DescLenTy_( c ), c.info->TypeOf_( hiN ) )
+    dim as MirValue one = ConstInt( c, 1, DescLenTy_( c ) )
+    dim as MirValue hi1 = Op2_( c, M_ADD, DescLenTy_( c ), hi, one )
 
     '' 0 <= lo <= hi + 1 <= len, as two unsigned compares: a negative value is enormous
     '' unsigned and fails whichever compare it is in. A pointer has no length, so only
@@ -552,7 +582,7 @@ function LowerSliceCall _
     if lenKnown then
         okHi = Op2_( c, M_ICMP_ULE, MT_I8, hi1, lenV )
     else
-        dim as MirValue z = ConstInt( c, 0, MT_I64 )
+        dim as MirValue z = ConstInt( c, 0, DescLenTy_( c ) )
         okHi = Op2_( c, M_ICMP_SGE, MT_I8, hi1, z )
     end if
     dim as MirValue okLo = Op2_( c, M_ICMP_ULE, MT_I8, lo, hi1 )
@@ -568,33 +598,33 @@ function LowerSliceCall _
     c.curBlock = failB
     Terminate( c, MTERM_CONDBR, failLoB, failHiB, okHi )
     c.curBlock = failHiB
-    dim as MirValue mOne = ConstInt( c, -1, MT_I64 )
+    dim as MirValue mOne = ConstInt( c, -1, DescLenTy_( c ) )
     dim as MirValue lenM1
     if lenKnown then
-        lenM1 = Op2_( c, M_SUB, MT_I64, lenV, one )
+        lenM1 = Op2_( c, M_SUB, DescLenTy_( c ), lenV, one )
     else
-        lenM1 = ConstInt( c, &h7FFFFFFFFFFFFFFFll, MT_I64 )
+        lenM1 = ConstInt( c, &h7FFFFFFFFFFFFFFFll, DescLenTy_( c ) )
     end if
     RangeFail_( c, id, src, hi, mOne, lenM1 )
     c.curBlock = failLoB
-    dim as MirValue zero = ConstInt( c, 0, MT_I64 )
+    dim as MirValue zero = ConstInt( c, 0, DescLenTy_( c ) )
     RangeFail_( c, id, src, lo, zero, hi1 )
     c.curBlock = contB
 
     dim as MirValue off = lo
     if ub <> 1 then
-        dim as MirValue ubv = ConstInt( c, ub, MT_I64 )
-        off = Op2_( c, M_MUL, MT_I64, lo, ubv )
+        dim as MirValue ubv = ConstInt( c, ub, DescLenTy_( c ) )
+        off = Op2_( c, M_MUL, DescLenTy_( c ), lo, ubv )
     end if
     dim as MirValue p = Op2_( c, M_PTR_ADD, MT_PTR, dataV, off )
-    dim as MirValue n = Op2_( c, M_SUB, MT_I64, hi1, lo )
+    dim as MirValue n = Op2_( c, M_SUB, DescLenTy_( c ), hi1, lo )
 
     dim as int32 slot = NewTempLocal( c, MT_AGG, SizeOfType( c, rt ) )
     if slot < 0 then return false
     dim as MirValue sa = Local_( slot )
     Store_( c, Fld_( c, sa, 0 ), p )
-    Store_( c, Fld_( c, sa, 8 ), n )
-    Store_( c, Fld_( c, sa, 16 ), anchorV )
+    Store_( c, Fld_( c, sa, DescLenOff_( c ) ), n )
+    Store_( c, Fld_( c, sa, DescAnchorOff_( c ) ), anchorV )
     outv = LowerExprLoad( c, sa, MT_AGG, SizeOfType( c, rt ) )
     return (outv.kind <> cast( uint8, MV_NONE ))
 end function
@@ -611,13 +641,13 @@ end function
 
 private function WordTy_( byref c as Ctx ) as MirType
     if c.types->target.pointerBits = 32 then return MT_I32
-    return MT_I64
+    return DescLenTy_( c )
 end function
 
 '' A pointer-width word widened to i64.
 private function Word64_( byref c as Ctx, byref v as MirValue ) as MirValue
-    if WordTy_( c ) = MT_I64 then return v
-    return CoerceTy( c, v, MT_I64, c.types->Builtin( Tko.TY_LONG ) )
+    if WordTy_( c ) = DescLenTy_( c ) then return v
+    return CoerceTy( c, v, DescLenTy_( c ), c.types->Builtin( Tko.TY_LONG ) )
 end function
 
 '' THE BYTES OF ONE ELEMENT of a span type, or 0 when t is not a span.
@@ -648,7 +678,7 @@ sub EmitSpanChecks _
     dim as MirValue p = LowerExprLoad( c, Fld_( c, sa, 0 ), MT_PTR )
     dim as MirValue n = Word64_( c, LowerExprLoad( c, Fld_( c, sa, pb ), WordTy_( c ) ) )
     dim as MirValue anc = LowerExprLoad( c, Fld_( c, sa, 2 * pb ), MT_PTR )
-    dim as MirValue ub = ConstInt( c, esz, MT_I64 )
+    dim as MirValue ub = ConstInt( c, esz, DescLenTy_( c ) )
 
     '' THE INDEX FIRST: 0 <= i < len is one unsigned compare.
     if idx <> nullptr then
@@ -671,11 +701,11 @@ sub EmitSpanChecks _
     dim as MirValue d = LowerExprLoad( c, Fld_( c, anc, pb ), MT_PTR )
     dim as MirValue sz = Word64_( c, LowerExprLoad( c, Fld_( c, anc, 2 * pb ), WordTy_( c ) ) )
     dim as MirValue dEnd = Op2_( c, M_PTR_ADD, MT_PTR, d, sz )
-    dim as MirValue pEnd = Op2_( c, M_PTR_ADD, MT_PTR, p, Op2_( c, M_MUL, MT_I64, n, ub ) )
+    dim as MirValue pEnd = Op2_( c, M_PTR_ADD, MT_PTR, p, Op2_( c, M_MUL, DescLenTy_( c ), n, ub ) )
     dim as MirValue lowOk = Op2_( c, M_ICMP_ULE, MT_I8, d, p )
     dim as MirValue highOk = Op2_( c, M_ICMP_ULE, MT_I8, pEnd, dEnd )
     '' AN EMPTY VIEW is inside anything, freed or not.
-    dim as MirValue empty_ = Op2_( c, M_ICMP_EQ, MT_I8, n, ConstInt( c, 0, MT_I64 ) )
+    dim as MirValue empty_ = Op2_( c, M_ICMP_EQ, MT_I8, n, ConstInt( c, 0, DescLenTy_( c ) ) )
     Terminate( c, MTERM_CONDBR, okB, badB, Op2_( c, M_OR, MT_I8, empty_, Op2_( c, M_AND, MT_I8, lowOk, highOk ) ) )
     c.curBlock = badB
     ThrowSix_( c, at )
@@ -691,20 +721,20 @@ function LowerSpanBound _
     if Slices.IsSpanType( *c.types, c.info->TypeOf_( a0 ) ) = false then return false
     dim as MirValue lenV
     if LowerSpanLen_( c, a0, lenV ) = false then return false
-    dim as MirValue one = ConstInt( c, 1, MT_I64 )
-    dim as MirValue zero = ConstInt( c, 0, MT_I64 )
+    dim as MirValue one = ConstInt( c, 1, DescLenTy_( c ) )
+    dim as MirValue zero = ConstInt( c, 0, DescLenTy_( c ) )
     dim as MirValue r1 = zero
-    if isU then r1 = Op2_( c, M_SUB, MT_I64, lenV, one )
+    if isU then r1 = Op2_( c, M_SUB, DescLenTy_( c ), lenV, one )
     if cp->count < 2 then outv = r1 : return true
     dim as Tko.NodeId dn = cast( Tko.NodeId, c.ast->ChildSlot( cp->first + 1 ) )
     dim as MirValue dimV = LowerExpr( c, dn )
     if dimV.kind = cast( uint8, MV_NONE ) then return false
-    dimV = CoerceTy( c, dimV, MT_I64, c.info->TypeOf_( dn ) )
+    dimV = CoerceTy( c, dimV, DescLenTy_( c ), c.info->TypeOf_( dn ) )
     '' Three answers through one temporary: dim 1 -> r1, dim 0 -> 1, any other -> 0 / -1.
-    dim as int32 slot = NewTempLocal( c, MT_I64, 8 )
+    dim as int32 slot = NewTempLocal( c, DescLenTy_( c ), 8 )
     if slot < 0 then return false
     dim as MirValue tv = Local_( slot )
-    Store_( c, tv, ConstInt( c, iif( isU, -1, 0 ), MT_I64 ) )
+    Store_( c, tv, ConstInt( c, iif( isU, -1, 0 ), DescLenTy_( c ) ) )
     dim as int32 is1 = NewBlock( c, "spanbnd1" )
     dim as int32 not1 = NewBlock( c, "spanbndn1" )
     dim as int32 is0 = NewBlock( c, "spanbnd0" )
@@ -719,7 +749,7 @@ function LowerSpanBound _
     Store_( c, tv, one )
     Terminate( c, MTERM_BR, done, -1, NoVal( ) )
     c.curBlock = done
-    outv = LowerExprLoad( c, tv, MT_I64 )
+    outv = LowerExprLoad( c, tv, DescLenTy_( c ) )
     return (outv.kind <> cast( uint8, MV_NONE ))
 end function
 
@@ -741,8 +771,8 @@ private function SpanSourceParts_ _
         dataV = LowerExprLoad( c, Fld_( c, sa, 0 ), MT_PTR )
         dim as MirValue n = Word64_( c, LowerExprLoad( c, Fld_( c, sa, pb ), WordTy_( c ) ) )
         anchorV = LowerExprLoad( c, Fld_( c, sa, 2 * pb ), MT_PTR )
-        lbV = ConstInt( c, 0, MT_I64 )
-        ubV = Op2_( c, M_SUB, MT_I64, n, ConstInt( c, 1, MT_I64 ) )
+        lbV = ConstInt( c, 0, DescLenTy_( c ) )
+        ubV = Op2_( c, M_SUB, DescLenTy_( c ), n, ConstInt( c, 1, DescLenTy_( c ) ) )
         return dataV.kind <> cast( uint8, MV_NONE )
     end if
     dim as Tko.TypeId at = Slices.BareType( *c.types, st )
@@ -754,8 +784,8 @@ private function SpanSourceParts_ _
         dim as int32 first = c.types->types[cast( int32, at )].first
         if c.types->types[cast( int32, at )].count < 2 then return false
         dataV = base_
-        lbV = ConstInt( c, c.types->boundPool[first], MT_I64 )
-        ubV = ConstInt( c, c.types->boundPool[first + 1], MT_I64 )
+        lbV = ConstInt( c, c.types->boundPool[first], DescLenTy_( c ) )
+        ubV = ConstInt( c, c.types->boundPool[first + 1], DescLenTy_( c ) )
         return true
     end if
     '' A DYNAMIC ARRAY OR AN 'a()' PARAMETER: base_ is its descriptor. A rank the source does
@@ -764,7 +794,7 @@ private function SpanSourceParts_ _
         dim as MirValue dims = Word64_( c, LowerExprLoad( c, Fld_( c, base_, 4 * pb ), WordTy_( c ) ) )
         dim as int32 badD = NewBlock( c, "spanbaddims" )
         dim as int32 okD = NewBlock( c, "spanokdims" )
-        Terminate( c, MTERM_CONDBR, okD, badD, Op2_( c, M_ICMP_ULE, MT_I8, dims, ConstInt( c, 1, MT_I64 ) ) )
+        Terminate( c, MTERM_CONDBR, okD, badD, Op2_( c, M_ICMP_ULE, MT_I8, dims, ConstInt( c, 1, DescLenTy_( c ) ) ) )
         c.curBlock = badD
         ThrowSix_( c, id )
         c.curBlock = okD
@@ -779,10 +809,10 @@ private function SpanSourceParts_ _
         dim as MirValue av = Local_( aslot )
         Store_( c, av, base_ )
         dim as MirValue fl = Word64_( c, LowerExprLoad( c, Fld_( c, base_, 5 * pb ), WordTy_( c ) ) )
-        dim as MirValue fixedLen = Op2_( c, M_AND, MT_I64, fl, ConstInt( c, &h20, MT_I64 ) )
+        dim as MirValue fixedLen = Op2_( c, M_AND, DescLenTy_( c ), fl, ConstInt( c, &h20, DescLenTy_( c ) ) )
         dim as int32 fixB = NewBlock( c, "spanfixeddesc" )
         dim as int32 dynB = NewBlock( c, "spandyndesc" )
-        Terminate( c, MTERM_CONDBR, dynB, fixB, Op2_( c, M_ICMP_EQ, MT_I8, fixedLen, ConstInt( c, 0, MT_I64 ) ) )
+        Terminate( c, MTERM_CONDBR, dynB, fixB, Op2_( c, M_ICMP_EQ, MT_I8, fixedLen, ConstInt( c, 0, DescLenTy_( c ) ) ) )
         c.curBlock = fixB
         Store_( c, av, ConstInt( c, 0, MT_PTR ) )
         Terminate( c, MTERM_BR, dynB, -1, NoVal( ) )
@@ -822,17 +852,17 @@ function LowerSpanCall _
     dim as MirValue lo = LowerExpr( c, loN )
     dim as MirValue hi = LowerExpr( c, hiN )
     if (lo.kind = cast( uint8, MV_NONE )) orelse (hi.kind = cast( uint8, MV_NONE )) then return false
-    lo = CoerceTy( c, lo, MT_I64, c.info->TypeOf_( loN ) )
-    hi = CoerceTy( c, hi, MT_I64, c.info->TypeOf_( hiN ) )
-    dim as MirValue one = ConstInt( c, 1, MT_I64 )
-    dim as MirValue hi1 = Op2_( c, M_ADD, MT_I64, hi, one )
-    dim as MirValue ub1 = Op2_( c, M_ADD, MT_I64, ubV, one )
+    lo = CoerceTy( c, lo, DescLenTy_( c ), c.info->TypeOf_( loN ) )
+    hi = CoerceTy( c, hi, DescLenTy_( c ), c.info->TypeOf_( hiN ) )
+    dim as MirValue one = ConstInt( c, 1, DescLenTy_( c ) )
+    dim as MirValue hi1 = Op2_( c, M_ADD, DescLenTy_( c ), hi, one )
+    dim as MirValue ub1 = Op2_( c, M_ADD, DescLenTy_( c ), ubV, one )
 
     '' RELATIVE TO lbound, two unsigned compares as for a string: hi + 1 - lb <=u ub + 1 - lb
     '' (the element count) and lo - lb <=u hi + 1 - lb.
-    dim as MirValue rHi1 = Op2_( c, M_SUB, MT_I64, hi1, lbV )
-    dim as MirValue rCnt = Op2_( c, M_SUB, MT_I64, ub1, lbV )
-    dim as MirValue rLo = Op2_( c, M_SUB, MT_I64, lo, lbV )
+    dim as MirValue rHi1 = Op2_( c, M_SUB, DescLenTy_( c ), hi1, lbV )
+    dim as MirValue rCnt = Op2_( c, M_SUB, DescLenTy_( c ), ub1, lbV )
+    dim as MirValue rLo = Op2_( c, M_SUB, DescLenTy_( c ), lo, lbV )
     dim as MirValue okHi = Op2_( c, M_ICMP_ULE, MT_I8, rHi1, rCnt )
     dim as MirValue okLo = Op2_( c, M_ICMP_ULE, MT_I8, rLo, rHi1 )
     dim as MirValue ok = Op2_( c, M_AND, MT_I8, okHi, okLo )
@@ -846,16 +876,16 @@ function LowerSpanCall _
     c.curBlock = failB
     Terminate( c, MTERM_CONDBR, failLoB, failHiB, okHi )
     c.curBlock = failHiB
-    RangeFail_( c, id, src, hi, Op2_( c, M_SUB, MT_I64, lbV, one ), ubV )
+    RangeFail_( c, id, src, hi, Op2_( c, M_SUB, DescLenTy_( c ), lbV, one ), ubV )
     c.curBlock = failLoB
     RangeFail_( c, id, src, lo, lbV, hi1 )
     c.curBlock = contB
 
     dim as MirValue off = rLo
-    if esz <> 1 then off = Op2_( c, M_MUL, MT_I64, rLo, ConstInt( c, esz, MT_I64 ) )
+    if esz <> 1 then off = Op2_( c, M_MUL, DescLenTy_( c ), rLo, ConstInt( c, esz, DescLenTy_( c ) ) )
     dim as MirValue p = Op2_( c, M_PTR_ADD, MT_PTR, dataV, off )
-    dim as MirValue n = Op2_( c, M_SUB, MT_I64, hi1, lo )
-    if WordTy_( c ) <> MT_I64 then n = CoerceTy( c, n, WordTy_( c ), c.types->Builtin( Tko.TY_LONGINT ) )
+    dim as MirValue n = Op2_( c, M_SUB, DescLenTy_( c ), hi1, lo )
+    if WordTy_( c ) <> DescLenTy_( c ) then n = CoerceTy( c, n, WordTy_( c ), c.types->Builtin( Tko.TY_LONGINT ) )
 
     dim as int32 pb = Pb_( c )
     dim as int32 slot = NewTempLocal( c, MT_AGG, SizeOfType( c, rt ) )
@@ -882,11 +912,11 @@ function LowerSpanIndex( byref c as Ctx, byval id as Tko.NodeId ) as MirValue
     if sa.kind = cast( uint8, MV_NONE ) then return none_
     dim as MirValue iv = LowerExpr( c, ixN )
     if iv.kind = cast( uint8, MV_NONE ) then return none_
-    iv = CoerceTy( c, iv, MT_I64, c.info->TypeOf_( ixN ) )
+    iv = CoerceTy( c, iv, DescLenTy_( c ), c.info->TypeOf_( ixN ) )
     EmitSpanChecks( c, id, sa, esz, @iv )
     dim as MirValue base_ = LowerExprLoad( c, Fld_( c, sa, 0 ), MT_PTR )
     dim as MirValue off = iv
-    if esz <> 1 then off = Op2_( c, M_MUL, MT_I64, iv, ConstInt( c, esz, MT_I64 ) )
+    if esz <> 1 then off = Op2_( c, M_MUL, DescLenTy_( c ), iv, ConstInt( c, esz, DescLenTy_( c ) ) )
     return Op2_( c, M_PTR_ADD, MT_PTR, base_, off )
 end function
 
