@@ -61,6 +61,11 @@ case "$(uname -s)" in
         VOS=windows
         TABLES=windows
         SYSROOT_ARG=
+        # NO CALLING-CONVENTION FLAG: the MinGW C convention is cdecl, which is what
+        # clang's MinGW target already uses, and the one library that wants otherwise
+        # says so in its own header (cJSON's CJSON_PUBLIC is __stdcall on Windows) --
+        # so the archive is decorated ('_cJSON_Delete@4') and the binding names the
+        # convention to match.
         if [ "$FLAVOUR" = mingw ]; then
             TABLES=windows-mingw
             VARCH=${TIKO_VENDOR_ARCH:-x86_64}
