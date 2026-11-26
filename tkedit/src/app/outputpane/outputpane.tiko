@@ -12,6 +12,8 @@
 '   Search    Find in Project's matches, a header row per file; Enter or a double click goes there
 '   Debug     the debugger (tka/debugpane): buttons, Locals/Globals/Watch | Call Stack/Breakpoints
 ' Rows carry an index the owner gives; what activating one means is the owner's (OnActivate).
+' At the tab strip's right end, the float / dock button (as the designer's palettes have): the owner
+' moves the frame onto a window of its own and back (tkWidget_Reparent: the lists keep their rows).
 ' After tiko-studio's tsa/outputpane: its Results, Compiler Log and Search Results (PROVENANCE.md).
 #module "outputpane"
 
@@ -22,6 +24,7 @@
 #import "vendor/tkControls/tkTabBar"
 #import "vendor/tkControls/tkListTree"
 #import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkToolbar"
 using containers
 using tkApp
 using tkHost
@@ -30,6 +33,7 @@ using tkTheme
 using tkTabBar
 using tkListTree
 using tkTextBox
+using tkToolbar
 
 public enum OutputTab explicit
     Results = 0
@@ -39,6 +43,7 @@ public enum OutputTab explicit
 end enum
 
 public type OutputActivateSub as sub( byval owner as any ptr, byval tab_ as OutputTab, byval itemIndex as long )
+public type OutputNotifySub as sub( byval owner as any ptr )
 
 public const TAB_CY = 26
 public const PANE_CY = 170               ' the pane's height, unscaled
@@ -47,15 +52,23 @@ const ID_RESULTS = 10
 const ID_LOG = 11
 const ID_SEARCH = 12
 const ID_DEBUG = 13
+const ID_FLOAT = 14
+const PAD = 4
+' PsIcons: the designer palettes' float / dock glyphs (design/panels GLYPH_FLOAT, GLYPH_DOCK)
+const GLYPH_FLOAT = &hF582
+const GLYPH_DOCK = &hF373
 
 public type Pane
     owner as any ptr
     OnActivate as OutputActivateSub
+    OnFloat as OutputNotifySub          ' the float / dock button: the owner toggles, not from inside the click
     frame as TK_WIDGET ptr
     tabs as TK_WIDGET ptr
     results as TK_WIDGET ptr
     logBox as TK_WIDGET ptr
     search as TK_WIDGET ptr
+    floatBtn as TK_WIDGET ptr
+    floating as boolean                 ' the button shows Dock
     Debug as debugpane.Pane              ' the Debug tab's content
     searchPressed as boolean            ' the button went down on a Search row
     current as OutputTab
@@ -69,6 +82,8 @@ public type Pane
     declare sub Focus( )
     declare sub ApplyColors( )                  ' after a theme change
     declare sub Relabel( )                      ' the tabs' text in the interface's language
+    declare sub SetFloating( byval onOff as boolean )
+    declare sub Rehome( )                       ' after a move to another window: that window's fonts
 end type
 
 private function PaneOf( byval w as TK_WIDGET ptr ) as Pane ptr
@@ -78,6 +93,13 @@ private function PaneOf( byval w as TK_WIDGET ptr ) as Pane ptr
     wend
     return 0
 end function
+
+' The float button's bar in the tab strip's own background. Pinned, so set again at every theme.
+private sub ColorFloatBar( byval bar as TK_WIDGET ptr )
+    dim as TKTOOLBAR_COLORS c = tkToolbar_ThemeColors( tkTheme_Get( ) )
+    c.BackColor = tkTabBar_ThemeColors( tkTheme_Get( ) ).BackColor
+    tkToolbar_SetColors( bar, @c )
+end sub
 
 private function FrameProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
     select case m->msg
@@ -91,6 +113,8 @@ private function FrameProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as
         cast( Pane ptr, w->pData )->Layout( )
         return true
     case TKM_THEMECHANGED
+        dim as Pane ptr p = w->pData
+        if p->floatBtn then ColorFloatBar( p->floatBtn )
         tkWidget_Invalidate( w )
         return true
     end select
@@ -148,6 +172,14 @@ sub Pane.Create( byval parent as TK_WIDGET ptr, byval id as long, byval owner_ a
     end function )
     tkListTree_SetPaintCallback( search, @tkListTree_PaintRowDefault )
     Debug.Create( frame, ID_DEBUG, owner_ )
+    floatBtn = tkToolbar_Create( frame, ID_FLOAT )
+    if f then tkToolbar_SetGlyphFont( floatBtn, tkForm_Font( f, TKFONT_GLYPH ) )
+    ColorFloatBar( floatBtn )
+    tkToolbar_AddItem( floatBtn, TBR_KIND_COMMAND, wchr( GLYPH_FLOAT ), "", ID_FLOAT )
+    tkToolbar_SetClickCallback( floatBtn, sub( byval h as TK_WIDGET ptr, byval idx as long, byval cid as long )
+        dim as Pane ptr p = PaneOf( h )
+        if (p <> 0) andalso (p->OnFloat <> 0) then p->OnFloat( p->owner )
+    end sub )
     this.Relabel( )
     this.ShowTab( OutputTab.Results )
     tkWidget_Show( frame, false )
@@ -155,8 +187,15 @@ end sub
 
 sub Pane.Layout( )
     if frame = 0 then exit sub
-    dim as long th = tkHost_Scale( frame->pHost, TAB_CY )
-    tkWidget_SetPos( tabs, 0, 0, frame->cw, th )
+    dim as long th = tkHost_Scale( frame->pHost, TAB_CY ), p_ = tkHost_Scale( frame->pHost, PAD ), bw = 0, bh = 0
+    if floatBtn then
+        tkToolbar_GetIdealSize( floatBtn, bw, bh )
+        if bh > th then bh = th
+        tkWidget_SetPos( floatBtn, frame->cw - bw - p_, (th - bh) \ 2, bw, bh )
+        bw += 2 * p_
+    end if
+    ' the tabs end where the button's room starts; the strip's background is under the button too
+    tkWidget_SetPos( tabs, 0, 0, frame->cw - bw, th )
     tkWidget_SetPos( results, 0, th, frame->cw, frame->ch - th )
     tkWidget_SetPos( logBox, 0, th, frame->cw, frame->ch - th )
     tkWidget_SetPos( search, 0, th, frame->cw, frame->ch - th )
@@ -215,4 +254,30 @@ sub Pane.Relabel( )
     tkTabBar_SetText( tabs, OutputTab.Search, i18n.Tr( "output.tab_search", "Search" ) )
     tkTabBar_SetText( tabs, OutputTab.Debug, i18n.Tr( "output.tab_debug", "Debug" ) )
     if Debug.frame then Debug.Relabel( )
+    if floatBtn then
+        if floating then
+            tkToolbar_SetTooltipText( floatBtn, 0, i18n.Tr( "designer.dock", "Dock" ) )
+        else
+            tkToolbar_SetTooltipText( floatBtn, 0, i18n.Tr( "designer.float", "Float" ) )
+        end if
+    end if
+end sub
+
+sub Pane.SetFloating( byval onOff as boolean )
+    floating = onOff
+    if floatBtn = 0 then exit sub
+    tkToolbar_SetGlyph( floatBtn, 0, wchr( iif( onOff, GLYPH_DOCK, GLYPH_FLOAT ) ) )
+    this.Relabel( )
+    tkWidget_Invalidate( floatBtn )
+end sub
+
+' The fonts the pane's controls were given came from the window they were made on; moved, they
+' take the new window's (its scale may differ). Its UI font they find through their surface.
+sub Pane.Rehome( )
+    dim as TK_FORM ptr f = tkForm_FromWidget( frame )
+    if f = 0 then exit sub
+    tkTextBox_SetFont( logBox, tkForm_Font( f, TKFONT_MONO ) )
+    if floatBtn then tkToolbar_SetGlyphFont( floatBtn, tkForm_Font( f, TKFONT_GLYPH ) )
+    Debug.Rehome( )
+    this.Layout( )
 end sub

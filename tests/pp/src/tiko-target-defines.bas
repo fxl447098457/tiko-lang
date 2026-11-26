@@ -5,7 +5,7 @@
     #ifndef TIKO_OS_WINDOWS
         #error "TIKO_OS_WINDOWS not defined on Windows"
     #endif
-    #if defined( TIKO_OS_LINUX ) orelse defined( TIKO_OS_MACOS )
+    #if defined( TIKO_OS_LINUX ) orelse defined( TIKO_OS_MACOS ) orelse defined( TIKO_OS_ANDROID )
         #error "another TIKO_OS_* defined on Windows"
     #endif
 #endif
@@ -13,7 +13,7 @@
     #ifndef TIKO_OS_LINUX
         #error "TIKO_OS_LINUX not defined on Linux"
     #endif
-    #if defined( TIKO_OS_WINDOWS ) orelse defined( TIKO_OS_MACOS )
+    #if defined( TIKO_OS_WINDOWS ) orelse defined( TIKO_OS_MACOS ) orelse defined( TIKO_OS_ANDROID )
         #error "another TIKO_OS_* defined on Linux"
     #endif
 #endif
@@ -21,8 +21,19 @@
     #ifndef TIKO_OS_MACOS
         #error "TIKO_OS_MACOS not defined on Darwin"
     #endif
-    #if defined( TIKO_OS_WINDOWS ) orelse defined( TIKO_OS_LINUX )
+    #if defined( TIKO_OS_WINDOWS ) orelse defined( TIKO_OS_LINUX ) orelse defined( TIKO_OS_ANDROID )
         #error "another TIKO_OS_* defined on Darwin"
+    #endif
+#endif
+#ifdef __FB_ANDROID__
+    #ifndef TIKO_OS_ANDROID
+        #error "TIKO_OS_ANDROID not defined on Android"
+    #endif
+    #if defined( TIKO_OS_WINDOWS ) orelse defined( TIKO_OS_LINUX ) orelse defined( TIKO_OS_MACOS )
+        #error "another TIKO_OS_* defined on Android"
+    #endif
+    #ifdef __FB_LINUX__
+        #error "__FB_LINUX__ defined on Android -- fbc does not"
     #endif
 #endif
 #if defined( TIKO_ARCH_X86_64 ) = defined( TIKO_ARCH_ARM64 )
@@ -61,6 +72,11 @@
         #error "TIKO_OS_MACOS is not 1"
     #endif
     #print os=macos
+#elseif defined( TIKO_OS_ANDROID )
+    #if TIKO_OS_ANDROID <> 1
+        #error "TIKO_OS_ANDROID is not 1"
+    #endif
+    #print os=android
 #else
     #error "no TIKO_OS_* defined"
 #endif

@@ -107,6 +107,19 @@ verify_live() {
   die "live check failed: $url (type '$ctype', sha $got, wanted $want)"
 }
 
+# An image cannot be checked byte for byte at the URL: the host's CDN (hcdn) re-encodes PNGs on
+# the way out (tkDataGrid.png: 115403 bytes on disk, 148607 served). The server's file is compared
+# by sha256 instead, and the URL only has to answer with an image.
+verify_image() {
+  local rel="$1" want there ctype
+  want=$(sha_of "$WEBSITE/$rel")
+  there=$(ssh "$SSH_HOST" "sha256sum $DOMAIN_DIR/public_html/$rel" | cut -d' ' -f1)
+  [[ "$there" == "$want" ]] || die "server copy of $rel differs (sha $there, wanted $want)"
+  ctype=$(curl -fsSL -m 60 -A 'Mozilla/5.0' -o /dev/null -w '%{content_type}' "$SITE_URL/$rel" || echo FETCH-FAILED)
+  [[ "${ctype,,}" == image/* ]] || die "live check failed: $SITE_URL/$rel (type '$ctype')"
+  say "live OK: $SITE_URL/$rel (server copy identical)"
+}
+
 # ---------------------------------------------------------------- the docs
 publish_docs() {
   git -C "$root" fetch -q origin
@@ -217,9 +230,14 @@ publish_landing() {
   esac
 
   # Files are overwritten, never swapped: the web root also holds what this repo does not own.
-  tar -czf - -C "$WEBSITE" index.html assets | ssh "$SSH_HOST" "set -e; mkdir -p $STAGE; rm -rf $STAGE/landing.new; mkdir $STAGE/landing.new; tar -xzf - -C $STAGE/landing.new; chmod -R u=rwX,go=rX $STAGE/landing.new; cp -f $STAGE/landing.new/assets/* $DOMAIN_DIR/public_html/assets/; cp -f $STAGE/landing.new/index.html $DOMAIN_DIR/public_html/index.html; rm -rf $STAGE/landing.new"
+  # assets/ has subfolders (tk/, showcase/), so it is copied recursively; controls.html is the
+  # tkControls gallery the landing page links.
+  tar -czf - -C "$WEBSITE" index.html controls.html assets | ssh "$SSH_HOST" "set -e; mkdir -p $STAGE; rm -rf $STAGE/landing.new; mkdir $STAGE/landing.new; tar -xzf - -C $STAGE/landing.new; chmod -R u=rwX,go=rX $STAGE/landing.new; mkdir -p $DOMAIN_DIR/public_html/assets; cp -rf $STAGE/landing.new/assets/. $DOMAIN_DIR/public_html/assets/; cp -f $STAGE/landing.new/index.html $STAGE/landing.new/controls.html $DOMAIN_DIR/public_html/; rm -rf $STAGE/landing.new"
   verify_live "$SITE_URL/index.html" "$WEBSITE/index.html"
+  verify_live "$SITE_URL/controls.html" "$WEBSITE/controls.html"
   verify_live "$SITE_URL/assets/tiko.js" "$WEBSITE/assets/tiko.js"
+  verify_image "assets/tk/tkDataGrid.png"
+  verify_image "assets/showcase/tkedit-designer-themes.png"
 }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/tiko-publish.XXXXXX")

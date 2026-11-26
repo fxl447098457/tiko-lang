@@ -1,0 +1,689 @@
+' tkBarcode self-test (phases BC1 + BC2, docs/tkControls/BARCODE.md §12). The encoder against zint's own
+' module matrix; then real windows, two passes with the scale pinned at 1.0 and 1.75, geometry
+' ASSERTED from pixels: every module of a QR code its exact size and colour, bar edges, quiet zones,
+' the fit modes, rotation, HRT placement, the error state, colours, widgetless painting.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkBarcode"
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkPdf"
+using tkBarcode
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+using tkPrint
+using tkPdf
+
+' ---- a grab of one widget's pixels (RGB), one readback per check ---------------------------------
+dim shared as ulong gPix(any)
+dim shared as int32 gW, gH, gAbsX, gAbsY
+
+sub Grab( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr )
+    tkHost_RenderTo( h, false )
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    gAbsX = a.left : gAbsY = a.top
+    gW = a.right - a.left : gH = a.bottom - a.top
+    erase gPix
+    if (gW <= 0) orelse (gH <= 0) then exit sub
+    redim gPix( 0 to gW * gH - 1 )
+    dim as SDL_Rect r
+    r.x = a.left : r.y = a.top : r.w = gW : r.h = gH
+    dim as SDL_Surface ptr s0 = SDL_RenderReadPixels( h->renderer, @r )
+    if s0 = 0 then exit sub
+    dim as SDL_Surface ptr s = SDL_ConvertSurface( s0, SDL_PIXELFORMAT_ARGB8888 )
+    SDL_DestroySurface( s0 )
+    for yy as int32 = 0 to gH - 1
+        dim as ulong ptr row = cast( ulong ptr, cast( ubyte ptr, s->pixels ) + yy * s->pitch )
+        for xx as int32 = 0 to gW - 1
+            gPix(yy * gW + xx) = row[xx] and &h00FFFFFFul
+        next
+    next
+    SDL_DestroySurface( s )
+end sub
+
+function G( byval x as int32, byval y as int32 ) as ulong
+    if (x < 0) orelse (y < 0) orelse (x >= gW) orelse (y >= gH) then return &hFF000000ul   ' never a colour
+    return gPix(y * gW + x)
+end function
+
+function RGBOf( byval c as ulong ) as ulong
+    return c and &h00FFFFFFul
+end function
+
+' Distinct colours in a client rect of the grab.
+function Tones( byval x1 as int32, byval y1 as int32, byval x2 as int32, byval y2 as int32 ) as int32
+    dim as ulong seen(0 to 31)
+    dim as int32 n = 0
+    for y as int32 = y1 to y2 - 1
+        for x as int32 = x1 to x2 - 1
+            dim as ulong c = G( x, y )
+            dim as boolean f = false
+            for i as int32 = 0 to n - 1
+                if seen(i) = c then f = true : exit for
+            next
+            if (f = false) andalso (n < 32) then seen(n) = c : n += 1
+        next
+    next
+    return n
+end function
+
+' Every module of the matrix: its rect's four corners and centre in the colour its bit says.
+' For an integer k also every module exactly k x k. Returns the number of bad modules.
+function MatrixBad( byval hb as TK_WIDGET ptr, byval bExact as boolean, byref detail as string ) as int32
+    dim as TKBARCODE_SYMBOL sym
+    tkBarcode_GetSymbol( hb, sym )
+    dim as TKBC_LAYOUT L
+    if tkBarcode_GetLayout( hb, L ) = false then detail = "no layout" : return 1
+    dim as int32 bad = 0
+    dim as TKBARCODE_COLORS c
+    tkBarcode_GetColors( hb, @c )
+    dim as int32 kx = int( L.kx + 0.5 )
+    for row as int32 = 0 to iif( sym.b2D, sym.nRows - 1, 0 )
+        for col as int32 = 0 to sym.nCols - 1
+            dim as TKRECT r
+            tkBarcode_ModuleRect( sym, L, row, col, r )
+            dim as ulong want = RGBOf( iif( tkBarcode_SymbolModule( sym, row, col ), c.BarColor, c.BackColor ) )
+            dim as boolean ok = G( r.left, r.top ) = want andalso G( r.right - 1, r.top ) = want _
+                andalso G( r.left, r.bottom - 1 ) = want andalso G( r.right - 1, r.bottom - 1 ) = want _
+                andalso G( ( r.left + r.right ) \ 2, ( r.top + r.bottom ) \ 2 ) = want
+            if ok andalso bExact andalso sym.b2D then
+                dim as boolean sideways = (L.nRotation = TKBC_ROT_90) orelse (L.nRotation = TKBC_ROT_270)
+                dim as int32 ww = r.right - r.left, hh = r.bottom - r.top
+                if sideways then swap ww, hh
+                ok = (ww = kx) andalso (hh = int( L.ky + 0.5 ))
+            end if
+            if ok = false then
+                if bad = 0 then detail = "first bad module (" & row & "," & col & ") at " & r.left & "," & r.top & "-" & r.right & "," & r.bottom & " got " & hex( G( r.left, r.top ) ) & " want " & hex( want )
+                bad += 1
+            end if
+        next
+    next
+    return bad
+end function
+
+' Encode only: rects read back as modules must equal zint's matrix (all rows for 2D, row 0 for 1D).
+function RectsMatchMatrix( byref sym as TKBARCODE_SYMBOL ) as boolean
+    dim as float32 rowH = 1
+    if sym.b2D then rowH = ( sym.nH - 2 * sym.fQzTop ) / sym.nRows
+    for row as int32 = 0 to iif( sym.b2D, sym.nRows - 1, 0 )
+        dim as float32 ym = iif( sym.b2D, sym.fQzTop + ( row + 0.5 ) * rowH, sym.fBarTop + 0.5 )
+        for col as int32 = 0 to sym.nCols - 1
+            dim as float32 xm = sym.fQzLeft + col + 0.5
+            dim as boolean dark = false
+            for i as int32 = 0 to sym.nRects - 1
+                if xm > sym.rects(i).x andalso xm < sym.rects(i).x + sym.rects(i).w andalso _
+                   ym > sym.rects(i).y andalso ym < sym.rects(i).y + sym.rects(i).h then dark = true : exit for
+            next
+            if dark <> tkBarcode_SymbolModule( sym, row, col ) then return false
+        next
+    next
+    return true
+end function
+
+dim shared as int32 gClicks
+sub OnClick( byval hb as TK_WIDGET ptr, byval id as int32 )
+    gClicks += 1
+end sub
+
+sub PaintStock( byval p as TKBARCODE_PAINTINFO ptr )
+    tkBarcode_PaintDefault( p )
+end sub
+
+' A canvas painting a widgetless barcode.
+dim shared as TKBARCODE_SPEC gCvSpec
+dim shared as TKBARCODE_SYMBOL gCvSym
+dim shared as TKBARCODE_LOOK gCvLook
+function CanvasProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg <> TKM_PAINT then return false
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, w->cw, w->ch )
+    tkBarcode_PaintInto( m->pPaint, rc, gCvSym, gCvSpec, gCvLook )
+    return true
+end function
+
+' ==========================================================================================
+' The encoder (no window)
+' ==========================================================================================
+sub EncoderChecks( )
+    tkTest_Begin( "encoder" )
+    dim as int32 nOk = 0, nMatch = 0
+    dim as string sBad = ""
+    for i as int32 = 0 to TKBC_SYMBOLOGY_COUNT - 1
+        dim as TKBARCODE_SPEC spec
+        spec.nSymbology = i
+        dim as TKBARCODE_SYMBOL sym
+        dim as boolean ok = tkBarcode_Encode( spec, tkBarcode_SampleData( i ), sym )
+        if ok andalso sym.nStatus = TKBC_OK andalso sym.b2D = tkBarcode_Is2D( i ) andalso sym.nRects > 0 then
+            nOk += 1
+        else
+            sBad &= " " & tkBarcode_SymbologyName( i ) & "=" & sym.nStatus
+        end if
+        if ok andalso RectsMatchMatrix( sym ) then nMatch += 1 else sBad &= " match:" & tkBarcode_SymbologyName( i )
+    next
+    tkTest_Check( "all 20 symbologies encode their sample, OK, 1D/2D as listed", nOk = TKBC_SYMBOLOGY_COUNT, sBad )
+    tkTest_Check( "the symbol's rects (module units) reproduce zint's module matrix, every symbology", nMatch = TKBC_SYMBOLOGY_COUNT, sBad )
+
+    dim as TKBARCODE_SPEC s
+    dim as TKBARCODE_SYMBOL y
+    s.nSymbology = TKBC_EAN13
+    tkBarcode_Encode( s, "5901234123457", y )
+    tkTest_Check( "EAN-13: 95 x 1 modules, quiet zones 11 / 7 (W = 113)", y.nCols = 95 andalso y.nRows = 1 andalso y.nW = 113 andalso y.fQzLeft = 11, y.nCols & "x" & y.nRows & " W=" & y.nW & " qz=" & y.fQzLeft )
+    tkBarcode_Encode( s, "123", y )
+    tkTest_Check( "EAN-13: short data is padded, the check digit added (HRT 0000000001236)", y.nStatus = TKBC_OK andalso y.nTexts = 3 andalso y.texts(0).s & y.texts(1).s & y.texts(2).s = "0000000001236" )
+    tkBarcode_Encode( s, "5901234123458", y )
+    tkTest_Check( "EAN-13: a wrong check digit is ERR_INVALID_CHECK with zint's message", y.nStatus = TKBC_ERR_INVALID_CHECK andalso instr( y.wszError, "check digit" ) > 0, y.wszError )
+    tkBarcode_Encode( s, "59012341234X", y )
+    tkTest_Check( "EAN-13: a letter is ERR_INVALID_DATA", y.nStatus = TKBC_ERR_INVALID_DATA )
+    tkTest_Check( "empty data: EMPTY, not encoded", tkBarcode_Encode( s, "", y ) = false andalso y.nStatus = TKBC_EMPTY )
+    s.nSymbology = TKBC_GS1_128
+    tkBarcode_Encode( s, "[01]09501101530004", y )
+    tkTest_Check( "GS1-128: a bad GTIN check is an ERROR here (zint only warns), D-14", y.nStatus = TKBC_ERR_NONCOMPLIANT, "" & y.nStatus )
+    tkBarcode_Encode( s, "(01)09501101530003", y )
+    tkTest_Check( "GS1 data in parentheses is accepted", y.nStatus = TKBC_OK, y.wszError )
+    s.nSymbology = TKBC_QR
+    tkBarcode_Encode( s, "Grüße 日本", y )
+    tkTest_Check( "QR: UTF-8 data draws, with zint's ECI warning", y.nStatus = TKBC_WARN_ECI andalso y.nRects > 0 )
+    tkBarcode_Encode( s, "https://tiko-lang.net", y )
+    dim as int32 c1 = y.nCols
+    s.opts(TKBC_OPT_ECC) = 3
+    tkBarcode_Encode( s, "https://tiko-lang.net", y )
+    dim as int32 c3 = y.nCols
+    s.opts(TKBC_OPT_ECC) = 0 : s.opts(TKBC_OPT_SIZE) = 6
+    tkBarcode_Encode( s, "https://tiko-lang.net", y )
+    tkTest_Check( "QR options: ECC L 25, ECC Q 29, version 6 is 41 modules", c1 = 25 andalso c3 = 29 andalso y.nCols = 41, c1 & " " & c3 & " " & y.nCols )
+    s.opts(TKBC_OPT_SIZE) = 0
+    tkBarcode_Encode( s, "https://tiko-lang.net", y )
+    dim as float32 wq = y.nW
+    s.bQuietZone = false
+    tkBarcode_Encode( s, "https://tiko-lang.net", y )
+    tkTest_Check( "QR quiet zone: 4 modules each side (33 vs 25)", wq = 33 andalso y.nW = 25, wq & " " & y.nW )
+    s.bQuietZone = true
+    s.nSymbology = TKBC_DATAMATRIX
+    s.opts(TKBC_OPT_DM_SQUARE) = 1
+    tkBarcode_Encode( s, "tiko DataMatrix rect", y )
+    tkTest_Check( "Data Matrix: DM_SQUARE gives a square symbol", y.nCols = y.nRows, y.nCols & "x" & y.nRows )
+    dim as TKBARCODE_SPEC s39
+    s39.nSymbology = TKBC_CODE39
+    tkBarcode_Encode( s39, "TIKO", y )
+    dim as ustring t0 = y.texts(0).s
+    s39.opts(TKBC_OPT_CHECK_DIGIT) = 1
+    tkBarcode_Encode( s39, "TIKO", y )
+    tkTest_Check( "Code 39: CHECK_DIGIT adds the check character (*TIKO* -> *TIKO5*)", t0 = "*TIKO*" andalso y.texts(0).s = "*TIKO5*", t0 & " " & y.texts(0).s )
+    dim as TKBARCODE_SPEC sI
+    sI.nSymbology = TKBC_ITF14
+    tkBarcode_Encode( sI, "1540014128876", y )
+    dim as float32 top0 = y.fBarTop
+    sI.opts(TKBC_OPT_BEARER) = TKBC_BEARER_NONE
+    tkBarcode_Encode( sI, "1540014128876", y )
+    tkTest_Check( "ITF-14: a 5-module bearer box by default; BEARER_NONE removes it", top0 = 5 andalso y.fBarTop = 0 andalso RectsMatchMatrix( y ), top0 & " " & y.fBarTop )
+    dim as ustring sErr
+    tkTest_Check( "Validate: the sample passes, a bad one fails with zint's text", tkBarcode_Validate( TKBC_EAN8, "96385074", sErr ) _
+                  andalso tkBarcode_Validate( TKBC_EAN8, "96385075", sErr ) = false andalso len( sErr ) > 0, sErr )
+    tkTest_Check( "DefaultXdimMm: EAN 0.33, QR 0.625", abs( tkBarcode_DefaultXdimMm( TKBC_EAN13 ) - 0.33 ) < 0.001 _
+                  andalso abs( tkBarcode_DefaultXdimMm( TKBC_QR ) - 0.625 ) < 0.001 )
+end sub
+
+' ==========================================================================================
+' The control
+' ==========================================================================================
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkBarcode selftest", 900, 640, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host created", false, *SDL_GetError() ) : exit sub
+    dim as TK_WIDGET ptr root = tkHost_Root( h )
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 50 )
+    dim as TKBARCODE_COLORS cc
+    dim as TKBC_LAYOUT L
+    dim as string det
+
+    ' ---- QR at NORMAL: every module exact ----------------------------------------------------------
+    dim as TK_WIDGET ptr q = tkBarcode_Create( root, 1, TKBC_QR )
+    tkWidget_SetPos( q, tkHost_Scale( h, 10 ), tkHost_Scale( h, 10 ), tkHost_Scale( h, 200 ), tkHost_Scale( h, 200 ) )
+    tkBarcode_SetData( q, "https://tiko-lang.net" )
+    tkBarcode_SetModuleWidth( q, 3 )
+    dim as int32 kN = cint( 3 * fScale )
+    Grab( h, q )
+    tkBarcode_GetLayout( q, L )
+    tkTest_Check( "QR NORMAL: k = ModuleWidth scaled to whole pixels; 33 modules wide, centred", _
+                  L.kx = kN andalso L.rcSymbol.right - L.rcSymbol.left = 33 * kN andalso abs( ( L.rcSymbol.left ) - ( q->cw - L.rcSymbol.right ) ) <= 1, _
+                  "k=" & L.kx & " w=" & ( L.rcSymbol.right - L.rcSymbol.left ) )
+    det = ""
+    dim as int32 nBad = MatrixBad( q, true, det )
+    tkTest_Check( "QR NORMAL: every module exactly k x k, in its bit's colour", nBad = 0, nBad & " bad; " & det )
+    tkBarcode_GetColors( q, @cc )
+    tkTest_Check( "QR: two tones only (no anti-aliasing) and the quiet zone white", _
+                  Tones( L.rcSymbol.left, L.rcSymbol.top, L.rcSymbol.right, L.rcSymbol.bottom ) = 2 _
+                  andalso G( L.rcSymbol.left + 2 * kN, L.rcSymbol.top + 2 * kN ) = RGBOf( cc.BackColor ) _
+                  andalso G( L.rcSymbol.left + 4 * kN, L.rcSymbol.top + 4 * kN ) = RGBOf( cc.BarColor ) )
+    dim as int32 pw, ph
+    tkBarcode_GetPreferredSize( q, pw, ph )
+    tkTest_Check( "QR preferred size = 33 k square", pw = 33 * kN andalso ph = 33 * kN, pw & "x" & ph )
+
+    ' ---- FIT, PROPORTIONAL, STRETCH -------------------------------------------------------------------
+    tkWidget_SetPos( q, q->x, q->y, 33 * kN - 1, tkHost_Scale( h, 200 ) )
+    tkBarcode_SetFitMode( q, TKBC_FIT_FIT )
+    Grab( h, q )
+    tkBarcode_GetLayout( q, L )
+    det = ""
+    nBad = MatrixBad( q, true, det )
+    tkTest_Check( "FIT: one pixel too narrow -> k - 1, still whole pixels, every module right", L.kx = kN - 1 andalso nBad = 0, "k=" & L.kx & " " & det )
+    tkWidget_SetPos( q, q->x, q->y, 100, 100 )
+    tkBarcode_SetFitMode( q, TKBC_FIT_PROPORTIONAL )
+    Grab( h, q )
+    tkBarcode_GetLayout( q, L )
+    det = ""
+    nBad = MatrixBad( q, false, det )
+    dim as int32 wMin = 999, wMax = 0
+    dim as TKBARCODE_SYMBOL sq
+    tkBarcode_GetSymbol( q, sq )
+    for col as int32 = 0 to sq.nCols - 1
+        dim as TKRECT r
+        tkBarcode_ModuleRect( sq, L, 0, col, r )
+        if r.right - r.left < wMin then wMin = r.right - r.left
+        if r.right - r.left > wMax then wMax = r.right - r.left
+    next
+    tkTest_Check( "PROPORTIONAL: k = 100/33 (fractional); modules 3 or 4 px, every module's colour right", _
+                  abs( L.kx - 100 / 33 ) < 0.001 andalso wMin = 3 andalso wMax = 4 andalso nBad = 0, "k=" & L.kx & " " & wMin & ".." & wMax & " " & nBad & " " & det )
+    tkTest_Check( "PROPORTIONAL: the symbol spans the width exactly", L.rcSymbol.right - L.rcSymbol.left = 100, "" & ( L.rcSymbol.right - L.rcSymbol.left ) )
+
+    ' ---- rotation -----------------------------------------------------------------------------------
+    tkWidget_SetPos( q, q->x, q->y, tkHost_Scale( h, 200 ), tkHost_Scale( h, 200 ) )
+    tkBarcode_SetFitMode( q, TKBC_FIT_NORMAL )
+    tkBarcode_SetRotation( q, TKBC_ROT_90 )
+    Grab( h, q )
+    tkBarcode_GetLayout( q, L )
+    det = ""
+    nBad = MatrixBad( q, true, det )
+    ' a QR's finders are top-left, top-right, bottom-left; turned 90 clockwise: top-left, top-right, bottom-right
+    dim as int32 qz = 4 * kN
+    dim as boolean bTL = G( L.rcSymbol.left + qz, L.rcSymbol.top + qz ) = 0
+    dim as boolean bTR = G( L.rcSymbol.right - qz - 1, L.rcSymbol.top + qz ) = 0
+    dim as boolean bBR = G( L.rcSymbol.right - qz - 1, L.rcSymbol.bottom - qz - 1 ) = 0
+    tkTest_Check( "ROT_90: every module where the rotation puts it; finders now TL, TR, BR", nBad = 0 andalso bTL andalso bTR andalso bBR, nBad & " " & det )
+    tkBarcode_SetRotation( q, TKBC_ROT_0 )
+
+    ' ---- Code 128, 1D: bars, quiet zone, HRT ---------------------------------------------------------
+    dim as TK_WIDGET ptr c = tkBarcode_Create( root, 2, TKBC_CODE128 )
+    tkWidget_SetPos( c, tkHost_Scale( h, 220 ), tkHost_Scale( h, 10 ), tkHost_Scale( h, 400 ), tkHost_Scale( h, 90 ) )
+    tkBarcode_SetData( c, "tiko 128" )
+    Grab( h, c )
+    tkBarcode_GetLayout( c, L )
+    det = ""
+    nBad = MatrixBad( c, true, det )
+    dim as TKBARCODE_SYMBOL s1
+    tkBarcode_GetSymbol( c, s1 )
+    kN = cint( 2 * fScale )
+    tkTest_Check( "Code 128 NORMAL: bars at whole-pixel k, every module's colour right", L.kx = kN andalso nBad = 0, "k=" & L.kx & " " & det )
+    dim as int32 barTop = int( L.oy + 0.5 ), barBot = barTop + int( L.fBarPx + 0.5 )
+    dim as int32 xBar = -1
+    for x as int32 = 0 to gW - 1
+        if G( x, ( barTop + barBot ) \ 2 ) = 0 then xBar = x : exit for
+    next
+    tkTest_Check( "Code 128: the first bar starts after a 10-module quiet zone", xBar = L.rcSymbol.left + 10 * kN, xBar & " vs " & ( L.rcSymbol.left + 10 * kN ) )
+    tkTest_Check( "Code 128: the bars fill the height above the text band", G( xBar, barTop ) = 0 andalso G( xBar, barBot - 1 ) = 0 andalso G( xBar, barBot ) <> 0 _
+                  andalso barTop <= 1 andalso L.bText, barTop & ".." & barBot & " of " & gH )
+    dim as int32 inkT, inkB
+    dim as boolean bInk = tkTest_InkRows( h, gAbsX + L.rcSymbol.left, gAbsY + barBot + 1, L.rcSymbol.right - L.rcSymbol.left, gH - barBot - 1, &hFFFFFFFFul, inkT, inkB )
+    tkTest_Check( "Code 128: HRT ink below the bars", bInk )
+    tkBarcode_SetTextMode( c, TKBC_TEXT_NONE )
+    Grab( h, c )
+    tkBarcode_GetLayout( c, L )
+    tkTest_Check( "TextMode NONE: the bars take the whole height", int( L.fBarPx + 0.5 ) = gH andalso G( xBar, gH - 1 ) = 0, "" & L.fBarPx )
+    tkBarcode_SetTextMode( c, TKBC_TEXT_ABOVE )
+    Grab( h, c )
+    tkBarcode_GetLayout( c, L )
+    barTop = int( L.oy + 0.5 )
+    bInk = tkTest_InkRows( h, gAbsX + L.rcSymbol.left, gAbsY, L.rcSymbol.right - L.rcSymbol.left, barTop, &hFFFFFFFFul, inkT, inkB )
+    tkTest_Check( "TextMode ABOVE: the HRT over the bars, the bars to the bottom", bInk andalso barTop > 0 andalso G( xBar, gH - 1 ) = 0, "" & barTop )
+    tkBarcode_SetTextMode( c, TKBC_TEXT_BELOW )
+    tkBarcode_SetBarHeight( c, 20 )
+    Grab( h, c )
+    tkBarcode_GetLayout( c, L )
+    tkTest_Check( "BarHeight 20 modules: bars 20 k high", int( L.fBarPx + 0.5 ) = 20 * kN, "" & L.fBarPx )
+    tkBarcode_SetBarHeight( c, 0 )
+    ' PROPORTIONAL on a 1D code keeps whole pixels (fractional 1D modules do not scan: BC1's oracle)
+    tkBarcode_SetFitMode( c, TKBC_FIT_PROPORTIONAL )
+    Grab( h, c )
+    tkBarcode_GetLayout( c, L )
+    dim as float32 kFrac = c->cw / s1.nW
+    tkTest_Check( "PROPORTIONAL (1D): whole pixels per module, the largest that fits", L.kx = int( kFrac ) andalso L.kx >= 1 andalso MatrixBad( c, true, det ) = 0, _
+                  "k=" & L.kx & " of " & kFrac )
+    tkBarcode_SetFitMode( c, TKBC_FIT_STRETCH )
+    Grab( h, c )
+    tkBarcode_GetLayout( c, L )
+    tkTest_Check( "STRETCH (1D): the symbol spans the control's width", L.rcSymbol.left = 0 andalso L.rcSymbol.right = c->cw, L.rcSymbol.left & ".." & L.rcSymbol.right )
+    tkBarcode_SetFitMode( c, TKBC_FIT_NORMAL )
+
+    ' ---- EAN-13: guards descend, digits between them --------------------------------------------------
+    tkBarcode_SetSymbology( c, TKBC_EAN13 )
+    tkBarcode_SetData( c, "5901234123457" )
+    Grab( h, c )
+    tkBarcode_GetLayout( c, L )
+    dim as TKBARCODE_SYMBOL se
+    tkBarcode_GetSymbol( c, se )
+    barBot = int( L.oy + L.fBarPx + 0.5 )
+    dim as int32 xGuard = L.ox + 11 * kN                     ' the left guard's first bar
+    tkTest_Check( "EAN-13: a guard bar runs below the normal bars", G( xGuard, barBot ) = 0 andalso G( xGuard, barBot - 1 ) = 0, hex( G( xGuard, barBot ) ) )
+    bInk = tkTest_InkRows( h, gAbsX + xGuard + kN * 3, gAbsY + barBot, 40 * kN, gH - barBot, &hFFFFFFFFul, inkT, inkB )
+    tkTest_Check( "EAN-13: the digits sit under the bars, between the guards", bInk andalso inkT - gAbsY > barBot, ( inkT - gAbsY ) & " > " & barBot )
+
+    ' ---- ITF-14: the HRT under the bearer box, not over it ------------------------------------------------
+    tkBarcode_SetSymbology( c, TKBC_ITF14 )
+    tkBarcode_SetData( c, "15400141288763" )
+    Grab( h, c )
+    tkBarcode_GetLayout( c, L )
+    dim as int32 boxBot = L.rcSymbol.bottom
+    bInk = tkTest_InkRows( h, gAbsX + L.rcSymbol.left + 20 * kN, gAbsY + boxBot, L.rcSymbol.right - L.rcSymbol.left - 40 * kN, gH - boxBot, &hFFFFFFFFul, inkT, inkB )
+    tkTest_Check( "ITF-14: the bearer box's bottom bar is black, the HRT starts below it", G( L.rcSymbol.left + 30 * kN, boxBot - 1 ) = 0 andalso bInk andalso inkT - gAbsY > boxBot, _
+                  ( inkT - gAbsY ) & " > " & boxBot )
+    tkBarcode_SetSymbology( c, TKBC_EAN13 )
+
+    ' ---- the error state, empty -----------------------------------------------------------------------
+    tkBarcode_SetData( c, "5901234123458" )
+    Grab( h, c )
+    tkBarcode_GetColors( c, @cc )
+    dim as boolean bBlack = false
+    for i as int32 = 0 to gW * gH - 1
+        if gPix(i) = 0 then bBlack = true : exit for
+    next
+    tkTest_Check( "error state: not valid, status, ErrorColor frame, no black anywhere (never a fake symbol)", _
+                  tkBarcode_IsValid( c ) = false andalso tkBarcode_GetStatus( c ) = TKBC_ERR_INVALID_CHECK andalso G( 0, 0 ) = RGBOf( cc.ErrorColor ) andalso bBlack = false, _
+                  hex( G( 0, 0 ) ) )
+    tkTest_Check( "error state: the tip gives the class and zint's message", instr( tkBarcode_GetTipText( c ), "Wrong check digit" ) = 1 andalso instr( tkBarcode_GetTipText( c ), "expecting" ) > 0, tkBarcode_GetTipText( c ) )
+    tkBarcode_SetShowErrors( c, false )
+    Grab( h, c )
+    tkTest_Check( "ShowErrors off: background only", Tones( 0, 0, gW, gH ) = 1 andalso G( 0, 0 ) = RGBOf( cc.BackColor ) )
+    tkBarcode_SetShowErrors( c, true )
+    tkBarcode_SetData( c, "" )
+    Grab( h, c )
+    tkTest_Check( "empty: not valid, status EMPTY, background only, no tip", tkBarcode_IsValid( c ) = false andalso tkBarcode_GetStatus( c ) = TKBC_EMPTY _
+                  andalso Tones( 0, 0, gW, gH ) = 1 andalso tkBarcode_GetTipText( c ) = "" )
+    tkBarcode_SetTooltipText( c, "SKU" )
+    tkTest_Check( "a tooltip text wins", tkBarcode_GetTipText( c ) = "SKU" )
+
+    ' ---- colours ------------------------------------------------------------------------------------
+    tkTheme_Apply( tkTheme_Dark() )
+    tkBarcode_GetColors( q, @cc )
+    dim as boolean bDark = cc.BackColor = &hFFFFFFFFul andalso cc.BarColor = &hFF000000ul andalso cc.ErrorBackColor = tkTheme_Dark().Window
+    tkTheme_Apply( tkTheme_Light() )
+    tkBarcode_GetColors( q, @cc )
+    tkTest_Check( "a theme change keeps the symbol black on white; the error state follows the theme", bDark andalso cc.BarColor = &hFF000000ul andalso cc.ErrorBackColor = tkTheme_Light().Window )
+    tkTest_Check( "contrast of the default colours is 21", abs( tkBarcode_GetContrast( q ) - 21 ) < 0.01, "" & tkBarcode_GetContrast( q ) )
+    dim as TKBARCODE_COLORS pin = cc
+    pin.BarColor = &hFF102080ul
+    tkBarcode_SetColors( q, @pin )
+    tkTheme_Apply( tkTheme_Dark() )
+    Grab( h, q )
+    tkBarcode_GetLayout( q, L )
+    kN = cint( 3 * fScale )
+    tkTest_Check( "SetColors pins: a theme change leaves them, the bars draw in them", G( L.rcSymbol.left + 4 * kN, L.rcSymbol.top + 4 * kN ) = &h102080ul )
+    tkBarcode_UnpinColors( q )
+    tkBarcode_GetColors( q, @cc )
+    tkTest_Check( "UnpinColors: back to black", cc.BarColor = &hFF000000ul )
+
+    ' ---- PaintDefault, widgetless, caption, click, rescale -----------------------------------------------
+    Grab( h, q )
+    dim as ulongint hashStock = tkTest_HashRect( h, gAbsX, gAbsY, gW, gH )
+    tkBarcode_SetPaintCallback( q, @PaintStock )
+    Grab( h, q )
+    tkTest_Check( "PaintDefault from a Paint callback draws the same pixels", tkTest_HashRect( h, gAbsX, gAbsY, gW, gH ) = hashStock )
+    tkBarcode_SetPaintCallback( q, 0 )
+    dim as TK_WIDGET ptr cv = tkWidget_CreateChild( root, 9, @CanvasProc, 0 )
+    tkWidget_SetPos( cv, tkHost_Scale( h, 10 ), tkHost_Scale( h, 300 ), q->cw, q->ch )
+    tkBarcode_GetSpec( q, gCvSpec )
+    tkBarcode_GetLook( q, gCvLook )
+    gCvLook.pColors = 0
+    tkBarcode_Encode( gCvSpec, tkBarcode_GetData( q ), gCvSym )
+    Grab( h, cv )
+    tkTest_Check( "PaintInto (widgetless) draws what the control draws", tkTest_HashRect( h, gAbsX, gAbsY, gW, gH ) = hashStock )
+    tkBarcode_SetCaption( q, "tiko-lang.net" )
+    Grab( h, q )
+    tkBarcode_GetLayout( q, L )
+    bInk = tkTest_InkRows( h, gAbsX, gAbsY + L.rcSymbol.bottom, gW, gH - L.rcSymbol.bottom, &hFFFFFFFFul, inkT, inkB )
+    tkBarcode_GetPreferredSize( q, pw, ph )
+    tkTest_Check( "a caption under a 2D symbol; the preferred height grows by the band", bInk andalso ph > 33 * kN andalso L.bText, "" & ph )
+    tkBarcode_SetCaption( q, "" )
+    tkBarcode_SetClickCallback( q, @OnClick )
+    gClicks = 0
+    dim as TKRECT a
+    tkWidget_AbsRect( q, a )
+    tkTest_Click( h, a.left + 5, a.top + 5 )
+    tkTest_Check( "a click is reported", gClicks = 1, "" & gClicks )
+    h->fScaleForced = fScale * 2
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
+    tkBarcode_GetLayout( q, L )
+    tkTest_Check( "rescale: the module follows the scale", L.kx = cint( 3 * fScale * 2 ), "" & L.kx )
+    h->fScaleForced = fScale
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
+
+    ' ---- the clipboard (BC2), with this window open; once ------------------------------------------
+    if fScale = 1 then
+        tkBarcode_SetData( q, "https://tiko-lang.net" )
+        dim as boolean clipOk = tkBarcode_CopyToClipboard( q, 300 )
+        dim as uinteger nc
+        dim as ubyte ptr pc = SDL_GetClipboardData( "image/png", @nc )
+        dim as boolean isPng = (pc <> 0) andalso (nc > 8) andalso (pc[1] = asc( "P" )) andalso (pc[2] = asc( "N" )) andalso (pc[3] = asc( "G" ))
+        if pc then SDL_free( pc )
+        pc = SDL_GetClipboardData( "text/plain;charset=utf-8", @nc )
+        dim as string ct = ""
+        if pc then
+            ct = space( nc )
+            for i as integer = 0 to nc - 1 : ct[i] = pc[i] : next
+            SDL_free( pc )
+        end if
+        tkTest_Check( "clipboard: a PNG (read back) and the data as text", clipOk andalso isPng andalso left( ct, 21 ) = "https://tiko-lang.net", "png=" & isPng & " text='" & ct & "'" )
+    end if
+
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+' Paper and exports (BC2): positions in points from the recorded page, the PDF's own content
+' stream, dot-snap measured in rendered pixels, PNG / SVG / clipboard
+' ==========================================================================================
+' Black runs along row y of a surface: their lengths, in pixels.
+function RunsOf( byval s as SDL_Surface ptr, byval y as int32, runs() as int32 ) as int32
+    dim as SDL_Surface ptr a = SDL_ConvertSurface( s, SDL_PIXELFORMAT_ARGB8888 )
+    dim as ulong ptr row = cast( ulong ptr, cast( ubyte ptr, a->pixels ) + y * a->pitch )
+    dim as int32 n = 0, cur = 0
+    redim runs( 0 to a->w )
+    for x as int32 = 0 to a->w - 1
+        dim as boolean dark = ( row[x] and &h00FFFFFFul ) = 0
+        if dark then
+            cur += 1
+        elseif cur > 0 then
+            runs(n) = cur : n += 1 : cur = 0
+        end if
+    next
+    if cur > 0 then runs(n) = cur : n += 1
+    SDL_DestroySurface( a )
+    return n
+end function
+
+' The row through the bars: the one (every third) with the most dark runs.
+function BarRow( byval s as SDL_Surface ptr ) as int32
+    dim as int32 runs()
+    dim as int32 best = 0, yb = 0
+    for y as int32 = 0 to s->h - 1 step 3
+        dim as int32 n = RunsOf( s, y, runs() )
+        if n > best then best = n : yb = y
+    next
+    return yb
+end function
+
+function CountOf( byref hay as string, byref needle as string ) as int32
+    dim as int32 n = 0, p = 1
+    do
+        p = instr( p, hay, needle )
+        if p = 0 then exit do
+        n += 1 : p += len( needle )
+    loop
+    return n
+end function
+
+sub PaperChecks( )
+    tkTest_Begin( "paper" )
+    dim as TKBARCODE_SPEC spec
+    spec.nSymbology = TKBC_EAN13
+    dim as TKBARCODE_SYMBOL sym
+    tkBarcode_Encode( spec, "5901234123457", sym )
+    dim as TKBARCODE_PAGELOOK pl
+    dim as TKBC_PAGEGEOM pgg
+    dim as TKRECTF rc
+    tkRectF_Set( rc, 100, 100, 400, 300 )
+    tkBarcode_PageGeometry( sym, spec, pl, rc, pgg )
+    dim as float32 X = 0.33 * TK_PT_PER_MM
+    tkTest_Check( "EAN-13 on paper: X = zint's 0.33 mm (0.9354 pt), 113 modules wide, bars 50 X, centred in the rect", _
+                  abs( pgg.xdim - X ) < 0.0001 andalso abs( pgg.wPt - 113 * X ) < 0.001 andalso abs( pgg.barPt - 50 * X ) < 0.001 _
+                  andalso abs( pgg.x - ( 100 + ( 300 - 113 * X ) / 2 ) ) < 0.001 andalso pgg.y = 100 andalso pgg.bFits, "X=" & pgg.xdim & " w=" & pgg.wPt )
+
+    ' ---- recorded ops: every bar exactly where computed (no 0.1 pt snap) ---------------------------
+    dim as TK_PRINTDOC ptr doc = tkPrintDoc_Create( "t" )
+    dim as TKPAGESETUP ps
+    ps.paper = TK_PAPER_A4
+    dim as TK_PAGE ptr pg = tkPrintDoc_AddPageEx( doc, ps )
+    dim as boolean drawn = tkBarcode_PaintPage( pg, rc, sym, spec, pl )
+    dim as int32 nBars = 0, nOff = 0
+    dim as float32 maxSnap = 0
+    for i as int32 = 0 to tkPrintDoc_GetOpCount( doc, 0 ) - 1
+        dim as TKPRINT_OPINFO oi
+        tkPrintDoc_GetOp( doc, 0, i, oi )
+        if (oi.op = TKREC_FILLRECT) andalso ( ( oi.c and &h00FFFFFFul ) = 0 ) andalso (nBars < sym.nRects) then
+            dim as float32 wantX = pgg.x + sym.rects(nBars).x * X, wantW = sym.rects(nBars).w * X
+            if abs( oi.x - wantX ) > 0.0005 orelse abs( oi.cw - wantW ) > 0.0005 then nOff += 1
+            ' what tkPage_FillRect's 0.1 pt grid would have made of this bar's width
+            dim as float32 snapW = int( ( wantX + wantW ) * 10 + 0.5 ) / 10 - int( wantX * 10 + 0.5 ) / 10
+            if abs( snapW - wantW ) > maxSnap then maxSnap = abs( snapW - wantW )
+            nBars += 1
+        end if
+    next
+    tkTest_Check( "PaintPage: one exact rect per bar run (30), each at its computed x and width to 0.0005 pt", _
+                  drawn andalso nBars = sym.nRects andalso nBars = 30 andalso nOff = 0, nBars & " bars, " & nOff & " off" )
+    print "  measured: tkPage_FillRect's 0.1 pt grid would change an EAN-13 bar's width by up to " & ( int( maxSnap * 1000 ) / 1000 ) & " pt (" & int( maxSnap / X * 100 ) & " % of X)"
+    tkTest_Check( "measured: the 0.1 pt page grid would have changed a bar's width by up to " & ( int( maxSnap * 1000 ) / 1000 ) & " pt (" & int( maxSnap / X * 100 ) & " % of X)", maxSnap > 0.05 )
+
+    ' ---- the PDF itself: uncompressed, its re f operators -------------------------------------------
+    dim as string pdfPath = "bc2-test.pdf"
+    dim as TKPDF_OPTIONS po
+    po.bCompress = false
+    dim as boolean pdfOk = tkPrintDoc_ExportPdf( doc, pdfPath, @po )
+    tkPrintDoc_Destroy( doc )
+    dim as uinteger nb
+    dim as ubyte ptr fb = SDL_LoadFile( strptr( pdfPath ), @nb )
+    dim as string pdf = space( nb )
+    for i as integer = 0 to nb - 1 : pdf[i] = fb[i] : next
+    SDL_free( fb )
+    dim as int32 nRe = 0, nReOff = 0, p0 = 1
+    do
+        dim as int32 q = instr( p0, pdf, " re f" )
+        if q = 0 then exit do
+        dim as int32 ls = q
+        while (ls > 1) andalso (mid( pdf, ls - 1, 1 ) <> chr( 10 )) : ls -= 1 : wend
+        dim as string ln = mid( pdf, ls, q - ls )             ' "0 0 0 rg x y w h"
+        if left( ln, 9 ) = "0 0 0 rg " then
+            dim as string rest = mid( ln, 10 ) & " "
+            dim as float32 v(0 to 3)
+            for k as int32 = 0 to 3
+                dim as int32 sp = instr( rest, " " )
+                v(k) = val( left( rest, sp - 1 ) )
+                rest = mid( rest, sp + 1 )
+            next
+            if nRe < sym.nRects then
+                if abs( v(0) - ( pgg.x + sym.rects(nRe).x * X ) ) > 0.0015 orelse abs( v(2) - sym.rects(nRe).w * X ) > 0.0015 then nReOff += 1
+            end if
+            nRe += 1
+        end if
+        p0 = q + 5
+    loop
+    tkTest_Check( "the PDF: 30 black 're f' rects, x and width as computed to 0.001 pt (vector, not raster)", pdfOk andalso nRe = 30 andalso nReOff = 0, nRe & " / " & nReOff & " off" )
+    kill pdfPath
+
+    ' ---- dot-snap ----------------------------------------------------------------------------------
+    dim as TKBARCODE_PAGELOOK pl6 = pl
+    pl6.fDpi = 600
+    tkBarcode_PageGeometry( sym, spec, pl6, rc, pgg )
+    dim as float32 dot = 72 / 600
+    tkTest_Check( "dot-snap at 600 dpi: X = 8 dots (0.96 pt, 0.339 mm), the origin on the dot grid", _
+                  abs( pgg.xdim - 8 * dot ) < 0.0001 andalso abs( pgg.x / dot - int( pgg.x / dot + 0.5 ) ) < 0.001, "X=" & pgg.xdim )
+    dim as SDL_Surface ptr s6 = tkBarcode_RenderSymbolSurface( sym, spec, pl, 600 )
+    dim as int32 runs()
+    dim as int32 nr = RunsOf( s6, BarRow( s6 ), runs() ), nBadRun = 0
+    for i as int32 = 0 to nr - 1
+        if runs(i) mod 8 <> 0 then nBadRun += 1
+    next
+    tkTest_Check( "rendered at 600 dpi with dot-snap: every bar a whole number of 8-dot modules", nr >= 25 andalso nBadRun = 0, nr & " runs, " & nBadRun & " not x8" )
+    SDL_DestroySurface( s6 )
+    ' without the snap, at the same dpi (X = 7.8 dots): how far the runs wander
+    doc = tkBarcode_MakeDocument( sym, spec, pl )
+    s6 = tkPrintDoc_RenderSurface( doc, 0, 600 )
+    tkPrintDoc_Destroy( doc )
+    nr = RunsOf( s6, BarRow( s6 ), runs() )
+    dim as int32 wMin = 999, wMaxU = 0
+    for i as int32 = 0 to nr - 1
+        if runs(i) < wMin then wMin = runs(i)
+        if runs(i) > wMaxU then wMaxU = runs(i)
+    next
+    print "  measured: unsnapped (X = 7.8 dots) at 600 dpi the bar runs are " & wMin & ".." & wMaxU & " dots"
+    tkTest_Check( "measured: unsnapped at 600 dpi the narrowest bar is " & wMin & " dots (X = 7.8 dots)", nr >= 25 )
+    SDL_DestroySurface( s6 )
+
+    ' ---- PNG, SVG, clipboard -------------------------------------------------------------------------
+    dim as string pngPath = "bc2-test.png"
+    dim as boolean pngOk = tkBarcode_ExportPngSymbol( sym, spec, pl, pngPath, 300 )
+    dim as SDL_Surface ptr sp = IMG_Load( strptr( pngPath ) )
+    dim as int32 nBad4 = 0
+    nr = 0
+    if sp then
+        nr = RunsOf( sp, BarRow( sp ), runs() )
+        for i as int32 = 0 to nr - 1
+            if runs(i) mod 4 <> 0 then nBad4 += 1
+        next
+    end if
+    tkTest_Check( "PNG at 300 dpi: written, every bar whole 4-pixel modules (X 3.9 px snapped)", pngOk andalso sp <> 0 andalso nr >= 25 andalso nBad4 = 0, nr & " runs, " & nBad4 & " bad" )
+    if sp then SDL_DestroySurface( sp )
+    kill pngPath
+    dim as string svg = tkBarcode_SvgSymbol( sym, spec, pl )
+    dim as int32 nRect = CountOf( svg, "<rect " ), nText = CountOf( svg, "<text " )
+    tkTest_Check( "SVG: 37.29 mm wide, viewBox in modules, a rect per run + the ground, a text per HRT run", _
+                  instr( svg, "width=""37.29mm""" ) > 0 andalso instr( svg, "viewBox=""0 0 113 " ) > 0 andalso nRect = 31 andalso nText = 3, _
+                  nRect & " rects, " & nText & " texts" )
+    ' (the clipboard is checked in RunPass, with a window open: X11 needs one to own a selection)
+    dim as TKBARCODE_SPEC sq
+    sq.nSymbology = TKBC_QR
+    dim as TKBARCODE_SYMBOL yq
+    tkBarcode_Encode( sq, "https://tiko-lang.net", yq )
+
+    ' ---- the error state on paper ------------------------------------------------------------------------
+    dim as TKBARCODE_SYMBOL ye
+    tkBarcode_Encode( spec, "5901234123458", ye )
+    doc = tkPrintDoc_Create( "e" )
+    pg = tkPrintDoc_AddPageEx( doc, ps )
+    dim as boolean eDrawn = tkBarcode_PaintPage( pg, rc, ye, spec, pl )
+    dim as int32 nBlack = 0, nStroke = 0
+    for i as int32 = 0 to tkPrintDoc_GetOpCount( doc, 0 ) - 1
+        dim as TKPRINT_OPINFO oi
+        tkPrintDoc_GetOp( doc, 0, i, oi )
+        if (oi.op = TKREC_FILLRECT) andalso ( ( oi.c and &h00FFFFFFul ) = 0 ) then nBlack += 1
+        if (oi.op = TKREC_STROKE) orelse (oi.op = TKREC_FILLPOLY) then nStroke += 1
+    next
+    tkPrintDoc_Destroy( doc )
+    tkTest_Check( "error state on paper: a thin frame, no bar", eDrawn = false andalso nBlack = 0 andalso nStroke >= 1, nBlack & " black, " & nStroke & " strokes" )
+
+    ' ---- a QR on paper ----------------------------------------------------------------------------------
+    tkBarcode_PageGeometry( yq, sq, pl, rc, pgg )
+    tkTest_Check( "QR on paper: X = 0.625 mm, 33 modules square", abs( pgg.xdim - 0.625 * TK_PT_PER_MM ) < 0.0001 andalso abs( pgg.wPt - 33 * pgg.xdim ) < 0.001 _
+                  andalso abs( pgg.hPt - 33 * pgg.xdim ) < 0.001, pgg.wPt & "x" & pgg.hPt )
+end sub
+
+' ==========================================================================================
+if tkTest_Init() = false then end 99
+EncoderChecks( )
+PaperChecks( )
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkBarcode" )
+tkTest_Quit()
+end nFail

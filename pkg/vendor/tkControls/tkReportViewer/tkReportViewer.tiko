@@ -1,0 +1,612 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportViewer -- a print document with its tools: a toolbar (Print, Page setup, PDF, first /
+' previous / page / next / last, zoom), a tkPrintPreview, a status bar (page, zoom, warnings).
+' Design: docs/tkControls/PRINTING.md (claude-docs) §8.3; phase R3 (the shell; tkReport is R4).
+'
+' Every part can be reached (GetPreview / GetToolbar / GetStatusBar) to restyle or extend it, and the
+' toolbar and the status bar can be hidden. Print runs tkPrintDialog and tkPrinter (synchronously:
+' the status bar counts the pages); Page setup runs tkPageSetupDialog and, for a document with a
+' PrintPage callback, generates it again on the preview; PDF asks where and writes it with tkPdf.
+'
+' Setters are silent; only user interaction notifies (BeforePrint, AfterPrint, Exported).
+'
+' ITS OWN REPORT (phase R5, what a designed form binds): fields (AddField, a caption and a width),
+' rows of values (ClearRows / AddRow / Cell; a designed form's <name>_Fill( ) fills them from an
+' Array( of T ) through tkBind_ToValue), then RefreshReport. The report's bands are made once, at the
+' first RefreshReport: by the BuildReport callback, or else a table of the fields (captions on every
+' page, a line per row, "Page {p} of {n}"). The viewer owns that report and its document.
+#module "tkReportViewer"
+
+#import "../tkPrintPreview" public
+#import "../tkPrintDialog" public
+#import "../tkReport" public
+#import "../tkToolbar"
+#import "../tkStatusBar"
+#import "../tkTextBox"
+#import "../tkComboBox"
+#import "../tkFileDialog"
+#import "../tkReportDef" public
+#import "../tkLabel"
+#import "../tkCheckBox"
+#import "../tkDatePicker"
+#import "../tkTimePicker"
+#import "../tkButton"
+using tkPrintPreview
+using tkPrintDialog
+using tkReport
+using tkBind
+using tkToolbar
+using tkStatusBar
+using tkTextBox
+using tkComboBox
+using tkFileDialog
+using tkReportDef
+using tkLabel
+using tkCheckBox
+using tkDatePicker
+using tkTimePicker
+using tkButton
+using tkCalendar
+using tkTimePanel
+using tkPrinter
+using tkPdf
+using tkPrint
+using tkHost
+using tkPaint
+
+public enum
+    TKRV_CMD_PRINT = 1
+    TKRV_CMD_SETUP
+    TKRV_CMD_PDF
+    TKRV_CMD_FIRST
+    TKRV_CMD_PREV
+    TKRV_CMD_NEXT
+    TKRV_CMD_LAST
+    TKRV_CMD_ZOOMOUT
+    TKRV_CMD_ZOOMIN
+end enum
+
+' Before a job goes out, after the Print dialog: change the job, or FALSE to stop it.
+public type RV_BeforePrintFunc as function( byval hViewer as TK_WIDGET ptr, byref job as TKPRINTJOB ) as boolean
+public type RV_AfterPrintSub as sub( byval hViewer as TK_WIDGET ptr, byval bOk as boolean )
+public type RV_ExportedSub as sub( byval hViewer as TK_WIDGET ptr, byref path as ustring, byval bOk as boolean )
+' Its own report's bands, made at the first RefreshReport (fields by tkReport_FindField or index).
+public type RV_BuildReportSub as sub( byval hViewer as TK_WIDGET ptr, byval rpt as TK_REPORT ptr )
+
+public type TKREPORTVIEWER_STATE
+    hWin         as TK_WIDGET ptr
+    id           as long
+    hBar         as TK_WIDGET ptr
+    hPage        as TK_WIDGET ptr        ' the page number box (in the toolbar)
+    ofIdx        as long                 ' the toolbar item "of N"
+    hZoom        as TK_WIDGET ptr        ' the zoom combo (in the toolbar)
+    hPv          as TK_WIDGET ptr
+    hStatus      as TK_WIDGET ptr
+    doc          as TK_PRINTDOC ptr
+    job          as TKPRINTJOB
+    bToolbar     as boolean = true
+    bStatus      as boolean = true
+    BeforePrint  as RV_BeforePrintFunc
+    AfterPrint   as RV_AfterPrintSub
+    Exported     as RV_ExportedSub
+    ' its own report (R5)
+    rpt          as TK_REPORT ptr
+    rptDoc       as TK_PRINTDOC ptr
+    bBuilt       as boolean
+    title        as ustring
+    colW(any)    as long                 ' each field's width, in pixels at 96 dpi
+    nCols        as long
+    BuildReport  as RV_BuildReportSub
+    ' a report definition and its parameter strip (Report Designer RD3, rvParams.tiko)
+    def          as TK_REPORTDEF ptr      ' borrowed
+    defDoc       as TK_PRINTDOC ptr       ' owned
+    pLbl(any)    as TK_WIDGET ptr
+    pCtl(any)    as TK_WIDGET ptr
+    pKind(any)   as long
+    nPar         as long
+    hRun         as TK_WIDGET ptr
+    stripH       as long
+    ' what Sync last showed: a document the preview is still generating is synced again at a paint
+    ' once its page count or completion differs (tkPrintPreview generates it on a timer, silently)
+    syncN        as long = -1
+    syncDone     as boolean
+end type
+
+function RV( byval w as TK_WIDGET ptr ) as TKREPORTVIEWER_STATE ptr
+    if w = 0 then return 0
+    return cast( TKREPORTVIEWER_STATE ptr, w->pData )
+end function
+
+' The viewer from one of its parts (toolbar, preview, a control in the toolbar).
+private function RVUp( byval w as TK_WIDGET ptr ) as TKREPORTVIEWER_STATE ptr
+    while w
+        if w->proc = @RvProc then return RV( w )
+        w = w->pParent
+    wend
+    return 0
+end function
+
+private sub Arrange( byval p as TKREPORTVIEWER_STATE ptr )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as long top = 0, bottom = w->ch
+    if p->bToolbar then
+        dim as long th = tkHost_Scale( w->pHost, 34 )
+        tkWidget_SetPos( p->hBar, 0, 0, w->cw, th )
+        top = th
+    end if
+    if p->bStatus then
+        dim as long sh = tkHost_Scale( w->pHost, 24 )
+        tkWidget_SetPos( p->hStatus, 0, w->ch - sh, w->cw, sh )
+        bottom = w->ch - sh
+    end if
+    tkWidget_Show( p->hBar, p->bToolbar )
+    tkWidget_Show( p->hStatus, p->bStatus )
+    top += RvStripLayout( p, top )
+    tkWidget_SetPos( p->hPv, 0, top, w->cw, iif( bottom > top, bottom - top, 0 ) )
+end sub
+
+' The toolbar's page box, "of N", the status bar's text, from the preview.
+private sub Sync( byval p as TKREPORTVIEWER_STATE ptr )
+    dim as long n = tkPrintPreview_GetPageCount( p->hPv ), pg = tkPrintPreview_GetPage( p->hPv )
+    dim as boolean done_ = tkPrintDoc_IsComplete( p->doc )
+    p->syncN = n
+    p->syncDone = done_
+    tkTextBox_SetText( p->hPage, iif( n > 0, str( pg + 1 ), "" ) )
+    tkToolbar_SetText( p->hBar, p->ofIdx, "of " & n & iif( done_, "", "+" ) )
+    dim as ustring st = iif( n > 0, "Page " & (pg + 1) & " of " & n & iif( done_, "", "+" ), "No pages" )
+    tkStatusBar_SetText( p->hStatus, 0, st )
+    tkStatusBar_SetText( p->hStatus, 1, clng( tkPrintPreview_GetZoom( p->hPv ) * 100 ) & "%" )
+    dim as ustring warn
+    if p->doc then warn = tkPrintDoc_Warnings( p->doc )
+    if len( warn ) then warn = "Warnings: " & warn
+    tkStatusBar_SetText( p->hStatus, 2, warn )
+end sub
+
+private sub OnPageChanged( byval hPreview as TK_WIDGET ptr, byval nPage as long )
+    dim as TKREPORTVIEWER_STATE ptr p = RVUp( hPreview )
+    if p then Sync( p )
+end sub
+
+private sub OnZoomChanged( byval hPreview as TK_WIDGET ptr, byval fZoom as single )
+    dim as TKREPORTVIEWER_STATE ptr p = RVUp( hPreview )
+    if p then Sync( p )
+end sub
+
+private sub GoPage( byval p as TKREPORTVIEWER_STATE ptr, byval pg as long )
+    dim as long n = tkPrintPreview_GetPageCount( p->hPv )
+    if n = 0 then exit sub
+    if pg < 0 then pg = 0
+    if pg > n - 1 then pg = n - 1
+    tkPrintPreview_SetPage( p->hPv, pg )
+    Sync( p )
+end sub
+
+' Print: the dialog, BeforePrint, the job, AfterPrint. The status bar counts the pages.
+function RvProgress( byval doc as TK_PRINTDOC ptr, byval nDone as long, byval nTotal as long, byval pCtx as any ptr ) as boolean
+    dim as TKREPORTVIEWER_STATE ptr p = pCtx
+    tkStatusBar_SetText( p->hStatus, 2, "Printing " & nDone & " of " & nTotal )
+    tkHost_RenderTo( p->hWin->pHost, true )
+    return true
+end function
+
+public function tkReportViewer_Print( byval hViewer as TK_WIDGET ptr, byval bDialog as boolean = true ) as boolean
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if (p = 0) orelse (p->doc = 0) then return false
+    while tkPrintDoc_GenerateStep( p->doc, 100 ) : wend          ' the whole document first
+    tkPrintPreview_Refresh( p->hPv )
+    if bDialog then
+        if tkPrintDialog_Show( hViewer->pHost, p->doc, p->job, tkPrintPreview_GetPage( p->hPv ) ) = false then return false
+    end if
+    if p->BeforePrint then
+        if p->BeforePrint( hViewer, p->job ) = false then return false
+    end if
+    p->job.pfnProgress = @RvProgress
+    p->job.pCtx = p
+    dim as boolean ok = tkPrintDoc_Print( p->doc, p->job )
+    dim as ustring msg = "Printed"
+    if ok = false then msg = "Not printed: " & tkPrinter_LastError( )
+    tkStatusBar_SetText( p->hStatus, 2, msg )
+    if p->AfterPrint then p->AfterPrint( hViewer, ok )
+    return ok
+end function
+
+' Page setup: the dialog; a document with a PrintPage callback is generated again on the preview.
+public function tkReportViewer_PageSetup( byval hViewer as TK_WIDGET ptr ) as boolean
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if (p = 0) orelse (p->doc = 0) then return false
+    dim as TKPAGESETUP ps = tkPrintDoc_GetPageSetup( p->doc )
+    if tkPageSetupDialog_Show( hViewer->pHost, ps ) = false then return false
+    tkPrintDoc_SetPageSetup( p->doc, ps )
+    tkPrintDoc_BeginGenerate( p->doc )
+    tkPrintPreview_Refresh( p->hPv )
+    Sync( p )
+    return true
+end function
+
+' The document as a PDF at path; "" asks where (a save dialog). Exported tells the result.
+public function tkReportViewer_ExportPdf( byval hViewer as TK_WIDGET ptr, byref path as ustring = "" ) as boolean
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if (p = 0) orelse (p->doc = 0) then return false
+    dim as ustring where = path
+    if len( where ) = 0 then
+        dim as ustring nm = tkPrintDoc_GetTitle( p->doc )
+        dim as ustring def = "document.pdf"
+        if len( nm ) then def = nm & ".pdf"
+        where = tkFileDialog_SaveFile( hViewer->pHost, "PDF files|*.pdf|All files|*.*", def )
+        if len( where ) = 0 then return false
+    end if
+    while tkPrintDoc_GenerateStep( p->doc, 100 ) : wend
+    dim as boolean ok = tkPrintDoc_ExportPdf( p->doc, where )
+    dim as ustring msg = "Saved " & where
+    if ok = false then msg = "Could not save " & where
+    tkStatusBar_SetText( p->hStatus, 2, msg )
+    if p->Exported then p->Exported( hViewer, where, ok )
+    return ok
+end function
+
+private sub OnCommand( byval hToolbar as TK_WIDGET ptr, byval idx as long, byval id as long )
+    dim as TKREPORTVIEWER_STATE ptr p = RVUp( hToolbar )
+    if p = 0 then exit sub
+    dim as long pg = tkPrintPreview_GetPage( p->hPv )
+    select case id
+    case TKRV_CMD_PRINT : tkReportViewer_Print( p->hWin )
+    case TKRV_CMD_SETUP : tkReportViewer_PageSetup( p->hWin )
+    case TKRV_CMD_PDF : tkReportViewer_ExportPdf( p->hWin )
+    case TKRV_CMD_FIRST : GoPage( p, 0 )
+    case TKRV_CMD_PREV : GoPage( p, pg - 1 )
+    case TKRV_CMD_NEXT : GoPage( p, pg + 1 )
+    case TKRV_CMD_LAST : GoPage( p, tkPrintPreview_GetPageCount( p->hPv ) - 1 )
+    case TKRV_CMD_ZOOMOUT : tkPrintPreview_SetZoom( p->hPv, tkPrintPreview_GetZoom( p->hPv ) / 1.25 ) : Sync( p )
+    case TKRV_CMD_ZOOMIN : tkPrintPreview_SetZoom( p->hPv, tkPrintPreview_GetZoom( p->hPv ) * 1.25 ) : Sync( p )
+    end select
+end sub
+
+' The page box's Enter: go to the page typed.
+private sub OnPageEnter( byval hTextBox as TK_WIDGET ptr )
+    dim as TKREPORTVIEWER_STATE ptr p = RVUp( hTextBox )
+    if p = 0 then exit sub
+    dim as long v = valint( tkTextBox_GetText( p->hPage ) )
+    if v >= 1 then GoPage( p, v - 1 ) else Sync( p )
+end sub
+
+private sub OnZoomPick( byval hCombo as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+    dim as TKREPORTVIEWER_STATE ptr p = RVUp( hCombo )
+    if p = 0 then exit sub
+    select case idxNew
+    case 0 : tkPrintPreview_SetZoomMode( p->hPv, TKPV_ZOOM_FITWIDTH )
+    case 1 : tkPrintPreview_SetZoomMode( p->hPv, TKPV_ZOOM_FITPAGE )
+    case 2 : tkPrintPreview_SetZoom( p->hPv, 0.5 )
+    case 3 : tkPrintPreview_SetZoom( p->hPv, 1 )
+    case 4 : tkPrintPreview_SetZoom( p->hPv, 1.5 )
+    case 5 : tkPrintPreview_SetZoom( p->hPv, 2 )
+    end select
+    Sync( p )
+end sub
+
+function RvProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKREPORTVIEWER_STATE ptr p = RV( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_SIZE, TKM_SCALECHANGED
+        Arrange( p )
+        return true
+    case TKM_PAINT
+        ' a lazily generated document: "of N" and the status follow the pages as they are made
+        if p->doc andalso ((tkPrintPreview_GetPageCount( p->hPv ) <> p->syncN) orelse (tkPrintDoc_IsComplete( p->doc ) <> p->syncDone)) then Sync( p )
+        return true
+    case TKM_DESTROY
+        ' the preview (a child) is gone already
+        if p->rptDoc then tkPrintDoc_Destroy( p->rptDoc )
+        if p->defDoc then tkPrintDoc_Destroy( p->defDoc )
+        if p->rpt then tkReport_Destroy( p->rpt )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+public function tkReportViewer_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKREPORTVIEWER_STATE ptr p = new TKREPORTVIEWER_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @RvProc, p )
+    p->hWin = w
+    p->hPv = tkPrintPreview_Create( w, ctrlId )
+    tkPrintPreview_SetPageChangedCallback( p->hPv, @OnPageChanged )
+    tkPrintPreview_SetZoomChangedCallback( p->hPv, @OnZoomChanged )
+    p->hBar = tkToolbar_Create( w, ctrlId )
+    tkToolbar_SetClickCallback( p->hBar, @OnCommand )
+    ' the toolbar's glyphs need the bundled icon font (the surface owns it and rescales it)
+    dim as TTF_Font ptr fIcons = tkHost_OpenFont( w->pHost, tkHost_FontDir( ) & TK_FONT_ICONS, 12 )
+    if fIcons then tkToolbar_SetGlyphFont( p->hBar, fIcons )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, wchr( TK_ICON_PAGE ), "Print", TKRV_CMD_PRINT )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, wchr( TK_ICON_SETTINGS ), "Page setup", TKRV_CMD_SETUP )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, wchr( TK_ICON_SAVE ), "PDF", TKRV_CMD_PDF )
+    tkToolbar_AddSeparator( p->hBar )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, "", wchr( &h00AB ), TKRV_CMD_FIRST )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, "", wchr( &h2039 ), TKRV_CMD_PREV )
+    p->hPage = tkTextBox_Create( p->hBar, ctrlId )
+    tkTextBox_SetEnterPressedCallback( p->hPage, @OnPageEnter )
+    tkToolbar_AddControl( p->hBar, p->hPage, tkHost_Scale( w->pHost, 44 ) )
+    p->ofIdx = tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, "", "of 0", 0 )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, "", wchr( &h203A ), TKRV_CMD_NEXT )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, "", wchr( &h00BB ), TKRV_CMD_LAST )
+    tkToolbar_AddSeparator( p->hBar )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, "", wchr( &h2212 ), TKRV_CMD_ZOOMOUT )
+    p->hZoom = tkComboBox_Create( p->hBar, ctrlId )
+    tkComboBox_AddItem( p->hZoom, "Fit width" ) : tkComboBox_AddItem( p->hZoom, "Fit page" )
+    tkComboBox_AddItem( p->hZoom, "50%" ) : tkComboBox_AddItem( p->hZoom, "100%" )
+    tkComboBox_AddItem( p->hZoom, "150%" ) : tkComboBox_AddItem( p->hZoom, "200%" )
+    tkComboBox_SetCurSel( p->hZoom, 0 )
+    tkComboBox_SetSelChangeCallback( p->hZoom, @OnZoomPick )
+    tkToolbar_AddControl( p->hBar, p->hZoom, tkHost_Scale( w->pHost, 110 ) )
+    tkToolbar_AddItem( p->hBar, TBR_KIND_COMMAND, "", "+", TKRV_CMD_ZOOMIN )
+    p->hStatus = tkStatusBar_Create( w, ctrlId )
+    tkStatusBar_AddPanel( p->hStatus, "No pages" )
+    tkStatusBar_AddPanel( p->hStatus, "" )
+    tkStatusBar_AddPanel( p->hStatus, "" )
+    return w
+end function
+
+public function tkReportViewer_GetID( byval hViewer as TK_WIDGET ptr ) as long
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->id
+end function
+
+' The document shown (borrowed). One begun with tkPrintDoc_BeginGenerate is finished by the preview.
+public sub tkReportViewer_SetDocument( byval hViewer as TK_WIDGET ptr, byval doc as TK_PRINTDOC ptr )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then exit sub
+    p->doc = doc
+    tkPrintPreview_SetDocument( p->hPv, doc )
+    Sync( p )
+end sub
+
+public function tkReportViewer_GetDocument( byval hViewer as TK_WIDGET ptr ) as TK_PRINTDOC ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->doc
+end function
+
+' The job the Print button starts from (printer, copies, ...): set it to preselect them.
+public sub tkReportViewer_SetJob( byval hViewer as TK_WIDGET ptr, byref job as TKPRINTJOB )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p then p->job = job
+end sub
+
+public function tkReportViewer_GetJob( byval hViewer as TK_WIDGET ptr ) as TKPRINTJOB
+    dim as TKPRINTJOB j
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p then j = p->job
+    return j
+end function
+
+' After the document changed outside the viewer.
+public sub tkReportViewer_Refresh( byval hViewer as TK_WIDGET ptr )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then exit sub
+    tkPrintPreview_Refresh( p->hPv )
+    Sync( p )
+end sub
+
+public sub tkReportViewer_SetPage( byval hViewer as TK_WIDGET ptr, byval nPage as long )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p then GoPage( p, nPage )
+end sub
+
+public function tkReportViewer_GetShowToolbar( byval hViewer as TK_WIDGET ptr ) as boolean
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return false
+    return p->bToolbar
+end function
+
+public sub tkReportViewer_SetShowToolbar( byval hViewer as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then exit sub
+    p->bToolbar = bShow
+    Arrange( p )
+end sub
+
+public function tkReportViewer_GetShowStatus( byval hViewer as TK_WIDGET ptr ) as boolean
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return false
+    return p->bStatus
+end function
+
+public sub tkReportViewer_SetShowStatus( byval hViewer as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then exit sub
+    p->bStatus = bShow
+    Arrange( p )
+end sub
+
+public function tkReportViewer_GetPreview( byval hViewer as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->hPv
+end function
+
+public function tkReportViewer_GetToolbar( byval hViewer as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->hBar
+end function
+
+public function tkReportViewer_GetStatusBar( byval hViewer as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->hStatus
+end function
+
+' The toolbar's page box and zoom combo (tests, restyling).
+public function tkReportViewer_GetPageBox( byval hViewer as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->hPage
+end function
+
+public function tkReportViewer_GetZoomCombo( byval hViewer as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->hZoom
+end function
+
+public sub tkReportViewer_SetBeforePrintCallback( byval hViewer as TK_WIDGET ptr, byval cb as RV_BeforePrintFunc )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p then p->BeforePrint = cb
+end sub
+
+public sub tkReportViewer_SetAfterPrintCallback( byval hViewer as TK_WIDGET ptr, byval cb as RV_AfterPrintSub )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p then p->AfterPrint = cb
+end sub
+
+public sub tkReportViewer_SetExportedCallback( byval hViewer as TK_WIDGET ptr, byval cb as RV_ExportedSub )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p then p->Exported = cb
+end sub
+
+' ---- its own report (R5) -------------------------------------------------------------------
+public sub tkReportViewer_SetBuildReportCallback( byval hViewer as TK_WIDGET ptr, byval cb as RV_BuildReportSub )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p then p->BuildReport = cb
+end sub
+
+' The title the made table shows on its first page and in its page footer.
+public sub tkReportViewer_SetTitle( byval hViewer as TK_WIDGET ptr, byref title as const ustring )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then exit sub
+    p->title = title
+    if p->rpt then p->rpt->title = title
+end sub
+
+public function tkReportViewer_GetTitle( byval hViewer as TK_WIDGET ptr ) as ustring
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return ""
+    return p->title
+end function
+
+' Its own report, made on first use (its bands are made at the first RefreshReport).
+public function tkReportViewer_GetReport( byval hViewer as TK_WIDGET ptr ) as TK_REPORT ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    if p->rpt = 0 then p->rpt = tkReport_Create( p->title )
+    return p->rpt
+end function
+
+' A field of its report: the caption its column shows, and that column's width in pixels (96 dpi).
+' Adding a field empties the rows. Returns the field's index.
+public function tkReportViewer_AddField( byval hViewer as TK_WIDGET ptr, byref caption as ustring, byval nWidth as long = 100 ) as long
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return -1
+    dim as long f = tkReport_TableAddField( tkReportViewer_GetReport( hViewer ), caption )
+    if f < 0 then return -1
+    redim preserve p->colW( 0 to f )
+    p->colW(f) = iif( nWidth > 0, nWidth, 100 )
+    p->nCols = f + 1
+    return f
+end function
+
+public function tkReportViewer_GetFieldCount( byval hViewer as TK_WIDGET ptr ) as long
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->nCols
+end function
+
+public sub tkReportViewer_ClearRows( byval hViewer as TK_WIDGET ptr )
+    tkReport_TableClear( tkReportViewer_GetReport( hViewer ) )
+end sub
+
+' A new row of empty values: its index (-1 with no fields).
+public function tkReportViewer_AddRow( byval hViewer as TK_WIDGET ptr ) as integer
+    return tkReport_TableAddRow( tkReportViewer_GetReport( hViewer ) )
+end function
+
+' A row's value of field f, to set (tkBind_ToValue, or its own setters). Valid until the next AddRow.
+public function tkReportViewer_Cell( byval hViewer as TK_WIDGET ptr, byval row as integer, byval f as long ) as TK_VALUE ptr
+    return tkReport_TableCell( tkReportViewer_GetReport( hViewer ), row, f )
+end function
+
+public function tkReportViewer_GetRowCount( byval hViewer as TK_WIDGET ptr ) as integer
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if (p = 0) orelse (p->rpt = 0) then return 0
+    return p->rpt->nRows
+end function
+
+private function RvRect( byval l as single, byval t as single, byval r as single, byval b as single ) as TKRECTF
+    dim as TKRECTF rc
+    tkRectF_Set( rc, l, t, r, b )
+    return rc
+end function
+
+' The made table: the title on page 1, the captions on every page, a line per row, the page number.
+' Widths are the fields' pixels as points (x 0.75), scaled down to the page's width when wider.
+private sub RvDefaultLayout( byval p as TKREPORTVIEWER_STATE ptr )
+    dim as TK_REPORT ptr rpt = p->rpt
+    dim as TKPAGESETUP ps = rpt->setup
+    tkPageSetup_Resolve( ps )
+    dim as single pw, ph
+    tkPageSetup_PageSize( ps, pw, ph )
+    dim as single avail = pw - ps.marginL - ps.marginR, total = 0
+    for f as long = 0 to p->nCols - 1 : total += p->colW(f) * 0.75 : next
+    dim as single k = 0.75
+    if (total > avail) andalso (total > 0) then k = 0.75 * avail / total
+    if total > avail then total = avail
+    dim as TKREPORT_ITEM ptr it
+    dim as TK_RBAND ptr b
+    if len( rpt->title ) then
+        b = tkReport_GetBand( rpt, TKRB_REPORT_HEADER )
+        tkRBand_SetHeight( b, 30 )
+        it = tkRBand_AddPageInfo( b, RvRect( 0, 0, total, 24 ), "{title}", TK_DT_LEFT )
+        it->font.pt = 16 : it->font.bold = true
+    end if
+    dim as TK_RBAND ptr hdr = tkReport_GetBand( rpt, TKRB_PAGE_HEADER )
+    tkRBand_SetHeight( hdr, 18 ) : hdr->backColor = tkRGB( 228, 234, 242 )
+    dim as TK_RBAND ptr det = tkReport_GetBand( rpt, TKRB_DETAIL )
+    tkRBand_SetHeight( det, 16 )
+    dim as single x = 0
+    for f as long = 0 to p->nCols - 1
+        dim as single w = p->colW(f) * k
+        dim as long kind = rpt->src.FieldKind( rpt->src.pCtx, f )
+        dim as long al = iif( (kind = TKV_INT) orelse (kind = TKV_FLOAT), TK_DT_RIGHT, TK_DT_LEFT )
+        it = tkRBand_AddLabel( hdr, RvRect( x + 2, 0, x + w - 2, 18 ), rpt->fName(f), al )
+        it->font.bold = true
+        select case kind
+        case TKV_BOOL
+            dim as single cx = x + w / 2
+            tkRBand_AddCheckBox( det, RvRect( cx - 6, 2, cx + 6, 14 ), f )
+        case TKV_FLOAT
+            tkRBand_AddField( det, RvRect( x + 2, 0, x + w - 2, 16 ), f, "#,##0.00", al )
+        case else
+            tkRBand_AddField( det, RvRect( x + 2, 0, x + w - 2, 16 ), f, "", al )
+        end select
+        x += w
+    next
+    b = tkReport_GetBand( rpt, TKRB_PAGE_FOOTER )
+    tkRBand_SetHeight( b, 18 )
+    dim as ustring pageText = "Page {p} of {n}"
+    if len( rpt->title ) then pageText = "{title}  -  " & pageText
+    it = tkRBand_AddPageInfo( b, RvRect( 0, 2, total, 18 ), pageText )
+    it->font.pt = 8
+end sub
+
+' Lay its report out (again) on the preview, after the rows changed. The first call makes the bands.
+public sub tkReportViewer_RefreshReport( byval hViewer as TK_WIDGET ptr )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then exit sub
+    dim as TK_REPORT ptr rpt = tkReportViewer_GetReport( hViewer )
+    if p->bBuilt = false then
+        p->bBuilt = true
+        if p->BuildReport then p->BuildReport( hViewer, rpt ) else RvDefaultLayout( p )
+    end if
+    if p->rptDoc = 0 then p->rptDoc = tkReport_CreateDoc( rpt )
+    tkPrintDoc_BeginGenerate( p->rptDoc )
+    tkReportViewer_SetDocument( hViewer, p->rptDoc )
+end sub

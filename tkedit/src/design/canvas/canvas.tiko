@@ -36,6 +36,13 @@
 #import "vendor/tkControls/tkOptionButton"
 #import "vendor/tkControls/tkSelectBar"
 #import "vendor/tkControls/tkIconPanel"
+#import "vendor/tkControls/tkCheckedList"
+#import "vendor/tkControls/tkCheckedCombo"
+#import "vendor/tkControls/tkTokenBox"
+#import "vendor/tkControls/tkBadge"
+#import "vendor/tkControls/tkAvatarGroup"
+#import "vendor/tkControls/tkAutoComplete"
+#import "vendor/tkControls/tkDataGrid"
 #import "../model"
 #import "../catalog"
 #import "../formfile"
@@ -48,6 +55,8 @@ using containers
 using tkApp
 using tkMeta
 using tkLayout
+using tkDataGrid
+using tkCalendar
 using tkTabControl
 using tkTabBar
 using tkScrollPanel
@@ -66,6 +75,12 @@ using tkCheckBox
 using tkOptionButton
 using tkSelectBar
 using tkIconPanel
+using tkCheckedList
+using tkCheckedCombo
+using tkTokenBox
+using tkBadge
+using tkAvatarGroup
+using tkAutoComplete
 using tkHost
 using tkPaint
 using model
@@ -95,6 +110,11 @@ public type CanvasPickFunc as function( byval host_ as any ptr, byval c as FormC
 ' character ("" for none); the theme's glyph font may have changed by then (GLYPHS.md, GQ1 = A).
 public type CanvasGlyphFunc as function( byval host_ as any ptr, byval c as FormCanvas_ ptr, byref current as const ustring, _
                                          byref picked as ustring ) as boolean
+' The fields of a record type, for a control's Bind row (B1): "Name,Phone,Address.City", in the type's
+' order; "" when the host knows no such type (nothing scanned yet, or no host). Never modal.
+public type CanvasFieldsFunc as function( byval host_ as any ptr, byval c as FormCanvas_ ptr, byref typeName as const ustring ) as ustring
+' B3: the element type of typeName's Array( of T ) field path ("" when the scans don't know it)
+public type CanvasElementTypeFunc as function( byval host_ as any ptr, byval c as FormCanvas_ ptr, byref typeName as const ustring, byref path as const ustring ) as ustring
 public type CanvasRenameSub as sub( byval host_ as any ptr, byval c as FormCanvas_ ptr, byref oldName as const ustring, byref newName as const ustring )
 ' Controls just dragged over a container that isn't their parent: true moves them into it. what is
 ' the one control's name (count 1) or empty; page is a tab control's page caption, else "".
@@ -171,8 +191,12 @@ public type FormCanvas
     OnRenamed as CanvasRenameSub
     OnEditItems as CanvasWireSub        ' name_: the control whose entries to edit
     OnEditColors as CanvasWireSub       ' name_: the control whose [control.colors] to edit
+    OnEditLanguages as CanvasWireSub    ' Translatable's "...": the project's Languages, this form's keys first
     OnPickResource as CanvasPickFunc    ' a file property's "...": the Resource Center
     OnPickGlyph as CanvasGlyphFunc      ' a glyph property's "...": the Glyph Picker
+    OnFields as CanvasFieldsFunc        ' a Bind row's "...": the fields of the form's DataType
+    OnElementType as CanvasElementTypeFunc  ' a list's field rows: the element type of its ItemsField
+    OnReports as CanvasFieldsFunc       ' a ReportViewer's Report row "...": the project's report modules (typeName unused)
     OnHandlerGone as CanvasGoneFunc     ' true: the body has code, so keep its declaration
     OnHandlerRenamed as CanvasHandlerRenameFunc ' true: the code's body (and its uses) now go by the new name
     OnContextMenu as CanvasMenuSub      ' a right click at x, y in Glass pixels, the selection already set
@@ -699,6 +723,18 @@ sub FormCanvas.Rebuild( )
         end select
         if Live = false then MakeInert_( w )
     next
+    ' badges hung on their targets (D-B3), as the generated code does once every control exists
+    for i as long = 0 to Doc.Controls.Count( ) - 1
+        dim as FormControl c = Doc.Controls[i]
+        if (c.TypeName <> catalog.BADGE_TYPE) orelse (len( c.AttachTo ) = 0) orelse (i >= Widgets.Count( )) then continue for
+        dim as TK_WIDGET ptr wb = Widgets[i], wt = this.WidgetOf( c.AttachTo )
+        if (wb = 0) orelse (wt = 0) orelse (wt = wb) then continue for
+        dim as long dx, dy
+        catalog.BadgeOffset( c.AttachOffset, dx, dy )
+        tkLayout_Remove( Layout, wb )
+        tkBadge_Attach( wb, wt, catalog.BadgeCornerIndex( c.AttachCorner ), dx, dy, _
+                        iif( catalog.BadgeOverlapIsCircle( c.AttachOverlap ), TKBADGE_OVERLAP_CIRCLE, TKBADGE_OVERLAP_RECT ) )
+    next
     TrayGlass = tkWidget_CreateChild( Tray, 6, @TrayGlassProc, @this )     ' last: on top of the boxes
     Building = false
     this.PlaceSurface( )
@@ -755,9 +791,32 @@ sub FormCanvas.ApplyItems( byref c as FormControl, byval w as TK_WIDGET ptr )
             n += 1
         next
     case catalog.ItemsKind.ItemsColumns
+        ' a ReportViewer's fields have no look until its report is laid out: a ListTree's columns only
+        if c.TypeName = "ListTree" then
+            for each it as FormItem in c.Items
+                tkListTree_AddColumn( w, it.Text, iif( it.Width > 0, it.Width, 100 ) )
+            next
+        end if
+    case catalog.ItemsKind.ItemsGridColumns
+        ' the columns, and three sample rows so their kinds show
+        tkDataGrid_BeginUpdate( w )
         for each it as FormItem in c.Items
-            tkListTree_AddColumn( w, it.Text, iif( it.Width > 0, it.Width, 100 ) )
+            tkDataGrid_AddColumnEx( w, it.Text, GridKindValue_( it.Kind ), iif( it.Width > 0, it.Width, 100 ) )
         next
+        if tkDataGrid_IsVirtual( w ) = false then
+            tkDataGrid_SetRowCount( w, 3 )
+            for r as long = 0 to 2
+                for k as long = 0 to c.Items.Count( ) - 1
+                    select case c.Items[k].Kind
+                    case "number", "progress" : tkDataGrid_SetCellFloat( w, r, k, (r + 1) * 25 )
+                    case "check" : tkDataGrid_SetCellBool( w, r, k, (r mod 2) = 0 )
+                    case "date" : tkDataGrid_SetCellDate( w, r, k, tkCalendar_MakeDate( 2026, 1, r + 1 ) )
+                    case else : tkDataGrid_SetCellText( w, r, k, c.Items[k].Text & " " & (r + 1) )
+                    end select
+                next
+            next
+        end if
+        tkDataGrid_EndUpdate( w )
     case catalog.ItemsKind.ItemsTabs
         for i as long = 0 to c.Items.Count( ) - 1
             tkTabBar_AddTab( w, c.Items[i].Text )
@@ -766,12 +825,30 @@ sub FormCanvas.ApplyItems( byref c as FormControl, byval w as TK_WIDGET ptr )
     case catalog.ItemsKind.ItemsList
         for each it as FormItem in c.Items
             select case c.TypeName
-            case "SelectBar" : tkSelectBar_AddPanel( w, it.Text )
-            case else        : tkComboBox_AddItem( w, it.Text )
+            case "SelectBar"       : tkSelectBar_AddPanel( w, it.Text )
+            case "CheckedList"     : tkCheckedList_AddItem( w, it.Text )
+            case "CheckedComboBox" : tkCheckedCombo_AddItem( w, it.Text )
+            case "TokenBox"        : tkTokenBox_AddItem( w, it.Text )
+            case "AutoComplete"    : tkAutoComplete_AddItem( w, it.Text )
+            case "AvatarGroup"     : tkAvatarGroup_AddItem( w, it.Text )
+            case else              : tkComboBox_AddItem( w, it.Text )
             end select
         next
     end select
 end sub
+
+private function GridKindValue_( byref kind as const ustring ) as long
+    select case kind
+    case "number"   : return TKDG_COL_NUMBER
+    case "check"    : return TKDG_COL_CHECK
+    case "combo"    : return TKDG_COL_COMBO
+    case "date"     : return TKDG_COL_DATE
+    case "button"   : return TKDG_COL_BUTTON
+    case "link"     : return TKDG_COL_LINK
+    case "progress" : return TKDG_COL_PROGRESS
+    end select
+    return TKDG_COL_TEXT
+end function
 
 ' The real controls to where the model says, without rebuilding them: the feedback during a drag.
 sub FormCanvas.SyncGeometry( )
@@ -783,6 +860,7 @@ sub FormCanvas.SyncGeometry( )
         if i >= Widgets.Count( ) then exit for
         dim as TK_WIDGET ptr w = Widgets[i]
         if (w = 0) orelse (w->pParent = Tray) then continue for     ' the tray places its own
+        if tkWidget_IsAdorner( w ) then continue for                ' an attached Badge: its target places it
         dim as FormControl c = Doc.Controls[i]
         tkLayout_SetDesignRect( Layout, w, c.X, c.Y, c.W, c.H )
         tkLayout_SetAnchor( Layout, w, c.Anchor )
@@ -931,6 +1009,16 @@ end function
 
 ' The topmost control at a point in Glass pixels: children come after their parents in the list.
 function FormCanvas.HitControl( byval x as long, byval y as long ) as long
+    ' an attached Badge first: it is drawn over its target, wherever it is in the list
+    for k as long = 0 to Doc.Controls.Count( ) - 1
+        if (k < Widgets.Count( )) andalso (Doc.Controls[k].TypeName = catalog.BADGE_TYPE) andalso (len( Doc.Controls[k].AttachTo ) > 0) then
+            dim as TK_WIDGET ptr wb = Widgets[k]
+            if (wb <> 0) andalso (tkBadge_GetTarget( wb ) <> 0) andalso this.Shows( wb ) then
+                dim as TKRECT rb = this.RectOf( wb )
+                if (x >= rb.left) andalso (x < rb.right) andalso (y >= rb.top) andalso (y < rb.bottom) then return k
+            end if
+        end if
+    next
     dim as long i = Doc.Controls.Count( ) - 1
     while i >= 0
         dim as TK_WIDGET ptr w = 0
@@ -1485,6 +1573,7 @@ end function
 ' ---- commands ---------------------------------------------------------------------------------
 
 sub FormCanvas.Commit( )
+    FillAllIds( Doc, false )        ' a new entry's id is fixed now, before anything moves it
     if OnCommit then OnCommit( Owner, formfile.Render( Doc ) )
     this.Changed( )
 end sub

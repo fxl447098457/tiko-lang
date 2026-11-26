@@ -1,0 +1,355 @@
+' tkPrint self-test (phase R0): page setup, the page API's recorded geometry, the widget recorder's
+' mapping, the font-source registry, late text, raster and PNG export -- and the identity claim:
+' a widget recorded with tkPrint_PaintWidget at one point per pixel and replayed at one pixel per
+' point is the SAME PIXELS as painting it directly. Two passes, scale 1.0 and 1.75.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkPrint"
+using tkTest
+using tkHost
+using tkPaint
+using tkPrint
+
+const BG = &hFF102030ul
+const FG = &hFFF0E0D0ul
+const PEN = &hFF00FF00ul
+
+dim shared as long gScene
+dim shared as TTF_Font ptr gFont
+dim shared as TTF_Font ptr gIcons
+dim shared as SDL_Texture ptr gTex
+
+function Near( byval a as single, byval b as single, byval tol as single = 0.01 ) as boolean
+    return abs( a - b ) <= tol
+end function
+
+' Everything tkPaint draws, in one canvas: the identity scene.
+function CanvasProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg <> TKM_PAINT then return false
+    dim as TK_PAINT ptr p = m->pPaint
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, w->cw, w->ch )
+    p->SetBackColor( BG ) : p->PaintRect( @rc )
+    p->SetBackColor( FG ) : p->SetPenColor( PEN ) : p->SetForeColor( FG )
+    p->SetFont( gFont )
+    select case gScene
+    case 0
+        tkRect_Set( rc, 10, 10, 110, 70 ) : p->PaintEllipse( @rc, 3 )
+        dim as TKPOINT pts(0 to 5) = { (130, 50), (150, 50), (165, 70), (210, 10), (230, 10), (165, 95) }
+        p->PaintPolygon( @pts(0), 6, 1 )
+        tkRect_Set( rc, 240, 10, 330, 100 ) : p->PaintPie( @rc, 20, 250, 1 )
+        tkRect_Set( rc, 10, 110, 100, 200 ) : p->PaintPieRing( @rc, 0.5, 0, 300 )
+        tkRect_Set( rc, 110, 110, 190, 190 ) : p->PaintGradientRect( @rc, &hFF000000ul, &hFFFFFFFFul, TK_GRADIENT_VERTICAL )
+        tkRect_Set( rc, 200, 110, 280, 190 ) : p->PaintGradientRect( @rc, &hFFFF0000ul, &hFF0000FFul, TK_GRADIENT_FDIAGONAL, 20 )
+        tkRect_Set( rc, 290, 110, 370, 190 ) : p->PaintRoundBorderRect( @rc, 16, 2 )
+        dim as TKPOINT ln(0 to 1) = { (10, 215), (370, 215) }
+        p->SetPenDashStyle( TK_PENDASH_DASH ) : p->PaintPolyline( @ln(0), 2, 2 ) : p->SetPenDashStyle( TK_PENDASH_SOLID )
+        dim as TKPOINT cv(0 to 2) = { (10, 290), (90, 230), (170, 290) }
+        p->PaintCurve( @cv(0), 3, 2 )
+        p->PaintLine( 1, 180, 230, 370, 230 )
+        p->PaintLine( 1, 180, 240, 370, 290 )
+    case else
+        tkRect_Set( rc, 50, 20, 100, 70 ) : p->PushClip( @rc )
+        tkRect_Set( rc, 0, 0, 200, 200 ) : p->SetBackColor( PEN ) : p->PaintRect( @rc )
+        p->PopClip()
+        tkRect_Set( rc, 120, 10, 380, 40 ) : p->PaintText( "Left aligned", @rc, TK_DT_LEFT )
+        tkRect_Set( rc, 120, 40, 380, 70 ) : p->PaintText( "Right aligned", @rc, TK_DT_RIGHT )
+        tkRect_Set( rc, 120, 70, 190, 100 ) : p->PaintText( "Far too long a caption", @rc, TK_DT_LEFT or TK_DT_ELLIPSIS )
+        tkRect_Set( rc, 10, 110, 160, 300 )
+        p->PaintTextEx( "the quick brown fox jumps over the lazy dog again and again", @rc, TK_DT_WORDBREAK )
+        if gIcons then p->SetFont( gIcons )
+        tkRect_Set( rc, 200, 110, 300, 150 ) : p->PaintText( wchr( TK_ICON_MORE ), @rc, TK_DT_CENTER )
+        tkRect_Set( rc, 200, 170, 296, 266 ) : p->PaintImage( gTex, @rc, TK_IMGFIT_STRETCH )
+    end select
+    return true
+end function
+
+' Pixels of a window rect, for an exact comparison (the caller destroys the surface).
+function Grab( byval h as TK_HOST ptr, byval x as long, byval y as long, byval w as long, byval hh as long ) as SDL_Surface ptr
+    dim as SDL_Rect r
+    r.x = x : r.y = y : r.w = w : r.h = hh
+    dim as SDL_Surface ptr s0 = SDL_RenderReadPixels( h->renderer, @r )
+    if s0 = 0 then return 0
+    dim as SDL_Surface ptr s = SDL_ConvertSurface( s0, SDL_PIXELFORMAT_ARGB8888 )
+    SDL_DestroySurface( s0 )
+    return s
+end function
+
+' Pixels that differ, and the largest channel difference among them.
+function Diff( byval a as SDL_Surface ptr, byval b as SDL_Surface ptr, byref maxd as long ) as long
+    maxd = 0
+    if (a = 0) orelse (b = 0) then return -1
+    if (a->w <> b->w) orelse (a->h <> b->h) then return -1
+    dim as long n = 0
+    for y as long = 0 to a->h - 1
+        dim as ulong ptr ra = cast( ulong ptr, cast( ubyte ptr, a->pixels ) + y * a->pitch )
+        dim as ulong ptr rb = cast( ulong ptr, cast( ubyte ptr, b->pixels ) + y * b->pitch )
+        for x as long = 0 to a->w - 1
+            dim as ulong ca = ra[x] and &hFFFFFFul, cb = rb[x] and &hFFFFFFul
+            if ca <> cb then
+                n += 1
+                for k as long = 0 to 2
+                    dim as long d = abs( clng( (ca shr (k * 8)) and 255 ) - clng( (cb shr (k * 8)) and 255 ) )
+                    if d > maxd then maxd = d
+                next
+            end if
+        next
+    next
+    return n
+end function
+
+function SurfPx( byval s as SDL_Surface ptr, byval x as long, byval y as long ) as ulong
+    if (s = 0) orelse (x < 0) orelse (y < 0) orelse (x >= s->w) orelse (y >= s->h) then return 0
+    dim as ulong ptr row = cast( ulong ptr, cast( ubyte ptr, s->pixels ) + y * s->pitch )
+    return row[x] or &hFF000000ul
+end function
+
+' The first and last column in a row band of a surface that is not white.
+function InkCols( byval s as SDL_Surface ptr, byval y0 as long, byval y1 as long, byval x0 as long, byval x1 as long, _
+                  byref first as long, byref last as long ) as boolean
+    first = -1 : last = -1
+    for x as long = x0 to x1 - 1
+        for y as long = y0 to y1 - 1
+            if SurfPx( s, x, y ) <> &hFFFFFFFFul then
+                if first < 0 then first = x
+                last = x
+                exit for
+            end if
+        next
+    next
+    return first >= 0
+end function
+
+' The last op of kind 'op' on a page (text ends with the clip it restores, so "the last op" is not it).
+function LastOp( byval doc as TK_PRINTDOC ptr, byval page as long, byval op as long, byref oi as TKPRINT_OPINFO ) as boolean
+    for i as long = tkPrintDoc_GetOpCount( doc, page ) - 1 to 0 step -1
+        tkPrintDoc_GetOp( doc, page, i, oi )
+        if oi.op = op then return true
+    next
+    return false
+end function
+
+' A pull-style producer: three pages, each with a box and the late footer.
+function ThreePages( byval doc as TK_PRINTDOC ptr, byval pg as TK_PAGE ptr, byval i as long ) as boolean
+    dim as TKRECTF rc
+    tkPage_GetMarginRect( pg, rc )
+    tkPage_SetFillColor( pg, &hFF000000ul )
+    dim as TKRECTF bx
+    tkRectF_Set( bx, rc.left, rc.top, rc.left + 72, rc.top + 72 )
+    tkPage_FillRect( pg, bx )
+    dim as TKRECTF ft
+    tkRectF_Set( ft, rc.left, rc.bottom - 20, rc.right, rc.bottom )
+    tkPage_LateText( pg, ft, "Page {p} of {n}", TK_DT_RIGHT )
+    return i < 2
+end function
+
+function MakeTexture( byval h as TK_HOST ptr ) as SDL_Texture ptr
+    dim as SDL_Surface ptr s = SDL_CreateSurface( 16, 16, SDL_PIXELFORMAT_ARGB8888 )
+    if s = 0 then return 0
+    dim as SDL_Rect r
+    for y as long = 0 to 3
+        for x as long = 0 to 3
+            r.x = x * 4 : r.y = y * 4 : r.w = 4 : r.h = 4
+            SDL_FillSurfaceRect( s, @r, iif( ((x + y) and 1) = 0, &hFFE04020ul, &hFF2040E0ul ) )
+        next
+    next
+    dim as SDL_Texture ptr t = SDL_CreateTextureFromSurface( h->renderer, s )
+    SDL_DestroySurface( s )
+    return t
+end function
+
+
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkPrint selftest", 640, 480, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host", false, *SDL_GetError() ) : exit sub
+    gFont = tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_UI, 10 )
+    gIcons = tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_ICONS, 10 )
+    gTex = MakeTexture( h )
+    dim as TK_WIDGET ptr cv = tkWidget_Create( h, 1, @CanvasProc, 0 )
+    tkWidget_SetPos( cv, 10, 10, 400, 320 )
+
+    ' Checks that do not depend on the host's scale run in the first pass only (the author's rule:
+    ' one check per distinct behaviour). The widget recorder and the identity claim run at both.
+    dim as boolean once = (fScale = 1.0)
+    dim as TKPRINT_OPINFO oi
+    dim as TK_PRINTDOC ptr doc = tkPrintDoc_Create( "selftest" )
+    dim as TKPAGESETUP ls
+    ls.paper = TK_PAPER_LETTER
+    tkPrintDoc_SetPageSetup( doc, ls )
+    dim as TK_PAGE ptr pg = tkPrintDoc_AddPage( doc )
+
+    if once then
+        ' ---- C-1: the font-source registry ----------------------------------------------------
+        dim as string fpath
+        dim as long fface = -1
+        tkTest_Check( "registry: an opened font has its source", tkHost_FontSource( gFont, fpath, fface ) _
+                      andalso (instr( fpath, TK_FONT_UI ) > 0) andalso (fface = 0), fpath & " face " & fface )
+        dim as TTF_Font ptr fTmp = tkHost_OpenFontFace( tkHost_FontDir() & TK_FONT_MONO, 9, 0 )
+        tkHost_CloseFont( fTmp )
+        tkTest_Check( "registry: closed through tkHost_CloseFont, forgotten", tkHost_FontSource( fTmp, fpath, fface ) = false )
+
+        ' ---- page setup -----------------------------------------------------------------------
+        dim as TKPAGESETUP ps
+        ps.paper = TK_PAPER_A4
+        ps.landscape = true
+        tkPageSetup_Resolve( ps )
+        dim as single pw, ph
+        tkPageSetup_PageSize( ps, pw, ph )
+        tkTest_Check( "A4 landscape is 841.89 x 595.28 pt", Near( pw, 841.890 ) andalso Near( ph, 595.276 ) )
+        dim as TKPAGESETUP pd
+        tkPageSetup_Resolve( pd )
+        tkTest_Check( "DEFAULT resolves to A4 or Letter", (pd.paper = TK_PAPER_A4) orelse (pd.paper = TK_PAPER_LETTER), "paper " & pd.paper )
+        dim as TKRECTF mr
+        tkPage_GetMarginRect( pg, mr )
+        tkTest_Check( "Letter margin rect = page less 20 mm", Near( mr.left, 56.69 ) andalso Near( mr.right, 612 - 56.69 ) andalso Near( mr.bottom, 792 - 56.69 ) )
+
+        ' ---- the page API's recorded geometry -----------------------------------------------------
+        dim as TKRECTF r1
+        tkRectF_Set( r1, 72, 72, 144, 108 )
+        tkPage_SetFillColor( pg, &hFF336699ul )
+        tkPage_FillRect( pg, r1 )
+        tkPrintDoc_GetOp( doc, 0, tkPrintDoc_GetOpCount( doc, 0 ) - 1, oi )
+        tkTest_Check( "FillRect records one rect in points", (oi.op = TKREC_FILLRECT) andalso Near( oi.x, 72 ) _
+                      andalso Near( oi.y, 72 ) andalso Near( oi.cw, 72 ) andalso Near( oi.ch, 36 ) andalso (oi.c = &hFF336699ul), _
+                      oi.op & " " & oi.x & "," & oi.y & " " & oi.cw & "x" & oi.ch )
+        tkPage_SetPen( pg, 1.5 )
+        tkPage_StrokeRect( pg, r1 )
+        tkPrintDoc_GetOp( doc, 0, tkPrintDoc_GetOpCount( doc, 0 ) - 1, oi )
+        tkTest_Check( "StrokeRect: an outline, pen 1.5 pt, centred 0.75 pt inside", (oi.op = TKREC_STROKE) andalso Near( oi.w, 1.5 ) _
+                      andalso Near( oi.x0, 72.75, 0.06 ) andalso Near( oi.y0, 72.75, 0.06 ), oi.op & " w " & oi.w & " p0 " & oi.x0 & "," & oi.y0 )
+        tkPage_SetPen( pg, 0.25 )
+        tkPage_Line( pg, 72, 300, 300, 300 )
+        tkPrintDoc_GetOp( doc, 0, tkPrintDoc_GetOpCount( doc, 0 ) - 1, oi )
+        tkTest_Check( "a horizontal hairline: a 0.3 pt rect (pen to whole 0.1 pt, a pixel at 720 dpi)", _
+                      (oi.op = TKREC_FILLRECT) andalso Near( oi.cw, 228 ) andalso (oi.ch >= 0.2) andalso (oi.ch <= 0.31), _
+                      oi.op & " " & oi.cw & "x" & oi.ch )
+        tkPage_SetPen( pg, 1 )
+        dim as long nBefore = tkPrintDoc_GetOpCount( doc, 0 )
+        tkPage_StrokeEllipse( pg, r1 )
+        tkTest_Check( "StrokeEllipse: the outline only (the transparent fill dropped)", _
+                      tkPrintDoc_GetOpCount( doc, 0 ) = nBefore + 1, "ops +" & (tkPrintDoc_GetOpCount( doc, 0 ) - nBefore) )
+
+        ' text: size in points, width as measured, font by its source
+        dim as TKFONTSPEC fs
+        fs.pt = 12
+        tkPage_SetFont( pg, fs )
+        dim as single mw = tkPage_MeasureText( pg, "Hello, world" )
+        dim as TKRECTF tr
+        tkRectF_Set( tr, 72, 400, 540, 430 )
+        tkPage_Text( pg, "Hello, world", tr, TK_DT_LEFT )
+        LastOp( doc, 0, TKREC_TEXT, oi )
+        tkTest_Check( "Text: one run, 12 pt, x at the rect, width = MeasureText", Near( oi.size, 12 ) _
+                      andalso Near( oi.x, 72 ) andalso Near( oi.tw, mw, 0.05 ) andalso (oi.text = "Hello, world") _
+                      andalso (instr( oi.font, TK_FONT_UI ) > 0), oi.size & "pt x " & oi.x & " tw " & oi.tw & " / " & mw & " " & oi.font )
+        tkPage_Text( pg, "Right", tr, TK_DT_RIGHT )
+        LastOp( doc, 0, TKREC_TEXT, oi )
+        tkTest_Check( "Text: right-aligned ends at the rect's right edge", Near( oi.x + oi.tw, 540, 0.11 ), "" & (oi.x + oi.tw) )
+        fs.bold = true
+        tkPage_SetFont( pg, fs )
+        tkPage_Text( pg, "Bold", tr, TK_DT_LEFT )
+        LastOp( doc, 0, TKREC_TEXT, oi )
+        tkTest_Check( "bold on the UI font is the bundled bold face", instr( oi.font, TK_FONT_UI_BOLD ) > 0, oi.font )
+    end if
+
+    ' ---- the widget recorder: mapping (k = 0.5) ------------------------------------------------
+    dim as TKRECTF wr
+    tkRectF_Set( wr, 100, 500, 300, 800 )         ' 200 x 300 pt for a 400 x 320 px widget: k = 0.5
+    gScene = 0
+    dim as long nW = tkPrintDoc_GetOpCount( doc, 0 )
+    tkPrint_PaintWidget( pg, cv, wr )
+    gScene = 1
+    tkPrint_PaintWidget( pg, cv, wr )
+    dim as boolean bgOk = false, penOk = false, txOk = false, imOk = false
+    dim as single fpx = 10 * 96 * h->fScale / 72
+    for i as long = nW to tkPrintDoc_GetOpCount( doc, 0 ) - 1
+        tkPrintDoc_GetOp( doc, 0, i, oi )
+        ' the background: 400 x 320 px -> 200 x 160 pt, centred vertically in the 300 pt rect
+        if (oi.op = TKREC_FILLRECT) andalso (oi.c = BG) then bgOk = Near( oi.x, 100 ) andalso Near( oi.y, 570 ) andalso Near( oi.cw, 200 ) andalso Near( oi.ch, 160 )
+        if (penOk = false) andalso (oi.op = TKREC_STROKE) andalso (oi.c = PEN) then penOk = Near( oi.w, 1.5 )   ' the ellipse's 3 px pen
+        if (oi.op = TKREC_TEXT) andalso (oi.text = "Left aligned") then txOk = Near( oi.size, fpx * 0.5, 0.02 ) andalso Near( oi.x, 100 + 120 * 0.5 )
+        if oi.op = TKREC_IMAGE then imOk = Near( oi.cw, 48 ) andalso Near( oi.ch, 48 )
+    next
+    tkTest_Check( "widget: rects, pens, text size and images map by k, centred in the rect", bgOk andalso penOk andalso txOk andalso imOk, _
+                  "bg " & bgOk & " pen " & penOk & " text " & txOk & " (font px " & fpx & ") image " & imOk & " " & tkPrintDoc_Warnings( doc ) )
+
+    ' ---- identity: record at 1 pt per px, replay at 1 px per pt = direct painting ------------------
+    dim as TKRECT a
+    tkWidget_AbsRect( cv, a )
+    for sc as long = 0 to 1
+        gScene = sc
+        dim as TK_PRINTDOC ptr d1 = tkPrintDoc_Create( )
+        dim as long winW, winH
+        tkHost_PixelSize( h, winW, winH )
+        dim as TKPAGESETUP cs
+        cs.paper = TK_PAPER_CUSTOM : cs.widthPt = winW : cs.heightPt = winH
+        tkPrintDoc_SetPageSetup( d1, cs )
+        dim as TK_PAGE ptr p1 = tkPrintDoc_AddPage( d1 )
+        dim as TKRECTF full
+        tkRectF_Set( full, a.left, a.top, a.left + cv->cw, a.top + cv->ch )
+        tkPrint_PaintWidget( p1, cv, full )
+        tkHost_RenderTo( h, false )
+        dim as SDL_Surface ptr sA = Grab( h, a.left, a.top, cv->cw, cv->ch )
+        SDL_SetRenderClipRect( h->renderer, 0 )
+        SDL_SetRenderDrawColor( h->renderer, 255, 0, 255, 255 )
+        dim as SDL_FRect fr
+        fr.x = a.left : fr.y = a.top : fr.w = cv->cw : fr.h = cv->ch
+        SDL_RenderFillRect( h->renderer, @fr )
+        dim as TK_PRINTREPLAY ptr rp = tkPrintReplay_Create( h->renderer, h->engine )
+        tkPrintReplay_Page( rp, d1, 0, 0, 0, 1 )
+        dim as SDL_Surface ptr sB = Grab( h, a.left, a.top, cv->cw, cv->ch )
+        dim as long maxd
+        dim as long nd = Diff( sA, sB, maxd )
+        tkTest_Check( "identity scene " & sc & ": replay = direct, pixel for pixel", nd = 0, nd & " px differ, max " & maxd )
+        if sA then SDL_DestroySurface( sA )
+        if sB then SDL_DestroySurface( sB )
+        tkPrintReplay_Destroy( rp )
+        tkPrintDoc_Destroy( d1 )
+    next
+
+    if once then
+        ' ---- late text, pages, raster -----------------------------------------------------------
+        dim as TK_PRINTDOC ptr d3 = tkPrintDoc_Create( "three" )
+        dim as TKPAGESETUP a4
+        a4.paper = TK_PAPER_A4
+        tkPrintDoc_SetPageSetup( d3, a4 )
+        tkPrintDoc_SetPrintPageCallback( d3, @ThreePages )
+        tkTest_Check( "Generate: three pages", tkPrintDoc_Generate( d3 ) = 3 )
+        dim as SDL_Surface ptr r72 = tkPrintDoc_RenderSurface( d3, 2, 72 )
+        dim as SDL_Surface ptr r144 = tkPrintDoc_RenderSurface( d3, 2, 144 )
+        tkTest_Check( "raster: A4 at 72 and 144 dpi, the box black on white, doubling", _
+                      (r72 <> 0) andalso (r144 <> 0) andalso (r72->w = 595) andalso (r72->h = 842) andalso (r144->w = 1191) _
+                      andalso (r144->h = 1684) andalso (SurfPx( r72, 93, 93 ) = &hFF000000ul) andalso (SurfPx( r72, 137, 93 ) = &hFFFFFFFFul) _
+                      andalso (SurfPx( r144, 253, 185 ) = &hFF000000ul) andalso (SurfPx( r144, 263, 185 ) = &hFFFFFFFFul) )
+        if r72 then
+            dim as long f0, f1
+            dim as long by = clng( 841.89 - 56.69 )
+            tkTest_Check( "late footer is drawn, right-aligned at the margin", InkCols( r72, by - 20, by, 0, 595, f0, f1 ) _
+                          andalso (f1 >= 595 - 57 - 3) andalso (f1 <= 595 - 57), "last ink col " & f1 )
+        end if
+        ' page 1's late text differs from page 3's: the page number is filled in per page
+        dim as SDL_Surface ptr q1 = tkPrintDoc_RenderSurface( d3, 0, 72 )
+        dim as long md
+        tkTest_Check( "late text resolves per page (page 1 differs from page 3)", Diff( q1, r72, md ) > 0 )
+        if q1 then SDL_DestroySurface( q1 )
+        if r72 then SDL_DestroySurface( r72 )
+        if r144 then SDL_DestroySurface( r144 )
+        SDL_CreateDirectory( "../out" )              ' examples/tkControls/out: ignored; the Linux build copy has none
+        dim as SDL_PathInfo inf
+        tkTest_Check( "ExportPng writes every page", tkPrintDoc_ExportPng( d3, "../out/tkprint-selftest-p{p}.png", 50 ) _
+                      andalso SDL_GetPathInfo( "../out/tkprint-selftest-p3.png", @inf ) andalso (inf.size > 0) )
+        tkPrintDoc_Destroy( d3 )
+    end if
+    tkPrintDoc_Destroy( doc )
+
+    SDL_DestroyTexture( gTex ) : gTex = 0
+    tkHost_Destroy( h )
+end sub
+
+if tkTest_Init() = false then end 1
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkPrint" )
+tkTest_Quit()
+end nFail

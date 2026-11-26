@@ -1,0 +1,656 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rrecords -- the Report Designer's list editors as models (RD7), without a window: the data sources,
+' the parameters, the group levels (with the sort that brings the rows in group order), one item's
+' conditional styles and the calculated fields. Each is a list of records with fields, Add / Remove / Move, and a few fields of
+' the whole list (Extras, record -1). rdialogs.RecordDialog shows any of them; it works on a copy of
+' the report, and its OK is one undoable edit.
+'
+' FIELD KEYS ARE THE FILE'S where the file has one (name, kind, sql, when ...), as in the inspector.
+#module "rrecords"
+
+#import "std/containers"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkReportDef"
+#import "../redits"
+#import "../rmodel"
+#import "../validate"
+using containers
+using tkReportDef
+using tkReport
+using tkRExpr
+using tkBind
+
+public enum RSet
+    RSetSources
+    RSetParams
+    RSetGroups
+    RSetRules
+    RSetCalcs
+end enum
+
+public type RecordSet
+    Def   as TK_REPORTDEF ptr
+    Kind  as RSet
+    Item  as ustring                   ' rules: the item's id
+    Desc  as Array( of boolean )       ' groups: each level descending
+    Extra as ustring                   ' groups: the sort keys after the group levels
+
+    declare sub Init( byval def_ as TK_REPORTDEF ptr, byval kind_ as RSet, byref item_ as const ustring = "" )
+    declare function Count( ) as int32
+    declare function Label( byval i as int32 ) as ustring
+    declare sub FieldsOf( byval i as int32, byref out_ as Array( of rmodel.RProp ) )
+    declare function GetValue( byval i as int32, byref key_ as const ustring ) as ustring
+    declare function SetValue( byval i as int32, byref key_ as const ustring, byref value as const ustring ) as ustring
+    declare function Add( ) as ustring
+    declare function Remove( byval i as int32 ) as ustring
+    declare function Move( byval i as int32, byval delta as int32 ) as boolean
+    declare function HeaderOf( byval level as int32 ) as int32
+    declare function FooterOf( byval level as int32 ) as int32
+    declare function DetailSource( ) as int32
+    declare sub ApplySort( )
+end type
+
+private sub P_( byref out_ as Array( of rmodel.RProp ), byref key_ as const ustring, byval kind_ as rmodel.RPropKind, byref items as const ustring = "" )
+    dim as rmodel.RProp p
+    p.Key = key_
+    p.Kind = kind_
+    p.Items = items
+    out_.Push( p )
+end sub
+
+private function IsName_( byref s as const ustring ) as boolean
+    if len( s ) = 0 then return false
+    for i as long = 1 to len( s )
+        dim as long ch = asc( mid( s, i, 1 ) )
+        dim as boolean ok = ((ch >= 65) andalso (ch <= 90)) orelse ((ch >= 97) andalso (ch <= 122)) orelse (ch = 95) orelse _
+                            ((i > 1) andalso (ch >= 48) andalso (ch <= 57))
+        if ok = false then return false
+    next
+    return true
+end function
+
+private function B_( byval b as boolean ) as ustring
+    if b then return "true"
+    return "false"
+end function
+
+' Splits a sort ("[A], Format([B], ","), [C] desc") at its top-level commas, trimmed.
+public sub SplitSort( byref s as const ustring, byref out_ as Array( of ustring ) )
+    out_.Clear( )
+    dim as long depth = 0, start = 1
+    dim as boolean quoted_ = false
+    for i as long = 1 to len( s ) + 1
+        dim as ustring ch = mid( s, i, 1 )
+        if i > len( s ) then ch = ","
+        if ch = """" then
+            quoted_ = (quoted_ = false)
+        elseif quoted_ = false then
+            select case ch
+            case "(", "[" : depth += 1
+            case ")", "]" : depth -= 1
+            case ","
+                if depth = 0 then
+                    dim as ustring k = trim( mid( s, start, i - start ) )
+                    if len( k ) then out_.Push( k )
+                    start = i + 1
+                end if
+            end select
+        end if
+    next
+end sub
+
+' ---- groups: the levels are the top-level group headers, by level ----
+function RecordSet.HeaderOf( byval level as int32 ) as int32
+    for i as int32 = 0 to Def->nBands - 1
+        if (Def->bands(i).kind = "group_header") andalso (len( Def->bands(i).parent ) = 0) andalso (Def->bands(i).level = level) then return i
+    next
+    return -1
+end function
+
+function RecordSet.FooterOf( byval level as int32 ) as int32
+    for i as int32 = 0 to Def->nBands - 1
+        if (Def->bands(i).kind = "group_footer") andalso (len( Def->bands(i).parent ) = 0) andalso (Def->bands(i).level = level) then return i
+    next
+    return -1
+end function
+
+' The source the top-level detail shows: where the group order's sort goes.
+function RecordSet.DetailSource( ) as int32
+    for i as int32 = 0 to Def->nBands - 1
+        if (Def->bands(i).kind = "detail") andalso (len( Def->bands(i).parent ) = 0) then return tkReportDef_FindSource( Def, Def->bands(i).source )
+    next
+    return -1
+end function
+
+' The detail source's sort: each level's group (descending as asked), then the extra keys.
+sub RecordSet.ApplySort( )
+    dim as int32 si = this.DetailSource( )
+    if si < 0 then exit sub
+    dim as ustring s
+    for lvl as int32 = 0 to this.Count( ) - 1
+        dim as int32 b = this.HeaderOf( lvl )
+        if (b < 0) orelse (len( Def->bands(b).group_ ) = 0) then continue for
+        if len( s ) then s &= ", "
+        s &= Def->bands(b).group_
+        if (lvl < Desc.Count( )) andalso Desc[lvl] then s &= " desc"
+    next
+    if len( Extra ) then
+        if len( s ) then s &= ", "
+        s &= Extra
+    end if
+    Def->sources(si).sort = s
+end sub
+
+sub RecordSet.Init( byval def_ as TK_REPORTDEF ptr, byval kind_ as RSet, byref item_ as const ustring = "" )
+    Def = def_
+    Kind = kind_
+    Item = item_
+    Desc.Clear( )
+    Extra = ""
+    if Kind <> RSet.RSetGroups then exit sub
+    ' what the sort says now: the leading keys that are the levels' groups, then the rest
+    dim as Array( of ustring ) keys
+    dim as int32 si = this.DetailSource( )
+    if si >= 0 then SplitSort( Def->sources(si).sort, keys )
+    dim as int32 k = 0
+    for lvl as int32 = 0 to this.Count( ) - 1
+        dim as boolean d = false
+        dim as int32 b = this.HeaderOf( lvl )
+        if (b >= 0) andalso (k < keys.Count( )) then
+            dim as ustring g = lcase( Def->bands(b).group_ ), key_ = lcase( keys[k] )
+            if key_ = g then
+                k += 1
+            elseif key_ = g & " desc" then
+                d = true
+                k += 1
+            elseif key_ = g & " asc" then
+                k += 1
+            end if
+        end if
+        Desc.Push( d )
+    next
+    for j as int32 = k to keys.Count( ) - 1
+        if len( Extra ) then Extra &= ", "
+        Extra &= keys[j]
+    next
+end sub
+
+function RecordSet.Count( ) as int32
+    select case Kind
+    case RSet.RSetSources : return Def->nSources
+    case RSet.RSetParams : return Def->nParams
+    case RSet.RSetGroups
+        dim as int32 n = 0
+        while this.HeaderOf( n ) >= 0
+            n += 1
+        wend
+        return n
+    case RSet.RSetRules
+        dim as int32 ii = tkReportDef_FindItem( Def, Item )
+        if ii < 0 then return 0
+        return Def->items(ii).nRules
+    case RSet.RSetCalcs : return Def->nCalcs
+    end select
+    return 0
+end function
+
+function RecordSet.Label( byval i as int32 ) as ustring
+    if (i < 0) orelse (i >= this.Count( )) then return ""
+    select case Kind
+    case RSet.RSetSources : return Def->sources(i).name_ & "  " & Def->sources(i).kind
+    case RSet.RSetParams : return "@" & Def->params(i).name_
+    case RSet.RSetGroups : return (i + 1) & "  " & Def->bands(this.HeaderOf( i )).group_
+    case RSet.RSetRules
+        dim as ustring w = Def->items(tkReportDef_FindItem( Def, Item )).rules(i).when_
+        return (i + 1) & "  " & w
+    case RSet.RSetCalcs : return Def->calcs(i).source & "." & Def->calcs(i).name_
+    end select
+    return ""
+end function
+
+' The fields of record i; i = -1, the list's own (groups: the sort's extra keys).
+sub RecordSet.FieldsOf( byval i as int32, byref out_ as Array( of rmodel.RProp ) )
+    out_.Clear( )
+    select case Kind
+    case RSet.RSetSources
+        if i < 0 then exit sub
+        dim as ustring others
+        for k as int32 = 0 to Def->nSources - 1
+            if k <> i then others &= "," & Def->sources(k).name_
+        next
+        P_( out_, "name", rmodel.RPropKind.RPropText )
+        P_( out_, "kind", rmodel.RPropKind.RPropEnum, "host,array,sqlite,grid,listtree" )
+        P_( out_, "parent", rmodel.RPropKind.RPropEnum, others )
+        P_( out_, "relation", rmodel.RPropKind.RPropText )
+        P_( out_, "item_type", rmodel.RPropKind.RPropText )
+        P_( out_, "items_source", rmodel.RPropKind.RPropText )
+        P_( out_, "sql", rmodel.RPropKind.RPropText )
+        P_( out_, "design_db", rmodel.RPropKind.RPropText )
+        P_( out_, "grid", rmodel.RPropKind.RPropText )
+        P_( out_, "sort", rmodel.RPropKind.RPropText )
+        P_( out_, "filter", rmodel.RPropKind.RPropText )
+        P_( out_, "fields", rmodel.RPropKind.RPropText )
+    case RSet.RSetParams
+        if i < 0 then exit sub
+        P_( out_, "name", rmodel.RPropKind.RPropText )
+        P_( out_, "type", rmodel.RPropKind.RPropEnum, "text,int,float,bool,date,time" )
+        P_( out_, "default", rmodel.RPropKind.RPropText )
+        P_( out_, "prompt", rmodel.RPropKind.RPropText )
+        P_( out_, "required", rmodel.RPropKind.RPropBool )
+    case RSet.RSetGroups
+        if i < 0 then
+            P_( out_, "sort", rmodel.RPropKind.RPropText )
+            exit sub
+        end if
+        P_( out_, "group", rmodel.RPropKind.RPropText )
+        P_( out_, "descending", rmodel.RPropKind.RPropBool )
+        P_( out_, "repeat", rmodel.RPropKind.RPropBool )
+        P_( out_, "page_break_before", rmodel.RPropKind.RPropBool )
+        P_( out_, "footer", rmodel.RPropKind.RPropBool )
+    case RSet.RSetRules
+        if i < 0 then exit sub
+        P_( out_, "when", rmodel.RPropKind.RPropText )
+        P_( out_, "fore", rmodel.RPropKind.RPropText )
+        P_( out_, "back", rmodel.RPropKind.RPropText )
+        P_( out_, "bold", rmodel.RPropKind.RPropEnum, ",true,false" )
+        P_( out_, "italic", rmodel.RPropKind.RPropEnum, ",true,false" )
+        P_( out_, "hide", rmodel.RPropKind.RPropBool )
+    case RSet.RSetCalcs
+        if i < 0 then exit sub
+        dim as ustring names
+        for k as int32 = 0 to Def->nSources - 1
+            if len( names ) then names &= ","
+            names &= Def->sources(k).name_
+        next
+        P_( out_, "source", rmodel.RPropKind.RPropEnum, names )
+        P_( out_, "name", rmodel.RPropKind.RPropText )
+        P_( out_, "expr", rmodel.RPropKind.RPropText )
+    end select
+end sub
+
+' A source's field snapshot as one line: "Customer, Amount:int" (text needs no kind).
+private function FieldsText_( byref s as TKRD_SOURCE ) as ustring
+    dim as ustring t
+    for k as int32 = 0 to s.nFields - 1
+        if len( t ) then t &= ", "
+        t &= s.fields(k).name_
+        if s.fields(k).kind <> TKV_TEXT then t &= ":" & tkReportDef_KindName( s.fields(k).kind )
+    next
+    return t
+end function
+
+private function Tri_( byval v as int32 ) as ustring
+    if v = 1 then return "true"
+    if v = 0 then return "false"
+    return ""
+end function
+
+function RecordSet.GetValue( byval i as int32, byref key_ as const ustring ) as ustring
+    select case Kind
+    case RSet.RSetSources
+        if (i < 0) orelse (i >= Def->nSources) then return ""
+        dim byref as TKRD_SOURCE s = Def->sources(i)
+        select case key_
+        case "name" : return s.name_
+        case "kind" : return s.kind
+        case "parent" : return s.parent
+        case "relation" : return s.relation
+        case "item_type" : return s.itemType
+        case "items_source" : return s.itemsSource
+        case "sql" : return s.sql
+        case "design_db" : return s.designDb
+        case "grid" : return s.grid
+        case "sort" : return s.sort
+        case "filter" : return s.filter
+        case "fields" : return FieldsText_( s )
+        end select
+    case RSet.RSetParams
+        if (i < 0) orelse (i >= Def->nParams) then return ""
+        dim byref as TKRD_PARAM p = Def->params(i)
+        select case key_
+        case "name" : return p.name_
+        case "type" : return tkReportDef_KindName( p.kind )
+        case "default" : return p.default_
+        case "prompt" : return p.prompt
+        case "required" : return B_( p.required )
+        end select
+    case RSet.RSetGroups
+        if i < 0 then
+            if key_ = "sort" then return Extra
+            return ""
+        end if
+        dim as int32 b = this.HeaderOf( i )
+        if b < 0 then return ""
+        select case key_
+        case "group" : return Def->bands(b).group_
+        case "descending" : return B_( (i < Desc.Count( )) andalso Desc[i] )
+        case "repeat" : return B_( Def->bands(b).repeat_ )
+        case "page_break_before" : return B_( Def->bands(b).breakBefore )
+        case "footer" : return B_( this.FooterOf( i ) >= 0 )
+        end select
+    case RSet.RSetRules
+        dim as int32 ii = tkReportDef_FindItem( Def, Item )
+        if (ii < 0) orelse (i < 0) orelse (i >= Def->items(ii).nRules) then return ""
+        dim byref as TKRD_RULE r = Def->items(ii).rules(i)
+        select case key_
+        case "when" : return r.when_
+        case "fore" : return r.fore
+        case "back" : return r.back
+        case "bold" : return Tri_( r.bold )
+        case "italic" : return Tri_( r.italic )
+        case "hide" : return B_( r.hide )
+        end select
+    case RSet.RSetCalcs
+        if (i < 0) orelse (i >= Def->nCalcs) then return ""
+        select case key_
+        case "source" : return Def->calcs(i).source
+        case "name" : return Def->calcs(i).name_
+        case "expr" : return Def->calcs(i).expr
+        end select
+    end select
+    return ""
+end function
+
+' A source renamed: what names it follows (bands, child sources, calculated fields).
+private sub RenameSource_( byval def as TK_REPORTDEF ptr, byref was as const ustring, byref now_ as const ustring )
+    dim as ustring w = lcase( was )
+    for k as int32 = 0 to def->nBands - 1
+        if lcase( def->bands(k).source ) = w then def->bands(k).source = now_
+    next
+    for k as int32 = 0 to def->nSources - 1
+        if lcase( def->sources(k).parent ) = w then def->sources(k).parent = now_
+    next
+    for k as int32 = 0 to def->nCalcs - 1
+        if lcase( def->calcs(k).source ) = w then def->calcs(k).source = now_
+    next
+end sub
+
+' Whether source src already has a field or another calculated field (not calc self) named n.
+private function CalcNameTaken_( byval def as TK_REPORTDEF ptr, byref src as const ustring, byref n as const ustring, byval self as int32 ) as boolean
+    dim as int32 si = tkReportDef_FindSource( def, src )
+    if si >= 0 then
+        for k as int32 = 0 to def->sources(si).nFields - 1
+            if lcase( def->sources(si).fields(k).name_ ) = lcase( n ) then return true
+        next
+    end if
+    for k as int32 = 0 to def->nCalcs - 1
+        if (k <> self) andalso (lcase( def->calcs(k).source ) = lcase( src )) andalso (lcase( def->calcs(k).name_ ) = lcase( n )) then return true
+    next
+    return false
+end function
+
+function RecordSet.SetValue( byval i as int32, byref key_ as const ustring, byref value as const ustring ) as ustring
+    dim as boolean b = (lcase( trim( value ) ) = "true")
+    select case Kind
+    case RSet.RSetSources
+        if (i < 0) orelse (i >= Def->nSources) then return "?"
+        dim byref as TKRD_SOURCE s = Def->sources(i)
+        select case key_
+        case "name"
+            if IsName_( value ) = false then return value & ": not a name"
+            dim as int32 o = tkReportDef_FindSource( Def, value )
+            if (o >= 0) andalso (o <> i) then return value & ": a source has that name"
+            dim as ustring was = s.name_
+            s.name_ = value
+            RenameSource_( Def, was, value )
+        case "kind" : s.kind = value
+        case "parent" : s.parent = value
+        case "relation" : s.relation = value
+        case "item_type" : s.itemType = value
+        case "items_source" : s.itemsSource = value
+        case "sql" : s.sql = value
+        case "design_db" : s.designDb = value
+        case "grid" : s.grid = value
+        case "sort" : s.sort = value
+        case "filter" : s.filter = value
+        case "fields"
+            ' "Name, Qty:int": each a name, a kind after a colon when not text
+            dim as Array( of ustring ) parts
+            SplitSort( value, parts )
+            dim as Array( of ustring ) names
+            dim as Array( of int32 ) kinds
+            for each part as ustring in parts
+                dim as long c = instr( part, ":" )
+                dim as ustring nm = trim( part ), kn = "text"
+                if c > 0 then
+                    nm = trim( left( part, c - 1 ) )
+                    kn = lcase( trim( mid( part, c + 1 ) ) )
+                end if
+                if IsName_( nm ) = false then return nm & ": not a field name"
+                select case kn
+                case "text", "int", "float", "bool", "date", "time"
+                case else : return kn & ": not a kind (text int float bool date time)"
+                end select
+                names.Push( nm )
+                kinds.Push( tkReportDef_KindOf( kn ) )
+            next
+            tkReportDef_ClearFields( Def, i )
+            for k as int32 = 0 to names.Count( ) - 1
+                tkReportDef_AddField( Def, i, names[k], kinds[k] )
+            next
+        case else : return "?"
+        end select
+    case RSet.RSetParams
+        if (i < 0) orelse (i >= Def->nParams) then return "?"
+        dim byref as TKRD_PARAM p = Def->params(i)
+        select case key_
+        case "name"
+            if IsName_( value ) = false then return value & ": not a name"
+            ' the generated report has a field of that name (rcodegen): a keyword would not compile
+            if validate.IsReserved( value ) then return value & ": a reserved word of tiko, not a parameter's name"
+            dim as int32 o = tkReportDef_FindParam( Def, value )
+            if (o >= 0) andalso (o <> i) then return value & ": a parameter has that name"
+            p.name_ = value
+        case "type" : p.kind = tkReportDef_KindOf( value )
+        case "default" : p.default_ = value
+        case "prompt" : p.prompt = value
+        case "required" : p.required = b
+        case else : return "?"
+        end select
+    case RSet.RSetGroups
+        if i < 0 then
+            if key_ <> "sort" then return "?"
+            Extra = trim( value )
+            this.ApplySort( )
+            return ""
+        end if
+        dim as int32 hb = this.HeaderOf( i )
+        if hb < 0 then return "?"
+        select case key_
+        case "group" : Def->bands(hb).group_ = value
+        case "descending"
+            while Desc.Count( ) <= i
+                dim as boolean f_ = false
+                Desc.Push( f_ )
+            wend
+            Desc[i] = b
+        case "repeat" : Def->bands(hb).repeat_ = b
+        case "page_break_before" : Def->bands(hb).breakBefore = b
+        case "footer"
+            dim as int32 fb = this.FooterOf( i )
+            if b andalso (fb < 0) then
+                dim as TKRD_BAND f
+                f.kind = "group_footer"
+                f.level = i
+                f.id = "groupFooter" & (i + 1)
+                dim as int32 n = 2
+                while tkReportDef_FindBand( Def, f.id ) >= 0
+                    f.id = "groupFooter" & (i + 1) & "_" & n
+                    n += 1
+                wend
+                tkReportDef_AddBand( Def, f )
+            elseif (b = false) andalso (fb >= 0) then
+                redits.DeleteBand( Def, Def->bands(fb).id )
+            end if
+        case else : return "?"
+        end select
+        this.ApplySort( )
+    case RSet.RSetRules
+        dim as int32 ii = tkReportDef_FindItem( Def, Item )
+        if (ii < 0) orelse (i < 0) orelse (i >= Def->items(ii).nRules) then return "?"
+        dim byref as TKRD_RULE r = Def->items(ii).rules(i)
+        select case key_
+        case "when" : r.when_ = value
+        case "fore" : r.fore = value
+        case "back" : r.back = value
+        case "bold"
+            r.bold = -1
+            if value = "true" then r.bold = 1
+            if value = "false" then r.bold = 0
+        case "italic"
+            r.italic = -1
+            if value = "true" then r.italic = 1
+            if value = "false" then r.italic = 0
+        case "hide" : r.hide = b
+        case else : return "?"
+        end select
+    case RSet.RSetCalcs
+        if (i < 0) orelse (i >= Def->nCalcs) then return "?"
+        dim byref as TKRD_CALC c = Def->calcs(i)
+        select case key_
+        case "source"
+            if tkReportDef_FindSource( Def, value ) < 0 then return value & ": not a source"
+            if CalcNameTaken_( Def, value, c.name_, i ) then return value & ": has a field named " & c.name_
+            c.source = value
+        case "name"
+            if IsName_( value ) = false then return value & ": not a name"
+            if CalcNameTaken_( Def, c.source, value, i ) then return value & ": " & c.source & " has a field of that name"
+            c.name_ = value
+        case "expr"
+            ' compiled as the report will: over the source's own fields, the parameters, the other calcs
+            if len( trim( value ) ) = 0 then return "a calculated field needs an expression"
+            dim as TKREXPR_SCHEMA sch
+            rmodel.SchemaFor( Def, "", true, sch )
+            sch.defaultSource = c.source
+            dim as TKREXPR_ERROR e
+            dim as TK_REXPR ptr x = tkRExpr_Compile( value, sch, e )
+            if x = 0 then return e.msg
+            tkRExpr_Destroy( x )
+            c.expr = value
+        case else : return "?"
+        end select
+    end select
+    return ""
+end function
+
+' A new record, last; "" or why not.
+function RecordSet.Add( ) as ustring
+    select case Kind
+    case RSet.RSetSources
+        dim as TKRD_SOURCE s
+        s.name_ = "Source1"
+        dim as int32 n = 2
+        while tkReportDef_FindSource( Def, s.name_ ) >= 0
+            s.name_ = "Source" & n
+            n += 1
+        wend
+        tkReportDef_AddSource( Def, s )
+    case RSet.RSetParams
+        dim as TKRD_PARAM p
+        p.name_ = "Param1"
+        dim as int32 n = 2
+        while tkReportDef_FindParam( Def, p.name_ ) >= 0
+            p.name_ = "Param" & n
+            n += 1
+        wend
+        tkReportDef_AddParam( Def, p )
+    case RSet.RSetGroups
+        ' the new innermost level, with its footer
+        redits.InsertBand( Def, "group_header" )
+        redits.InsertBand( Def, "group_footer" )
+        dim as boolean f0 = false
+        Desc.Push( f0 )
+        this.ApplySort( )
+    case RSet.RSetRules
+        dim as int32 ii = tkReportDef_FindItem( Def, Item )
+        if ii < 0 then return "?"
+        dim as TKRD_RULE r
+        tkReportDef_AddRule( Def, ii, r )
+    case RSet.RSetCalcs
+        ' on the top-level detail's source (else the first), a name it has no field of, a 0 to edit
+        if Def->nSources = 0 then return "a calculated field needs a data source first"
+        dim as TKRD_CALC c
+        dim as int32 si = this.DetailSource( )
+        if si < 0 then si = 0
+        c.source = Def->sources(si).name_
+        c.name_ = "Calc1"
+        dim as int32 n = 2
+        while CalcNameTaken_( Def, c.source, c.name_, -1 )
+            c.name_ = "Calc" & n
+            n += 1
+        wend
+        c.expr = "0"
+        tkReportDef_AddCalc( Def, c )
+    end select
+    return ""
+end function
+
+function RecordSet.Remove( byval i as int32 ) as ustring
+    if (i < 0) orelse (i >= this.Count( )) then return "?"
+    select case Kind
+    case RSet.RSetSources
+        dim as ustring nm = lcase( Def->sources(i).name_ )
+        for k as int32 = 0 to Def->nBands - 1
+            if lcase( Def->bands(k).source ) = nm then return Def->sources(i).name_ & ": band '" & Def->bands(k).id & "' shows it"
+        next
+        for k as int32 = 0 to Def->nSources - 1
+            if lcase( Def->sources(k).parent ) = nm then return Def->sources(i).name_ & ": source '" & Def->sources(k).name_ & "' is its child"
+        next
+        for k as int32 = 0 to Def->nCalcs - 1
+            if lcase( Def->calcs(k).source ) = nm then return Def->sources(i).name_ & ": calculated field '" & Def->calcs(k).name_ & "' is on it"
+        next
+        tkReportDef_RemoveSource( Def, i )
+    case RSet.RSetParams
+        tkReportDef_RemoveParam( Def, i )
+    case RSet.RSetGroups
+        ' the level's header and footer; the levels inside move up one
+        dim as int32 hb = this.HeaderOf( i )
+        if hb >= 0 then redits.DeleteBand( Def, Def->bands(hb).id )
+        dim as int32 fb = this.FooterOf( i )
+        if fb >= 0 then redits.DeleteBand( Def, Def->bands(fb).id )
+        for k as int32 = 0 to Def->nBands - 1
+            dim byref as TKRD_BAND bd = Def->bands(k)
+            if (len( bd.parent ) = 0) andalso ((bd.kind = "group_header") orelse (bd.kind = "group_footer")) andalso (bd.level > i) then bd.level -= 1
+        next
+        if i < Desc.Count( ) then Desc.Remove( i )
+        this.ApplySort( )
+    case RSet.RSetRules
+        tkReportDef_RemoveRule( Def, tkReportDef_FindItem( Def, Item ), i )
+    case RSet.RSetCalcs
+        tkReportDef_RemoveCalc( Def, i )
+    end select
+    return ""
+end function
+
+' Record i up (delta -1) or down (+1); false at an end. A group level swaps with its neighbour.
+function RecordSet.Move( byval i as int32, byval delta as int32 ) as boolean
+    dim as int32 j = i + delta
+    if (i < 0) orelse (j < 0) orelse (i >= this.Count( )) orelse (j >= this.Count( )) then return false
+    select case Kind
+    case RSet.RSetSources : tkReportDef_SwapSources( Def, i, j )
+    case RSet.RSetParams : tkReportDef_SwapParams( Def, i, j )
+    case RSet.RSetGroups
+        dim as int32 hi = this.HeaderOf( i ), hj = this.HeaderOf( j ), fi = this.FooterOf( i ), fj = this.FooterOf( j )
+        Def->bands(hi).level = j
+        Def->bands(hj).level = i
+        if fi >= 0 then Def->bands(fi).level = j
+        if fj >= 0 then Def->bands(fj).level = i
+        while Desc.Count( ) <= j
+            dim as boolean f1 = false
+            Desc.Push( f1 )
+        wend
+        dim as boolean t = Desc[i]
+        Desc[i] = Desc[j]
+        Desc[j] = t
+        this.ApplySort( )
+    case RSet.RSetRules : tkReportDef_SwapRules( Def, tkReportDef_FindItem( Def, Item ), i, j )
+    case RSet.RSetCalcs : tkReportDef_SwapCalcs( Def, i, j )
+    end select
+    return true
+end function

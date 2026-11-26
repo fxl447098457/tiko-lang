@@ -1,0 +1,1417 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkTimePicker -- a time-of-day field: segments you type into and step, a dropdown chooser (or a
+' spin pair). New in tkControls; the design is C:\dev\docs\tkControls\TIMEPICKER.md. This is
+' phases T2 (the field, here and in tpkEdit.tiko) and T3 (the dropdown, tpkPopup.tiko).
+'
+' THE FIELD is painted by the control (no tkTextBox): the pattern's segments -- hour, minute,
+' second, fraction, AM/PM -- with one of them focused. Digits fill the focused segment and move on;
+' Up/Down step it (wrapping inside the segment, no carry); Left/Right move between segments. A
+' partial entry completes on its second digit, on a separator, on a pause, on Enter or when the
+' focus leaves. The frame, divider and button cell are tkDatePicker's layout, so the two look like
+' siblings side by side.
+'
+' THE VALUE is a TKTIME (tkTimePanel): wHour = -1 is "no time". Setters are silent and keep every
+' part; a USER edit zeroes the parts the pattern does not show and clamps to the range.
+' TimeChanged fires once per completed change, never for a partial entry, never from a setter.
+'
+' THE BUTTON CELL is a dropdown (tkTimePanel in a popup, with an optional Now / OK band), a spin
+' pair (step the focused segment, auto-repeat), or none. The dropdown's choices are pending: the
+' field changes only when the user accepts (Enter, OK, a pick in the last column or in the list);
+' Esc, F4, Alt+Up/Down and an outside press dismiss it.
+#module "tkTimePicker"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTimePanel" public
+#import "../tkTooltip" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTimePanel
+using tkTooltip
+
+' ---- constants ---------------------------------------------------------------------------------
+public enum
+    TKTP_BUTTON_DROPDOWN = 0
+    TKTP_BUTTON_SPIN
+    TKTP_BUTTON_NONE
+end enum
+
+public enum
+    TKTPK_HIT_NONE = 0
+    TKTPK_HIT_FIELD
+    TKTPK_HIT_BUTTON                            ' the dropdown button
+    TKTPK_HIT_SPINUP
+    TKTPK_HIT_SPINDOWN
+end enum
+
+' Sizes in design units, scaled once at create (tkDatePicker's values). Border and divider are
+' hairline rules: never scaled.
+public const as long CTP_DEFAULT_ICONWIDTH = 28
+public const as long CTP_DEFAULT_FIELDPAD = 6
+public const as long CTP_DEFAULT_VERTPAD = 5
+public const as long CTP_DEFAULT_CORNERRADIUS = 6
+public const as long CTP_DEFAULT_BORDERTHICK = 1
+public const as long CTP_DEFAULT_DIVIDERTHICK = 1
+public const as long CTP_POP_BORDERTHICK = 1
+public const as long CTP_FOOTERH = 30
+public const as long CTP_DEFAULT_REPEATDELAY = 400
+public const as long CTP_DEFAULT_REPEATINTERVAL = 60
+public const as long TPK_TIMER_ENTRY = TK_TIMER_APP + 1
+
+' ---- types -------------------------------------------------------------------------------------
+' The frame block is tkDatePicker's, value for value, so a picker pair matches under every theme.
+public type TKTIMEPICKER_COLORS
+    BackColor                as ulong = &hFF21252Bul
+    BorderColor              as ulong = &hFF3C424Dul
+    FocusBorderColor         as ulong = &hFF569CD6ul
+    BorderColorDisabled      as ulong = &hFF30343Cul
+    DividerColor             as ulong = &hFF3C424Dul
+    DividerColorDisabled     as ulong = &hFF30343Cul
+    FieldBackColor           as ulong = &hFF2C313Aul
+    FieldForeColor           as ulong = &hFFD7DAE0ul
+    FieldBackColorDisabled   as ulong = &hFF262A31ul
+    FieldForeColorDisabled   as ulong = &hFF5A606Aul
+    IconColor                as ulong = &hFF2C313Aul
+    IconGlyphColor           as ulong = &hFFBEC4CEul
+    IconGlyphColorHot        as ulong = &hFFFFFFFFul
+    IconBackColorHot         as ulong = &hFF383E49ul
+    IconGlyphColorDisabled   as ulong = &hFF5A606Aul
+    ' --- the field's segments ---
+    SegmentBackColorFocused  as ulong = &hFF0078D7ul
+    SegmentForeColorFocused  as ulong = &hFFFFFFFFul
+    PlaceholderColor         as ulong = &hFF8C929Cul
+    ' --- the dropdown ---
+    PanelBackColor           as ulong = &hFF21252Bul
+    PanelBorderColor         as ulong = &hFF464C58ul
+    ItemColor                as ulong = &hFFD2D6DCul
+    ItemColorDisabled        as ulong = &hFF383C44ul
+    ItemBackColorHot         as ulong = &hFF343A44ul
+    ItemForeColorHot         as ulong = &hFFFFFFFFul
+    ItemBackColorSelected    as ulong = &hFF0078D7ul
+    ItemForeColorSelected    as ulong = &hFFFFFFFFul
+    ColumnDividerColor       as ulong = &hFF3C424Dul
+    FooterColor              as ulong = &hFFAAB0BAul
+    FooterColorHot           as ulong = &hFFFFFFFFul
+    FooterColorDisabled      as ulong = &hFF464A52ul
+end type
+
+public type TKTIMEPICKER_PAINTINFO
+    hCtrl        as TK_WIDGET ptr
+    b            as TK_PAINT ptr
+    rcClient     as TKRECT
+    rcFrame      as TKRECT
+    rcField      as TKRECT
+    rcDiv        as TKRECT
+    rcIcon       as TKRECT                ' the button cell (empty with TKTP_BUTTON_NONE)
+    rcUp         as TKRECT                ' spin halves (empty unless TKTP_BUTTON_SPIN)
+    rcDown       as TKRECT
+    isEnabled    as boolean
+    isFocused    as boolean
+    isOpen       as boolean
+    hasTime      as boolean
+    nHotPart     as long                  ' TKTPK_HIT_*
+    nPressedPart as long
+    nFocusSeg    as long                  ' segment index, -1 unfocused
+end type
+
+public type TKTIMEPICKER_MESSAGEINFO
+    hCtrl  as TK_WIDGET ptr
+    msg    as long
+    x      as single
+    y      as single
+    key    as long
+    mods   as long
+    wheelX as single
+    wheelY as single
+end type
+
+public type TKTIMEPICKER_TOOLTIPINFO
+    hCtrl    as TK_WIDGET ptr
+    tm       as TKTIME             ' the value (empty when there is none)
+    hasTime  as boolean
+    nPart    as long               ' TKTPK_HIT_* under the pointer
+    nSegment as long               ' the segment under the pointer, -1 (a literal, the button, outside)
+    outText  as ustring            ' the tip's text: set it, and return TRUE to show it
+end type
+
+' FormatTime: sOut arrives as the pattern's text; set it to show other text at rest ("" keeps it).
+public type TPK_FormatCallbackSub as sub( byval hCtrl as TK_WIDGET ptr, byval pTime as TKTIME ptr, byref sOut as ustring )
+public type TPK_TooltipCallbackFunc as function( byval t as TKTIMEPICKER_TOOLTIPINFO ptr ) as boolean
+public type TPK_TimeChangedCallbackSub as sub( byval hCtrl as TK_WIDGET ptr, byval pTime as TKTIME ptr, byval bHasTime as boolean )
+public type TPK_DropDownCallbackSub as sub( byval hCtrl as TK_WIDGET ptr, byval isOpen as boolean )
+public type TPK_PaintCallbackSub as sub( byval p as TKTIMEPICKER_PAINTINFO ptr )
+public type TPK_ItemDisabledCallbackFunc as function( byval hCtrl as TK_WIDGET ptr, byval nKind as long, byval nValue as long ) as boolean
+public type TPK_MessageCallbackFunc as function( byval m as TKTIMEPICKER_MESSAGEINFO ptr ) as boolean
+
+type TKTIMEPICKER_STATE
+    hWin            as TK_WIDGET ptr
+    idc             as long
+    isEnabled       as boolean = true
+    isFocused       as boolean
+    bColorsPinned   as boolean
+    bShapePinned    as boolean
+    bLayoutDirty    as boolean = true
+    colors          as TKTIMEPICKER_COLORS
+    ' value and rules
+    tm              as TKTIME
+    tMin            as TKTIME
+    tMax            as TKTIME
+    hasMin          as boolean
+    hasMax          as boolean
+    bAllowEmpty     as boolean = true
+    nStep           as long = TKTP_DEFAULT_STEP
+    ' display
+    sPattern        as ustring = TKTP_DEFAULT_PATTERN
+    sAm             as ustring = "AM"
+    sPm             as ustring = "PM"
+    sPlaceholder    as ustring
+    segs(any)       as TKTIME_SEGMENT
+    nSegs           as long
+    segX(any)       as long
+    segW(any)       as long
+    nZeroFrom       as long = 2                  ' the first unit a user edit zeroes: 1 m, 2 s, 3 ms, 4 none
+    ' editing
+    nFocusSeg       as long = -1
+    sEntry          as string                    ' a partial entry's digits
+    bTabMovesSegments as boolean
+    nWheelAccum     as single
+    ' button cell
+    nButtonStyle    as long = TKTP_BUTTON_DROPDOWN
+    nHotPart        as long
+    nPressedPart    as long
+    bRepeatOn       as boolean
+    nRepeatDelay    as long = CTP_DEFAULT_REPEATDELAY
+    nRepeatInterval as long = CTP_DEFAULT_REPEATINTERVAL
+    ' the dropdown's settings
+    nPanelMode      as long = TKTP_PANEL_COLUMNS
+    tListStart      as TKTIME
+    tListEnd        as TKTIME
+    nListInterval   as long = TKTP_DEFAULT_LIST_INTERVAL
+    nVisibleRows    as long = TKTP_DEFAULT_ROWS
+    bShowNow        as boolean
+    bShowOK         as boolean
+    sNowText        as ustring = "Now"
+    sOKText         as ustring = "OK"
+    tNowPinned      as TKTIME
+    bNowPinned      as boolean
+    ' the open dropdown (all 0 while closed)
+    isOpen          as boolean
+    pPop            as TK_HOST ptr
+    wPop            as TK_WIDGET ptr
+    wPanel          as TK_WIDGET ptr
+    wFooter         as TK_WIDGET ptr
+    nFooterHot      as long = -1                 ' 0 Now, 1 OK
+    nClosedBySerial as ulong = &hFFFFFFFFul
+    bSilentClose    as boolean
+    ' fonts and metrics
+    pFont           as TTF_Font ptr              ' borrowed; 0 = the host's
+    pIconFont       as TTF_Font ptr              ' borrowed; 0 = the drawn clock
+    wszIconGlyph    as ustring
+    nIconWidth      as long
+    nFieldPad       as long
+    nVertPadding    as long
+    nCornerRadius   as long
+    nBorderThick    as long = CTP_DEFAULT_BORDERTHICK
+    nDividerThick   as long = CTP_DEFAULT_DIVIDERTHICK
+    nFooterH        as long
+    rcFrame         as TKRECT
+    rcField         as TKRECT
+    rcDiv           as TKRECT
+    rcIcon          as TKRECT
+    rcUp            as TKRECT
+    rcDown          as TKRECT
+    ' callbacks
+    TimeChangedCallback  as TPK_TimeChangedCallbackSub
+    DropDownCallback     as TPK_DropDownCallbackSub
+    PaintCallback        as TPK_PaintCallbackSub
+    ItemDisabledCallback as TPK_ItemDisabledCallbackFunc
+    MessageCallback      as TPK_MessageCallbackFunc
+    FormatCallback       as TPK_FormatCallbackSub
+    TooltipCallback      as TPK_TooltipCallbackFunc
+    tip                  as TKTIPHOST_STATE
+    nMouseX              as long = -1
+    nMouseY              as long = -1
+end type
+
+dim shared as TKTIMEPICKER_STATE ptr gOpenTimePicker     ' one dropdown open per process
+
+
+' ==========================================================================================
+' State helpers
+' ==========================================================================================
+function TPK( byval w as TK_WIDGET ptr ) as TKTIMEPICKER_STATE ptr
+    if w = 0 then return 0
+    return cast( TKTIMEPICKER_STATE ptr, w->pData )
+end function
+
+function TpkFont( byval p as TKTIMEPICKER_STATE ptr ) as TTF_Font ptr
+    if p->pFont then return p->pFont
+    return p->hWin->pHost->pDefaultFont
+end function
+
+' The pattern as segments, and what a user edit zeroes.
+sub TpkParse( byval p as TKTIMEPICKER_STATE ptr )
+    p->nSegs = tkTimePanel_ParsePattern( p->sPattern, p->segs() )
+    if p->nSegs = 0 then p->nSegs = tkTimePanel_ParsePattern( TKTP_DEFAULT_PATTERN, p->segs() )
+    redim p->segX( 0 to p->nSegs - 1 )
+    redim p->segW( 0 to p->nSegs - 1 )
+    dim as long finest = 0
+    for i as long = 0 to p->nSegs - 1
+        select case p->segs( i ).kind
+        case TKTP_SEG_MINUTE   : if finest < 1 then finest = 1
+        case TKTP_SEG_SECOND   : if finest < 2 then finest = 2
+        case TKTP_SEG_FRACTION : finest = 3
+        end select
+    next
+    p->nZeroFrom = finest + 1
+    p->sEntry = ""
+    if (p->nFocusSeg >= p->nSegs) orelse ((p->nFocusSeg >= 0) andalso (p->segs( p->nFocusSeg ).kind = TKTP_SEG_LITERAL)) then p->nFocusSeg = -1
+    p->bLayoutDirty = true
+end sub
+
+function TpkIsEditable( byval p as TKTIMEPICKER_STATE ptr, byval i as long ) as boolean
+    if (i < 0) orelse (i >= p->nSegs) then return false
+    return p->segs( i ).kind <> TKTP_SEG_LITERAL
+end function
+
+function TpkFirstSeg( byval p as TKTIMEPICKER_STATE ptr ) as long
+    for i as long = 0 to p->nSegs - 1
+        if TpkIsEditable( p, i ) then return i
+    next
+    return -1
+end function
+
+function TpkLastSeg( byval p as TKTIMEPICKER_STATE ptr ) as long
+    for i as long = p->nSegs - 1 to 0 step -1
+        if TpkIsEditable( p, i ) then return i
+    next
+    return -1
+end function
+
+' The editable segment after (dirn 1) or before (-1) i, or -1.
+function TpkNextSeg( byval p as TKTIMEPICKER_STATE ptr, byval i as long, byval dirn as long ) as long
+    dim as long j = i + dirn
+    while (j >= 0) andalso (j < p->nSegs)
+        if TpkIsEditable( p, j ) then return j
+        j += dirn
+    wend
+    return -1
+end function
+
+function TpkClampMs( byval p as TKTIMEPICKER_STATE ptr, byval ms as long ) as long
+    if p->hasMin andalso (ms < tkTimePanel_TimeToMs( p->tMin )) then ms = tkTimePanel_TimeToMs( p->tMin )
+    if p->hasMax andalso (ms > tkTimePanel_TimeToMs( p->tMax )) then ms = tkTimePanel_TimeToMs( p->tMax )
+    return ms
+end function
+
+' A USER edit's result: the parts the pattern hides zeroed (TIMEPICKER.md D-4), then clamped.
+function TpkFinish( byval p as TKTIMEPICKER_STATE ptr, byval t as TKTIME ) as TKTIME
+    if tkTimePanel_IsTime( t ) = false then return t
+    if p->nZeroFrom <= 1 then t.wMinute = 0
+    if p->nZeroFrom <= 2 then t.wSecond = 0
+    if p->nZeroFrom <= 3 then t.wMilliseconds = 0
+    return tkTimePanel_MsToTime( TpkClampMs( p, tkTimePanel_TimeToMs( t ) ) )
+end function
+
+' The time edits start from: the value, else midnight (D-7).
+function TpkBase( byval p as TKTIMEPICKER_STATE ptr ) as TKTIME
+    if tkTimePanel_IsTime( p->tm ) then return p->tm
+    return tkTimePanel_MakeTime( 0, 0 )
+end function
+
+' The value set by the USER. TRUE when it changed (the caller notifies, last).
+function TpkUserSet( byval p as TKTIMEPICKER_STATE ptr, byref t as const TKTIME ) as boolean
+    dim as boolean bWas = tkTimePanel_IsTime( p->tm ), bNow = tkTimePanel_IsTime( t )
+    if (bWas = bNow) andalso ((bNow = false) orelse tkTimePanel_SameTime( p->tm, t )) then return false
+    if bNow then p->tm = t else p->tm = tkTimePanel_EmptyTime()
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( p->hWin )
+    return true
+end function
+
+' From a snapshot, last: the callback may destroy the picker.
+sub TpkNotify( byval p as TKTIMEPICKER_STATE ptr )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as TKTIME t = p->tm
+    dim as TPK_TimeChangedCallbackSub cb = p->TimeChangedCallback
+    if cb then cb( w, @t, tkTimePanel_IsTime( t ) )
+end sub
+
+function TpkCallMessage( byval p as TKTIMEPICKER_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKTIMEPICKER_MESSAGEINFO mi
+    mi.hCtrl = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    mi.key = m->key : mi.mods = m->mods
+    mi.wheelX = m->wheelX : mi.wheelY = m->wheelY
+    return p->MessageCallback( @mi )
+end function
+
+' ---- what the field shows ------------------------------------------------------------------------
+' t as text: the pattern's, then FormatTime's say ("" from it keeps the pattern's). "" for no time.
+function TpkFormatOf( byval p as TKTIMEPICKER_STATE ptr, byref t as const TKTIME ) as ustring
+    if tkTimePanel_IsTime( t ) = false then return ""
+    dim as ustring sOut = tkTimePanel_FormatPattern( t, p->sPattern, p->sAm, p->sPm )
+    if p->FormatCallback then
+        dim as ustring sDef = sOut
+        dim as TKTIME tc = t
+        p->FormatCallback( p->hWin, @tc, sOut )
+        if len( sOut ) = 0 then sOut = sDef
+    end if
+    return sOut
+end function
+
+' At rest -- unfocused, a time, no pending entry -- a FormatTime callback's text replaces the segments.
+function TpkShowsFormat( byval p as TKTIMEPICKER_STATE ptr ) as boolean
+    return (p->FormatCallback <> 0) andalso (p->isFocused = false) andalso tkTimePanel_IsTime( p->tm ) _
+           andalso (len( p->sEntry ) = 0)
+end function
+
+function TpkSegText( byval p as TKTIMEPICKER_STATE ptr, byval i as long ) as ustring
+    with p->segs( i )
+        if .kind = TKTP_SEG_LITERAL then return .text
+        if (i = p->nFocusSeg) andalso (len( p->sEntry ) > 0) then return p->sEntry
+        if tkTimePanel_IsTime( p->tm ) then return tkTimePanel_SegmentText( .kind, .nLen, p->tm, p->sAm, p->sPm )
+        if .kind = TKTP_SEG_FRACTION then return string( .nLen, "-" )
+        return "--"
+    end with
+end function
+
+' ---- layout -------------------------------------------------------------------------------------
+' tkDatePicker's layout: the button cell = the right nIconWidth pixels, the divider left of it, the
+' field from left + radius to the divider, inset by the border. No button: no cell, no divider.
+sub TpkLayout( byval p as TKTIMEPICKER_STATE ptr )
+    dim as long cw = p->hWin->cw, ch = p->hWin->ch
+    p->bLayoutDirty = false
+    tkRect_Set( p->rcFrame, 0, 0, cw, ch )
+    tkRect_Set( p->rcIcon, cw, 0, cw, ch )
+    tkRect_Set( p->rcDiv, cw, 0, cw, ch )
+    tkRect_Set( p->rcUp, 0, 0, 0, 0 )
+    tkRect_Set( p->rcDown, 0, 0, 0, 0 )
+    dim as long fr = cw - p->nBorderThick
+    if p->nButtonStyle <> TKTP_BUTTON_NONE then
+        tkRect_Set( p->rcIcon, cw - p->nIconWidth, 0, cw, ch )
+        tkRect_Set( p->rcDiv, p->rcIcon.left - p->nDividerThick, 0, p->rcIcon.left, ch )
+        fr = p->rcDiv.left
+        if p->nButtonStyle = TKTP_BUTTON_SPIN then
+            dim as long mid_ = ch \ 2
+            tkRect_Set( p->rcUp, p->rcIcon.left, 0, cw, mid_ )
+            tkRect_Set( p->rcDown, p->rcIcon.left, mid_, cw, ch )
+        end if
+    end if
+    dim as long fl = p->nCornerRadius
+    if fr < fl then fr = fl
+    dim as long ft = p->nBorderThick, fb = ch - p->nBorderThick
+    if fb < ft then fb = ft
+    tkRect_Set( p->rcField, fl, ft, fr, fb )
+    ' the segments, left to right from the field's padding, each as wide as its text
+    dim as TTF_Font ptr f = TpkFont( p )
+    dim as long x = p->rcField.left + p->nFieldPad
+    for i as long = 0 to p->nSegs - 1
+        p->segX( i ) = x
+        p->segW( i ) = tkText_Width( f, TpkSegText( p, i ) )
+        x += p->segW( i )
+    next
+end sub
+
+sub TpkEnsureLayout( byval p as TKTIMEPICKER_STATE ptr )
+    ' segment widths follow the text, which changes with every edit: lay out on demand
+    TpkLayout( p )
+end sub
+
+sub TpkRefresh( byval p as TKTIMEPICKER_STATE ptr )
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+function TpkHit( byval p as TKTIMEPICKER_STATE ptr, byval x as single, byval y as single ) as long
+    TpkEnsureLayout( p )
+    if (x < 0) orelse (y < 0) orelse (x >= p->hWin->cw) orelse (y >= p->hWin->ch) then return TKTPK_HIT_NONE
+    select case p->nButtonStyle
+    case TKTP_BUTTON_DROPDOWN
+        if tkRect_Contains( p->rcIcon, x, y ) then return TKTPK_HIT_BUTTON
+    case TKTP_BUTTON_SPIN
+        if tkRect_Contains( p->rcUp, x, y ) then return TKTPK_HIT_SPINUP
+        if tkRect_Contains( p->rcDown, x, y ) then return TKTPK_HIT_SPINDOWN
+    end select
+    return TKTPK_HIT_FIELD
+end function
+
+' The editable segment at x: the one under it, else the nearest.
+function TpkSegAt( byval p as TKTIMEPICKER_STATE ptr, byval x as long ) as long
+    TpkEnsureLayout( p )
+    dim as long best = -1, bestD = &h7FFFFFFF
+    for i as long = 0 to p->nSegs - 1
+        if TpkIsEditable( p, i ) then
+            dim as long d = 0
+            if x < p->segX( i ) then
+                d = p->segX( i ) - x
+            elseif x >= p->segX( i ) + p->segW( i ) then
+                d = x - (p->segX( i ) + p->segW( i )) + 1
+            end if
+            if d < bestD then best = i : bestD = d
+        end if
+    next
+    return best
+end function
+
+' ---- painting -----------------------------------------------------------------------------------
+' The drawn clock: a ring and two hands, until a glyph font is handed over.
+sub TpkPaintClock( byval b as TK_PAINT ptr, byref rc as TKRECT, byval clrGlyph as ulong, byval clrBack as ulong )
+    dim as long d = ((rc.right - rc.left) * 5) \ 9
+    if d < 6 then exit sub
+    dim as long x = rc.left + ((rc.right - rc.left) - d) \ 2
+    dim as long y = rc.top + ((rc.bottom - rc.top) - d) \ 2
+    dim as long th = (d + 8) \ 16
+    if th < 1 then th = 1
+    dim as TKRECT r
+    tkRect_Set( r, x, y, x + d, y + d )
+    b->SetBackColor( clrBack )
+    b->SetPenColor( clrGlyph )
+    b->PaintEllipse( @r, th )
+    dim as long cx = x + d \ 2, cy = y + d \ 2
+    b->SetPenColor( clrGlyph )
+    b->PaintLine( th, cx, cy, cx, y + (d * 2) \ 9 )                ' minute hand, to 12
+    b->PaintLine( th, cx, cy, x + (d * 3) \ 4 - th, cy )           ' hour hand, to 3
+end sub
+
+' A small chevron, up or down, centred in rc.
+sub TpkPaintChevron( byval b as TK_PAINT ptr, byref rc as TKRECT, byval bUp as boolean, byval clr as ulong, byval th as long )
+    dim as long w = (rc.right - rc.left) \ 3
+    if w < 4 then w = 4
+    dim as long hgt = w \ 2
+    dim as long cx = (rc.left + rc.right) \ 2, cy = (rc.top + rc.bottom) \ 2
+    dim as TKPOINT pts( 0 to 2 )
+    pts( 0 ).x = cx - w \ 2 : pts( 2 ).x = cx + w \ 2 : pts( 1 ).x = cx
+    if bUp then
+        pts( 0 ).y = cy + hgt \ 2 : pts( 2 ).y = pts( 0 ).y : pts( 1 ).y = cy - hgt \ 2
+    else
+        pts( 0 ).y = cy - hgt \ 2 : pts( 2 ).y = pts( 0 ).y : pts( 1 ).y = cy + hgt \ 2
+    end if
+    b->SetPenColor( clr )
+    b->PaintPolyline( @pts( 0 ), 3, th )
+end sub
+
+sub TpkRenderDefault( byval p as TKTIMEPICKER_STATE ptr, byval pi as TKTIMEPICKER_PAINTINFO ptr )
+    dim as TK_PAINT ptr b = pi->b
+    dim as long cw = pi->rcFrame.right - pi->rcFrame.left, ch = pi->rcFrame.bottom - pi->rcFrame.top
+    if (cw <= 0) orelse (ch <= 0) then exit sub
+    dim as long ell = p->nCornerRadius * 2
+    dim as TKRECT rcFrame = pi->rcFrame
+    b->SetBackColor( iif( pi->isEnabled, p->colors.FieldBackColor, p->colors.FieldBackColorDisabled ) )
+    b->PaintRoundRect( @rcFrame, ell )
+    ' the button cell, extended inward past the divider so only its outer corners round
+    if p->nButtonStyle <> TKTP_BUTTON_NONE then
+        dim as long ext = p->nCornerRadius + p->nDividerThick + 1
+        dim as TKRECT rcFill
+        tkRect_Set( rcFill, pi->rcIcon.left - ext, pi->rcIcon.top, pi->rcIcon.right, pi->rcIcon.bottom )
+        dim as boolean bLit = (p->nButtonStyle = TKTP_BUTTON_DROPDOWN) andalso _
+                              ((pi->nHotPart = TKTPK_HIT_BUTTON) orelse (pi->nPressedPart = TKTPK_HIT_BUTTON) orelse pi->isOpen)
+        b->SetBackColor( iif( pi->isEnabled andalso bLit, p->colors.IconBackColorHot, p->colors.IconColor ) )
+        b->PaintRoundRect( @rcFill, ell )
+        if p->nDividerThick > 0 then
+            dim as TKRECT rcDiv = pi->rcDiv
+            b->SetBackColor( iif( pi->isEnabled, p->colors.DividerColor, p->colors.DividerColorDisabled ) )
+            b->PaintRect( @rcDiv )
+        end if
+        if p->nButtonStyle = TKTP_BUTTON_DROPDOWN then
+            dim as ulong clrGlyph = p->colors.IconGlyphColor
+            if pi->isEnabled = false then
+                clrGlyph = p->colors.IconGlyphColorDisabled
+            elseif bLit then
+                clrGlyph = p->colors.IconGlyphColorHot
+            end if
+            dim as TKRECT rcIcon = pi->rcIcon
+            if (p->pIconFont <> 0) andalso (len( p->wszIconGlyph ) > 0) then
+                b->SetFont( p->pIconFont )
+                b->SetForeColor( clrGlyph )
+                b->PaintText( p->wszIconGlyph, @rcIcon, TK_DT_CENTER )
+            else
+                TpkPaintClock( b, rcIcon, clrGlyph, iif( pi->isEnabled andalso bLit, p->colors.IconBackColorHot, p->colors.IconColor ) )
+            end if
+        else
+            dim as long th = cint( p->hWin->pHost->fScale * 1.5 )      ' 2 px at 1.0, 3 at 1.75
+            if th < 1 then th = 1
+            for k as long = 0 to 1
+                dim as TKRECT r = pi->rcDown
+                if k = 0 then r = pi->rcUp
+                dim as long part = iif( k = 0, TKTPK_HIT_SPINUP, TKTPK_HIT_SPINDOWN )
+                dim as ulong clr = p->colors.IconGlyphColor
+                if pi->isEnabled = false then
+                    clr = p->colors.IconGlyphColorDisabled
+                elseif (pi->nHotPart = part) orelse (pi->nPressedPart = part) then
+                    clr = p->colors.IconGlyphColorHot
+                end if
+                TpkPaintChevron( b, r, k = 0, clr, th )
+            next
+        end if
+    end if
+    ' the segments
+    dim as TTF_Font ptr f = TpkFont( p )
+    b->SetFont( f )
+    dim as boolean bEmpty = (pi->hasTime = false) andalso (len( p->sEntry ) = 0)
+    if TpkShowsFormat( p ) then
+        dim as TKRECT rcF = pi->rcField
+        rcF.left += p->nFieldPad
+        b->SetForeColor( iif( pi->isEnabled, p->colors.FieldForeColor, p->colors.FieldForeColorDisabled ) )
+        b->PaintText( TpkFormatOf( p, p->tm ), @rcF, TK_DT_LEFT or TK_DT_ELLIPSIS )
+    elseif bEmpty andalso (len( p->sPlaceholder ) > 0) andalso (pi->isFocused = false) then
+        dim as TKRECT rcT = pi->rcField
+        rcT.left += p->nFieldPad
+        b->SetForeColor( iif( pi->isEnabled, p->colors.PlaceholderColor, p->colors.FieldForeColorDisabled ) )
+        b->PaintText( p->sPlaceholder, @rcT, TK_DT_LEFT or TK_DT_ELLIPSIS )
+    else
+        dim as TKRECT rcClip = pi->rcField
+        b->PushClip( @rcClip )
+        dim as long textH = tkText_Height( f )
+        dim as long cy = (pi->rcField.top + pi->rcField.bottom) \ 2
+        for i as long = 0 to p->nSegs - 1
+            dim as TKRECT rs
+            tkRect_Set( rs, p->segX( i ), pi->rcField.top, p->segX( i ) + p->segW( i ), pi->rcField.bottom )
+            dim as ulong fore = p->colors.FieldForeColor
+            if pi->isEnabled = false then
+                fore = p->colors.FieldForeColorDisabled
+            elseif bEmpty andalso (p->segs( i ).kind <> TKTP_SEG_LITERAL) then
+                fore = p->colors.PlaceholderColor
+            end if
+            if pi->isFocused andalso pi->isEnabled andalso (i = pi->nFocusSeg) then
+                dim as TKRECT rh
+                tkRect_Set( rh, rs.left - 1, cy - textH \ 2, rs.right + 1, cy - textH \ 2 + textH )
+                b->SetBackColor( p->colors.SegmentBackColorFocused )
+                b->PaintRect( @rh )
+                fore = p->colors.SegmentForeColorFocused
+            end if
+            b->SetForeColor( fore )
+            b->PaintText( TpkSegText( p, i ), @rs, TK_DT_LEFT or TK_DT_NOCLIP )
+        next
+        b->PopClip()
+    end if
+    ' the outline last
+    if p->nBorderThick > 0 then
+        dim as ulong clrBorder = p->colors.BorderColor
+        if pi->isEnabled = false then
+            clrBorder = p->colors.BorderColorDisabled
+        elseif pi->isFocused orelse pi->isOpen then
+            clrBorder = p->colors.FocusBorderColor
+        end if
+        b->SetPenColor( clrBorder )
+        b->PaintRoundOutline( @rcFrame, ell, p->nBorderThick )
+    end if
+end sub
+
+sub TpkPaint( byval p as TKTIMEPICKER_STATE ptr, byval b as TK_PAINT ptr )
+    TpkEnsureLayout( p )
+    dim as TKTIMEPICKER_PAINTINFO pi
+    pi.hCtrl = p->hWin : pi.b = b
+    tkRect_Set( pi.rcClient, 0, 0, p->hWin->cw, p->hWin->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @pi.rcClient )
+    pi.rcFrame = p->rcFrame : pi.rcField = p->rcField : pi.rcDiv = p->rcDiv : pi.rcIcon = p->rcIcon
+    pi.rcUp = p->rcUp : pi.rcDown = p->rcDown
+    pi.isEnabled = p->isEnabled : pi.isFocused = p->isFocused : pi.isOpen = p->isOpen
+    pi.hasTime = tkTimePanel_IsTime( p->tm )
+    pi.nHotPart = p->nHotPart : pi.nPressedPart = p->nPressedPart
+    pi.nFocusSeg = iif( p->isFocused, p->nFocusSeg, -1 )
+    if p->PaintCallback then p->PaintCallback( @pi ) else TpkRenderDefault( p, @pi )
+end sub
+
+sub TpkSetHot( byval p as TKTIMEPICKER_STATE ptr, byval part as long )
+    if part <> p->nHotPart then p->nHotPart = part : tkWidget_Invalidate( p->hWin )
+end sub
+
+sub TpkRescale( byval p as TKTIMEPICKER_STATE ptr, byval fOld as single, byval fNew as single )
+    if (fOld <= 0) orelse (fNew <= 0) orelse (fOld = fNew) then exit sub
+    dim as single k = fNew / fOld
+    p->nIconWidth = cint( p->nIconWidth * k )
+    p->nFieldPad = cint( p->nFieldPad * k )
+    p->nVertPadding = cint( p->nVertPadding * k )
+    p->nCornerRadius = cint( p->nCornerRadius * k )
+    p->nFooterH = cint( p->nFooterH * k )
+    if p->isOpen then tkTimePicker_CloseUp( p->hWin )     ' sized for the old scale
+    TpkRefresh( p )
+end sub
+
+
+' ==========================================================================================
+' The proc
+' ==========================================================================================
+function TpkProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( w )
+    if p = 0 then return false
+    dim as TK_HOST ptr h = w->pHost
+    select case m->msg
+    case TKM_PAINT
+        TpkPaint( p, m->pPaint )
+        return true
+
+    case TKM_SIZE
+        TpkRefresh( p )
+        return true
+
+    case TKM_SCALECHANGED
+        TpkRescale( p, m->fOld, m->fNew )
+        return true
+
+    case TKM_THEMECHANGED
+        tkTimePicker_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+
+    case TKM_MOUSEMOVE
+        p->nMouseX = cint( m->x ) : p->nMouseY = cint( m->y )
+        if p->TooltipCallback then tkTipHost_SetToolIndex( @p->tip, TpkTipIndex( p ) )
+        if TpkCallMessage( p, m ) then return true
+        if p->isEnabled = false then return true
+        dim as long part = TpkHit( p, m->x, m->y )
+        TpkSetHot( p, iif( part = TKTPK_HIT_FIELD, TKTPK_HIT_NONE, part ) )
+        return true
+
+    case TKM_MOUSELEAVE
+        TpkCallMessage( p, m )
+        TpkSetHot( p, TKTPK_HIT_NONE )
+        return true
+
+    case TKM_LBUTTONDOWN
+        if p->isEnabled = false then return true
+        tkTipHost_Pop( @p->tip )
+        if TpkCallMessage( p, m ) then return true
+        return TpkPress( p, m->x, m->y )
+
+    case TKM_LBUTTONUP
+        TpkCallMessage( p, m )
+        TpkRelease( p )
+        return true
+
+    case TKM_CAPTURECHANGED
+        TpkStopRepeat( p )
+        if p->nPressedPart <> TKTPK_HIT_NONE then p->nPressedPart = TKTPK_HIT_NONE : tkWidget_Invalidate( w )
+        return true
+
+    case TKM_TIMER
+        return TpkTimer( p, m->timerId )
+
+    case TKM_SETFOCUS
+        p->isFocused = true
+        if TpkIsEditable( p, p->nFocusSeg ) = false then p->nFocusSeg = TpkFirstSeg( p )
+        tkWidget_Invalidate( w )
+        TpkCallMessage( p, m )
+        return true
+
+    case TKM_KILLFOCUS
+        p->isFocused = false
+        p->nWheelAccum = 0
+        tkWidget_Invalidate( w )
+        dim as boolean bChanged = TpkCommitEntry( p )
+        TpkCallMessage( p, m )
+        if bChanged then TpkNotify( p )
+        return true
+
+    case TKM_KEYDOWN
+        if p->isEnabled = false then return false
+        if TpkCallMessage( p, m ) then return true
+        return TpkKey( p, m->key, m->mods, m->scancode )
+
+    case TKM_MOUSEWHEEL
+        if (p->isEnabled = false) orelse (p->isFocused = false) then return false     ' D-8: it scrolls the form
+        if TpkCallMessage( p, m ) then return true
+        return TpkWheel( p, m->x, m->wheelY )
+
+    case TKM_ENABLE
+        p->isEnabled = m->bFlag
+        if p->isEnabled = false then
+            if p->isOpen then tkTimePicker_CloseUp( w )
+            TpkStopRepeat( p )
+            p->nHotPart = TKTPK_HIT_NONE : p->nPressedPart = TKTPK_HIT_NONE
+            p->sEntry = ""
+        end if
+        tkWidget_Invalidate( w )
+        TpkCallMessage( p, m )
+        return true
+
+    case TKM_DESTROY
+        if p->pPop then
+            p->bSilentClose = true
+            tkHost_Close( p->pPop )
+        end if
+        if gOpenTimePicker = p then gOpenTimePicker = 0
+        tkWidget_KillTimer( w, TK_TIMER_AUTOREPEAT )
+        tkWidget_KillTimer( w, TPK_TIMER_ENTRY )
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' A child of hParent, created 0x0: size it from GetIdealSize.
+public function tkTimePicker_Create( byval hParent as TK_WIDGET ptr, byval CtrlID as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TK_HOST ptr h = hParent->pHost
+    dim as TKTIMEPICKER_STATE ptr p = new TKTIMEPICKER_STATE
+    p->idc = CtrlID
+    p->nIconWidth = tkHost_Scale( h, CTP_DEFAULT_ICONWIDTH )
+    p->nFieldPad = tkHost_Scale( h, CTP_DEFAULT_FIELDPAD )
+    p->nVertPadding = tkHost_Scale( h, CTP_DEFAULT_VERTPAD )
+    p->nCornerRadius = tkHost_Scale( h, CTP_DEFAULT_CORNERRADIUS )
+    p->nFooterH = tkHost_Scale( h, CTP_FOOTERH )
+    p->tListStart = tkTimePanel_MakeTime( 0, 0 )
+    p->tListEnd = tkTimePanel_MakeTime( 23, 59 )
+    TpkParse( p )
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, CtrlID, @TpkProc, p )
+    w->isFocusable = true
+    p->hWin = w
+    p->colors = tkTimePicker_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKTIMEPICKER_COLORS ) \ 4, "TimePicker" )
+    TpkApplyThemeShape( w )
+    return w
+end function
+
+public function tkTimePicker_GetID( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->idc
+end function
+
+public function tkTimePicker_GetEnabled( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return false
+    return p->isEnabled
+end function
+
+public sub tkTimePicker_SetEnabled( byval hCtrl as TK_WIDGET ptr, byval isEnabled as boolean )
+    if hCtrl then tkWidget_Enable( hCtrl, isEnabled )
+end sub
+
+public function tkTimePicker_GetFocused( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return false
+    return p->isFocused
+end function
+
+public sub tkTimePicker_Refresh( byval hCtrl as TK_WIDGET ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then TpkRefresh( p )
+end sub
+
+' ---- value (all silent) ---------------------------------------------------------------------------
+public function tkTimePicker_GetTime( byval hCtrl as TK_WIDGET ptr, byref t as TKTIME ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    t = tkTimePanel_EmptyTime()
+    if p = 0 then return false
+    t = p->tm
+    return tkTimePanel_IsTime( t )
+end function
+
+' Keeps every part (hidden ones too); clamps to the range. An empty t clears -- even without
+' AllowEmpty, which governs the user only.
+public sub tkTimePicker_SetTime( byval hCtrl as TK_WIDGET ptr, byref t as const TKTIME )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->sEntry = ""
+    if tkTimePanel_IsTime( t ) then
+        p->tm = tkTimePanel_MsToTime( TpkClampMs( p, tkTimePanel_TimeToMs( t ) ) )
+    else
+        p->tm = tkTimePanel_EmptyTime()
+    end if
+    TpkRefresh( p )
+end sub
+
+public sub tkTimePicker_ClearTime( byval hCtrl as TK_WIDGET ptr )
+    tkTimePicker_SetTime( hCtrl, tkTimePanel_EmptyTime() )
+end sub
+
+public function tkTimePicker_HasTime( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return false
+    return tkTimePanel_IsTime( p->tm )
+end function
+
+' The bind pair: an empty TKTIME is no time.
+public function tkTimePicker_GetTimeValue( byval hCtrl as TK_WIDGET ptr ) as TKTIME
+    dim as TKTIME t
+    tkTimePicker_GetTime( hCtrl, t )
+    return t
+end function
+
+public sub tkTimePicker_SetTimeValue( byval hCtrl as TK_WIDGET ptr, byval t as TKTIME )
+    tkTimePicker_SetTime( hCtrl, t )
+end sub
+
+' For the form designer (its rows hold numbers).
+public sub tkTimePicker_SetTimeParts( byval hCtrl as TK_WIDGET ptr, byval hh as long, byval mi as long, byval ss as long )
+    tkTimePicker_SetTime( hCtrl, tkTimePanel_MakeTime( hh, mi, ss ) )
+end sub
+
+public sub tkTimePicker_GetRange( byval hCtrl as TK_WIDGET ptr, byref tMin as TKTIME, byref tMax as TKTIME, _
+                                  byref hasMin as boolean, byref hasMax as boolean )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    tMin = p->tMin : tMax = p->tMax : hasMin = p->hasMin : hasMax = p->hasMax
+end sub
+
+' Min <= max (an inverted pair is swapped); an invalid bound is absent. Clamps the value, silently.
+public sub tkTimePicker_SetRange( byval hCtrl as TK_WIDGET ptr, byref tMin as const TKTIME, byref tMax as const TKTIME, _
+                                  byval hasMin as boolean = true, byval hasMax as boolean = true )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->hasMin = hasMin andalso tkTimePanel_IsTime( tMin )
+    p->hasMax = hasMax andalso tkTimePanel_IsTime( tMax )
+    p->tMin = tkTimePanel_EmptyTime()
+    p->tMax = tkTimePanel_EmptyTime()
+    if p->hasMin then p->tMin = tMin
+    if p->hasMax then p->tMax = tMax
+    if p->hasMin andalso p->hasMax andalso (tkTimePanel_CompareTime( p->tMin, p->tMax ) > 0) then swap p->tMin, p->tMax
+    if tkTimePanel_IsTime( p->tm ) then p->tm = tkTimePanel_MsToTime( TpkClampMs( p, tkTimePanel_TimeToMs( p->tm ) ) )
+    TpkRefresh( p )
+end sub
+
+public sub tkTimePicker_SetMinTime( byval hCtrl as TK_WIDGET ptr, byval hh as long, byval mi as long, byval ss as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    tkTimePicker_SetRange( hCtrl, tkTimePanel_MakeTime( hh, mi, ss ), p->tMax, true, p->hasMax )
+end sub
+
+public sub tkTimePicker_SetMaxTime( byval hCtrl as TK_WIDGET ptr, byval hh as long, byval mi as long, byval ss as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    tkTimePicker_SetRange( hCtrl, p->tMin, tkTimePanel_MakeTime( hh, mi, ss ), p->hasMin, true )
+end sub
+
+public function tkTimePicker_GetAllowEmpty( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return false
+    return p->bAllowEmpty
+end function
+
+' Whether the USER may clear the time (Backspace / Delete / Ctrl+X).
+public sub tkTimePicker_SetAllowEmpty( byval hCtrl as TK_WIDGET ptr, byval bAllow as boolean )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then p->bAllowEmpty = bAllow
+end sub
+
+public function tkTimePicker_GetStep( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return TKTP_DEFAULT_STEP
+    return p->nStep
+end function
+
+' Seconds, 1 .. 3600: the dropdown's items, and the step of the finest minute / second segment.
+public sub tkTimePicker_SetStep( byval hCtrl as TK_WIDGET ptr, byval nSeconds as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    if nSeconds < 1 then nSeconds = 1
+    if nSeconds > 3600 then nSeconds = 3600
+    p->nStep = nSeconds
+end sub
+
+' ---- display ------------------------------------------------------------------------------------
+public function tkTimePicker_GetFormat( byval hCtrl as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return ""
+    return p->sPattern
+end function
+
+' The pattern: the field's segments and the dropdown's columns. "" is HH:mm.
+public sub tkTimePicker_SetFormat( byval hCtrl as TK_WIDGET ptr, byval sPattern as ustring )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->sPattern = sPattern
+    if len( sPattern ) = 0 then p->sPattern = TKTP_DEFAULT_PATTERN
+    TpkParse( p )
+    if p->isFocused then p->nFocusSeg = TpkFirstSeg( p )
+    TpkRefresh( p )
+end sub
+
+public sub tkTimePicker_SetAmPmText( byval hCtrl as TK_WIDGET ptr, byval sAm as ustring, byval sPm as ustring )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->sAm = sAm
+    p->sPm = sPm
+    if len( sAm ) = 0 then p->sAm = "AM"
+    if len( sPm ) = 0 then p->sPm = "PM"
+    TpkRefresh( p )
+end sub
+
+' One designator at a time, for the form designer's rows ("" keeps AM / PM).
+public sub tkTimePicker_SetAmText( byval hCtrl as TK_WIDGET ptr, byval sAm as ustring )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then tkTimePicker_SetAmPmText( hCtrl, sAm, p->sPm )
+end sub
+
+public sub tkTimePicker_SetPmText( byval hCtrl as TK_WIDGET ptr, byval sPm as ustring )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then tkTimePicker_SetAmPmText( hCtrl, p->sAm, sPm )
+end sub
+
+public function tkTimePicker_GetAmText( byval hCtrl as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return ""
+    return p->sAm
+end function
+
+public function tkTimePicker_GetPmText( byval hCtrl as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return ""
+    return p->sPm
+end function
+
+public function tkTimePicker_GetPlaceholderText( byval hCtrl as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return ""
+    return p->sPlaceholder
+end function
+
+' Shown instead of the dashes while there is no time and the field is not focused.
+public sub tkTimePicker_SetPlaceholderText( byval hCtrl as TK_WIDGET ptr, byval sText as ustring )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->sPlaceholder = sText
+    tkWidget_Invalidate( hCtrl )
+end sub
+
+' The time as text: the pattern's, or FormatTime's when it says something; "" when there is none.
+' (Ctrl+C copies the pattern's text, which pastes back.)
+public function tkTimePicker_GetText( byval hCtrl as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return ""
+    return TpkFormatOf( p, p->tm )
+end function
+
+public function tkTimePicker_GetButtonStyle( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return TKTP_BUTTON_DROPDOWN
+    return p->nButtonStyle
+end function
+
+public sub tkTimePicker_SetButtonStyle( byval hCtrl as TK_WIDGET ptr, byval nStyle as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    if (nStyle < TKTP_BUTTON_DROPDOWN) orelse (nStyle > TKTP_BUTTON_NONE) then nStyle = TKTP_BUTTON_DROPDOWN
+    if p->isOpen andalso (nStyle <> TKTP_BUTTON_DROPDOWN) then tkTimePicker_CloseUp( hCtrl )
+    p->nButtonStyle = nStyle
+    TpkRefresh( p )
+end sub
+
+public function tkTimePicker_GetTabMovesSegments( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return false
+    return p->bTabMovesSegments
+end function
+
+' TRUE: Tab / Shift+Tab walk the segments first (Qt), leaving at the last / first.
+public sub tkTimePicker_SetTabMovesSegments( byval hCtrl as TK_WIDGET ptr, byval bMoves as boolean )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then p->bTabMovesSegments = bMoves
+end sub
+
+' ---- segments ----------------------------------------------------------------------------------------
+public function tkTimePicker_GetSegmentCount( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->nSegs
+end function
+
+' TKTP_SEG_* of segment i, or -1.
+public function tkTimePicker_GetSegmentKind( byval hCtrl as TK_WIDGET ptr, byval i as long ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if (p = 0) orelse (i < 0) orelse (i >= p->nSegs) then return -1
+    return p->segs( i ).kind
+end function
+
+' The segment the keys edit (also while unfocused: where they will start), or -1.
+public function tkTimePicker_GetFocusedSegment( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return -1
+    return p->nFocusSeg
+end function
+
+public sub tkTimePicker_SetFocusedSegment( byval hCtrl as TK_WIDGET ptr, byval i as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if (p = 0) orelse (TpkIsEditable( p, i ) = false) then exit sub
+    p->sEntry = ""
+    p->nFocusSeg = i
+    tkWidget_Invalidate( hCtrl )
+end sub
+
+' Segment i's text box, control pixels (the field's height). FALSE for no such segment.
+public function tkTimePicker_GetSegmentRect( byval hCtrl as TK_WIDGET ptr, byval i as long, byref rc as TKRECT ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    tkRect_Set( rc, 0, 0, 0, 0 )
+    if (p = 0) orelse (i < 0) orelse (i >= p->nSegs) then return false
+    TpkEnsureLayout( p )
+    tkRect_Set( rc, p->segX( i ), p->rcField.top, p->segX( i ) + p->segW( i ), p->rcField.bottom )
+    return true
+end function
+
+' The digits typed into the focused segment so far ("" when no entry is pending). A test seam.
+public function tkTimePicker_GetPendingEntry( byval hCtrl as TK_WIDGET ptr ) as string
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return ""
+    return p->sEntry
+end function
+
+' Qt's stepBy: segment i stepped n times as Up / Down would, but SILENT.
+public sub tkTimePicker_StepBy( byval hCtrl as TK_WIDGET ptr, byval i as long, byval n as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if (p = 0) orelse (TpkIsEditable( p, i ) = false) orelse (n = 0) then exit sub
+    dim as TKTIME t = TpkBase( p )
+    for k as long = 1 to abs( n )
+        t = TpkStepped( p, t, i, sgn( n ), false )
+    next
+    p->tm = TpkFinish( p, t )
+    TpkRefresh( p )
+end sub
+
+' ---- appearance --------------------------------------------------------------------------------------
+public function tkTimePicker_GetFont( byval hCtrl as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->pFont
+end function
+
+public sub tkTimePicker_SetFont( byval hCtrl as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->pFont = f
+    TpkRefresh( p )
+end sub
+
+public function tkTimePicker_GetIconFont( byval hCtrl as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->pIconFont
+end function
+
+' A glyph font for the dropdown button; with it AND a glyph (SetIconGlyph), the glyph replaces the
+' drawn clock. No default glyph yet: the bundled font's clock codepoint is not chosen.
+public sub tkTimePicker_SetIconFont( byval hCtrl as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->pIconFont = f
+    tkWidget_Invalidate( hCtrl )
+end sub
+
+public function tkTimePicker_GetIconGlyph( byval hCtrl as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return ""
+    return p->wszIconGlyph
+end function
+
+public sub tkTimePicker_SetIconGlyph( byval hCtrl as TK_WIDGET ptr, byval sGlyph as ustring )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->wszIconGlyph = sGlyph
+    tkWidget_Invalidate( hCtrl )
+end sub
+
+public function tkTimePicker_GetIconWidth( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->nIconWidth
+end function
+
+public sub tkTimePicker_SetIconWidth( byval hCtrl as TK_WIDGET ptr, byval nWidth as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->nIconWidth = iif( nWidth < 0, 0, nWidth )
+    TpkRefresh( p )
+end sub
+
+public function tkTimePicker_GetCornerRadius( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->nCornerRadius
+end function
+
+public sub tkTimePicker_SetCornerRadius( byval hCtrl as TK_WIDGET ptr, byval nRadius as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->nCornerRadius = iif( nRadius < 0, 0, nRadius )
+    p->bShapePinned = true
+    TpkRefresh( p )
+end sub
+
+public function tkTimePicker_GetBorderThickness( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->nBorderThick
+end function
+
+public sub tkTimePicker_SetBorderThickness( byval hCtrl as TK_WIDGET ptr, byval nThickness as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->nBorderThick = iif( nThickness < 0, 0, nThickness )
+    p->bShapePinned = true
+    TpkRefresh( p )
+end sub
+
+' tkDatePicker's formula, measured on the widest time the pattern can show. Valid before sizing.
+public sub tkTimePicker_GetIdealSize( byval hCtrl as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    nWidth = 0 : nHeight = 0
+    if p = 0 then exit sub
+    dim as TTF_Font ptr f = TpkFont( p )
+    dim as long textW = 0
+    for k as long = 0 to 1
+        dim as TKTIME t = tkTimePanel_MakeTime( 10 + k * 12, 58, 58, 888 )
+        dim as long tw = tkText_Width( f, TpkFormatOf( p, t ) )
+        if tw > textW then textW = tw
+        tw = tkText_Width( f, tkTimePanel_FormatPattern( t, p->sPattern, p->sAm, p->sPm ) )
+        if tw > textW then textW = tw
+    next
+    if len( p->sPlaceholder ) then
+        dim as long pw = tkText_Width( f, p->sPlaceholder )
+        if pw > textW then textW = pw
+    end if
+    dim as long cell = 0
+    if p->nButtonStyle <> TKTP_BUTTON_NONE then cell = p->nDividerThick + p->nIconWidth
+    nWidth = p->nCornerRadius + p->nFieldPad + textW + p->nFieldPad + cell
+    if p->nButtonStyle = TKTP_BUTTON_NONE then nWidth += p->nBorderThick
+    nHeight = tkText_Height( f ) + 2 * p->nVertPadding + 2 * p->nBorderThick
+end sub
+
+public function tkTimePicker_GetFrameRect( byval hCtrl as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    tkRect_Set( rc, 0, 0, 0, 0 )
+    if p = 0 then return false
+    TpkEnsureLayout( p )
+    rc = p->rcFrame
+    return (rc.right > rc.left) andalso (rc.bottom > rc.top)
+end function
+
+public function tkTimePicker_GetFieldRect( byval hCtrl as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    tkRect_Set( rc, 0, 0, 0, 0 )
+    if p = 0 then return false
+    TpkEnsureLayout( p )
+    rc = p->rcField
+    return (rc.right > rc.left) andalso (rc.bottom > rc.top)
+end function
+
+' The button cell (dropdown or spin pair); FALSE with TKTP_BUTTON_NONE.
+public function tkTimePicker_GetIconRect( byval hCtrl as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    tkRect_Set( rc, 0, 0, 0, 0 )
+    if p = 0 then return false
+    TpkEnsureLayout( p )
+    rc = p->rcIcon
+    return (rc.right > rc.left) andalso (rc.bottom > rc.top)
+end function
+
+' One spin half (bUp: the upper); FALSE unless TKTP_BUTTON_SPIN.
+public function tkTimePicker_GetSpinRect( byval hCtrl as TK_WIDGET ptr, byval bUp as boolean, byref rc as TKRECT ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    tkRect_Set( rc, 0, 0, 0, 0 )
+    if p = 0 then return false
+    TpkEnsureLayout( p )
+    if bUp then rc = p->rcUp else rc = p->rcDown
+    return (rc.right > rc.left) andalso (rc.bottom > rc.top)
+end function
+
+public function tkTimePicker_HitTest( byval hCtrl as TK_WIDGET ptr, byval x as long, byval y as long ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return TKTPK_HIT_NONE
+    return TpkHit( p, x, y )
+end function
+
+public function tkTimePicker_GetHotPart( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return TKTPK_HIT_NONE
+    return p->nHotPart
+end function
+
+public sub tkTimePicker_GetRepeat( byval hCtrl as TK_WIDGET ptr, byref nDelayMs as long, byref nIntervalMs as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    nDelayMs = p->nRepeatDelay : nIntervalMs = p->nRepeatInterval
+end sub
+
+' The spin pair's auto-repeat; 0 for either turns it off.
+public sub tkTimePicker_SetRepeat( byval hCtrl as TK_WIDGET ptr, byval nDelayMs as long, byval nIntervalMs as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->nRepeatDelay = iif( nDelayMs < 0, 0, nDelayMs )
+    p->nRepeatInterval = iif( nIntervalMs < 0, 0, nIntervalMs )
+end sub
+
+public sub tkTimePicker_GetColors( byval hCtrl as TK_WIDGET ptr, byval pColors as TKTIMEPICKER_COLORS ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Copies the struct and PINS it: a theme change leaves this picker alone until UnpinColors.
+public sub tkTimePicker_SetColors( byval hCtrl as TK_WIDGET ptr, byval pColors as TKTIMEPICKER_COLORS ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hCtrl )
+end sub
+
+' The frame block maps exactly as tkDatePicker_ThemeColors; the dropdown as its calendar.
+public function tkTimePicker_ThemeColors( byref t as TKTHEME_COLORS ) as TKTIMEPICKER_COLORS
+    dim as TKTIMEPICKER_COLORS c
+    c.BackColor               = t.Window
+    c.BorderColor             = t.Border
+    c.FocusBorderColor        = t.FocusRing
+    c.BorderColorDisabled     = t.BorderDisabled
+    c.DividerColor            = t.Divider
+    c.DividerColorDisabled    = t.BorderDisabled
+    c.FieldBackColor          = t.Surface
+    c.FieldForeColor          = t.Text
+    c.FieldBackColorDisabled  = t.SurfaceDisabled
+    c.FieldForeColorDisabled  = t.TextDisabled
+    c.IconColor               = t.Surface
+    c.IconGlyphColor          = t.Text
+    c.IconGlyphColorHot       = t.TextHot
+    c.IconBackColorHot        = t.SurfaceHot
+    c.IconGlyphColorDisabled  = t.TextDisabled
+    c.SegmentBackColorFocused = t.Selected
+    c.SegmentForeColorFocused = t.SelectedText
+    c.PlaceholderColor        = t.TextDim
+    c.PanelBackColor          = t.Popup
+    c.PanelBorderColor        = t.Border
+    c.ItemColor               = t.PopupText
+    c.ItemColorDisabled       = t.TextDisabled
+    c.ItemBackColorHot        = t.SurfaceHot
+    c.ItemForeColorHot        = t.TextHot
+    c.ItemBackColorSelected   = t.Selected
+    c.ItemForeColorSelected   = t.SelectedText
+    c.ColumnDividerColor      = t.Divider
+    c.FooterColor             = t.TextDim
+    c.FooterColorHot          = t.TextHot
+    c.FooterColorDisabled     = t.TextDisabled
+    return c
+end function
+
+public sub tkTimePicker_ApplyTheme( byval hCtrl as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    TpkApplyThemeShape( hCtrl )
+    if p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hCtrl, t )
+    p->colors = tkTimePicker_ThemeColors( tr )
+    tkTheme_ResolveInto( hCtrl, tr, cast( ulong ptr, @p->colors ), sizeof( TKTIMEPICKER_COLORS ) \ 4, "TimePicker" )
+    tkWidget_Invalidate( hCtrl )
+end sub
+
+public sub tkTimePicker_UnpinColors( byval hCtrl as TK_WIDGET ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkTimePicker_ApplyTheme( hCtrl, tkTheme_Of( hCtrl ) )
+end sub
+
+public sub tkTimePicker_ApplyFonts( byval hCtrl as TK_WIDGET ptr, byval fText as TTF_Font ptr, byval fGlyph as TTF_Font ptr )
+    if fText then tkTimePicker_SetFont( hCtrl, fText )
+    if fGlyph then tkTimePicker_SetIconFont( hCtrl, fGlyph )
+end sub
+
+' ---- callbacks -------------------------------------------------------------------------------------
+' A paint callback's way to draw the picker as it would have been drawn, then add to it.
+public sub tkTimePicker_PaintDefault( byval pi as TKTIMEPICKER_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKTIMEPICKER_STATE ptr p = TPK( pi->hCtrl )
+    if p then TpkRenderDefault( p, pi )
+end sub
+
+public sub tkTimePicker_SetTimeChangedCallback( byval hCtrl as TK_WIDGET ptr, byval usersub as TPK_TimeChangedCallbackSub )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then p->TimeChangedCallback = usersub
+end sub
+
+public sub tkTimePicker_SetDropDownCallback( byval hCtrl as TK_WIDGET ptr, byval usersub as TPK_DropDownCallbackSub )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then p->DropDownCallback = usersub
+end sub
+
+public sub tkTimePicker_SetPaintCallback( byval hCtrl as TK_WIDGET ptr, byval usersub as TPK_PaintCallbackSub )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->PaintCallback = usersub
+    tkWidget_Invalidate( hCtrl )
+end sub
+
+' Forwarded to the dropdown's panel (hCtrl is the PICKER): disables chooser items.
+public sub tkTimePicker_SetItemDisabledCallback( byval hCtrl as TK_WIDGET ptr, byval userfunc as TPK_ItemDisabledCallbackFunc )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then p->ItemDisabledCallback = userfunc
+end sub
+
+public sub tkTimePicker_SetMessageCallback( byval hCtrl as TK_WIDGET ptr, byval userfunc as TPK_MessageCallbackFunc )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then p->MessageCallback = userfunc
+end sub
+
+' FormatTime: the text shown at rest (unfocused, a time, nothing being typed), GetText, and the
+' dropdown's list labels. Focus brings the segments back: editing works on the pattern.
+public sub tkTimePicker_SetFormatCallback( byval hCtrl as TK_WIDGET ptr, byval usersub as TPK_FormatCallbackSub )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->FormatCallback = usersub
+    TpkRefresh( p )
+end sub
+
+' The tip over the picker: TRUE with outText shows it. The tip is made when this is first set.
+public sub tkTimePicker_SetTooltipCallback( byval hCtrl as TK_WIDGET ptr, byval userfunc as TPK_TooltipCallbackFunc )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->TooltipCallback = userfunc
+    if userfunc then tkTipHost_Ensure( @p->tip, hCtrl, @TpkTipText )
+end sub
+
+' The tip (0 until a Tooltip callback is set): its delays, or tkTooltip_Show in a test.
+public function tkTimePicker_GetTooltipHandle( byval hCtrl as TK_WIDGET ptr ) as TK_TIP ptr
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return tkTipHost_Tip( @p->tip )
+end function
+
+' The segment under (x, y), -1 for a literal, the button cell or outside.
+function TpkSegUnder( byval p as TKTIMEPICKER_STATE ptr, byval x as long, byval y as long ) as long
+    if TpkHit( p, x, y ) <> TKTPK_HIT_FIELD then return -1
+    for i as long = 0 to p->nSegs - 1
+        if TpkIsEditable( p, i ) andalso (x >= p->segX( i )) andalso (x < p->segX( i ) + p->segW( i )) then return i
+    next
+    return -1
+end function
+
+' One tool per part and segment, so moving between segments brings a fresh tip.
+function TpkTipIndex( byval p as TKTIMEPICKER_STATE ptr ) as long
+    return TpkHit( p, p->nMouseX, p->nMouseY ) * 100 + TpkSegUnder( p, p->nMouseX, p->nMouseY ) + 1
+end function
+
+function TpkTipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKTIMEPICKER_STATE ptr p = TPK( a )
+    if (p = 0) orelse (p->TooltipCallback = 0) then return ""
+    dim as TKTIMEPICKER_TOOLTIPINFO ti
+    ti.hCtrl = p->hWin
+    ti.tm = p->tm
+    ti.hasTime = tkTimePanel_IsTime( p->tm )
+    ti.nPart = TpkHit( p, p->nMouseX, p->nMouseY )
+    ti.nSegment = TpkSegUnder( p, p->nMouseX, p->nMouseY )
+    if p->TooltipCallback( @ti ) = false then return ""
+    return ti.outText
+end function
+
+' The theme's shape until a shape setter ran: its CornerRadius and BorderWidth.
+sub TpkApplyThemeShape( byval w as TK_WIDGET ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( w )
+    if (p = 0) orelse p->bShapePinned then exit sub
+    dim as TKTHEME_SHAPE sh = tkTheme_ShapeOf( w )
+    p->nCornerRadius = iif( sh.CornerRadius >= 0, tkHost_Scale( w->pHost, sh.CornerRadius ), tkHost_Scale( w->pHost, CTP_DEFAULT_CORNERRADIUS ) )
+    p->nBorderThick = iif( sh.BorderWidth >= 0, sh.BorderWidth, CTP_DEFAULT_BORDERTHICK )
+    TpkRefresh( p )
+end sub

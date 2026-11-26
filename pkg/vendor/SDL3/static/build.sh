@@ -15,6 +15,12 @@
 #            static C++ on that target does
 #   linux    gcc/g++, position-independent; X11, Wayland, GL and audio stay dlopen'd by SDL
 #   macos    Apple clang, arm64, macOS 13.0
+#   android  from Windows (vendorfetch.sh --target android-x86_64|android-arm64): the NDK's own
+#            clang through its CMake toolchain file, API 29, libc++ static, position-independent
+#            (the archives go into a program's libmain.so). Also classes.dex: SDL's Java glue
+#            (android-project's org.libsdl.app) and org.tiko.app.TikoActivity (android/ here),
+#            compiled once against the SDK's newest android.jar, so an app build never runs javac
+#            (docs/tiko-android A4, D-A4-6)
 # Output: bin/<host>/{SDL3,SDL3_ttf,SDL3_image}_<host>_<arch>.a beside this script, and on Windows
 # bin/windows/{SDL3,SDL3_ttf,SDL3_image}.dll -- /MT too, so they need no Visual C++
 # redistributable. The build trees live under TIKO_VENDOR_CACHE. Incremental: a stamp of the
@@ -31,6 +37,7 @@ case $HOST in
     windows) ARCH=x86_64 ;;
     linux)   ARCH=${TIKO_VENDOR_ARCH:-x86_64} ;;   # arm64 on linux-arm64 (docs/tiko-linux-arm64 L4)
     macos)   ARCH=arm64 ;;
+    android) ARCH=${TIKO_VENDOR_ARCH:-x86_64} ;;
     *) echo "SDL3 static: unknown host '$HOST'" >&2; exit 1 ;;
 esac
 # THE FLAVOUR, TIKO_VENDOR_FLAVOUR: 'msvc' (the default) builds the MSVC ABI against the
@@ -48,12 +55,16 @@ else
     FLAVOUR_TAG=
 fi
 OUT=$HERE/bin/$HOST
+# Android's two architectures are built on ONE host, so each gets its own directory and stamp.
+[ "$HOST" = android ] && OUT=$HERE/bin/android-$ARCH
 OUTS="$OUT/SDL3_${HOST}_$ARCH$FLAVOUR_TAG.a $OUT/SDL3_ttf_${HOST}_$ARCH$FLAVOUR_TAG.a $OUT/SDL3_image_${HOST}_$ARCH$FLAVOUR_TAG.a"
 [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ] && OUTS="$OUTS $OUT/SDL3.dll $OUT/SDL3_ttf.dll $OUT/SDL3_image.dll"
+[ "$HOST" = android ] && OUTS="$OUTS $OUT/classes.dex"
+JAVA_TIKO=$HERE/android/org/tiko/app/TikoActivity.java
 
 # macOS has no sha256sum; its shasum is the same digest.
 digest() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
-STAMP=$( { for f in "$@"; do basename "$f"; done; cat "$0"; echo "$HOST"; [ "$ARCH" = x86_64 ] || echo "$ARCH"; } | digest | cut -c1-16 )
+STAMP=$( { for f in "$@"; do basename "$f"; done; cat "$0"; [ "$HOST" = android ] && cat "$JAVA_TIKO"; echo "$HOST"; [ "$HOST" = windows ] && echo "$FLAVOUR"; [ "$ARCH" = x86_64 ] || echo "$ARCH"; } | digest | cut -c1-16 )
 fresh=1
 for o in $OUTS; do [ -f "$o" ] || fresh=0; done
 [ "$fresh" = 1 ] && [ "$(cat "$OUT/.stamp" 2>/dev/null)" = "$STAMP" ] && exit 0
@@ -61,6 +72,8 @@ for o in $OUTS; do [ -f "$o" ] || fresh=0; done
 # worktree) finds the archives the last identical build left there.
 W=$CACHE/sdl3-static-$HOST
 [ "$HOST" = linux ] && [ "$ARCH" != x86_64 ] && W=$CACHE/sdl3-static-$HOST-$ARCH
+[ "$HOST" = windows ] && [ "$FLAVOUR" = mingw ] && W=$W-mingw
+[ "$HOST" = android ] && W=$CACHE/sdl3-static-android-$ARCH
 if [ "$(cat "$W/done/.stamp" 2>/dev/null)" = "$STAMP" ]; then
     mkdir -p "$OUT"
     for o in $OUTS; do cp -f "$W/done/$(basename "$o")" "$o" || exit 1; done
@@ -108,6 +121,14 @@ macos)
     C+=(-DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++
         -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_OSX_ARCHITECTURES=arm64
         -DCMAKE_FIND_USE_CMAKE_SYSTEM_PATH=OFF) ;;
+android)
+    NDK=${TIKO_ANDROID_NDK:?run me through build/vendorfetch.sh --target android-...}
+    case $ARCH in x86_64) ABI=x86_64 ;; arm64) ABI=arm64-v8a ;; *) echo "SDL3 static: android arch '$ARCH'" >&2; exit 1 ;; esac
+    C+=(-DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=$ABI
+        -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+        # The toolchain file confines find_package to the sysroot (FIND_ROOT_PATH_MODE ONLY), so
+        # the satellites could not see FreeType and SDL3 under W/inst: it is a root too.
+        -DCMAKE_FIND_ROOT_PATH="$(cygpath -m "$W/inst")") ;;
 esac
 
 step() {     # step <name> <source dir> <cmake args...>
@@ -120,6 +141,8 @@ step() {     # step <name> <source dir> <cmake args...>
 
 # X11 screensaver and XTest need development packages a build host may lack; neither is used.
 SDLX=(); [ "$HOST" = linux ] && SDLX=(-DSDL_X11_XSCRNSAVER=OFF -DSDL_X11_XTEST=OFF)
+# SDL3.jar is SDL's own packaging of the Java glue; classes.dex below replaces it.
+[ "$HOST" = android ] && SDLX=(-DSDL_ANDROID_JAR=OFF)
 step sdl "$(dir_of 'SDL3-*')" -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF -DSDL_EXAMPLES=OFF "${SDLX[@]}"
 step ft "$(dir_of 'freetype-*')" -DFT_DISABLE_ZLIB=ON -DFT_DISABLE_BZIP2=ON -DFT_DISABLE_PNG=ON \
      -DFT_DISABLE_BROTLI=ON -DFT_DISABLE_HARFBUZZ=ON
@@ -189,6 +212,14 @@ linux)
     printf 'create %s\naddlib %s\naddlib %s\naddlib %s\nsave\nend\n' "$TTF" "$L_TTF" "$L_FT" "$L_HB" | ar -M >> "$LOG" 2>&1 ;;
 macos)
     libtool -static -o "$TTF" "$L_TTF" "$L_FT" "$L_HB" >> "$LOG" 2>&1 ;;
+android)
+    printf 'create %s
+addlib %s
+addlib %s
+addlib %s
+save
+end
+' "$(cygpath -m "$TTF")" "$(cygpath -m "$L_TTF")"         "$(cygpath -m "$L_FT")" "$(cygpath -m "$L_HB")" | "$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe" -M >> "$LOG" 2>&1 ;;
 esac
 [ -f "$TTF" ] || { echo "SDL3 static: combining SDL3_ttf failed ($LOG)" >&2; exit 1; }
 if [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ]; then
@@ -198,11 +229,41 @@ if [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ]; then
 fi
 cp -f "$L_SDL" "$OUT/SDL3_${HOST}_$ARCH$FLAVOUR_TAG.a"
 cp -f "$L_IMG" "$OUT/SDL3_image_${HOST}_$ARCH$FLAVOUR_TAG.a"
+# The NDK's toolchain file compiles with -g: 35 MB of DWARF in SDL3_ttf's archive alone, which a
+# program's link strips anyway.
+if [ "$HOST" = android ]; then
+    for a in "$OUT/SDL3_${HOST}_$ARCH.a" "$TTF" "$OUT/SDL3_image_${HOST}_$ARCH.a"; do
+        "$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe" --strip-debug "$(cygpath -m "$a")" >> "$LOG" 2>&1 ||
+            { echo "SDL3 static: stripping $(basename "$a") failed" >&2; exit 1; }
+    done
+fi
 if [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ]; then
     for d in SDL3 SDL3_ttf SDL3_image; do
         [ -f "$W/dll/bin/$d.dll" ] || { echo "SDL3 static: no $d.dll under $W/dll/bin" >&2; ls "$W/dll/bin" >&2; exit 1; }
         cp -f "$W/dll/bin/$d.dll" "$OUT/$d.dll"
     done
+fi
+# SDL'S JAVA, ONCE: javac at Java 8 against the newest android.jar (SDL's own Gradle build uses
+# source/target 1.8), then d8 for the minimum API. The JDK: JAVA_HOME, else the one beside the
+# SDK (docs/tiko-android README, D4).
+if [ "$HOST" = android ]; then
+    SDK=${TIKO_ANDROID_SDK:?run me through build/vendorfetch.sh --target android-...}
+    JDK=${JAVA_HOME:-$(dirname "$SDK")/jdk-17}
+    BT=$(ls -d "$SDK"/build-tools/* 2>/dev/null | sort -V | tail -1)
+    AJAR=$(ls -d "$SDK"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
+    [ -x "$JDK/bin/javac.exe" ] || [ -x "$JDK/bin/javac" ] || { echo "SDL3 static: no JDK at '$JDK' (set JAVA_HOME)" >&2; exit 1; }
+    [ -n "$BT" ] && [ -n "$AJAR" ] || { echo "SDL3 static: the SDK at '$SDK' needs build-tools and a platform" >&2; exit 1; }
+    J=$W/java; rm -rf "$J"; mkdir -p "$J/classes" "$J/dex"
+    JSRC=$(dir_of 'SDL3-*')/android-project/app/src/main/java
+    find "$JSRC" "$HERE/android" -name '*.java' | while read -r f; do cygpath -m "$f"; done > "$J/sources.txt"
+    echo "== java" >> "$LOG"
+    # Java's AF_UNIX self-pipe fails on some Windows machines (docs/tiko-android FACTS, Host).
+    export JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS:--Djdk.net.unixdomain.tmpdir=C:/no-such-dir-afunix}
+    if ! { "$JDK/bin/javac" -source 8 -target 8 -Xlint:-options -encoding UTF-8                -bootclasspath "$(cygpath -m "$AJAR")" -d "$(cygpath -m "$J/classes")" @"$(cygpath -m "$J/sources.txt")" &&
+           JAVA_HOME=$(cygpath -w "$JDK") "$BT/d8.bat" --release --min-api 29 --lib "$(cygpath -m "$AJAR")"                --output "$(cygpath -m "$J/dex")" $(find "$J/classes" -name '*.class' | while read -r f; do cygpath -m "$f"; done); } >> "$LOG" 2>&1; then
+        echo "SDL3 static: SDL's Java failed ($LOG)" >&2; tail -20 "$LOG" >&2; exit 1
+    fi
+    cp -f "$J/dex/classes.dex" "$OUT/classes.dex"
 fi
 echo "$STAMP" > "$OUT/.stamp"
 mkdir -p "$W/done"

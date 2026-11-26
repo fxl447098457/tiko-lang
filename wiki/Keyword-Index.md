@@ -197,6 +197,7 @@ Every page in this wiki, A–Z. marks an tiko-lang addition.
 | [Common](Common) | Variable declaration and scope modifier. | [Modularizing](Category-Modularizing) |
 | [Compiler Error Messages](Compiler-Error-Messages) |  | Using the FreeBASIC compiler |
 | [Compiler Option: -a](Compiler-Option-a) | Add an object file to the linker's list. | Using the FreeBASIC compiler |
+| [Compiler Option: -app](Compiler-Option-App) | Build an Android app (an APK, or an App Bundle for Play) of an SDL3 program. | Using the FreeBASIC compiler |
 | [Compiler Option: -arch](Compiler-Option-Arch) | Set target architecture for improved/restricted code generation or cross-compiling. | Using the FreeBASIC compiler |
 | [Compiler Option: -asm](Compiler-Option-Asm) | Set assembler format for inline assembly under -gen gcc. | Using the FreeBASIC compiler |
 | [Compiler Option: -b](Compiler-Option-B) | Add a source file to compilation. | Using the FreeBASIC compiler |

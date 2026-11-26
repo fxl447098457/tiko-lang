@@ -6,9 +6,11 @@
 #   build/pdf.sh --chapter 05    one chapter (always drafted)
 #   build/pdf.sh --png           also render page 1 to PNG, for eyeballing the design
 #
-# pandoc and typst both ship inside Quarto and are not on PATH. Override with
-# PANDOC= and TYPST= if they live somewhere else. On macOS they are Homebrew's
-# (brew install pandoc typst), and python is python3 (docs/tiko-macos M10).
+# pandoc and typst both ship inside Quarto and are not on PATH. Quarto is looked for
+# beside a quarto on PATH, then in the per-user install (%USERPROFILE%\AppData\Local\
+# Programs\Quarto), then in the machine-wide one (C:\Program Files\Quarto). Override
+# with QUARTO_TOOLS=, or PANDOC= and TYPST=, if they live somewhere else. On macOS
+# they are Homebrew's (brew install pandoc typst), and python is python3 (docs/tiko-macos M10).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,7 +21,18 @@ if [[ "$(uname -s)" == Darwin ]]; then
   TYPST="${TYPST:-/opt/homebrew/bin/typst}"
   PYTHON="${PYTHON:-python3}"
 else
-  QUARTO_TOOLS="${QUARTO_TOOLS:-/c/Users/TheDude/AppData/Local/Programs/Quarto/bin/tools}"
+  if [[ -z "${QUARTO_TOOLS:-}" ]]; then
+    candidates=()
+    if q="$(command -v quarto 2>/dev/null)"; then candidates+=("$(dirname "$q")/tools"); fi
+    if [[ -n "${USERPROFILE:-}" ]]; then
+      candidates+=("$(cygpath -u "$USERPROFILE")/AppData/Local/Programs/Quarto/bin/tools")
+    fi
+    candidates+=("/c/Program Files/Quarto/bin/tools")
+    QUARTO_TOOLS="${candidates[0]}"
+    for c in "${candidates[@]}"; do
+      if [[ -x "$c/pandoc.exe" ]]; then QUARTO_TOOLS="$c"; break; fi
+    done
+  fi
   PANDOC="${PANDOC:-$QUARTO_TOOLS/pandoc.exe}"
   TYPST="${TYPST:-$QUARTO_TOOLS/x86_64/typst.exe}"
   PYTHON="${PYTHON:-python}"

@@ -12,6 +12,8 @@
 #   build/package.sh --third-party-inc DIR  third-party bindings (default: the seed's inc/)
 #   build/package.sh --out DIR              somewhere other than toolchains/
 #   build/package.sh --no-tkedit            leave the editor out (see "the editor")
+#   build/package.sh --with-android         Windows only: also android-x86_64 and android-arm64
+#                                           (feat/android, docs/tiko-android A6; see "android")
 #
 # The output is toolchains/tiko-windows or toolchains/tiko-linux: what an end user
 # unpacks, as opposed to bin/tiko, which is what build/build.sh produces for
@@ -62,6 +64,7 @@ DO_INC=1
 DO_CLEAN=0
 DO_VERIFY=0
 DO_TKEDIT=1
+WITH_ANDROID=0
 T0=$(date +%s)
 TPINC=${TIKO_THIRDPARTY_INC:-}
 OUT=
@@ -86,7 +89,7 @@ unversion_tinfo( ) {
 }
 
 usage( ) {
-    sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -101,6 +104,7 @@ while [ $# -gt 0 ]; do
         --clean)     DO_CLEAN=1;  shift ;;
         --verify)    DO_VERIFY=1; shift ;;
         --no-tkedit) DO_TKEDIT=0; shift ;;
+        --with-android) WITH_ANDROID=1; shift ;;
         # Both retired 2026-10-10, refused by name rather than as 'unknown'.
         --fbc-tree)  die "--fbc-tree is gone: nothing reads fbc now (--third-party-inc for bindings)" ;;
         --implibs)   die "--implibs is gone: the import libraries are built from lib/implib/ on every run" ;;
@@ -173,6 +177,18 @@ case $HOST in
     *)           HOSTOS=$HOST; HOSTARCH=x86_64 ;;
 esac
 
+# ANDROID (--with-android, docs/tiko-android A6 step 6): a Windows package may carry the two Android
+# targets, which tiko cross-compiles from Windows with the NDK. Their runtime, its startup objects
+# and the app entry fbrtapp.o go in lib/android-*/ as any target's do; the vendor packages' Android
+# archives (all static) and SDL's classes.dex in pkg/vendor/*/lib, built by vendorfetch.sh
+# --target android-*. A program for them is never RUN here: --verify compiles and links it only.
+# Without the flag nothing below changes. The NDK, SDK and JDK stay external (the MANIFEST says so).
+if [ "$WITH_ANDROID" = "1" ]; then
+    [ "$HOST" = "windows" ] || die "--with-android packages from Windows (the NDK cross-build runs there)"
+    TARGETS="$TARGETS android-x86_64 android-arm64"
+fi
+is_android( ) { case $1 in android-*) return 0 ;; esac; return 1; }
+
 # WHICH TARGETS HAVE A GRAPHICS LIBRARY. windows-x86_64, where tiko emits the
 # Microsoft ABI and there is no MSVC libfbgfx anywhere to fall back on; and
 # linux-x86_64 since the X11 driver landed (docs/graphics RFC-0012 L2), which loads
@@ -233,6 +249,12 @@ if [ "$DO_BUILD" = "1" ]; then
         note "building the runtime [$CFG $t]"
         sh "$ROOT/lib/rt/build/build.sh" "$CFG" "$t" >"$ROOT/lib/rt/obj/package-$t.log" 2>&1 &
         _pids_rt="$_pids_rt $t:$!"
+        # THE SIZE RUNTIME BESIDE IT: MinSizeRel writes libfb-s.a / libfbmt-s.a (and the pic
+        # pair), which the driver links under '-Os'. Its own obj/ tree and archive names, so
+        # it builds concurrently with the one above; it leaves fbrt0.o to that one.
+        note "building the size runtime [MinSizeRel $t]"
+        sh "$ROOT/lib/rt/build/build.sh" MinSizeRel "$t" >"$ROOT/lib/rt/obj/package-$t-s.log" 2>&1 &
+        _pids_rt="$_pids_rt $t-s:$!"
     done
     # The graphics library too -- see the note below on why its failure is not fatal.
     _pids_gfx=""
@@ -288,6 +310,8 @@ TIKO="$ROOT/bin/tiko$EXT"
 for t in $TARGETS; do
     [ -f "$ROOT/lib/rt/lib/$t/libfb.a" ] || \
         die "no runtime for $t -- run lib/rt/build/build.sh $CFG $t"
+    [ -f "$ROOT/lib/rt/lib/$t/libfb-s.a" ] || \
+        die "no size runtime for $t -- run lib/rt/build/build.sh MinSizeRel $t"
 done
 
 # ----------------------------------------------------------------- the assembly
@@ -380,6 +404,10 @@ if [ "$DO_INC" = "1" ]; then
     # One entry per line, a path below inc/; a second word 'unreachable' exempts it from the
     # include check below (inc-exclude.txt says when that is true).
     _exf=$( grep -v '^[[:space:]]*#' "$ROOT/build/inc-exclude.txt" | tr -d '\r' | grep -v '^[[:space:]]*$' )
+    # WITH ANDROID, crt/android IS REACHABLE: tiko defines __FB_ANDROID__ there, and crt/stdio.bi
+    # (vendor/SDL3's headers include it) then includes crt/android/stdio.bi -- measured, a
+    # packaged -app failed on it (docs/tiko-android A6 step 6).
+    [ "$WITH_ANDROID" = "1" ] && _exf=$( printf '%s\n' "$_exf" | awk '$1 != "crt/android"' )
     _excl=$( printf '%s\n' "$_exf" | awk '{ print $1 }' )
     _chk=$( printf '%s\n' "$_exf" | awk '$2 != "unreachable" { print $1 }' )
     _nex=0
@@ -437,6 +465,14 @@ rm -rf "$OUT/pkg/vendor/tkControls/fonts" "$OUT/pkg/vendor/tkControls/tkCodeEdit
        "$OUT/pkg/vendor/tkControls/tkCodeEdit/scintk/out" "$OUT/pkg/vendor/SDL3/static/bin" \
        "$OUT/pkg/vendor/raylib6/shared/bin"
 sh "$ROOT/build/vendorfetch.sh" --out "$OUT/pkg" || die "vendorfetch.sh failed: the vendor packages have no binaries"
+for t in $TARGETS; do
+    is_android "$t" || continue
+    sh "$ROOT/build/vendorfetch.sh" --out "$OUT/pkg" --target "$t" || die "vendorfetch.sh --target $t failed"
+    _arch=${t#android-}
+    [ -f "$OUT/pkg/vendor/SDL3/lib/SDL3_android_$_arch.a" ] || die "packaged vendor/SDL3 has no Android archive for $t"
+    [ -f "$OUT/pkg/vendor/SDL3/lib/android/classes.dex" ] || die "packaged vendor/SDL3 has no lib/android/classes.dex -- 'tiko -app' would refuse"
+    note "vendor packages -> pkg/vendor/*/lib for $t"
+done
 for _vm in "$OUT"/pkg/vendor/*/; do
     _vft="$ROOT/pkg/vendor/$( basename "$_vm" )/fetch.toml"
     if grep -q "^\[$HOST\." "$_vft" 2>/dev/null; then
@@ -491,10 +527,17 @@ for t in $TARGETS; do
     for _pic in libfbpic.a libfbmtpic.a; do
         [ -f "$ROOT/lib/rt/lib/$t/$_pic" ] && cp -f "$ROOT/lib/rt/lib/$t/$_pic" "$OUT/lib/$t/"
     done
+    # THE SIZE RUNTIME, what '-Os' links: the same set built at '-Os', suffixed -s. Its
+    # own stamp, .config-s, is checked, so a stale or Debug pair cannot ship as one.
+    [ "$( cat "$ROOT/lib/rt/lib/$t/.config-s" 2>/dev/null )" = "MinSizeRel" ] || \
+        die "the size runtime for $t is not a MinSizeRel build -- run lib/rt/build/build.sh MinSizeRel $t"
+    for _s in libfb-s.a libfbmt-s.a libfbpic-s.a libfbmtpic-s.a; do
+        [ -f "$ROOT/lib/rt/lib/$t/$_s" ] && cp -f "$ROOT/lib/rt/lib/$t/$_s" "$OUT/lib/$t/"
+    done
     # THE STARTUP OBJECT, tiko-rt's own since 2026-10-09 (lib/rt/src/c/fbrt0.c), for a
     # gnu target. It goes beside the runtime so the driver's first-match search finds
     # it before lib/<target>-fb/; that copy of fbc's is deleted below all the same.
-    for _rt0 in fbrt0.o fbrt0pic.o; do
+    for _rt0 in fbrt0.o fbrt0pic.o fbrtapp.o; do
         [ -f "$ROOT/lib/rt/lib/$t/$_rt0" ] && cp -f "$ROOT/lib/rt/lib/$t/$_rt0" "$OUT/lib/$t/"
     done
     case $t in
@@ -502,6 +545,9 @@ for t in $TARGETS; do
         *) [ -f "$OUT/lib/$t/fbrt0.o" ] || \
                die "no fbrt0.o for $t -- lib/rt/build/build.sh builds it beside libfb.a" ;;
     esac
+    if is_android "$t"; then
+        [ -f "$OUT/lib/$t/fbrtapp.o" ] || die "no fbrtapp.o for $t -- 'tiko -app' links it"
+    fi
 
     # THE GRAPHICS LIBRARY GOES BESIDE THE RUNTIME, in lib/<target>/ and not a
     # directory of its own, because that is where the compiler looks: since
@@ -909,8 +955,47 @@ sqlite3_close( db )
     done
 }
 
+# AN ANDROID TARGET IS BUILT, NOT RUN (--with-android): a console program linked with the NDK,
+# then an SDL3 app as a signed APK with the SDK's tools -- what 'tiko -app' needs from this
+# package (lib/<t>/fbrtapp.o, vendor/SDL3's archives and classes.dex). Running either needs a
+# device: build/adbrun.sh and build/tkadb.sh in tiko-lang. The artefact is the test, as above.
+verify_android( ) {
+    _t=$1
+    _tmp="$OUT/.verify.$_t"
+    rm -rf "$_tmp"; mkdir -p "$_tmp"
+    printf 'print "ok"
+' > "$_tmp/hello.tiko"
+    printf '#import "vendor/SDL3"
+print "app ok"
+' > "$_tmp/app.tiko"
+    ( cd "$OUT" && "./${BINSUB}tiko$EXT" -target "$_t" ".verify.$_t/hello.tiko" -o ".verify.$_t/hello" ) >"$_tmp/log" 2>&1 || true
+    if [ -f "$_tmp/hello" ]; then
+        VERIFY_LINES="$VERIFY_LINES
+  $_t  PASS -- compiled and linked (not run: a device runs it)"
+    else
+        _why=$( grep -m1 -iE 'error|undefined' "$_tmp/log" | cut -c1-160 )
+        VERIFY_LINES="$VERIFY_LINES
+  $_t  FAIL -- ${_why:-see the build log}"
+    fi
+    ( cd "$OUT" && "./${BINSUB}tiko$EXT" -target "$_t" -app ".verify.$_t/app.tiko" -o ".verify.$_t/app.apk" ) >"$_tmp/applog" 2>&1 || true
+    if [ -f "$_tmp/app.apk" ]; then
+        VERIFY_LINES="$VERIFY_LINES
+  $_t  -app PASS -- an SDL3 app built and signed as an APK (not installed)"
+    else
+        _why=$( grep -m1 -iE 'error' "$_tmp/applog" | cut -c1-160 )
+        VERIFY_LINES="$VERIFY_LINES
+  $_t  -app FAIL -- ${_why:-see the build log}"
+    fi
+    rm -rf "$_tmp"
+}
+
 if [ "$DO_VERIFY" = "1" ]; then
     for t in $TARGETS; do
+        if is_android "$t"; then
+            note "verifying $t: compile and link (no device here)"
+            verify_android "$t"
+            continue
+        fi
         note "verifying $t: compile, link and run"
         verify_target "$t"
         verify_fbcunit "$t"
@@ -1173,6 +1258,16 @@ SIZE=$( du -sh "$OUT" | cut -f1 | tr -d ' ' )
     for t in $TARGETS; do
         say "  tiko -target $t yourprogram.tiko"
     done
+    if [ "$WITH_ANDROID" = "1" ]; then
+        say
+        say "ANDROID (android-x86_64, android-arm64) NEEDS THREE THINGS NOT BUNDLED:"
+        say "            the Android NDK (r30 or newer; ANDROID_NDK_HOME, or <sdk>/ndk/<ver>)"
+        say "            for every link; and for 'tiko -app' (an APK) the Android SDK's"
+        say "            build-tools and platform 36 (ANDROID_HOME) and a JDK 17+ (JAVA_HOME)."
+        say "            -appbundle (an .aab for Play) also needs bundletool's jar beside the"
+        say "            SDK in bundletool/, or TIKO_ANDROID_BUNDLETOOL."
+        say "  tiko -target android-arm64 -app yourgame.tiko      a signed APK (debug key)"
+    fi
     say
     if [ "$HOST" = "windows" ]; then
         say "GRAPHICS IS windows-x86_64 ONLY. libtkogfx is built for the Microsoft ABI"

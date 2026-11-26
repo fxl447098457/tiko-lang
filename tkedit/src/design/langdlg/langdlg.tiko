@@ -1,0 +1,676 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' langdlg -- Languages: the project's languages (appLanguages, langfile) and, for the one selected,
+' a translation of every text the translatable forms show.
+'
+'   left        the forms' own language first, then the others: Add, Remove; the selected one's code,
+'               name, and whether its catalog is built into the program
+'   right       every key (codegen.TranslatableTexts): the form's text, the translation, and where it
+'               stands (missing, stale, unused). Enter in the translation box takes it and goes on.
+'
+' Nothing is written here. On OK the caller writes the .tklang and every catalog (CatalogText), and
+' deletes the files of languages removed or renamed (OldFiles).
+#module "langdlg"
+
+#import "std/containers"
+#import "std/strings"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkCheckBox"
+#import "../codegen"
+#import "../langfile"
+using containers
+using tkApp
+using tkListTree
+using tkButton
+using tkLabel
+using tkTextBox
+using tkCheckBox
+using tkHost
+using tkPaint
+
+const as long WIN_CX = 900
+const as long WIN_CY = 560
+const as long ROW_CY = 28
+const as long GAP = 8
+const as long LEFT_CX = 260
+const as long GLYPH_CX = 40
+const as ulong GLYPH_ADD = &hF109               ' add (a plus)
+const as ulong GLYPH_DELETE = &hF34C            ' remove (a bin)
+
+public type LangAskFunc as function( byval owner as any ptr, byref text as const ustring ) as boolean
+
+public type LanguagesDialog
+    Win as TK_FORM ptr
+    Proj as langfile.LangProject                ' the working copy
+    Cats as Array( of langfile.Catalog )        ' by language, as Proj.Languages
+    OrigCodes as Array( of ustring )            ' by language: its code on disk; "" = added here
+    Removed as Array( of ustring )              ' codes on disk of languages removed here
+    OrigText as ustring                         ' everything as opened: Changed( ) compares against it
+    Texts as Array( of codegen.TrEntry )        ' every key the project's translatable forms ask for
+    FormName as ustring                         ' opened from a form: its keys first ("" = all forms)
+    RowKeys as Array( of ustring )              ' the grid's rows
+    RowBase as Array( of ustring )              ' and the forms' text on each ("" = unused)
+    Accepted as boolean
+    IsModal as boolean
+    Loading as boolean
+    Owner as any ptr
+    Ask as LangAskFunc
+
+    LstLang as TK_WIDGET ptr
+    BtnAdd as TK_WIDGET ptr
+    BtnRemove as TK_WIDGET ptr
+    LblCode as TK_WIDGET ptr
+    TxtCode as TK_WIDGET ptr
+    LblName as TK_WIDGET ptr
+    TxtName as TK_WIDGET ptr
+    ChkEmbed as TK_WIDGET ptr
+    LblInfo as TK_WIDGET ptr
+    Grid as TK_WIDGET ptr
+    ChkThisForm as TK_WIDGET ptr
+    ChkOpenOnly as TK_WIDGET ptr
+    LblTrans as TK_WIDGET ptr
+    TxtTrans as TK_WIDGET ptr
+    BtnReviewed as TK_WIDGET ptr
+    BtnUnused as TK_WIDGET ptr
+    BtnOk as TK_WIDGET ptr
+    BtnCancel as TK_WIDGET ptr
+
+    declare sub Open( byval owner_ as TK_FORM ptr, byref proj_ as langfile.LangProject, byref cats_ as Array( of langfile.Catalog ), _
+                      byref texts_ as Array( of codegen.TrEntry ), byref formName_ as const ustring )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub Finish( byval ok as boolean )
+    declare sub Layout( )
+    declare function ButtonWidth( byval b as TK_WIDGET ptr, byval minW as long ) as long
+    declare function AllText( ) as ustring
+    declare function Changed( ) as boolean
+    declare function OldFiles( ) as Array( of ustring )
+    declare function LangIndex( ) as long
+    declare sub FillLangs( byval selectIdx as long )
+    declare sub ShowLang( )
+    declare sub FillGrid( byval selectRow as long )
+    declare sub ShowRow( )
+    declare function RowIndex( ) as long
+    declare sub AddLanguage( )
+    declare function RemoveLanguage( ) as boolean
+    declare function ApplyFields( ) as ustring
+    declare sub EmbedToggled( byval on_ as boolean )
+    declare function TakeTranslation( byval advance as boolean ) as boolean
+    declare sub MarkReviewed( )
+    declare sub DeleteUnused( )
+end type
+
+private sub RaiseOwner_( byval f as TK_FORM ptr )
+    if (f <> 0) andalso (f->pOwner <> 0) then SDL_RaiseWindow( f->pOwner->host->win )
+end sub
+
+private function DlgOf( byval w as TK_WIDGET ptr ) as LanguagesDialog ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub OnButton( byval h as TK_WIDGET ptr, byval id as long )
+    dim as LanguagesDialog ptr d = DlgOf( h )
+    if d = 0 then exit sub
+    select case h
+    case d->BtnOk       : d->Finish( true )
+    case d->BtnCancel   : d->Finish( false )
+    case d->BtnAdd      : d->AddLanguage( )
+    case d->BtnRemove   : d->RemoveLanguage( )
+    case d->BtnReviewed : d->MarkReviewed( )
+    case d->BtnUnused   : d->DeleteUnused( )
+    end select
+end sub
+
+private sub OnLangSel( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as LanguagesDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->ShowLang( )
+end sub
+
+private sub OnRowSel( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as LanguagesDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->ShowRow( )
+end sub
+
+private sub OnFieldEnter( byval h as TK_WIDGET ptr )
+    dim as LanguagesDialog ptr d = DlgOf( h )
+    if d = 0 then exit sub
+    tkLabel_SetText( d->LblInfo, d->ApplyFields( ) )
+end sub
+
+private sub OnTransEnter( byval h as TK_WIDGET ptr )
+    dim as LanguagesDialog ptr d = DlgOf( h )
+    if d then d->TakeTranslation( true )
+end sub
+
+private sub OnEmbed( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as LanguagesDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then d->EmbedToggled( isChecked )
+end sub
+
+private sub OnFilter( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as LanguagesDialog ptr d = DlgOf( h )
+    if (d <> 0) andalso (d->Loading = false) then
+        d->TakeTranslation( false )
+        d->FillGrid( 0 )
+        d->ShowRow( )
+    end if
+end sub
+
+private function MakeButton_( byval parent as TK_WIDGET ptr, byref text as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    dim as ustring t = text
+    tkButton_SetText( b, t )
+    tkButton_SetClickCallback( b, @OnButton )
+    return b
+end function
+
+private function MakeGlyphButton_( byval parent as TK_WIDGET ptr, byval cp as ulong, byref tip as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    tkButton_SetGlyphFont( b, tkForm_Font( tkForm_FromWidget( parent ), TKFONT_GLYPH_LARGE ) )
+    tkButton_SetGlyphLeft( b, wchr( cp ) )
+    tkButton_SetTooltipText( b, tip )
+    tkButton_SetClickCallback( b, @OnButton )
+    return b
+end function
+
+private function MakeCheck_( byval parent as TK_WIDGET ptr, byref text as const ustring, byval cb as any ptr ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr c = tkCheckBox_Create( parent, 1 )
+    tkCheckBox_SetText( c, text )
+    tkCheckBox_SetCheckChangedCallback( c, cb )
+    return c
+end function
+
+private function NoHeaderTip_( byval h as TK_WIDGET ptr, byval idx as integer ) as ustring
+    return ""
+end function
+
+' A cell's whole text as its tooltip: a long one is cut short in its column.
+private function CellTip_( byval h as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ustring
+    if (row < 0) orelse (col < 0) then return ""
+    return tkListTree_GetCellText( h, row, col )
+end function
+
+private function StateText_( byval st as long ) as ustring
+    select case st
+    case langfile.EntryState.StateMissing : return i18n.Tr( "designer.lang_state_missing", "Missing" )
+    case langfile.EntryState.StateStale   : return i18n.Tr( "designer.lang_state_stale", "Changed" )
+    case langfile.EntryState.StateUnused  : return i18n.Tr( "designer.lang_state_unused", "Unused" )
+    end select
+    return ""
+end function
+
+' "frmMain" of "frmMain.btnOK.Text".
+private function FormOf_( byref key_ as const ustring ) as ustring
+    dim as long d = instr( key_, "." )
+    if d = 0 then return key_
+    return left( key_, d - 1 )
+end function
+
+sub LanguagesDialog.Open( byval owner_ as TK_FORM ptr, byref proj_ as langfile.LangProject, byref cats_ as Array( of langfile.Catalog ), _
+                          byref texts_ as Array( of codegen.TrEntry ), byref formName_ as const ustring )
+    Proj = proj_
+    Cats = cats_
+    Texts = texts_
+    FormName = formName_
+    OrigCodes.Clear( )
+    for each x as langfile.LangInfo in Proj.Languages
+        OrigCodes.Push( x.Code )
+    next
+    OrigText = this.AllText( )
+
+    dim as single sc = 0
+    if owner_ then sc = tkForm_Host( owner_ )->fScaleForced
+    Win = tkApp_NewForm( i18n.Tr( "designer.lang_title", "Languages" ), WIN_CX, WIN_CY, owner_, sc )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    tkForm_OnClose( Win, function( byval f as TK_FORM ptr ) as boolean
+        RaiseOwner_( f )
+        return true
+    end function )
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    Loading = true
+
+    LstLang = tkListTree_Create( root_, 1 )
+    tkListTree_AddColumn( LstLang, i18n.Tr( "designer.lang_col_language", "Language" ), tkForm_Scale( Win, 150 ) )
+    tkListTree_AddColumn( LstLang, i18n.Tr( "designer.lang_col_code", "Code" ), tkForm_Scale( Win, 50 ) )
+    tkListTree_AddColumn( LstLang, i18n.Tr( "designer.res_col_embed", "Built in" ), tkForm_Scale( Win, 60 ) )
+    tkListTree_ShowHeader( LstLang, true )
+    tkListTree_SetPaintCallback( LstLang, @tkListTree_PaintRowDefault )
+    tkListTree_SetHeaderTooltipCallback( LstLang, @NoHeaderTip_ )
+    tkListTree_SetSelChangeCallback( LstLang, @OnLangSel )
+    BtnAdd = MakeGlyphButton_( root_, GLYPH_ADD, i18n.Tr( "designer.lang_add", "Add a language" ) )
+    BtnRemove = MakeGlyphButton_( root_, GLYPH_DELETE, i18n.Tr( "designer.lang_remove", "Remove the language" ) )
+    LblCode = tkLabel_Create( root_, 1 )
+    tkLabel_SetText( LblCode, i18n.Tr( "designer.lang_code", "Code" ) )
+    TxtCode = tkTextBox_Create( root_, 1 )
+    tkTextBox_SetEnterPressedCallback( TxtCode, @OnFieldEnter )
+    LblName = tkLabel_Create( root_, 1 )
+    tkLabel_SetText( LblName, i18n.Tr( "designer.res_name", "Name" ) )
+    TxtName = tkTextBox_Create( root_, 1 )
+    tkTextBox_SetEnterPressedCallback( TxtName, @OnFieldEnter )
+    ChkEmbed = MakeCheck_( root_, i18n.Tr( "designer.res_embed", "Build into the program" ), @OnEmbed )
+    LblInfo = tkLabel_Create( root_, 1 )
+    tkLabel_SetWordWrap( LblInfo, true )
+
+    Grid = tkListTree_Create( root_, 1 )
+    tkListTree_AddColumn( Grid, i18n.Tr( "designer.lang_col_key", "Key" ), tkForm_Scale( Win, 170 ) )
+    tkListTree_AddColumn( Grid, i18n.Tr( "designer.lang_col_text", "Form text" ), tkForm_Scale( Win, 150 ) )
+    tkListTree_AddColumn( Grid, i18n.Tr( "designer.lang_col_translation", "Translation" ), tkForm_Scale( Win, 150 ) )
+    tkListTree_AddColumn( Grid, i18n.Tr( "designer.lang_col_state", "State" ), tkForm_Scale( Win, 70 ) )
+    tkListTree_ShowHeader( Grid, true )
+    tkListTree_SetPaintCallback( Grid, @tkListTree_PaintRowDefault )
+    tkListTree_SetHeaderTooltipCallback( Grid, @NoHeaderTip_ )
+    tkListTree_SetTooltipCallback( Grid, @CellTip_ )
+    tkListTree_SetSelChangeCallback( Grid, @OnRowSel )
+    ChkThisForm = MakeCheck_( root_, strings.Format( i18n.Tr( "designer.lang_this_form", "Only {}" ), FormName ), @OnFilter )
+    tkCheckBox_SetChecked( ChkThisForm, len( FormName ) > 0 )
+    ChkOpenOnly = MakeCheck_( root_, i18n.Tr( "designer.lang_open_only", "Only missing or changed" ), @OnFilter )
+    LblTrans = tkLabel_Create( root_, 1 )
+    tkLabel_SetText( LblTrans, i18n.Tr( "designer.lang_col_translation", "Translation" ) )
+    TxtTrans = tkTextBox_Create( root_, 1 )
+    tkTextBox_SetEnterPressedCallback( TxtTrans, @OnTransEnter )
+    BtnReviewed = MakeButton_( root_, i18n.Tr( "designer.lang_reviewed", "Keep translation" ) )
+    tkButton_SetTooltipText( BtnReviewed, i18n.Tr( "designer.lang_reviewed_tip", "The translation fits the form's new text" ) )
+    BtnUnused = MakeButton_( root_, i18n.Tr( "designer.lang_delete_unused", "Delete unused" ) )
+    BtnOk = MakeButton_( root_, i18n.Tr( "designer.ok", "OK" ) )
+    BtnCancel = MakeButton_( root_, i18n.Tr( "designer.cancel", "Cancel" ) )
+
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        cast( LanguagesDialog ptr, f->Tag )->Layout( )
+    end sub )
+    Loading = false
+    tkWidget_Show( ChkThisForm, len( FormName ) > 0 )
+    this.FillLangs( iif( Proj.Languages.Count( ) > 0, 0, -1 ) )
+    tkForm_Show( Win )
+    this.Layout( )
+    this.ShowLang( )
+end sub
+
+function LanguagesDialog.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub LanguagesDialog.Close( )
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+end sub
+
+' The project and every catalog as text, with what was removed: Changed( ) compares this.
+function LanguagesDialog.AllText( ) as ustring
+    dim as ustring o = langfile.ProjectText( Proj )
+    for i as long = 0 to Cats.Count( ) - 1
+        o &= chr( 1 ) & OrigCodes[i] & chr( 1 ) & langfile.CatalogText( Cats[i] )
+    next
+    for each r as ustring in Removed
+        o &= chr( 2 ) & r
+    next
+    return o
+end function
+
+function LanguagesDialog.Changed( ) as boolean
+    return this.AllText( ) <> OrigText
+end function
+
+' The catalogs (lang/<code>.toml) to delete on OK: removed languages', and renamed ones' old files.
+function LanguagesDialog.OldFiles( ) as Array( of ustring )
+    dim as Array( of ustring ) a
+    for each r as ustring in Removed
+        a.Push( r )
+    next
+    for i as long = 0 to Proj.Languages.Count( ) - 1
+        if (len( OrigCodes[i] ) > 0) andalso (OrigCodes[i] <> Proj.Languages[i].Code) then a.Push( OrigCodes[i] )
+    next
+    return a
+end function
+
+sub LanguagesDialog.Finish( byval ok as boolean )
+    if ok then
+        ' what is still in the boxes counts, as if Enter had been pressed
+        this.TakeTranslation( false )
+        dim as ustring fault = this.ApplyFields( )
+        if len( fault ) then
+            tkLabel_SetText( LblInfo, fault )
+            exit sub
+        end if
+        dim as Array( of ustring ) problems
+        langfile.CheckProject( Proj, "", problems )
+        if problems.Count( ) then
+            tkLabel_SetText( LblInfo, problems[0] )
+            exit sub
+        end if
+    end if
+    Accepted = ok
+    if IsModal then
+        RaiseOwner_( Win )
+        tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+    end if
+end sub
+
+' A button's ideal width with some room either side; at least minW.
+function LanguagesDialog.ButtonWidth( byval b as TK_WIDGET ptr, byval minW as long ) as long
+    dim as long iw, ih
+    tkButton_GetIdealSize( b, iw, ih )
+    iw += 2 * tkForm_Scale( Win, GAP )
+    return iif( iw > minW, iw, minW )
+end function
+
+sub LanguagesDialog.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long g = tkForm_Scale( Win, GAP ), rh = tkForm_Scale( Win, ROW_CY ), cw = root_->cw, ch = root_->ch
+    dim as long lw = tkForm_Scale( Win, LEFT_CX ), bw = tkForm_Scale( Win, 110 ), gw = tkForm_Scale( Win, GLYPH_CX )
+    dim as long labW = tkForm_Scale( Win, 50 )
+    dim as long bottomY = ch - g - rh
+    ' left: the languages, their buttons, the selected one's fields, the info line
+    dim as long fieldsY = bottomY - 5 * (rh + g)
+    tkWidget_SetPos( LstLang, g, g, lw, fieldsY - 2 * g - rh )
+    tkWidget_SetPos( BtnAdd, g, fieldsY - g - rh, gw, rh )
+    tkWidget_SetPos( BtnRemove, 2 * g + gw, fieldsY - g - rh, gw, rh )
+    tkWidget_SetPos( LblCode, g, fieldsY, labW, rh )
+    tkWidget_SetPos( TxtCode, 2 * g + labW, fieldsY, lw - labW - g, rh )
+    tkWidget_SetPos( LblName, g, fieldsY + rh + g, labW, rh )
+    tkWidget_SetPos( TxtName, 2 * g + labW, fieldsY + rh + g, lw - labW - g, rh )
+    tkWidget_SetPos( ChkEmbed, g, fieldsY + 2 * (rh + g), lw, rh )
+    tkWidget_SetPos( LblInfo, g, fieldsY + 3 * (rh + g), lw, 2 * rh + g )
+    ' right: the filters, the keys, the translation box with its buttons
+    dim as long rx = 2 * g + lw, rw = cw - rx - g
+    tkWidget_SetPos( ChkThisForm, rx, g, rw \ 2, rh )
+    tkWidget_SetPos( ChkOpenOnly, rx + rw \ 2, g, rw - rw \ 2, rh )
+    dim as long transY = bottomY - 2 * (rh + g)
+    tkWidget_SetPos( Grid, rx, 2 * g + rh, rw, transY - 3 * g - rh )
+    tkWidget_SetPos( LblTrans, rx, transY, tkForm_Scale( Win, 90 ), rh )
+    tkWidget_SetPos( TxtTrans, rx + tkForm_Scale( Win, 90 ) + g, transY, rw - tkForm_Scale( Win, 90 ) - g, rh )
+    ' each as wide as its own text (translations run long), never narrower than OK
+    dim as long revW = this.ButtonWidth( BtnReviewed, bw ), unW = this.ButtonWidth( BtnUnused, bw )
+    tkWidget_SetPos( BtnReviewed, rx, transY + rh + g, revW, rh )
+    tkWidget_SetPos( BtnUnused, rx + revW + g, transY + rh + g, unW, rh )
+    tkWidget_SetPos( BtnCancel, cw - g - bw, bottomY, bw, rh )
+    tkWidget_SetPos( BtnOk, cw - 2 * (g + bw), bottomY, bw, rh )
+end sub
+
+' ---- the languages ---------------------------------------------------------------------------
+
+' The selected language: its index in Proj.Languages, -1 for the forms' own.
+function LanguagesDialog.LangIndex( ) as long
+    dim as integer r = tkListTree_GetCurSel( LstLang )
+    if r < 0 then return -1
+    return tkListTree_GetItemData( LstLang, r )
+end function
+
+' The forms' own language first, then the others. selectIdx: the language to select (-1 = the forms').
+sub LanguagesDialog.FillLangs( byval selectIdx as long )
+    Loading = true
+    tkListTree_BeginUpdate( LstLang )
+    tkListTree_Clear( LstLang )
+    dim as integer r = tkListTree_AddString( LstLang, Proj.BaseName & " " & i18n.Tr( "designer.lang_forms_own", "(the forms)" ), -1 )
+    tkListTree_SetCellText( LstLang, r, 1, Proj.BaseCode )
+    dim as long selRow = 0
+    for i as long = 0 to Proj.Languages.Count( ) - 1
+        dim byref as langfile.LangInfo x = Proj.Languages[i]
+        r = tkListTree_AddString( LstLang, x.Name, i )
+        tkListTree_SetCellText( LstLang, r, 1, x.Code )
+        tkListTree_SetCellText( LstLang, r, 2, iif( x.Embed, i18n.Tr( "designer.res_yes", "Yes" ), i18n.Tr( "designer.res_no", "No" ) ) )
+        if i = selectIdx then selRow = r
+    next
+    tkListTree_EndUpdate( LstLang )
+    tkListTree_SetCurSel( LstLang, selRow )
+    Loading = false
+end sub
+
+' The selected language in the fields, and its translations in the grid.
+sub LanguagesDialog.ShowLang( )
+    dim as long i = this.LangIndex( )
+    Loading = true
+    tkLabel_SetText( LblInfo, "" )
+    tkWidget_Enable( BtnRemove, i >= 0 )
+    tkWidget_Enable( ChkEmbed, i >= 0 )
+    if i < 0 then
+        tkTextBox_SetText( TxtCode, Proj.BaseCode )
+        tkTextBox_SetText( TxtName, Proj.BaseName )
+        tkCheckBox_SetChecked( ChkEmbed, false )
+        tkLabel_SetText( LblInfo, i18n.Tr( "designer.lang_forms_info", "The texts as the forms have them. Add a language to translate them." ) )
+    else
+        tkTextBox_SetText( TxtCode, Proj.Languages[i].Code )
+        tkTextBox_SetText( TxtName, Proj.Languages[i].Name )
+        tkCheckBox_SetChecked( ChkEmbed, Proj.Languages[i].Embed )
+        tkLabel_SetText( LblInfo, langfile.LANG_MODULE & "/" & langfile.CatalogFile( Proj.Languages[i].Code ) )
+    end if
+    Loading = false
+    this.FillGrid( 0 )
+    this.ShowRow( )
+end sub
+
+sub LanguagesDialog.AddLanguage( )
+    this.TakeTranslation( false )
+    dim as langfile.LangInfo x
+    x.Code = "xx"
+    dim as long n = 2
+    while (langfile.Find( Proj, x.Code ) >= 0) orelse (lcase( x.Code ) = lcase( Proj.BaseCode ))
+        x.Code = "xx" & n
+        n += 1
+    wend
+    x.Name = i18n.Tr( "designer.lang_new", "New language" )
+    Proj.Languages.Push( x )
+    dim as langfile.Catalog c
+    c.Name = x.Name
+    Cats.Push( c )
+    OrigCodes.Push( "" )
+    this.FillLangs( Proj.Languages.Count( ) - 1 )
+    this.ShowLang( )
+    tkLabel_SetText( LblInfo, i18n.Tr( "designer.lang_new_info", "Type its code (fr, pt_BR) and its name as it calls itself, then Enter." ) )
+    tkHost_SetFocus( tkForm_Host( Win ), TxtCode )
+end sub
+
+' The selected language out, after asking.
+function LanguagesDialog.RemoveLanguage( ) as boolean
+    dim as long i = this.LangIndex( )
+    if i < 0 then return false
+    if Ask <> 0 then
+        dim as ustring q
+        if Cats[i].Entries.Count( ) > 0 then
+            q = strings.Format( i18n.Tr( "designer.lang_remove_ask", "Remove {0} and its {1} translations?" ), _
+                                Proj.Languages[i].Name, Cats[i].Entries.Count( ) )
+        else
+            q = strings.Format( i18n.Tr( "designer.lang_remove_ask_empty", "Remove {0}?" ), Proj.Languages[i].Name )
+        end if
+        if Ask( Owner, q ) = false then return false
+    end if
+    if len( OrigCodes[i] ) then Removed.Push( OrigCodes[i] )
+    Proj.Languages.Remove( i )
+    Cats.Remove( i )
+    OrigCodes.Remove( i )
+    this.FillLangs( iif( i < Proj.Languages.Count( ), i, Proj.Languages.Count( ) - 1 ) )
+    this.ShowLang( )
+    return true
+end function
+
+' The code and name boxes into the selected language (or the forms' own). "" when done, else why not.
+function LanguagesDialog.ApplyFields( ) as ustring
+    dim as long i = this.LangIndex( )
+    dim as ustring code = trim( tkTextBox_GetText( TxtCode ) ), nm = trim( tkTextBox_GetText( TxtName ) )
+    if langfile.IsCode( code ) = false then return i18n.Tr( "designer.lang_bad_code", "A code is a letter, then letters, digits, _ and -" )
+    if len( nm ) = 0 then return i18n.Tr( "designer.lang_needs_name", "A language needs a name" )
+    if i < 0 then
+        if langfile.Find( Proj, code ) >= 0 then return strings.Format( i18n.Tr( "designer.res_name_taken", "{} is taken" ), code )
+        if (code = Proj.BaseCode) andalso (nm = Proj.BaseName) then return ""
+        Proj.BaseCode = code
+        Proj.BaseName = nm
+    else
+        dim as long j = langfile.Find( Proj, code )
+        if ((j >= 0) andalso (j <> i)) orelse (lcase( code ) = lcase( Proj.BaseCode )) then
+            return strings.Format( i18n.Tr( "designer.res_name_taken", "{} is taken" ), code )
+        end if
+        if (code = Proj.Languages[i].Code) andalso (nm = Proj.Languages[i].Name) then return ""
+        Proj.Languages[i].Code = code
+        Proj.Languages[i].Name = nm
+        Cats[i].Name = nm
+    end if
+    this.FillLangs( i )
+    this.ShowLang( )
+    return ""
+end function
+
+sub LanguagesDialog.EmbedToggled( byval on_ as boolean )
+    dim as long i = this.LangIndex( )
+    if i < 0 then exit sub
+    Proj.Languages[i].Embed = on_
+    this.FillLangs( i )
+end sub
+
+' ---- the translations ------------------------------------------------------------------------
+
+' The grid again for the selected language: the forms' keys (this form's only, when asked), then
+' the catalog's keys no form has. selectRow: the row to select.
+sub LanguagesDialog.FillGrid( byval selectRow as long )
+    dim as long li = this.LangIndex( )
+    dim as boolean thisOnly = (len( FormName ) > 0) andalso tkCheckBox_GetChecked( ChkThisForm )
+    dim as boolean openOnly = (li >= 0) andalso tkCheckBox_GetChecked( ChkOpenOnly )
+    Loading = true
+    RowKeys.Clear( )
+    RowBase.Clear( )
+    tkListTree_BeginUpdate( Grid )
+    tkListTree_Clear( Grid )
+    for each t as codegen.TrEntry in Texts
+        if thisOnly andalso (FormOf_( t.Key ) <> FormName) then continue for
+        dim as ustring tr_
+        dim as long st = langfile.EntryState.StateDone
+        if li >= 0 then
+            st = langfile.StateOf( Cats[li], t.Key, t.Text )
+            dim as long e = langfile.FindEntry( Cats[li], t.Key )
+            if e >= 0 then tr_ = Cats[li].Entries[e].Text
+        end if
+        if openOnly andalso (st = langfile.EntryState.StateDone) then continue for
+        dim as integer r = tkListTree_AddString( Grid, t.Key, RowKeys.Count( ) )
+        tkListTree_SetCellText( Grid, r, 1, t.Text )
+        tkListTree_SetCellText( Grid, r, 2, tr_ )
+        if li >= 0 then tkListTree_SetCellText( Grid, r, 3, StateText_( st ) )
+        RowKeys.Push( t.Key )
+        RowBase.Push( t.Text )
+    next
+    if li >= 0 then
+        for each e as langfile.CatEntry in Cats[li].Entries
+            if thisOnly andalso (FormOf_( e.Key ) <> FormName) then continue for
+            dim as boolean used = false
+            for each t as codegen.TrEntry in Texts
+                if t.Key = e.Key then
+                    used = true
+                    exit for
+                end if
+            next
+            if used then continue for
+            dim as integer r = tkListTree_AddString( Grid, e.Key, RowKeys.Count( ) )
+            tkListTree_SetCellText( Grid, r, 2, e.Text )
+            tkListTree_SetCellText( Grid, r, 3, StateText_( langfile.EntryState.StateUnused ) )
+            RowKeys.Push( e.Key )
+            RowBase.Push( "" )
+        next
+    end if
+    tkListTree_EndUpdate( Grid )
+    if RowKeys.Count( ) then
+        if selectRow >= RowKeys.Count( ) then selectRow = RowKeys.Count( ) - 1
+        if selectRow < 0 then selectRow = 0
+        tkListTree_SetCurSel( Grid, selectRow )
+    end if
+    tkWidget_Enable( BtnUnused, li >= 0 )
+    Loading = false
+end sub
+
+' The selected row; -1 for none.
+function LanguagesDialog.RowIndex( ) as long
+    dim as integer r = tkListTree_GetCurSel( Grid )
+    if r < 0 then return -1
+    return tkListTree_GetItemData( Grid, r )
+end function
+
+' The selected row's translation in the box.
+sub LanguagesDialog.ShowRow( )
+    dim as long li = this.LangIndex( ), k = this.RowIndex( )
+    Loading = true
+    dim as boolean can = (li >= 0) andalso (k >= 0)
+    tkWidget_Enable( TxtTrans, can )
+    tkWidget_Enable( BtnReviewed, can )
+    dim as ustring tr_
+    if can then
+        dim as long e = langfile.FindEntry( Cats[li], RowKeys[k] )
+        if e >= 0 then tr_ = Cats[li].Entries[e].Text
+    end if
+    tkTextBox_SetText( TxtTrans, tr_ )
+    Loading = false
+end sub
+
+' The box's text as the selected row's translation (empty: none), translated from the form's text as
+' it is now; advance: on to the next row. False when there was nothing to take.
+function LanguagesDialog.TakeTranslation( byval advance as boolean ) as boolean
+    dim as long li = this.LangIndex( ), k = this.RowIndex( )
+    if (li < 0) orelse (k < 0) then return false
+    dim as ustring t = tkTextBox_GetText( TxtTrans ), had
+    dim as long e = langfile.FindEntry( Cats[li], RowKeys[k] )
+    if e >= 0 then had = Cats[li].Entries[e].Text
+    dim as integer row = tkListTree_GetCurSel( Grid )
+    if t <> had then
+        if len( RowBase[k] ) then
+            langfile.PutEntry( Cats[li], RowKeys[k], t, RowBase[k] )
+        elseif e >= 0 then
+            ' an unused one keeps what it was translated from
+            langfile.PutEntry( Cats[li], RowKeys[k], t, Cats[li].Entries[e].Source )
+        end if
+    end if
+    if (t = had) andalso (advance = false) then return false
+    this.FillGrid( iif( advance, row + 1, row ) )
+    this.ShowRow( )
+    if advance then tkHost_SetFocus( tkForm_Host( Win ), TxtTrans )
+    return true
+end function
+
+' The selected row's translation still fits the form's (changed) text.
+sub LanguagesDialog.MarkReviewed( )
+    dim as long li = this.LangIndex( ), k = this.RowIndex( )
+    if (li < 0) orelse (k < 0) then exit sub
+    this.TakeTranslation( false )
+    dim as long e = langfile.FindEntry( Cats[li], RowKeys[k] )
+    if (e < 0) orelse (len( RowBase[k] ) = 0) then exit sub
+    Cats[li].Entries[e].Source = RowBase[k]
+    this.FillGrid( tkListTree_GetCurSel( Grid ) )
+    this.ShowRow( )
+end sub
+
+' The selected language's translations of keys no form has any more.
+sub LanguagesDialog.DeleteUnused( )
+    dim as long li = this.LangIndex( )
+    if li < 0 then exit sub
+    this.TakeTranslation( false )
+    dim as long i = 0, n = 0
+    while i < Cats[li].Entries.Count( )
+        dim as boolean used = false
+        for each t as codegen.TrEntry in Texts
+            if t.Key = Cats[li].Entries[i].Key then
+                used = true
+                exit for
+            end if
+        next
+        if used then
+            i += 1
+        else
+            Cats[li].Entries.Remove( i )
+            n += 1
+        end if
+    wend
+    this.FillGrid( 0 )
+    this.ShowRow( )
+    tkLabel_SetText( LblInfo, strings.Format( i18n.Tr( "designer.lang_deleted_unused", "{} unused deleted" ), n ) )
+end sub

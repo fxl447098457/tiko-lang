@@ -13,6 +13,15 @@
 # own headers, read by clang for that triple -- only the host differs. Once tiko runs there
 # (L3), regenerate natively and diff.
 #
+#   lib/rt/build/genbind.sh --target android-x86_64 --sysroot <dir>
+#                                      anywhere: src/inc/sysbind/android-x86_64.ti, against
+#                                      Bionic's headers under <dir>/usr/include
+#
+# THE CROSS FORM is for a target whose own tiko does not exist: <dir> is the target's sysroot
+# -- for Android the NDK's own, <ndk>/toolchains/llvm/prebuilt/<host>/sysroot, which IS that
+# target's headers (docs/tiko-android A1) -- handed to clang as -csysroot. The same
+# form as linux-arm64's above.
+#
 # tiko's own C importer (-cimport, decision 0016) reads lib/rt/build/sysbind.h against the
 # host's C headers -- MinGW-w64's on Windows, the system's glibc on Linux -- and genbind.py
 # keeps the declarations tiko-rt's sources name and what those need. Each target's binding

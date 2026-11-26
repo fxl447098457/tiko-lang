@@ -1,0 +1,172 @@
+' tkPdf self-test (printing phase R2). One check per behaviour: deflate round-trips, the file's
+' structure (header, xref offsets, trailer), real text (Identity-H codes, Tz, ToUnicode), the font
+' embedded whole, icon glyphs as paths, links, an image's soft mask, a gradient's shading, and a
+' script that needs shaping drawn as an image with a warning. No window is needed: one pass.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkPdf"
+using tkTest
+using tkPdf
+using tkPrint
+using tkHost
+using tkPaint
+
+' ---- a fixed-Huffman inflater: the test's own check of the encoder ---------------------------
+dim shared as const ubyte ptr gIn
+dim shared as integer gBit
+
+function Bit1( ) as long
+    dim as long v = (gIn[gBit \ 8] shr (gBit mod 8)) and 1
+    gBit += 1
+    return v
+end function
+
+function Bits( byval k as long ) as long
+    dim as long v = 0
+    for i as long = 0 to k - 1 : v or= Bit1( ) shl i : next
+    return v
+end function
+
+function Inflate( byval p as const ubyte ptr, byval n as integer ) as string
+    static as long lbase(0 to 28) = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 }
+    static as long lext(0 to 28) = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 }
+    static as long dbase(0 to 29) = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 }
+    static as long dext(0 to 29) = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 }
+    gIn = p + 2 : gBit = 0
+    if (Bit1( ) <> 1) orelse (Bits( 2 ) <> 1) then return "<not one fixed block>"
+    dim as string o
+    do
+        dim as long code = 0
+        for i as long = 1 to 7 : code = (code shl 1) or Bit1( ) : next
+        dim as long sym
+        if code <= &h17 then
+            sym = 256 + code
+        else
+            code = (code shl 1) or Bit1( )
+            if (code >= &h30) andalso (code <= &hBF) then
+                sym = code - &h30
+            elseif code >= &hC0 andalso code <= &hC7 then
+                sym = 280 + code - &hC0
+            else
+                code = (code shl 1) or Bit1( )
+                sym = 144 + code - &h190
+            end if
+        end if
+        if sym < 256 then
+            o &= chr( sym )
+        elseif sym = 256 then
+            exit do
+        else
+            dim as long length = lbase(sym - 257) + Bits( lext(sym - 257) )
+            dim as long dc = 0
+            for i as long = 1 to 5 : dc = (dc shl 1) or Bit1( ) : next
+            dim as long dist = dbase(dc) + Bits( dext(dc) )
+            for i as long = 1 to length : o &= mid( o, len( o ) - dist + 1, 1 ) : next
+        end if
+    loop while gBit \ 8 < n
+    return o
+end function
+
+' ---- helpers --------------------------------------------------------------------------------
+function AsStr( byref b as PDF_BUF ) as string
+    dim as string s = space( b.n )
+    for i as integer = 0 to b.n - 1 : s[i] = b.b(i) : next
+    return s
+end function
+
+' A page with everything the checks look for.
+function Page1( byval doc as TK_PRINTDOC ptr, byval pg as TK_PAGE ptr, byval i as long ) as boolean
+    dim as TKFONTSPEC fs
+    fs.pt = 12
+    tkPage_SetFont( pg, fs )
+    dim as TKRECTF r
+    tkRectF_Set( r, 72, 72, 400, 90 )
+    tkPage_Text( pg, "Hello", r, TK_DT_LEFT )
+    fs.src = tkHost_FontDir( ) & TK_FONT_ICONS
+    tkPage_SetFont( pg, fs )
+    tkRectF_Set( r, 72, 100, 120, 130 )
+    tkPage_Text( pg, wchr( TK_ICON_MORE ), r, TK_DT_LEFT )
+    fs.src = ""
+    tkPage_SetFont( pg, fs )
+    tkRectF_Set( r, 72, 140, 400, 160 )
+    tkPage_Text( pg, wchr( &h05E9, &h05DC, &h05D5, &h05DD ), r, TK_DT_LEFT )      ' Hebrew: needs shaping
+    tkRectF_Set( r, 72, 170, 200, 190 )
+    tkPage_LinkToPage( pg, r, 0, 100 )
+    tkRectF_Set( r, 72, 200, 200, 220 )
+    tkPage_Link( pg, r, "https://example.com/a(b)" )
+    tkRectF_Set( r, 300, 72, 400, 172 )
+    tkPage_GradientRect( pg, r, &hFF000000ul, &hFFFF0000ul )
+    dim as SDL_Surface ptr s = SDL_CreateSurface( 4, 4, SDL_PIXELFORMAT_ARGB8888 )
+    SDL_FillSurfaceRect( s, 0, &h80FF0000ul )                                       ' half-transparent red
+    tkRectF_Set( r, 300, 200, 340, 240 )
+    tkPage_ImageSurface( pg, s, r, TK_IMGFIT_STRETCH )
+    SDL_DestroySurface( s )
+    return false
+end function
+
+sub RunPass( )
+    tkTest_Begin( "pdf" )
+    ' deflate: text with repeats and every byte value, back through the inflater
+    dim as string src
+    for i as long = 0 to 2999 : src &= "line " & (i mod 37) & " of the page, again; " : next
+    for i as long = 0 to 255 : src &= chr( i ) : next
+    dim as PDF_BUF z
+    tkPdf_Deflate( cast( const ubyte ptr, strptr( src ) ), len( src ), z )
+    dim as string back = Inflate( @z.b(0), z.n )
+    tkTest_Check( "deflate round-trips, smaller", (back = src) andalso (z.n < len( src ) \ 4), len( src ) & " -> " & z.n & ", back " & len( back ) )
+
+    dim as TK_PRINTDOC ptr doc = tkPrintDoc_Create( "Self test" )
+    tkPrintDoc_SetPrintPageCallback( doc, @Page1 )
+    tkPrintDoc_Generate( doc )
+    dim as TKPDF_OPTIONS opts
+    opts.bCompress = false
+    dim as PDF_BUF b
+    tkTest_Check( "write", tkPdf_Write( doc, b, @opts ) )
+    dim as string pdf = AsStr( b )
+
+    ' structure: header, every xref entry at its object, startxref at the table
+    dim as long sx = instrrev( pdf, "startxref" )
+    dim as long xref = valint( mid( pdf, sx + 10 ) )
+    dim as boolean okX = (left( pdf, 8 ) = "%PDF-1.7") andalso (right( pdf, 6 ) = "%%EOF" & chr( 10 )) andalso (mid( pdf, xref + 1, 4 ) = "xref")
+    dim as long nObj = valint( mid( pdf, xref + 8 ) ) - 1, bad = 0
+    dim as long e = instr( xref + 1, pdf, "65535 f " ) + 10
+    for id as long = 1 to nObj
+        dim as long off = valint( mid( pdf, e + (id - 1) * 20, 10 ) )
+        if mid( pdf, off + 1, len( id & " 0 obj" ) ) <> id & " 0 obj" then bad += 1
+    next
+    tkTest_Check( "structure: header, trailer, every xref offset at its object", okX andalso (nObj > 10) andalso (bad = 0), nObj & " objects, " & bad & " bad" )
+
+    ' real text: Identity-H codes with Tz, the font embedded whole, H mapped back to U+0048
+    dim as const any ptr pd
+    dim as integer nd
+    dim as boolean owned
+    tkHost_FontBytes( tkHost_FontDir( ) & TK_FONT_UI, pd, nd, owned )
+    if owned then SDL_free( cast( any ptr, pd ) )
+    tkTest_Check( "text: a Tj in a Type0 font, Tz-fitted, mapped back by ToUnicode", (instr( pdf, "> Tj ET" ) > 0) andalso (instr( pdf, " Tz ") > 0) _
+                  andalso (instr( pdf, "/Subtype /Type0" ) > 0) andalso (instr( pdf, "/Encoding /Identity-H" ) > 0) andalso (instr( pdf, "<0048>" ) > 0) )
+    tkTest_Check( "the UI font embedded whole (FontFile2 /Length1 = its size)", instr( pdf, "/Length1 " & nd & " " ) > 0, "size " & nd )
+    ' the icon glyph is a path: no font object for the icon file, curves and a fill in the content
+    tkTest_Check( "an icon glyph is a filled path, its font not embedded", (instr( pdf, "/FontFile2" ) = instrrev( pdf, "/FontFile2" )) _
+                  andalso (instr( pdf, " c" & chr( 10 ) ) > 0) )
+    tkTest_Check( "links: a page destination and a URI, parentheses escaped", (instr( pdf, "/Dest [5 0 R /XYZ 0 ") > 0) _
+                  andalso (instr( pdf, "/URI (https://example.com/a\(b\))" ) > 0) )
+    tkTest_Check( "a half-transparent image has a soft mask", instr( pdf, "/SMask " ) > 0 )
+    tkTest_Check( "a gradient is an axial shading", instr( pdf, "/ShadingType 2" ) > 0 )
+    tkTest_Check( "Hebrew is an image, with a warning", (instr( pdf, "/Tx0 " ) > 0) andalso (instr( tkPrintDoc_Warnings( doc ), "shaping" ) > 0), _
+                  tkPrintDoc_Warnings( doc ) )
+
+    ' compressed: every stream FlateDecode, and the file far smaller
+    dim as PDF_BUF bz
+    tkPdf_Write( doc, bz )
+    tkTest_Check( "compressed by default: under 65%, FlateDecode", (bz.n < b.n * 0.65) andalso (instr( AsStr( bz ), "/FlateDecode" ) > 0), b.n & " -> " & bz.n )
+    SDL_CreateDirectory( "../out" )               ' for a look by eye: examples/tkControls/out/tkpdf-selftest.pdf
+    tkPrintDoc_ExportPdf( doc, "../out/tkpdf-selftest.pdf" )
+    tkPrintDoc_Destroy( doc )
+end sub
+
+if tkTest_Init() = false then end 1
+RunPass( )
+dim as long nFail = tkTest_Report( "tkPdf" )
+tkTest_Quit()
+end nFail

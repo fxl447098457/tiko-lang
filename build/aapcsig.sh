@@ -3,6 +3,7 @@
 #
 #   build/aapcsig.sh                         macos-arm64 (Apple's AAPCS64)
 #   build/aapcsig.sh --target linux-arm64    generic AAPCS64 (docs/tiko-linux-arm64)
+#   build/aapcsig.sh --target android-arm64  generic AAPCS64 under Bionic (docs/tiko-android A3)
 #
 # tests/abi/apple/sig.c and sig.tiko declare the same shapes -- integer aggregates of 1 to
 # 17 bytes, HFAs of 1 to 5 floats and doubles (nested, arrayed, a union), mixed float and
@@ -35,7 +36,8 @@ if [ "${1:-}" = "--target" ]; then TGT=${2:-}; fi
 case "$TGT" in
     macos-arm64) T=arm64-apple-macosx13.0 ;;
     linux-arm64) T=aarch64-unknown-linux-gnu ;;
-    *) echo "aapcsig: no AAPCS64 target '$TGT' (macos-arm64 or linux-arm64)" >&2; exit 3 ;;
+    android-arm64) T=aarch64-linux-android29 ;;
+    *) echo "aapcsig: no AAPCS64 target '$TGT' (macos-arm64, linux-arm64 or android-arm64)" >&2; exit 3 ;;
 esac
 W="$ROOT/build/.aapcsig/$TGT"
 mkdir -p "$W"

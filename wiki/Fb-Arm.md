@@ -16,6 +16,8 @@ Define created at compile time if the compilation target uses the ARM CPU archit
 
 ## Remarks
 
+[`TIKO_ARCH_ARM64`](Category-Tiko-Compiler-Define) is tiko's own name for the same test; tiko code uses it.
+
 ### Differences from QB
 
 - New to FreeBASIC
@@ -30,6 +32,7 @@ Define created at compile time if the compilation target uses the ARM CPU archit
 - [`__FB_CYGWIN__`](Fb-Cygwin)
 - [`__FB_DARWIN__`](Fb-Darwin)
 - [`__FB_PCOS__`](Fb-Pcos)
+- [`TIKO_ARCH_ARM64`](Category-Tiko-Compiler-Define)
 - [Compiler Option: -target](Compiler-Option-Target)
 
 ## Examples

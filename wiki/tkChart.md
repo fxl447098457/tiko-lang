@@ -395,6 +395,7 @@ as a percentage, `(23%)`; on an HLOC chart the value is all four numbers, `O …
 | `tkChart_ResolveTooltipText( hChart ) as ustring` | What the tip would say now, by the order above. |
 | `tkChart_GetTooltipHandle( hChart ) as TK_TIP ptr` | The chart's tip, for the tooltip's own styling functions. |
 | `tkChart_SetHoverTime( hChart, ms )` | How long the mouse rests before the tip appears. |
+| `tkChart_SetTapToInspect( hChart, bOn as boolean )` / `Get...` | Default FALSE. TRUE is for a touch screen, which has no hover: a tap picks the point under it -- or, off every point, the nearest one across inside the plot (a bar's column, a line's vertex) -- makes it the hot point (`HotChange` fires) and shows its tip at once, until the next tap (on another point, on the same one, which lets it go, or off the plot). Moves and the leave are ignored meanwhile. Turning it off lets the point go. |
 
 ### Callback registration
 

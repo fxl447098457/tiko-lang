@@ -24,6 +24,15 @@
 #
 # Every run is from a COPY of the test's directory (data files; and these suites write), with
 # a closed stdin and a timeout. Modules are cached in a private TIKO_MODCACHE, emptied first.
+#
+#   build/stdsuite.sh --adb [PAT]        the ports, built on Windows for TIKO_ADB_TARGET (android-x86_64,
+#                                        the default, or android-arm64) and run
+#                                        on the device adb reaches (docs/tiko-android A2): every
+#                                        program is built first and staged with a copy of its
+#                                        directory, build/adbrun.sh runs them all in one push,
+#                                        and each record is then judged as above. The runtime
+#                                        is this tree's lib/rt/lib/<that target>, with
+#                                        fbcunit built for it here.
 set -u
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -35,6 +44,13 @@ case "$EXT" in
           elif [ "$(uname -m)" = aarch64 ]; then TC=$ROOT/toolchains/tiko-linux-arm64; LIBT=linux-arm64
           else TC=$ROOT/toolchains/tiko-linux; LIBT=linux-x86_64; fi ;;
 esac
+ADB=0
+[ "${1:-}" = "--adb" ] && { ADB=1; shift; }
+TGTOPT=""
+if [ "$ADB" = 1 ]; then
+    [ "$EXT" = .exe ] || { echo "stdsuite: --adb runs from Windows" >&2; exit 3; }
+    LIBT=${TIKO_ADB_TARGET:-android-x86_64}; TGTOPT="-target $LIBT"; EXT=""  # docs/tiko-android A3, D-A3-4
+fi
 # linux-arm64 has no packaged toolchain until docs/tiko-linux-arm64 L5: build/standin.sh lays
 # out this tree's inc/, runtime, graphics library and libfbcunit.a in its place.
 if [ "$LIBT" = linux-arm64 ] && [ ! -d "$TC" ]; then
@@ -60,6 +76,19 @@ PAT=${1:-}
 
 rm -rf "$WK"; mkdir -p "$WK/cache" "$WK/rd"
 export TIKO_MODCACHE="$WK/cache"
+if [ "$ADB" = 1 ]; then
+    # THIS TREE'S ANDROID RUNTIME, and fbcunit built for it as package.sh builds it per target.
+    export TIKO_LIBPATH="$WK/lib"
+    STAGE=$WK/stage
+    mkdir -p "$TIKO_LIBPATH" "$WK/fbcunit" "$STAGE"
+    cp "$ROOT"/lib/rt/lib/$LIBT/* "$TIKO_LIBPATH"/ || { echo "stdsuite: no lib/rt/lib/$LIBT (lib/rt/build/build.sh Release $LIBT)" >&2; exit 3; }
+    for s in "$CU"/src/*.bas; do
+        "$TKO" $TGTOPT -c "$s" -i "$CU/inc" -i "$CU/src" -o "$WK/fbcunit/$(basename "$s" .bas).o" > /dev/null 2>&1
+    done
+    AR=${TIKO_AR:-/c/Program Files/LLVM/bin/llvm-ar.exe}
+    "$AR" rcs "$TIKO_LIBPATH/libfbcunit.a" "$WK"/fbcunit/*.o || { echo "stdsuite: fbcunit did not build for $LIBT" >&2; exit 3; }
+    : > "$STAGE/list"; : > "$WK/pending"
+fi
 
 if [ "$MODE" = baseline ]; then
     # THE BASELINE WAS TAKEN ONCE, over inc/fb, which left the tree on 2026-10-10: it runs
@@ -77,8 +106,9 @@ else
 fi
 
 norm( ) {
-    # Paths and their separators are not a difference; nor is a temporary's address.
-    tr '\\' '/' | sed -E "s|[A-Za-z]:/[^ :()]*/||g; s|$ROOT/||g; s|/tmp/[^ :()]*/||g"
+    # Paths and their separators are not a difference; nor is a temporary's address. The
+    # device's run directory goes first: '/tmp/' alone would leave its '/data/local' behind.
+    tr '\\' '/' | sed -E "s|/data/local/tmp/[^ :()]*/||g; s|[A-Za-z]:/[^ :()]*/||g; s|$ROOT/||g; s|/tmp/[^ :()]*/||g"
 }
 
 # A FAILING ASSERT'S SITE, compared without its directory or line: the port lives in
@@ -88,6 +118,21 @@ site( ) {
     # and its LINE, which is the library's, not the test's: x.tiko is not x.bi line for line,
     # and any edit above the aborting procedure moved it (review LIB-04 added two lines).
     sed -E 's|tests/(vendor/fbc-tests\|std)/[A-Za-z0-9_]+/([A-Za-z0-9_.-]+\.bas)\([0-9]+(,[0-9]+)?\)|\2(L)|g; s|of ([A-Za-z0-9_]+)\.(bi\|tiko)\(|of \1(|g; s|at line [0-9]+ of ([A-Za-z0-9_]+)\(|at line L of \1(|g'
+}
+
+judge( ) {
+    area=$1; name=$2; got=$3
+    want="tests/std/baseline/$area/$name.txt"
+    if [ "$MODE" = baseline ]; then
+        mkdir -p "$(dirname "$want")"
+        printf '%s\n' "$got" > "$want"
+        echo "stdsuite: $(printf '%s\n' "$got" | head -1)  $area/$name"
+    elif [ ! -f "$want" ]; then
+        nbad=$((nbad+1)); echo "stdsuite: NO BASELINE $area/$name"
+    elif ! diff -q <(printf '%s\n' "$got" | site) <(site < "$want") >/dev/null; then
+        nbad=$((nbad+1)); echo "stdsuite: DIFF $area/$name"
+        diff <(site < "$want") <(printf '%s\n' "$got" | site) | head -8 | sed 's/^/stdsuite:     /'
+    fi
 }
 
 n=0; nbad=0
@@ -103,15 +148,23 @@ for f in $LIST; do
     exe="$WK/$area-$name$EXT"; log="$WK/$area-$name.log"
     extra=""; [ -f "${f%.bas}_mod2.bas" ] && extra="${f%.bas}_mod2.bas"
     if [ "$mode" = SUITE ]; then
-        "$TKO" -mt -i "$INC" -i "$CU/inc" "$DRV" "$f" $extra -o "$exe" >"$log" 2>&1
+        "$TKO" $TGTOPT -mt -i "$INC" -i "$CU/inc" "$DRV" "$f" $extra -o "$exe" >"$log" 2>&1
     else
-        "$TKO" -i "$INC" "$f" $extra -o "$exe" >"$log" 2>&1
+        "$TKO" $TGTOPT -i "$INC" "$f" $extra -o "$exe" >"$log" 2>&1
     fi
     brc=$?
     rec="mode=$mode build=$brc"
     out=""
     if [ "$mode" = COMPILE_ONLY_FAIL ]; then
         out=$(grep -oE "(error|warning) TKO[0-9]+" "$log" | sort -u)
+    elif [ $brc -eq 0 ] && [ "$ADB" = 1 ]; then
+        # STAGED, run later on the device: the program and a copy of its directory, run there.
+        key="$area-$name"; d=$(dirname "$f")
+        mkdir -p "$STAGE/$key/$d"; cp "$d"/* "$STAGE/$key/$d"/ 2>/dev/null
+        mv "$exe" "$STAGE/$key/$key"
+        echo "$key $d" >> "$STAGE/list"
+        echo "$area $name $key $rec" >> "$WK/pending"
+        continue
     elif [ $brc -eq 0 ]; then
         d=$(dirname "$f")
         mkdir -p "$WK/rd/$d"; cp "$d"/* "$WK/rd/$d"/ 2>/dev/null
@@ -121,18 +174,16 @@ for f in $LIST; do
     else
         out=$(grep -E "error TKO" "$log" | head -5 | norm)
     fi
-    want="tests/std/baseline/$area/$name.txt"
-    got=$(printf '%s\n%s\n' "$rec" "$out")
-    if [ "$MODE" = baseline ]; then
-        mkdir -p "$(dirname "$want")"
-        printf '%s\n' "$got" > "$want"
-        echo "stdsuite: $rec  $area/$name"
-    elif [ ! -f "$want" ]; then
-        nbad=$((nbad+1)); echo "stdsuite: NO BASELINE $area/$name"
-    elif ! diff -q <(printf '%s\n' "$got" | site) <(site < "$want") >/dev/null; then
-        nbad=$((nbad+1)); echo "stdsuite: DIFF $area/$name"
-        diff <(site < "$want") <(printf '%s\n' "$got" | site) | head -8 | sed 's/^/stdsuite:     /'
-    fi
+    judge "$area" "$name" "$(printf '%s\n%s\n' "$rec" "$out")"
 done
+
+if [ "$ADB" = 1 ] && [ -s "$STAGE/list" ]; then
+    sh "$ROOT/build/adbrun.sh" "$STAGE" "$RUNTIMEOUT"
+    while read -r area name key rec; do
+        rc=$(cat "$STAGE/out/$key.rc" 2>/dev/null || echo missing)
+        out=$(norm < "$STAGE/out/$key.out" 2>/dev/null)
+        judge "$area" "$name" "$(printf '%s\n%s\n' "$rec run=$rc" "$out")"
+    done < "$WK/pending"
+fi
 echo "stdsuite: $n files ($MODE), $nbad differ"
 [ $nbad -eq 0 ]

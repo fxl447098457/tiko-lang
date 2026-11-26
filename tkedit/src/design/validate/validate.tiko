@@ -13,6 +13,8 @@
 #import "vendor/tkControls/tkMeta"
 #import "vendor/tkControls/tkKeys"
 #import "vendor/tkControls/tkLayout"
+#import "vendor/tkControls/tkBind"
+#import "std/chrono"
 #import "../model"
 #import "../catalog"
 #import "../formfile"
@@ -21,6 +23,8 @@ using tkMeta
 using tkKeys
 using tkLayout
 using model
+using tkBind
+using chrono
 
 public function IsIdentifier( byref s as const ustring ) as boolean
     if len( s ) = 0 then return false
@@ -42,7 +46,7 @@ end function
 
 ' What FormBase and the generated Form already use, and the names a field must not hide.
 private function IsFormMember_( byref s as const ustring ) as boolean
-    const as string MEMBERS = " handle layout build show showmodal endmodal close isopen openwindow form this base "
+    const as string MEMBERS = " handle layout build show showmodal endmodal close isopen openwindow form this base loadfrom saveto isdirty "
     return instr( MEMBERS, " " & lcase( s ) & " " ) > 0
 end function
 
@@ -57,6 +61,255 @@ private function IsControlWord_( byref s as const ustring ) as boolean
         if (lcase( m->Name ) = want) orelse (lcase( m->Module_ ) = want) then return true
     next
     return false
+end function
+
+' A dotted name: "Contact", "contactdb.Contact", "Address.City" -- each part an identifier.
+private function IsDottedName_( byref s as const ustring ) as boolean
+    if len( s ) = 0 then return false
+    dim as long at = 1
+    do
+        dim as long dot = instr( at, s, "." )
+        dim as ustring part = iif( dot > 0, mid( s, at, dot - at ), mid( s, at ) )
+        if IsIdentifier( part ) = false then return false
+        if dot = 0 then return true
+        at = dot + 1
+    loop
+end function
+
+private function AllDigits_( byref s as const ustring ) as boolean
+    for i as long = 1 to len( s )
+        dim as long c = asc( s, i )
+        if (c < 48) orelse (c > 57) then return false
+    next
+    return true
+end function
+
+' [+|-]digits[.digits][e[+|-]digits] (or .digits): a Minimum / Maximum that is a number.
+private function IsNumberText_( byref s as const ustring ) as boolean
+    dim as ustring t = trim( s )
+    if (left( t, 1 ) = "+") orelse (left( t, 1 ) = "-") then t = mid( t, 2 )
+    dim as long ep = instr( lcase( t ), "e" )
+    if ep then
+        dim as ustring ex = mid( t, ep + 1 )
+        if (left( ex, 1 ) = "+") orelse (left( ex, 1 ) = "-") then ex = mid( ex, 2 )
+        if (len( ex ) = 0) orelse (AllDigits_( ex ) = false) then return false
+        t = left( t, ep - 1 )
+    end if
+    dim as long dp = instr( t, "." )
+    dim as ustring a = t, b
+    if dp then a = left( t, dp - 1 ) : b = mid( t, dp + 1 )
+    if (len( a ) = 0) andalso (len( b ) = 0) then return false
+    return AllDigits_( a ) andalso AllDigits_( b )
+end function
+
+' yyyy-mm-dd, a real date: a Minimum / Maximum for a date.
+private function IsIsoDate_( byref s as const ustring ) as boolean
+    dim as LocalDate ld
+    dim as ustring t = trim( s )
+    return (len( t ) = 10) andalso LocalDate.TryParseIso( t, ld )
+end function
+
+' B2's rules on one control: with Bind, of a kind that takes them, and well formed.
+private sub CheckRules_( byref c as FormControl, byval m as TKMETA_CONTROL ptr, byref out_ as Array( of ustring ) )
+    dim as ustring set_ = catalog.RulesSet( c )
+    if len( set_ ) = 0 then exit sub
+    if len( c.Bind ) = 0 then
+        out_.Push( c.Name & ": " & set_ & " need" & iif( instr( set_, " " ), "", "s" ) & " Bind first" )
+        exit sub
+    end if
+    dim as ustring t = set_ & " "
+    dim as long at_ = 1
+    do
+        dim as long sp = instr( at_, t, " " )
+        if sp = 0 then exit do
+        dim as ustring rule = mid( t, at_, sp - at_ )
+        if catalog.RuleAllowed( m, rule ) = false then
+            out_.Push( c.Name & ": a " & m->Name & " has no " & rule & " rule" )
+            exit sub
+        end if
+        at_ = sp + 1
+    loop
+    ' Minimum / Maximum: numbers, or dates (a DatePicker's always), the two of one kind, in order
+    dim as boolean dateKind = (m->BindKind = "date"), numKind = (m->BindKind = "float")
+    dim as ustring lim( 0 to 1 ) = { c.Minimum, c.Maximum }, nm( 0 to 1 ) = { "minimum", "maximum" }
+    dim as long kinds( 0 to 1 )                  ' 0 none, 1 number, 2 date
+    for k as long = 0 to 1
+        if len( lim( k ) ) = 0 then continue for
+        if IsIsoDate_( lim( k ) ) andalso (numKind = false) then
+            kinds( k ) = 2
+        elseif IsNumberText_( lim( k ) ) andalso (dateKind = false) then
+            kinds( k ) = 1
+        else
+            out_.Push( c.Name & ": " & nm( k ) & " '" & lim( k ) & "' is not " & iif( dateKind, "a date (yyyy-mm-dd)", iif( numKind, "a number", "a number or a date (yyyy-mm-dd)" ) ) )
+            exit sub
+        end if
+    next
+    if (kinds( 0 ) <> 0) andalso (kinds( 1 ) <> 0) then
+        if kinds( 0 ) <> kinds( 1 ) then
+            out_.Push( c.Name & ": minimum and maximum must both be numbers or both dates" )
+        elseif kinds( 0 ) = 1 then
+            if val( c.Minimum ) > val( c.Maximum ) then out_.Push( c.Name & ": minimum " & c.Minimum & " is above maximum " & c.Maximum )
+        elseif trim( c.Minimum ) > trim( c.Maximum ) then
+            out_.Push( c.Name & ": minimum " & c.Minimum & " is after maximum " & c.Maximum )
+        end if
+    end if
+    if c.MaxLength < 0 then out_.Push( c.Name & ": max length " & c.MaxLength & " is below 0" )
+    if len( c.Format ) andalso (tkBind_IsFormat( c.Format ) = false) then
+        out_.Push( c.Name & ": format '" & c.Format & "' is neither a number format (.2f) nor a date pattern (dd/MM/yyyy)" )
+    end if
+end sub
+
+' A field of a list's element: Name, Home.City, or a method with no arguments, FullName( ).
+private function IsElementField_( byref s as const ustring ) as boolean
+    dim as ustring t = trim( s )
+    if right( t, 1 ) = ")" then
+        dim as long op = instr( t, "(" )
+        if (op = 0) orelse (len( trim( mid( t, op + 1, len( t ) - op - 1 ) ) ) > 0) then return false
+        t = rtrim( left( t, op - 1 ) )
+    end if
+    return IsDottedName_( t )
+end function
+
+' An ItemsSource: a name (People, contactdb.All) or a call (contactdb.Countries( )), parentheses
+' balanced, on one line.
+private function IsSourceExpr_( byref s as const ustring ) as boolean
+    dim as ustring t = trim( s )
+    if (len( t ) = 0) orelse instr( t, chr( 10 ) ) orelse instr( t, chr( 34 ) ) then return false
+    dim as long op = instr( t, "(" )
+    dim as ustring head_ = t
+    if op then
+        if right( t, 1 ) <> ")" then return false
+        head_ = rtrim( left( t, op - 1 ) )
+        dim as long depth = 0
+        for i as long = op to len( t )
+            select case mid( t, i, 1 )
+            case "(" : depth += 1
+            case ")" : depth -= 1 : if depth < 0 then return false
+            end select
+        next
+        if depth <> 0 then return false
+    end if
+    return IsDottedName_( head_ )
+end function
+
+' B3's list binding on one control.
+private sub CheckList_( byref doc as FormDoc, byref c as FormControl, byval m as TKMETA_CONTROL ptr, byref out_ as Array( of ustring ) )
+    if m->ItemsBind = "records" then exit sub           ' a navigator: CheckNav_
+    dim as boolean anyField = false
+    for each it as FormItem in c.Items
+        if len( it.Field ) then anyField = true
+    next
+    dim as boolean anySet = catalog.HasListSource( c ) orelse (len( c.ItemType ) > 0) orelse (len( c.DisplayField ) > 0) _
+        orelse (len( c.ValueField ) > 0) orelse (len( c.CheckField ) > 0) orelse anyField
+    if c.ItemsLive andalso (m->ItemsBind <> "grid") then out_.Push( c.Name & ": only a DataGrid shows its array in place (ItemsLive)" )
+    if anySet = false then exit sub
+    dim as ustring shape = m->ItemsBind
+    if len( shape ) = 0 then
+        out_.Push( c.Name & ": a " & m->Name & " has no list to bind" )
+        exit sub
+    end if
+    if (len( c.ItemsField ) > 0) andalso (len( c.ItemsSource ) > 0) then
+        out_.Push( c.Name & ": a list comes from ItemsField or ItemsSource, not both" )
+        exit sub
+    end if
+    if len( c.ItemsField ) then
+        if IsDottedName_( c.ItemsField ) = false then
+            out_.Push( c.Name & ": items field '" & c.ItemsField & "' is not a field name" )
+        elseif len( doc.DataType ) = 0 then
+            out_.Push( c.Name & ": an ItemsField needs the form's DataType first" )
+        end if
+    end if
+    if len( c.ItemsSource ) andalso (IsSourceExpr_( c.ItemsSource ) = false) then
+        out_.Push( c.Name & ": items source '" & c.ItemsSource & "' is not a name or a call (People, contactdb.Countries( ))" )
+    end if
+    dim as boolean src = catalog.HasListSource( c )
+    if len( c.ItemType ) andalso (IsDottedName_( c.ItemType ) = false) then
+        out_.Push( c.Name & ": item type '" & c.ItemType & "' is not a type name" )
+    end if
+    if shape = "items" then
+        if len( c.CheckField ) orelse anyField then out_.Push( c.Name & ": a " & m->Name & " has DisplayField and ValueField, not columns or checks" )
+        if src andalso c.Items.Count( ) then out_.Push( c.Name & ": its items come from the list; remove the ones typed in" )
+        if (src = false) andalso (len( c.DisplayField ) orelse len( c.ValueField )) then out_.Push( c.Name & ": DisplayField and ValueField need ItemsField or ItemsSource" )
+        if len( c.DisplayField ) andalso (IsElementField_( c.DisplayField ) = false) then out_.Push( c.Name & ": display field '" & c.DisplayField & "' is not a field (Name, FullName( ))" )
+        if len( c.ValueField ) andalso (IsElementField_( c.ValueField ) = false) then out_.Push( c.Name & ": value field '" & c.ValueField & "' is not a field (Id, Code)" )
+    else
+        if (shape = "grid") andalso len( c.CheckField ) then out_.Push( c.Name & ": a DataGrid has no CheckField: give a column the Kind check and a Field" )
+        ' G5b: shown in place, so the array must be one that lives on, not a call's copy
+        if c.ItemsLive andalso len( c.ItemsSource ) andalso (IsDottedName_( c.ItemsSource ) = false) then
+            out_.Push( c.Name & ": a live grid's ItemsSource must be an array it can change, a name (Lines), not '" & c.ItemsSource & "'" )
+        end if
+        if len( c.DisplayField ) orelse len( c.ValueField ) then out_.Push( c.Name & ": a " & m->Name & " shows columns: give each column a Field" )
+        if (shape = "report") andalso len( c.CheckField ) then out_.Push( c.Name & ": a ReportViewer's fields are its columns; it has no CheckField" )
+        if (src = false) andalso (len( c.CheckField ) orelse anyField) then out_.Push( c.Name & ": columns' fields need ItemsField or ItemsSource" )
+        if len( c.CheckField ) andalso (IsElementField_( c.CheckField ) = false) then
+            out_.Push( c.Name & ": check field '" & c.CheckField & "' is not a field" )
+        end if
+        for each it as FormItem in c.Items
+            if len( it.Field ) andalso (IsElementField_( it.Field ) = false) then out_.Push( c.Name & ": column field '" & it.Field & "' is not a field (Name, FullName( ))" )
+        next
+    end if
+    ' the members the generated code adds for it
+    if src then
+        for each o as FormControl in doc.Controls
+            dim as ustring ln = lcase( o.Name )
+            if (ln = lcase( c.Name & "_Fill" )) orelse (ln = lcase( c.Name & "_Item" )) orelse (ln = lcase( c.Name & "_Values_" )) then
+                out_.Push( o.Name & ": the name is taken by " & c.Name & "'s list" )
+            end if
+        next
+    end if
+end sub
+
+' B4: a navigator steps through ItemsSource, an Array( of DataType ) it changes (New, Delete), so
+' a name, not a call; it may follow a B3 list control over the same array. One per form.
+private sub CheckNav_( byref doc as FormDoc, byref c as FormControl, byval m as TKMETA_CONTROL ptr, byref out_ as Array( of ustring ) )
+    if m->ItemsBind <> "records" then
+        if len( c.Follows ) then out_.Push( c.Name & ": only a Navigator follows a list" )
+        exit sub
+    end if
+    if len( c.ItemsField ) orelse len( c.ItemType ) orelse len( c.DisplayField ) orelse len( c.ValueField ) orelse len( c.CheckField ) then
+        out_.Push( c.Name & ": a Navigator takes ItemsSource (its records) and Follows, nothing else of a list" )
+    end if
+    if len( c.ItemsSource ) then
+        if IsDottedName_( c.ItemsSource ) = false then
+            out_.Push( c.Name & ": a Navigator's records must be an array it can change, a name (People), not '" & c.ItemsSource & "'" )
+        elseif len( doc.DataType ) = 0 then
+            out_.Push( c.Name & ": a Navigator needs the form's DataType first, the type of its records" )
+        end if
+    elseif len( c.Follows ) then
+        out_.Push( c.Name & ": Follows needs the Navigator's ItemsSource first" )
+    end if
+    if len( c.Follows ) andalso len( c.ItemsSource ) then
+        dim as long fi = -1
+        for k as long = 0 to doc.Controls.Count( ) - 1
+            if lcase( doc.Controls[k].Name ) = lcase( c.Follows ) then fi = k : exit for
+        next
+        if fi < 0 then
+            out_.Push( c.Name & ": follows '" & c.Follows & "', which is not on the form" )
+        else
+            dim as ustring shape = catalog.ItemsBindOf( doc.Controls[fi] )
+            if (shape <> "rows") andalso (shape <> "items") andalso (shape <> "grid") then
+                out_.Push( c.Name & ": follows '" & c.Follows & "', which is no ListTree, ComboBox or DataGrid" )
+            elseif lcase( trim( doc.Controls[fi].ItemsSource ) ) <> lcase( trim( c.ItemsSource ) ) then
+                out_.Push( c.Name & ": follows '" & c.Follows & "', whose ItemsSource is not " & c.ItemsSource )
+            end if
+        end if
+    end if
+    dim as long nNav = 0
+    for each o as FormControl in doc.Controls
+        if catalog.IsNavigator( o ) then nNav += 1
+        dim as ustring ln = lcase( o.Name )
+        if (ln <> lcase( c.Name )) andalso ((ln = lcase( c.Name & "_MoveTo" )) orelse (ln = lcase( c.Name & "_Refresh" )) orelse (ln = lcase( c.Name & "_Current" ))) then
+            out_.Push( o.Name & ": the name is taken by " & c.Name & "'s records" )
+        end if
+    next
+    if (nNav > 1) andalso (lcase( c.Name ) = lcase( FirstNav_( doc ) )) then out_.Push( c.Name & ": a form has one Navigator" )
+end sub
+
+private function FirstNav_( byref doc as FormDoc ) as ustring
+    for each o as FormControl in doc.Controls
+        if catalog.IsNavigator( o ) then return o.Name
+    next
+    return ""
 end function
 
 ' Why this name can't be a field or handler of a form, or "" when it can.
@@ -221,6 +474,9 @@ public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref
         out_.Push( "form file name '" & moduleName & "' can't be a module name" )
     end if
     if (doc.ClientW <= 0) orelse (doc.ClientH <= 0) then out_.Push( "form: width and height must be positive" )
+    if len( doc.DataType ) andalso (IsDottedName_( doc.DataType ) = false) then
+        out_.Push( "form: data type '" & doc.DataType & "' is not a type name (Contact, or contactdb.Contact)" )
+    end if
     select case doc.StartPosition
     case "", "CenterScreen", "CenterOwner"
     case else : out_.Push( "form: no start position '" & doc.StartPosition & "'" )
@@ -265,6 +521,26 @@ public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref
                 out_.Push( c.Name & ": a " & m->Name & " has no context menu" )
             else
                 ContextMenuProblem_( doc, c.Name, c.ContextMenu, out_ )
+            end if
+        end if
+
+        ' a Badge hangs on another visual control of the form (D-B3); nothing else hangs
+        if len( c.AttachTo ) orelse len( c.AttachCorner ) orelse len( c.AttachOffset ) orelse len( c.AttachOverlap ) then
+            if c.TypeName <> catalog.BADGE_TYPE then
+                out_.Push( c.Name & ": only a Badge attaches to a control" )
+            elseif len( c.AttachTo ) then
+                dim as long t = FindControl( doc, c.AttachTo )
+                dim as long dx, dy
+                if t < 0 then
+                    out_.Push( c.Name & ": attaches to '" & c.AttachTo & "', which is not on the form" )
+                elseif t = i then
+                    out_.Push( c.Name & ": a Badge can't attach to itself" )
+                elseif doc.Controls[t].TypeName = catalog.BADGE_TYPE then
+                    out_.Push( c.Name & ": attaches to '" & c.AttachTo & "', another Badge" )
+                elseif catalog.IsComponent( doc.Controls[t].TypeName ) then
+                    out_.Push( c.Name & ": attaches to '" & c.AttachTo & "', a component, which is never shown" )
+                end if
+                if catalog.BadgeOffset( c.AttachOffset, dx, dy ) = false then out_.Push( c.Name & ": AttachOffset is two whole numbers: dx,dy" )
             end if
         end if
 
@@ -313,6 +589,50 @@ public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref
         CheckProps_( c, m, out_ )
         CheckColors_( c, m, out_ )
 
+        ' the report a ReportViewer shows (RD4): a module whose name is a name; its member <Name>Report
+        if len( c.Report ) then
+            dim as ustring rstem = c.Report
+            dim as long rk = instrrev( rstem, "/" )
+            rstem = mid( rstem, rk + 1 )
+            if c.TypeName <> "ReportViewer" then
+                out_.Push( c.Name & ": only a ReportViewer shows a report" )
+            elseif IsDottedName_( rstem ) = false orelse (instr( rstem, "." ) > 0) then
+                out_.Push( c.Name & ": report '" & c.Report & "' is not a report module (rptOrders, ../reports/rptOrders)" )
+            elseif len( c.ItemsSource ) then
+                out_.Push( c.Name & ": a ReportViewer shows a designed report or its own list, not both" )
+            else
+                for k as long = 0 to doc.Controls.Count( ) - 1
+                    if lcase( doc.Controls[k].Name ) = lcase( c.Name & "Report" ) then out_.Push( c.Name & ": its report member " & c.Name & "Report is the name of a control" )
+                next
+            end if
+        end if
+
+        ' data binding (B1): a field of the form's DataType, on a control that has a value to move
+        if len( c.Bind ) then
+            if len( m->BindKind ) = 0 then
+                out_.Push( c.Name & ": a " & m->Name & " can't be bound to a field" )
+            elseif IsDottedName_( c.Bind ) = false then
+                out_.Push( c.Name & ": bind '" & c.Bind & "' is not a field name (Name, or Address.City)" )
+            elseif len( doc.DataType ) = 0 then
+                out_.Push( c.Name & ": binding to a field needs the form's DataType first" )
+            end if
+        end if
+        CheckRules_( c, m, out_ )
+        CheckList_( doc, c, m, out_ )
+        CheckNav_( doc, c, m, out_ )
+        ' a two-value control's second field (bind2): only with the first, and only while it applies
+        if len( c.Bind2 ) then
+            if len( m->Bind2Kind ) = 0 then
+                out_.Push( c.Name & ": a " & m->Name & " has no second value to bind" )
+            elseif len( c.Bind ) = 0 then
+                out_.Push( c.Name & ": " & m->Bind2Name & " needs Bind first" )
+            elseif IsDottedName_( c.Bind2 ) = false then
+                out_.Push( c.Name & ": " & m->Bind2Name & " '" & c.Bind2 & "' is not a field name (Name, or Address.City)" )
+            elseif catalog.Bind2Holds( c ) = false then
+                out_.Push( c.Name & ": " & m->Bind2Name & " needs " & m->Bind2When )
+            end if
+        end if
+
         for each s as Setting in c.Events
             dim as TKMETA_EVENT ptr e = tkMeta_FindEvent( m, s.Key )
             if e = 0 then
@@ -360,6 +680,16 @@ public sub Check( byref doc as FormDoc, byref moduleName as const ustring, byref
                     out_.Push( c.Name & ": no icon panel item kind '" & it.Kind & "'" )
                 end select
             end if
+            if (kind_ = catalog.ItemsKind.ItemsGridColumns) andalso (catalog.GridKindOk( it.Kind ) = false) then
+                out_.Push( c.Name & ": no DataGrid column kind '" & it.Kind & "' (text number check combo date button link progress)" )
+            end if
+            if (kind_ = catalog.ItemsKind.ItemsGridColumns) andalso (len( catalog.GridAlignConst( it.Align ) ) = 0) then
+                out_.Push( c.Name & ": no DataGrid column align '" & it.Align & "' (left center right, or none for the kind's)" )
+            end if
+            if (kind_ = catalog.ItemsKind.ItemsGridColumns) andalso (len( catalog.GridSummaryConst( it.Summary ) ) = 0) then
+                out_.Push( c.Name & ": no DataGrid column summary '" & it.Summary & "' (sum count avg min max, or none)" )
+            end if
+            if (it.MinWidth < 0) orelse (it.Fill < 0) then out_.Push( c.Name & ": a column's MinWidth and Fill are 0 or more" )
             if len( it.Handler ) then AddHandler_( handlers, c.Name, it.Handler, "", doc, out_ )
         next
     next

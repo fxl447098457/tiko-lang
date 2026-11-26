@@ -1,0 +1,574 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPrintDialog -- the Print and Page Setup dialogs, tk-drawn on every OS (decision P-11). Design:
+' docs/tkControls/PRINTING.md (claude-docs) §8.2; phase R3.
+'
+' PRINT: printer (with its location, and the driver's own "Properties..." on Windows), copies and
+' collate, pages (all / the current one / a range such as "1-3, 7, 10-", checked against the
+' document's page count), two-sided (when the printer can), colour. Print refuses a range that
+' names no page and says so in the dialog.
+' PAGE SETUP: paper, orientation, margins (millimetres, or inches where Letter is the paper), with
+' a drawing of the page and its printable area.
+'
+' Each is Create (the dialog, not shown), Collect (the controls -> the job / setup; FALSE when they
+' do not make one), Run (modal; TRUE = OK, the dialog destroyed), and Show = Create + Run.
+' The English strings are TKPRINTDIALOG_STRINGS: tkPrintDialog_SetStrings replaces them.
+#module "tkPrintDialog"
+
+#import "../tkPrinter" public
+#import "../tkComboBox"
+#import "../tkNumericUpDown"
+#import "../tkCheckBox"
+#import "../tkOptionButton"
+#import "../tkTextBox"
+#import "../tkButton"
+#import "../tkLabel"
+using tkPrinter
+using tkComboBox
+using tkNumericUpDown
+using tkCheckBox
+using tkOptionButton
+using tkTextBox
+using tkButton
+using tkLabel
+using tkPdf
+using tkPrint
+using tkHost
+using tkPaint
+
+public type TKPRINTDIALOG_STRINGS
+    PrintTitle     as ustring = "Print"
+    Printer        as ustring = "Printer"
+    Properties     as ustring = "Properties..."
+    Copies         as ustring = "Copies"
+    Collate        as ustring = "Collate"
+    Pages          as ustring = "Pages"
+    AllPages       as ustring = "All"
+    CurrentPage    as ustring = "Current"
+    Range          as ustring = "Range"
+    RangeHint      as ustring = "for example 1-3, 7, 10-"
+    TwoSided       as ustring = "Two-sided"
+    OneSided       as ustring = "One-sided"
+    LongEdge       as ustring = "Long edge"
+    ShortEdge      as ustring = "Short edge"
+    Colour         as ustring = "Colour"
+    PrintButton    as ustring = "Print"
+    Cancel         as ustring = "Cancel"
+    BadRange       as ustring = "The page range names no page of the document."
+    NoPrinter      as ustring = "There is no printer."
+    SetupTitle     as ustring = "Page Setup"
+    Paper          as ustring = "Paper"
+    Orientation    as ustring = "Orientation"
+    Portrait       as ustring = "Portrait"
+    Landscape      as ustring = "Landscape"
+    Margins        as ustring = "Margins"
+    LeftMargin     as ustring = "Left"
+    TopMargin      as ustring = "Top"
+    RightMargin    as ustring = "Right"
+    BottomMargin   as ustring = "Bottom"
+    Millimetres    as ustring = "mm"
+    Inches         as ustring = "in"
+    OK             as ustring = "OK"
+    BadMargins     as ustring = "The margins leave too little of the page."
+end type
+
+' Control ids: tkPrintDialog_GetControl( dlg, id ).
+public enum
+    TKPD_ID_PRINTER = 101
+    TKPD_ID_PROPERTIES
+    TKPD_ID_INFO
+    TKPD_ID_COPIES
+    TKPD_ID_COLLATE
+    TKPD_ID_ALL
+    TKPD_ID_CURRENT
+    TKPD_ID_RANGE
+    TKPD_ID_RANGETEXT
+    TKPD_ID_DUPLEX
+    TKPD_ID_COLOUR
+    TKPD_ID_ERROR
+    TKPD_ID_OK
+    TKPD_ID_CANCEL
+    TKPD_ID_PAPER
+    TKPD_ID_PORTRAIT
+    TKPD_ID_LANDSCAPE
+    TKPD_ID_MARGIN_L
+    TKPD_ID_MARGIN_T
+    TKPD_ID_MARGIN_R
+    TKPD_ID_MARGIN_B
+    TKPD_ID_PREVIEW
+    TKPD_ID_LAST
+end enum
+
+dim shared as TKPRINTDIALOG_STRINGS gStr
+
+public sub tkPrintDialog_SetStrings( byref s as TKPRINTDIALOG_STRINGS )
+    gStr = s
+end sub
+
+public function tkPrintDialog_GetStrings( ) as TKPRINTDIALOG_STRINGS
+    return gStr
+end function
+
+public type TKPD_STATE
+    dlg        as TK_HOST ptr
+    bSetup     as boolean
+    doc        as TK_PRINTDOC ptr
+    nPages     as long
+    curPage    as long
+    job        as TKPRINTJOB
+    ps         as TKPAGESETUP
+    printers(any) as TKPRINTERINFO
+    nPrinters  as long
+    ctl(TKPD_ID_PRINTER to TKPD_ID_LAST) as TK_WIDGET ptr
+    bInches    as boolean
+end type
+
+private function St( byval h as TK_HOST ptr ) as TKPD_STATE ptr
+    if h = 0 then return 0
+    return cast( TKPD_STATE ptr, h->pUser )
+end function
+
+private function StOf( byval w as TK_WIDGET ptr ) as TKPD_STATE ptr
+    if w = 0 then return 0
+    return St( w->pHost )
+end function
+
+' The control with this id (TKPD_ID_*), 0 when the dialog has none.
+public function tkPrintDialog_GetControl( byval dlg as TK_HOST ptr, byval id as long ) as TK_WIDGET ptr
+    dim as TKPD_STATE ptr s = St( dlg )
+    if (s = 0) orelse (id < TKPD_ID_PRINTER) orelse (id > TKPD_ID_LAST) then return 0
+    return s->ctl(id)
+end function
+
+' ---- building ------------------------------------------------------------------------------
+private function Sz( byval s as TKPD_STATE ptr, byval v as long ) as long
+    return tkHost_Scale( s->dlg, v )
+end function
+
+private sub Place( byval s as TKPD_STATE ptr, byval w as TK_WIDGET ptr, byval x as long, byval y as long, byval cw as long, byval ch as long )
+    tkWidget_SetPos( w, Sz( s, x ), Sz( s, y ), Sz( s, cw ), Sz( s, ch ) )
+end sub
+
+private function AddLabel( byval s as TKPD_STATE ptr, byref text as ustring, byval x as long, byval y as long, byval cw as long, _
+                           byval id as long = 0 ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr l = tkLabel_Create( tkHost_Root( s->dlg ), id )
+    tkLabel_SetText( l, text )
+    Place( s, l, x, y, cw, 26 )
+    if id then s->ctl(id) = l
+    return l
+end function
+
+private function AddButton( byval s as TKPD_STATE ptr, byref text as ustring, byval x as long, byval y as long, byval cw as long, _
+                            byval id as long, byval cb as BTN_ClickCallbackSub ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( tkHost_Root( s->dlg ), id )
+    tkButton_SetText( b, text )
+    tkButton_SetClickCallback( b, cb )
+    Place( s, b, x, y, cw, 28 )
+    s->ctl(id) = b
+    return b
+end function
+
+private function AddOption( byval s as TKPD_STATE ptr, byref text as ustring, byval x as long, byval y as long, byval cw as long, _
+                            byval id as long, byval grp as long ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr o = tkOptionButton_Create( tkHost_Root( s->dlg ), id, grp )
+    tkOptionButton_SetText( o, text )
+    Place( s, o, x, y, cw, 26 )
+    s->ctl(id) = o
+    return o
+end function
+
+private function AddNumber( byval s as TKPD_STATE ptr, byval x as long, byval y as long, byval cw as long, byval id as long, _
+                            byval lo as double, byval hi as double, byval places as long, byval value as double ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr n = tkNumericUpDown_Create( tkHost_Root( s->dlg ), id )
+    tkNumericUpDown_SetRange( n, lo, hi )
+    tkNumericUpDown_SetDecimalPlaces( n, places )
+    tkNumericUpDown_SetIncrement( n, iif( places > 0, 0.1, 1 ) )
+    tkNumericUpDown_SetValue( n, value )
+    Place( s, n, x, y, cw, 26 )
+    s->ctl(id) = n
+    return n
+end function
+
+private sub ShowError( byval s as TKPD_STATE ptr, byref msg as ustring )
+    tkLabel_SetText( s->ctl(TKPD_ID_ERROR), msg )
+    tkWidget_Show( s->ctl(TKPD_ID_ERROR), len( msg ) > 0 )
+end sub
+
+private function OnPreKey( byval h as TK_HOST ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKPD_STATE ptr s = St( h )
+    if s = 0 then return false
+    select case m->key
+    case SDLK_ESCAPE
+        tkHost_EndModal( h, 0 )
+        return true
+    case SDLK_RETURN, SDLK_KP_ENTER
+        if s->bSetup then
+            if tkPageSetupDialog_Collect( h, s->ps ) then tkHost_EndModal( h, 1 )
+        else
+            if tkPrintDialog_Collect( h, s->job ) then tkHost_EndModal( h, 1 )
+        end if
+        return true
+    end select
+    return false
+end function
+
+private sub OnOk( byval hButton as TK_WIDGET ptr, byval id as long )
+    dim as TKPD_STATE ptr s = StOf( hButton )
+    if s = 0 then exit sub
+    if s->bSetup then
+        if tkPageSetupDialog_Collect( s->dlg, s->ps ) then tkHost_EndModal( s->dlg, 1 )
+    else
+        if tkPrintDialog_Collect( s->dlg, s->job ) then tkHost_EndModal( s->dlg, 1 )
+    end if
+end sub
+
+private sub OnCancel( byval hButton as TK_WIDGET ptr, byval id as long )
+    dim as TKPD_STATE ptr s = StOf( hButton )
+    if s then tkHost_EndModal( s->dlg, 0 )
+end sub
+
+' The printer's location / comment under its name, and what it can do.
+private sub PrinterChanged( byval s as TKPD_STATE ptr )
+    dim as long i = tkComboBox_GetCurSel( s->ctl(TKPD_ID_PRINTER) )
+    if (i < 0) orelse (i >= s->nPrinters) then exit sub
+    dim as ustring info = s->printers(i).location
+    if len( s->printers(i).comment ) then info &= iif( len( info ), "  ", "" ) & s->printers(i).comment
+    tkLabel_SetText( s->ctl(TKPD_ID_INFO), info )
+    dim as TKPRINTERCAPS caps
+    dim as boolean ok = tkPrinter_GetCaps( s->printers(i).name, caps )
+    tkWidget_Enable( s->ctl(TKPD_ID_DUPLEX), ok andalso caps.bDuplex )
+    tkWidget_Enable( s->ctl(TKPD_ID_COLOUR), ok andalso caps.bColor )
+    if s->printers(i).name <> s->job.printer then s->job.devMode = ""     ' another driver's settings do not carry over
+end sub
+
+private sub OnPrinter( byval hCombo as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+    dim as TKPD_STATE ptr s = StOf( hCombo )
+    if s then PrinterChanged( s )
+end sub
+
+private sub OnProperties( byval hButton as TK_WIDGET ptr, byval id as long )
+    dim as TKPD_STATE ptr s = StOf( hButton )
+    if s = 0 then exit sub
+    dim as long i = tkComboBox_GetCurSel( s->ctl(TKPD_ID_PRINTER) )
+    if (i < 0) orelse (i >= s->nPrinters) then exit sub
+    s->job.printer = s->printers(i).name
+    tkPrinter_Properties( s->dlg, s->job )
+end sub
+
+' Typing a range picks "Range".
+private sub OnRangeText( byval hTextBox as TK_WIDGET ptr )
+    dim as TKPD_STATE ptr s = StOf( hTextBox )
+    if s then tkOptionButton_SetChecked( s->ctl(TKPD_ID_RANGE), true ) : ShowError( s, "" )
+end sub
+
+private function NewDialog( byval owner as TK_HOST ptr, byref title as ustring, byval w as long, byval h as long, _
+                            byval bSetup as boolean ) as TKPD_STATE ptr
+    dim as TK_HOST ptr dlg = tkHost_CreateDialog( owner, title, w, h, false )
+    if dlg = 0 then return 0
+    dim as TKPD_STATE ptr s = new TKPD_STATE
+    s->dlg = dlg
+    s->bSetup = bSetup
+    dlg->pUser = s
+    dlg->OnPreKey = @OnPreKey
+    ' w x h are design units: the window is that times the scale, centred over its owner again
+    dim as long ww = cint( w * dlg->fScale / dlg->fDensity ), wh = cint( h * dlg->fScale / dlg->fDensity )
+    SDL_SetWindowSize( dlg->win, ww, wh )
+    if owner then
+        dim as long ox, oy, ow, oh
+        SDL_GetWindowPosition( owner->win, @ox, @oy )
+        SDL_GetWindowSize( owner->win, @ow, @oh )
+        SDL_SetWindowPosition( dlg->win, ox + (ow - ww) \ 2, oy + (oh - wh) \ 2 )
+    end if
+    if dlg->pDefaultFont = 0 then dlg->pDefaultFont = tkHost_OpenFont( dlg, tkHost_FontDir( ) & TK_FONT_UI, 9 )
+    return s
+end function
+
+' The Print dialog for doc, filled from job (printer, copies, collate, page set, duplex, colour).
+' currentPage (from 0) offers "Current"; -1 does not. Not shown: Run it, or Show.
+public function tkPrintDialog_Create( byval owner as TK_HOST ptr, byval doc as TK_PRINTDOC ptr, byref job as TKPRINTJOB, _
+                                      byval currentPage as long = -1 ) as TK_HOST ptr
+    dim as TKPD_STATE ptr s = NewDialog( owner, gStr.PrintTitle, 440, 330, false )
+    if s = 0 then return 0
+    s->doc = doc
+    s->nPages = tkPrintDoc_GetPageCount( doc )
+    s->curPage = currentPage
+    s->job = job
+    AddLabel( s, gStr.Printer, 16, 16, 80 )
+    dim as TK_WIDGET ptr cb = tkComboBox_Create( tkHost_Root( s->dlg ), TKPD_ID_PRINTER )
+    Place( s, cb, 104, 16, 208, 26 )
+    s->ctl(TKPD_ID_PRINTER) = cb
+    s->nPrinters = tkPrinter_Enumerate( s->printers() )
+    dim as ustring want = iif( len( job.printer ), job.printer, tkPrinter_GetDefault( ) )
+    dim as long sel = -1
+    for i as long = 0 to s->nPrinters - 1
+        tkComboBox_AddItem( cb, s->printers(i).name )
+        if s->printers(i).name = want then sel = i
+    next
+    if (sel < 0) andalso (s->nPrinters > 0) then sel = 0
+    tkComboBox_SetCurSel( cb, sel )
+    tkComboBox_SetSelChangeCallback( cb, @OnPrinter )
+    AddButton( s, gStr.Properties, 320, 15, 104, TKPD_ID_PROPERTIES, @OnProperties )
+#ifndef __FB_WIN32__
+    tkWidget_Show( s->ctl(TKPD_ID_PROPERTIES), false )
+#endif
+    AddLabel( s, "", 104, 44, 320, TKPD_ID_INFO )
+    AddLabel( s, gStr.Copies, 16, 80, 80 )
+    AddNumber( s, 104, 80, 76, TKPD_ID_COPIES, 1, 999, 0, iif( job.copies < 1, 1, job.copies ) )
+    dim as TK_WIDGET ptr co = tkCheckBox_Create( tkHost_Root( s->dlg ), TKPD_ID_COLLATE )
+    tkCheckBox_SetText( co, gStr.Collate )
+    tkCheckBox_SetChecked( co, job.collate )
+    Place( s, co, 196, 80, 140, 26 )
+    s->ctl(TKPD_ID_COLLATE) = co
+    AddLabel( s, gStr.Pages, 16, 116, 80 )
+    AddOption( s, gStr.AllPages, 104, 116, 80, TKPD_ID_ALL, 1 )
+    AddOption( s, gStr.CurrentPage, 190, 116, 100, TKPD_ID_CURRENT, 1 )
+    if currentPage < 0 then tkWidget_Enable( s->ctl(TKPD_ID_CURRENT), false )
+    AddOption( s, gStr.Range, 104, 146, 80, TKPD_ID_RANGE, 1 )
+    dim as TK_WIDGET ptr rt = tkTextBox_Create( tkHost_Root( s->dlg ), TKPD_ID_RANGETEXT )
+    Place( s, rt, 190, 146, 234, 26 )
+    s->ctl(TKPD_ID_RANGETEXT) = rt
+    AddLabel( s, gStr.RangeHint, 190, 172, 234 )
+    if len( trim( job.pageSet ) ) then
+        tkTextBox_SetText( rt, job.pageSet )
+        tkOptionButton_SetChecked( s->ctl(TKPD_ID_RANGE), true )
+    else
+        tkOptionButton_SetChecked( s->ctl(TKPD_ID_ALL), true )
+    end if
+    tkTextBox_SetChangeCallback( rt, @OnRangeText )
+    AddLabel( s, gStr.TwoSided, 16, 206, 80 )
+    dim as TK_WIDGET ptr dx = tkComboBox_Create( tkHost_Root( s->dlg ), TKPD_ID_DUPLEX )
+    tkComboBox_AddItem( dx, gStr.OneSided ) : tkComboBox_AddItem( dx, gStr.LongEdge ) : tkComboBox_AddItem( dx, gStr.ShortEdge )
+    tkComboBox_SetCurSel( dx, job.duplex )
+    Place( s, dx, 104, 206, 160, 26 )
+    s->ctl(TKPD_ID_DUPLEX) = dx
+    dim as TK_WIDGET ptr cl = tkCheckBox_Create( tkHost_Root( s->dlg ), TKPD_ID_COLOUR )
+    tkCheckBox_SetText( cl, gStr.Colour )
+    tkCheckBox_SetChecked( cl, job.color )
+    Place( s, cl, 276, 206, 140, 26 )
+    s->ctl(TKPD_ID_COLOUR) = cl
+    AddLabel( s, "", 16, 248, 408, TKPD_ID_ERROR )
+    tkWidget_Show( s->ctl(TKPD_ID_ERROR), false )
+    AddButton( s, gStr.PrintButton, 248, 288, 84, TKPD_ID_OK, @OnOk )
+    tkButton_SetDefault( s->ctl(TKPD_ID_OK), true )
+    AddButton( s, gStr.Cancel, 340, 288, 84, TKPD_ID_CANCEL, @OnCancel )
+    if s->nPrinters = 0 then
+        ShowError( s, gStr.NoPrinter )
+        tkWidget_Enable( s->ctl(TKPD_ID_OK), false )
+    else
+        PrinterChanged( s )
+    end if
+    tkHost_SetFocus( s->dlg, s->ctl(TKPD_ID_OK) )
+    return s->dlg
+end function
+
+' The controls as a job. FALSE (and the reason shown in the dialog) when they are not one: no
+' printer, or a range naming no page.
+public function tkPrintDialog_Collect( byval dlg as TK_HOST ptr, byref job as TKPRINTJOB ) as boolean
+    dim as TKPD_STATE ptr s = St( dlg )
+    if (s = 0) orelse s->bSetup then return false
+    dim as long i = tkComboBox_GetCurSel( s->ctl(TKPD_ID_PRINTER) )
+    if (i < 0) orelse (i >= s->nPrinters) then ShowError( s, gStr.NoPrinter ) : return false
+    dim as TKPRINTJOB j = s->job
+    j.printer = s->printers(i).name
+    j.copies = clng( tkNumericUpDown_GetValue( s->ctl(TKPD_ID_COPIES) ) )
+    j.collate = tkCheckBox_GetChecked( s->ctl(TKPD_ID_COLLATE) )
+    if tkOptionButton_GetChecked( s->ctl(TKPD_ID_CURRENT) ) andalso (s->curPage >= 0) then
+        j.pageSet = str( s->curPage + 1 )
+    elseif tkOptionButton_GetChecked( s->ctl(TKPD_ID_RANGE) ) then
+        j.pageSet = trim( tkTextBox_GetText( s->ctl(TKPD_ID_RANGETEXT) ) )
+        dim as long pages()
+        if (len( j.pageSet ) = 0) orelse (tkPrinter_ParsePageSet( j.pageSet, s->nPages, pages() ) = 0) then
+            ShowError( s, gStr.BadRange )
+            tkHost_SetFocus( dlg, s->ctl(TKPD_ID_RANGETEXT) )
+            return false
+        end if
+    else
+        j.pageSet = ""
+    end if
+    j.duplex = iif( tkWidget_IsEnabled( s->ctl(TKPD_ID_DUPLEX) ), tkComboBox_GetCurSel( s->ctl(TKPD_ID_DUPLEX) ), TK_DUPLEX_NONE )
+    if j.duplex < 0 then j.duplex = TK_DUPLEX_NONE
+    j.color = tkCheckBox_GetChecked( s->ctl(TKPD_ID_COLOUR) )
+    job = j
+    s->job = j
+    ShowError( s, "" )
+    return true
+end function
+
+' Modal. TRUE = Print, with job filled; the dialog is destroyed either way.
+public function tkPrintDialog_Run( byval dlg as TK_HOST ptr, byref job as TKPRINTJOB ) as boolean
+    dim as TKPD_STATE ptr s = St( dlg )
+    if s = 0 then return false
+    dim as TKPRINTJOB j
+    dim as boolean ok = tkHost_RunModal( dlg ) = 1
+    if ok then j = s->job : job = j
+    tkHost_Destroy( dlg )
+    delete s
+    return ok
+end function
+
+public function tkPrintDialog_Show( byval owner as TK_HOST ptr, byval doc as TK_PRINTDOC ptr, byref job as TKPRINTJOB, _
+                                    byval currentPage as long = -1 ) as boolean
+    dim as TK_HOST ptr dlg = tkPrintDialog_Create( owner, doc, job, currentPage )
+    if dlg = 0 then return false
+    return tkPrintDialog_Run( dlg, job )
+end function
+
+' ---- page setup ----------------------------------------------------------------------------
+private function PaperIds( ids() as long ) as long
+    redim ids( 0 to 7 )
+    ids(0) = TK_PAPER_A4 : ids(1) = TK_PAPER_LETTER : ids(2) = TK_PAPER_LEGAL : ids(3) = TK_PAPER_A3
+    ids(4) = TK_PAPER_A5 : ids(5) = TK_PAPER_B5 : ids(6) = TK_PAPER_TABLOID : ids(7) = TK_PAPER_EXECUTIVE
+    return 8
+end function
+
+private function PaperName( byval id as long ) as ustring
+    select case id
+    case TK_PAPER_A4 : return "A4"
+    case TK_PAPER_LETTER : return "Letter"
+    case TK_PAPER_LEGAL : return "Legal"
+    case TK_PAPER_A3 : return "A3"
+    case TK_PAPER_A5 : return "A5"
+    case TK_PAPER_B5 : return "B5"
+    case TK_PAPER_TABLOID : return "Tabloid"
+    case TK_PAPER_EXECUTIVE : return "Executive"
+    end select
+    return "Custom"
+end function
+
+' The setup the controls show now (unvalidated), for the drawing.
+private sub PeekSetup( byval s as TKPD_STATE ptr, byref ps as TKPAGESETUP )
+    ps = s->ps
+    dim as long ids()
+    PaperIds( ids() )
+    dim as long i = tkComboBox_GetCurSel( s->ctl(TKPD_ID_PAPER) )
+    if (i >= 0) andalso (i <= ubound( ids )) then ps.paper = ids(i) : tkPageSetup_Resolve( ps )
+    ps.landscape = tkOptionButton_GetChecked( s->ctl(TKPD_ID_LANDSCAPE) )
+    dim as double k = iif( s->bInches, TK_PT_PER_INCH, TK_PT_PER_MM )
+    ps.marginL = tkNumericUpDown_GetValue( s->ctl(TKPD_ID_MARGIN_L) ) * k
+    ps.marginT = tkNumericUpDown_GetValue( s->ctl(TKPD_ID_MARGIN_T) ) * k
+    ps.marginR = tkNumericUpDown_GetValue( s->ctl(TKPD_ID_MARGIN_R) ) * k
+    ps.marginB = tkNumericUpDown_GetValue( s->ctl(TKPD_ID_MARGIN_B) ) * k
+end sub
+
+' The drawing: the page in proportion, its printable area dashed.
+private function PreviewProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg <> TKM_PAINT then return false
+    dim as TKPD_STATE ptr s = StOf( w )
+    if s = 0 then return true
+    dim as TK_PAINT ptr p = m->pPaint
+    dim as TKPAGESETUP ps
+    PeekSetup( s, ps )
+    dim as single pw, ph
+    tkPageSetup_PageSize( ps, pw, ph )
+    if (pw <= 0) orelse (ph <= 0) then return true
+    dim as single k = (w->cw - 8) / pw
+    if (w->ch - 8) / ph < k then k = (w->ch - 8) / ph
+    dim as long x0 = (w->cw - clng( pw * k )) \ 2, y0 = (w->ch - clng( ph * k )) \ 2
+    dim as TKRECT rc
+    tkRect_Set( rc, x0, y0, x0 + clng( pw * k ), y0 + clng( ph * k ) )
+    p->SetBackColor( &hFFFFFFFFul ) : p->SetPenColor( &hFF808080ul )
+    p->PaintBorderRect( @rc, 1 )
+    dim as TKPOINT pts(0 to 4)
+    dim as long l = x0 + clng( ps.marginL * k ), t = y0 + clng( ps.marginT * k )
+    dim as long r = x0 + clng( (pw - ps.marginR) * k ), b = y0 + clng( (ph - ps.marginB) * k )
+    pts(0).x = l : pts(0).y = t : pts(1).x = r : pts(1).y = t : pts(2).x = r : pts(2).y = b
+    pts(3).x = l : pts(3).y = b : pts(4) = pts(0)
+    p->SetPenColor( &hFF4A6C8Cul ) : p->SetPenDashStyle( TK_PENDASH_DASH )
+    p->PaintPolyline( @pts(0), 5, 1 )
+    p->SetPenDashStyle( TK_PENDASH_SOLID )
+    return true
+end function
+
+private sub OnSetupChanged( byval hCombo as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+    dim as TKPD_STATE ptr s = StOf( hCombo )
+    if s then tkWidget_Invalidate( s->ctl(TKPD_ID_PREVIEW) )
+end sub
+
+private sub OnMarginChanged( byval hCtrl as TK_WIDGET ptr, byval nValue as double )
+    dim as TKPD_STATE ptr s = StOf( hCtrl )
+    if s then tkWidget_Invalidate( s->ctl(TKPD_ID_PREVIEW) ) : ShowError( s, "" )
+end sub
+
+public function tkPageSetupDialog_Create( byval owner as TK_HOST ptr, byref ps as TKPAGESETUP ) as TK_HOST ptr
+    dim as TKPD_STATE ptr s = NewDialog( owner, gStr.SetupTitle, 520, 300, true )
+    if s = 0 then return 0
+    s->ps = ps
+    tkPageSetup_Resolve( s->ps )
+    s->bInches = (tkPrint_DefaultPaper( ) = TK_PAPER_LETTER)
+    AddLabel( s, gStr.Paper, 16, 16, 90 )
+    dim as TK_WIDGET ptr pc = tkComboBox_Create( tkHost_Root( s->dlg ), TKPD_ID_PAPER )
+    Place( s, pc, 112, 16, 170, 26 )
+    s->ctl(TKPD_ID_PAPER) = pc
+    dim as long ids()
+    dim as long n = PaperIds( ids() ), sel = 0
+    for i as long = 0 to n - 1
+        tkComboBox_AddItem( pc, PaperName( ids(i) ) )
+        if ids(i) = s->ps.paper then sel = i
+    next
+    tkComboBox_SetCurSel( pc, sel )
+    tkComboBox_SetSelChangeCallback( pc, @OnSetupChanged )
+    AddLabel( s, gStr.Orientation, 16, 52, 90 )
+    AddOption( s, gStr.Portrait, 112, 52, 150, TKPD_ID_PORTRAIT, 2 )
+    AddOption( s, gStr.Landscape, 112, 78, 150, TKPD_ID_LANDSCAPE, 2 )
+    tkOptionButton_SetChecked( s->ctl(iif( s->ps.landscape, TKPD_ID_LANDSCAPE, TKPD_ID_PORTRAIT )), true )
+    AddLabel( s, gStr.Margins & " (" & iif( s->bInches, gStr.Inches, gStr.Millimetres ) & ")", 16, 114, 200 )
+    dim as double k = iif( s->bInches, TK_PT_PER_INCH, TK_PT_PER_MM )
+    dim as long places = iif( s->bInches, 2, 1 )
+    dim as double hi = iif( s->bInches, 10, 250 )
+    AddLabel( s, gStr.LeftMargin, 16, 142, 60 ) : AddNumber( s, 80, 142, 110, TKPD_ID_MARGIN_L, 0, hi, places, s->ps.marginL / k )
+    AddLabel( s, gStr.RightMargin, 16, 176, 60 ) : AddNumber( s, 80, 176, 110, TKPD_ID_MARGIN_R, 0, hi, places, s->ps.marginR / k )
+    AddLabel( s, gStr.TopMargin, 204, 142, 56 ) : AddNumber( s, 262, 142, 110, TKPD_ID_MARGIN_T, 0, hi, places, s->ps.marginT / k )
+    AddLabel( s, gStr.BottomMargin, 204, 176, 56 ) : AddNumber( s, 262, 176, 110, TKPD_ID_MARGIN_B, 0, hi, places, s->ps.marginB / k )
+    for id as long = TKPD_ID_MARGIN_L to TKPD_ID_MARGIN_B
+        tkNumericUpDown_SetValueChangedCallback( s->ctl(id), @OnMarginChanged )
+    next
+    dim as TK_WIDGET ptr pv = tkWidget_CreateChild( tkHost_Root( s->dlg ), TKPD_ID_PREVIEW, @PreviewProc, 0 )
+    Place( s, pv, 392, 16, 112, 200 )
+    s->ctl(TKPD_ID_PREVIEW) = pv
+    AddLabel( s, "", 16, 220, 488, TKPD_ID_ERROR )
+    tkWidget_Show( s->ctl(TKPD_ID_ERROR), false )
+    AddButton( s, gStr.OK, 328, 258, 84, TKPD_ID_OK, @OnOk )
+    tkButton_SetDefault( s->ctl(TKPD_ID_OK), true )
+    AddButton( s, gStr.Cancel, 420, 258, 84, TKPD_ID_CANCEL, @OnCancel )
+    tkHost_SetFocus( s->dlg, s->ctl(TKPD_ID_OK) )
+    return s->dlg
+end function
+
+' The controls as a page setup. FALSE (the reason shown) when the margins leave less than an inch
+' of the page either way.
+public function tkPageSetupDialog_Collect( byval dlg as TK_HOST ptr, byref ps as TKPAGESETUP ) as boolean
+    dim as TKPD_STATE ptr s = St( dlg )
+    if (s = 0) orelse (s->bSetup = false) then return false
+    dim as TKPAGESETUP p
+    PeekSetup( s, p )
+    dim as single pw, ph
+    tkPageSetup_PageSize( p, pw, ph )
+    if (pw - p.marginL - p.marginR < TK_PT_PER_INCH) orelse (ph - p.marginT - p.marginB < TK_PT_PER_INCH) then
+        ShowError( s, gStr.BadMargins )
+        return false
+    end if
+    ps = p
+    s->ps = p
+    ShowError( s, "" )
+    return true
+end function
+
+public function tkPageSetupDialog_Run( byval dlg as TK_HOST ptr, byref ps as TKPAGESETUP ) as boolean
+    dim as TKPD_STATE ptr s = St( dlg )
+    if s = 0 then return false
+    dim as boolean ok = tkHost_RunModal( dlg ) = 1
+    if ok then ps = s->ps
+    tkHost_Destroy( dlg )
+    delete s
+    return ok
+end function
+
+public function tkPageSetupDialog_Show( byval owner as TK_HOST ptr, byref ps as TKPAGESETUP ) as boolean
+    dim as TK_HOST ptr dlg = tkPageSetupDialog_Create( owner, ps )
+    if dlg = 0 then return false
+    return tkPageSetupDialog_Run( dlg, ps )
+end function

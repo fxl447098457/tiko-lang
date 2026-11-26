@@ -6,6 +6,11 @@
 #                                   then the linux-x86_64 control in WSL
 #   build/aapcslane.sh --mac-only   the Mac alone
 #   build/aapcslane.sh --vm-only    the linux-arm64 VM alone
+#   build/aapcslane.sh --android-only
+#                                   android-arm64 on the Android device adb reaches -- an arm64
+#                                   phone, the Mac's arm64 emulator, or the x86_64 emulator's ARM
+#                                   translation (docs/tiko-android A3)
+#   build/aapcslane.sh --with-android   the default three, then android-arm64
 #
 # THE VM (docs/tiko-linux-arm64, docs/build.md "Linux arm64 VM on the Mac"): Lima instance
 # TIKO_LIMA_VM (default 'tk') on the Mac, aarch64 Ubuntu with clang-23. It sees the Mac's ~/tkm
@@ -41,10 +46,12 @@ TKO="$ROOT/bin/tiko$EXT"
 HOST=${TIKO_MAC_HOST:-mac}
 SSHO=${TIKO_MAC_SSH_OPTS:-}
 VM=${TIKO_LIMA_VM:-tk}
-RUN_MAC=1; RUN_VM=1; RUN_CTL=1
+RUN_MAC=1; RUN_VM=1; RUN_CTL=1; RUN_AND=0
 case "${1:-}" in
     --mac-only) RUN_VM=0; RUN_CTL=0 ;;
     --vm-only)  RUN_MAC=0; RUN_CTL=0 ;;
+    --android-only) RUN_MAC=0; RUN_VM=0; RUN_CTL=0; RUN_AND=1 ;;
+    --with-android) RUN_AND=1 ;;
     "") ;;
     *) echo "aapcslane: unknown option '$1'" >&2; exit 3 ;;
 esac
@@ -138,6 +145,32 @@ EOF
     MSYS_NO_PATHCONV=1 wsl.exe -- bash "$(mnt "$W")/linux.sh" < /dev/null > "$W/linux.out" 2>&1
     sed 's/^/linux-x86_64 control: /' "$W/linux.out"
     grep -q '^rc=0$' "$W/linux.out" || { echo "FAIL linux-x86_64 control"; fail=1; }
+fi
+
+# ------------------------------------------------------------------ android-arm64
+# BUILT AND LINKED ON WINDOWS: the C half by the NDK's clang for the same triple tiko targets, the
+# tiko half by tiko; the program runs on the device. On the x86_64 emulator that is Google's ARM
+# translation, which executes the instructions -- the registers and the stack are the arm64
+# program's own -- so the lane checks the ABI there too; a native arm64 Android is the authority
+# for anything the translator might do its own way (docs/tiko-android A3, D-A3-1).
+if [ "$RUN_AND" = "1" ]; then
+    export MSYS_NO_PATHCONV=1
+    SDK=${ANDROID_HOME:-${LOCALAPPDATA:-}/Android/Sdk}
+    NDK=${TIKO_ANDROID_NDK:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1)}}}
+    NCC=$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe
+    ADBX=$SDK/platform-tools/adb.exe
+    WM=$(cygpath -m "$W")
+    "$TKO" -c -target android-arm64 "$(cygpath -m "$ROOT")/tests/abi/apple/lane.tiko" -o "$WM/lane-and.o" > "$W/tiko-and.log" 2>&1 \
+        || { echo "FAIL android-arm64: tiko did not compile lane.tiko"; head -5 "$W/tiko-and.log"; exit 1; }
+    "$NCC" --target=aarch64-linux-android29 -O1 -c "$WM/lane.c" -o "$WM/lane-c-and.o" \
+        && "$NCC" --target=aarch64-linux-android29 "$WM/lane-c-and.o" "$WM/lane-and.o" -o "$WM/lane-and" \
+        || { echo "FAIL android-arm64: the NDK's clang did not build the lane"; exit 1; }
+    "$ADBX" push "$WM/lane-and" /data/local/tmp/tiko-aapcslane > /dev/null \
+        || { echo "FAIL android-arm64: adb push (is a device attached?)"; exit 3; }
+    "$ADBX" shell 'chmod 755 /data/local/tmp/tiko-aapcslane; /data/local/tmp/tiko-aapcslane; echo "rc=$?"; rm -f /data/local/tmp/tiko-aapcslane' \
+        < /dev/null 2>&1 | tr -d '\r' > "$W/and.out"
+    sed 's/^/android-arm64: /' "$W/and.out" | tail -5
+    grep -q '^rc=0$' "$W/and.out" || { echo "FAIL android-arm64 lane"; fail=1; }
 fi
 
 [ "$fail" = "0" ] && echo "aapcslane: ok"

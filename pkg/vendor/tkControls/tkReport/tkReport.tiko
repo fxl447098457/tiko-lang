@@ -1,0 +1,835 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReport -- banded reports over rows of data, laid out into tkPrint pages. Design:
+' docs/tkControls/PRINTING.md (claude-docs) §10; phase R4.
+'
+' THE MODEL is the banded report every reporting tool shares:
+'   Report Header   once, on the first page          Page Header    every page
+'     Group Header n  when group key n changes, outer to inner (RepeatOnEveryPage: again on each page)
+'       Detail          once per row
+'     Group Footer n  inner to outer, with the group's summaries
+'   Report Footer   once, after the last row         Page Footer    every page, at the bottom
+' A band holds items placed in points: labels, fields, summaries (sum / count / average / min / max
+' over a group or the whole report), page info ("Page {p} of {n}", resolved when drawn), lines,
+' boxes, images, check boxes, and custom items a callback draws.
+'
+' THE DATA is read once, forward, through a TKREPORT_SOURCE: field names and kinds, then MoveNext /
+' GetValue per row. The engine never sorts (decision P-13): rows must arrive in group order. Built-in
+' sources: callbacks (SetFields + SetRowCount + a GetValue callback), a tkListTree (its columns and
+' rows as text), and any procedure table (tkReportSqlite builds one over a query).
+'
+' SORTING is the source's (TKREPORT_SOURCE.Sort, asked with tkReport_AddSortKey): the callback / table
+' / ListTree source sorts a row map, tkReportSqlite wraps its query in an ORDER BY.
+'
+' EXPRESSIONS (Report Designer RD2, rpExpr.tiko): calculated fields, a filter, groups on an
+' expression, TKRI_EXPR / TKRI_TEXT items, visibility and conditional styles, parameters -- text
+' compiled by tkRExpr (tkReport_Prepare), with totals that restart by group, page or report and
+' late values (a group's total in its own header, Page n of N) filled in when they are known. A
+' NO_DATA band prints when no row passes.
+'
+' RUNNING: tkReport_CreateDoc makes a tkPrint document whose PrintPage callback is this engine, a
+' page per call -- so a tkPrintPreview / tkReportViewer shows the first pages while the rest are
+' laid out, and Generate / GenerateStep / Print / PDF all work on it. Laying out again (a new page
+' setup) rewinds the source.
+#module "tkReport"
+
+#import "../tkPrint" public
+#import "../tkBind" public
+#import "../tkRExpr" public
+#import "../tkListTree"
+using tkPrint
+using tkBind
+using tkRExpr
+using tkListTree
+using tkColumnHeader
+using tkHost
+using tkPaint
+
+public enum
+    TKRB_REPORT_HEADER = 0
+    TKRB_PAGE_HEADER
+    TKRB_GROUP_HEADER
+    TKRB_DETAIL
+    TKRB_GROUP_FOOTER
+    TKRB_REPORT_FOOTER
+    TKRB_PAGE_FOOTER
+    TKRB_NO_DATA            ' in place of the rows when there are none (after the filter)
+end enum
+
+public enum
+    TKRI_LABEL = 0          ' text
+    TKRI_FIELD              ' a field of the row, formatted
+    TKRI_SUMMARY            ' a field summed (counted ...) over a group or the report
+    TKRI_PAGEINFO           ' text with {p} {n} (filled in when drawn), {date} {time} {title}
+    TKRI_LINE               ' from the rect's top-left to its bottom-right
+    TKRI_BOX                ' the rect: filled with BackColor, outlined with the pen
+    TKRI_IMAGE              ' a file / resource: Text, or the field's text
+    TKRI_CHECK              ' a bool field as a box, ticked when true
+    TKRI_CUSTOM             ' the PaintItem callback draws it
+    TKRI_BARCODE            ' a barcode of the field's text (or Text): drawn by the painter tkReportBarcode
+                            ' installs (tkReport_SetItemPainter); with none, a thin red frame
+    TKRI_EXPR               ' an expression's value (tkRExpr), formatted by fmt
+    TKRI_TEXT               ' text with {expression} parts: "Total for {[Customer]}: {Sum([Amount])}"
+end enum
+
+public enum
+    TKRS_SUM = 0
+    TKRS_COUNT
+    TKRS_AVG
+    TKRS_MIN
+    TKRS_MAX
+end enum
+
+' A summary's scope: a group level (0 = outermost), or the whole report. An expression's totals
+' also restart on each page (PAGE), or by the band they are in (AUTO: a group's bands -> that group,
+' the page header / footer -> the page, else the report).
+public const TKRS_SCOPE_REPORT = -1
+public const TKRS_SCOPE_PAGE = -2
+public const TKRS_RESET_AUTO = -3
+
+' A conditional style: when 'when_' is true for the values the item shows, these apply (the first
+' rule that is true wins). hide = TRUE leaves the item out.
+public type TKREPORT_RULE
+    when_     as ustring
+    setFore   as boolean
+    fore      as ulong
+    setBack   as boolean
+    back      as ulong
+    setBold   as boolean
+    bold      as boolean
+    setItalic as boolean
+    italic    as boolean
+    hide      as boolean
+    px        as TK_REXPR ptr          ' compiled by tkReport_Prepare
+    aggBase   as long = -1
+end type
+
+' A sort key a source is asked to order its rows by (the report never sorts: P-13).
+public type TKREPORT_SORTKEY
+    field as long
+    desc  as boolean
+end type
+
+' Item borders.
+public enum
+    TKRI_BORDER_LEFT = 1
+    TKRI_BORDER_TOP = 2
+    TKRI_BORDER_RIGHT = 4
+    TKRI_BORDER_BOTTOM = 8
+    TKRI_BORDER_ALL = 15
+end enum
+
+' A forward cursor over rows: what a report reads. RowCount -1 = unknown. Rewind FALSE = cannot
+' (the report can then be laid out once only).
+public type TKREPORT_SOURCE
+    pCtx       as any ptr
+    FieldCount as function( byval pCtx as any ptr ) as long
+    FieldName  as function( byval pCtx as any ptr, byval f as long ) as ustring
+    FieldKind  as function( byval pCtx as any ptr, byval f as long ) as long
+    RowCount   as function( byval pCtx as any ptr ) as integer
+    MoveNext   as function( byval pCtx as any ptr ) as boolean
+    GetValue   as sub( byval pCtx as any ptr, byval f as long, byref v as TK_VALUE )
+    Rewind     as function( byval pCtx as any ptr ) as boolean
+    ' optional (0 = the source can't): order the rows by these keys, most significant first
+    Sort       as function( byval pCtx as any ptr, byval keys as TKREPORT_SORTKEY ptr, byval nKeys as long ) as boolean
+end type
+
+public type TKREPORT_ITEM
+    kind      as long
+    rc        as TKRECTF               ' in the band: points from the band's top-left (the left margin)
+    text      as ustring               ' LABEL / PAGEINFO text; IMAGE file
+    field     as long = -1             ' FIELD / SUMMARY / CHECK / IMAGE
+    fmt       as ustring               ' numbers "#,##0.00", dates "dd/mm/yyyy", booleans "Yes|No"
+    fn        as long                  ' SUMMARY
+    scope     as long = TKRS_SCOPE_REPORT
+    font      as TKFONTSPEC
+    fore      as ulong = &hFF000000ul
+    back      as ulong = 0             ' 0 = none
+    lineColor as ulong = &hFF000000ul
+    penPt     as single = 0.5
+    borders   as long
+    flags     as long = TK_DT_LEFT     ' TK_DT_* alignment; vertically centred unless TOP / BOTTOM
+    canGrow   as boolean               ' text wraps and the band grows
+    tag       as integer
+    sumIdx    as long = -1             ' the engine's accumulator
+    opts      as ustring               ' an installed kind's settings, "key=value;..." (BARCODE: tkReportBarcode)
+    ' ---- expressions (Report Designer RD2; compiled by tkReport_Prepare) ----
+    name_     as ustring               ' named in tkReport_Prepare's errors
+    expr      as ustring               ' EXPR: the value; TEXT: the template; IMAGE / CHECK: in place of field
+    visibleExpr as ustring             ' "" = always shown
+    rules(any) as TKREPORT_RULE
+    nRules    as long
+    reset     as long = TKRS_RESET_AUTO ' where the expression's totals restart
+    running   as boolean               ' totals so far, never filled in later (a running total)
+    incrLevel as long = -1             ' totals: -1 = every row; L = once per group L (a master's row)
+    px        as TK_REXPR ptr
+    pvis      as TK_REXPR ptr
+    aggBase   as long = -1             ' the first of px's totals in the report's accumulators
+    visBase   as long = -1
+    late      as long                  ' RP_LATE_* bits: printed into a slot filled when they are known
+end type
+
+public type TKREPORT_BAND
+    kind              as long
+    level             as long          ' GROUP_HEADER / GROUP_FOOTER
+    height            as single = 20
+    canGrow           as boolean = true ' its canGrow items may make it taller
+    pageBreakBefore   as boolean
+    pageBreakAfter    as boolean
+    repeatOnEveryPage as boolean       ' GROUP_HEADER: again at the top of each page of the group
+    printOnFirstPage  as boolean = true ' PAGE_HEADER / PAGE_FOOTER
+    visible           as boolean = true
+    backColor         as ulong
+    items(any)        as TKREPORT_ITEM
+    nItems            as long
+    visibleExpr       as ustring       ' "" = always; else shown only when true for its values
+    defaultSource     as ustring       ' [X] in its expressions also finds "<defaultSource>.X"
+    printAtBottom     as boolean       ' REPORT_FOOTER: at the bottom of the last page
+    pvis              as TK_REXPR ptr
+    visBase           as long = -1
+end type
+
+public type TK_REPORT as TK_REPORT_
+public type TK_RBAND as TKREPORT_BAND
+
+' Before a band is drawn: bShow FALSE skips it (conditional bands). row: the band's values.
+public type RP_BeforePrintFunc as function( byval rpt as TK_REPORT ptr, byval band as TK_RBAND ptr, byval row as TK_VALUE ptr ) as boolean
+' A TKRI_CUSTOM item: draw it in rc on the page.
+public type RP_PaintItemSub as sub( byval rpt as TK_REPORT ptr, byval item as TKREPORT_ITEM ptr, byval pg as TK_PAGE ptr, _
+                                    byref rc as TKRECTF, byval row as TK_VALUE ptr )
+' An item kind drawn by a module that registers itself (TKRI_BARCODE: tkReportBarcode), so tkReport
+' links nothing of it. value: the item's field formatted by its fmt, or its Text with no field.
+public type RP_ItemPainterSub as sub( byval rpt as TK_REPORT ptr, byval item as TKREPORT_ITEM ptr, byval pg as TK_PAGE ptr, _
+                                      byref rc as TKRECTF, byref value as ustring )
+' The callback source: field f of row (from 0).
+public type RP_GetValueSub as sub( byval rpt as TK_REPORT ptr, byval row as integer, byval f as long, byref v as TK_VALUE )
+
+public type RP_QITEM                     ' a band waiting to be drawn, with the values it shows
+    band   as TKREPORT_BAND ptr
+    vals(any) as TK_VALUE
+    sums(any) as double
+    open_  as long                       ' GROUP_HEADER: the level it opens; FOOTER: closes; -1
+    xv(any) as TK_VALUE                  ' the expressions' totals as they stood
+    rowNo  as integer                    ' RowNumber / GroupRowNumber for its expressions
+    grpRowNo as integer
+end type
+
+' One total of one expression, with its scope.
+public type RP_XACC
+    acc    as TKREXPR_ACC
+    x      as TK_REXPR ptr               ' the expression it belongs to (its argument: AggArg( x, k ))
+    k      as long
+    reset  as long                       ' a group level, TKRS_SCOPE_REPORT or TKRS_SCOPE_PAGE
+    incr   as long                       ' -1 every row; L once per group L
+end type
+
+public const RP_LATE_DOC = 1             ' reads PageCount: known when the document is complete
+public const RP_LATE_GROUP = 2           ' a group's totals in its header: known when the group closes
+public const RP_LATE_REPORT = 4          ' the report's totals in its header: known at the end of the rows
+public const RP_LATE_PAGE = 8            ' the page's totals in the page header: known at the end of the page
+
+' A late item drawn and waiting for its value.
+public type RP_LATE
+    slot   as long
+    item   as TKREPORT_ITEM ptr
+    level  as long                       ' its band's group level
+    page   as long
+    need   as long                       ' RP_LATE_* still to come
+    vals(any) as TK_VALUE
+    xv(any) as TK_VALUE
+    rowNo  as integer
+    grpRowNo as integer
+end type
+
+public type RP_ACC
+    count  as double
+    sum    as double
+    mn     as double
+    mx     as double
+end type
+
+public type TK_REPORT_
+    title       as ustring
+    setup       as TKPAGESETUP
+    src         as TKREPORT_SOURCE
+    bSrc        as boolean
+    ' the callback source
+    fName(any)  as ustring
+    fKind(any)  as long
+    nF          as long
+    nRows       as integer
+    vRow        as integer = -1
+    cbGet       as RP_GetValueSub
+    hList       as TK_WIDGET ptr         ' the ListTree source
+    bTable      as boolean               ' the table source: the values below, nF per row
+    tv(any)     as TK_VALUE
+    tvCap       as integer
+    rowMap(any) as integer               ' the callback source sorted: row at each position (empty = in order)
+    groupKey(any) as long
+    nGroups     as long
+    bands(any)  as TKREPORT_BAND ptr
+    nBands      as long
+    BeforePrint as RP_BeforePrintFunc
+    PaintItem   as RP_PaintItemSub
+    pUser       as any ptr
+    boolText    as ustring = "Yes|No"
+    ' the engine (rpLayout.tiko)
+    q(any)      as RP_QITEM
+    nQ          as long
+    cur(any)    as TK_VALUE
+    acc(any)    as RP_ACC
+    sumScope(any) as long
+    sumField(any) as long
+    sumFn(any)  as long
+    nSum        as long
+    keys(any)   as TK_VALUE
+    openLevels  as long                  ' group headers drawn whose footers are not
+    eof         as boolean
+    started     as boolean
+    nRead       as integer
+    ' ---- expressions (rpExpr.tiko) ----
+    groupExpr(any) as ustring            ' per group level: "" = groupKey's field, else this expression
+    groupDef(any) as ustring             ' its default source
+    calcName(any) as ustring             ' calculated fields: the user's, then the group expressions'
+    calcSrc(any)  as ustring
+    calcDef(any)  as ustring             ' each one's default source ([X] = "<it>.X")
+    calcX(any)    as TK_REXPR ptr
+    nCalc       as long                  ' all calculated fields
+    nCalcUser   as long                  ' of which the host's (AddCalcField)
+    nSrcF       as long                  ' fields the source gives; calculated ones follow
+    filterSrc   as ustring
+    filterDef   as ustring               ' the filter's default source
+    filterX     as TK_REXPR ptr
+    pName(any)  as ustring               ' parameters
+    pKind(any)  as long
+    pVal(any)   as TK_VALUE
+    nPar        as long
+    sortK(any)  as TKREPORT_SORTKEY
+    nSortK      as long
+    sortDone    as boolean
+    sch         as TKREXPR_SCHEMA
+    ctx         as TKREXPR_CTX
+    prepared    as boolean
+    prepErrors  as ustring
+    xa(any)     as RP_XACC
+    nXa         as long
+    late(any)   as RP_LATE
+    nLate       as long
+    doc         as TK_PRINTDOC ptr       ' the document being laid out
+    curPage     as long
+    grpRow      as integer
+    nFiltered   as integer
+end type
+
+' ---- building ------------------------------------------------------------------------------
+public function tkReport_Create( byref title as ustring = "" ) as TK_REPORT ptr
+    dim as TK_REPORT ptr r = new TK_REPORT
+    r->title = title
+    tkPageSetup_Resolve( r->setup )
+    return r
+end function
+
+public sub tkReport_Destroy( byval rpt as TK_REPORT ptr )
+    if rpt = 0 then exit sub
+    RpFreeCompiled( rpt )
+    for i as long = 0 to rpt->nBands - 1 : delete rpt->bands(i) : next
+    delete rpt
+end sub
+
+public sub tkReport_SetPageSetup( byval rpt as TK_REPORT ptr, byref ps as TKPAGESETUP )
+    if rpt = 0 then exit sub
+    rpt->setup = ps
+    tkPageSetup_Resolve( rpt->setup )
+end sub
+
+public sub tkReport_SetUserData( byval rpt as TK_REPORT ptr, byval p as any ptr )
+    if rpt then rpt->pUser = p
+end sub
+
+public function tkReport_GetUserData( byval rpt as TK_REPORT ptr ) as any ptr
+    if rpt = 0 then return 0
+    return rpt->pUser
+end function
+
+' The band of a kind (and group level), made on first use. Group bands need the group (AddGroup).
+public function tkReport_GetBand( byval rpt as TK_REPORT ptr, byval kind as long, byval level as long = 0 ) as TK_RBAND ptr
+    if rpt = 0 then return 0
+    if (kind <> TKRB_GROUP_HEADER) andalso (kind <> TKRB_GROUP_FOOTER) then level = 0
+    for i as long = 0 to rpt->nBands - 1
+        if (rpt->bands(i)->kind = kind) andalso (rpt->bands(i)->level = level) then return rpt->bands(i)
+    next
+    dim as TKREPORT_BAND ptr b = new TKREPORT_BAND
+    b->kind = kind : b->level = level
+    if rpt->nBands > ubound( rpt->bands ) then redim preserve rpt->bands( 0 to rpt->nBands * 2 + 7 )
+    rpt->bands(rpt->nBands) = b
+    rpt->nBands += 1
+    return b
+end function
+
+' A group on field 'keyField' (outer groups first). Its level (0 = outermost).
+public function tkReport_AddGroup( byval rpt as TK_REPORT ptr, byval keyField as long ) as long
+    if rpt = 0 then return -1
+    redim preserve rpt->groupKey( 0 to rpt->nGroups )
+    redim preserve rpt->groupExpr( 0 to rpt->nGroups )
+    redim preserve rpt->groupDef( 0 to rpt->nGroups )
+    rpt->groupKey(rpt->nGroups) = keyField
+    rpt->groupExpr(rpt->nGroups) = ""
+    rpt->nGroups += 1
+    rpt->prepared = false
+    return rpt->nGroups - 1
+end function
+
+' A group on an expression's value ("Left([Customer], 1)", "Year([Date])"): rows must arrive in
+' its order (sort the source by what it reads). Its level.
+public function tkReport_AddGroupExpr( byval rpt as TK_REPORT ptr, byref expr as const ustring, _
+                                       byref defaultSource as const ustring = "" ) as long
+    dim as long L = tkReport_AddGroup( rpt, -1 )
+    if L >= 0 then
+        rpt->groupExpr(L) = expr
+        rpt->groupDef(L) = defaultSource
+    end if
+    return L
+end function
+
+public sub tkRBand_SetHeight( byval band as TK_RBAND ptr, byval heightPt as single )
+    if band then band->height = heightPt
+end sub
+
+' The band's height as designed (canGrow items may make it taller when drawn).
+public function tkRBand_GetHeight( byval band as TK_RBAND ptr ) as single
+    if band = 0 then return 0
+    return band->height
+end function
+
+' Add an item; the pointer is valid until the next item is added to this band.
+public function tkRBand_AddItem( byval band as TK_RBAND ptr, byref item as TKREPORT_ITEM ) as TKREPORT_ITEM ptr
+    if band = 0 then return 0
+    if band->nItems > ubound( band->items ) then redim preserve band->items( 0 to band->nItems * 2 + 7 )
+    band->items(band->nItems) = item
+    band->nItems += 1
+    return @band->items(band->nItems - 1)
+end function
+
+private function MakeItem( byval kind as long, byref rc as TKRECTF ) as TKREPORT_ITEM
+    dim as TKREPORT_ITEM it
+    it.kind = kind : it.rc = rc
+    return it
+end function
+
+public function tkRBand_AddLabel( byval band as TK_RBAND ptr, byref rc as TKRECTF, byref text as ustring, _
+                                  byval flags as long = TK_DT_LEFT ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_LABEL, rc )
+    it.text = text : it.flags = flags
+    return tkRBand_AddItem( band, it )
+end function
+
+public function tkRBand_AddField( byval band as TK_RBAND ptr, byref rc as TKRECTF, byval nField as long, _
+                                  byref fmt as ustring = "", byval flags as long = TK_DT_LEFT ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_FIELD, rc )
+    it.field = nField : it.fmt = fmt : it.flags = flags
+    return tkRBand_AddItem( band, it )
+end function
+
+' fn: TKRS_*; scope: a group level or TKRS_SCOPE_REPORT. A summary shows the total of the rows of its
+' scope that came before it: in a footer the group's (report's) whole total.
+public function tkRBand_AddSummary( byval band as TK_RBAND ptr, byref rc as TKRECTF, byval nField as long, byval fn as long, _
+                                    byval nScope as long = TKRS_SCOPE_REPORT, byref fmt as ustring = "", _
+                                    byval flags as long = TK_DT_RIGHT ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_SUMMARY, rc )
+    it.field = nField : it.fn = fn : it.scope = nScope : it.fmt = fmt : it.flags = flags
+    return tkRBand_AddItem( band, it )
+end function
+
+public function tkRBand_AddPageInfo( byval band as TK_RBAND ptr, byref rc as TKRECTF, byref text as ustring = "Page {p} of {n}", _
+                                     byval flags as long = TK_DT_RIGHT ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_PAGEINFO, rc )
+    it.text = text : it.flags = flags
+    return tkRBand_AddItem( band, it )
+end function
+
+public function tkRBand_AddLine( byval band as TK_RBAND ptr, byref rc as TKRECTF, byval penPt as single = 0.5 ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_LINE, rc )
+    it.penPt = penPt
+    return tkRBand_AddItem( band, it )
+end function
+
+public function tkRBand_AddBox( byval band as TK_RBAND ptr, byref rc as TKRECTF, byval back as ulong = 0, _
+                                byval penPt as single = 0.5 ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_BOX, rc )
+    it.back = back : it.penPt = penPt
+    return tkRBand_AddItem( band, it )
+end function
+
+' An image: file (or a registered name); or, with field >= 0, the file the field's text names.
+public function tkRBand_AddImage( byval band as TK_RBAND ptr, byref rc as TKRECTF, byref file as ustring, _
+                                  byval nField as long = -1 ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_IMAGE, rc )
+    it.text = file : it.field = nField
+    return tkRBand_AddItem( band, it )
+end function
+
+public function tkRBand_AddCheckBox( byval band as TK_RBAND ptr, byref rc as TKRECTF, byval nField as long ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_CHECK, rc )
+    it.field = nField
+    return tkRBand_AddItem( band, it )
+end function
+
+public function tkRBand_AddCustom( byval band as TK_RBAND ptr, byref rc as TKRECTF, byval tag as integer = 0 ) as TKREPORT_ITEM ptr
+    dim as TKREPORT_ITEM it = MakeItem( TKRI_CUSTOM, rc )
+    it.tag = tag
+    return tkRBand_AddItem( band, it )
+end function
+
+public sub tkReport_SetBeforePrintCallback( byval rpt as TK_REPORT ptr, byval cb as RP_BeforePrintFunc )
+    if rpt then rpt->BeforePrint = cb
+end sub
+
+public sub tkReport_SetPaintItemCallback( byval rpt as TK_REPORT ptr, byval cb as RP_PaintItemSub )
+    if rpt then rpt->PaintItem = cb
+end sub
+
+' The painters of the installable item kinds, process-wide: a module that draws a kind registers
+' itself here (tkReportBarcode_Install), so a program that never prints one never links it.
+dim shared as RP_ItemPainterSub gItemPainters(0 to 15)
+
+public sub tkReport_SetItemPainter( byval kind as long, byval cb as RP_ItemPainterSub )
+    if (kind > TKRI_CUSTOM) andalso (kind - TKRI_CUSTOM - 1 <= ubound( gItemPainters )) then gItemPainters(kind - TKRI_CUSTOM - 1) = cb
+end sub
+
+public function tkReport_GetItemPainter( byval kind as long ) as RP_ItemPainterSub
+    if (kind > TKRI_CUSTOM) andalso (kind - TKRI_CUSTOM - 1 <= ubound( gItemPainters )) then return gItemPainters(kind - TKRI_CUSTOM - 1)
+    return 0
+end function
+
+' How a bool field reads: "Yes|No" by default.
+public sub tkReport_SetBoolText( byval rpt as TK_REPORT ptr, byref yesNo as ustring )
+    if rpt then rpt->boolText = yesNo
+end sub
+
+' ---- sources -------------------------------------------------------------------------------
+public sub tkReport_SetSource( byval rpt as TK_REPORT ptr, byref src as TKREPORT_SOURCE )
+    if rpt = 0 then exit sub
+    rpt->src = src
+    rpt->bSrc = true
+    rpt->prepared = false
+    rpt->sortDone = false
+end sub
+
+private function CbFieldCount( byval p as any ptr ) as long
+    return cast( TK_REPORT ptr, p )->nF
+end function
+private function CbFieldName( byval p as any ptr, byval f as long ) as ustring
+    dim as TK_REPORT ptr r = p
+    if (f < 0) orelse (f >= r->nF) then return ""
+    return r->fName(f)
+end function
+private function CbFieldKind( byval p as any ptr, byval f as long ) as long
+    dim as TK_REPORT ptr r = p
+    if (f < 0) orelse (f >= r->nF) then return TKV_EMPTY
+    if r->bTable andalso (r->fKind(f) = TKV_EMPTY) then
+        for row as integer = 0 to r->nRows - 1         ' a table's field: its first value's kind
+            if r->tv(row * r->nF + f).kind <> TKV_EMPTY then return r->tv(row * r->nF + f).kind
+        next
+    end if
+    return r->fKind(f)
+end function
+private function CbRowCount( byval p as any ptr ) as integer
+    return cast( TK_REPORT ptr, p )->nRows
+end function
+private function CbNext( byval p as any ptr ) as boolean
+    dim as TK_REPORT ptr r = p
+    if r->vRow + 1 >= r->nRows then r->vRow = r->nRows : return false
+    r->vRow += 1
+    return true
+end function
+' Field f of row 'row' (the row as stored, not as sorted).
+private sub CbValueAt( byval r as TK_REPORT ptr, byval row as integer, byval f as long, byref v as TK_VALUE )
+    v.Clear( )
+    if r->bTable then
+        if (f >= 0) andalso (f < r->nF) then v = r->tv(row * r->nF + f)
+    elseif r->hList then
+        if f = 0 then v.SetText( tkListTree_GetText( r->hList, row ) ) else v.SetText( tkListTree_GetCellText( r->hList, row, f ) )
+    elseif r->cbGet then
+        r->cbGet( r, row, f, v )
+    end if
+end sub
+private sub CbGet( byval p as any ptr, byval f as long, byref v as TK_VALUE )
+    dim as TK_REPORT ptr r = p
+    dim as integer row = r->vRow
+    if (ubound( r->rowMap ) >= row) andalso (row >= 0) then row = r->rowMap(row)
+    CbValueAt( r, row, f, v )
+end sub
+
+' Two values in sort order: -1 / 0 / 1. Empty first; numbers by value; text by character code.
+public function tkReport_CompareValues( byref a as TK_VALUE, byref b as TK_VALUE ) as long
+    if a.kind = TKV_EMPTY then return iif( b.kind = TKV_EMPTY, 0, -1 )
+    if b.kind = TKV_EMPTY then return 1
+    dim as boolean na = (a.kind = TKV_INT) orelse (a.kind = TKV_FLOAT), nb = (b.kind = TKV_INT) orelse (b.kind = TKV_FLOAT)
+    if na andalso nb then
+        if (a.kind = TKV_INT) andalso (b.kind = TKV_INT) then
+            if a.i = b.i then return 0
+            return iif( a.i < b.i, -1, 1 )
+        end if
+        dim as double x = a.AsFloat( ), y = b.AsFloat( )
+        if x = y then return 0
+        return iif( x < y, -1, 1 )
+    end if
+    if a.kind <> b.kind then return iif( a.kind < b.kind, -1, 1 )
+    dim as longint ka, kb
+    select case a.kind
+    case TKV_TEXT
+        if a.s = b.s then return 0
+        return iif( a.s < b.s, -1, 1 )
+    case TKV_BOOL
+        ka = iif( a.b, 1, 0 ) : kb = iif( b.b, 1, 0 )
+    case TKV_DATE
+        ka = (a.d.wYear * 13 + a.d.wMonth) * 32 + a.d.wDay : kb = (b.d.wYear * 13 + b.d.wMonth) * 32 + b.d.wDay
+    case TKV_TIME
+        ka = (a.t.wHour * 60 + a.t.wMinute) * 60 + a.t.wSecond : kb = (b.t.wHour * 60 + b.t.wMinute) * 60 + b.t.wSecond
+    end select
+    if ka = kb then return 0
+    return iif( ka < kb, -1, 1 )
+end function
+
+' The callback / table / ListTree source sorts itself: a stable merge sort of a row map by the keys.
+private function CbSort( byval p as any ptr, byval keys as TKREPORT_SORTKEY ptr, byval nKeys as long ) as boolean
+    dim as TK_REPORT ptr r = p
+    dim as integer n = r->nRows
+    erase r->rowMap
+    if (n < 2) orelse (nKeys < 1) then return true
+    for j as long = 0 to nKeys - 1
+        if (keys[j].field < 0) orelse (keys[j].field >= r->nF) then return false
+    next
+    dim as TK_VALUE kv(any)
+    redim kv( 0 to n * nKeys - 1 )
+    for row as integer = 0 to n - 1
+        for j as long = 0 to nKeys - 1
+            CbValueAt( r, row, keys[j].field, kv(row * nKeys + j) )
+        next
+    next
+    dim as integer a(any), t(any)
+    redim a( 0 to n - 1 )
+    redim t( 0 to n - 1 )
+    for i as integer = 0 to n - 1 : a(i) = i : next
+    dim as integer w = 1
+    while w < n
+        dim as integer lo = 0
+        while lo < n
+            dim as integer mid_ = lo + w, hi = lo + 2 * w
+            if mid_ > n then mid_ = n
+            if hi > n then hi = n
+            dim as integer i = lo, j = mid_, o = lo
+            while (i < mid_) orelse (j < hi)
+                dim as boolean takeLeft = (j >= hi)
+                if (takeLeft = false) andalso (i < mid_) then
+                    dim as long c = 0
+                    for k as long = 0 to nKeys - 1
+                        c = tkReport_CompareValues( kv(a(i) * nKeys + k), kv(a(j) * nKeys + k) )
+                        if keys[k].desc then c = -c
+                        if c <> 0 then exit for
+                    next
+                    takeLeft = (c <= 0)
+                end if
+                if takeLeft then
+                    t(o) = a(i) : i += 1
+                else
+                    t(o) = a(j) : j += 1
+                end if
+                o += 1
+            wend
+            lo = hi
+        wend
+        for i as integer = 0 to n - 1 : a(i) = t(i) : next
+        w *= 2
+    wend
+    redim r->rowMap( 0 to n - 1 )
+    for i as integer = 0 to n - 1 : r->rowMap(i) = a(i) : next
+    return true
+end function
+private function CbRewind( byval p as any ptr ) as boolean
+    cast( TK_REPORT ptr, p )->vRow = -1
+    return true
+end function
+
+private sub UseCallbackSource( byval rpt as TK_REPORT ptr )
+    dim as TKREPORT_SOURCE s
+    s.pCtx = rpt
+    s.FieldCount = @CbFieldCount : s.FieldName = @CbFieldName : s.FieldKind = @CbFieldKind
+    s.RowCount = @CbRowCount : s.MoveNext = @CbNext : s.GetValue = @CbGet : s.Rewind = @CbRewind
+    s.Sort = @CbSort
+    rpt->src = s
+    rpt->bSrc = true
+    rpt->vRow = -1
+    erase rpt->rowMap
+    rpt->prepared = false
+end sub
+
+' The callback source: these fields (names, TKV_* kinds), nRows rows, each value from cb.
+public sub tkReport_SetFields( byval rpt as TK_REPORT ptr, names() as ustring, kinds() as long )
+    if rpt = 0 then exit sub
+    rpt->nF = ubound( names ) - lbound( names ) + 1
+    redim rpt->fName( 0 to rpt->nF - 1 )
+    redim rpt->fKind( 0 to rpt->nF - 1 )
+    for i as long = 0 to rpt->nF - 1
+        rpt->fName(i) = names(lbound( names ) + i)
+        rpt->fKind(i) = iif( i <= ubound( kinds ) - lbound( kinds ), kinds(lbound( kinds ) + i), TKV_TEXT )
+    next
+    rpt->hList = 0
+    rpt->bTable = false
+    UseCallbackSource( rpt )
+end sub
+
+public sub tkReport_SetRowCount( byval rpt as TK_REPORT ptr, byval nRows as integer )
+    if rpt = 0 then exit sub
+    rpt->nRows = iif( nRows < 0, 0, nRows )
+    erase rpt->rowMap
+    rpt->sortDone = false
+end sub
+
+public sub tkReport_SetGetValueCallback( byval rpt as TK_REPORT ptr, byval cb as RP_GetValueSub )
+    if rpt then rpt->cbGet = cb
+end sub
+
+' A tkListTree as the source: its columns (captions as field names, text values), its rows in order.
+public sub tkReport_SourceFromListTree( byval rpt as TK_REPORT ptr, byval hList as TK_WIDGET ptr )
+    if (rpt = 0) orelse (hList = 0) then exit sub
+    dim as long nc = tkListTree_GetColumnCount( hList )
+    if nc < 1 then nc = 1
+    rpt->nF = nc
+    redim rpt->fName( 0 to nc - 1 )
+    redim rpt->fKind( 0 to nc - 1 )
+    dim as TK_WIDGET ptr hdr = tkListTree_GetHeader( hList )
+    for i as long = 0 to nc - 1
+        rpt->fName(i) = ""
+        if hdr then rpt->fName(i) = tkColumnHeader_GetColumnText( hdr, i )
+        rpt->fKind(i) = TKV_TEXT
+    next
+    rpt->nRows = tkListTree_GetCount( hList )
+    rpt->hList = hList
+    rpt->cbGet = 0
+    rpt->bTable = false
+    UseCallbackSource( rpt )
+end sub
+
+' ---- the table source: values the report holds (printing R5; what a designed ReportViewer fills) ----
+' Fields first, then rows, each value set through its cell. A field's kind is its first non-empty
+' value's. Adding a field empties the rows.
+' Every row gone; the fields stay.
+public sub tkReport_TableClear( byval rpt as TK_REPORT ptr )
+    if (rpt = 0) orelse (rpt->bTable = false) then exit sub
+    erase rpt->tv
+    rpt->tvCap = 0
+    rpt->nRows = 0
+    rpt->vRow = -1
+    erase rpt->rowMap
+    rpt->sortDone = false
+end sub
+
+public function tkReport_TableAddField( byval rpt as TK_REPORT ptr, byref name_ as ustring ) as long
+    if rpt = 0 then return -1
+    if rpt->bTable = false then
+        rpt->nF = 0
+        erase rpt->fName, rpt->fKind
+        rpt->hList = 0
+        rpt->cbGet = 0
+        rpt->bTable = true
+    end if
+    tkReport_TableClear( rpt )
+    redim preserve rpt->fName( 0 to rpt->nF )
+    redim preserve rpt->fKind( 0 to rpt->nF )
+    rpt->fName(rpt->nF) = name_
+    rpt->fKind(rpt->nF) = TKV_EMPTY
+    rpt->nF += 1
+    UseCallbackSource( rpt )
+    return rpt->nF - 1
+end function
+
+' A new row of empty values: its index.
+public function tkReport_TableAddRow( byval rpt as TK_REPORT ptr ) as integer
+    if (rpt = 0) orelse (rpt->bTable = false) orelse (rpt->nF < 1) then return -1
+    dim as integer need = (rpt->nRows + 1) * rpt->nF
+    if need > rpt->tvCap then
+        rpt->tvCap = iif( rpt->tvCap < 64, 64, rpt->tvCap * 2 )
+        if rpt->tvCap < need then rpt->tvCap = need
+        redim preserve rpt->tv( 0 to rpt->tvCap - 1 )
+    end if
+    rpt->nRows += 1
+    if ubound( rpt->rowMap ) >= 0 then erase rpt->rowMap
+    rpt->sortDone = false
+    return rpt->nRows - 1
+end function
+
+' The value of field f in a row, to set (0 when there is no such cell).
+public function tkReport_TableCell( byval rpt as TK_REPORT ptr, byval row as integer, byval f as long ) as TK_VALUE ptr
+    if (rpt = 0) orelse (rpt->bTable = false) then return 0
+    if (row < 0) orelse (row >= rpt->nRows) orelse (f < 0) orelse (f >= rpt->nF) then return 0
+    return @rpt->tv(row * rpt->nF + f)
+end function
+
+' The field named 'name' (case-insensitive), -1 when there is none.
+public function tkReport_FindField( byval rpt as TK_REPORT ptr, byref name_ as ustring ) as long
+    if (rpt = 0) orelse (rpt->bSrc = false) then return -1
+    dim as long n = rpt->src.FieldCount( rpt->src.pCtx )
+    for f as long = 0 to n - 1
+        if lcase( rpt->src.FieldName( rpt->src.pCtx, f ) ) = lcase( name_ ) then return f
+    next
+    for c as long = 0 to rpt->nCalcUser - 1          ' a calculated field follows the source's
+        if lcase( rpt->calcName(c) ) = lcase( name_ ) then return n + c
+    next
+    return -1
+end function
+
+' ---- formatting ----------------------------------------------------------------------------
+' x with 'dec' decimals, thousands grouped with ',' when asked. Rounded half away from zero.
+function RpNumber( byval x as double, byval dec as long, byval grouped as boolean ) as string
+    dim as double p10 = 10 ^ dec
+    dim as longint n = clngint( int( abs( x ) * p10 + 0.5 ) )
+    dim as string ip = str( n \ clngint( p10 ) ), fp
+    if dec > 0 then fp = "." & right( string( dec, "0" ) & str( n mod clngint( p10 ) ), dec )
+    if grouped then
+        dim as string g
+        dim as long c = 0
+        for i as long = len( ip ) to 1 step -1
+            g = mid( ip, i, 1 ) & g
+            c += 1
+            if (c mod 3 = 0) andalso (i > 1) then g = "," & g
+        next
+        ip = g
+    end if
+    return iif( (x < 0) andalso (n <> 0), "-", "" ) & ip & fp
+end function
+
+' A value as text: by fmt when given (numbers, dates "dd/mm/yyyy" (yyyy mm dd), times "hh:nn:ss",
+' booleans "Yes|No"), else plainly (numbers as they are, dates ISO, times hh:nn).
+public function tkReport_FormatValue( byref v as TK_VALUE, byref fmt as ustring = "", byref boolText as ustring = "Yes|No" ) as ustring
+    return tkRExpr_FormatValue( v, fmt, boolText )       ' one formatter (tkRExpr), the same results
+end function
+
+' ---- running -------------------------------------------------------------------------------
+' A document whose pages are this report: hand it to a preview / viewer (generated while shown) or
+' call tkPrintDoc_Generate. The report must outlive the document's generation.
+public function tkReport_CreateDoc( byval rpt as TK_REPORT ptr ) as TK_PRINTDOC ptr
+    if rpt = 0 then return 0
+    dim as TK_PRINTDOC ptr doc = tkPrintDoc_Create( rpt->title )
+    tkPrintDoc_SetPageSetup( doc, rpt->setup )
+    tkPrintDoc_SetUserData( doc, rpt )
+    tkPrintDoc_SetPrintPageCallback( doc, @RpPrintPage )
+    return doc
+end function
+
+' CreateDoc, then lay out every page. The caller destroys the document.
+public function tkReport_Run( byval rpt as TK_REPORT ptr ) as TK_PRINTDOC ptr
+    dim as TK_PRINTDOC ptr doc = tkReport_CreateDoc( rpt )
+    if doc then tkPrintDoc_Generate( doc )
+    return doc
+end function
+
+' Rows read by the last layout.
+public function tkReport_GetRowsRead( byval rpt as TK_REPORT ptr ) as integer
+    if rpt = 0 then return 0
+    return rpt->nRead
+end function

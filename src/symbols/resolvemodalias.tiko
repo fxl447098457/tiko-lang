@@ -21,7 +21,50 @@
 '' second instance, which a pass after discovery corrected for the alias alone, so 'return x'
 '' was TKO0738 (tests/modules/alias-instance-later-file). After discovery it runs again for
 '' what discovery's instantiations settle.
+''
+'' ...WITH THE MODULE'S FILE-LEVEL USINGS IN EFFECT. The walk registers a 'using' on reaching
+'' it, so here, ahead of the walk, a name only a using reaches resolved to nothing: in
+'' tkDataGrid, 'type DG_GridSub as sub( byval hGrid as TK_WIDGET ptr )' under 'using tkHost'
+'' took 'TK_WIDGET ptr' as a pointer to no type, and a file sorting before the alias's typed
+'' 'byval cb as DG_GridSub' with it -- defined as F(void(*)(void*)) while every caller, reading
+'' the interface, called F(void(*)(TK_WIDGET_*)): lld-link, undefined symbol (2026-11-22,
+'' tests/modules/procptr-using-later-file). Registered for this pass alone (ModuleUsingsAhead_)
+'' and removed after it, as discovery removes its own: the walk then registers each where it
+'' stands. Each stays its own file's: UsingHere reads aliasPos, the type name being resolved.
+private sub ModuleUsingsAhead_( byref c as Ctx )
+    for n as int32 = 1 to c.ast->Count( )
+        dim as Tko.NodeId id = cast( Tko.NodeId, n )
+        if c.ast->Kind( id ) <> Tko.N_USING then continue for
+        dim as Tko.ScopeId here = c.info->ScopeOf( id )
+        dim as Tko.SymScope ptr hs = c.syms->ScopeAt( here )
+        if hs = nullptr then continue for                 '' a comma list's later path: below
+        '' A procedure's or a block's using is positional and no alias's business.
+        dim as boolean fileLevel = (hs->kind = cast( uint8, Tko.SCOPEK_GLOBAL )) orelse _
+            (hs->kind = cast( uint8, Tko.SCOPEK_MODULE )) orelse _
+            (hs->kind = cast( uint8, Tko.SCOPEK_NAMESPACE ))
+        if fileLevel = false then continue for
+        dim as Tko.StmtPayload ptr usp = StmtOf( c, id )
+        for u as int32 = -1 to usp->count - 1
+            dim as Tko.NodeId un = id
+            if u >= 0 then un = c.ast->ChildAt( usp->first, u )
+            dim as Tko.InternId unm = StmtOf( c, un )->name
+            if unm = 0 then continue for
+            dim as uint32 savedAt = c.syms->aliasPos
+            c.syms->aliasPos = cast( uint32, un )         '' the file's own imports (M22)
+            dim as Tko.Symbol ptr nss = c.syms->SymbolAt( LookupDottedNamespace_( c, here, unm ) )
+            c.syms->aliasPos = savedAt
+            if nss = nullptr then continue for
+            if nss->kind <> cast( uint8, Tko.SYM_NAMESPACE ) then continue for
+            c.syms->AddUsing( here, nss->inner, cast( uint32, un ) )
+        next
+    next
+end sub
+
 private sub ModuleTypedefsFirst_( byref c as Ctx )
+    dim as int32 ulo = c.syms->usingAt.Count
+    if c.syms->modFileCount > 0 then ModuleUsingsAhead_( c )
+    dim as uint32 savedPos = c.syms->usePos
+    c.syms->usePos = Tko.USEPOS_LATEST                    '' so UsingHere reads aliasPos
     for r as int32 = 1 to 8
         dim as boolean progress = false
         for n as int32 = 1 to c.ast->Count( )
@@ -43,6 +86,8 @@ private sub ModuleTypedefsFirst_( byref c as Ctx )
         next
         if progress = false then exit for
     next
+    c.syms->usePos = savedPos
+    c.syms->RemoveUsings( ulo, c.syms->usingAt.Count )
 end sub
 
 '' 'redim A( 3 ) as T' WHERE A IS ANOTHER MODULE'S SHARED DYNAMIC ARRAY, reached through a

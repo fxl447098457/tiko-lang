@@ -1,0 +1,613 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkNavigator -- a record navigator (Form Designer B4): First, Previous, the position ("3 of 120"),
+' Next, Last, New and Delete, in one strip. It holds a count and a position and nothing else: what a
+' move means is the program's (a designed form's generated code loads the record there).
+'
+' A click on an enabled button fires Navigate( action, target ) -- TKNAV_FIRST .. TKNAV_DELETE and
+' the index it would go to -- which answers Allow. Allowed (or with no callback), the navigator takes
+' the new position and count itself: a move goes to target, New adds one and goes to it, Delete
+' takes one away and stays (or goes to the new last; -1 when none are left). Refused, nothing moves.
+' The setters are silent. The ends disable their buttons: First / Previous at the first record,
+' Next / Last at the last, Delete with no record.
+'
+' Not a focus stop: a navigator beside a form's boxes must not take the caret, so it claims no
+' keys. Its glyphs are drawn (bars, triangles, a plus, a cross), not taken from a glyph font.
+' Seeded from tkSelectBar: the press / slide-off / release gesture with capture, hot tracking with
+' a guaranteed leave, per-part tooltips, the theme's recipes from the start.
+#module "tkNavigator"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+
+' The actions Navigate reports, and the parts in screen order (TKNAV_TEXT is no action).
+public enum
+    TKNAV_FIRST = 0
+    TKNAV_PREV
+    TKNAV_NEXT
+    TKNAV_LAST
+    TKNAV_NEW
+    TKNAV_DELETE
+    TKNAV_TEXT
+end enum
+
+public const as long TKNAVIGATOR_PARTS = 7
+public const as long TKNAVIGATOR_DEFAULT_BUTTONW = 28     ' design units, scaled at create
+public const as long TKNAVIGATOR_DEFAULT_TEXTPAD = 10
+public const as long TKNAVIGATOR_DEFAULT_TEXTMINW = 64
+
+public type TKNAVIGATOR_COLORS
+    BackColor          as ulong = &hFF21252Bul
+    BorderColor        as ulong = &hFF444A56ul
+    ButtonBackHot      as ulong = &hFF2C313Aul
+    ButtonBackPressed  as ulong = &hFF3E4451ul
+    GlyphColor         as ulong = &hFFD7DAE0ul
+    GlyphColorDisabled as ulong = &hFF5A606Aul
+    TextColor          as ulong = &hFFC8CDD6ul
+end type
+
+' Navigate: an enabled button was clicked. Answer true (Allow) to let it move.
+public type NAV_NavigateCallbackFunc as function( byval hNav as TK_WIDGET ptr, byval action as int32, byval target as int32 ) as boolean
+
+type TKNAVIGATOR_STATE
+    hWin          as TK_WIDGET ptr
+    id            as long
+    bColorsPinned as boolean
+    tip           as TKTIPHOST_STATE
+    nCount        as long
+    nPos          as long = -1
+    bShowNew      as boolean = true
+    bShowDelete   as boolean = true
+    sPosFmt       as ustring = "{1} of {2}"
+    tips( 0 to TKNAVIGATOR_PARTS - 1 ) as ustring
+    nHot          as long = -1
+    nPressed      as long = -1
+    colors        as TKNAVIGATOR_COLORS
+    pFont         as TTF_Font ptr       ' borrowed; 0 = the host's default
+    nButtonW      as long
+    nTextPad      as long
+    nTextMinW     as long
+    rcPart( 0 to TKNAVIGATOR_PARTS - 1 ) as TKRECT
+    bLayoutDirty  as boolean = true
+    NavigateCallback as NAV_NavigateCallbackFunc
+
+    declare function FontInUse( ) as TTF_Font ptr
+    declare function PosText( ) as ustring
+    declare function Visible( byval part as long ) as boolean
+    declare function Enabled( byval part as long ) as boolean
+    declare function Target( byval part as long ) as long
+    declare sub Layout( )
+    declare function HitTest( byval x as long, byval y as long ) as long
+    declare sub Refresh( )
+end type
+
+' Screen order of the parts, left to right.
+private function PartAt_( byval slot as long ) as long
+    select case slot
+    case 0 : return TKNAV_FIRST
+    case 1 : return TKNAV_PREV
+    case 2 : return TKNAV_TEXT
+    case 3 : return TKNAV_NEXT
+    case 4 : return TKNAV_LAST
+    case 5 : return TKNAV_NEW
+    case 6 : return TKNAV_DELETE
+    end select
+    return -1
+end function
+
+function TKNAVIGATOR_STATE.FontInUse( ) as TTF_Font ptr
+    if this.pFont then return this.pFont
+    if this.hWin = 0 then return 0
+    return this.hWin->pHost->pDefaultFont
+end function
+
+' The position text: {1} the 1-based position ("-" for none), {2} the count.
+function TKNAVIGATOR_STATE.PosText( ) as ustring
+    dim as ustring s = this.sPosFmt, pos_ = "-"
+    if (this.nPos >= 0) andalso (this.nPos < this.nCount) then pos_ = str( this.nPos + 1 )
+    dim as long at_ = instr( s, "{1}" )
+    if at_ then s = left( s, at_ - 1 ) & pos_ & mid( s, at_ + 3 )
+    at_ = instr( s, "{2}" )
+    if at_ then s = left( s, at_ - 1 ) & str( this.nCount ) & mid( s, at_ + 3 )
+    return s
+end function
+
+function TKNAVIGATOR_STATE.Visible( byval part as long ) as boolean
+    if part = TKNAV_NEW then return this.bShowNew
+    if part = TKNAV_DELETE then return this.bShowDelete
+    return (part >= 0) andalso (part < TKNAVIGATOR_PARTS)
+end function
+
+' Whether a click on the part would do anything: the ends disable their buttons.
+function TKNAVIGATOR_STATE.Enabled( byval part as long ) as boolean
+    if (this.hWin = 0) orelse (tkWidget_IsEnabled( this.hWin ) = false) then return false
+    if this.Visible( part ) = false then return false
+    dim as boolean has = (this.nPos >= 0) andalso (this.nPos < this.nCount)
+    select case part
+    case TKNAV_FIRST  : return (this.nCount > 0) andalso (this.nPos <> 0)
+    case TKNAV_PREV   : return has andalso (this.nPos > 0)
+    case TKNAV_NEXT   : return (this.nCount > 0) andalso (this.nPos < this.nCount - 1)
+    case TKNAV_LAST   : return (this.nCount > 0) andalso (this.nPos <> this.nCount - 1)
+    case TKNAV_NEW    : return true
+    case TKNAV_DELETE : return has
+    end select
+    return false
+end function
+
+' The index a click on the part goes to (New: the index the new record will have).
+function TKNAVIGATOR_STATE.Target( byval part as long ) as long
+    select case part
+    case TKNAV_FIRST  : return 0
+    case TKNAV_PREV   : return this.nPos - 1
+    case TKNAV_NEXT   : return this.nPos + 1
+    case TKNAV_LAST   : return this.nCount - 1
+    case TKNAV_NEW    : return this.nCount
+    case TKNAV_DELETE : return this.nPos
+    end select
+    return -1
+end function
+
+' Left to right: square-ish buttons of nButtonW, the text as wide as the widest position it can show
+' (the count against itself) plus padding, no narrower than nTextMinW; hidden parts take no room.
+sub TKNAVIGATOR_STATE.Layout( )
+    this.bLayoutDirty = false
+    if this.hWin = 0 then exit sub
+    dim as long ch = this.hWin->ch
+    dim as long textW = this.nTextMinW
+    dim as TTF_Font ptr f = this.FontInUse( )
+    if f then
+        dim as long savePos = this.nPos
+        this.nPos = this.nCount - 1                  ' the widest the number gets
+        dim as long w_ = tkText_Width( f, this.PosText( ) ) + 2 * this.nTextPad
+        this.nPos = savePos
+        if w_ > textW then textW = w_
+    end if
+    dim as long x = 0
+    for slot as long = 0 to TKNAVIGATOR_PARTS - 1
+        dim as long part = PartAt_( slot )
+        if this.Visible( part ) = false then
+            tkRect_SetEmpty( this.rcPart( part ) )
+            continue for
+        end if
+        dim as long w_ = iif( part = TKNAV_TEXT, textW, this.nButtonW )
+        tkRect_Set( this.rcPart( part ), x, 0, x + w_, ch )
+        x += w_
+    next
+end sub
+
+function TKNAVIGATOR_STATE.HitTest( byval x as long, byval y as long ) as long
+    if this.bLayoutDirty then this.Layout( )
+    for part as long = 0 to TKNAVIGATOR_PARTS - 1
+        with this.rcPart( part )
+            if (x >= .left) andalso (x < .right) andalso (y >= .top) andalso (y < .bottom) then return part
+        end with
+    next
+    return -1
+end function
+
+sub TKNAVIGATOR_STATE.Refresh( )
+    this.bLayoutDirty = true
+    if this.hWin then tkWidget_Invalidate( this.hWin )
+end sub
+
+private function NavPtr_( byval h as TK_WIDGET ptr ) as TKNAVIGATOR_STATE ptr
+    if h = 0 then return 0
+    return cast( TKNAVIGATOR_STATE ptr, h->pData )
+end function
+
+' The part a click at (x, y) would press: an enabled button, -1 otherwise.
+private function ButtonAt_( byval p as TKNAVIGATOR_STATE ptr, byval x as single, byval y as single ) as long
+    dim as TK_WIDGET ptr w = p->hWin
+    if (x < 0) orelse (y < 0) orelse (x >= w->cw) orelse (y >= w->ch) then return -1
+    dim as long part = p->HitTest( int( x ), int( y ) )
+    if (part < 0) orelse (part = TKNAV_TEXT) then return -1
+    if p->Enabled( part ) = false then return -1
+    return part
+end function
+
+private function TipText_( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval part as long ) as ustring
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( a )
+    if (p = 0) orelse (part < 0) orelse (part >= TKNAVIGATOR_PARTS) then return ""
+    return p->tips( part )
+end function
+
+private sub SetHot_( byval p as TKNAVIGATOR_STATE ptr, byval part as long )
+    if part = p->nHot then exit sub
+    p->nHot = part
+    tkTipHost_SetToolIndex( @p->tip, part )
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' A user's click on an enabled button: ask, then move (or not).
+private sub Activate_( byval p as TKNAVIGATOR_STATE ptr, byval part as long )
+    if p->Enabled( part ) = false then exit sub
+    dim as long target = p->Target( part )
+    dim as boolean allow = true
+    if p->NavigateCallback then allow = p->NavigateCallback( p->hWin, part, target )
+    if allow = false then exit sub
+    select case part
+    case TKNAV_NEW
+        p->nCount += 1
+        p->nPos = p->nCount - 1
+    case TKNAV_DELETE
+        if p->nCount > 0 then p->nCount -= 1
+        if p->nPos >= p->nCount then p->nPos = p->nCount - 1
+    case else
+        p->nPos = target
+    end select
+    p->Refresh( )
+end sub
+
+' ---- painting --------------------------------------------------------------------------------
+
+private sub Glyph_( byval p as TKNAVIGATOR_STATE ptr, byval b as TK_PAINT ptr, byval part as long, byref rc as TKRECT, byval clr as ulong )
+    dim as long cx = (rc.left + rc.right) \ 2, cy = (rc.top + rc.bottom) \ 2
+    dim as long sz = (rc.bottom - rc.top)
+    if (rc.right - rc.left) < sz then sz = rc.right - rc.left
+    dim as long hh = sz * 3 \ 10                   ' half the glyph's height
+    if hh < 3 then hh = 3
+    dim as long tw = hh                            ' a triangle's width
+    dim as long bar = hh \ 3
+    if bar < 1 then bar = 1
+    b->SetBackColor( clr )
+    b->SetPenColor( clr )
+    dim as TKPOINT pt( 0 to 2 )
+    dim as TKRECT r
+    select case part
+    case TKNAV_PREV, TKNAV_FIRST
+        dim as long x0 = cx - tw \ 2
+        if part = TKNAV_FIRST then x0 += bar
+        pt( 0 ).x = x0 : pt( 0 ).y = cy
+        pt( 1 ).x = x0 + tw : pt( 1 ).y = cy - hh
+        pt( 2 ).x = x0 + tw : pt( 2 ).y = cy + hh
+        b->PaintPolygon( @pt( 0 ), 3 )
+        if part = TKNAV_FIRST then
+            tkRect_Set( r, x0 - bar - bar, cy - hh, x0 - bar, cy + hh )
+            b->PaintRect( @r )
+        end if
+    case TKNAV_NEXT, TKNAV_LAST
+        dim as long x0 = cx + tw \ 2
+        if part = TKNAV_LAST then x0 -= bar
+        pt( 0 ).x = x0 : pt( 0 ).y = cy
+        pt( 1 ).x = x0 - tw : pt( 1 ).y = cy - hh
+        pt( 2 ).x = x0 - tw : pt( 2 ).y = cy + hh
+        b->PaintPolygon( @pt( 0 ), 3 )
+        if part = TKNAV_LAST then
+            tkRect_Set( r, x0 + bar, cy - hh, x0 + bar + bar, cy + hh )
+            b->PaintRect( @r )
+        end if
+    case TKNAV_NEW
+        tkRect_Set( r, cx - hh, cy - bar \ 2 - (bar and 1), cx + hh, cy + bar \ 2 + 1 )
+        b->PaintRect( @r )
+        tkRect_Set( r, cx - bar \ 2 - (bar and 1), cy - hh, cx + bar \ 2 + 1, cy + hh )
+        b->PaintRect( @r )
+    case TKNAV_DELETE
+        dim as long d = hh * 8 \ 10
+        b->PaintLine( bar + 1, cx - d, cy - d, cx + d, cy + d )
+        b->PaintLine( bar + 1, cx - d, cy + d, cx + d, cy - d )
+    end select
+end sub
+
+private sub OnPaint_( byval p as TKNAVIGATOR_STATE ptr, byval b as TK_PAINT ptr )
+    if p->bLayoutDirty then p->Layout( )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as TKRECT rcC
+    tkRect_Set( rcC, 0, 0, w->cw, w->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @rcC )
+    for part as long = 0 to TKNAVIGATOR_PARTS - 1
+        if p->Visible( part ) = false then continue for
+        dim as TKRECT rc = p->rcPart( part )
+        if part = TKNAV_TEXT then
+            b->SetColors( p->colors.TextColor, p->colors.BackColor )
+            b->SetFont( p->FontInUse( ) )
+            b->PaintText( p->PosText( ), @rc, TK_DT_CENTER )
+            continue for
+        end if
+        dim as boolean bOn = p->Enabled( part )
+        if bOn andalso (part = p->nPressed) andalso (p->nHot = p->nPressed) then
+            b->SetBackColor( p->colors.ButtonBackPressed )
+            b->PaintRect( @rc )
+        elseif bOn andalso (part = p->nHot) then
+            b->SetBackColor( p->colors.ButtonBackHot )
+            b->PaintRect( @rc )
+        end if
+        Glyph_( p, b, part, rc, iif( bOn, p->colors.GlyphColor, p->colors.GlyphColorDisabled ) )
+    next
+    b->SetPenColor( p->colors.BorderColor )
+    b->PaintRoundOutline( @rcC, 0, 1 )          ' the outline only: PaintBorderRect fills first
+end sub
+
+private sub Rescale_( byval p as TKNAVIGATOR_STATE ptr, byval fOld as single, byval fNew as single )
+    if (fOld <= 0) orelse (fNew <= 0) then exit sub
+    dim as single k = fNew / fOld
+    p->nButtonW = cint( p->nButtonW * k )
+    p->nTextPad = cint( p->nTextPad * k )
+    p->nTextMinW = cint( p->nTextMinW * k )
+    p->Refresh( )
+end sub
+
+public declare sub tkNavigator_ApplyTheme( byval hNav as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+private function Navigator_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( w )
+    if p = 0 then return false
+    dim as TK_HOST ptr h = w->pHost
+    select case m->msg
+    case TKM_PAINT
+        OnPaint_( p, m->pPaint )
+        return true
+    case TKM_SIZE
+        p->Refresh( )
+        return true
+    case TKM_SCALECHANGED
+        Rescale_( p, m->fOld, m->fNew )
+        return true
+    case TKM_THEMECHANGED
+        tkNavigator_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_MOUSEMOVE
+        SetHot_( p, ButtonAt_( p, m->x, m->y ) )
+        return true
+    case TKM_MOUSELEAVE
+        SetHot_( p, -1 )
+        return true
+    case TKM_LBUTTONDOWN
+        dim as long part = ButtonAt_( p, m->x, m->y )
+        if part <> -1 then
+            tkTipHost_Pop( @p->tip )
+            tkHost_SetCapture( w )
+            p->nPressed = part
+            SetHot_( p, part )
+            tkWidget_Invalidate( w )
+        end if
+        return true
+    case TKM_LBUTTONUP
+        ' snapshot before releasing: CAPTURECHANGED arrives synchronously and cancels the press
+        dim as long pressed = p->nPressed
+        if tkHost_GetCapture( h ) = w then tkHost_ReleaseCapture( h )
+        dim as long part = ButtonAt_( p, m->x, m->y )
+        p->nPressed = -1
+        SetHot_( p, part )
+        tkWidget_Invalidate( w )
+        if (pressed <> -1) andalso (part = pressed) then Activate_( p, part )
+        return true
+    case TKM_CAPTURECHANGED
+        p->nPressed = -1
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_ENABLE
+        if m->bFlag = false then
+            p->nPressed = -1
+            SetHot_( p, -1 )
+            tkTipHost_Pop( @p->tip )
+        end if
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_DESTROY
+        if tkHost_GetCapture( h ) = w then tkHost_ReleaseCapture( h )
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' ========================================================================================
+' Public API
+' ========================================================================================
+public declare function tkNavigator_ThemeColors( byref t as TKTHEME_COLORS ) as TKNAVIGATOR_COLORS
+
+' A child of hParent, created zero-sized, with no records (position -1).
+public function tkNavigator_Create( byval hParent as TK_WIDGET ptr, byval CtrlID as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TK_HOST ptr pHost = hParent->pHost
+    dim as TKNAVIGATOR_STATE ptr p = new TKNAVIGATOR_STATE
+    p->id = CtrlID
+    p->nButtonW = tkHost_Scale( pHost, TKNAVIGATOR_DEFAULT_BUTTONW )
+    p->nTextPad = tkHost_Scale( pHost, TKNAVIGATOR_DEFAULT_TEXTPAD )
+    p->nTextMinW = tkHost_Scale( pHost, TKNAVIGATOR_DEFAULT_TEXTMINW )
+    p->tips( TKNAV_FIRST ) = "First" : p->tips( TKNAV_PREV ) = "Previous" : p->tips( TKNAV_NEXT ) = "Next"
+    p->tips( TKNAV_LAST ) = "Last" : p->tips( TKNAV_NEW ) = "New" : p->tips( TKNAV_DELETE ) = "Delete"
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, CtrlID, @Navigator_Proc, p )
+    p->hWin = w
+    p->colors = tkNavigator_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKNAVIGATOR_COLORS ) \ 4, "Navigator" )
+    tkTipHost_Ensure( @p->tip, w, @TipText_ )
+    tkTipHost_SetDelay( @p->tip, TK_TIPDELAY_INITIAL, 250 )
+    return w
+end function
+
+' ---- count and position (silent) ----------------------------------------------------------------
+public sub tkNavigator_SetCount( byval hNav as TK_WIDGET ptr, byval n as long )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then exit sub
+    if n < 0 then n = 0
+    p->nCount = n
+    if p->nPos >= n then p->nPos = n - 1
+    p->Refresh( )
+end sub
+
+public function tkNavigator_GetCount( byval hNav as TK_WIDGET ptr ) as long
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return 0
+    return p->nCount
+end function
+
+' -1 = no record; anything past the count is clamped to the last.
+public sub tkNavigator_SetPosition( byval hNav as TK_WIDGET ptr, byval i as long )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then exit sub
+    if i < -1 then i = -1
+    if i >= p->nCount then i = p->nCount - 1
+    p->nPos = i
+    p->Refresh( )
+end sub
+
+public function tkNavigator_GetPosition( byval hNav as TK_WIDGET ptr ) as long
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return -1
+    return p->nPos
+end function
+
+' ---- parts ------------------------------------------------------------------------------------
+public sub tkNavigator_SetShowNew( byval hNav as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then exit sub
+    p->bShowNew = bShow
+    p->Refresh( )
+end sub
+
+public function tkNavigator_GetShowNew( byval hNav as TK_WIDGET ptr ) as boolean
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return false
+    return p->bShowNew
+end function
+
+public sub tkNavigator_SetShowDelete( byval hNav as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then exit sub
+    p->bShowDelete = bShow
+    p->Refresh( )
+end sub
+
+public function tkNavigator_GetShowDelete( byval hNav as TK_WIDGET ptr ) as boolean
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return false
+    return p->bShowDelete
+end function
+
+' The position text's pattern: {1} the position (1-based, "-" for none), {2} the count.
+public sub tkNavigator_SetPositionText( byval hNav as TK_WIDGET ptr, byval fmt as ustring )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then exit sub
+    p->sPosFmt = fmt
+    p->Refresh( )
+end sub
+
+public function tkNavigator_GetPositionText( byval hNav as TK_WIDGET ptr ) as ustring
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return ""
+    return p->sPosFmt
+end function
+
+' What the position part shows now ("3 of 120").
+public function tkNavigator_GetText( byval hNav as TK_WIDGET ptr ) as ustring
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return ""
+    return p->PosText( )
+end function
+
+' A button's tooltip (defaults "First", "Previous", ..., "Delete"); "" for none.
+public sub tkNavigator_SetButtonTip( byval hNav as TK_WIDGET ptr, byval part as long, byval text as ustring )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if (p = 0) orelse (part < 0) orelse (part >= TKNAVIGATOR_PARTS) then exit sub
+    p->tips( part ) = text
+end sub
+
+public function tkNavigator_GetButtonTip( byval hNav as TK_WIDGET ptr, byval part as long ) as ustring
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if (p = 0) orelse (part < 0) orelse (part >= TKNAVIGATOR_PARTS) then return ""
+    return p->tips( part )
+end function
+
+' The part's rect (widget-local); false for a hidden part.
+public function tkNavigator_GetPartRect( byval hNav as TK_WIDGET ptr, byval part as long, byref rc as TKRECT ) as boolean
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if (p = 0) orelse (part < 0) orelse (part >= TKNAVIGATOR_PARTS) then return false
+    if p->bLayoutDirty then p->Layout( )
+    rc = p->rcPart( part )
+    return p->Visible( part )
+end function
+
+' Whether a click on the part would do anything now.
+public function tkNavigator_GetPartEnabled( byval hNav as TK_WIDGET ptr, byval part as long ) as boolean
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return false
+    return p->Enabled( part )
+end function
+
+' The width its visible parts take (design: give it at least this).
+public function tkNavigator_GetIdealWidth( byval hNav as TK_WIDGET ptr ) as long
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return 0
+    p->Layout( )
+    dim as long r = 0
+    for part as long = 0 to TKNAVIGATOR_PARTS - 1
+        if p->rcPart( part ).right > r then r = p->rcPart( part ).right
+    next
+    return r
+end function
+
+public function tkNavigator_GetHot( byval hNav as TK_WIDGET ptr ) as long
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return -1
+    return p->nHot
+end function
+
+' ---- font, colours, the event ----------------------------------------------------------------
+public function tkNavigator_GetFont( byval hNav as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then return 0
+    return p->pFont
+end function
+
+public sub tkNavigator_SetFont( byval hNav as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then exit sub
+    p->pFont = f
+    p->Refresh( )
+end sub
+
+public sub tkNavigator_GetColors( byval hNav as TK_WIDGET ptr, byval pColors as TKNAVIGATOR_COLORS ptr )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Pins them: a theme change no longer replaces them (UnpinColors undoes that).
+public sub tkNavigator_SetColors( byval hNav as TK_WIDGET ptr, byval pColors as TKNAVIGATOR_COLORS ptr )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hNav )
+end sub
+
+public function tkNavigator_ThemeColors( byref t as TKTHEME_COLORS ) as TKNAVIGATOR_COLORS
+    dim as TKNAVIGATOR_COLORS c
+    c.BackColor = t.Window : c.BorderColor = t.Border
+    c.ButtonBackHot = t.SurfaceHot : c.ButtonBackPressed = t.Selected
+    c.GlyphColor = t.Text : c.GlyphColorDisabled = t.TextDisabled : c.TextColor = t.Text
+    return c
+end function
+
+public sub tkNavigator_ApplyTheme( byval hNav as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    p->colors = tkNavigator_ThemeColors( t )
+    tkTheme_ResolveInto( hNav, t, cast( ulong ptr, @p->colors ), sizeof( TKNAVIGATOR_COLORS ) \ 4, "Navigator" )
+    tkWidget_Invalidate( hNav )
+end sub
+
+public sub tkNavigator_UnpinColors( byval hNav as TK_WIDGET ptr )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkNavigator_ApplyTheme( hNav, tkTheme_Of( hNav ) )
+end sub
+
+public sub tkNavigator_SetNavigateCallback( byval hNav as TK_WIDGET ptr, byval userfunc as NAV_NavigateCallbackFunc )
+    dim as TKNAVIGATOR_STATE ptr p = NavPtr_( hNav )
+    if p then p->NavigateCallback = userfunc
+end sub

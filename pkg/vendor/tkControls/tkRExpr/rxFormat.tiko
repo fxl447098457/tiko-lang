@@ -1,0 +1,240 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkRExpr -- formatting by mask, and running totals.
+'
+' THE MASKS are tkReport_FormatValue's, to the character (the self-test compares the two): a number
+' pattern of # 0 , . with literal text around it ("$#,##0.00", "0.0%", "#,##0 kg"); dates
+' "dd/mm/yyyy" (yyyy mm dd, each once); times "hh:nn:ss"; true / false "Yes|No". Here a mask is
+' parsed ONCE (RX_FMT) -- RD0's spike S1 measured re-reading it on every call as most of the cost.
+' tkReport will format through this in RD2, so there is one formatter.
+#module "tkRExpr"
+
+#import "../tkBind"
+#import "std/chrono"
+
+using tkBind
+using tkCalendar
+using tkTimePanel
+
+' x with 'dec' decimals, thousands grouped with ',' when asked; rounded half away from zero.
+function RxNumber( byval x as float64, byval dec as int32, byval grouped as boolean ) as string
+    dim as float64 p10 = 10 ^ dec
+    dim as int64 n = clngint( int( abs( x ) * p10 + 0.5 ) )
+    dim as string ip = str( n \ clngint( p10 ) ), fp
+    if dec > 0 then fp = "." & right( string( dec, "0" ) & str( n mod clngint( p10 ) ), dec )
+    if grouped then
+        dim as string g
+        dim as int32 c = 0
+        for i as int32 = len( ip ) to 1 step -1
+            g = mid( ip, i, 1 ) & g
+            c += 1
+            if (c mod 3 = 0) andalso (i > 1) then g = "," & g
+        next
+        ip = g
+    end if
+    if (x < 0) andalso (n <> 0) then return "-" & ip & fp
+    return ip & fp
+end function
+
+function RxParseFmt( byref mask as const ustring ) as RX_FMT
+    dim as RX_FMT f
+    f.mask = mask
+    dim as string m = mask
+    dim as int32 a = 0, b = 0
+    for i as int32 = 1 to len( m )
+        if instr( "#0,.", mid( m, i, 1 ) ) then
+            if a = 0 then a = i
+            b = i
+        elseif a then
+            exit for
+        end if
+    next
+    if a = 0 then return f
+    f.hasNum = true
+    dim as string pat = mid( m, a, b - a + 1 )
+    dim as int32 dot = instr( pat, "." )
+    if dot then f.dec = len( pat ) - dot
+    f.grouped = instr( pat, "," ) > 0
+    f.percent = instr( m, "%" ) > 0
+    f.pre = left( m, a - 1 )
+    f.post = mid( m, b + 1 )
+    return f
+end function
+
+private function Pad2F( byval n as int64 ) as string
+    return right( "0" & n, 2 )
+end function
+
+private function FmtNum( byval x as float64, byref f as RX_FMT ) as string
+    if len( f.mask ) = 0 then return str( x )
+    if f.hasNum = false then return f.mask & str( x )
+    if f.percent then x *= 100
+    return f.pre & RxNumber( x, f.dec, f.grouped ) & f.post
+end function
+
+private function FmtBool( byval b as boolean, byref mask as const ustring, byref boolText as const ustring ) as string
+    dim as string bt = boolText
+    if len( mask ) then bt = mask
+    dim as int32 bar = instr( bt, "|" )
+    if bar = 0 then
+        if b then return bt
+        return ""
+    end if
+    if b then return left( bt, bar - 1 )
+    return mid( bt, bar + 1 )
+end function
+
+private function FmtDate( byval days as int64, byref mask as const ustring ) as string
+    dim as int64 y, m, d
+    RxCivilFromDays( days, y, m, d )
+    dim as string s = mask
+    if len( s ) = 0 then s = "yyyy-mm-dd"
+    dim as int32 k = instr( s, "yyyy" )
+    if k then s = left( s, k - 1 ) & y & mid( s, k + 4 )
+    k = instr( s, "mm" )
+    if k then s = left( s, k - 1 ) & Pad2F( m ) & mid( s, k + 2 )
+    k = instr( s, "dd" )
+    if k then s = left( s, k - 1 ) & Pad2F( d ) & mid( s, k + 2 )
+    return s
+end function
+
+private function FmtTime( byval secs as int64, byref mask as const ustring ) as string
+    dim as string s = mask
+    if len( s ) = 0 then s = "hh:nn"
+    dim as int32 k = instr( s, "hh" )
+    if k then s = left( s, k - 1 ) & Pad2F( secs \ 3600 ) & mid( s, k + 2 )
+    k = instr( s, "nn" )
+    if k then s = left( s, k - 1 ) & Pad2F( (secs \ 60) mod 60 ) & mid( s, k + 2 )
+    k = instr( s, "ss" )
+    if k then s = left( s, k - 1 ) & Pad2F( secs mod 60 ) & mid( s, k + 2 )
+    return s
+end function
+
+function RxFormatSlot( byref s as RX_SLOT, byref f as RX_FMT ) as ustring
+    select case s.k
+    case TKV_TEXT : return s.s
+    case TKV_INT
+        if len( f.mask ) = 0 then return str( s.i )
+        return FmtNum( s.i, f )
+    case TKV_FLOAT : return FmtNum( s.n, f )
+    case TKV_BOOL : return FmtBool( s.i <> 0, f.mask, "Yes|No" )
+    case TKV_DATE : return FmtDate( s.i, f.mask )
+    case TKV_TIME : return FmtTime( s.i, f.mask )
+    end select
+    return ""
+end function
+
+' A value as text by a mask: tkReport_FormatValue's masks and results.
+public function tkRExpr_FormatValue( byref v as TK_VALUE, byref mask as const ustring = "", _
+                                     byref boolText as const ustring = "Yes|No" ) as ustring
+    if v.kind = TKV_BOOL then return FmtBool( v.b, mask, boolText )
+    dim as RX_SLOT s
+    RxValueToSlot( v, s )
+    if (v.kind = TKV_DATE) orelse (v.kind = TKV_TIME) then
+        ' an all-zero date / an unset time formats as tkReport does: from the fields as they are
+        if s.k = TKV_EMPTY then
+            if v.kind = TKV_DATE then
+                dim as string t = mask
+                if len( t ) = 0 then t = "yyyy-mm-dd"
+                dim as int32 k = instr( t, "yyyy" )
+                if k then t = left( t, k - 1 ) & v.d.wYear & mid( t, k + 4 )
+                k = instr( t, "mm" )
+                if k then t = left( t, k - 1 ) & Pad2F( v.d.wMonth ) & mid( t, k + 2 )
+                k = instr( t, "dd" )
+                if k then t = left( t, k - 1 ) & Pad2F( v.d.wDay ) & mid( t, k + 2 )
+                return t
+            end if
+            return ""
+        end if
+    end if
+    dim as RX_FMT f = RxParseFmt( mask )
+    return RxFormatSlot( s, f )
+end function
+
+' ==========================================================================================
+' Running totals
+' ==========================================================================================
+sub TKREXPR_ACC.Init( byval fn_ as int32, byval kind_ as int32 )
+    fn = fn_
+    kind = kind_
+    Reset( )
+end sub
+
+sub TKREXPR_ACC.Reset( )
+    rows = 0 : n = 0 : si = 0 : sf = 0
+    best.Clear( )
+end sub
+
+sub TKREXPR_ACC.AddRow( )
+    rows += 1
+end sub
+
+' A row's argument value. Empty values are counted as rows and otherwise ignored.
+sub TKREXPR_ACC.Add( byref v as TK_VALUE )
+    rows += 1
+    if v.kind = TKV_EMPTY then exit sub
+    if (v.kind = TKV_DATE) andalso (v.d.wYear = 0) then exit sub
+    if (v.kind = TKV_TIME) andalso (v.t.wHour < 0) then exit sub
+    n += 1
+    select case fn
+    case TKRX_AGG_SUM, TKRX_AGG_AVG
+        if v.kind = TKV_INT then
+            si += v.i
+            sf += v.i
+        else
+            sf += v.f
+        end if
+    case TKRX_AGG_MIN, TKRX_AGG_MAX
+        if n = 1 then
+            best = v
+        else
+            dim as RX_SLOT a, b
+            RxValueToSlot( v, a )
+            RxValueToSlot( best, b )
+            dim as int32 c = RxCompare( a, b )
+            if ((fn = TKRX_AGG_MIN) andalso (c = -1)) orelse ((fn = TKRX_AGG_MAX) andalso (c = 1)) then best = v
+        end if
+    case TKRX_AGG_FIRST
+        if n = 1 then best = v
+    case TKRX_AGG_LAST
+        best = v
+    end select
+end sub
+
+sub TKREXPR_ACC.Result( byref r as TK_VALUE )
+    select case fn
+    case TKRX_AGG_SUM
+        if kind = TKV_INT then r.SetInt( si ) else r.SetFloat( sf )
+    case TKRX_AGG_AVG
+        if n = 0 then r.Clear( ) else r.SetFloat( sf / n )
+    case TKRX_AGG_COUNT
+        r.SetInt( n )
+    case TKRX_AGG_COUNTROWS, TKRX_AGG_GROUPCOUNT
+        r.SetInt( rows )
+    case else
+        if n = 0 then r.Clear( ) else r = best
+    end select
+end sub
+
+' Feeds aggregate k of x one row of ctx: its argument evaluated (or, for Count( ) / GroupCount( ),
+' just the row).
+public sub tkRExpr_AccAdd( byref acc as TKREXPR_ACC, byval x as TK_REXPR ptr, byval k as int32, byref ctx as TKREXPR_CTX )
+    dim as TK_REXPR ptr arg = tkRExpr_AggArg( x, k )
+    if arg = 0 then
+        acc.AddRow( )
+        exit sub
+    end if
+    dim as TK_VALUE v
+    tkRExpr_Eval( arg, ctx, v )
+    acc.Add( v )
+end sub
+
+' An accumulator ready for aggregate k of x.
+public sub tkRExpr_AccInit( byref acc as TKREXPR_ACC, byval x as TK_REXPR ptr, byval k as int32 )
+    dim as TK_REXPR ptr arg = tkRExpr_AggArg( x, k )
+    acc.Init( tkRExpr_AggFn( x, k ), iif( arg, tkRExpr_Kind( arg ), TKV_INT ) )
+end sub

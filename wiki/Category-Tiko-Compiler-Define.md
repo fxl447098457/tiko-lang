@@ -39,10 +39,13 @@ tiko defines one `TIKO_OS_` name for the target being built, always `1`:
 
 | Target | Defined | Not defined |
 | --- | --- | --- |
-| `windows-x86_64` | `TIKO_OS_WINDOWS` | `TIKO_OS_LINUX`, `TIKO_OS_MACOS` |
-| `linux-x86_64` | `TIKO_OS_LINUX` | `TIKO_OS_WINDOWS`, `TIKO_OS_MACOS` |
-| `linux-arm64` | `TIKO_OS_LINUX` | `TIKO_OS_WINDOWS`, `TIKO_OS_MACOS` |
-| `macos-arm64` | `TIKO_OS_MACOS` | `TIKO_OS_WINDOWS`, `TIKO_OS_LINUX` |
+| `windows-x86_64` | `TIKO_OS_WINDOWS` | `TIKO_OS_LINUX`, `TIKO_OS_MACOS`, `TIKO_OS_ANDROID` |
+| `linux-x86_64` | `TIKO_OS_LINUX` | `TIKO_OS_WINDOWS`, `TIKO_OS_MACOS`, `TIKO_OS_ANDROID` |
+| `linux-arm64` | `TIKO_OS_LINUX` | `TIKO_OS_WINDOWS`, `TIKO_OS_MACOS`, `TIKO_OS_ANDROID` |
+| `macos-arm64` | `TIKO_OS_MACOS` | `TIKO_OS_WINDOWS`, `TIKO_OS_LINUX`, `TIKO_OS_ANDROID` |
+| `android-x86_64`, `android-arm64` ([experimental](Android)) | `TIKO_OS_ANDROID` | `TIKO_OS_WINDOWS`, `TIKO_OS_LINUX`, `TIKO_OS_MACOS` |
+
+Android is not Linux to tiko: its C library is not glibc, so `TIKO_OS_LINUX` is not defined there. Code meant for any Linux kernel tests both names.
 
 The name follows `-target`, not the machine running the compiler, so `-target linux-x86_64` on Windows takes the Linux branch:
 
@@ -73,9 +76,10 @@ Exactly one of the three is defined on every target.
 | `TIKO_OS_WINDOWS` | `1` on `windows-x86_64`, otherwise not defined |
 | `TIKO_OS_LINUX` | `1` on `linux-x86_64` and `linux-arm64`, otherwise not defined |
 | `TIKO_OS_MACOS` | `1` on `macos-arm64`, otherwise not defined |
+| `TIKO_OS_ANDROID` | `1` on `android-x86_64` and `android-arm64`, otherwise not defined |
 | `__TIKO_ASAN__` | `1` when built with [`-fsanitize=address`](Compiler-Option-Fsanitize), otherwise not defined |
-| `TIKO_ARCH_X86_64` | `1` on `windows-x86_64` and `linux-x86_64`, otherwise not defined |
-| `TIKO_ARCH_ARM64` | `1` on `linux-arm64` and `macos-arm64`, otherwise not defined |
+| `TIKO_ARCH_X86_64` | `1` on `windows-x86_64`, `linux-x86_64` and `android-x86_64`, otherwise not defined |
+| `TIKO_ARCH_ARM64` | `1` on `linux-arm64`, `macos-arm64` and `android-arm64`, otherwise not defined |
 | `__TIKO_CALLER_LOCATION__` | `1`: [`__CALLER_LINE__` and `__CALLER_FILE__`](Caller-Line) exist |
 
 `__TIKO_COMPILER__` says **which compiler** is building; `__TIKO_VERSION__` says which version of it. Neither says which features it has, so code that must build with several versions still tests more than one symbol. `__TIKO_CALLER_LOCATION__` is one such feature test.

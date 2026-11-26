@@ -1,0 +1,251 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportViewer -- a report definition (tkReportDef) shown with its PARAMETER STRIP (Report Designer
+' RD3): under the toolbar, a prompt and a control per parameter -- a TextBox for text and numbers,
+' a CheckBox for true / false, a DatePicker, a TimePicker -- and Run. Run reads the controls into
+' the definition's parameters, makes the report again and shows it; what stops it (a number that
+' is not one, a required parameter left empty, a source not bound) goes to the status bar's third
+' panel and nothing else changes. The strip wraps onto more rows when the viewer is narrow.
+'
+'   tkReportViewer_SetReportDef( hViewer, def )     the strip from def's parameters, then Run
+'   tkReportViewer_RunReportDef( hViewer )          what the Run button does; FALSE when it can't
+'
+' The definition is BORROWED: it must outlive the viewer, or be taken off (SetReportDef( h, 0 ))
+' first. The document the viewer made from it is the viewer's.
+#module "tkReportViewer"
+
+#import "../tkReport"
+#import "../tkReportDef"
+#import "../tkTextBox"
+#import "../tkLabel"
+#import "../tkCheckBox"
+#import "../tkDatePicker"
+#import "../tkTimePicker"
+#import "../tkButton"
+#import "../tkStatusBar"
+#import "../tkPrintPreview"
+using tkReport
+using tkReportDef
+using tkBind
+using tkTextBox
+using tkLabel
+using tkCheckBox
+using tkDatePicker
+using tkTimePicker
+using tkButton
+using tkStatusBar
+using tkPrintPreview
+using tkPrint
+using tkHost
+using tkPaint
+using tkCalendar
+using tkTimePanel
+
+' The strip's height laid out from row 'top' (0 when the viewer shows no definition's parameters).
+function RvStripLayout( byval p as TKREPORTVIEWER_STATE ptr, byval top as long ) as long
+    if p->nPar = 0 then
+        p->stripH = 0
+        exit function
+    end if
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as TK_HOST ptr h = w->pHost
+    dim as long pad = tkHost_Scale( h, 6 ), rowH = tkHost_Scale( h, 28 ), ctlH = tkHost_Scale( h, 24 )
+    dim as long x = pad, y = top + pad
+    for i as long = 0 to p->nPar - 1
+        dim as long lw = tkText_Width( h->pDefaultFont, tkLabel_GetText( p->pLbl(i) ) ) + tkHost_Scale( h, 6 )
+        dim as long cw
+        select case p->pKind(i)
+        case TKV_BOOL : cw = tkHost_Scale( h, 24 )
+        case TKV_DATE : cw = tkHost_Scale( h, 130 )
+        case TKV_TIME : cw = tkHost_Scale( h, 100 )
+        case TKV_INT, TKV_FLOAT : cw = tkHost_Scale( h, 90 )
+        case else : cw = tkHost_Scale( h, 150 )
+        end select
+        if (x > pad) andalso (x + lw + cw > w->cw - pad) then
+            x = pad
+            y += rowH
+        end if
+        tkWidget_SetPos( p->pLbl(i), x, y + (ctlH - tkHost_Scale( h, 18 )) \ 2, lw, tkHost_Scale( h, 18 ) )
+        tkWidget_SetPos( p->pCtl(i), x + lw, y, cw, ctlH )
+        x += lw + cw + tkHost_Scale( h, 14 )
+    next
+    dim as long bw = tkHost_Scale( h, 70 )
+    if (x > pad) andalso (x + bw > w->cw - pad) then
+        x = pad
+        y += rowH
+    end if
+    tkWidget_SetPos( p->hRun, x, y, bw, ctlH )
+    p->stripH = (y - top) + rowH + pad
+    return p->stripH
+end function
+
+private sub RemoveStrip( byval p as TKREPORTVIEWER_STATE ptr )
+    for i as long = 0 to p->nPar - 1
+        tkWidget_Destroy( p->pLbl(i) )
+        tkWidget_Destroy( p->pCtl(i) )
+    next
+    if p->hRun then tkWidget_Destroy( p->hRun )
+    p->hRun = 0
+    erase p->pLbl, p->pCtl, p->pKind
+    p->nPar = 0
+end sub
+
+private sub OnRun( byval hButton as TK_WIDGET ptr, byval id as long )
+    dim as TK_WIDGET ptr w = hButton->pParent
+    if w then tkReportViewer_RunReportDef( w )
+end sub
+
+' Parameter i's value from its control; FALSE (with why) when the text is no number.
+private function ReadControl( byval p as TKREPORTVIEWER_STATE ptr, byval i as long, byref v as TK_VALUE, byref why as ustring ) as boolean
+    v.Clear( )
+    dim as TK_WIDGET ptr c = p->pCtl(i)
+    select case p->pKind(i)
+    case TKV_BOOL
+        v.SetBool( tkCheckBox_GetChecked( c ) )
+    case TKV_DATE
+        v.SetDate( tkDatePicker_GetDateValue( c ) )
+    case TKV_TIME
+        dim as TKTIME t = tkTimePicker_GetTimeValue( c )
+        if t.wHour >= 0 then v.SetTime( t )
+    case TKV_INT, TKV_FLOAT
+        dim as ustring s = trim( tkTextBox_GetText( c ) )
+        if len( s ) = 0 then return true
+        dim as boolean ok = true, dot
+        for k as long = 1 to len( s )
+            dim as ustring ch = mid( s, k, 1 )
+            if (ch >= "0") andalso (ch <= "9") then continue for
+            if ((ch = "-") orelse (ch = "+")) andalso (k = 1) then continue for
+            if (ch = ".") andalso (p->pKind(i) = TKV_FLOAT) andalso (dot = false) then
+                dot = true
+                continue for
+            end if
+            ok = false
+        next
+        if ok = false then
+            why = tkLabel_GetText( p->pLbl(i) ) & " is not " & iif( p->pKind(i) = TKV_INT, "a whole number", "a number" )
+            return false
+        end if
+        if p->pKind(i) = TKV_INT then v.SetInt( vallng( s ) ) else v.SetFloat( val( s ) )
+    case else
+        dim as ustring s = tkTextBox_GetText( c )
+        if len( s ) then v.SetText( s )
+    end select
+    return true
+end function
+
+private sub WriteControl( byval p as TKREPORTVIEWER_STATE ptr, byval i as long, byref v as TK_VALUE )
+    dim as TK_WIDGET ptr c = p->pCtl(i)
+    select case p->pKind(i)
+    case TKV_BOOL : tkCheckBox_SetChecked( c, (v.kind = TKV_BOOL) andalso v.b )
+    case TKV_DATE
+        dim as TKDATE none_
+        if v.kind = TKV_DATE then tkDatePicker_SetDateValue( c, v.d ) else tkDatePicker_SetDateValue( c, none_ )
+    case TKV_TIME
+        dim as TKTIME none_
+        if v.kind = TKV_TIME then tkTimePicker_SetTimeValue( c, v.t ) else tkTimePicker_SetTimeValue( c, none_ )
+    case else
+        if v.kind = TKV_EMPTY then tkTextBox_SetText( c, "" ) else tkTextBox_SetText( c, tkReport_FormatValue( v ) )
+    end select
+end sub
+
+' Show definition def (borrowed; 0 takes it off): its parameter strip, then its report.
+public sub tkReportViewer_SetReportDef( byval hViewer as TK_WIDGET ptr, byval def as TK_REPORTDEF ptr )
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then exit sub
+    RemoveStrip( p )
+    if p->defDoc then
+        if p->doc = p->defDoc then
+            tkPrintPreview_SetDocument( p->hPv, 0 )
+            p->doc = 0
+        end if
+        tkPrintDoc_Destroy( p->defDoc )
+        p->defDoc = 0
+    end if
+    p->def = def
+    if def then
+        dim as TK_WIDGET ptr w = p->hWin
+        p->nPar = def->nParams
+        if p->nPar > 0 then
+            redim p->pLbl( 0 to p->nPar - 1 )
+            redim p->pCtl( 0 to p->nPar - 1 )
+            redim p->pKind( 0 to p->nPar - 1 )
+        end if
+        for i as long = 0 to p->nPar - 1
+            dim byref as TKRD_PARAM pr = def->params(i)
+            p->pKind(i) = pr.kind
+            p->pLbl(i) = tkLabel_Create( w, p->id )
+            dim as ustring cap = pr.prompt
+            if len( cap ) = 0 then cap = pr.name_
+            tkLabel_SetText( p->pLbl(i), cap )
+            select case pr.kind
+            case TKV_BOOL : p->pCtl(i) = tkCheckBox_Create( w, p->id )
+            case TKV_DATE : p->pCtl(i) = tkDatePicker_Create( w, p->id )
+            case TKV_TIME : p->pCtl(i) = tkTimePicker_Create( w, p->id )
+            case else : p->pCtl(i) = tkTextBox_Create( w, p->id )
+            end select
+            dim as TK_VALUE v
+            tkReportDef_GetParam( def, i, v )
+            WriteControl( p, i, v )
+        next
+        if p->nPar > 0 then
+            p->hRun = tkButton_Create( w, p->id )
+            tkButton_SetText( p->hRun, "Run" )
+            tkButton_SetClickCallback( p->hRun, @OnRun )
+        end if
+    end if
+    Arrange( p )
+    tkWidget_Invalidate( p->hWin )
+    if def then tkReportViewer_RunReportDef( hViewer )
+end sub
+
+' The parameters from the strip, the report made again and shown. FALSE (why in the status bar,
+' the document shown so far kept) when a value or the report can't be made.
+public function tkReportViewer_RunReportDef( byval hViewer as TK_WIDGET ptr ) as boolean
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if (p = 0) orelse (p->def = 0) then return false
+    dim as ustring why
+    for i as long = 0 to p->nPar - 1
+        dim as TK_VALUE v
+        if ReadControl( p, i, v, why ) = false then
+            tkStatusBar_SetText( p->hStatus, 2, why )
+            return false
+        end if
+        tkReportDef_SetParam( p->def, p->def->params(i).name_, v )
+    next
+    ' the old document goes first: the definition makes its report again
+    if p->defDoc then
+        if p->doc = p->defDoc then
+            tkPrintPreview_SetDocument( p->hPv, 0 )
+            p->doc = 0
+        end if
+        tkPrintDoc_Destroy( p->defDoc )
+        p->defDoc = 0
+    end if
+    dim as TK_PRINTDOC ptr doc = tkReportDef_CreateDoc( p->def, why )
+    if doc = 0 then
+        Sync( p )
+        tkStatusBar_SetText( p->hStatus, 2, why )
+        return false
+    end if
+    p->defDoc = doc
+    tkPrintDoc_BeginGenerate( doc )
+    tkReportViewer_SetDocument( hViewer, doc )
+    return true
+end function
+
+' Parameter i's control in the strip (TextBox, CheckBox, DatePicker or TimePicker); 0 when none.
+public function tkReportViewer_GetParamControl( byval hViewer as TK_WIDGET ptr, byval i as long ) as TK_WIDGET ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if (p = 0) orelse (i < 0) orelse (i >= p->nPar) then return 0
+    return p->pCtl(i)
+end function
+
+public function tkReportViewer_GetRunButton( byval hViewer as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKREPORTVIEWER_STATE ptr p = RV( hViewer )
+    if p = 0 then return 0
+    return p->hRun
+end function

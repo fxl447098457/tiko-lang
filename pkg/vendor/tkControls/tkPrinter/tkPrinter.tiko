@@ -1,0 +1,204 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPrinter -- printers and print jobs for tkPrint documents. Design: docs/tkControls/PRINTING.md
+' (claude-docs) §7; phase R3.
+'
+'   Windows        winspool / gdi32 through GetProcAddress (no import library): the printers, their
+'                  papers, the driver's own Properties dialog, and a RASTER job -- each page replayed
+'                  by tkPrint into bands at the printer's resolution (at most 600 dpi) and sent with
+'                  StretchDIBits (decision P-9).
+'   Linux, macOS   CUPS: libcups loaded at run time (SDL_LoadObject), the document written as a PDF
+'                  by tkPdf and submitted with cupsPrintFile; without libcups, `lp` (decision P-10).
+'
+' Its own module (not part of tkPrint) because the CUPS path needs tkPdf, which imports tkPrint.
+#module "tkPrinter"
+
+#import "../tkPdf" public
+using tkPdf
+using tkPrint
+using tkHost
+using tkPaint
+
+public enum
+    TK_DUPLEX_NONE = 0
+    TK_DUPLEX_LONGEDGE        ' turn pages like a book (portrait)
+    TK_DUPLEX_SHORTEDGE       ' turn pages like a calendar
+end enum
+
+public type TKPRINTERINFO
+    name      as ustring
+    location  as ustring
+    comment   as ustring
+    isDefault as boolean
+end type
+
+public type TKPRINTERCAPS
+    nPapers     as long
+    paperName(any) as ustring
+    paperW(any) as single           ' portrait, points
+    paperH(any) as single
+    bDuplex     as boolean
+    bColor      as boolean
+end type
+
+' A page done (1-based count) of the pages to print: FALSE cancels the job.
+public type PRN_ProgressFunc as function( byval doc as TK_PRINTDOC ptr, byval nDone as long, byval nTotal as long, _
+                                          byval pCtx as any ptr ) as boolean
+
+public type TKPRINTJOB
+    printer     as ustring          ' "" = the default printer
+    copies      as long = 1
+    collate     as boolean = true
+    pageSet     as ustring          ' "1-3,7,10-" (pages from 1); "" = all
+    duplex      as long = TK_DUPLEX_NONE
+    color       as boolean = true
+    title       as ustring          ' the job's name; "" = the document's title
+    outputFile  as ustring          ' Windows: a print-to-file driver writes here, no prompt ("Microsoft Print to PDF")
+    devMode     as string           ' Windows: the driver's settings from tkPrinter_Properties (opaque)
+    pfnProgress as PRN_ProgressFunc
+    pCtx        as any ptr
+end type
+
+dim shared as ustring gPrnError
+
+' Why the last call failed ("" after a success).
+public function tkPrinter_LastError( ) as ustring
+    return gPrnError
+end function
+
+sub PrnFail( byref s as ustring )
+    gPrnError = s
+end sub
+
+' The pages (from 0) a page set names, in order, each once at most: "1-3,7,10-" with 12 pages ->
+' 0 1 2 6 9 10 11. "" = all. A part that is not a number or a range ("x", "5-3") makes the whole set
+' invalid: 0 pages.
+public function tkPrinter_ParsePageSet( byref spec as ustring, byval nPages as long, pages() as long ) as long
+    dim as string s = trim( spec )
+    erase pages
+    if nPages <= 0 then return 0
+    if len( s ) = 0 then
+        redim pages( 0 to nPages - 1 )
+        for i as long = 0 to nPages - 1 : pages(i) = i : next
+        return nPages
+    end if
+    dim as ubyte seen( 0 to nPages - 1 )
+    dim as long n = 0
+    dim as long pos_ = 1
+    s &= ","
+    while pos_ <= len( s )
+        dim as long comma = instr( pos_, s, "," )
+        dim as string part = trim( mid( s, pos_, comma - pos_ ) )
+        pos_ = comma + 1
+        if len( part ) = 0 then continue while
+        dim as long dash = instr( part, "-" ), a, b
+        dim as string sa = trim( iif( dash, left( part, dash - 1 ), part ) )
+        dim as string sb = trim( iif( dash, mid( part, dash + 1 ), part ) )
+        for k as long = 1 to len( sa ) + len( sb )
+            dim as string ch = mid( sa & sb, k, 1 )
+            if (ch < "0") orelse (ch > "9") then erase pages : return 0
+        next
+        if len( sa ) = 0 then erase pages : return 0
+        a = valint( sa )
+        b = iif( len( sb ) = 0, nPages, valint( sb ) )          ' "10-" runs to the end
+        if (a < 1) orelse (b < a) then erase pages : return 0
+        if b > nPages then b = nPages
+        for p as long = a to b
+            if seen(p - 1) = 0 then
+                seen(p - 1) = 1
+                redim preserve pages( 0 to n )
+                pages(n) = p - 1
+                n += 1
+            end if
+        next
+    wend
+    return n
+end function
+
+' The CUPS options a job becomes (name=value, space-separated): copies, page-ranges, sides,
+' collation, colour, media. What tkPrintDoc_Print hands cupsPrintFile / lp; public for tests.
+public function tkPrinter_CupsOptions( byval doc as TK_PRINTDOC ptr, byref job as TKPRINTJOB ) as string
+    dim as string o
+    if job.copies > 1 then
+        o &= "copies=" & job.copies & " "
+        o &= "multiple-document-handling=" & iif( job.collate, "separate-documents-collated-copies", "separate-documents-uncollated-copies" ) & " "
+    end if
+    dim as string ps = trim( job.pageSet )
+    if len( ps ) then o &= "page-ranges=" & ps & " "
+    select case job.duplex
+    case TK_DUPLEX_LONGEDGE : o &= "sides=two-sided-long-edge "
+    case TK_DUPLEX_SHORTEDGE : o &= "sides=two-sided-short-edge "
+    case else : o &= "sides=one-sided "
+    end select
+    if job.color = false then o &= "print-color-mode=monochrome "
+    if doc then
+        dim as TKPAGESETUP st = tkPrintDoc_GetPageSetup( doc )
+        select case st.paper
+        case TK_PAPER_A4 : o &= "media=A4 "
+        case TK_PAPER_LETTER : o &= "media=Letter "
+        case TK_PAPER_LEGAL : o &= "media=Legal "
+        case TK_PAPER_A3 : o &= "media=A3 "
+        case TK_PAPER_A5 : o &= "media=A5 "
+        case TK_PAPER_B5 : o &= "media=ISOB5 "
+        case TK_PAPER_TABLOID : o &= "media=Tabloid "
+        case TK_PAPER_EXECUTIVE : o &= "media=Executive "
+        end select
+    end if
+    return rtrim( o )
+end function
+
+' Tell the job's progress callback; FALSE = cancelled.
+function PrnProgress( byval doc as TK_PRINTDOC ptr, byref job as TKPRINTJOB, byval nDone as long, byval nTotal as long ) as boolean
+    if job.pfnProgress = 0 then return true
+    return job.pfnProgress( doc, nDone, nTotal, job.pCtx )
+end function
+
+' ---- the public calls, each OS's half in its own file ----------------------------------------
+' The printers this machine can print to. Their count.
+public function tkPrinter_Enumerate( list() as TKPRINTERINFO ) as long
+    erase list
+    gPrnError = ""
+    return PrnEnumerate( list() )
+end function
+
+' The default printer's name ("" when there is none).
+public function tkPrinter_GetDefault( ) as ustring
+    gPrnError = ""
+    return PrnDefault( )
+end function
+
+' A printer's papers (portrait, points), duplex and colour. FALSE when it cannot be asked.
+public function tkPrinter_GetCaps( byref printer as ustring, byref caps as TKPRINTERCAPS ) as boolean
+    dim as TKPRINTERCAPS blank
+    caps = blank
+    gPrnError = ""
+    return PrnCaps( iif( len( printer ), printer, PrnDefault( ) ), caps )
+end function
+
+' Windows: the driver's own settings dialog for job.printer; its result is kept in job.devMode and
+' used by the job. FALSE when cancelled, or on any other OS. owner: the window it belongs to.
+public function tkPrinter_Properties( byval owner as TK_HOST ptr, byref job as TKPRINTJOB ) as boolean
+    gPrnError = ""
+    return PrnProperties( owner, job )
+end function
+
+' Print the document's pages (job.pageSet), copies times, on job.printer. Synchronous: a progress
+' callback (job.pfnProgress) is told of each page and can cancel. FALSE with tkPrinter_LastError.
+public function tkPrintDoc_Print( byval doc as TK_PRINTDOC ptr, byref job as TKPRINTJOB ) as boolean
+    gPrnError = ""
+    if (doc = 0) orelse (tkPrintDoc_GetPageCount( doc ) = 0) then PrnFail( "nothing to print" ) : return false
+    if job.copies < 1 then job.copies = 1
+    dim as long pages()
+    if tkPrinter_ParsePageSet( job.pageSet, tkPrintDoc_GetPageCount( doc ), pages() ) = 0 then
+        PrnFail( "the page range names no page: " & job.pageSet )
+        return false
+    end if
+    dim as ustring printer = job.printer
+    if len( printer ) = 0 then printer = PrnDefault( )
+    if len( printer ) = 0 then PrnFail( "no printer" ) : return false
+    return PrnPrint( doc, printer, job, pages() )
+end function

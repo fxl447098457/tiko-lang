@@ -162,8 +162,7 @@ before any `end match`.
   (`'mid' takes a string` beside TKO1255, for instance).
 - No `match` expression in an `elseif` condition or a `case` value.
 - No `exit match`.
-- Sum types, which `match` will take apart when they exist, are a separate step (docs/tiko-comparison
-  RFC-0001-match §8.1).
+- Sum types, which `match` will take apart when they exist, are a separate step.
 
 ## Implementation
 

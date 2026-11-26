@@ -1,0 +1,252 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rpreview -- the Report Designer's design data (RD8): what a report shows in the Preview, where no
+' program gives it rows. Nothing compiles: tkReportDef makes the report in-process.
+'
+'   SQLite      a source with a design_db (relative to the .tkreport) is read LIVE, through
+'               tkReportSqlite, when its children are SQLite too (a child array needs an array
+'               master); SQLite is linked into tkEdit statically (RD0's S7).
+'   the rest    rows from <rpt>.sample.toml beside the report, one array of tables per source,
+'               fields by the [[source.field]] snapshot; a child's rows say their master's row
+'               (_master = 1-based). With no file, GenerateSample's rows: dummy values by kind,
+'               five masters, two children each, the text fields repeating so groups show.
+'
+' The rows are bound as array sources (tkReportDef_BindArray / BindArrayChild), whatever kind the
+' source has for the program: the Preview stands in for the program's data.
+#module "rpreview"
+
+#import "std/containers"
+#import "std/config"
+#import "std/fs"
+#import "vendor/sqlite3" link static
+#import "vendor/tkControls/tkReportDef"
+#import "vendor/tkControls/tkReportSqlite"
+using containers
+using tkReportDef
+using tkReport
+using tkReportSqlite
+using tkBind
+using tkCalendar
+using tkTimePanel
+
+' One source's design rows: NF values a row, and each row's master row (a child source).
+public type RSampleSource
+    Name   as ustring
+    NF     as int32
+    Vals   as Array( of TK_VALUE )
+    Master as Array( of int32 )         ' 0-based master row; -1 for a top-level source
+    declare function RowCount( ) as int32
+end type
+
+function RSampleSource.RowCount( ) as int32
+    if NF <= 0 then return Master.Count( )
+    return Vals.Count( ) \ NF
+end function
+
+public type RDesignData
+    Sources as Array( of RSampleSource )
+    Dbs     as Array( of any ptr )      ' the design databases opened (sqlite3 ptr)
+    Live    as Array( of ustring )      ' the sources read live
+    declare sub Release( )
+end type
+
+sub RDesignData.Release( )
+    for each p as any ptr in Dbs
+        sqlite3_close( cast( sqlite3 ptr, p ) )
+    next
+    Dbs.Clear( )
+end sub
+
+' ---- generating -------------------------------------------------------------------------------
+private function TomlValueText_( byval kind as int32, byref fieldName as const ustring, byval n as int32 ) as ustring
+    select case kind
+    case TKV_INT : return str( n * 7 )
+    case TKV_FLOAT : return str( n * 2 ) & ".5"
+    case TKV_BOOL
+        if n mod 2 then return "true"
+        return "false"
+    case TKV_DATE : return """2026-01-" & right( "0" & n, 2 ) & """"
+    case TKV_TIME : return """09:" & right( "0" & n, 2 ) & ":00"""
+    end select
+    ' text: two rows share each value, so a group on it shows
+    return """" & fieldName & " " & ((n - 1) \ 2 + 1) & """"
+end function
+
+' Dummy rows for every source of def, as <rpt>.sample.toml text.
+public function GenerateSample( byval def as TK_REPORTDEF ptr ) as ustring
+    dim as ustring o = "# Design rows for the Report Designer's Preview: one [[Source]] table a row." & !"\n" & _
+                       "# A child source's rows name their master's row: _master = 1 is the first." & !"\n"
+    if def = 0 then return o
+    for si as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(si)
+        dim as int32 masters = 1, per = 5
+        if len( s.parent ) then
+            per = 2
+            masters = 5
+        end if
+        dim as int32 n = 0
+        for m as int32 = 1 to masters
+            for k as int32 = 1 to per
+                n += 1
+                o &= !"\n[[" & s.name_ & !"]]\n"
+                if len( s.parent ) then o &= "_master = " & m & !"\n"
+                for f as int32 = 0 to s.nFields - 1
+                    o &= s.fields(f).name_ & " = " & TomlValueText_( s.fields(f).kind, s.fields(f).name_, n ) & !"\n"
+                next
+            next
+        next
+    next
+    return o
+end function
+
+' ---- reading ----------------------------------------------------------------------------------
+private sub ValueOf_( byref tv as config.TomlValue, byval kind as int32, byref v as TK_VALUE )
+    select case kind
+    case TKV_INT : v.SetInt( tv.AsInt( ).ValueOr( 0 ) )
+    case TKV_FLOAT : v.SetFloat( tv.AsFloat( ).ValueOr( 0 ) )
+    case TKV_BOOL : v.SetBool( tv.AsBool( ).ValueOr( false ) )
+    case TKV_DATE
+        ' "YYYY-MM-DD", quoted (the sample's dates are strings)
+        dim as TKDATE d
+        dim as ustring t = tv.AsString( ).ValueOr( "" )
+        d.wYear = valint( mid( t, 1, 4 ) ) : d.wMonth = valint( mid( t, 6, 2 ) ) : d.wDay = valint( mid( t, 9, 2 ) )
+        v.SetDate( d )
+    case TKV_TIME
+        dim as TKTIME tm
+        dim as ustring t = tv.AsString( ).ValueOr( "" )
+        tm.wHour = valint( mid( t, 1, 2 ) ) : tm.wMinute = valint( mid( t, 4, 2 ) ) : tm.wSecond = valint( mid( t, 7, 2 ) )
+        v.SetTime( tm )
+    case else : v.SetText( tv.AsString( ).ValueOr( "" ) )
+    end select
+end sub
+
+' The sample text's rows for every source of def (a source the text leaves out gets none). errs:
+' what could not be read.
+public sub ReadSample( byval def as TK_REPORTDEF ptr, byref text as const ustring, byref data_ as RDesignData, byref errs as ustring )
+    data_.Sources.Clear( )
+    dim as config.ConfigResultToml r = config.ParseToml( text )
+    if r.IsOk( ) = false then
+        errs = r.Failure( ).Message( )
+        return
+    end if
+    dim as config.TomlValue root = r.Value( )
+    for si as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(si)
+        dim as RSampleSource ss
+        ss.Name = s.name_
+        ss.NF = s.nFields
+        dim as config.TomlValue ptr arr = root.Find( s.name_ )
+        if arr then
+            for i as long = 0 to arr->Count( ) - 1
+                dim byref as config.TomlValue row = arr->Item( i )
+                for f as int32 = 0 to s.nFields - 1
+                    dim as TK_VALUE v
+                    dim as config.TomlValue ptr cell = row.Find( s.fields(f).name_ )
+                    if cell then ValueOf_( *cell, s.fields(f).kind, v )
+                    ss.Vals.Push( v )
+                next
+                dim as int32 m = -1
+                dim as config.TomlValue ptr mc = row.Find( "_master" )
+                if mc then m = clng( mc->AsInt( ).ValueOr( 1 ) ) - 1
+                ss.Master.Push( m )
+            next
+        end if
+        data_.Sources.Push( ss )
+    next
+end sub
+
+' ---- binding ----------------------------------------------------------------------------------
+private function SCount_( byval p as any ptr ) as int32
+    return cast( RSampleSource ptr, p )->RowCount( )
+end function
+
+private sub SValue_( byval p as any ptr, byval row as int32, byval f as int32, byref v as TK_VALUE )
+    dim as RSampleSource ptr s = p
+    dim as int32 i = row * s->NF + f
+    if (i >= 0) andalso (i < s->Vals.Count( )) then v = s->Vals[i]
+end sub
+
+' A child's rows for master row masterRow: the k-th row whose master it is.
+private function ChildRow_( byval s as RSampleSource ptr, byval masterRow as int32, byval k as int32 ) as int32
+    dim as int32 n = 0
+    for r as int32 = 0 to s->Master.Count( ) - 1
+        if s->Master[r] = masterRow then
+            if n = k then return r
+            n += 1
+        end if
+    next
+    return -1
+end function
+
+private function CCount_( byval p as any ptr, byval masterRow as int32 ) as int32
+    dim as RSampleSource ptr s = p
+    dim as int32 n = 0
+    for r as int32 = 0 to s->Master.Count( ) - 1
+        if s->Master[r] = masterRow then n += 1
+    next
+    return n
+end function
+
+private sub CValue_( byval p as any ptr, byval masterRow as int32, byval row as int32, byval f as int32, byref v as TK_VALUE )
+    dim as RSampleSource ptr s = p
+    dim as int32 r = ChildRow_( s, masterRow, row )
+    if r >= 0 then SValue_( p, r, f, v )
+end sub
+
+' Whether source si is read live: SQLite, its design_db there, and so are its master and children.
+private function CanLive_( byval def as TK_REPORTDEF ptr, byval si as int32, byref dir_ as const ustring ) as boolean
+    dim byref as TKRD_SOURCE s = def->sources(si)
+    if (s.kind <> "sqlite") orelse (len( s.designDb ) = 0) then return false
+    if fs.IsFile( fs.PathJoin( dir_, s.designDb ) ) = false then return false
+    if len( s.parent ) then
+        dim as int32 pi_ = tkReportDef_FindSource( def, s.parent )
+        if (pi_ < 0) orelse (CanLive_( def, pi_, dir_ ) = false) then return false
+    end if
+    for k as int32 = 0 to def->nSources - 1
+        if lcase( def->sources(k).parent ) = lcase( s.name_ ) then
+            if (def->sources(k).kind <> "sqlite") orelse (len( def->sources(k).designDb ) = 0) then return false
+        end if
+    next
+    return true
+end function
+
+' def's sources bound to design data: live SQLite where it can be, else data_'s rows (read from the
+' sample text, or generated when sampleText is ""). dir_ is the report's folder. data_ must outlive
+' every report made from def. errs: what was not bound, or could not be read.
+public sub BindDesignData( byval def as TK_REPORTDEF ptr, byref dir_ as const ustring, byref sampleText as const ustring, _
+                           byref data_ as RDesignData, byref errs as ustring )
+    errs = ""
+    data_.Release( )
+    data_.Live.Clear( )
+    dim as ustring text = sampleText
+    if len( text ) = 0 then text = GenerateSample( def )
+    ReadSample( def, text, data_, errs )
+    if len( errs ) then return
+    for si as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(si)
+        if CanLive_( def, si, dir_ ) then
+            dim as sqlite3 ptr db
+            dim as string path8 = fs.PathJoin( dir_, s.designDb )
+            if sqlite3_open_v2( strptr( path8 ), @db, SQLITE_OPEN_READONLY, 0 ) = SQLITE_OK then
+                data_.Dbs.Push( db )
+                if tkReportSqlite_BindDef( def, s.name_, db ) then
+                    data_.Live.Push( s.name_ )
+                    continue for
+                end if
+            elseif db then
+                sqlite3_close( db )
+            end if
+        end if
+        dim as RSampleSource ptr ss = @data_.Sources[si]
+        if len( s.parent ) then
+            tkReportDef_BindArrayChild( def, s.name_, ss, @CCount_, @CValue_ )
+        else
+            tkReportDef_BindArray( def, s.name_, ss, @SCount_, @SValue_ )
+        end if
+    next
+end sub

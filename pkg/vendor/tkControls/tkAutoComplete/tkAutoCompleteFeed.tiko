@@ -1,0 +1,263 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkAutoComplete, part four: where the rows come from (phase A4 of docs/tkControls/AUTOCOMPLETE.md
+' section 5). The types and core are in tkAutoComplete.tiko.
+'
+' STORED ITEMS (A1) are the default: the control filters them. Two feeds hand the filtering to the
+' host instead, and their rows are SUPPLIED -- they are not items (GetResultItem is -1 for them;
+' GetResultText / GetResultId read them), and committing one makes its id the value
+' (GetSelectedId), with GetSelectedIndex -1:
+'   ItemsNeeded( query )          synchronous: inside it, ClearResults then AddResult per row,
+'                                 already filtered and ordered (an index, a LIKE query)
+'   Populate( query, requestId )  asynchronous: start the fetch and return; later, on the UI thread
+'                                 (tkApp_RunOnUI from a worker), BeginSupply( requestId ) -- FALSE
+'                                 when a newer request has replaced it: drop the answer -- then
+'                                 AddResult per row and EndSupply. While an answer is awaited the
+'                                 list shows the last rows with a status row ("Searching...",
+'                                 SetStatusText); typing below MinChars, CancelPending or a newer
+'                                 request makes the old id stale. The control owns no thread (D-6).
+'                                 Do not call into a destroyed control: the host's fetch must check.
+' The feeds debounce 200 ms by default (D-7); SetDelay sets it for every feed. Matched runs are
+' still painted, from the query and FilterMode. There is no narrowing over supplied rows.
+'
+' A SOURCE (SetSource, a TKAUTOCOMPLETE_SOURCE procedure table) fills the stored items from the
+' host's data -- what generated binding code uses. The control READS it (texts, ids, details, folded
+' once), so call SourceChanged after the data changes.
+'
+' SetSelectedItem( id, text ) sets a value the items do not hold: an async lookup's, loaded from a
+' record. It stands while its text does.
+#module "tkAutoComplete"
+
+#import "../tkHost" public
+#import "../tkTextBox" public
+#import "../tkMatch" public
+using tkHost
+using tkTextBox
+using tkMatch
+
+private sub AcSupClear( byval p as TKAUTOCOMPLETE_STATE ptr )
+    p->nSup = 0
+end sub
+
+' A feed switched: no row of the old one may show under the new (nor a stale id be accepted).
+private sub AcFeedReset( byval p as TKAUTOCOMPLETE_STATE ptr )
+    AcCloseList( p )
+    AcSupClear( p )
+    p->nShown = 0 : p->nTotal = 0
+    erase p->hits
+    p->nPendingReq = 0
+    p->bHaveQ = false
+end sub
+
+' The supplied rows as the shown rows: in the host's order, capped by MaxResults.
+private sub AcSupHits( byval p as TKAUTOCOMPLETE_STATE ptr )
+    dim as long n = p->nSup
+    p->nTotal = n
+    if (p->nMaxResults > 0) andalso (n > p->nMaxResults) then n = p->nMaxResults
+    p->nShown = n
+    if n > 0 then
+        redim p->hits( 0 to n - 1 )
+        for i as long = 0 to n - 1
+            p->hits(i).index = i
+            p->hits(i).score = 0
+        next
+    else
+        erase p->hits
+    end if
+end sub
+
+' AcFilter for the feeds.
+sub AcFeedFilter( byval p as TKAUTOCOMPLETE_STATE ptr )
+    tkMatch_Prepare( p->q, p->nFilterMode, p->sQuery, p->bCaseSensitive )
+    p->bHaveQ = false
+    if p->PopulateCallback then
+        ' the last rows stay up under the status row until the answer comes
+        p->nReq += 1
+        p->nPendingReq = p->nReq
+        p->PopulateCallback( p->hWin, p->sQuery, p->nReq )
+        exit sub
+    end if
+    AcSupClear( p )
+    p->ItemsNeededCallback( p->hWin, p->sQuery )
+    AcSupHits( p )
+end sub
+
+' The first supplied row whose text is text (case-blind) becomes the value, as a commit; FALSE if none.
+function AcSelectSuppliedText( byval p as TKAUTOCOMPLETE_STATE ptr, byref text as const ustring ) as boolean
+    dim as ustring k = tkMatch_Fold( text )
+    for i as long = 0 to p->nSup - 1
+        if p->supKey(i) = k then
+            p->bError = false
+            p->nAppendItem = -1
+            tkTextBox_SetText( p->wEdit, p->supText(i) )
+            p->sQuery = p->supText(i)
+            p->nSel = -1
+            p->bExtSel = true : p->nSelId = p->supId(i) : p->sSelText = p->supText(i)
+            AcEditColors( p )
+            AcFaceSync( p )
+            if p->TextChangedCallback then p->TextChangedCallback( p->hWin, true )
+            if p->ItemSelectedCallback then p->ItemSelectedCallback( p->hWin, -1, p->supId(i) )
+            AcSearchNow( p )
+            return true
+        end if
+    next
+    return false
+end function
+
+' Reads the source into the stored items.
+private sub AcReadSource( byval p as TKAUTOCOMPLETE_STATE ptr )
+    dim as TK_WIDGET ptr h = p->hWin
+    tkAutoComplete_BeginUpdate( h )
+    tkAutoComplete_Clear( h )
+    dim as TKAUTOCOMPLETE_SOURCE ptr src = p->pSource
+    if (src <> 0) andalso (src->Count <> 0) andalso (src->GetText <> 0) then
+        dim as long n = src->Count( src->pCtx )
+        dim as TKAUTOCOMPLETE_ITEM it
+        for i as long = 0 to n - 1
+            it.text = src->GetText( src->pCtx, i )
+            it.id = i
+            if src->GetId then it.id = src->GetId( src->pCtx, i )
+            it.detail = ""
+            if src->GetDetail then it.detail = src->GetDetail( src->pCtx, i )
+            tkAutoComplete_AddItemEx( h, it )
+        next
+    end if
+    tkAutoComplete_EndUpdate( h )
+end sub
+
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' The synchronous feed (0 = back to the stored items).
+public sub tkAutoComplete_SetItemsNeededCallback( byval hAC as TK_WIDGET ptr, byval cb as AC_ItemsNeededSub )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    AcFeedReset( p )
+    p->ItemsNeededCallback = cb
+end sub
+
+' The asynchronous feed (0 = back to the stored items).
+public sub tkAutoComplete_SetPopulateCallback( byval hAC as TK_WIDGET ptr, byval cb as AC_PopulateSub )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    AcFeedReset( p )
+    p->PopulateCallback = cb
+end sub
+
+public sub tkAutoComplete_ClearResults( byval hAC as TK_WIDGET ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p then AcSupClear( p )
+end sub
+
+' One row: inside ItemsNeeded, or between an accepted BeginSupply and EndSupply.
+public sub tkAutoComplete_AddResult( byval hAC as TK_WIDGET ptr, byval text as ustring, byval id as longint = 0, _
+                                     byval detail as ustring = "" )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    if p->nSup > ubound( p->supText ) then
+        dim as long cap = iif( p->nSup < 16, 32, p->nSup * 2 )
+        redim preserve p->supText( 0 to cap - 1 )
+        redim preserve p->supKey( 0 to cap - 1 )
+        redim preserve p->supDetail( 0 to cap - 1 )
+        redim preserve p->supId( 0 to cap - 1 )
+    end if
+    p->supText(p->nSup) = text
+    p->supKey(p->nSup) = tkMatch_Fold( text )
+    p->supDetail(p->nSup) = detail
+    p->supId(p->nSup) = id
+    p->nSup += 1
+end sub
+
+' An async answer begins: FALSE when requestId is not the one awaited (stale, cancelled) -- add
+' nothing then. TRUE clears the old rows.
+public function tkAutoComplete_BeginSupply( byval hAC as TK_WIDGET ptr, byval requestId as long ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p = 0) orelse (requestId = 0) orelse (requestId <> p->nPendingReq) then return false
+    AcSupClear( p )
+    p->bSupplying = true
+    return true
+end function
+
+' The answer is in: the rows show (the list opens if the box still has the focus and the query).
+public sub tkAutoComplete_EndSupply( byval hAC as TK_WIDGET ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p = 0) orelse (p->bSupplying = false) then exit sub
+    p->bSupplying = false
+    p->nPendingReq = 0
+    AcSupHits( p )
+    if p->bFiltering then exit sub                       ' answered inside Populate: AcRun shows it
+    if p->isOpen = false then
+        if tkHost_GetFocus( p->hWin->pHost ) <> p->wEdit then exit sub
+        if len( p->sQuery ) < p->nMinChars then exit sub
+    end if
+    AcShowResults( p )
+end sub
+
+' Forget the awaited answer (its id goes stale); the status row goes.
+public sub tkAutoComplete_CancelPending( byval hAC as TK_WIDGET ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p = 0) orelse (p->nPendingReq = 0) then exit sub
+    p->nPendingReq = 0
+    p->bSupplying = false
+    if p->isOpen then AcShowResults( p )
+end sub
+
+' The awaited request's id, 0 = none.
+public function tkAutoComplete_GetPendingRequest( byval hAC as TK_WIDGET ptr ) as long
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->nPendingReq, 0 )
+end function
+
+public sub tkAutoComplete_SetStatusText( byval hAC as TK_WIDGET ptr, byval s as ustring )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->sStatusText = s
+    if p->wList then tkWidget_Invalidate( p->wList )
+end sub
+
+public function tkAutoComplete_GetStatusText( byval hAC as TK_WIDGET ptr ) as ustring
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then return ""
+    return p->sStatusText
+end function
+
+' A shown row's text and id, whichever feed it came from.
+public function tkAutoComplete_GetResultText( byval hAC as TK_WIDGET ptr, byval row as long ) as ustring
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p = 0) orelse (row < 0) orelse (row >= p->nShown) then return ""
+    return AcRowText( p, row )
+end function
+
+public function tkAutoComplete_GetResultId( byval hAC as TK_WIDGET ptr, byval row as long ) as longint
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p = 0) orelse (row < 0) orelse (row >= p->nShown) then return 0
+    return AcRowId( p, row )
+end function
+
+' The stored items from a source (read now; again on SourceChanged). 0 = none (the items stay).
+public sub tkAutoComplete_SetSource( byval hAC as TK_WIDGET ptr, byval src as TKAUTOCOMPLETE_SOURCE ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->pSource = src
+    if src then AcReadSource( p )
+end sub
+
+public sub tkAutoComplete_SourceChanged( byval hAC as TK_WIDGET ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p <> 0) andalso (p->pSource <> 0) then AcReadSource( p )
+end sub
+
+' Silent: a value the items do not hold (an async lookup's, loaded from a record).
+public sub tkAutoComplete_SetSelectedItem( byval hAC as TK_WIDGET ptr, byval id as longint, byval text as ustring )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    tkAutoComplete_SetText( hAC, text )
+    p->bExtSel = true
+    p->nSelId = id
+    p->sSelText = text
+end sub

@@ -1,0 +1,239 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- the column chooser and the context menu (phase G7a).
+'
+' THE CHOOSER (SetColumnChooser; off by default) is a tkPopupMenu a right-click on the header band
+' opens: one checked item per column in display order (checked = shown; the last shown column
+' cannot be hidden), then "Best fit" (the column clicked), "Best fit (all columns)" and "Show all
+' columns". The menu is created on first use and rebuilt on every open, as tkTextBox's is; its
+' texts are SetChooserTexts' (localization). Choosing an item is a user action: hiding fires
+' ColumnVisibilityChanged, a best fit ColumnResize( col, width, FALSE ) as the gutter's double
+' click does, and hiding the current cell's column moves the current cell to the next shown one.
+'
+' THE CONTEXT MENU is the host's: the grid fires ContextMenu( row, col, x, y, bKeyboard ) for a
+' right-click the MessageCallback did not take (a header one only while the chooser is off), and
+' for the Menu key or Shift+F10 at the current cell. x, y are window pixels, what tkPopupMenu_Show
+' takes. A tkContextMenu attached with tkWidget_SetContextMenu takes the right-click before the grid
+' sees it (tkHost's rule).
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkPopupMenu"
+using tkHost
+using tkPaint
+using tkPopupMenu
+
+const DG_IDM_BESTFIT = 1
+const DG_IDM_BESTFITALL = 2
+const DG_IDM_SHOWALL = 3
+const DG_IDM_COLUMN = 1000           ' + the model column
+
+dim shared as TKDATAGRID_STATE ptr gDgMenuGrid      ' whose chooser is open
+
+' ==========================================================================================
+' User actions (they notify)
+' ==========================================================================================
+function DgShownColumnCount( byval p as TKDATAGRID_STATE ptr ) as integer
+    dim as integer n = 0
+    for k as integer = 0 to p->colCount - 1
+        if p->cols(k).c.visible then n += 1
+    next
+    return n
+end function
+
+' The column to the width its caption and cells need; ColumnResize( col, width, FALSE ).
+sub DgUserBestFit( byval p as TKDATAGRID_STATE ptr, byval col as integer )
+    if (DgValidCol( p, col ) = false) orelse (p->cols(col).c.visible = false) then exit sub
+    dim as integer w = DgAutoWidth( p, col, 200 )
+    p->cols(col).c.width = w
+    p->cols(col).c.fillWeight = 0
+    DgChanged( p )
+    if p->ColumnResizeCallback then p->ColumnResizeCallback( p->hWin, col, w, false )
+end sub
+
+' Shows or hides col as the user asked: never the last shown column; an edit in it ends first; the
+' current cell leaves it for the next shown column (or the one before).
+sub DgUserSetVisible( byval p as TKDATAGRID_STATE ptr, byval col as integer, byval bVisible as boolean )
+    if (DgValidCol( p, col ) = false) orelse (p->cols(col).c.visible = bVisible) then exit sub
+    if bVisible = false then
+        if DgShownColumnCount( p ) <= 1 then exit sub
+        if p->bEditing andalso (p->editCol = col) then
+            if DgEndEdit( p, true ) = false then DgEndEdit( p, false )
+        end if
+    end if
+    dim as DG_USERMARK mk
+    DgUserBegin( p, mk )
+    p->cols(col).c.visible = bVisible
+    if (bVisible = false) andalso (p->hotHdrCol = col) then p->hotHdrCol = -1
+    p->hotDivCol = -1
+    if (bVisible = false) andalso (p->curCol = col) then
+        dim as integer d = p->cols(col).disp
+        dim as integer nd = DgNextVisDisp( p, d, 1 )
+        if nd < 0 then nd = DgNextVisDisp( p, d, -1 )
+        if nd >= 0 then
+            p->curCol = p->order(nd)
+            if DgValidViewRow( p, p->curRow ) then DgSelectOnly( p, p->curRow, nd )
+        end if
+    end if
+    DgChanged( p )
+    if p->ColumnVisibilityChangedCallback then p->ColumnVisibilityChangedCallback( p->hWin, col, bVisible )
+    DgUserEnd( p, mk )
+end sub
+
+' ==========================================================================================
+' The chooser menu
+' ==========================================================================================
+' What the chooser calls a column: its caption, else its key, else "Column n".
+function DgColumnLabel( byval p as TKDATAGRID_STATE ptr, byval col as integer ) as ustring
+    if len( p->cols(col).c.caption ) then return p->cols(col).c.caption
+    if len( p->cols(col).c.key ) then return p->cols(col).c.key
+    return "Column " & (col + 1)
+end function
+
+private sub DgChooserSelect( byval hPopup as TK_MENU ptr, byval id as long )
+    dim as TKDATAGRID_STATE ptr p = gDgMenuGrid
+    gDgMenuGrid = 0
+    if p = 0 then exit sub
+    select case id
+    case DG_IDM_BESTFIT
+        DgUserBestFit( p, p->menuCol )
+    case DG_IDM_BESTFITALL
+        for d as integer = 0 to p->colCount - 1
+            if p->cols( p->order(d) ).c.visible then DgUserBestFit( p, p->order(d) )
+        next
+    case DG_IDM_SHOWALL
+        for d as integer = 0 to p->colCount - 1
+            DgUserSetVisible( p, p->order(d), true )
+        next
+    case is >= DG_IDM_COLUMN
+        dim as integer col = id - DG_IDM_COLUMN
+        if DgValidCol( p, col ) then DgUserSetVisible( p, col, p->cols(col).c.visible = false )
+    end select
+end sub
+
+' Opens the chooser at surface-local (x, y) for column col (-1: none). FALSE when it could not.
+function DgShowChooser( byval p as TKDATAGRID_STATE ptr, byval col as integer, byval x as integer, byval y as integer ) as boolean
+    if p->colCount = 0 then return false
+    if p->bEditing then
+        if DgEndEdit( p, true ) = false then return false     ' refused: the editor keeps the focus
+    end if
+    if p->pMenu = 0 then p->pMenu = tkPopupMenu_Create( p->hWin->pHost, p->hWin->CtrlID )
+    dim as TK_MENU ptr m = p->pMenu
+    tkPopupMenu_Clear( m )
+    p->menuCol = iif( DgValidCol( p, col ), col, -1 )
+    dim as integer nShown = DgShownColumnCount( p )
+    dim as boolean anyHidden = nShown < p->colCount
+    for d as integer = 0 to p->colCount - 1
+        dim as integer k = p->order(d)
+        dim as boolean bOn = p->cols(k).c.visible
+        ' the last shown column cannot go
+        tkPopupMenu_AddItem( m, DG_IDM_COLUMN + k, DgColumnLabel( p, k ), "", bOn andalso (nShown <= 1), bOn )
+    next
+    tkPopupMenu_AddSeparator( m )
+    dim as boolean bFitOne = (p->menuCol >= 0) andalso p->cols( iif( p->menuCol >= 0, p->menuCol, 0 ) ).c.visible
+    tkPopupMenu_AddItem( m, DG_IDM_BESTFIT, p->wszBestFit, "", bFitOne = false )
+    tkPopupMenu_AddItem( m, DG_IDM_BESTFITALL, p->wszBestFitAll )
+    tkPopupMenu_AddItem( m, DG_IDM_SHOWALL, p->wszShowAll, "", anyHidden = false )
+    dim as TKRECT a
+    tkWidget_AbsRect( p->wSurf, a )
+    gDgMenuGrid = p
+    tkPopupMenu_SetSelectCallback( m, @DgChooserSelect )
+    if tkPopupMenu_Show( m, a.left + x, a.top + y ) = false then
+        gDgMenuGrid = 0
+        return false
+    end if
+    return true
+end function
+
+sub DgChooserDestroy( byval p as TKDATAGRID_STATE ptr )
+    if gDgMenuGrid = p then gDgMenuGrid = 0
+    if p->pMenu then
+        tkPopupMenu_Destroy( p->pMenu )
+        p->pMenu = 0
+    end if
+end sub
+
+' ==========================================================================================
+' Right-click and the Menu key (dgInput)
+' ==========================================================================================
+private sub DgFireContextMenu( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, _
+                               byval x as integer, byval y as integer, byval bKeyboard as boolean )
+    if p->ContextMenuCallback = 0 then exit sub
+    dim as TKRECT a
+    tkWidget_AbsRect( p->wSurf, a )
+    p->ContextMenuCallback( p->hWin, row, col, a.left + x, a.top + y, bKeyboard )
+end sub
+
+' The right button's release at surface-local (x, y), after the MessageCallback let it through.
+sub DgRightClick( byval p as TKDATAGRID_STATE ptr, byref ht as TKDG_HITTEST, byval x as integer, byval y as integer )
+    dim as boolean onHeader = (ht.area = TKDG_HT_HEADER) orelse (ht.area = TKDG_HT_DIVIDER) orelse (ht.area = TKDG_HT_CORNER) _
+                              orelse ((ht.area = TKDG_HT_EMPTY) andalso (y < DgHdrHPx( p )))
+    if onHeader then
+        if p->bChooser then
+            DgShowChooser( p, ht.col, x, y )
+            exit sub
+        end if
+        DgFireContextMenu( p, -1, ht.col, x, y, false )
+        exit sub
+    end if
+    DgFireContextMenu( p, ht.row, ht.col, x, y, false )
+end sub
+
+' The Menu key or Shift+F10: ContextMenu at the current cell's bottom-left (the body's top-left
+' when it is not on screen). FALSE when nobody listens (the key is not claimed).
+function DgKeyContextMenu( byval p as TKDATAGRID_STATE ptr ) as boolean
+    if p->ContextMenuCallback = 0 then return false
+    dim as integer row = p->curRow, col = p->curCol
+    if (DgValidViewRow( p, row ) = false) orelse (DgValidCol( p, col ) = false) then row = -1 : col = -1
+    dim as TKRECT rc
+    dim as integer x = DgRhPx( p ), y = DgHdrHPx( p )
+    if (row >= 0) andalso tkDataGrid_GetCellRect( p->hWin, row, col, rc ) then x = rc.left : y = rc.bottom
+    DgFireContextMenu( p, row, col, x, y, true )
+    return true
+end function
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' A right-click on the header band opens the column chooser (instead of firing ContextMenu).
+public sub tkDataGrid_SetColumnChooser( byval hGrid as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->bChooser = bOn
+end sub
+
+public function tkDataGrid_GetColumnChooser( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return (p <> 0) andalso p->bChooser
+end function
+
+' The chooser's own items (the columns use their captions). "" keeps a text as it is.
+public sub tkDataGrid_SetChooserTexts( byval hGrid as TK_WIDGET ptr, byref BestFit as const ustring, _
+                                       byref BestFitAll as const ustring, byref ShowAll as const ustring )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    if len( BestFit ) then p->wszBestFit = BestFit
+    if len( BestFitAll ) then p->wszBestFitAll = BestFitAll
+    if len( ShowAll ) then p->wszShowAll = ShowAll
+end sub
+
+' Opens the chooser from code (a toolbar button) at surface-local (x, y); col is the column its
+' "Best fit" sizes (-1: none). Works whether or not SetColumnChooser is on. FALSE: no columns, or
+' an edit that would not commit.
+public function tkDataGrid_ShowColumnChooser( byval hGrid as TK_WIDGET ptr, byval col as integer, _
+                                              byval x as integer, byval y as integer ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return false
+    return DgShowChooser( p, col, x, y )
+end function
+
+' The chooser's tkPopupMenu (0 before it was first opened): style it with tkPopupMenu's setters;
+' its items are rebuilt on every open.
+public function tkDataGrid_GetChooserMenu( byval hGrid as TK_WIDGET ptr ) as TK_MENU ptr
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return 0
+    return p->pMenu
+end function

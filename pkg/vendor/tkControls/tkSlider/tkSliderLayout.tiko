@@ -1,0 +1,653 @@
+#module "tkSlider"
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkSlider, part three: geometry (SLIDER.md §4), ticks and labels (§3.3), painting (§7), the value
+' tip (§6.1). The types and the value model are in tkSlider.tiko.
+'
+' LAYOUT, in the track's own frame ("along" / "across"), mapped to x / y at the end:
+'   content   = the client less the ring band (FocusGap + FocusThick) on every side
+'   across    = one block, centred in the content:
+'               [labels LabelGap][ticks TickGap]  thumb band (ThumbAcross)  [TickGap ticks][LabelGap labels]
+'               the top/left side has ticks for TOPLEFT and BOTH, labels only for TOPLEFT;
+'               the bottom/right side has ticks for BOTTOMRIGHT and BOTH, labels otherwise
+'   along     a0 = content.lo + ThumbAlong\2       a1 = content.hi - (ThumbAlong - ThumbAlong\2)
+'             a value's centre: a0 + round( fr * span ), or a1 - round( fr * span ) when Min is
+'             at the high end (vertical, or reversed horizontal; both = not inverted)
+'   track     a0 - T\2 .. a1 + (T - T\2) along, centred on the thumb band across
+'   fill      from the Min end of the track (FILL_MIN) or FillOrigin's centre (FILL_ORIGIN) to the
+'             thumb's centre
+'   ticks     each at its value's centre; thinned greedily so shown ticks are >= MIN_TICKSPACE
+'             apart (the last tick always kept); labels likewise by their measured rects
+'             (>= MIN_LABELSPACE apart), centred on the tick and clamped inside the content.
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+
+' v with n decimals, half away from zero (tiko has no format()).
+private function Fmt( byval v as double, byval n as long ) as ustring
+    if n < 0 then n = 0
+    dim as double k = 10.0 ^ n
+    dim as double a = abs( v ) * k
+    dim as ulongint q = fix( a + 0.5 + a * 1e-12 )
+    dim as string d = str( q )
+    if n > 0 then
+        while len( d ) <= n
+            d = "0" & d
+        wend
+        d = left( d, len( d ) - n ) & "." & right( d, n )
+    end if
+    if (v < 0) andalso (q <> 0) then d = "-" & d
+    return d
+end function
+
+function FormatV( byval p as TKSLIDER_STATE ptr, byval v as double, byval nWhere as long ) as ustring
+    if p->FormatCallback then
+        dim as ustring s = p->FormatCallback( p->hWin, v, nWhere )
+        if len( s ) then return s
+    end if
+    return Fmt( v, p->nDecimals )
+end function
+
+private function LabelFont( byval p as TKSLIDER_STATE ptr ) as TTF_Font ptr
+    if p->pFont then return p->pFont
+    if (p->hWin <> 0) andalso (p->hWin->pHost <> 0) then return p->hWin->pHost->pDefaultFont
+    return 0
+end function
+
+' Which side the labels sit on: 0 none, 1 top / left, 2 bottom / right.
+private function LabelSide( byval p as TKSLIDER_STATE ptr ) as long
+    if (p->bShowLabels = false) orelse (p->nTicks = 0) orelse (LabelFont( p ) = 0) then return 0
+    if p->nTickPlacement = TKSL_TICKS_TOPLEFT then return 1
+    return 2
+end function
+
+private function TicksOn( byval p as TKSLIDER_STATE ptr, byval side as long ) as boolean
+    select case p->nTickPlacement
+    case TKSL_TICKS_BOTH : return true
+    case TKSL_TICKS_TOPLEFT : return side = 1
+    case TKSL_TICKS_BOTTOMRIGHT : return side = 2
+    end select
+    return false
+end function
+
+' A label candidate: every LabelEvery-th tick from the first, and the last.
+private function LabelWanted( byval p as TKSLIDER_STATE ptr, byval i as long ) as boolean
+    return ((i mod p->nLabelEvery) = 0) orelse (i = p->nTicks - 1)
+end function
+
+' The tick arrays sized to nTicks, every candidate's text and measured size (in labelRc as
+' 0,0,w,h). Returns the label band's size across: the line height (horizontal) or the widest
+' label (vertical); 0 without labels.
+private function FillLabels( byval p as TKSLIDER_STATE ptr ) as long
+    if p->bTicksDirty then p->BuildTicks()
+    if p->nTicks > 0 then
+        redim p->tickPos( 0 to p->nTicks - 1 )
+        redim p->tickShown( 0 to p->nTicks - 1 )
+        redim p->labelShown( 0 to p->nTicks - 1 )
+        redim p->labelRc( 0 to p->nTicks - 1 )
+        redim p->labelTxt( 0 to p->nTicks - 1 )
+    else
+        erase p->tickPos, p->tickShown, p->labelShown, p->labelRc, p->labelTxt
+    end if
+    if LabelSide( p ) = 0 then return 0
+    dim as TTF_Font ptr f = LabelFont( p )
+    dim as long lh = tkText_Height( f ), widest = 0
+    for i as long = 0 to p->nTicks - 1
+        if LabelWanted( p, i ) = false then continue for
+        p->labelTxt(i) = FormatV( p, p->tickVal(i), TKSL_FMT_TICK )
+        dim as long lw = tkText_Width( f, p->labelTxt(i) )
+        tkRect_Set( p->labelRc(i), 0, 0, lw, lh )
+        if lw > widest then widest = lw
+    next
+    return iif( p->nOrientation = TKSL_VERTICAL, widest, lh )
+end function
+
+' The across sizes on each side of the thumb band.
+private sub SideSizes( byval p as TKSLIDER_STATE ptr, byval labelSize as long, byref s1 as long, byref s2 as long )
+    dim as long side = LabelSide( p )
+    s1 = 0 : s2 = 0
+    if TicksOn( p, 1 ) then s1 += p->nTickGap + p->nTickLen
+    if TicksOn( p, 2 ) then s2 += p->nTickGap + p->nTickLen
+    if side = 1 then s1 += p->nLabelGap + labelSize
+    if side = 2 then s2 += p->nLabelGap + labelSize
+end sub
+
+sub IdealSize( byval p as TKSLIDER_STATE ptr, byref nW as long, byref nH as long )
+    dim as long rp = p->RingPad(), s1, s2
+    SideSizes( p, FillLabels( p ), s1, s2 )
+    dim as long nAlongSz = p->nThumbA + tkHost_Scale( p->hWin->pHost, TKSLIDER_DEFAULT_LENGTH ) + 2 * rp
+    dim as long nAcrossSz = s1 + p->nThumbX + s2 + 2 * rp
+    p->bLayoutDirty = true                  ' FillLabels resized the arrays the layout fills
+    if p->nOrientation = TKSL_VERTICAL then
+        nW = nAcrossSz : nH = nAlongSz
+    else
+        nW = nAlongSz : nH = nAcrossSz
+    end if
+end sub
+
+' along / across extents to a control-local rect.
+private sub MapRect( byval p as TKSLIDER_STATE ptr, byref rc as TKRECT, byval aLo as long, byval aHi as long, _
+                     byval xLo as long, byval xHi as long )
+    if p->nOrientation = TKSL_VERTICAL then
+        tkRect_Set( rc, xLo, aLo, xHi, aHi )
+    else
+        tkRect_Set( rc, aLo, xLo, aHi, xHi )
+    end if
+end sub
+
+' A label's extent along the axis.
+private sub LabelAlong( byval p as TKSLIDER_STATE ptr, byval i as long, byref s as long, byref e as long )
+    if p->nOrientation = TKSL_VERTICAL then
+        s = p->labelRc(i).top : e = p->labelRc(i).bottom
+    else
+        s = p->labelRc(i).left : e = p->labelRc(i).right
+    end if
+end sub
+
+private function LabelsClash( byval p as TKSLIDER_STATE ptr, byval i as long, byval j as long, byval gap as long ) as boolean
+    dim as long si, ei, sj, ej
+    LabelAlong( p, i, si, ei )
+    LabelAlong( p, j, sj, ej )
+    return (si < ej + gap) andalso (sj < ei + gap)
+end function
+
+sub TKSLIDER_STATE.Layout()
+    this.bLayoutDirty = false
+    tkRect_SetEmpty( this.rcTrack ) : tkRect_SetEmpty( this.rcFill )
+    tkRect_SetEmpty( this.rcThumb ) : tkRect_SetEmpty( this.rcTarget )
+    tkRect_SetEmpty( this.rcThumb1 ) : tkRect_SetEmpty( this.rcTarget1 ) : tkRect_SetEmpty( this.rcBody )
+    tkRect_SetEmpty( this.rcTicks1 ) : tkRect_SetEmpty( this.rcTicks2 ) : tkRect_SetEmpty( this.rcLabels )
+    this.a0 = 0 : this.a1 = 0
+    if this.hWin = 0 then exit sub
+    dim as long labelSize = FillLabels( @this )
+    dim as long cw = this.hWin->cw, ch = this.hWin->ch
+    if (cw <= 0) orelse (ch <= 0) then this.bLayoutDirty = true : exit sub
+    dim as boolean vert = (this.nOrientation = TKSL_VERTICAL)
+    dim as TK_HOST ptr h = this.hWin->pHost
+    dim as long rp = this.RingPad()
+    dim as long cl = rp, ct = rp, cr = cw - rp, cb = ch - rp
+    dim as long alo = iif( vert, ct, cl ), ahi = iif( vert, cb, cr )
+    dim as long xlo = iif( vert, cl, ct ), xhi = iif( vert, cr, cb )
+
+    ' across: the block, centred
+    dim as long s1, s2
+    SideSizes( @this, labelSize, s1, s2 )
+    dim as long block = s1 + this.nThumbX + s2
+    dim as long bandLo = xlo + ((xhi - xlo) - block) \ 2 + s1
+    dim as long bandHi = bandLo + this.nThumbX
+
+    ' along: the travel
+    dim as long half = this.nThumbA \ 2
+    this.a0 = alo + half
+    this.a1 = ahi - (this.nThumbA - half)
+    if this.a1 < this.a0 then this.a1 = this.a0                   ' no travel: Span 0
+
+    dim as long t = this.nTrackThick
+    dim as long tLo = bandLo + (this.nThumbX - t) \ 2
+    dim as long trLo = this.a0 - t \ 2, trHi = this.a1 + (t - t \ 2)
+    MapRect( @this, this.rcTrack, trLo, trHi, tLo, tLo + t )
+
+    dim as long c = this.CentreOf( this.nValue )
+    dim as long minT = tkHost_Scale( h, TKSLIDER_MIN_TARGET )
+    dim as long gA = (minT - this.nThumbA + 1) \ 2, gX = (minT - this.nThumbX + 1) \ 2
+    if gA < 0 then gA = 0
+    if gX < 0 then gX = 0
+    MapRect( @this, this.rcThumb, c - half, c - half + this.nThumbA, bandLo, bandHi )
+    this.rcTarget = this.rcThumb
+    if vert then tkRect_Inflate( this.rcTarget, gX, gA ) else tkRect_Inflate( this.rcTarget, gA, gX )
+
+    if this.IsRange() then
+        ' range mode: the second thumb, and the fill (and the body a range drag grabs) between them
+        dim as long c1 = this.CentreOf( this.nUpper )
+        MapRect( @this, this.rcThumb1, c1 - half, c1 - half + this.nThumbA, bandLo, bandHi )
+        this.rcTarget1 = this.rcThumb1
+        if vert then tkRect_Inflate( this.rcTarget1, gX, gA ) else tkRect_Inflate( this.rcTarget1, gA, gX )
+        dim as long lo = iif( c < c1, c, c1 ), hi = iif( c < c1, c1, c )
+        if hi > lo then MapRect( @this, this.rcFill, lo, hi, tLo, tLo + t )
+        if hi > lo then MapRect( @this, this.rcBody, lo, hi, bandLo, bandHi )
+    else
+        dim as long o = c
+        select case this.nFillMode
+        case TKSL_FILL_MIN    : o = iif( this.Inverted(), trHi, trLo )
+        case TKSL_FILL_ORIGIN : o = this.CentreOf( Clamp_( this.nFillOrigin, this.nMin, this.nMax ) )
+        end select
+        if o <> c then MapRect( @this, this.rcFill, iif( o < c, o, c ), iif( o < c, c, o ), tLo, tLo + t )
+    end if
+
+    ' the tick and label bands (the whole content along)
+    dim as long tk = this.nTickGap + this.nTickLen
+    if TicksOn( @this, 1 ) then MapRect( @this, this.rcTicks1, alo, ahi, bandLo - tk, bandLo - this.nTickGap )
+    if TicksOn( @this, 2 ) then MapRect( @this, this.rcTicks2, alo, ahi, bandHi + this.nTickGap, bandHi + tk )
+    dim as long side = LabelSide( @this )
+    dim as long lLo = 0, lHi = 0
+    if side = 1 then
+        lHi = bandLo - iif( TicksOn( @this, 1 ), tk, 0 ) - this.nLabelGap
+        lLo = lHi - labelSize
+    elseif side = 2 then
+        lLo = bandHi + iif( TicksOn( @this, 2 ), tk, 0 ) + this.nLabelGap
+        lHi = lLo + labelSize
+    end if
+    if side <> 0 then MapRect( @this, this.rcLabels, alo, ahi, lLo, lHi )
+
+    ' ticks: positions, then the greedy thinning (the last always kept)
+    if this.nTicks = 0 then exit sub
+    dim as long minGap = tkHost_Scale( h, TKSLIDER_MIN_TICKSPACE )
+    dim as boolean marks = (this.nTickPlacement <> TKSL_TICKS_NONE)
+    dim as long lastKept = -1
+    for i as long = 0 to this.nTicks - 1
+        this.tickPos(i) = this.CentreOf( this.tickVal(i) )
+        this.tickShown(i) = false
+        if marks = false then continue for
+        if (lastKept < 0) orelse (abs( this.tickPos(i) - this.tickPos(lastKept) ) >= minGap) then
+            this.tickShown(i) = true : lastKept = i
+        end if
+    next
+    dim as long nLast = this.nTicks - 1
+    if marks andalso (this.tickShown(nLast) = false) then
+        for j as long = nLast - 1 to 1 step -1
+            if this.tickShown(j) andalso (abs( this.tickPos(nLast) - this.tickPos(j) ) < minGap) then this.tickShown(j) = false
+        next
+        if (nLast = 0) orelse (abs( this.tickPos(nLast) - this.tickPos(0) ) >= minGap) then this.tickShown(nLast) = true
+    end if
+
+    ' labels: centred on the tick, clamped inside the content, then thinned the same way
+    if side = 0 then exit sub
+    dim as long lgap = tkHost_Scale( h, TKSLIDER_MIN_LABELSPACE )
+    dim as long lastL = -1, lastCand = -1, firstL = -1
+    for i as long = 0 to this.nTicks - 1
+        this.labelShown(i) = false
+        if len( this.labelTxt(i) ) = 0 then continue for
+        dim as long lw = this.labelRc(i).right, lh = this.labelRc(i).bottom
+        if vert then
+            dim as long y = this.tickPos(i) - lh \ 2
+            if y + lh > cb then y = cb - lh
+            if y < ct then y = ct
+            dim as long x = iif( side = 2, lLo, lHi - lw )
+            tkRect_Set( this.labelRc(i), x, y, x + lw, y + lh )
+        else
+            dim as long x = this.tickPos(i) - lw \ 2
+            if x + lw > cr then x = cr - lw
+            if x < cl then x = cl
+            tkRect_Set( this.labelRc(i), x, lLo, x + lw, lLo + lh )
+        end if
+        lastCand = i
+        if (lastL < 0) orelse (LabelsClash( @this, i, lastL, lgap ) = false) then
+            this.labelShown(i) = true : lastL = i
+            if firstL < 0 then firstL = i
+        end if
+    next
+    if (lastCand >= 0) andalso (this.labelShown(lastCand) = false) then
+        for j as long = lastCand - 1 to 0 step -1
+            if this.labelShown(j) andalso (j <> firstL) andalso LabelsClash( @this, j, lastCand, lgap ) then this.labelShown(j) = false
+        next
+        if (firstL = lastCand) orelse (LabelsClash( @this, firstL, lastCand, lgap ) = false) then this.labelShown(lastCand) = true
+    end if
+end sub
+
+' ==========================================================================================
+' Painting
+' ==========================================================================================
+sub RenderDefault( byval p as TKSLIDER_STATE ptr, byval pi as TKSLIDER_PAINTINFO ptr )
+    dim as TK_PAINT ptr b = pi->b
+    if tkRect_IsEmpty( pi->rcTrack ) then exit sub
+    dim as TK_HOST ptr h = p->hWin->pHost
+    dim as boolean vert = (pi->nOrientation = TKSL_VERTICAL)
+    dim as ulong clrTrack, clrFill, clrTick, clrLabel
+    dim as ulong clrThumb(0 to 1), clrBorder(0 to 1)
+    with p->colors
+        if pi->isEnabled = false then
+            clrTrack = .TrackColorDisabled : clrFill = .FillColorDisabled
+            clrTick = .TickColorDisabled : clrLabel = .LabelColorDisabled
+            for k as long = 0 to 1
+                clrThumb(k) = .ThumbColorDisabled : clrBorder(k) = .ThumbBorderColorDisabled
+            next
+        else
+            clrTrack = .TrackColor : clrTick = .TickColor : clrLabel = .LabelColor : clrFill = .FillColor
+            for k as long = 0 to 1
+                if (pi->nPressedThumb = k) orelse (pi->nPressedThumb = TKSL_THUMB_BOTH) then
+                    clrFill = .FillColorHot : clrThumb(k) = .ThumbColorPressed : clrBorder(k) = .ThumbBorderColorHot
+                elseif pi->nHotThumb = k then
+                    clrFill = .FillColorHot : clrThumb(k) = .ThumbColorHot : clrBorder(k) = .ThumbBorderColorHot
+                else
+                    clrThumb(k) = .ThumbColor : clrBorder(k) = .ThumbBorderColor
+                end if
+            next
+        end if
+    end with
+
+    ' track, then the fill over it: both pills (corner diameter = thickness)
+    dim as TKRECT r = pi->rcTrack
+    dim as long t = iif( vert, r.right - r.left, r.bottom - r.top )
+    b->SetBackColor( clrTrack )
+    b->PaintRoundRect( @r, t )
+    if tkRect_IsEmpty( pi->rcFill ) = false then
+        r = pi->rcFill
+        b->SetBackColor( clrFill )
+        b->PaintRoundRect( @r, t )
+    end if
+
+    ' tick marks, one scaled pixel wide
+    if p->nTicks > 0 then
+        dim as long tw = tkHost_Scale( h, 1 )
+        if tw < 1 then tw = 1
+        b->SetBackColor( clrTick )
+        for i as long = 0 to p->nTicks - 1
+            if p->tickShown(i) = false then continue for
+            dim as long s = p->tickPos(i) - tw \ 2
+            for band as long = 1 to 2
+                dim as TKRECT rb = p->rcTicks2
+                if band = 1 then rb = p->rcTicks1
+                if tkRect_IsEmpty( rb ) then continue for
+                if vert then
+                    tkRect_Set( r, rb.left, s, rb.right, s + tw )
+                else
+                    tkRect_Set( r, s, rb.top, s + tw, rb.bottom )
+                end if
+                b->PaintRect( @r )
+            next
+        next
+        ' labels
+        dim as TTF_Font ptr f = LabelFont( p )
+        if (f <> 0) andalso (tkRect_IsEmpty( p->rcLabels ) = false) then
+            b->SetFont( f )
+            b->SetColors( clrLabel, p->colors.BackColor )
+            for i as long = 0 to p->nTicks - 1
+                if p->labelShown(i) = false then continue for
+                r = p->labelRc(i)
+                b->PaintText( p->labelTxt(i), @r, TK_DT_LEFT or TK_DT_NOCLIP )
+            next
+        end if
+    end if
+
+    ' the thumbs: filled, the border stroked inside; the inactive one first, the active on top
+    dim as long corner = 2 * tkHost_Scale( h, TKSLIDER_RECT_CORNER )
+    dim as long nThumbs = iif( pi->nThumbs = 2, 2, 1 )
+    for n as long = 0 to nThumbs - 1
+        dim as long k = n
+        if nThumbs = 2 then k = iif( n = 0, 1 - pi->nActiveThumb, pi->nActiveThumb )
+        r = pi->rcThumb
+        if k = 1 then r = pi->rcThumb1
+        b->SetBackColor( clrThumb(k) )
+        b->SetPenColor( clrBorder(k) )
+        if pi->nThumbShape = TKSL_THUMB_RECT then
+            if p->nBorderThick > 0 then
+                b->PaintRoundBorderRect( @r, corner, p->nBorderThick )
+            else
+                b->PaintRoundRect( @r, corner )
+            end if
+        else
+            b->PaintEllipse( @r, p->nBorderThick )
+        end if
+    next
+
+    ' the ring round the thumb, an outline drawn over everything
+    if pi->isFocused andalso (p->nFocusThick > 0) then
+        r = pi->rcFocus
+        b->SetPenColor( p->colors.FocusRingColor )
+        if pi->nThumbShape = TKSL_THUMB_RECT then
+            b->PaintRoundOutline( @r, corner + 2 * p->RingPad(), p->nFocusThick )
+        else
+            b->PaintRoundOutline( @r, iif( vert, r.right - r.left, r.bottom - r.top ), p->nFocusThick )
+        end if
+    end if
+end sub
+
+sub OnPaint( byval p as TKSLIDER_STATE ptr, byval b as TK_PAINT ptr )
+    EnsureLayout( p )
+    dim as TKSLIDER_PAINTINFO pi
+    pi.hSlider = p->hWin
+    pi.b = b
+    tkRect_Set( pi.rcClient, 0, 0, p->hWin->cw, p->hWin->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @pi.rcClient )
+    pi.rcTrack = p->rcTrack
+    pi.rcFill = p->rcFill
+    pi.rcThumb = p->rcThumb
+    pi.nThumbs = iif( p->IsRange(), 2, 1 )
+    pi.nActiveThumb = iif( p->IsRange(), p->nActive, 0 )
+    if p->IsRange() then pi.rcThumb1 = p->rcThumb1
+    pi.nUpperValue = p->nUpper
+    pi.rcFocus = p->rcThumb
+    if pi.nActiveThumb = 1 then pi.rcFocus = p->rcThumb1
+    tkRect_Inflate( pi.rcFocus, p->RingPad(), p->RingPad() )
+    pi.nHotThumb = p->nHot
+    pi.nPressedThumb = -1
+    if p->isPaging then
+        pi.nPressedThumb = p->nPageThumb
+    elseif p->isDragging then
+        pi.nPressedThumb = iif( p->nDrag >= 0, p->nDrag, p->nActive )
+    end if
+    pi.isEnabled = p->isEnabled
+    pi.isFocused = p->isFocused
+    pi.isReadOnly = p->isReadOnly
+    pi.nOrientation = p->nOrientation
+    pi.bReversed = p->bReversed
+    pi.nThumbShape = p->nThumbShape
+    pi.nValue = p->nValue
+    if p->PaintCallback then
+        p->PaintCallback( @pi )
+    else
+        RenderDefault( p, @pi )
+    end if
+end sub
+
+' ==========================================================================================
+' The value tip: a tracked tkTooltip of its own (the hover tip's callback would override its
+' text), made on first use, over the thumb.
+' ==========================================================================================
+sub HideTip( byval p as TKSLIDER_STATE ptr )
+    if p->bTipShown = false then exit sub
+    p->bTipShown = false
+    tkTipHost_TrackHide( @p->vtip )
+    ' its own dwell clock still watches the control: give it nothing to re-show
+    if tkTipHost_Tip( @p->vtip ) then tkTooltip_SetText( tkTipHost_Tip( @p->vtip ), "" )
+end sub
+
+sub UpdateTip( byval p as TKSLIDER_STATE ptr )
+    dim as boolean want = false
+    if p->isEnabled andalso (p->hWin <> 0) andalso p->hWin->isVisible then
+        select case p->nShowTip
+        case TKSL_TIP_DRAG    : want = p->isDragging orelse p->isPaging
+        case TKSL_TIP_FOCUSED : want = p->isFocused orelse p->isDragging orelse p->isPaging
+        end select
+    end if
+    if want then
+        EnsureLayout( p )
+        if p->bLayoutDirty then want = false
+    end if
+    if want = false then HideTip( p ) : exit sub
+    if tkTipHost_Tip( @p->vtip ) = 0 then
+        tkTipHost_SetTracked( @p->vtip, true )
+        tkTipHost_SetDelay( @p->vtip, TK_TIPDELAY_AUTOPOP, 0 )          ' a tracked tip never auto-pops
+        if tkTipHost_Ensure( @p->vtip, p->hWin ) = false then exit sub
+    end if
+    tkTipHost_Pop( @p->tip )
+    dim as long k = p->nActive
+    if p->isPaging then k = p->nPageThumb
+    if p->isDragging andalso (p->nDrag >= 0) then k = p->nDrag
+    if p->IsRange() = false then k = 0
+    if k = TKSL_THUMB_BOTH then
+        tkTipHost_TrackShow( @p->vtip, p->rcBody, FormatV( p, p->nValue, TKSL_FMT_TIP ) & " - " & FormatV( p, p->nUpper, TKSL_FMT_TIP ), TIP_ALIGN_ABOVE )
+    elseif k = 1 then
+        tkTipHost_TrackShow( @p->vtip, p->rcThumb1, FormatV( p, p->nUpper, TKSL_FMT_TIP ), TIP_ALIGN_ABOVE )
+    else
+        tkTipHost_TrackShow( @p->vtip, p->rcThumb, FormatV( p, p->nValue, TKSL_FMT_TIP ), TIP_ALIGN_ABOVE )
+    end if
+    p->bTipShown = true
+end sub
+
+' ==========================================================================================
+' Public API: ticks and labels (moved here to keep tkSlider.tiko under 1500 lines)
+' ==========================================================================================
+' ---- ticks and labels -----------------------------------------------------------------------
+public function tkSlider_GetTickFrequency( byval hSlider as TK_WIDGET ptr ) as double
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then return 0
+    return p->nTickFreq
+end function
+
+' Ticks at Min + k * f, plus Max; 0 = none. An explicit list (SetTicks) takes precedence.
+public sub tkSlider_SetTickFrequency( byval hSlider as TK_WIDGET ptr, byval f as double )
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then exit sub
+    p->nTickFreq = iif( f < 0, 0, f )
+    p->bTicksDirty = true
+    if p->bSnapToTicks then p->Resnap()
+    p->Refresh()
+end sub
+
+' Ticks at exactly these values (sorted, those outside the range dropped); an empty array returns
+' to TickFrequency.
+public sub tkSlider_SetTicks( byval hSlider as TK_WIDGET ptr, values() as double )
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then exit sub
+    dim as long n = ubound( values ) - lbound( values ) + 1
+    if n < 0 then n = 0
+    p->nUserTicks = n
+    erase p->userTicks
+    if n > 0 then
+        redim p->userTicks( 0 to n - 1 )
+        for i as long = 0 to n - 1
+            p->userTicks(i) = values( lbound( values ) + i )
+        next
+    end if
+    p->bTicksDirty = true
+    if p->bSnapToTicks then p->Resnap()
+    p->Refresh()
+end sub
+
+public function tkSlider_GetTickPlacement( byval hSlider as TK_WIDGET ptr ) as long
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then return TKSL_TICKS_NONE
+    return p->nTickPlacement
+end function
+
+public sub tkSlider_SetTickPlacement( byval hSlider as TK_WIDGET ptr, byval nPlacement as long )
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then exit sub
+    select case nPlacement
+    case TKSL_TICKS_NONE, TKSL_TICKS_TOPLEFT, TKSL_TICKS_BOTTOMRIGHT, TKSL_TICKS_BOTH
+        p->nTickPlacement = nPlacement
+        p->Refresh()
+    end select
+end sub
+
+public function tkSlider_GetSnapToTicks( byval hSlider as TK_WIDGET ptr ) as boolean
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then return false
+    return p->bSnapToTicks
+end function
+
+' The tick values replace the Step grid as the legal values (when there are ticks). Re-snaps.
+public sub tkSlider_SetSnapToTicks( byval hSlider as TK_WIDGET ptr, byval bSnap as boolean )
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then exit sub
+    p->bSnapToTicks = bSnap
+    p->Resnap()
+    p->Refresh()
+end sub
+
+public function tkSlider_GetShowTickLabels( byval hSlider as TK_WIDGET ptr ) as boolean
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then return false
+    return p->bShowLabels
+end function
+
+' Labels on the ticks' side (BOTH: the bottom / right one; NONE: bottom / right, no marks).
+public sub tkSlider_SetShowTickLabels( byval hSlider as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then exit sub
+    p->bShowLabels = bShow
+    p->Refresh()
+end sub
+
+public function tkSlider_GetLabelEvery( byval hSlider as TK_WIDGET ptr ) as long
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then return 1
+    return p->nLabelEvery
+end function
+
+' A label on every n-th tick (from the first; the last tick always has one). Floored at 1.
+public sub tkSlider_SetLabelEvery( byval hSlider as TK_WIDGET ptr, byval n as long )
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then exit sub
+    p->nLabelEvery = iif( n < 1, 1, n )
+    p->Refresh()
+end sub
+
+private function TickOk( byval p as TKSLIDER_STATE ptr, byval i as long ) as boolean
+    if p = 0 then return false
+    EnsureLayout( p )
+    return (i >= 0) andalso (i < p->nTicks)
+end function
+
+' All tick values, shown or thinned away.
+public function tkSlider_GetTickCount( byval hSlider as TK_WIDGET ptr ) as long
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then return 0
+    if p->bTicksDirty then p->BuildTicks()
+    return p->nTicks
+end function
+
+public function tkSlider_GetTickValue( byval hSlider as TK_WIDGET ptr, byval i as long ) as double
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if TickOk( p, i ) = false then return 0
+    return p->tickVal(i)
+end function
+
+' The tick's centre along the axis, control-local (x horizontal, y vertical).
+public function tkSlider_GetTickPos( byval hSlider as TK_WIDGET ptr, byval i as long ) as long
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if TickOk( p, i ) = false then return 0
+    return p->tickPos(i)
+end function
+
+' FALSE for a tick thinned away (closer than MIN_TICKSPACE to a shown one) or when no marks are drawn.
+public function tkSlider_GetTickShown( byval hSlider as TK_WIDGET ptr, byval i as long ) as boolean
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if TickOk( p, i ) = false then return false
+    return p->tickShown(i)
+end function
+
+' The label's rect, control-local; FALSE when tick i has no label shown.
+public function tkSlider_GetLabelRect( byval hSlider as TK_WIDGET ptr, byval i as long, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if TickOk( p, i ) = false then return false
+    if p->labelShown(i) = false then return false
+    rc = p->labelRc(i)
+    return true
+end function
+
+public function tkSlider_GetLabelText( byval hSlider as TK_WIDGET ptr, byval i as long ) as ustring
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if TickOk( p, i ) = false then return ""
+    return p->labelTxt(i)
+end function
+
+public function tkSlider_GetFont( byval hSlider as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then return 0
+    return p->pFont
+end function
+
+' The labels' font (borrowed); 0 = the host's default font.
+public sub tkSlider_SetFont( byval hSlider as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKSLIDER_STATE ptr p = SL( hSlider )
+    if p = 0 then exit sub
+    p->pFont = f
+    p->Refresh()
+end sub
+
+' The form's font roles (tkForms): the text font for the labels; the glyph font is unused.
+public sub tkSlider_ApplyFonts( byval hSlider as TK_WIDGET ptr, byval fText as TTF_Font ptr, byval fGlyph as TTF_Font ptr )
+    tkSlider_SetFont( hSlider, fText )
+end sub

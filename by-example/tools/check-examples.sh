@@ -31,6 +31,7 @@
 #                                              listing links. Implies cwd: listing; a source
 #                                              named here is not a listing of its own
 #                 env: LD_LIBRARY_PATH=.       set for the run, on every target
+#                 stderr: drop               the run's stderr is not compared, only stdout and the exit code
 #                 verb: test                   the listing is a file of a project whose
 #                                              output is a tiko SUBCOMMAND's, not a program's:
 #                                              `tiko <verb> <.args>` runs in the listing's
@@ -271,6 +272,7 @@ for t in "${targets[@]}"; do
 done
 
 # ------------------------------------------------------------------ listings
+exec 7>/dev/null   # where a 'stderr: drop' listing's stderr goes
 meta_get() { [[ -f "$1" ]] && sed -nE "s/^$2:[[:space:]]*//p" "$1" | head -1; }
 
 all=(); while IFS= read -r _l; do all+=("$_l"); done < <(find examples \( -name '*.tiko' -o -name '*.bas' \) | sed 's|\\|/|g' | sort)
@@ -322,6 +324,8 @@ for f in "${listings[@]}"; do
   cwd="$(meta_get "$meta" cwd)"
   prebuild="$(meta_get "$meta" prebuild)"
   runenv="$(meta_get "$meta" env)"
+  # stderr: drop -- the run's stderr is not compared (a report full of addresses and pids).
+  errfd=1; [[ "$(meta_get "$meta" stderr)" == drop ]] && errfd=7
   project="$(meta_get "$meta" project)"
   verb="$(meta_get "$meta" verb)"
   show="$(meta_get "$meta" show)"
@@ -434,15 +438,15 @@ for f in "${listings[@]}"; do
       # One quoted eval: the .args line is parsed once, as a shell would, so a '*' inside
       # quotes reaches the program instead of being expanded against the directory.
       if [[ -f "$base.stdin" ]]; then
-        got="$(cd "$dir" && eval "$runenv \"\$root/\$exe\" $args" < "$root/$base.stdin" 2>&1)"
+        got="$(cd "$dir" && eval "$runenv \"\$root/\$exe\" $args" < "$root/$base.stdin" 2>&$errfd)"
       else
-        got="$(cd "$dir" && eval "$runenv \"\$root/\$exe\" $args" 2>&1)"
+        got="$(cd "$dir" && eval "$runenv \"\$root/\$exe\" $args" 2>&$errfd)"
       fi
     else
       if [[ -f "$base.stdin" ]]; then
-        got="$(wsl -d "$WSL_DISTRO" -- bash -c "cd '$book_wsl/$dir' && $runenv '$book_wsl/$exe' $args" < "$base.stdin" 2>&1)"
+        got="$(wsl -d "$WSL_DISTRO" -- bash -c "cd '$book_wsl/$dir' && $runenv '$book_wsl/$exe' $args" < "$base.stdin" 2>&$errfd)"
       else
-        got="$(wsl -d "$WSL_DISTRO" -- bash -c "cd '$book_wsl/$dir' && $runenv '$book_wsl/$exe' $args" 2>&1)"
+        got="$(wsl -d "$WSL_DISTRO" -- bash -c "cd '$book_wsl/$dir' && $runenv '$book_wsl/$exe' $args" 2>&$errfd)"
       fi
     fi
     rc=$?

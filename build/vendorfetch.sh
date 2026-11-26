@@ -4,6 +4,10 @@
 #   sh build/vendorfetch.sh                    into the tree's own pkg/vendor/*/lib
 #   sh build/vendorfetch.sh --out DIR          into DIR/vendor/*/lib (package.sh: $OUT/pkg)
 #   sh build/vendorfetch.sh --module sqlite3   one module only
+#   sh build/vendorfetch.sh --target android-x86_64|android-arm64
+#                                              on Windows: the [android.<n>] (x86_64) or
+#                                              [android-arm64.<n>] entries, cross-built with the
+#                                              NDK (docs/tiko-android A2, A3)
 #
 # A vendor package commits its translated headers and a fetch.toml; its binaries are never
 # committed. This reads each pkg/vendor/<module>/fetch.toml and, for THIS host's [<os>.<n>]
@@ -16,8 +20,9 @@
 # (tkControls' scintk, SDL3's static libraries, raylib6's Linux .so) and copies what it made; its
 # optional 'inputs' -- 'url sha256 url sha256 ...' -- are fetched and verified first, like any
 # download, and handed to the script as TIKO_VENDOR_INPUTS (the local paths, in order), with
-# TIKO_VENDOR_HOST (windows, linux, macos: the OS, also on linux-arm64), TIKO_VENDOR_ARCH
-# (x86_64, arm64) and TIKO_VENDOR_CACHE. A 'cbuild' entry's optional
+# TIKO_VENDOR_HOST (windows, linux, macos: the OS, also on linux-arm64; android under --target,
+# with TIKO_ANDROID_NDK and TIKO_ANDROID_SDK), TIKO_VENDOR_ARCH (x86_64, arm64) and
+# TIKO_VENDOR_CACHE. A 'cbuild' entry's optional
 # 'patches' -- files committed in the package, relative to it, applied in order with 'patch -p1'
 # inside 'dir' before compiling -- carry upstream fixes no release has yet. Its optional
 # 'copies' -- 'from:to' pairs, both relative to 'dir' -- are copied after the patches: the
@@ -38,12 +43,15 @@ set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$ROOT/pkg"
 ONLY=
+XTARGET=
+SYSROOTOPT=
 die( ) { echo "vendorfetch: $*" >&2; exit 1; }
 note( ) { echo "vendorfetch: $*"; }
 while [ $# -gt 0 ]; do
     case $1 in
         --out)    OUT=$2;  shift 2 ;;
         --module) ONLY=$2; shift 2 ;;
+        --target) XTARGET=$2; shift 2 ;;
         -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1'" ;;
     esac
@@ -60,7 +68,6 @@ case "$(uname -s)" in
         FLAVOUR=${TIKO_VENDOR_FLAVOUR:-msvc}
         VOS=windows
         TABLES=windows
-        SYSROOT_ARG=
         # NO CALLING-CONVENTION FLAG: the MinGW C convention is cdecl, which is what
         # clang's MinGW target already uses, and the one library that wants otherwise
         # says so in its own header (cJSON's CJSON_PUBLIC is __stdcall on Windows) --
@@ -76,7 +83,7 @@ case "$(uname -s)" in
             # THE SYSROOT IS NAMED, because clang does not find the i686 one by itself:
             # a clang.cfg beside it pins the 64-bit root, and the 64-bit root has no i686
             # headers ('stdio.h' file not found, measured).
-            [ -n "${TIKO_MINGW_ROOT:-}" ] && SYSROOT_ARG="--sysroot=$TIKO_MINGW_ROOT"
+            [ -n "${TIKO_MINGW_ROOT:-}" ] && SYSROOTOPT="--sysroot=$TIKO_MINGW_ROOT"
         else
             TRIPLE=x86_64-pc-windows-msvc; VARCH=x86_64
         fi
@@ -97,6 +104,36 @@ case "$(uname -s)" in
         CLANG=${TIKO_CLANG:-${CLANG:-clang}}
         AR=${TIKO_AR:-$(command -v llvm-ar || command -v ar)} ;;
     *) die "unsupported host '$(uname -s)'" ;;
+esac
+# A CROSS TARGET: Android, from Windows. Its C sources need Bionic's headers, so clang gets the
+# NDK's sysroot (the NDK found as the compiler finds it: TIKO_ANDROID_NDK, ANDROID_NDK_HOME,
+# ANDROID_NDK_ROOT, then the highest <sdk>/ndk/<version>), and the archive is static.
+case "$XTARGET" in
+    "") ;;
+    android-x86_64|android-arm64)
+        [ "$HOST" = windows ] || die "--target $XTARGET runs from Windows"
+        # The cross target selects its own tables, even if the host defaults named a Windows
+        # flavour above; the NDK sysroot replaces any MinGW one.
+        TABLES=
+        _sdk=${ANDROID_HOME:-${LOCALAPPDATA:-}/Android/Sdk}
+        _ndk=${TIKO_ANDROID_NDK:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-$(ls -d "$_sdk"/ndk/* 2>/dev/null | sort -V | tail -1)}}}
+        _sr=$_ndk/toolchains/llvm/prebuilt/windows-x86_64/sysroot
+        [ -f "$_sr/usr/include/stdio.h" ] || die "no Android NDK sysroot at '$_sr' (set ANDROID_NDK_HOME)"
+        command -v cygpath > /dev/null 2>&1 && _sr=$(cygpath -m "$_sr")
+        if [ "$XTARGET" = android-arm64 ]; then
+            HOST=android-arm64; TRIPLE=aarch64-linux-android29; VARCH=arm64
+        else
+            HOST=android; TRIPLE=x86_64-linux-android29; VARCH=x86_64
+        fi
+        # A 'script' entry (SDL3's CMake build, A4) gets the OS as android and the NDK and SDK
+        # themselves: CMake takes the NDK's toolchain file, and SDL's Java is compiled against
+        # the SDK's android.jar.
+        VOS=android
+        TIKO_ANDROID_NDK=$(cygpath -m "$_ndk" 2>/dev/null || printf '%s' "$_ndk")
+        TIKO_ANDROID_SDK=$(cygpath -m "$_sdk" 2>/dev/null || printf '%s' "$_sdk")
+        export TIKO_ANDROID_NDK TIKO_ANDROID_SDK
+        SYSROOTOPT="--sysroot=$_sr" ;;
+    *) die "--target: android-x86_64 and android-arm64 are the cross targets" ;;
 esac
 CACHE=${TIKO_VENDOR_CACHE:-$ROOT/build/.vendorfetch}
 mkdir -p "$CACHE"
@@ -235,7 +272,7 @@ entry( ) {
         for _s in $(_get sources); do
             _o="$_x/$(basename "$_s" .c).o"
             # shellcheck disable=SC2046
-            "$CLANG" --target=$TRIPLE $SYSROOT_ARG $(_get cflags) -c "$_dir/$_s" -o "$_o" || die "$_mod: clang failed on $_s"
+            "$CLANG" --target=$TRIPLE $SYSROOTOPT $(_get cflags) -c "$_dir/$_s" -o "$_o" || die "$_mod: clang failed on $_s"
             _objs="$_objs $_o"
         done
         _st=$(_get static); _sh=$(_get shared)
@@ -254,7 +291,7 @@ entry( ) {
                 # -implib:, not /implib: -- MSYS would rewrite a leading slash as a path.
                 _imp="$(cygpath -m "$_x" 2>/dev/null || printf '%s' "$_x")/$(basename "$_sh" .dll).lib"
                 # shellcheck disable=SC2086
-                "$CLANG" --target=$TRIPLE $SYSROOT_ARG -shared -fuse-ld=lld -o "$_mdir/$_sh" \
+                "$CLANG" --target=$TRIPLE $SYSROOTOPT -shared -fuse-ld=lld -o "$_mdir/$_sh" \
                     -Wl,-implib:"$_imp" \
                     $_objs $(_get libs) || die "$_mod: linking $_sh failed"
             elif [ "$HOST" = macos ]; then

@@ -71,6 +71,7 @@ public type TKTEXTBOX_COLORS
     SelBackColor      as ulong = &hFF264F78ul
     SelForeColor      as ulong = &hFFFFFFFFul
     ForeColorDisabled as ulong = &hFF606670ul
+    ErrorColor        as ulong = &hFFE06C75ul    ' the border while SetError is on (a bound value that won't save)
 end type
 
 public type TKTEXTBOX_MESSAGEINFO
@@ -144,6 +145,7 @@ public type TKTEXTBOX_STATE
     bCaretOn        as boolean = true
     nCaretBlinkMs   as long = TKTEXTBOX_CARET_BLINK_MS
     bFocused        as boolean
+    bError          as boolean             ' SetError: the border in ErrorColor until the user's next change
     sComp           as string              ' the IME pre-edit, UTF-8 ("" = not composing)
     nCompCursor     as long                ' byte offset of the IME cursor inside sComp
     fWheelAccum     as single
@@ -685,6 +687,11 @@ end sub
 ' Editing: the one primitive, undo, the clipboard
 ' ==========================================================================================
 private sub TbNotifyChange( byval t as TKTEXTBOX_STATE ptr )
+    ' the user changed the text: an error mark (SetError) has done its job
+    if t->bError then
+        t->bError = false
+        tkWidget_Invalidate( t->hWin )
+    end if
     if t->ChangeCallback then t->ChangeCallback( t->hWin )
 end sub
 
@@ -1005,7 +1012,11 @@ private sub TbOnPaint( byval t as TKTEXTBOX_STATE ptr, byval b as TK_PAINT ptr )
     b->PaintRect( @rcAll )
     b->SetBackColor( t->colors.BackColor )
     if t->nBorderWidth > 0 then
-        b->SetPenColor( iif( t->bFocused, t->colors.FocusBorderColor, t->colors.BorderColor ) )
+        if t->bError then
+            b->SetPenColor( t->colors.ErrorColor )
+        else
+            b->SetPenColor( iif( t->bFocused, t->colors.FocusBorderColor, t->colors.BorderColor ) )
+        end if
         b->PaintRoundBorderRect( @rcAll, 2 * t->nCornerRadius, t->nBorderWidth )
     else
         b->PaintRoundRect( @rcAll, 2 * t->nCornerRadius )
@@ -1450,6 +1461,20 @@ end sub
 ' ==========================================================================================
 public declare function tkTextBox_ThemeColors( byref t as TKTHEME_COLORS ) as TKTEXTBOX_COLORS
 
+' The screen keyboard the box's modes ask for (docs/fasting-android F4 X1): a note's, a line's, a
+' password's, or a number pad -- decimal when DecimalPlaces > 0.
+private sub TbTextKind( byval t as TKTEXTBOX_STATE ptr )
+    dim as long k = TK_TEXT_LINE
+    if t->bMultiline then
+        k = TK_TEXT_MULTILINE
+    elseif t->chPassword <> 0 then
+        k = TK_TEXT_PASSWORD
+    elseif t->bNumeric then
+        k = iif( t->nDecimals > 0, TK_TEXT_DECIMAL, TK_TEXT_INTEGER )
+    end if
+    tkWidget_SetTextKind( t->hWin, k )
+end sub
+
 ' bMultiline is fixed for the control's lifetime.
 public function tkTextBox_Create( byval hParent as TK_WIDGET ptr, byval CtrlID as long, byval bMultiline as boolean = false ) as TK_WIDGET ptr
     if hParent = 0 then return 0
@@ -1461,6 +1486,7 @@ public function tkTextBox_Create( byval hParent as TK_WIDGET ptr, byval CtrlID a
     w->bWantsText = true
     w->cursor = TK_CURSOR_IBEAM
     t->hWin = w
+    TbTextKind( t )
     t->nScrollW = tkHost_Scale( w->pHost, TKVSCROLL_DEFAULT_WIDTH )
     t->colors = tkTextBox_ThemeColors( tkTheme_Of( w ) )
     ' the theme's recipes for this type apply from the start, not just after a theme change
@@ -1602,6 +1628,7 @@ public sub tkTextBox_SetPasswordChar( byval hTextBox as TK_WIDGET ptr, byval wch
     if (t = 0) orelse t->bMultiline then exit sub
     t->chPassword = wchChar
     t->sMask = iif( wchChar <> 0, TbUtf8Of( wchChar ), "" )
+    TbTextKind( t )
     TbTextChanged( t )
     TbEnsureCaretVisible( t )
     tkWidget_Invalidate( hTextBox )
@@ -1701,6 +1728,7 @@ public sub tkTextBox_SetNumericMode( byval hTextBox as TK_WIDGET ptr, byval bEna
     dim as TKTEXTBOX_STATE ptr t = TB( hTextBox )
     if (t = 0) orelse t->bMultiline then exit sub
     t->bNumeric = bEnable
+    TbTextKind( t )
 end sub
 
 public function tkTextBox_GetDecimalPlaces( byval hTextBox as TK_WIDGET ptr ) as integer
@@ -1711,7 +1739,9 @@ end function
 
 public sub tkTextBox_SetDecimalPlaces( byval hTextBox as TK_WIDGET ptr, byval nPlaces as integer )
     dim as TKTEXTBOX_STATE ptr t = TB( hTextBox )
-    if t then t->nDecimals = iif( nPlaces < 0, 0, nPlaces )
+    if t = 0 then exit sub
+    t->nDecimals = iif( nPlaces < 0, 0, nPlaces )
+    TbTextKind( t )
 end sub
 
 ' Empty, "-" and "." read as 0.
@@ -1951,6 +1981,28 @@ public function tkTextBox_GetCueBannerText( byval hTextBox as TK_WIDGET ptr ) as
     return t->wszCue
 end function
 
+' An error mark (Form Designer B2: a bound value that won't save): the border drawn in ErrorColor,
+' focused or not, until SetError( false ) or the user's next change to the text. Silent.
+public sub tkTextBox_SetError( byval hTextBox as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKTEXTBOX_STATE ptr t = TB( hTextBox )
+    if (t = 0) orelse (t->bError = bOn) then exit sub
+    t->bError = bOn
+    tkWidget_Invalidate( hTextBox )
+end sub
+
+public function tkTextBox_GetError( byval hTextBox as TK_WIDGET ptr ) as boolean
+    dim as TKTEXTBOX_STATE ptr t = TB( hTextBox )
+    if t = 0 then return false
+    return t->bError
+end function
+
+public function tkTextBox_GetErrorColor( byval hTextBox as TK_WIDGET ptr ) as ulong
+    return TbGetColor( hTextBox, 9 )
+end function
+public sub tkTextBox_SetErrorColor( byval hTextBox as TK_WIDGET ptr, byval clr as ulong )
+    TbSetColor( hTextBox, 9, clr )
+end sub
+
 public sub tkTextBox_SetCueBannerText( byval hTextBox as TK_WIDGET ptr, byval Text as ustring )
     dim as TKTEXTBOX_STATE ptr t = TB( hTextBox )
     if t = 0 then exit sub
@@ -2038,6 +2090,7 @@ public function tkTextBox_ThemeColors( byref t as TKTHEME_COLORS ) as TKTEXTBOX_
     c.BackColor = t.Surface : c.ForeColor = t.Text : c.CueColor = t.TextDim
     c.BorderColor = t.Border : c.FocusBorderColor = t.FocusRing : c.OuterBackColor = t.Window
     c.SelBackColor = t.Selected : c.SelForeColor = t.SelectedText : c.ForeColorDisabled = t.TextDisabled
+    c.ErrorColor = t.Error
     return c
 end function
 

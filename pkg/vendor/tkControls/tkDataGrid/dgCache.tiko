@@ -1,0 +1,225 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- the block cache (phase G6; AG Grid's infinite row model, DevExpress Instant Feedback).
+'
+' OPT-IN over a virtual feed or a source whose reads are slow: tkDataGrid_SetBlockCache( h, rows,
+' blocks ). Rows are held in blocks of `rows` (block b = rows b * rows ..); at most `blocks` of them,
+' the least recently painted one reused first. Each block is a SLOT of one flat array of values
+' (slot s, row i, model column k at (s * rows + i) * colCount + k), so a column change, like a row
+' change, simply drops them all.
+'
+' PAINT NEVER WAITS. A cell in a block that is not loaded paints a placeholder; the block is asked
+' for once: with a DataRequest callback, DataRequest( firstRow, count ) and the host answers with
+' tkDataGrid_SupplyRows -- at once, or later from the UI thread (a worker posts it with
+' tkApp_RunOnUI); with none, the grid fills the block itself from the feed (CellValueNeeded or the
+' source's GetCell), once, instead of once per paint.
+'
+' EVERY OTHER READ (the Get* API, copy, sort and filter keys, the editor's starting value, autosize,
+' tooltips) takes a loaded block's value, else reads the feed synchronously -- so copy over rows not
+' loaded fetches them (D-5). A host that answers only through SupplyRows has nothing to give there:
+' those cells read EMPTY.
+'
+' A write that the feed took is written into a loaded block too. Rows inserted or removed, a new
+' feed, Reset, a column added or deleted, a source that sorted itself: every block goes, and the next
+' paint asks again. SupplyRows fills only blocks the cache holds (asked for, not dropped since); a
+' host that resets should drop its own requests still in flight, or an old answer can land in the
+' block the new request is for.
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkPaint"
+using tkHost
+using tkPaint
+
+const DG_BLOCK_REQUESTED = 1
+const DG_BLOCK_LOADED = 2
+
+function DgCacheOn( byval p as TKDATAGRID_STATE ptr ) as boolean
+    return (p->cacheRows > 0) andalso (p->feed <> DG_FEED_STORE) andalso (p->colCount > 0)
+end function
+
+' Every block dropped (and the slots sized for the current columns).
+sub DgCacheClear( byval p as TKDATAGRID_STATE ptr )
+    if p->cacheRows <= 0 then exit sub
+    redim p->blkIdx( 0 to p->cacheMax - 1 )
+    redim p->blkState( 0 to p->cacheMax - 1 )
+    redim p->blkUsed( 0 to p->cacheMax - 1 )
+    for s as integer = 0 to p->cacheMax - 1
+        p->blkIdx(s) = -1
+    next
+    erase p->cacheVals
+    p->cacheCols = p->colCount
+    if p->colCount > 0 then redim p->cacheVals( 0 to p->cacheMax * p->cacheRows * p->colCount - 1 )
+    p->cacheHit = -1
+end sub
+
+' The slot holding block b, or -1.
+function DgCacheSlot( byval p as TKDATAGRID_STATE ptr, byval b as integer ) as integer
+    if (p->cacheHit >= 0) andalso (p->blkIdx(p->cacheHit) = b) then return p->cacheHit
+    for s as integer = 0 to p->cacheMax - 1
+        if p->blkIdx(s) = b then p->cacheHit = s : return s
+    next
+    return -1
+end function
+
+' A slot for block b: a free one, else the least recently used (its block is dropped).
+function DgCacheTake( byval p as TKDATAGRID_STATE ptr, byval b as integer ) as integer
+    dim as integer s_ = -1
+    for s as integer = 0 to p->cacheMax - 1
+        if p->blkIdx(s) = -1 then s_ = s : exit for
+        if (s_ < 0) orelse (p->blkUsed(s) < p->blkUsed(s_)) then s_ = s
+    next
+    dim as integer base_ = s_ * p->cacheRows * p->cacheCols
+    for i as integer = 0 to p->cacheRows * p->cacheCols - 1
+        p->cacheVals(base_ + i).Clear( )
+    next
+    p->blkIdx(s_) = b
+    p->blkState(s_) = 0
+    p->cacheTick += 1
+    p->blkUsed(s_) = p->cacheTick
+    return s_
+end function
+
+' A loaded block's value of model row / column: TRUE (and v), else FALSE.
+function DgCacheGet( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE ) as boolean
+    if (DgCacheOn( p ) = false) orelse (p->cacheCols <> p->colCount) then return false
+    dim as integer s = DgCacheSlot( p, row \ p->cacheRows )
+    if (s < 0) orelse (p->blkState(s) <> DG_BLOCK_LOADED) then return false
+    v = p->cacheVals((s * p->cacheRows + row mod p->cacheRows) * p->cacheCols + col)
+    return true
+end function
+
+' The paint's read: TRUE with the value, FALSE for a placeholder. A missing block is asked for once.
+function DgCachePaintRead( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE ) as boolean
+    if p->cacheCols <> p->colCount then DgCacheClear( p )
+    dim as integer b = row \ p->cacheRows
+    dim as integer s = DgCacheSlot( p, b )
+    if s < 0 then
+        s = DgCacheTake( p, b )
+        dim as integer first = b * p->cacheRows
+        dim as integer n = p->cacheRows
+        if first + n > p->rowCount then n = p->rowCount - first
+        if p->DataRequestCallback then
+            p->blkState(s) = DG_BLOCK_REQUESTED
+            p->nRequests += 1
+            p->DataRequestCallback( p->hWin, first, n )
+            ' the host may have answered at once (or reset everything)
+            s = DgCacheSlot( p, b )
+            if s < 0 then return false
+        else
+            ' no host to ask: read the block from the feed, once
+            dim as integer base_ = s * p->cacheRows * p->cacheCols
+            for i as integer = 0 to n - 1
+                for k as integer = 0 to p->cacheCols - 1
+                    DgReadFeed( p, first + i, k, p->cacheVals(base_ + i * p->cacheCols + k) )
+                next
+            next
+            p->blkState(s) = DG_BLOCK_LOADED
+        end if
+    end if
+    p->cacheTick += 1
+    p->blkUsed(s) = p->cacheTick
+    if p->blkState(s) <> DG_BLOCK_LOADED then return false
+    v = p->cacheVals((s * p->cacheRows + row mod p->cacheRows) * p->cacheCols + col)
+    return true
+end function
+
+' A write the feed took: into its loaded block too.
+sub DgCachePut( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, byref v as const TKDG_VALUE )
+    if (DgCacheOn( p ) = false) orelse (p->cacheCols <> p->colCount) then exit sub
+    dim as integer s = DgCacheSlot( p, row \ p->cacheRows )
+    if (s < 0) orelse (p->blkState(s) <> DG_BLOCK_LOADED) then exit sub
+    p->cacheVals((s * p->cacheRows + row mod p->cacheRows) * p->cacheCols + col) = v
+end sub
+
+' A cell waiting for its block: the row's background and a dimmed bar where the value will be.
+sub DgPaintPlaceholder( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr, byref rc as TKRECT, byval back_ as ulong )
+    b->SetBackColor( back_ )
+    b->PaintRect( @rc )
+    dim as integer padX = DgScale( p, 6 ), h = (rc.bottom - rc.top) \ 3
+    if h < 2 then h = 2
+    dim as TKRECT bar
+    tkRect_Set( bar, rc.left + padX, rc.top + h, rc.right - padX, rc.bottom - h )
+    if bar.right <= bar.left then exit sub
+    b->SetBackColor( p->colors.GridLineColor )
+    b->PaintRect( @bar )
+end sub
+
+' ==========================================================================================
+' The API
+' ==========================================================================================
+' rows > 0: cache the feed's rows in blocks of `rows`, at most `blocks` at a time (paint asks for a
+' missing one, see the top of this file); rows = 0: no cache (the default). Drops every block.
+public sub tkDataGrid_SetBlockCache( byval hGrid as TK_WIDGET ptr, byval rows as integer = 100, byval blocks as integer = 50 )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    if rows < 0 then rows = 0
+    if blocks < 1 then blocks = 1
+    p->cacheRows = rows
+    p->cacheMax = blocks
+    if rows = 0 then
+        erase p->blkIdx, p->blkState, p->blkUsed, p->cacheVals
+        p->cacheHit = -1
+    else
+        DgCacheClear( p )
+    end if
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+public function tkDataGrid_GetBlockCacheRows( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->cacheRows, 0 )
+end function
+
+' Is model row's block loaded? (Without a cache, every row is.)
+public function tkDataGrid_IsRowLoaded( byval hGrid as TK_WIDGET ptr, byval row as integer ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidRow( p, row ) = false) then return false
+    if DgCacheOn( p ) = false then return true
+    if p->cacheCols <> p->colCount then return false
+    dim as integer s = DgCacheSlot( p, row \ p->cacheRows )
+    return (s >= 0) andalso (p->blkState(s) = DG_BLOCK_LOADED)
+end function
+
+' How many blocks DataRequest has asked for since the cache was set (a host's progress, tests).
+public function tkDataGrid_GetBlockRequestCount( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->nRequests, 0 )
+end function
+
+' The host's answer to DataRequest: count rows from firstRow (model), values row by row, colCount
+' values each, in model column order. UI THREAD ONLY (from a worker: tkApp_RunOnUI). Rows of a block
+' nobody asked for (or one dropped since, by Reset or eviction) are ignored. FALSE: none taken.
+public function tkDataGrid_SupplyRows( byval hGrid as TK_WIDGET ptr, byval firstRow as integer, byval count as integer, values() as TKDG_VALUE ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgCacheOn( p ) = false) orelse (count <= 0) orelse (firstRow < 0) then return false
+    if p->cacheCols <> p->colCount then return false
+    dim as integer lo = lbound( values ), nVals = ubound( values ) - lbound( values ) + 1
+    if nVals < count * p->colCount then count = nVals \ p->colCount
+    dim as boolean took = false
+    dim as integer i = 0
+    while i < count
+        dim as integer row = firstRow + i
+        if row >= p->rowCount then exit while
+        dim as integer s = DgCacheSlot( p, row \ p->cacheRows )
+        if s >= 0 then
+            dim as integer base_ = (s * p->cacheRows + row mod p->cacheRows) * p->cacheCols
+            for k as integer = 0 to p->cacheCols - 1
+                p->cacheVals(base_ + k) = values(lo + i * p->colCount + k)
+            next
+            ' the host answers a request with its block's rows: any of them loads it
+            p->blkState(s) = DG_BLOCK_LOADED
+            took = true
+        end if
+        i += 1
+    wend
+    if took then
+        DgSumInvalidate( p )             ' G7b
+        tkWidget_Invalidate( p->wSurf )
+    end if
+    return took
+end function

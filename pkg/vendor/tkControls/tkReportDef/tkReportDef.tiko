@@ -1,0 +1,470 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportDef -- a report defined in a .tkreport file (TOML, format 1), read at run time and laid out
+' by tkReport. Report Designer phase RD3; the format is claude-docs docs/tkReportDesigner/SPEC.md,
+' "The .tkreport format".
+'
+'   dim as ustring errs
+'   dim as TK_REPORTDEF ptr def = tkReportDef_LoadFile( "orders.tkreport", errs )   ' or LoadText( bytes )
+'   tkReportSqlite_BindDef( def, "Orders", db )        ' a source by its name: SQLite,
+'   tkReportGrid_BindDef( def, "Lines", hGrid )        '   a DataGrid,
+'   tkReportDef_BindSource( def, "Other", src )        '   or any TKREPORT_SOURCE of the host
+'   tkReportDef_SetParam( def, "From", v )
+'   dim as TK_PRINTDOC ptr doc = tkReportDef_CreateDoc( def, errs )     ' 0 + errs when it can't
+'
+' THE MODEL is the file's tables as types (TKRD_*), public so a designer edits them; SaveText writes
+' them back canonically (fixed order, defaults left out, numbers to 0.01 pt), so a file the
+' designer wrote reads and writes back byte for byte.
+'
+' BUILDING (rdBuild.tiko) makes a TK_REPORT the definition owns:
+'   - its data is the bound sources through a join: fields are "Source.Field", a master's rows
+'     each with its child rows (a detail_report band), or one row with __has_<Child> false;
+'   - each bound source's fields are checked against the file's [[source.field]] snapshot (names
+'     and kinds): a mismatch refuses the report rather than printing wrong data;
+'   - bands and items become tkReport's, their expressions compiled (tkReport_Prepare), the errors
+'     naming the item by its id.
+' The definition stays GUI-free and links no data library: tkReportSqlite and tkReportGrid bind
+' their own kinds (they register open procedures on the definition, TKRD_BINDING).
+#module "tkReportDef"
+
+#import "../tkReport" public
+#import "../tkRExpr" public
+#import "std/config"
+#import "std/fs"
+using tkReport
+using tkRExpr
+using tkBind
+using tkPrint
+using tkCalendar
+using tkTimePanel
+
+' ---- the model ---------------------------------------------------------------------------------
+public type TKRD_PARAM
+    name_    as ustring
+    kind     as int32 = TKV_TEXT
+    default_ as ustring                 ' an expression, evaluated when the report is made
+    prompt   as ustring
+    required as boolean
+end type
+
+public type TKRD_FIELD
+    name_ as ustring
+    kind  as int32 = TKV_TEXT
+end type
+
+public type TKRD_SOURCE
+    name_       as ustring
+    kind        as ustring = "host"     ' array | sqlite | grid | listtree | host
+    parent      as ustring              ' a child source: its master
+    relation    as ustring              ' array: the master's Array field
+    itemType    as ustring              ' array: the element type (codegen)
+    itemsSource as ustring              ' array: where the rows come from (codegen)
+    sql         as ustring              ' sqlite
+    grid        as ustring              ' grid: "frmMain.dgOrders" (the designer reads its columns)
+    sort        as ustring              ' "[A], [B] desc"
+    filter      as ustring
+    designDb    as ustring              ' sqlite: the database the designer fetches the schema from
+    pNames(any) as ustring              ' sqlite: :name = expression
+    pExprs(any) as ustring
+    nPar        as int32
+    fields(any) as TKRD_FIELD           ' the schema snapshot
+    nFields     as int32
+end type
+
+public type TKRD_CALC
+    source as ustring
+    name_  as ustring
+    expr   as ustring
+end type
+
+public type TKRD_RULE
+    when_  as ustring
+    fore   as ustring                   ' "" = unchanged, else "#RRGGBB" / "#AARRGGBB"
+    back   as ustring
+    bold   as int32 = -1                ' -1 unchanged, 0 / 1
+    italic as int32 = -1
+    hide   as boolean
+end type
+
+public type TKRD_BAND
+    id               as ustring
+    kind             as ustring         ' report_header page_header group_header detail detail_report group_footer report_footer page_footer no_data
+    parent           as ustring         ' in a detail_report: its id
+    source           as ustring         ' detail / detail_report: the source it shows
+    level            as int32           ' group bands
+    group_           as ustring         ' group_header: what it groups on (an expression)
+    height           as float32 = 20
+    canGrow          as boolean = true
+    breakBefore      as boolean
+    breakAfter       as boolean
+    repeat_          as boolean         ' group_header: again on each page of the group
+    printOnFirstPage as boolean = true  ' page header / footer
+    printAtBottom    as boolean         ' report footer
+    visible          as ustring         ' an expression; "" = always
+    back             as ustring         ' "#RRGGBB"
+end type
+
+public type TKRD_ITEM
+    id        as ustring
+    band      as ustring
+    kind      as ustring = "text"       ' text field line box image check custom
+    x         as float32
+    y         as float32
+    w         as float32 = 100
+    h         as float32 = 14
+    text      as ustring                ' text: the template; image: the file
+    expr      as ustring                ' field: the value; image / check: in place of text
+    format    as ustring
+    align     as ustring = "left"       ' left center right
+    valign    as ustring = "middle"     ' top middle bottom
+    wrap      as boolean
+    canGrow   as boolean
+    fontSrc   as ustring                ' "" = the UI font; a file or res:<name>
+    fontSize  as float32 = 10
+    bold      as boolean
+    italic    as boolean
+    fore      as ustring
+    back      as ustring
+    border    as ustring                ' "all" or any of "left top right bottom"
+    lineColor as ustring
+    pen       as float32 = 0.5
+    visible   as ustring
+    reset     as ustring = "auto"       ' auto page report group:N
+    running   as boolean
+    incr      as ustring = "row"        ' row master group:N
+    tag       as int64                  ' custom: what the PaintItem callback is told
+    rules(any) as TKRD_RULE
+    nRules    as int32
+end type
+
+' A child source as a binder opens it: its rows, and Open positions them on one master row's children.
+public type TKRD_CHILD
+    pCtx as any ptr
+    rows as TKREPORT_SOURCE
+    Open as function( byval pCtx as any ptr, byval master as TK_VALUE ptr, byval nMaster as int32 ) as boolean
+end type
+
+public type TK_REPORTDEF as TK_REPORTDEF_
+
+public type RD_OpenRowsFunc as function( byval def as TK_REPORTDEF ptr, byval si as int32, byval pCtx as any ptr, _
+                                         byref src as TKREPORT_SOURCE ) as boolean
+public type RD_OpenChildFunc as function( byval def as TK_REPORTDEF ptr, byval si as int32, byval pCtx as any ptr, _
+                                          byref child as TKRD_CHILD ) as boolean
+public type RD_CloseSub as sub( byval pCtx as any ptr, byval bFinal as boolean )
+public type RD_ReportMadeSub as sub( byval def as TK_REPORTDEF ptr, byval rpt as TK_REPORT ptr, byval pUser as any ptr )
+
+' How source si reaches its rows: a ready source / child of the host, or procedures a binder
+' registered (OpenRows for a master, OpenChild for a child; CloseAll frees what they opened, and
+' with bFinal its own context).
+public type TKRD_BINDING
+    pCtx      as any ptr
+    OpenRows  as RD_OpenRowsFunc
+    OpenChild as RD_OpenChildFunc
+    CloseAll  as RD_CloseSub
+    src       as TKREPORT_SOURCE
+    bSrc      as boolean
+    child     as TKRD_CHILD
+    bChild    as boolean
+end type
+
+
+public type TK_REPORTDEF_
+    format     as int32 = 1
+    title      as ustring
+    paper      as ustring               ' "" = by locale; A4 Letter Legal A3 A5 B5 Tabloid Executive Custom
+    paperW     as float32               ' Custom: points
+    paperH     as float32
+    landscape  as boolean
+    mL         as float32 = 56.69       ' margins, points (20 mm, tkPrint's default)
+    mT         as float32 = 56.69
+    mR         as float32 = 56.69
+    mB         as float32 = 56.69
+    units      as ustring = "mm"        ' what the designer shows
+    dataModule as ustring               ' codegen (RD4)
+    boolText   as ustring = "Yes|No"
+    params(any)  as TKRD_PARAM
+    nParams    as int32
+    sources(any) as TKRD_SOURCE
+    nSources   as int32
+    calcs(any) as TKRD_CALC
+    nCalcs     as int32
+    bands(any) as TKRD_BAND
+    nBands     as int32
+    items(any) as TKRD_ITEM
+    nItems     as int32
+    evNames(any) as ustring             ' [report.events]: event = handler (codegen)
+    evHandlers(any) as ustring
+    nEvents    as int32
+    ' ---- binding and the built report ----
+    binds(any) as TKRD_BINDING          ' by source index
+    pv(any)    as TK_VALUE              ' parameter values (by index)
+    pvSet(any) as boolean
+    rpt        as TK_REPORT ptr
+    join_      as any ptr               ' the join (rdBuild.tiko)
+    childPar(any) as TK_REXPR ptr       ' the child source's parameter expressions, compiled against the master
+    childParSi as int32 = -1
+    ctx        as TKREXPR_CTX
+    onMade     as RD_ReportMadeSub        ' after each CreateReport (a generated report attaches its events)
+    onMadeUser as any ptr
+end type
+
+' ---- small helpers shared by the files of the module --------------------------------------------
+function RdKindName( byval k as int32 ) as ustring
+    select case k
+    case TKV_TEXT : return "text"
+    case TKV_INT : return "int"
+    case TKV_FLOAT : return "float"
+    case TKV_BOOL : return "bool"
+    case TKV_DATE : return "date"
+    case TKV_TIME : return "time"
+    end select
+    return ""
+end function
+
+function RdKindOf( byref s as const ustring ) as int32
+    select case lcase( s )
+    case "text" : return TKV_TEXT
+    case "int" : return TKV_INT
+    case "float" : return TKV_FLOAT
+    case "bool" : return TKV_BOOL
+    case "date" : return TKV_DATE
+    case "time" : return TKV_TIME
+    end select
+    return TKV_EMPTY
+end function
+
+' "#RRGGBB" / "#AARRGGBB" -> ARGB; dflt when empty or not a colour.
+function RdColor( byref s as const ustring, byval dflt as ulong ) as ulong
+    dim as ustring t = trim( s )
+    if (left( t, 1 ) <> "#") orelse ((len( t ) <> 7) andalso (len( t ) <> 9)) then return dflt
+    dim as ulong v = cast( ulong, vallng( "&h" & mid( t, 2 ) ) )
+    if len( t ) = 7 then v or= &hFF000000ul
+    return v
+end function
+
+function RdIsColor( byref s as const ustring ) as boolean
+    return RdColor( s, 1 ) <> 1 orelse (RdColor( s, 2 ) <> 2)
+end function
+
+' ---- the public API ------------------------------------------------------------------------------
+public function tkReportDef_Create( ) as TK_REPORTDEF ptr
+    return new TK_REPORTDEF
+end function
+
+public sub tkReportDef_Destroy( byval def as TK_REPORTDEF ptr )
+    if def = 0 then exit sub
+    RdFreeBuilt( def, true )
+    delete def
+end sub
+
+' The definition in TOML text (a .tkreport's bytes). 0 with errors (one per line) when it does not
+' read: TOML that does not parse, an unknown key or kind, a link to an id that is not there.
+public function tkReportDef_LoadText( byref text as const ustring, byref errors as ustring ) as TK_REPORTDEF ptr
+    errors = ""
+    dim as config.ConfigResultToml r = config.ParseToml( text )
+    if r.IsOk( ) = false then
+        errors = r.Failure( ).Message( )
+        return 0
+    end if
+    dim as TK_REPORTDEF ptr def = new TK_REPORTDEF
+    dim as config.TomlValue root = r.Value( )
+    if RdRead( def, root, errors ) = false then
+        delete def
+        return 0
+    end if
+    return def
+end function
+
+public function tkReportDef_LoadFile( byref path as const ustring, byref errors as ustring ) as TK_REPORTDEF ptr
+    dim as fs.FsResultUStr t = fs.ReadAllText( path )
+    if t.IsOk( ) = false then
+        errors = path & ": " & t.Failure( ).Message( )
+        return 0
+    end if
+    return tkReportDef_LoadText( t.Value( ), errors )
+end function
+
+' Bytes embedded in the program (#embed) as the text LoadText reads.
+public function tkReportDef_LoadBytes( byval p as const ubyte ptr, byval n as int64, byref errors as ustring ) as TK_REPORTDEF ptr
+    dim as string s = space( n )
+    for i as int64 = 0 to n - 1
+        s[i] = p[i]
+    next
+    return tkReportDef_LoadText( s, errors )
+end function
+
+' The definition as canonical TOML: what LoadText reads back to the same definition.
+public function tkReportDef_SaveText( byval def as TK_REPORTDEF ptr ) as ustring
+    if def = 0 then return ""
+    return RdWrite( def )
+end function
+
+public function tkReportDef_SaveFile( byval def as TK_REPORTDEF ptr, byref path as const ustring ) as boolean
+    if def = 0 then return false
+    return fs.WriteAllText( path, RdWrite( def ) ).IsOk( )
+end function
+
+public function tkReportDef_FindSource( byval def as TK_REPORTDEF ptr, byref name_ as const ustring ) as int32
+    if def = 0 then return -1
+    for i as int32 = 0 to def->nSources - 1
+        if lcase( def->sources(i).name_ ) = lcase( name_ ) then return i
+    next
+    return -1
+end function
+
+public function tkReportDef_FindParam( byval def as TK_REPORTDEF ptr, byref name_ as const ustring ) as int32
+    if def = 0 then return -1
+    for i as int32 = 0 to def->nParams - 1
+        if lcase( def->params(i).name_ ) = lcase( name_ ) then return i
+    next
+    return -1
+end function
+
+public function tkReportDef_FindBand( byval def as TK_REPORTDEF ptr, byref id as const ustring ) as int32
+    if def = 0 then return -1
+    for i as int32 = 0 to def->nBands - 1
+        if lcase( def->bands(i).id ) = lcase( id ) then return i
+    next
+    return -1
+end function
+
+public function tkReportDef_FindItem( byval def as TK_REPORTDEF ptr, byref id as const ustring ) as int32
+    if def = 0 then return -1
+    for i as int32 = 0 to def->nItems - 1
+        if lcase( def->items(i).id ) = lcase( id ) then return i
+    next
+    return -1
+end function
+
+' ---- editing the model (the Report Designer): items are drawn in their order, the last on top ----
+' Appends a copy of it; its index.
+public function tkReportDef_AddItem( byval def as TK_REPORTDEF ptr, byref it as TKRD_ITEM ) as int32
+    if def = 0 then return -1
+    if def->nItems > ubound( def->items ) then redim preserve def->items( 0 to def->nItems * 2 + 7 )
+    def->items(def->nItems) = it
+    def->nItems += 1
+    return def->nItems - 1
+end function
+
+public sub tkReportDef_RemoveItem( byval def as TK_REPORTDEF ptr, byval i as int32 )
+    if (def = 0) orelse (i < 0) orelse (i >= def->nItems) then exit sub
+    for k as int32 = i to def->nItems - 2
+        def->items(k) = def->items(k + 1)
+    next
+    dim as TKRD_ITEM blank
+    def->items(def->nItems - 1) = blank
+    def->nItems -= 1
+end sub
+
+' Appends a copy of b; its index.
+public function tkReportDef_AddBand( byval def as TK_REPORTDEF ptr, byref b as TKRD_BAND ) as int32
+    if def = 0 then return -1
+    if def->nBands > ubound( def->bands ) then redim preserve def->bands( 0 to def->nBands * 2 + 7 )
+    def->bands(def->nBands) = b
+    def->nBands += 1
+    return def->nBands - 1
+end function
+
+' Band i and the items in it.
+public sub tkReportDef_RemoveBand( byval def as TK_REPORTDEF ptr, byval i as int32 )
+    if (def = 0) orelse (i < 0) orelse (i >= def->nBands) then exit sub
+    dim as ustring id = lcase( def->bands(i).id )
+    for k as int32 = def->nItems - 1 to 0 step -1
+        if lcase( def->items(k).band ) = id then tkReportDef_RemoveItem( def, k )
+    next
+    for k as int32 = i to def->nBands - 2
+        def->bands(k) = def->bands(k + 1)
+    next
+    dim as TKRD_BAND blank
+    def->bands(def->nBands - 1) = blank
+    def->nBands -= 1
+end sub
+
+' Item from goes to index to_; the ones between shift by one.
+public sub tkReportDef_MoveItem( byval def as TK_REPORTDEF ptr, byval from as int32, byval to_ as int32 )
+    if (def = 0) orelse (from < 0) orelse (from >= def->nItems) orelse (to_ < 0) orelse (to_ >= def->nItems) orelse (from = to_) then exit sub
+    dim as TKRD_ITEM t = def->items(from)
+    if from < to_ then
+        for k as int32 = from to to_ - 1
+            def->items(k) = def->items(k + 1)
+        next
+    else
+        for k as int32 = from to to_ + 1 step -1
+            def->items(k) = def->items(k - 1)
+        next
+    end if
+    def->items(to_) = t
+end sub
+
+private sub EnsureBinds( byval def as TK_REPORTDEF ptr )
+    if ubound( def->binds ) < def->nSources - 1 then redim preserve def->binds( 0 to def->nSources - 1 )
+    if ubound( def->pv ) < def->nParams - 1 then
+        redim preserve def->pv( 0 to def->nParams - 1 )
+        redim preserve def->pvSet( 0 to def->nParams - 1 )
+    end if
+end sub
+
+' Source 'name' reads from a binder's procedures (tkReportSqlite_BindDef, tkReportGrid_BindDef).
+public function tkReportDef_Bind( byval def as TK_REPORTDEF ptr, byref name_ as const ustring, byref b as TKRD_BINDING ) as boolean
+    dim as int32 si = tkReportDef_FindSource( def, name_ )
+    if si < 0 then return false
+    EnsureBinds( def )
+    RdFreeBuilt( def, false )
+    if def->binds(si).CloseAll then def->binds(si).CloseAll( def->binds(si).pCtx, true )
+    def->binds(si) = b
+    return true
+end function
+
+' Source 'name' is the host's own: its rows as they are (a master or a single source).
+public function tkReportDef_BindSource( byval def as TK_REPORTDEF ptr, byref name_ as const ustring, byref src as TKREPORT_SOURCE ) as boolean
+    dim as TKRD_BINDING b
+    b.src = src
+    b.bSrc = true
+    return tkReportDef_Bind( def, name_, b )
+end function
+
+' Child source 'name' is the host's: its rows, positioned on each master row's children by Open.
+public function tkReportDef_BindChild( byval def as TK_REPORTDEF ptr, byref name_ as const ustring, byref child as TKRD_CHILD ) as boolean
+    dim as TKRD_BINDING b
+    b.child = child
+    b.bChild = true
+    return tkReportDef_Bind( def, name_, b )
+end function
+
+public sub tkReportDef_SetParam( byval def as TK_REPORTDEF ptr, byref name_ as const ustring, byref v as TK_VALUE )
+    dim as int32 i = tkReportDef_FindParam( def, name_ )
+    if i < 0 then exit sub
+    EnsureBinds( def )
+    def->pv(i) = v
+    def->pvSet(i) = true
+end sub
+
+' A parameter's value as the report will use it: the one set, else its default (evaluated now).
+public function tkReportDef_GetParam( byval def as TK_REPORTDEF ptr, byval i as int32, byref v as TK_VALUE ) as boolean
+    v.Clear( )
+    if (def = 0) orelse (i < 0) orelse (i >= def->nParams) then return false
+    EnsureBinds( def )
+    if def->pvSet(i) then
+        v = def->pv(i)
+        return true
+    end if
+    return RdParamDefault( def, i, v )
+end function
+
+' The report the definition last made (owned by it; 0 before CreateReport).
+public function tkReportDef_GetReport( byval def as TK_REPORTDEF ptr ) as TK_REPORT ptr
+    if def = 0 then return 0
+    return def->rpt
+end function
+
+' cb is called after each report the definition makes (CreateReport, CreateDoc, a viewer's Run), with
+' pUser: where a generated report sets its event handlers on the new TK_REPORT.
+public sub tkReportDef_SetReportMadeCallback( byval def as TK_REPORTDEF ptr, byval cb as RD_ReportMadeSub, byval pUser as any ptr )
+    if def = 0 then exit sub
+    def->onMade = cb
+    def->onMadeUser = pUser
+end sub

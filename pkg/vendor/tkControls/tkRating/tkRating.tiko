@@ -1,0 +1,1286 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkRating -- a row of N stars showing a fractional value, set by mouse, touch or keyboard. New in
+' tkControls (no Win32 sibling); the design is C:\dev\docs\tkControls\RATING-BADGE-AVATAR-CHIP.md
+' §4. Phases R0 + R1: star / heart / circle / diamond / glyph items, a caption, a placeholder
+' value, item tooltips, size presets, a PaintItem callback and the widgetless tkRating_PaintInto.
+' The painting is in tkRatingPaint.tiko; types, state, input and the API are here.
+'
+' THE VALUE MODEL (§4.1, §4.2): a double in [0, ItemCount]; 0 = unset. The DISPLAY is always
+' exact -- item i is filled to clamp( Value - i, 0, 1 ) of its width -- and Precision (whole,
+' half, tenth) governs only what the USER can pick. Setters store what they are given (clamped,
+' rounded to 6 places): a loaded 3.5 shows 3.5 and saves back 3.5 whatever the Precision.
+'
+' INPUT (§4.5): hovering previews the value a click would set (HoverPreview); a press shows the
+' preview while held (drag along the row on touch) and the release sets it; releasing on the
+' current value clears to 0 when AllowClear. After a clear -- or a key change -- the preview of
+' that same value is held back until the pointer moves to another value or leaves, so the change
+' is seen (Ant's rule). Release outside the row, Esc, or a lost capture cancels. The wheel is
+' never taken (it bubbles: ratings sit in scrolling forms). Keys: Right/Up, Left/Down one
+' Precision step, Home/End 0 (or one step) / ItemCount, 1..9 that value, 0 / Delete / Backspace
+' clear (AllowClear).
+'
+' NOTIFICATION: setters are silent. ValueChanged fires for each user change; HoverChanged when
+' the previewed value changes (-1 when the preview ends). State is updated first; every path
+' notifies LAST, from snapshots, and touches no state after (a callback may destroy the rating).
+#module "tkRating"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+
+' What the user can pick.
+public enum
+    TKRATING_FULL = 0          ' whole items (default)
+    TKRATING_HALF              ' halves
+    TKRATING_TENTH             ' tenths
+end enum
+
+' HitTest's answers besides an item index (0-based).
+public const as long TKRATING_HIT_NONE = -1
+public const as long TKRATING_HIT_CAPTION = -2
+
+' The items' shape. GLYPH needs glyphs (SetGlyphs) and a glyph font (ApplyFonts); without them
+' it draws STAR.
+public enum
+    TKRATING_STAR = 0
+    TKRATING_HEART
+    TKRATING_CIRCLE
+    TKRATING_DIAMOND
+    TKRATING_GLYPH
+end enum
+
+' Size presets: the item size in design units 16 / 20 / 28. CUSTOM after SetItemSize.
+public enum
+    TKRATING_SIZE_CUSTOM = -1
+    TKRATING_SIZE_SMALL = 0
+    TKRATING_SIZE_MEDIUM
+    TKRATING_SIZE_LARGE
+end enum
+
+' Which colours an item is drawn in.
+public enum
+    TKRATING_MOOD_NORMAL = 0
+    TKRATING_MOOD_PREVIEW          ' the hover / press preview: the hot colours
+    TKRATING_MOOD_PLACEHOLDER      ' the placeholder under an unset value
+    TKRATING_MOOD_DISABLED
+end enum
+
+public const as long TKRATING_MAX_ITEMS = 20
+
+' Sizes in design units, scaled at create and by TKM_SCALECHANGED. The two THICKNESSES (item
+' border, focus ring) are rules, not sizes: never scaled.
+public const as long TKRATING_DEFAULT_ITEMS      = 5
+public const as long TKRATING_DEFAULT_ITEMSIZE   = 20
+public const as long TKRATING_DEFAULT_SPACING    = 4
+public const as long TKRATING_DEFAULT_FOCUSGAP   = 2
+public const as long TKRATING_DEFAULT_FOCUSTHICK = 1
+public const as long TKRATING_DEFAULT_BORDER     = 1
+public const as long TKRATING_DEFAULT_CAPTIONGAP = 8
+
+' Precedence: disabled > preview (hot) > placeholder > normal.
+public type TKRATING_COLORS
+    BackColor            as ulong = &hFF21252Bul
+    FocusRingColor       as ulong = &hFF61AFEFul
+    FillColor            as ulong = &hFFE5C07Bul
+    FillColorHot         as ulong = &hFFE9C88Cul
+    FillColorDisabled    as ulong = &hFF606670ul
+    EmptyColor           as ulong = &hFF33373Ful
+    EmptyColorHot        as ulong = &hFF373D48ul
+    EmptyColorDisabled   as ulong = &hFF282C33ul
+    BorderColor          as ulong = &hFF444A56ul
+    BorderColorDisabled  as ulong = &hFF30343Cul
+    PlaceholderColor     as ulong = &hFF969CA6ul
+    CaptionColor         as ulong = &hFF969CA6ul
+    CaptionColorDisabled as ulong = &hFF606670ul
+end type
+
+' Everything a painter needs. Item rects come from tkRating_GetItemRect (Layout's, never re-derived).
+public type TKRATING_PAINTINFO
+    hRating     as TK_WIDGET ptr
+    b           as TK_PAINT ptr            ' borrowed for this frame
+    rcClient    as TKRECT
+    rcRow       as TKRECT                  ' the items, first to last
+    rcFocus     as TKRECT                  ' rcRow inflated by the ring band: where the ring goes
+    rcCaption   as TKRECT                  ' empty when there is no caption
+    wszCaption  as ustring                 ' the caption's text this frame (FormatCaption or Caption)
+    nItems      as long
+    nValue      as double                  ' the value
+    nPlaceholder as double
+    nDisplay    as double                  ' what is drawn: the preview, else the placeholder under an unset value, else nValue
+    nMood       as long                    ' TKRATING_MOOD_*: the colours nDisplay is drawn in
+    isPreview   as boolean                 ' nDisplay is a preview (hot colours)
+    isPressed   as boolean
+    isEnabled   as boolean
+    isFocused   as boolean
+    isReadOnly  as boolean
+end type
+
+' One item, for a PaintItem callback.
+public type TKRATING_ITEMPAINTINFO
+    hRating     as TK_WIDGET ptr
+    b           as TK_PAINT ptr
+    nItem       as long
+    rcItem      as TKRECT
+    nFill       as double                  ' 0 .. 1: how much of it is filled
+    nMood       as long                    ' TKRATING_MOOD_*
+    isFocused   as boolean
+end type
+
+' How tkRating_PaintInto draws a rating with no widget (and how the control draws its items).
+public type TKRATING_DRAWSPEC
+    nShape         as long = TKRATING_STAR
+    wszGlyphFilled as ustring
+    wszGlyphEmpty  as ustring              ' "" = the filled glyph in the empty colour
+    fGlyph         as TTF_Font ptr
+    nItemSize      as long                 ' 0 = the rect's height
+    nSpacing       as long = -1            ' -1 = a fifth of the item size
+    nBorder        as long = 1
+    bShowEmpty     as boolean = true
+    bEnabled       as boolean = true
+    bPreview       as boolean              ' the value in the hot colours
+    nPlaceholder   as double               ' drawn, in the placeholder colour, under a value of 0
+    pColors        as TKRATING_COLORS ptr  ' 0 = the app theme's
+end type
+
+public type TKRATING_MESSAGEINFO
+    hRating as TK_WIDGET ptr
+    msg     as long                        ' TKM_*
+    x       as single
+    y       as single
+    key     as long
+    mods    as long
+end type
+
+public type RTG_ValueChangedCallbackSub as sub( byval hRating as TK_WIDGET ptr, byval nValue as double )
+public type RTG_HoverChangedCallbackSub as sub( byval hRating as TK_WIDGET ptr, byval nHover as double )
+public type RTG_PaintCallbackSub as sub( byval p as TKRATING_PAINTINFO ptr )
+public type RTG_PaintItemCallbackSub as sub( byval p as TKRATING_ITEMPAINTINFO ptr )
+public type RTG_FormatCaptionCallbackFunc as function( byval hRating as TK_WIDGET ptr, byval nValue as double, byval nHover as double ) as ustring
+public type RTG_MessageCallbackFunc as function( byval m as TKRATING_MESSAGEINFO ptr ) as boolean
+
+public type TKRATING_STATE
+    hWin              as TK_WIDGET ptr
+    id                as long
+    bColorsPinned     as boolean
+    bShapePinned      as boolean
+    wszTooltip        as ustring
+    tip               as TKTIPHOST_STATE
+    colors            as TKRATING_COLORS
+    ' value model
+    nItems            as long = TKRATING_DEFAULT_ITEMS
+    nValue            as double
+    nPrecision        as long = TKRATING_FULL
+    bAllowClear       as boolean = true
+    isReadOnly        as boolean
+    bHoverPreview     as boolean = true
+    bShowEmpty        as boolean = true
+    nPlaceholder      as double
+    ' look
+    nShape            as long = TKRATING_STAR
+    wszGlyphFilled    as ustring
+    wszGlyphEmpty     as ustring
+    fText             as TTF_Font ptr         ' the caption's; 0 = the surface's default
+    fGlyph            as TTF_Font ptr
+    nSizePreset       as long = TKRATING_SIZE_MEDIUM
+    wszCaption        as ustring
+    wszItemTip(0 to TKRATING_MAX_ITEMS - 1) as ustring
+    ' state
+    isEnabled         as boolean = true
+    isFocused         as boolean
+    isPressed         as boolean
+    nPreview          as double = -1          ' the value previewed (hover or press); -1 = none
+    nSuppress         as double = -1          ' a preview of this value is held back (after a clear / key)
+    ' geometry (pixels)
+    nItemSize         as long
+    nSpacing          as long
+    nBorderThick      as long = TKRATING_DEFAULT_BORDER
+    nFocusGap         as long
+    nFocusThick       as long = TKRATING_DEFAULT_FOCUSTHICK
+    nCaptionGap       as long
+    bLayoutDirty      as boolean = true
+    rcRow             as TKRECT
+    rcFocus           as TKRECT
+    rcCaption         as TKRECT
+    rcItem(0 to TKRATING_MAX_ITEMS - 1) as TKRECT
+    rcZone(0 to TKRATING_MAX_ITEMS - 1) as TKRECT
+    ' callbacks
+    ChangedCallback   as RTG_ValueChangedCallbackSub
+    HoverCallback     as RTG_HoverChangedCallbackSub
+    PaintCallback     as RTG_PaintCallbackSub
+    PaintItemCallback as RTG_PaintItemCallbackSub
+    FormatCallback    as RTG_FormatCaptionCallbackFunc
+    MessageCallback   as RTG_MessageCallbackFunc
+
+    declare function RingPad() as long
+    declare function StepSize() as double
+    declare function Lowest() as double
+    declare function Clean( byval v as double ) as double
+    declare function ValueAt( byval x as long ) as double
+    declare function InRow( byval x as single, byval y as single ) as boolean
+    declare sub      Layout()
+    declare sub      Refresh()
+end type
+
+' ==========================================================================================
+' The value model
+' ==========================================================================================
+private function Differ( byval a as double, byval b as double ) as boolean
+    return abs( a - b ) > 1e-9
+end function
+
+' Half away from zero, to 6 decimals: drops binary residue (0.1 * 3).
+private function Round6( byval v as double ) as double
+    if v < 0 then return -int( (-v * 1e6) + 0.5 ) / 1e6
+    return int( (v * 1e6) + 0.5 ) / 1e6
+end function
+
+' Clamped to [0, ItemCount], residue dropped.
+function TKRATING_STATE.Clean( byval v as double ) as double
+    v = Round6( v )
+    if v < 0 then return 0
+    if v > this.nItems then return this.nItems
+    return v
+end function
+
+function TKRATING_STATE.StepSize() as double
+    select case this.nPrecision
+    case TKRATING_HALF  : return 0.5
+    case TKRATING_TENTH : return 0.1
+    end select
+    return 1
+end function
+
+' The least a user can set: 0 when clearing is allowed, else one step.
+function TKRATING_STATE.Lowest() as double
+    return iif( this.bAllowClear, 0.0, this.StepSize() )
+end function
+
+' The next step above v / below v (strictly), on the Precision grid.
+private function StepUp( byval p as TKRATING_STATE ptr, byval v as double ) as double
+    dim as double st = p->StepSize()
+    return p->Clean( (int( v / st + 1e-9 ) + 1) * st )
+end function
+
+private function StepDown( byval p as TKRATING_STATE ptr, byval v as double ) as double
+    dim as double st = p->StepSize()
+    dim as double r = Round6( (-int( -(v / st) + 1e-9 ) - 1) * st )
+    if r < p->Lowest() then r = p->Lowest()
+    return p->Clean( r )
+end function
+
+' ==========================================================================================
+' Geometry (§4.3)
+' ==========================================================================================
+function TKRATING_STATE.RingPad() as long
+    return this.nFocusGap + this.nFocusThick
+end function
+
+' rcRow: the items left to right from the ring band, vertically centred. Each item owns a ZONE:
+' itself plus half of each gap beside it (the first reaches the ring's left edge, the last its
+' right), so the zones tile the row with no dead pixel.
+sub TKRATING_STATE.Layout()
+    this.bLayoutDirty = false
+    tkRect_SetEmpty( this.rcRow ) : tkRect_SetEmpty( this.rcFocus )
+    for i as long = 0 to TKRATING_MAX_ITEMS - 1
+        tkRect_SetEmpty( this.rcItem(i) ) : tkRect_SetEmpty( this.rcZone(i) )
+    next
+    if this.hWin = 0 then exit sub
+    dim as long cw = this.hWin->cw, ch = this.hWin->ch
+    if (cw <= 0) orelse (ch <= 0) then this.bLayoutDirty = true : exit sub
+    dim as long rp = this.RingPad(), sz = this.nItemSize, sp = this.nSpacing, n = this.nItems
+    dim as long top = rp + ((ch - 2 * rp) - sz) \ 2
+    for i as long = 0 to n - 1
+        dim as long l = rp + i * (sz + sp)
+        tkRect_Set( this.rcItem(i), l, top, l + sz, top + sz )
+    next
+    tkRect_Set( this.rcRow, rp, top, this.rcItem(n - 1).right, top + sz )
+    this.rcFocus = this.rcRow
+    tkRect_Inflate( this.rcFocus, rp, rp )
+    for i as long = 0 to n - 1
+        dim as long zl = iif( i = 0, this.rcFocus.left, this.rcItem(i).left - sp \ 2 )
+        dim as long zr = iif( i = n - 1, this.rcFocus.right, this.rcItem(i).right + (sp - sp \ 2) )
+        tkRect_Set( this.rcZone(i), zl, this.rcFocus.top, zr, this.rcFocus.bottom )
+    next
+    ' the caption: right of the ring band and the gap, to the client's right edge
+    tkRect_SetEmpty( this.rcCaption )
+    if (len( this.wszCaption ) > 0) orelse (this.FormatCallback <> 0) then
+        dim as long cl = this.rcFocus.right + this.nCaptionGap
+        if cl < cw then tkRect_Set( this.rcCaption, cl, 0, cw, ch )
+    end if
+end sub
+
+' The caption's text now: FormatCaption's answer for (value, preview), else Caption.
+private function CaptionText( byval p as TKRATING_STATE ptr ) as ustring
+    if p->FormatCallback then
+        dim as ustring t = p->FormatCallback( p->hWin, p->nValue, p->nPreview )
+        if len( t ) then return t
+    end if
+    return p->wszCaption
+end function
+
+' The caption's font: the rating's, else the surface's default.
+private function CaptionFont( byval p as TKRATING_STATE ptr ) as TTF_Font ptr
+    if p->fText then return p->fText
+    if (p->hWin <> 0) andalso (p->hWin->pHost <> 0) then return p->hWin->pHost->pDefaultFont
+    return 0
+end function
+
+sub TKRATING_STATE.Refresh()
+    this.bLayoutDirty = true
+    tkWidget_Invalidate( this.hWin )
+end sub
+
+' Is (x, y) on the row: the items, the gaps and the ring band round them.
+function TKRATING_STATE.InRow( byval x as single, byval y as single ) as boolean
+    return tkRect_Contains( this.rcFocus, x, y )
+end function
+
+' The value a click at column x would set (y is not read; x is clamped to the row). In item i at
+' fraction f (pixel centres): FULL i + 1, HALF i + 0.5 up to the middle, else i + 1, TENTH
+' i + ceil( 10 f ) / 10. Left of the item, in its zone's half-gap: i -- the items before it, full
+' -- or one step for the first. Right of it: i + 1.
+function TKRATING_STATE.ValueAt( byval x as long ) as double
+    dim as long n = this.nItems
+    dim as long i = 0
+    while (i < n - 1) andalso (x >= this.rcZone(i).right)
+        i += 1
+    wend
+    dim as TKRECT r = this.rcItem(i)
+    if x < r.left then return this.Clean( iif( i = 0, this.StepSize(), cdbl( i ) ) )
+    if x >= r.right then return this.Clean( i + 1 )
+    dim as double f = (x - r.left + 0.5) / this.nItemSize
+    select case this.nPrecision
+    case TKRATING_HALF
+        return this.Clean( i + iif( f <= 0.5, 0.5, 1.0 ) )
+    case TKRATING_TENTH
+        dim as double t = -int( -(f * 10) + 1e-9 )
+        if t < 1 then t = 1
+        if t > 10 then t = 10
+        return this.Clean( i + t / 10 )
+    end select
+    return this.Clean( i + 1 )
+end function
+
+private function RT( byval w as TK_WIDGET ptr ) as TKRATING_STATE ptr
+    if w = 0 then return 0
+    return cast( TKRATING_STATE ptr, w->pData )
+end function
+
+private sub EnsureLayout( byval p as TKRATING_STATE ptr )
+    if p->bLayoutDirty then p->Layout()
+end sub
+
+' ==========================================================================================
+' Notification: from snapshots, last, nothing touched after
+' ==========================================================================================
+private sub Notify( byval p as TKRATING_STATE ptr, byval bHover as boolean, byval bValue as boolean )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as double v = p->nValue, hv = p->nPreview
+    dim as RTG_HoverChangedCallbackSub cbHover = p->HoverCallback
+    dim as RTG_ValueChangedCallbackSub cbValue = p->ChangedCallback
+    ' p may be gone after the first callback: only the snapshots are used from here
+    if bHover andalso (cbHover <> 0) then cbHover( w, hv )
+    if bValue andalso (cbValue <> 0) then cbValue( w, v )
+end sub
+
+' Set the preview; TRUE when it changed (the caller notifies). A held-back value shows as none;
+' any other value (or none) ends the hold.
+private function SetPreview( byval p as TKRATING_STATE ptr, byval v as double ) as boolean
+    if v >= 0 then
+        if (p->nSuppress >= 0) andalso (Differ( v, p->nSuppress ) = false) then
+            v = -1
+        else
+            p->nSuppress = -1
+        end if
+    else
+        p->nSuppress = -1
+    end if
+    if Differ( v, p->nPreview ) = false then return false
+    p->nPreview = v
+    tkWidget_Invalidate( p->hWin )
+    return true
+end function
+
+' The preview for a pointer at (x, y): none unless enabled, writable, on the row, and either
+' pressed or previewing on hover.
+private function PreviewAt( byval p as TKRATING_STATE ptr, byval x as single, byval y as single ) as double
+    if (p->isEnabled = false) orelse p->isReadOnly then return -1
+    if (p->isPressed = false) andalso (p->bHoverPreview = false) then return -1
+    EnsureLayout( p )
+    if p->bLayoutDirty orelse (p->InRow( x, y ) = false) then return -1
+    return p->ValueAt( cint( int( x ) ) )
+end function
+
+' The value set by the USER: set, repaint. TRUE when it changed (the caller notifies).
+private function UserSet( byval p as TKRATING_STATE ptr, byval v as double ) as boolean
+    v = p->Clean( v )
+    if Differ( v, p->nValue ) = false then return false
+    p->nValue = v
+    tkWidget_Invalidate( p->hWin )
+    return true
+end function
+
+' The item whose zone holds (x, y) on the row, else -1.
+private function ItemAt( byval p as TKRATING_STATE ptr, byval x as single, byval y as single ) as long
+    EnsureLayout( p )
+    if p->bLayoutDirty orelse (p->InRow( x, y ) = false) then return -1
+    for i as long = 0 to p->nItems - 1
+        if tkRect_Contains( p->rcZone(i), x, y ) then return i
+    next
+    return -1
+end function
+
+private function CallMessage( byval p as TKRATING_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKRATING_MESSAGEINFO mi
+    mi.hRating = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    mi.key = m->key : mi.mods = m->mods
+    return p->MessageCallback( @mi )
+end function
+
+' ==========================================================================================
+' The proc
+' ==========================================================================================
+public declare sub tkRating_ApplyTheme( byval hRating as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+declare sub ApplyThemeShape( byval w as TK_WIDGET ptr )
+
+private sub Rescale( byval p as TKRATING_STATE ptr, byval fOld as single, byval fNew as single )
+    if (fOld <= 0) orelse (fNew <= 0) orelse (fOld = fNew) then exit sub
+    dim as single k = fNew / fOld
+    p->nItemSize = cint( p->nItemSize * k )
+    p->nSpacing = cint( p->nSpacing * k )
+    p->nFocusGap = cint( p->nFocusGap * k )
+    p->nCaptionGap = cint( p->nCaptionGap * k )
+    if p->nItemSize < 1 then p->nItemSize = 1
+    p->Refresh()
+end sub
+
+' The press ends without a value (Esc, lost capture, release off the row). TRUE when the
+' preview changed (the caller notifies).
+private function CancelPress( byval p as TKRATING_STATE ptr ) as boolean
+    if p->isPressed = false then return false
+    p->isPressed = false
+    if tkHost_GetCapture( p->hWin->pHost ) = p->hWin then tkHost_ReleaseCapture( p->hWin->pHost )
+    tkWidget_Invalidate( p->hWin )
+    return SetPreview( p, -1 )
+end function
+
+' A key or a release changed the value: hold back the preview of the value under the pointer, so
+' the new value shows until the pointer moves to another one. TRUE when the preview changed.
+private function HoldPreview( byval p as TKRATING_STATE ptr ) as boolean
+    if p->nPreview < 0 then return false
+    dim as double held = p->nPreview
+    p->nPreview = -1
+    p->nSuppress = held
+    tkWidget_Invalidate( p->hWin )
+    return true
+end function
+
+private function OnKey( byval p as TKRATING_STATE ptr, byval key as long ) as boolean
+    dim as double v = p->nValue
+    select case key
+    case SDLK_RIGHT, SDLK_UP     : v = StepUp( p, v )
+    case SDLK_LEFT, SDLK_DOWN    : v = StepDown( p, v )
+    case SDLK_HOME               : v = p->Lowest()
+    case SDLK_END                : v = p->nItems
+    case SDLK_1 to SDLK_9, SDLK_KP_1 to SDLK_KP_9
+        dim as long d = iif( key >= SDLK_KP_1, key - SDLK_KP_1 + 1, key - SDLK_1 + 1 )
+        if d > p->nItems then return false
+        v = d
+    case SDLK_0, SDLK_KP_0, SDLK_DELETE, SDLK_BACKSPACE
+        if p->bAllowClear = false then return false
+        v = 0
+    case else : return false
+    end select
+    if UserSet( p, v ) then
+        dim as boolean bHover = HoldPreview( p )
+        Notify( p, bHover, true )
+    end if
+    return true                                         ' claimed, moved or not (at a limit)
+end function
+
+private function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKRATING_STATE ptr p = RT( w )
+    if p = 0 then return false
+    dim as TK_HOST ptr h = w->pHost
+
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+
+    case TKM_SIZE
+        p->Refresh()
+        return true
+
+    case TKM_SCALECHANGED
+        Rescale( p, m->fOld, m->fNew )
+        return true
+
+    case TKM_THEMECHANGED
+        tkRating_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+
+    case TKM_MOUSEMOVE
+        if p->isEnabled = false then return true
+        ' pressed, moves come from anywhere (capture): off the row the preview ends, and a release
+        ' there cancels
+        dim as boolean bHover = SetPreview( p, PreviewAt( p, m->x, m->y ) )
+        tkTipHost_SetToolIndex( @p->tip, ItemAt( p, m->x, m->y ) )
+        CallMessage( p, m )
+        if bHover then Notify( p, true, false )
+        return true
+
+    case TKM_MOUSELEAVE
+        dim as boolean bHover = false
+        if p->isPressed = false then bHover = SetPreview( p, -1 )
+        CallMessage( p, m )
+        if bHover then Notify( p, true, false )
+        return true
+
+    case TKM_LBUTTONDOWN
+        ' m->clicks is not read: a second click is an ordinary press
+        if p->isEnabled = false then return true
+        tkTipHost_Pop( @p->tip )
+        tkHost_SetFocus( h, w )
+        if CallMessage( p, m ) then return true
+        if p->isReadOnly then return true
+        EnsureLayout( p )
+        if p->bLayoutDirty orelse (p->InRow( m->x, m->y ) = false) then return true
+        p->isPressed = true
+        p->nSuppress = -1                                ' a press always shows its value
+        tkHost_SetCapture( w )
+        tkWidget_Invalidate( w )
+        if SetPreview( p, PreviewAt( p, m->x, m->y ) ) then Notify( p, true, false )
+        return true
+
+    case TKM_LBUTTONUP
+        ' snapshot before releasing: TKM_CAPTURECHANGED arrives synchronously
+        dim as boolean bWasPressed = p->isPressed
+        p->isPressed = false
+        if tkHost_GetCapture( h ) = w then tkHost_ReleaseCapture( h )
+        tkWidget_Invalidate( w )
+        CallMessage( p, m )                              ' result ignored
+        if bWasPressed = false then return true
+        EnsureLayout( p )
+        if p->InRow( m->x, m->y ) = false then
+            if SetPreview( p, -1 ) then Notify( p, true, false )      ' released off the row: cancelled
+            return true
+        end if
+        dim as double v = p->ValueAt( cint( int( m->x ) ) )
+        if p->bAllowClear andalso (p->nValue > 0) andalso (Differ( v, p->nValue ) = false) then v = 0
+        dim as boolean bValue = UserSet( p, v )
+        dim as boolean bHover = false
+        if p->bHoverPreview = false then
+            bHover = SetPreview( p, -1 )                 ' no hover preview: it lived only while pressed
+        elseif bValue then
+            bHover = HoldPreview( p )                    ' the new value shows, not the preview of it
+        end if
+        if bValue orelse bHover then Notify( p, bHover, bValue )
+        return true
+
+    case TKM_CAPTURECHANGED
+        ' lost mid-press (another widget took it): cancelled
+        if p->isPressed then
+            p->isPressed = false
+            tkWidget_Invalidate( w )
+            if SetPreview( p, -1 ) then Notify( p, true, false )
+        end if
+        return true
+
+    case TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        CallMessage( p, m )                              ' reported, never acted on
+        return true
+
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        dim as boolean bFocused = (m->msg = TKM_SETFOCUS)
+        if bFocused <> p->isFocused then p->isFocused = bFocused : tkWidget_Invalidate( w )
+        CallMessage( p, m )                              ' result ignored: focus is a fact
+        return true
+
+    case TKM_KEYDOWN
+        if p->isEnabled = false then return false
+        if CallMessage( p, m ) then return true
+        if (m->mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI)) <> 0 then return false   ' a chord is not ours
+        if m->key = SDLK_ESCAPE then
+            if p->isPressed = false then return false    ' only a press claims Esc
+            if CancelPress( p ) then Notify( p, true, false )
+            return true
+        end if
+        if p->isReadOnly orelse p->isPressed then return false
+        return OnKey( p, m->key )
+
+    case TKM_MOUSEWHEEL
+        return false                                     ' never taken: it bubbles
+
+    case TKM_ENABLE
+        p->isEnabled = m->bFlag
+        if p->isEnabled = false then
+            ' the host takes capture, focus and hot at once; the press and the preview end, silently
+            p->isPressed = false
+            p->nPreview = -1 : p->nSuppress = -1
+            tkTipHost_Pop( @p->tip )
+        end if
+        tkWidget_Invalidate( w )
+        return true
+
+    case TKM_SHOW
+        if m->bFlag = false then p->isPressed = false : p->nPreview = -1 : p->nSuppress = -1
+        return true
+
+    case TKM_DESTROY
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+public declare function tkRating_ThemeColors( byref t as TKTHEME_COLORS ) as TKRATING_COLORS
+
+' The item under the pointer's own tip, else the rating's.
+private function TipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKRATING_STATE ptr p = RT( a )
+    if p = 0 then return ""
+    if (idx >= 0) andalso (idx < p->nItems) then
+        if len( p->wszItemTip(idx) ) then return p->wszItemTip(idx)
+    end if
+    return p->wszTooltip
+end function
+
+' A child of hParent, created 0x0: size it from GetIdealSize, place it with tkWidget_SetPos.
+public function tkRating_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TK_HOST ptr pHost = hParent->pHost
+    dim as TKRATING_STATE ptr p = new TKRATING_STATE
+    p->id = ctrlId
+    p->nItemSize = tkHost_Scale( pHost, TKRATING_DEFAULT_ITEMSIZE )
+    p->nSpacing = tkHost_Scale( pHost, TKRATING_DEFAULT_SPACING )
+    p->nFocusGap = tkHost_Scale( pHost, TKRATING_DEFAULT_FOCUSGAP )
+    p->nCaptionGap = tkHost_Scale( pHost, TKRATING_DEFAULT_CAPTIONGAP )
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @Proc, p )
+    w->isFocusable = true
+    p->hWin = w
+    p->colors = tkRating_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKRATING_COLORS ) \ 4, "Rating" )
+    tkTipHost_Ensure( @p->tip, w, @TipText )
+    ApplyThemeShape( w )
+    return w
+end function
+
+public function tkRating_GetID( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->id
+end function
+
+public function tkRating_GetEnabled( byval hRating as TK_WIDGET ptr ) as boolean
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return false
+    return p->isEnabled
+end function
+
+' tkWidget_Enable: input stops, Tab skips it, capture / focus / hot go at once.
+public sub tkRating_SetEnabled( byval hRating as TK_WIDGET ptr, byval isEnabled as boolean )
+    if hRating then tkWidget_Enable( hRating, isEnabled )
+end sub
+
+public function tkRating_GetFocused( byval hRating as TK_WIDGET ptr ) as boolean
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return false
+    return p->isFocused
+end function
+
+public sub tkRating_Refresh( byval hRating as TK_WIDGET ptr )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then p->Refresh()
+end sub
+
+' ---- value (every setter SILENT) ------------------------------------------------------------
+public function tkRating_GetValue( byval hRating as TK_WIDGET ptr ) as double
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->nValue
+end function
+
+' Clamped to [0, ItemCount] and stored as given otherwise: Precision does not snap a setter.
+public sub tkRating_SetValue( byval hRating as TK_WIDGET ptr, byval nValue as double )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->nValue = p->Clean( nValue )
+    tkWidget_Invalidate( hRating )
+end sub
+
+public function tkRating_GetItemCount( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->nItems
+end function
+
+' 1 .. TKRATING_MAX_ITEMS. The value is re-clamped, silently.
+public sub tkRating_SetItemCount( byval hRating as TK_WIDGET ptr, byval nItems as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    if nItems < 1 then nItems = 1
+    if nItems > TKRATING_MAX_ITEMS then nItems = TKRATING_MAX_ITEMS
+    p->nItems = nItems
+    p->nValue = p->Clean( p->nValue )
+    p->nPlaceholder = p->Clean( p->nPlaceholder )
+    p->nPreview = -1 : p->nSuppress = -1
+    p->Refresh()
+end sub
+
+public function tkRating_GetPrecision( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return TKRATING_FULL
+    return p->nPrecision
+end function
+
+' TKRATING_FULL / HALF / TENTH; other values are ignored. The value is NOT re-snapped.
+public sub tkRating_SetPrecision( byval hRating as TK_WIDGET ptr, byval nPrecision as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    select case nPrecision
+    case TKRATING_FULL, TKRATING_HALF, TKRATING_TENTH
+        p->nPrecision = nPrecision
+    end select
+end sub
+
+public function tkRating_GetAllowClear( byval hRating as TK_WIDGET ptr ) as boolean
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    return (p <> 0) andalso p->bAllowClear
+end function
+
+public sub tkRating_SetAllowClear( byval hRating as TK_WIDGET ptr, byval bAllow as boolean )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then p->bAllowClear = bAllow
+end sub
+
+public function tkRating_GetReadOnly( byval hRating as TK_WIDGET ptr ) as boolean
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    return (p <> 0) andalso p->isReadOnly
+end function
+
+' Read-only: focusable, ring shown; nothing changes the value and nothing is previewed.
+public sub tkRating_SetReadOnly( byval hRating as TK_WIDGET ptr, byval bReadOnly as boolean )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->isReadOnly = bReadOnly
+    if bReadOnly then
+        if p->isPressed then
+            p->isPressed = false
+            if tkHost_GetCapture( hRating->pHost ) = hRating then tkHost_ReleaseCapture( hRating->pHost )
+        end if
+        p->nPreview = -1 : p->nSuppress = -1
+    end if
+    tkWidget_Invalidate( hRating )
+end sub
+
+public function tkRating_GetHoverPreview( byval hRating as TK_WIDGET ptr ) as boolean
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    return (p <> 0) andalso p->bHoverPreview
+end function
+
+' Off: the preview shows only while pressed.
+public sub tkRating_SetHoverPreview( byval hRating as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->bHoverPreview = bOn
+    if (bOn = false) andalso (p->isPressed = false) then p->nPreview = -1
+    tkWidget_Invalidate( hRating )
+end sub
+
+public function tkRating_GetShowEmpty( byval hRating as TK_WIDGET ptr ) as boolean
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    return (p <> 0) andalso p->bShowEmpty
+end function
+
+' Off: empty items (and the empty part of a partial one) are not drawn.
+public sub tkRating_SetShowEmpty( byval hRating as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->bShowEmpty = bOn
+    tkWidget_Invalidate( hRating )
+end sub
+
+' The previewed value (hover or press), or -1.
+public function tkRating_GetHoverValue( byval hRating as TK_WIDGET ptr ) as double
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return -1
+    return p->nPreview
+end function
+
+public function tkRating_IsPressed( byval hRating as TK_WIDGET ptr ) as boolean
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    return (p <> 0) andalso p->isPressed
+end function
+
+' ---- layout: raw pixels, the caller scales ----------------------------------------------------
+public function tkRating_GetItemSize( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->nItemSize
+end function
+
+public sub tkRating_SetItemSize( byval hRating as TK_WIDGET ptr, byval nSize as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->nItemSize = iif( nSize < 1, 1, nSize )
+    p->nSizePreset = TKRATING_SIZE_CUSTOM
+    p->Refresh()
+end sub
+
+public function tkRating_GetItemSpacing( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->nSpacing
+end function
+
+public sub tkRating_SetItemSpacing( byval hRating as TK_WIDGET ptr, byval nSpacing as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->nSpacing = iif( nSpacing < 0, 0, nSpacing )
+    p->Refresh()
+end sub
+
+public function tkRating_GetBorderThickness( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->nBorderThick
+end function
+
+' The outline of each item; 0 = none. Pins the shape: the theme's BorderWidth leaves it alone.
+public sub tkRating_SetBorderThickness( byval hRating as TK_WIDGET ptr, byval nThick as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->nBorderThick = iif( nThick < 0, 0, nThick )
+    p->bShapePinned = true
+    tkWidget_Invalidate( hRating )
+end sub
+
+public sub tkRating_GetFocusRing( byval hRating as TK_WIDGET ptr, byref nGap as long, byref nThickness as long )
+    nGap = 0 : nThickness = 0
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    nGap = p->nFocusGap : nThickness = p->nFocusThick
+end sub
+
+' Both change the ideal size: the band is reserved whether or not the rating has focus.
+public sub tkRating_SetFocusRing( byval hRating as TK_WIDGET ptr, byval nGap as long, byval nThickness as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->nFocusGap = iif( nGap < 0, 0, nGap )
+    p->nFocusThick = iif( nThickness < 0, 0, nThickness )
+    p->Refresh()
+end sub
+
+' The row plus the ring band both ways: valid before the control is sized.
+public sub tkRating_GetIdealSize( byval hRating as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    nWidth = 0 : nHeight = 0
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    dim as long rp = p->RingPad()
+    nWidth = p->nItems * p->nItemSize + (p->nItems - 1) * p->nSpacing + 2 * rp
+    nHeight = p->nItemSize + 2 * rp
+    ' the caption as it reads now (value, no preview)
+    dim as ustring cap = CaptionText( p )
+    dim as TTF_Font ptr f = CaptionFont( p )
+    if (len( cap ) > 0) andalso (f <> 0) then
+        nWidth += p->nCaptionGap + tkText_Width( f, cap )
+        dim as long th = tkText_Height( f )
+        if th > nHeight then nHeight = th
+    end if
+end sub
+
+' ---- geometry (control-local; FALSE, rc empty, while not laid out) ----------------------------
+private function Laid( byval p as TKRATING_STATE ptr ) as boolean
+    if p = 0 then return false
+    EnsureLayout( p )
+    return p->bLayoutDirty = false
+end function
+
+public function tkRating_GetItemRect( byval hRating as TK_WIDGET ptr, byval nItem as long, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if Laid( p ) = false then return false
+    if (nItem < 0) orelse (nItem >= p->nItems) then return false
+    rc = p->rcItem(nItem)
+    return true
+end function
+
+' The part of the row an item answers for: itself plus half of each gap beside it.
+public function tkRating_GetItemZone( byval hRating as TK_WIDGET ptr, byval nItem as long, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if Laid( p ) = false then return false
+    if (nItem < 0) orelse (nItem >= p->nItems) then return false
+    rc = p->rcZone(nItem)
+    return true
+end function
+
+public function tkRating_GetRowRect( byval hRating as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if Laid( p ) = false then return false
+    rc = p->rcRow
+    return true
+end function
+
+' The ring's rect, which is also what a pointer must be in to preview or set a value.
+public function tkRating_GetFocusRect( byval hRating as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if Laid( p ) = false then return false
+    rc = p->rcFocus
+    return true
+end function
+
+' The value a click at column x would set (x clamped to the row); the value itself while not
+' laid out.
+public function tkRating_ValueFromPoint( byval hRating as TK_WIDGET ptr, byval x as long ) as double
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    if Laid( p ) = false then return p->nValue
+    return p->ValueAt( x )
+end function
+
+' The item whose zone holds (x, y) on the row, or TKRATING_HIT_NONE.
+public function tkRating_HitTest( byval hRating as TK_WIDGET ptr, byval x as long, byval y as long ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if Laid( p ) = false then return TKRATING_HIT_NONE
+    if tkRect_Contains( p->rcCaption, x, y ) then return TKRATING_HIT_CAPTION
+    if p->InRow( x, y ) = false then return TKRATING_HIT_NONE
+    for i as long = 0 to p->nItems - 1
+        if tkRect_Contains( p->rcZone(i), x, y ) then return i
+    next
+    return TKRATING_HIT_NONE
+end function
+
+' ---- R1: shape, glyphs, size, placeholder, caption, fonts ---------------------------------------
+public function tkRating_GetShape( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return TKRATING_STAR
+    return p->nShape
+end function
+
+' TKRATING_STAR / HEART / CIRCLE / DIAMOND / GLYPH; other values are ignored.
+public sub tkRating_SetShape( byval hRating as TK_WIDGET ptr, byval nShape as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    select case nShape
+    case TKRATING_STAR, TKRATING_HEART, TKRATING_CIRCLE, TKRATING_DIAMOND, TKRATING_GLYPH
+        p->nShape = nShape
+        tkWidget_Invalidate( hRating )
+    end select
+end sub
+
+' The GLYPH shape's characters: filled, and empty ("" = the filled one in the empty colour).
+public sub tkRating_SetGlyphs( byval hRating as TK_WIDGET ptr, byval wszFilled as ustring, byval wszEmpty as ustring )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->wszGlyphFilled = wszFilled
+    p->wszGlyphEmpty = wszEmpty
+    tkWidget_Invalidate( hRating )
+end sub
+
+public sub tkRating_GetGlyphs( byval hRating as TK_WIDGET ptr, byref wszFilled as ustring, byref wszEmpty as ustring )
+    wszFilled = "" : wszEmpty = ""
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    wszFilled = p->wszGlyphFilled : wszEmpty = p->wszGlyphEmpty
+end sub
+
+public function tkRating_GetSize( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return TKRATING_SIZE_CUSTOM
+    return p->nSizePreset
+end function
+
+' A preset item size: SMALL 16, MEDIUM 20, LARGE 28 design units, scaled now. Other values ignored.
+public sub tkRating_SetSize( byval hRating as TK_WIDGET ptr, byval nSize as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    dim as long du
+    select case nSize
+    case TKRATING_SIZE_SMALL  : du = 16
+    case TKRATING_SIZE_MEDIUM : du = 20
+    case TKRATING_SIZE_LARGE  : du = 28
+    case else : exit sub
+    end select
+    p->nItemSize = tkHost_Scale( hRating->pHost, du )
+    p->nSizePreset = nSize
+    p->Refresh()
+end sub
+
+public function tkRating_GetPlaceholderValue( byval hRating as TK_WIDGET ptr ) as double
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->nPlaceholder
+end function
+
+' Drawn in the placeholder colour while the value is 0 (a community average under an unrated
+' control); 0 = none. Clamped like a value; silent.
+public sub tkRating_SetPlaceholderValue( byval hRating as TK_WIDGET ptr, byval nValue as double )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->nPlaceholder = p->Clean( nValue )
+    tkWidget_Invalidate( hRating )
+end sub
+
+public function tkRating_GetCaption( byval hRating as TK_WIDGET ptr ) as ustring
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return ""
+    return p->wszCaption
+end function
+
+' Text right of the stars; a FormatCaption callback's non-empty answer replaces it.
+public sub tkRating_SetCaption( byval hRating as TK_WIDGET ptr, byval wszCaption as ustring )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->wszCaption = wszCaption
+    p->Refresh()
+end sub
+
+' What the caption reads now (FormatCaption for the value and the preview, else Caption).
+public function tkRating_GetCaptionText( byval hRating as TK_WIDGET ptr ) as ustring
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return ""
+    return CaptionText( p )
+end function
+
+public function tkRating_GetCaptionGap( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->nCaptionGap
+end function
+
+public sub tkRating_SetCaptionGap( byval hRating as TK_WIDGET ptr, byval nGap as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->nCaptionGap = iif( nGap < 0, 0, nGap )
+    p->Refresh()
+end sub
+
+' The caption's rect: right of the ring band and the gap to the client's right edge; FALSE
+' (empty) while there is no caption or no room.
+public function tkRating_GetCaptionRect( byval hRating as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if Laid( p ) = false then return false
+    rc = p->rcCaption
+    return tkRect_IsEmpty( rc ) = false
+end function
+
+public function tkRating_GetFont( byval hRating as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->fText
+end function
+
+' The caption's font (borrowed); 0 = the surface's default.
+public sub tkRating_SetFont( byval hRating as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->fText = f
+    p->Refresh()
+end sub
+
+public function tkRating_GetGlyphFont( byval hRating as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return p->fGlyph
+end function
+
+' The GLYPH shape's font (borrowed).
+public sub tkRating_SetGlyphFont( byval hRating as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->fGlyph = f
+    tkWidget_Invalidate( hRating )
+end sub
+
+' The family's font pair: text (the caption) and glyph; a 0 leaves that one alone.
+public sub tkRating_ApplyFonts( byval hRating as TK_WIDGET ptr, byval fText as TTF_Font ptr, byval fGlyph as TTF_Font ptr )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    if fText then p->fText = fText
+    if fGlyph then p->fGlyph = fGlyph
+    p->Refresh()
+end sub
+
+' One item's own tooltip (Ant's per-item tooltips); "" = the rating's.
+public sub tkRating_SetItemTooltip( byval hRating as TK_WIDGET ptr, byval nItem as long, byval Text as ustring )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if (p = 0) orelse (nItem < 0) orelse (nItem >= TKRATING_MAX_ITEMS) then exit sub
+    p->wszItemTip(nItem) = Text
+end sub
+
+public function tkRating_GetItemTooltip( byval hRating as TK_WIDGET ptr, byval nItem as long ) as ustring
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if (p = 0) orelse (nItem < 0) orelse (nItem >= TKRATING_MAX_ITEMS) then return ""
+    return p->wszItemTip(nItem)
+end function
+
+' The tip's current tool: the item the pointer is over, or -1 (the rating's own tip).
+public function tkRating_GetTipItem( byval hRating as TK_WIDGET ptr ) as long
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return -1
+    return tkTooltip_GetToolIndex( tkTipHost_Tip( @p->tip ) )
+end function
+
+' The text the tip shows for the tool it is on now (the item's own, else the rating's).
+public function tkRating_GetTipText( byval hRating as TK_WIDGET ptr ) as ustring
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return ""
+    return TipText( 0, hRating, tkTooltip_GetToolIndex( tkTipHost_Tip( @p->tip ) ) )
+end function
+
+' ---- tooltip (tkTipHost) -------------------------------------------------------------------
+public sub tkRating_SetTooltipText( byval hRating as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then p->wszTooltip = Text
+end sub
+
+public function tkRating_GetTooltipText( byval hRating as TK_WIDGET ptr ) as ustring
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return ""
+    return p->wszTooltip
+end function
+
+public function tkRating_GetTooltipHandle( byval hRating as TK_WIDGET ptr ) as TK_TIP ptr
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then return 0
+    return tkTipHost_Tip( @p->tip )
+end function
+
+public sub tkRating_SetHoverTime( byval hRating as TK_WIDGET ptr, byval ms as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then tkTipHost_SetDelay( @p->tip, TK_TIPDELAY_INITIAL, ms )
+end sub
+
+public sub tkRating_SetAutoPopTime( byval hRating as TK_WIDGET ptr, byval ms as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then tkTipHost_SetDelay( @p->tip, TK_TIPDELAY_AUTOPOP, ms )
+end sub
+
+public sub tkRating_SetReshowTime( byval hRating as TK_WIDGET ptr, byval ms as long )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then tkTipHost_SetDelay( @p->tip, TK_TIPDELAY_RESHOW, ms )
+end sub
+
+' ---- appearance ----------------------------------------------------------------------------
+public sub tkRating_GetColors( byval hRating as TK_WIDGET ptr, byval pColors as TKRATING_COLORS ptr )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Copies the struct and PINS it: a theme change leaves this rating alone until UnpinColors.
+public sub tkRating_SetColors( byval hRating as TK_WIDGET ptr, byval pColors as TKRATING_COLORS ptr )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hRating )
+end sub
+
+' The rating's colours from the theme's roles (§4.7): stars in Warning (amber, D-R5).
+public function tkRating_ThemeColors( byref t as TKTHEME_COLORS ) as TKRATING_COLORS
+    dim as TKRATING_COLORS c
+    c.BackColor            = t.Window
+    c.FocusRingColor       = t.FocusRing
+    c.FillColor            = t.Warning
+    c.FillColorHot         = tkColor_Lerp( t.Warning, t.TextStrong, 0.2 )
+    c.FillColorDisabled    = t.TextDisabled
+    c.EmptyColor           = t.Track
+    c.EmptyColorHot        = t.SurfaceHot
+    c.EmptyColorDisabled   = t.SurfaceDisabled
+    c.BorderColor          = t.Border
+    c.BorderColorDisabled  = t.BorderDisabled
+    c.PlaceholderColor     = t.TextDim
+    c.CaptionColor         = t.TextDim
+    c.CaptionColorDisabled = t.TextDisabled
+    return c
+end function
+
+public sub tkRating_ApplyTheme( byval hRating as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    ApplyThemeShape( hRating )
+    if p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hRating, t )
+    p->colors = tkRating_ThemeColors( tr )
+    tkTheme_ResolveInto( hRating, tr, cast( ulong ptr, @p->colors ), sizeof( TKRATING_COLORS ) \ 4, "Rating" )
+    tkWidget_Invalidate( hRating )
+end sub
+
+' Hands the rating back to the theme, which is applied at once.
+public sub tkRating_UnpinColors( byval hRating as TK_WIDGET ptr )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkRating_ApplyTheme( hRating, tkTheme_Of( hRating ) )
+end sub
+
+' ---- callbacks -----------------------------------------------------------------------------
+public sub tkRating_SetPaintCallback( byval hRating as TK_WIDGET ptr, byval usersub as RTG_PaintCallbackSub )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->PaintCallback = usersub
+    tkWidget_Invalidate( hRating )
+end sub
+
+public sub tkRating_SetMessageCallback( byval hRating as TK_WIDGET ptr, byval userfunc as RTG_MessageCallbackFunc )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then p->MessageCallback = userfunc
+end sub
+
+' Replaces the stock drawing of each item; tkRating_PaintItemDefault draws one as it would have been.
+public sub tkRating_SetPaintItemCallback( byval hRating as TK_WIDGET ptr, byval usersub as RTG_PaintItemCallbackSub )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->PaintItemCallback = usersub
+    tkWidget_Invalidate( hRating )
+end sub
+
+' The caption's text for (value, preview -- -1 when none); "" = the Caption.
+public sub tkRating_SetFormatCaptionCallback( byval hRating as TK_WIDGET ptr, byval userfunc as RTG_FormatCaptionCallbackFunc )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p = 0 then exit sub
+    p->FormatCallback = userfunc
+    p->Refresh()
+end sub
+
+public sub tkRating_SetValueChangedCallback( byval hRating as TK_WIDGET ptr, byval usersub as RTG_ValueChangedCallbackSub )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then p->ChangedCallback = usersub
+end sub
+
+public sub tkRating_SetHoverChangedCallback( byval hRating as TK_WIDGET ptr, byval usersub as RTG_HoverChangedCallbackSub )
+    dim as TKRATING_STATE ptr p = RT( hRating )
+    if p then p->HoverCallback = usersub
+end sub
+
+' The theme's shape until a shape setter ran: its BorderWidth is the items' outline.
+private sub ApplyThemeShape( byval w as TK_WIDGET ptr )
+    dim as TKRATING_STATE ptr p = RT( w )
+    if (p = 0) orelse p->bShapePinned then exit sub
+    dim as TKTHEME_SHAPE sh = tkTheme_ShapeOf( w )
+    p->nBorderThick = iif( sh.BorderWidth >= 0, sh.BorderWidth, TKRATING_DEFAULT_BORDER )
+    tkWidget_Invalidate( w )
+end sub

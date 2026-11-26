@@ -1,0 +1,968 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkBind, part two (Form Designer B2): the strict checks a designed form's SaveTo runs before it
+' writes anything, the report LoadFrom makes when a control can't show a field's value, the rules a
+' bound control carries, and the errors both raise.
+'
+'     dim as TKBIND_ERRORS e
+'     tkBind_Check( e, txtAge.Handle, "Age", r.Age, tkTextBox_GetText( txtAge.Handle ), tkBind_Rule( true, "0", "120" ) )
+'     tkBind_Range( e, txtAge.Handle, "Age", r.Age, tkTextBox_GetText( txtAge.Handle ), tkBind_Rule( true, "0", "120" ) )
+'     if e.Count then tkBind_ShowErrors( Handle, e, false ) : return false
+'
+' THE STRICT RULES, by field (after trimming; empty text is 0, false or no date unless Required):
+'   whole numbers   [+|-]digits, within the field's own range (a ubyte is 0 to 255); a fraction from a
+'                   number control is refused
+'   real numbers    [+|-]digits[.digits][e[+|-]digits] (or .digits); a single refuses beyond 3.4e38
+'   boolean         true false yes no on off 1 0 -1
+'   dates           yyyy-mm-dd, or the rule's Format when that is a date pattern (dd/MM/yyyy)
+'   text            any; MaxLength counts characters
+' Format: a std::format spec for numbers (".2f", "08d"), a chrono pattern for dates ("dd/MM/yyyy").
+' Minimum / Maximum: numbers, or yyyy-mm-dd for dates; tkBind_Range exists for number and date
+' fields only, so a range on a text field is a compile error. Messages are English; Code names each.
+#module "tkBind"
+
+#import "std/strings"
+#import "std/containers"
+#import "std/chrono"
+#import "../tkCalendar" public
+#import "../tkApp"
+#import "../tkMessageBox"
+using chrono
+using containers
+using tkCalendar
+using tkApp
+using tkMessageBox
+using tkHost
+
+public enum
+    TKBIND_ERR_NONE = 0
+    TKBIND_ERR_NOTNUMBER        ' text that is no number, into a number field
+    TKBIND_ERR_NOTWHOLE         ' a fraction, into a whole-number field
+    TKBIND_ERR_OUTOFRANGE       ' a number the field's type can't hold (300 into a ubyte)
+    TKBIND_ERR_NOTDATE          ' text that is no date, into a date field
+    TKBIND_ERR_NOTBOOL          ' text that is no yes or no, into a boolean field
+    TKBIND_ERR_REQUIRED         ' Required, and empty / no date / no selection
+    TKBIND_ERR_TOOLONG          ' longer than MaxLength
+    TKBIND_ERR_BELOWMIN         ' below the rule's Minimum
+    TKBIND_ERR_ABOVEMAX         ' above the rule's Maximum
+    TKBIND_ERR_CLAMPED          ' LoadFrom: the control shows something else than the field holds
+    TKBIND_ERR_NOTINLIST        ' LoadFrom: a ComboBox has no item with the field's value (B3)
+end enum
+
+' One problem with one bound control.
+public type TKBIND_ERROR
+    Widget  as TK_WIDGET ptr    ' the control, to focus
+    Field   as ustring          ' the record's field, as the form binds it ("Age", "Home.City")
+    Code    as long             ' TKBIND_ERR_*
+    Value   as ustring          ' the value at fault, as text
+    Message as ustring          ' English: "'abc' is not a number"
+end type
+
+public type TKBIND_ERRORS
+    Items( any ) as TKBIND_ERROR
+    Count as long
+    declare sub Add( byval w as TK_WIDGET ptr, byref fld as const ustring, byval code as long, byref value as const ustring, byref msg as const ustring )
+    declare function Has( byval w as TK_WIDGET ptr ) as boolean
+    declare function Text( ) as ustring       ' one line each: "Age: 'abc' is not a number"
+    declare sub Clear( )
+end type
+
+sub TKBIND_ERRORS.Add( byval w as TK_WIDGET ptr, byref fld as const ustring, byval code as long, byref value as const ustring, byref msg as const ustring )
+    redim preserve this.Items( 0 to this.Count )
+    with this.Items( this.Count )
+        .Widget = w : .Field = fld : .Code = code : .Value = value : .Message = msg
+    end with
+    this.Count += 1
+end sub
+
+function TKBIND_ERRORS.Has( byval w as TK_WIDGET ptr ) as boolean
+    for i as long = 0 to this.Count - 1
+        if this.Items( i ).Widget = w then return true
+    next
+    return false
+end function
+
+function TKBIND_ERRORS.Text( ) as ustring
+    dim as ustring o
+    for i as long = 0 to this.Count - 1
+        if i then o &= !"\n"
+        o &= this.Items( i ).Field & ": " & this.Items( i ).Message
+    next
+    return o
+end function
+
+sub TKBIND_ERRORS.Clear( )
+    erase this.Items
+    this.Count = 0
+end sub
+
+' A bound control's rules, as the designer sets them. MinText / MaxText: numbers, or yyyy-mm-dd.
+' HasNone / NoneValue: the int value that means "nothing chosen" (a ComboBox's -1), for Required.
+public type TKBIND_RULE
+    Required  as boolean
+    MinText   as ustring
+    MaxText   as ustring
+    MaxLength as long
+    Format    as ustring
+    HasNone   as boolean
+    NoneValue as longint
+end type
+
+public function tkBind_Rule( byval required as boolean = false, byref minText as const ustring = "", byref maxText as const ustring = "", _
+                             byval maxLength as long = 0, byref fmt as const ustring = "", _
+                             byval hasNone as boolean = false, byval noneValue as longint = 0 ) as TKBIND_RULE
+    dim as TKBIND_RULE r
+    r.Required = required : r.MinText = minText : r.MaxText = maxText : r.MaxLength = maxLength
+    r.Format = fmt : r.HasNone = hasNone : r.NoneValue = noneValue
+    return r
+end function
+
+' ---- the strict parsers -----------------------------------------------------------------------
+
+private function IsDigits_( byref s as const ustring ) as boolean
+    if len( s ) = 0 then return false
+    for i as long = 1 to len( s )
+        dim as long c = asc( s, i )
+        if (c < 48) orelse (c > 57) then return false
+    next
+    return true
+end function
+
+' [+|-]digits: the sign apart, the magnitude in a ulongint. False on anything else or on overflow.
+private function ParseWhole_( byref s as const ustring, byref neg as boolean, byref mag as ulongint ) as boolean
+    dim as ustring t = trim( s )
+    neg = false : mag = 0
+    if (left( t, 1 ) = "+") orelse (left( t, 1 ) = "-") then
+        neg = (left( t, 1 ) = "-")
+        t = mid( t, 2 )
+    end if
+    if IsDigits_( t ) = false then return false
+    for i as long = 1 to len( t )
+        dim as ulongint d = asc( t, i ) - 48
+        if mag > (&hFFFFFFFFFFFFFFFFull - d) \ 10 then return false
+        mag = mag * 10 + d
+    next
+    if mag = 0 then neg = false
+    return true
+end function
+
+' [+|-]digits[.digits][e[+|-]digits], or [+|-].digits[...]. Then VAL, which reads exactly that.
+private function ParseReal_( byref s as const ustring, byref v as float64 ) as boolean
+    dim as ustring t = trim( s )
+    v = 0
+    if len( t ) = 0 then return false
+    dim as ustring m = t
+    if (left( m, 1 ) = "+") orelse (left( m, 1 ) = "-") then m = mid( m, 2 )
+    dim as ustring ex
+    dim as long ep = instr( lcase( m ), "e" )
+    if ep then
+        ex = mid( m, ep + 1 )
+        m = left( m, ep - 1 )
+        if (left( ex, 1 ) = "+") orelse (left( ex, 1 ) = "-") then ex = mid( ex, 2 )
+        if IsDigits_( ex ) = false then return false
+    end if
+    dim as long dp = instr( m, "." )
+    if dp then
+        dim as ustring a = left( m, dp - 1 ), b = mid( m, dp + 1 )
+        if (len( a ) = 0) andalso (len( b ) = 0) then return false
+        if len( a ) andalso (IsDigits_( a ) = false) then return false
+        if len( b ) andalso (IsDigits_( b ) = false) then return false
+    elseif IsDigits_( m ) = false then
+        return false
+    end if
+    v = val( t )
+    return true
+end function
+
+private function ParseBool_( byref s as const ustring, byref b as boolean ) as boolean
+    select case lcase( trim( s ) )
+    case "true", "yes", "on", "1", "-1" : b = true : return true
+    case "false", "no", "off", "0" : b = false : return true
+    end select
+    return false
+end function
+
+' A Format that is a std::format spec for a number (".2f", "08d"), not a date pattern.
+private function IsNumberSpec_( byref fmt as const ustring ) as boolean
+    if len( fmt ) = 0 then return false
+    dim as ustring none_ = chr( 1 )
+    if strings.TryFormat( "{:" & fmt & "}", 1.5 ).ValueOr( none_ ) <> none_ then return true
+    return strings.TryFormat( "{:" & fmt & "}", 1 ).ValueOr( none_ ) <> none_
+end function
+
+' A Format that is a date pattern: not a number spec, and it names a day, month or year.
+private function IsDatePattern_( byref fmt as const ustring ) as boolean
+    if (len( fmt ) = 0) orelse IsNumberSpec_( fmt ) then return false
+    return (instr( fmt, "d" ) > 0) orelse (instr( fmt, "M" ) > 0) orelse (instr( fmt, "y" ) > 0)
+end function
+
+' Whether the designer may take fmt as a Format: a number spec, or a date pattern that formats.
+public function tkBind_IsFormat( byref fmt as const ustring ) as boolean
+    if IsNumberSpec_( fmt ) then return true
+    if IsDatePattern_( fmt ) = false then return false
+    dim as DateTime dt = DateTime( 2026, 1, 2 )
+    dim as ustring s, pat = fmt
+    return dt.TryFormat( pat, s )
+end function
+
+private function IsoB2_( byref d as const TKDATE ) as ustring
+    if d.wYear = 0 then return ""
+    dim as ustring y = str( d.wYear ), m = str( d.wMonth ), dd = str( d.wDay )
+    return string( 4 - len( y ), "0" ) & y & "-" & string( 2 - len( m ), "0" ) & m & "-" & string( 2 - len( dd ), "0" ) & dd
+end function
+
+private function DateOfLocalB2_( byref ld as LocalDate ) as TKDATE
+    dim as TKDATE none_
+    if ld.IsValid = false then return none_
+    return tkCalendar_MakeDate( ld.Year, ld.Month, ld.Day )
+end function
+
+' A DateTime's date part (Time picker T4 binds a DatePicker to one); an invalid one is no date.
+private function DateOfDateTimeB3_( byref d as DateTime ) as TKDATE
+    dim as TKDATE none_
+    if d.IsValid = false then return none_
+    return tkCalendar_MakeDate( d.Year, d.Month, d.Day )
+end function
+
+private function LocalOfDateB2_( byref d as const TKDATE ) as LocalDate
+    dim as LocalDate none_
+    if d.wYear = 0 then return none_
+    return LocalDate( d.wYear, d.wMonth, d.wDay )
+end function
+
+' yyyy-mm-dd, or fmt when it is a date pattern. Empty text is no date (true, d all zero).
+private function ParseDate_( byref s as const ustring, byref fmt as const ustring, byref d as TKDATE ) as boolean
+    dim as TKDATE none_
+    d = none_
+    dim as ustring t = trim( s )
+    if len( t ) = 0 then return true
+    dim as LocalDate ld
+    if LocalDate.TryParseIso( t, ld ) then d = DateOfLocalB2_( ld ) : return true
+    if IsDatePattern_( fmt ) then
+        dim as DateTime dt
+        dim as ustring pat = fmt
+        if DateTime.TryParseExact( t, pat, dt ) then d = tkCalendar_MakeDate( dt.Year, dt.Month, dt.Day ) : return true
+    end if
+    return false
+end function
+
+private function DateOfTextFmt_( byref s as const ustring, byref fmt as const ustring ) as TKDATE
+    dim as TKDATE d
+    if ParseDate_( s, fmt, d ) = false then
+        dim as TKDATE none_
+        return none_
+    end if
+    return d
+end function
+
+' ---- Format on load ---------------------------------------------------------------------------
+
+private function FmtF_( byval v as float64, byref fmt as const ustring ) as ustring
+    if len( fmt ) = 0 then return str( v )
+    dim as ustring s = str( v )
+    return strings.TryFormat( "{:" & fmt & "}", v ).ValueOr( s )
+end function
+
+private function FmtI_( byval v as longint, byref fmt as const ustring ) as ustring
+    if len( fmt ) = 0 then return str( v )
+    dim as ustring none_ = chr( 1 )
+    dim as ustring s = strings.TryFormat( "{:" & fmt & "}", v ).ValueOr( none_ )
+    if s <> none_ then return s
+    return FmtF_( cdbl( v ), fmt )
+end function
+
+private function FmtU_( byval v as ulongint, byref fmt as const ustring ) as ustring
+    if len( fmt ) = 0 then return str( v )
+    dim as ustring none_ = chr( 1 )
+    dim as ustring s = strings.TryFormat( "{:" & fmt & "}", v ).ValueOr( none_ )
+    if s <> none_ then return s
+    return FmtF_( cdbl( v ), fmt )
+end function
+
+private function FmtDate_( byref d as const TKDATE, byref fmt as const ustring ) as ustring
+    if d.wYear = 0 then return ""
+    if IsDatePattern_( fmt ) = false then return IsoB2_( d )
+    dim as DateTime dt = DateTime( d.wYear, d.wMonth, d.wDay )
+    dim as ustring s, pat = fmt
+    if dt.TryFormat( pat, s ) = false then return IsoB2_( d )
+    return s
+end function
+
+' ---- the checks -------------------------------------------------------------------------------
+
+private function Quoted_( byref s as const ustring ) as ustring
+    return "'" & trim( s ) & "'"
+end function
+
+' The rules every text value meets first: Required, MaxLength. True when it is empty.
+private function TextRules_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, _
+                             byref v as const ustring, byref ru as const TKBIND_RULE ) as boolean
+    dim as boolean empty_ = (len( trim( v ) ) = 0)
+    if empty_ andalso ru.Required then e.Add( w, fld, TKBIND_ERR_REQUIRED, "", "is required" )
+    if (ru.MaxLength > 0) andalso (len( v ) > ru.MaxLength) then
+        e.Add( w, fld, TKBIND_ERR_TOOLONG, v, "is longer than " & ru.MaxLength & " characters" )
+    end if
+    return empty_
+end function
+
+private function FieldRange_( byval bUnsigned as boolean, byval nBytes as long ) as ustring
+    if bUnsigned then
+        if nBytes = 8 then return "0 to 18446744073709551615"
+        return "0 to " & str( (1ull shl (8 * nBytes)) - 1 )
+    end if
+    dim as ulongint lo = 1ull shl (8 * nBytes - 1)
+    return "-" & str( lo ) & " to " & str( lo - 1 )
+end function
+
+' A whole number (neg, mag) in a field of nBytes, signed or not.
+private sub CheckFits_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref shown as const ustring, _
+                        byval neg as boolean, byval mag as ulongint, byval bUnsigned as boolean, byval nBytes as long )
+    dim as boolean ok
+    if bUnsigned then
+        dim as ulongint hi = iif( nBytes = 8, &hFFFFFFFFFFFFFFFFull, (1ull shl (8 * nBytes)) - 1 )
+        ok = (neg = false) andalso (mag <= hi)
+    else
+        dim as ulongint lo = 1ull shl (8 * nBytes - 1)
+        ok = iif( neg, mag <= lo, mag <= lo - 1 )
+    end if
+    if ok = false then e.Add( w, fld, TKBIND_ERR_OUTOFRANGE, shown, shown & " is outside " & FieldRange_( bUnsigned, nBytes ) )
+end sub
+
+private sub CheckTextWhole_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref v as const ustring, _
+                             byref ru as const TKBIND_RULE, byval bUnsigned as boolean, byval nBytes as long )
+    if TextRules_( e, w, fld, v, ru ) then exit sub
+    dim as boolean neg
+    dim as ulongint mag
+    if ParseWhole_( v, neg, mag ) = false then
+        dim as float64 x
+        dim as ustring t = trim( v )
+        if (left( t, 1 ) = "+") orelse (left( t, 1 ) = "-") then t = mid( t, 2 )
+        if IsDigits_( t ) then
+            ' digits past even a ulongint
+            e.Add( w, fld, TKBIND_ERR_OUTOFRANGE, trim( v ), trim( v ) & " is outside " & FieldRange_( bUnsigned, nBytes ) )
+        elseif ParseReal_( v, x ) then
+            e.Add( w, fld, TKBIND_ERR_NOTWHOLE, v, Quoted_( v ) & " is not a whole number" )
+        else
+            e.Add( w, fld, TKBIND_ERR_NOTNUMBER, v, Quoted_( v ) & " is not a number" )
+        end if
+        exit sub
+    end if
+    CheckFits_( e, w, fld, trim( v ), neg, mag, bUnsigned, nBytes )
+end sub
+
+private sub CheckSingle_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byval x as float64 )
+    if abs( x ) > 3.402823466e38 then e.Add( w, fld, TKBIND_ERR_OUTOFRANGE, str( x ), str( x ) & " is too large for a single" )
+end sub
+
+private sub CheckTextReal_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref v as const ustring, _
+                            byref ru as const TKBIND_RULE, byval bSingle as boolean )
+    if TextRules_( e, w, fld, v, ru ) then exit sub
+    dim as float64 x
+    if ParseReal_( v, x ) = false then
+        e.Add( w, fld, TKBIND_ERR_NOTNUMBER, v, Quoted_( v ) & " is not a number" )
+        exit sub
+    end if
+    if bSingle then CheckSingle_( e, w, fld, x )
+end sub
+
+private sub CheckTextBool_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref v as const ustring, byref ru as const TKBIND_RULE )
+    if TextRules_( e, w, fld, v, ru ) then exit sub
+    dim as boolean b
+    if ParseBool_( v, b ) = false then e.Add( w, fld, TKBIND_ERR_NOTBOOL, v, Quoted_( v ) & " is not yes or no" )
+end sub
+
+private sub CheckTextText_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref v as const ustring, byref ru as const TKBIND_RULE )
+    TextRules_( e, w, fld, v, ru )
+end sub
+
+private sub CheckTextDate_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref v as const ustring, byref ru as const TKBIND_RULE )
+    if TextRules_( e, w, fld, v, ru ) then exit sub
+    dim as TKDATE d
+    if ParseDate_( v, ru.Format, d ) = false then
+        dim as ustring want = "yyyy-mm-dd"
+        if IsDatePattern_( ru.Format ) then want = ru.Format
+        e.Add( w, fld, TKBIND_ERR_NOTDATE, v, Quoted_( v ) & " is not a date (" & want & ")" )
+    end if
+end sub
+
+private sub CheckRequiredInt_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byval v as longint, byref ru as const TKBIND_RULE )
+    if ru.Required andalso ru.HasNone andalso (v = ru.NoneValue) then e.Add( w, fld, TKBIND_ERR_REQUIRED, "", "is required" )
+end sub
+
+private sub CheckIntWhole_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byval v as longint, _
+                            byref ru as const TKBIND_RULE, byval bUnsigned as boolean, byval nBytes as long )
+    if ru.Required andalso ru.HasNone andalso (v = ru.NoneValue) then
+        CheckRequiredInt_( e, w, fld, v, ru )
+        exit sub
+    end if
+    dim as ulongint mag
+    if v < 0 then mag = cast( ulongint, -(v + 1) ) + 1 else mag = cast( ulongint, v )
+    CheckFits_( e, w, fld, str( v ), v < 0, mag, bUnsigned, nBytes )
+end sub
+
+private sub CheckRealWhole_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byval x as float64, _
+                             byval bUnsigned as boolean, byval nBytes as long )
+    if x <> fix( x ) then
+        e.Add( w, fld, TKBIND_ERR_NOTWHOLE, str( x ), str( x ) & " is not a whole number" )
+        exit sub
+    end if
+    if abs( x ) >= 1.8446744073709552e19 then
+        e.Add( w, fld, TKBIND_ERR_OUTOFRANGE, str( x ), str( x ) & " is outside " & FieldRange_( bUnsigned, nBytes ) )
+        exit sub
+    end if
+    CheckFits_( e, w, fld, str( x ), x < 0, cast( ulongint, abs( x ) ), bUnsigned, nBytes )
+end sub
+
+private sub CheckRequiredDate_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref d as const TKDATE, byref ru as const TKBIND_RULE )
+    if ru.Required andalso (d.wYear = 0) then e.Add( w, fld, TKBIND_ERR_REQUIRED, "", "is required" )
+end sub
+
+' ---- Minimum / Maximum ------------------------------------------------------------------------
+
+private sub RangeReal_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byval x as float64, byref ru as const TKBIND_RULE )
+    dim as float64 lim
+    if len( ru.MinText ) andalso ParseReal_( ru.MinText, lim ) andalso (x < lim) then
+        e.Add( w, fld, TKBIND_ERR_BELOWMIN, str( x ), str( x ) & " is below the minimum, " & ru.MinText )
+    elseif len( ru.MaxText ) andalso ParseReal_( ru.MaxText, lim ) andalso (x > lim) then
+        e.Add( w, fld, TKBIND_ERR_ABOVEMAX, str( x ), str( x ) & " is above the maximum, " & ru.MaxText )
+    end if
+end sub
+
+' Text that didn't convert was reported by Check; empty text is no value to compare.
+private sub RangeText_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref v as const ustring, byref ru as const TKBIND_RULE )
+    dim as float64 x
+    if ParseReal_( v, x ) then RangeReal_( e, w, fld, x, ru )
+end sub
+
+private sub RangeDate_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref d as const TKDATE, byref ru as const TKBIND_RULE )
+    if d.wYear = 0 then exit sub
+    dim as ustring iso = IsoB2_( d )
+    if len( ru.MinText ) andalso (iso < trim( ru.MinText )) then
+        e.Add( w, fld, TKBIND_ERR_BELOWMIN, iso, iso & " is before the minimum, " & ru.MinText )
+    elseif len( ru.MaxText ) andalso (iso > trim( ru.MaxText )) then
+        e.Add( w, fld, TKBIND_ERR_ABOVEMAX, iso, iso & " is after the maximum, " & ru.MaxText )
+    end if
+end sub
+
+private sub RangeDateText_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref v as const ustring, byref ru as const TKBIND_RULE )
+    dim as TKDATE d
+    if ParseDate_( v, ru.Format, d ) then RangeDate_( e, w, fld, d, ru )
+end sub
+
+' ---- LoadFrom's report ------------------------------------------------------------------------
+
+private sub LoadedReal_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byval held as float64, byval shown as float64 )
+    dim as float64 scale_ = abs( held )
+    if scale_ < 1 then scale_ = 1
+    if abs( held - shown ) <= 1e-9 * scale_ then exit sub
+    e.Add( w, fld, TKBIND_ERR_CLAMPED, str( held ), str( held ) & " is shown as " & str( shown ) )
+end sub
+
+private sub LoadedText_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref held as const ustring, byval shown as float64 )
+    dim as float64 x
+    if len( trim( held ) ) = 0 then
+        x = 0
+    elseif ParseReal_( held, x ) = false then
+        e.Add( w, fld, TKBIND_ERR_NOTNUMBER, held, Quoted_( held ) & " is not a number (shown as " & str( shown ) & ")" )
+        exit sub
+    end if
+    LoadedReal_( e, w, fld, x, shown )
+end sub
+
+private sub LoadedDate_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref held as const TKDATE, byref shown as const TKDATE )
+    if IsoB2_( held ) = IsoB2_( shown ) then exit sub
+    dim as ustring h = "no date", s = "no date"
+    if held.wYear then h = IsoB2_( held )
+    if shown.wYear then s = IsoB2_( shown )
+    e.Add( w, fld, TKBIND_ERR_CLAMPED, IsoB2_( held ), h & " is shown as " & s )
+end sub
+
+private sub LoadedDateText_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref held as const ustring, byref shown as const TKDATE )
+    dim as TKDATE d
+    dim as ustring none_
+    if ParseDate_( held, none_, d ) = false then
+        e.Add( w, fld, TKBIND_ERR_NOTDATE, held, Quoted_( held ) & " is not a date (yyyy-mm-dd)" )
+        exit sub
+    end if
+    LoadedDate_( e, w, fld, d, shown )
+end sub
+
+' ---- showing them -----------------------------------------------------------------------------
+
+' Replaces the default (a message box) for every form: an app's own surface, or a selftest's
+' recorder. f is the form, bLoading true for LoadFrom's report. 0 puts the default back.
+public type TKBIND_PresenterSub as sub( byval f as TK_FORM ptr, byref e as TKBIND_ERRORS, byval bLoading as boolean )
+
+dim shared as TKBIND_PresenterSub gBindPresenter
+
+public sub tkBind_SetErrorPresenter( byval p as TKBIND_PresenterSub )
+    gBindPresenter = p
+end sub
+
+' What a designed form's SaveTo / LoadFrom do with the errors its ValidationError handler left: the
+' presenter if one is set; else focus the first control at fault and say what is wrong in a
+' message box over the form, in its fonts.
+public sub tkBind_ShowErrors( byval f as TK_FORM ptr, byref e as TKBIND_ERRORS, byval bLoading as boolean )
+    if e.Count = 0 then exit sub
+    if gBindPresenter then
+        gBindPresenter( f, e, bLoading )
+        exit sub
+    end if
+    if f = 0 then exit sub
+    if e.Items( 0 ).Widget then tkHost_SetFocus( tkForm_Host( f ), e.Items( 0 ).Widget )
+    dim as TK_WIDGET ptr box = tkMessageBox_Create( tkForm_Widget( f ) )
+    if box = 0 then exit sub
+    dim as TTF_Font ptr fGlyph = tkForm_Font( f, TKFONT_GLYPH )
+    if fGlyph then
+        dim as long fh = TTF_GetFontHeight( fGlyph )
+        tkMessageBox_SetIconSize( box, fh, fh )
+    end if
+    tkMessageBox_ApplyFonts( box, tkForm_Font( f, TKFONT_UI ), fGlyph )
+    tkMessageBox_SetCloseGlyphFont( box, fGlyph )
+    if bLoading then
+        tkMessageBox_SetCaption( box, "Some values were changed to fit" )
+        tkMessageBox_SetIconKind( box, MBX_ICON_WARNING )
+    else
+        tkMessageBox_SetCaption( box, "Can't save" )
+        tkMessageBox_SetIconKind( box, MBX_ICON_ERROR )
+    end if
+    tkMessageBox_SetText( box, e.Text( ) )
+    tkMessageBox_AddPreset( box, MBX_BTN_OK )
+    tkMessageBox_DoModal( box )
+end sub
+
+' ---- check: would this value go into the field? (SaveTo, before it writes anything) ----------
+
+public sub tkBind_Check overload( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as boolean, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextBool_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, false, 1 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, true, 1 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, false, 2 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, true, 2 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, false, 4 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, true, 4 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, false, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, true, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, false, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextWhole_( e, w, fld, v, ru, true, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextReal_( e, w, fld, v, ru, true ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextReal_( e, w, fld, v, ru, false ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ustring, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as string, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as TKDATE, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextDate_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as LocalDate, byref v as const ustring, byref ru as const TKBIND_RULE ) : CheckTextDate_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as boolean, byval v as longint, byref ru as const TKBIND_RULE ) : CheckRequiredInt_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, false, 1 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, true, 1 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, false, 2 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, true, 2 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, false, 4 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, true, 4 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, false, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, true, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, false, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byval v as longint, byref ru as const TKBIND_RULE ) : CheckIntWhole_( e, w, fld, v, ru, true, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byval v as longint, byref ru as const TKBIND_RULE ) : CheckRequiredInt_( e, w, fld, v, ru ) : CheckSingle_( e, w, fld, v ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byval v as longint, byref ru as const TKBIND_RULE ) : CheckRequiredInt_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ustring, byval v as longint, byref ru as const TKBIND_RULE ) : CheckRequiredInt_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as string, byval v as longint, byref ru as const TKBIND_RULE ) : CheckRequiredInt_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as boolean, byval v as float64, byref ru as const TKBIND_RULE ) : exit sub : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, false, 1 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, true, 1 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, false, 2 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, true, 2 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, false, 4 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, true, 4 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, false, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, true, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, false, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byval v as float64, byref ru as const TKBIND_RULE ) : CheckRealWhole_( e, w, fld, v, true, 8 ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byval v as float64, byref ru as const TKBIND_RULE ) : CheckSingle_( e, w, fld, v ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byval v as float64, byref ru as const TKBIND_RULE ) : exit sub : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ustring, byval v as float64, byref ru as const TKBIND_RULE ) : exit sub : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as string, byval v as float64, byref ru as const TKBIND_RULE ) : exit sub : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ustring, byref v as const TKDATE, byref ru as const TKBIND_RULE ) : CheckRequiredDate_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as string, byref v as const TKDATE, byref ru as const TKBIND_RULE ) : CheckRequiredDate_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as TKDATE, byref v as const TKDATE, byref ru as const TKBIND_RULE ) : CheckRequiredDate_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as LocalDate, byref v as const TKDATE, byref ru as const TKBIND_RULE ) : CheckRequiredDate_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Check( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as DateTime, byref v as const TKDATE, byref ru as const TKBIND_RULE ) : CheckRequiredDate_( e, w, fld, v, ru ) : end sub
+
+' ---- range: Minimum / Maximum, for number and date fields only (a text field has none to compare) --
+
+public sub tkBind_Range overload( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byval v as longint, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byval v as float64, byref ru as const TKBIND_RULE ) : RangeReal_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as TKDATE, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeDateText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as TKDATE, byref v as const TKDATE, byref ru as const TKBIND_RULE ) : RangeDate_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as LocalDate, byref v as const ustring, byref ru as const TKBIND_RULE ) : RangeDateText_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as LocalDate, byref v as const TKDATE, byref ru as const TKBIND_RULE ) : RangeDate_( e, w, fld, v, ru ) : end sub
+public sub tkBind_Range( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as DateTime, byref v as const TKDATE, byref ru as const TKBIND_RULE ) : RangeDate_( e, w, fld, v, ru ) : end sub
+
+' ---- loaded: does the control show the field's value? (LoadFrom, after each setter) -----------
+
+public sub tkBind_Loaded overload( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as boolean, byval shown as longint ) : LoadedReal_( e, w, fld, iif( f, 1.0, 0.0 ), shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byval shown as longint ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ustring, byval shown as longint ) : LoadedText_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as string, byval shown as longint ) : LoadedText_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as boolean, byval shown as float64 ) : LoadedReal_( e, w, fld, iif( f, 1.0, 0.0 ), shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byval shown as float64 ) : LoadedReal_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ustring, byval shown as float64 ) : LoadedText_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as string, byval shown as float64 ) : LoadedText_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ustring, byref shown as const TKDATE ) : LoadedDateText_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as string, byref shown as const TKDATE ) : LoadedDateText_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as TKDATE, byref shown as const TKDATE ) : LoadedDate_( e, w, fld, f, shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as LocalDate, byref shown as const TKDATE ) : LoadedDate_( e, w, fld, DateOfLocalB2_( f ), shown ) : end sub
+public sub tkBind_Loaded( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as DateTime, byref shown as const TKDATE ) : LoadedDate_( e, w, fld, DateOfDateTimeB3_( f ), shown ) : end sub
+
+' ---- Format: a field as text in a pattern (load), text in that pattern back into it (save) --------
+
+public function tkBind_Text overload( byval v as boolean, byref fmt as const ustring ) as ustring : return iif( v, "true", "false" ) : end function
+public function tkBind_Text( byval v as byte, byref fmt as const ustring ) as ustring : return FmtI_( v, fmt ) : end function
+public function tkBind_Text( byval v as ubyte, byref fmt as const ustring ) as ustring : return FmtI_( v, fmt ) : end function
+public function tkBind_Text( byval v as short, byref fmt as const ustring ) as ustring : return FmtI_( v, fmt ) : end function
+public function tkBind_Text( byval v as ushort, byref fmt as const ustring ) as ustring : return FmtI_( v, fmt ) : end function
+public function tkBind_Text( byval v as long, byref fmt as const ustring ) as ustring : return FmtI_( v, fmt ) : end function
+public function tkBind_Text( byval v as ulong, byref fmt as const ustring ) as ustring : return FmtI_( v, fmt ) : end function
+public function tkBind_Text( byval v as longint, byref fmt as const ustring ) as ustring : return FmtI_( v, fmt ) : end function
+public function tkBind_Text( byval v as ulongint, byref fmt as const ustring ) as ustring : return FmtU_( v, fmt ) : end function
+public function tkBind_Text( byval v as integer, byref fmt as const ustring ) as ustring : return FmtI_( v, fmt ) : end function
+public function tkBind_Text( byval v as uinteger, byref fmt as const ustring ) as ustring : return FmtU_( v, fmt ) : end function
+public function tkBind_Text( byval v as single, byref fmt as const ustring ) as ustring : return FmtF_( v, fmt ) : end function
+public function tkBind_Text( byval v as double, byref fmt as const ustring ) as ustring : return FmtF_( v, fmt ) : end function
+public function tkBind_Text( byref v as const ustring, byref fmt as const ustring ) as ustring : return v : end function
+public function tkBind_Text( byref v as const string, byref fmt as const ustring ) as ustring : return v : end function
+public function tkBind_Text( byref v as const TKDATE, byref fmt as const ustring ) as ustring : return FmtDate_( v, fmt ) : end function
+public function tkBind_Text( byref v as LocalDate, byref fmt as const ustring ) as ustring : return FmtDate_( DateOfLocalB2_( v ), fmt ) : end function
+public sub tkBind_Put overload( byref f as boolean, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as byte, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as ubyte, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as short, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as ushort, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as long, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as ulong, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as longint, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as ulongint, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as integer, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as uinteger, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as single, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as double, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as ustring, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as string, byref v as const ustring, byref fmt as const ustring ) : tkBind_Put( f, v ) : end sub
+public sub tkBind_Put( byref f as TKDATE, byref v as const ustring, byref fmt as const ustring ) : f = DateOfTextFmt_( v, fmt ) : end sub
+public sub tkBind_Put( byref f as LocalDate, byref v as const ustring, byref fmt as const ustring ) : f = LocalOfDateB2_( DateOfTextFmt_( v, fmt ) ) : end sub
+
+' ---- B3: list binding helpers -----------------------------------------------------------------
+
+' Where text is in values (a ComboBox's ValueField texts), or -1.
+public function tkBind_IndexOf( byref values as Array( of ustring ), byref text as const ustring ) as long
+    for i as long = 0 to values.Count( ) - 1
+        if values[i] = text then return i
+    next
+    return -1
+end function
+
+' The chosen item's value text; "" for no choice (into a field: 0, false, no date, "").
+private function PickText_( byref values as Array( of ustring ), byval sel as long ) as ustring
+    if (sel < 0) orelse (sel >= values.Count( )) then return ""
+    return values[sel]
+end function
+
+' No choice: Required says so, and there is nothing else to check. True when handled.
+private function PickNone_( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, _
+                            byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE ) as boolean
+    if (sel >= 0) andalso (sel < values.Count( )) then return false
+    if ru.Required then e.Add( w, fld, TKBIND_ERR_REQUIRED, "", "is required" )
+    return true
+end function
+
+' The rule for the chosen value itself: Required was the choice's to meet.
+private function NoRequired_( byref ru as const TKBIND_RULE ) as TKBIND_RULE
+    dim as TKBIND_RULE r = ru
+    r.Required = false
+    return r
+end function
+
+' LoadFrom: the field's value (as tkBind_Text gives it) found no item. "" and "0" are no value.
+public sub tkBind_LoadedPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, _
+                              byref held as const ustring, byval sel as long )
+    if sel >= 0 then exit sub
+    dim as ustring t = trim( held )
+    if (len( t ) = 0) orelse (t = "0") then exit sub
+    e.Add( w, fld, TKBIND_ERR_NOTINLIST, t, "'" & t & "' is not in the list" )
+end sub
+
+' ---- B3: a ComboBox that binds its items' ValueField ------------------------------------------
+' The values are kept as text (tkBind_Text of each item's ValueField, in a generated member); the
+' chosen one goes back through tkBind_Check / tkBind_Put, so an id, a code or a date all bind.
+
+public sub tkBind_CheckPick overload( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as boolean, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as byte, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ubyte, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as short, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ushort, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as long, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulong, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as longint, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ulongint, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as integer, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as uinteger, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as single, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as double, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as ustring, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as string, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as TKDATE, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_CheckPick( byref e as TKBIND_ERRORS, byval w as TK_WIDGET ptr, byref fld as const ustring, byref f as LocalDate, byref values as Array( of ustring ), byval sel as long, byref ru as const TKBIND_RULE )
+    if PickNone_( e, w, fld, values, sel, ru ) then exit sub
+    tkBind_Check( e, w, fld, f, values[sel], NoRequired_( ru ) )
+end sub
+public sub tkBind_PutPick overload( byref f as boolean, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as byte, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as ubyte, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as short, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as ushort, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as long, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as ulong, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as longint, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as ulongint, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as integer, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as uinteger, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as single, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as double, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as ustring, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as string, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as TKDATE, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+public sub tkBind_PutPick( byref f as LocalDate, byref values as Array( of ustring ), byval sel as long ) : tkBind_Put( f, PickText_( values, sel ) ) : end sub
+
+' ---- B4: comparing for IsDirty ----------------------------------------------------------------
+
+private function DiffReal_( byval held as float64, byval shown as float64 ) as boolean
+    dim as float64 scale_ = abs( held )
+    if scale_ < 1 then scale_ = 1
+    return abs( held - shown ) > 1e-9 * scale_
+end function
+
+' A number field against text: empty text is 0; text that is no number differs.
+private function DiffNum_( byval held as float64, byref v as const ustring ) as boolean
+    dim as float64 x
+    if len( trim( v ) ) = 0 then return DiffReal_( held, 0 )
+    if ParseReal_( v, x ) = false then return true
+    return DiffReal_( held, x )
+end function
+
+private function DiffBool_( byval held as boolean, byref v as const ustring ) as boolean
+    dim as boolean b
+    if len( trim( v ) ) = 0 then return held
+    if ParseBool_( v, b ) = false then return true
+    return b <> held
+end function
+
+' A date field against text in fmt (or ISO): empty text is no date; text that is no date differs.
+private function DiffDate_( byref held as const TKDATE, byref v as const ustring, byref fmt as const ustring ) as boolean
+    dim as TKDATE d
+    if ParseDate_( v, fmt, d ) = false then return true
+    return IsoB2_( d ) <> IsoB2_( held )
+end function
+
+' Two value texts the same, "" and "0" both standing for no value.
+private function SamePick_( byref a as const ustring, byref b as const ustring ) as boolean
+    dim as ustring x = trim( a ), y = trim( b )
+    if (x = "0") then x = ""
+    if (y = "0") then y = ""
+    return x = y
+end function
+
+' ---- B4: does the control show something else than the field holds? (IsDirty, per value) -----
+' Text is read strictly (text that is no number differs from any number); numbers within a float
+' tolerance; dates by day. A by-value ComboBox: its chosen value's text against the field's, with
+' "" and "0" both no value. Nothing here writes.
+
+public function tkBind_Differs overload( byref f as boolean, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffBool_( f, v ) : end function
+public function tkBind_Differs( byref f as byte, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as ubyte, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as short, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as ushort, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as long, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as ulong, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as longint, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as ulongint, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as integer, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as uinteger, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as single, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as double, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffNum_( f, v ) : end function
+public function tkBind_Differs( byref f as ustring, byref v as const ustring, byref fmt as const ustring ) as boolean : return f <> v : end function
+public function tkBind_Differs( byref f as string, byref v as const ustring, byref fmt as const ustring ) as boolean : return f <> v : end function
+public function tkBind_Differs( byref f as TKDATE, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffDate_( f, v, fmt ) : end function
+public function tkBind_Differs( byref f as LocalDate, byref v as const ustring, byref fmt as const ustring ) as boolean : return DiffDate_( DateOfLocalB2_( f ), v, fmt ) : end function
+public function tkBind_Differs( byref f as boolean, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as byte, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as ubyte, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as short, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as ushort, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as long, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as ulong, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as longint, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as ulongint, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as integer, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as uinteger, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as single, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as double, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as ustring, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as string, byval v as boolean ) as boolean : return tkBind_Bool( f ) <> v : end function
+public function tkBind_Differs( byref f as boolean, byval v as longint ) as boolean : return DiffReal_( iif( f, 1.0, 0.0 ), v ) : end function
+public function tkBind_Differs( byref f as byte, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ubyte, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as short, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ushort, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as long, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ulong, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as longint, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ulongint, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as integer, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as uinteger, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as single, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as double, byval v as longint ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ustring, byval v as longint ) as boolean : return DiffNum_( cdbl( v ), f ) : end function
+public function tkBind_Differs( byref f as string, byval v as longint ) as boolean : return DiffNum_( cdbl( v ), f ) : end function
+public function tkBind_Differs( byref f as boolean, byval v as float64 ) as boolean : return DiffReal_( iif( f, 1.0, 0.0 ), v ) : end function
+public function tkBind_Differs( byref f as byte, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ubyte, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as short, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ushort, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as long, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ulong, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as longint, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ulongint, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as integer, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as uinteger, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as single, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as double, byval v as float64 ) as boolean : return DiffReal_( f, v ) : end function
+public function tkBind_Differs( byref f as ustring, byval v as float64 ) as boolean : return DiffNum_( cdbl( v ), f ) : end function
+public function tkBind_Differs( byref f as string, byval v as float64 ) as boolean : return DiffNum_( cdbl( v ), f ) : end function
+public function tkBind_Differs( byref f as ustring, byref v as const TKDATE ) as boolean : return DiffDate_( v, f, "" ) : end function
+public function tkBind_Differs( byref f as string, byref v as const TKDATE ) as boolean : return DiffDate_( v, f, "" ) : end function
+public function tkBind_Differs( byref f as TKDATE, byref v as const TKDATE ) as boolean : return IsoB2_( f ) <> IsoB2_( v ) : end function
+public function tkBind_Differs( byref f as LocalDate, byref v as const TKDATE ) as boolean : return IsoB2_( DateOfLocalB2_( f ) ) <> IsoB2_( v ) : end function
+public function tkBind_Differs( byref f as DateTime, byref v as const TKDATE ) as boolean : return IsoB2_( DateOfDateTimeB3_( f ) ) <> IsoB2_( v ) : end function
+public function tkBind_DiffersPick overload( byref f as boolean, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as byte, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as ubyte, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as short, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as ushort, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as long, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as ulong, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as longint, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as ulongint, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as integer, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as uinteger, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as single, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as double, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as ustring, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as string, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as TKDATE, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function
+public function tkBind_DiffersPick( byref f as LocalDate, byref values as Array( of ustring ), byval sel as long ) as boolean : return SamePick_( tkBind_Text( f ), PickText_( values, sel ) ) = false : end function

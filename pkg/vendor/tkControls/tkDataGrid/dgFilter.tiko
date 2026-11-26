@@ -1,0 +1,598 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- column filters and the filter row (phase G7c).
+'
+' THE MODEL. Each model column may hold a TKDG_COLFILTER (an operator and one or two values) and
+' the text it was typed as. Filters of several columns AND together, and with the Filter callback
+' and the quick filter. They are applied where the rows are, as sorting is (dgSort.tiko):
+'   - a source with a Filter procedure is handed them (a database makes a WHERE of them) and the
+'     grid counts its rows again;
+'   - in HOST mode (a virtual grid, by default) the grid applies nothing: a change by the user
+'     fires FilterChanged and the host re-queries, as for SortChanged;
+'   - otherwise the grid keeps the rows that pass, in DgApplyView.
+'
+' THE TEXT (SetColumnFilterText, and what the filter row's editor takes):
+'     abc       contains, in a text column (case-insensitive, over the shown text);
+'               equals, in a number / date / check column
+'     =x <>x    equal / not equal (text without case)
+'     >x >=x <x <=x
+'     ^abc      starts with
+'     a..b      between a and b, both included
+'     ""        empty            !""   not empty
+' A value is read as the column's value kind by the store's strict rules (numbers, ISO dates,
+' true / false / yes / no), so ">100" is numeric and dates compare as dates. A text that does not
+' read for its column is kept and shown in the error colour, and filters nothing.
+'
+' THE FILTER ROW (ShowFilterRow) is a band under the header, one row high. A click on a column's
+' cell there (or Up from the first row) opens a text editor over it; what is typed applies after
+' DG_FILTER_IDLE_MS without a key, and at once on Enter; Esc puts the text back as it was when
+' the editor opened; Tab / Shift+Tab go to the next / previous column's filter; Down goes to the
+' first row. Leaving the editor applies it.
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkTextBox"
+#import "../tkColumnHeader"
+using tkHost
+using tkPaint
+using tkTextBox
+using tkColumnHeader
+
+const DG_TIMER_FILTER = TK_TIMER_APP + 11
+const DG_FILTER_IDLE_MS = 300
+
+' ==========================================================================================
+' The model
+' ==========================================================================================
+' The per-column arrays as long as the columns.
+sub DgFltEnsure( byval p as TKDATAGRID_STATE ptr )
+    if p->nFlt = p->colCount then exit sub
+    if p->colCount = 0 then
+        erase p->flt : erase p->fltText : erase p->fltBad
+    else
+        redim preserve p->flt( 0 to p->colCount - 1 )
+        redim preserve p->fltText( 0 to p->colCount - 1 )
+        redim preserve p->fltBad( 0 to p->colCount - 1 )
+    end if
+    p->nFlt = p->colCount
+end sub
+
+' A column was inserted at col / removed from col: the filters follow their columns.
+sub DgFltColumnInserted( byval p as TKDATAGRID_STATE ptr, byval col as integer )
+    if p->nFlt = 0 then exit sub
+    dim as integer n = p->nFlt
+    redim preserve p->flt( 0 to n ) : redim preserve p->fltText( 0 to n ) : redim preserve p->fltBad( 0 to n )
+    for k as integer = n to col + 1 step -1
+        p->flt(k) = p->flt(k - 1) : p->fltText(k) = p->fltText(k - 1) : p->fltBad(k) = p->fltBad(k - 1)
+    next
+    dim as TKDG_COLFILTER none_
+    p->flt(col) = none_ : p->fltText(col) = "" : p->fltBad(col) = 0
+    p->nFlt = n + 1
+end sub
+
+sub DgFltColumnRemoved( byval p as TKDATAGRID_STATE ptr, byval col as integer )
+    if (p->nFlt = 0) orelse (col >= p->nFlt) then exit sub
+    dim as boolean had = (p->flt(col).op <> TKDG_FLT_NONE)
+    for k as integer = col to p->nFlt - 2
+        p->flt(k) = p->flt(k + 1) : p->fltText(k) = p->fltText(k + 1) : p->fltBad(k) = p->fltBad(k + 1)
+    next
+    p->nFlt -= 1
+    if p->nFlt = 0 then
+        erase p->flt : erase p->fltText : erase p->fltBad
+    else
+        redim preserve p->flt( 0 to p->nFlt - 1 ) : redim preserve p->fltText( 0 to p->nFlt - 1 ) : redim preserve p->fltBad( 0 to p->nFlt - 1 )
+    end if
+    if had then p->fltSerial += 1
+    if p->fltEditCol = col then p->fltEditCol = -1
+end sub
+
+' Any column filter in force?
+function DgFltAny( byval p as TKDATAGRID_STATE ptr ) as boolean
+    for k as integer = 0 to p->nFlt - 1
+        if p->flt(k).op <> TKDG_FLT_NONE then return true
+    next
+    return false
+end function
+
+' Does the grid apply the column filters itself? (Not when the source took them, nor in HOST mode.)
+function DgFltInternal( byval p as TKDATAGRID_STATE ptr ) as boolean
+    if p->bSrcFiltered orelse (DgFltAny( p ) = false) then return false
+    return DgSortModeOf( p ) <> TKDG_SORT_HOST
+end function
+
+' The kind a column's filter values are read as: a combo column's shown text, else its value kind.
+private function DgFltKind( byval p as TKDATAGRID_STATE ptr, byval col as integer ) as long
+    if p->cols(col).c.kind = TKDG_COL_COMBO then return TKDG_TEXT
+    return p->cols(col).c.valueKind
+end function
+
+' s as a value of the column's filter kind; FALSE when it will not read so.
+private function DgFltValue( byval p as TKDATAGRID_STATE ptr, byval col as integer, byref s as const ustring, byref v as TKDG_VALUE ) as boolean
+    dim as ustring t = trim( s )
+    if len( t ) = 0 then return false
+    v.SetText( t )
+    if DgConvert( v, DgFltKind( p, col ) ) = false then return false
+    return v.kind <> TKDG_EMPTY
+end function
+
+' The filter text as a filter for model column col. FALSE: it does not read (f is NONE then).
+function DgFltParse( byval p as TKDATAGRID_STATE ptr, byval col as integer, byref text as const ustring, byref f as TKDG_COLFILTER ) as boolean
+    dim as TKDG_COLFILTER none_
+    f = none_
+    dim as ustring t = trim( text )
+    if len( t ) = 0 then return true
+    if t = """""" then f.op = TKDG_FLT_EMPTY : return true
+    if t = "!""""" then f.op = TKDG_FLT_NOTEMPTY : return true
+    dim as integer opLen = 0
+    dim as long op = TKDG_FLT_NONE
+    if (left( t, 2 ) = ">=") then
+        op = TKDG_FLT_GE : opLen = 2
+    elseif left( t, 2 ) = "<=" then
+        op = TKDG_FLT_LE : opLen = 2
+    elseif (left( t, 2 ) = "<>") orelse (left( t, 2 ) = "!=") then
+        op = TKDG_FLT_NE : opLen = 2
+    elseif left( t, 1 ) = ">" then
+        op = TKDG_FLT_GT : opLen = 1
+    elseif left( t, 1 ) = "<" then
+        op = TKDG_FLT_LT : opLen = 1
+    elseif left( t, 1 ) = "=" then
+        op = TKDG_FLT_EQ : opLen = 1
+    elseif left( t, 1 ) = "^" then
+        op = TKDG_FLT_STARTS : opLen = 1
+    end if
+    dim as TKDG_COLFILTER r
+    if op = TKDG_FLT_NONE then
+        dim as integer dd = instr( t, ".." )
+        if dd > 1 then
+            r.op = TKDG_FLT_BETWEEN
+            if DgFltValue( p, col, left( t, dd - 1 ), r.v1 ) = false then return false
+            if DgFltValue( p, col, mid( t, dd + 2 ), r.v2 ) = false then return false
+            f = r
+            return true
+        end if
+        ' a bare value: contains (text) / equals (the rest)
+        op = iif( DgFltKind( p, col ) = TKDG_TEXT, TKDG_FLT_CONTAINS, TKDG_FLT_EQ )
+    end if
+    dim as ustring rest = trim( mid( t, opLen + 1 ) )
+    if len( rest ) = 0 then return false
+    r.op = op
+    if op = TKDG_FLT_STARTS orelse op = TKDG_FLT_CONTAINS then
+        r.v1.SetText( rest )
+    elseif DgFltValue( p, col, rest, r.v1 ) = false then
+        return false
+    end if
+    f = r
+    return true
+end function
+
+' A filter as the text the filter row shows.
+function DgFltToText( byval p as TKDATAGRID_STATE ptr, byval col as integer, byref f as const TKDG_COLFILTER ) as ustring
+    select case f.op
+    case TKDG_FLT_NONE     : return ""
+    case TKDG_FLT_EMPTY    : return """"""
+    case TKDG_FLT_NOTEMPTY : return "!"""""
+    case TKDG_FLT_CONTAINS : return f.v1.s
+    case TKDG_FLT_STARTS   : return "^" & f.v1.s
+    case TKDG_FLT_BETWEEN  : return DgDefaultText( f.v1 ) & ".." & DgDefaultText( f.v2 )
+    case TKDG_FLT_EQ       : return iif( DgFltKind( p, col ) = TKDG_TEXT, wstr( "=" ), wstr( "" ) ) & DgDefaultText( f.v1 )
+    case TKDG_FLT_NE       : return "<>" & DgDefaultText( f.v1 )
+    case TKDG_FLT_LT       : return "<" & DgDefaultText( f.v1 )
+    case TKDG_FLT_LE       : return "<=" & DgDefaultText( f.v1 )
+    case TKDG_FLT_GT       : return ">" & DgDefaultText( f.v1 )
+    case TKDG_FLT_GE       : return ">=" & DgDefaultText( f.v1 )
+    end select
+    return ""
+end function
+
+' Does model row row pass column col's filter?
+private function DgFltPasses( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer ) as boolean
+    dim byref as TKDG_COLFILTER f = p->flt(col)
+    if f.op = TKDG_FLT_NONE then return true
+    select case f.op
+    case TKDG_FLT_CONTAINS, TKDG_FLT_STARTS
+        dim as ustring shown = lcase( DgShownText( p, row, col ) ), needle = lcase( f.v1.s )
+        if f.op = TKDG_FLT_STARTS then return left( shown, len( needle ) ) = needle
+        return instr( shown, needle ) > 0
+    end select
+    dim as TKDG_VALUE v
+    DgRead( p, row, col, v )
+    dim as long fk = DgFltKind( p, col )
+    if fk = TKDG_TEXT then
+        v.SetText( DgShownText( p, row, col ) )
+        if len( v.s ) = 0 then v.Clear( )
+    elseif DgConvert( v, fk ) = false then
+        v.Clear( )
+    end if
+    if (v.kind = TKDG_TEXT) andalso (len( v.s ) = 0) then v.Clear( )
+    select case f.op
+    case TKDG_FLT_EMPTY    : return v.kind = TKDG_EMPTY
+    case TKDG_FLT_NOTEMPTY : return v.kind <> TKDG_EMPTY
+    end select
+    if v.kind = TKDG_EMPTY then return false           ' as SQL: an empty cell compares to nothing
+    dim as long c = DgSumCmp( v, f.v1 )
+    select case f.op
+    case TKDG_FLT_EQ : return c = 0
+    case TKDG_FLT_NE : return c <> 0
+    case TKDG_FLT_LT : return c < 0
+    case TKDG_FLT_LE : return c <= 0
+    case TKDG_FLT_GT : return c > 0
+    case TKDG_FLT_GE : return c >= 0
+    case TKDG_FLT_BETWEEN : return (c >= 0) andalso (DgSumCmp( v, f.v2 ) <= 0)
+    end select
+    return true
+end function
+
+' Does model row row pass every column filter?
+function DgFltRowPasses( byval p as TKDATAGRID_STATE ptr, byval row as integer ) as boolean
+    for k as integer = 0 to p->nFlt - 1
+        if p->flt(k).op = TKDG_FLT_NONE then continue for
+        if DgFltPasses( p, row, k ) = false then return false
+    next
+    return true
+end function
+
+' A source with a Filter procedure is told of a change (from DgApplyView): TRUE when its rows
+' changed (it took the filters, or gave them back), so the grid counts them again.
+function DgFltSyncSource( byval p as TKDATAGRID_STATE ptr ) as boolean
+    if (p->feed <> DG_FEED_SOURCE) orelse (p->src.Filter = 0) then return false
+    if p->srcFltSerial = p->fltSerial then return false
+    p->srcFltSerial = p->fltSerial
+    dim as boolean took
+    if DgFltAny( p ) then
+        took = p->src.Filter( p->src.pCtx, @p->flt(0), p->nFlt )
+    elseif p->bSrcFiltered then
+        p->src.Filter( p->src.pCtx, 0, 0 )
+        took = false
+    else
+        return false
+    end if
+    dim as boolean wasFiltered = p->bSrcFiltered
+    p->bSrcFiltered = took
+    if (took = false) andalso (wasFiltered = false) then return false
+    ' its rows changed: count them again; positions held across them go
+    DgCacheClear( p )
+    DgSelReset( p )
+    p->dirtyRow = -1 : p->bDirtyIsNew = false
+    erase p->dirtySnap
+    if p->src.RowCount then
+        p->rowCount = p->src.RowCount( p->src.pCtx )
+        if p->rowCount < 0 then p->rowCount = 0
+    end if
+    if p->curRow >= p->rowCount then p->curRow = iif( p->rowCount > 0, 0, -1 )
+    if p->hotRow >= p->rowCount then p->hotRow = -1
+    return true
+end function
+
+' Sets column col's filter from text; user TRUE fires FilterChanged. FALSE: the text does not read
+' (kept, shown as an error, filters nothing).
+function DgFltSetText( byval p as TKDATAGRID_STATE ptr, byval col as integer, byref text as const ustring, byval bUser as boolean ) as boolean
+    DgFltEnsure( p )
+    dim as TKDG_COLFILTER f
+    dim as boolean ok = DgFltParse( p, col, text, f )
+    dim as boolean changed = (p->fltText(col) <> text) orelse (p->flt(col).op <> f.op) _
+                             orelse (DgSumCmp( p->flt(col).v1, f.v1 ) <> 0) orelse (DgSumCmp( p->flt(col).v2, f.v2 ) <> 0) _
+                             orelse (p->flt(col).v1.kind <> f.v1.kind) orelse (p->flt(col).v2.kind <> f.v2.kind)
+    p->fltText(col) = text
+    p->fltBad(col) = iif( ok, 0, 1 )
+    if changed = false then return ok
+    p->flt(col) = f
+    p->fltSerial += 1
+    DgApplyView( p )
+    if bUser andalso (p->FilterChangedCallback <> 0) then p->FilterChangedCallback( p->hWin )
+    return ok
+end function
+
+' ==========================================================================================
+' The filter row
+' ==========================================================================================
+' The filter cell's rect of column col (surface-local); FALSE when it is hidden or off screen.
+private function DgFltCellRect( byval p as TKDATAGRID_STATE ptr, byval col as integer, byref rc as TKRECT ) as boolean
+    if (p->bFilterRow = false) orelse (DgValidCol( p, col ) = false) orelse (p->cols(col).wPx <= 0) then return false
+    dim as integer x = DgColLeft( p, col ), y = DgHdrHPx( p )
+    tkRect_Set( rc, x, y, x + p->cols(col).wPx, y + DgRowHPx( p ) )
+    dim as integer lim = iif( DgIsFrozen( p, col ), DgRhPx( p ), DgScrollLeft( p ) )
+    return (rc.right > lim) andalso (rc.left < p->wSurf->cw)
+end function
+
+private function DgFltEditor( byval p as TKDATAGRID_STATE ptr ) as TK_WIDGET ptr
+    if p->wEdFilter = 0 then
+        p->wEdFilter = tkTextBox_Create( p->wSurf, p->hWin->ctrlId + 13, false )
+        tkTextBox_SetEnterPressedCallback( p->wEdFilter, @DgFltEdEnter )
+        tkTextBox_SetChangeCallback( p->wEdFilter, @DgFltEdChange )
+        tkTextBox_SetFocusCallback( p->wEdFilter, @DgFltEdFocus )
+        tkTextBox_SetSelectOnFocus( p->wEdFilter, false )
+        tkTextBox_SetBorderWidth( p->wEdFilter, 1 )
+        tkWidget_Show( p->wEdFilter, false )
+    end if
+    tkTextBox_SetFont( p->wEdFilter, iif( p->pFont <> 0, p->pFont, p->hWin->pHost->pDefaultFont ) )
+    dim as integer m_ = DgScale( p, CDATAGRID_CELL_PAD ) - 1
+    tkTextBox_SetMargins( p->wEdFilter, iif( m_ < 0, 0, m_ ), iif( m_ < 0, 0, m_ ) )
+    return p->wEdFilter
+end function
+
+' The editor over its cell (after a scroll, a resize); a cell gone from view closes it.
+sub DgFltPlaceEditor( byval p as TKDATAGRID_STATE ptr )
+    if p->fltEditCol < 0 then exit sub
+    dim as TKRECT rc
+    if DgFltCellRect( p, p->fltEditCol, rc ) = false then
+        DgFltClose( p, true, false )
+        exit sub
+    end if
+    tkWidget_SetPos( p->wEdFilter, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top )
+end sub
+
+' Opens the filter editor on column col (scrolled into view; an open cell edit ends first).
+' FALSE when the column has no filter cell or the cell edit would not end.
+function DgFltOpen( byval p as TKDATAGRID_STATE ptr, byval col as integer ) as boolean
+    if (p->bFilterRow = false) orelse (DgValidCol( p, col ) = false) orelse (p->cols(col).c.visible = false) then return false
+    if p->bEditing then
+        if DgEndEdit( p, true ) = false then return false
+    end if
+    if (p->fltEditCol >= 0) andalso (p->fltEditCol <> col) then DgFltClose( p, true, false )
+    DgFltEnsure( p )
+    DgEnsureVisible( p, -1, col )
+    dim as TK_WIDGET ptr ed = DgFltEditor( p )
+    p->fltEditCol = col
+    p->fltEditOrig = p->fltText(col)
+    p->bFltLoading = true
+    tkTextBox_SetText( ed, p->fltText(col) )
+    p->bFltLoading = false
+    DgFltPlaceEditor( p )
+    if p->fltEditCol < 0 then return false
+    tkWidget_Show( ed, true )
+    tkHost_SetFocus( p->hWin->pHost, ed )
+    tkTextBox_SetSel( ed, len( p->fltText(col) ), len( p->fltText(col) ) )
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
+' Applies the editor's text (bApply) and hides it; bFocusGrid gives the focus back to the grid.
+sub DgFltClose( byval p as TKDATAGRID_STATE ptr, byval bApply as boolean, byval bFocusGrid as boolean )
+    if p->fltEditCol < 0 then exit sub
+    dim as integer col = p->fltEditCol
+    tkWidget_KillTimer( p->wSurf, DG_TIMER_FILTER )
+    p->fltEditCol = -1                    ' first: hiding the editor moves the focus (DgFltEdFocus)
+    if bApply then DgFltSetText( p, col, tkTextBox_GetText( p->wEdFilter ), true )
+    if bFocusGrid then tkHost_SetFocus( p->hWin->pHost, p->wSurf )
+    tkWidget_Show( p->wEdFilter, false )
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' The idle timer: what was typed applies (the editor stays open).
+sub DgFltIdleTick( byval p as TKDATAGRID_STATE ptr )
+    tkWidget_KillTimer( p->wSurf, DG_TIMER_FILTER )
+    if p->fltEditCol < 0 then exit sub
+    DgFltSetText( p, p->fltEditCol, tkTextBox_GetText( p->wEdFilter ), true )
+end sub
+
+private function DgFltGrid( byval hEdit as TK_WIDGET ptr ) as TKDATAGRID_STATE ptr
+    ' the editor is a child of the surface, whose parent is the grid
+    return DgState( tkWidget_Parent( tkWidget_Parent( hEdit ) ) )
+end function
+
+sub DgFltEdEnter( byval hEdit as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgFltGrid( hEdit )
+    if (p = 0) orelse (p->fltEditCol < 0) then exit sub
+    tkWidget_KillTimer( p->wSurf, DG_TIMER_FILTER )
+    DgFltSetText( p, p->fltEditCol, tkTextBox_GetText( p->wEdFilter ), true )
+end sub
+
+sub DgFltEdChange( byval hEdit as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgFltGrid( hEdit )
+    if (p = 0) orelse (p->fltEditCol < 0) orelse p->bFltLoading then exit sub
+    ' (re)start the idle wait
+    tkWidget_KillTimer( p->wSurf, DG_TIMER_FILTER )
+    tkWidget_SetTimer( p->wSurf, DG_TIMER_FILTER, DG_FILTER_IDLE_MS )
+end sub
+
+sub DgFltEdFocus( byval hEdit as TK_WIDGET ptr, byval bGotFocus as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgFltGrid( hEdit )
+    if (p = 0) orelse bGotFocus orelse (p->fltEditCol < 0) then exit sub
+    ' the focus went elsewhere: what was typed applies
+    DgFltClose( p, true, false )
+end sub
+
+' The keys the editor leaves (they reach the surface): Esc, Tab, Down, Up. TRUE = claimed.
+function DgFltKey( byval p as TKDATAGRID_STATE ptr, byval key as long, byval bShift as boolean ) as boolean
+    if p->fltEditCol < 0 then return false
+    dim as integer col = p->fltEditCol
+    select case key
+    case SDLK_ESCAPE
+        ' the text back as it was when the editor opened
+        p->bFltLoading = true
+        tkTextBox_SetText( p->wEdFilter, p->fltEditOrig )
+        p->bFltLoading = false
+        DgFltClose( p, true, true )
+        return true
+    case SDLK_TAB
+        dim as integer d = DgNextVisDisp( p, p->cols(col).disp, iif( bShift, -1, 1 ) )
+        if d < 0 then d = iif( bShift, DgLastVisDisp( p ), DgFirstVisDisp( p ) )
+        DgFltClose( p, true, false )
+        DgFltOpen( p, p->order(d) )
+        return true
+    case SDLK_DOWN
+        DgFltClose( p, true, true )
+        if DgViewRows( p ) > 0 then
+            dim as DG_USERMARK mk
+            DgUserBegin( p, mk )
+            DgSelectOnly( p, DgModelOf( p, 0 ), p->cols(col).disp )
+            p->curRow = DgModelOf( p, 0 ) : p->curCol = col
+            DgEnsureVisible( p, p->curRow, col )
+            DgUserEnd( p, mk )
+        end if
+        return true
+    case SDLK_UP
+        return true                        ' nothing above the filter row
+    end select
+    return false
+end function
+
+' Painting: the band's back, each column's filter text (the error colour when it does not read).
+private sub DgPaintFilterRegion( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr, byval bFrozen as boolean, _
+                                 byref clip as TKRECT, byval font_ as TTF_Font ptr )
+    if clip.right <= clip.left then exit sub
+    b->PushClip( @clip )
+    dim as integer pad = DgScale( p, CDATAGRID_CELL_PAD )
+    dim as integer d0 = iif( bFrozen, 0, p->nFrozen ), d1 = iif( bFrozen, p->nFrozen - 1, p->colCount - 1 )
+    if d1 > p->colCount - 1 then d1 = p->colCount - 1
+    dim as TKRECT rc
+    for d as integer = d0 to d1
+        dim as integer k = p->order(d)
+        if p->cols(k).wPx <= 0 then continue for
+        dim as integer x = DgColLeft( p, k )
+        if x >= clip.right then exit for
+        if x + p->cols(k).wPx <= clip.left then continue for
+        if (k < p->nFlt) andalso (len( p->fltText(k) ) > 0) andalso (k <> p->fltEditCol) then
+            tkRect_Set( rc, x + pad, clip.top, x + p->cols(k).wPx - pad, clip.bottom )
+            b->SetFont( font_ )
+            b->SetForeColor( iif( p->fltBad(k) <> 0, p->colors.ErrorColor, p->colors.ForeColor ) )
+            b->PaintText( p->fltText(k), @rc, TK_DT_VCENTER or TK_DT_ELLIPSIS )
+        end if
+        if p->nGridLines and TKDG_GRID_VERT then
+            tkRect_Set( rc, x + p->cols(k).wPx - 1, clip.top, x + p->cols(k).wPx, clip.bottom )
+            b->SetBackColor( p->colors.GridLineColor )
+            b->PaintRect( @rc )
+        end if
+    next
+    b->PopClip( )
+end sub
+
+sub DgPaintFilterRow( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr )
+    if p->bFilterRow = false then exit sub
+    DgFltEnsure( p )
+    dim as integer cw = p->wSurf->cw, top = DgHdrHPx( p ), bot = top + DgRowHPx( p )
+    dim as integer rh = DgRhPx( p ), sl = DgScrollLeft( p )
+    if sl > cw then sl = cw
+    dim as TKRECT rc, clip
+    tkRect_Set( rc, 0, top, cw, bot )
+    b->SetBackColor( p->colors.FilterBackColor )
+    b->PaintRect( @rc )
+    dim as TTF_Font ptr font_ = iif( p->pFont <> 0, p->pFont, p->wSurf->pHost->pDefaultFont )
+    tkRect_Set( clip, sl, top, cw, bot )
+    DgPaintFilterRegion( p, b, false, clip, font_ )
+    tkRect_Set( clip, rh, top, sl, bot )
+    DgPaintFilterRegion( p, b, true, clip, font_ )
+    tkRect_Set( rc, 0, bot - 1, cw, bot )
+    b->SetBackColor( p->colors.GridLineColor )
+    b->PaintRect( @rc )
+end sub
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' A band under the header where the user types each column's filter. Silent.
+public sub tkDataGrid_ShowFilterRow( byval hGrid as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    if (bShow = false) andalso (p->fltEditCol >= 0) then DgFltClose( p, true, true )
+    p->bFilterRow = bShow
+    DgChanged( p )
+end sub
+
+public function tkDataGrid_IsFilterRowVisible( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return (p <> 0) andalso p->bFilterRow
+end function
+
+' Reads text as a filter for model column col (the filter row's syntax) without setting it.
+public function tkDataGrid_ParseFilterText( byval hGrid as TK_WIDGET ptr, byval col as integer, byref text as const ustring, _
+                                            byref f as TKDG_COLFILTER ) as boolean
+    dim as TKDG_COLFILTER none_
+    f = none_
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return false
+    return DgFltParse( p, col, text, f )
+end function
+
+' Column col's filter from text (as typed in the filter row); "" clears it. FALSE when the text does
+' not read for the column: it is kept (the filter row shows it as an error) and filters nothing.
+' Silent: no FilterChanged.
+public function tkDataGrid_SetColumnFilterText( byval hGrid as TK_WIDGET ptr, byval col as integer, byref text as const ustring ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return false
+    return DgFltSetText( p, col, text, false )
+end function
+
+public function tkDataGrid_GetColumnFilterText( byval hGrid as TK_WIDGET ptr, byval col as integer ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return ""
+    DgFltEnsure( p )
+    return p->fltText(col)
+end function
+
+' Column col's filter as a TKDG_COLFILTER (its values are converted to the column's kind); the filter
+' row shows it as text. FALSE: no such column, or a value that will not convert. Silent.
+public function tkDataGrid_SetColumnFilter( byval hGrid as TK_WIDGET ptr, byval col as integer, byref f as const TKDG_COLFILTER ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return false
+    if (f.op < TKDG_FLT_NONE) orelse (f.op > TKDG_FLT_NOTEMPTY) then return false
+    dim as TKDG_COLFILTER g = f
+    select case g.op
+    case TKDG_FLT_CONTAINS, TKDG_FLT_STARTS
+        DgConvert( g.v1, TKDG_TEXT )
+    case TKDG_FLT_NONE, TKDG_FLT_EMPTY, TKDG_FLT_NOTEMPTY
+    case else
+        if DgConvert( g.v1, DgFltKind( p, col ) ) = false then return false
+        if (g.op = TKDG_FLT_BETWEEN) andalso (DgConvert( g.v2, DgFltKind( p, col ) ) = false) then return false
+    end select
+    return DgFltSetText( p, col, DgFltToText( p, col, g ), false )
+end function
+
+public function tkDataGrid_GetColumnFilter( byval hGrid as TK_WIDGET ptr, byval col as integer, byref f as TKDG_COLFILTER ) as boolean
+    dim as TKDG_COLFILTER none_
+    f = none_
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return false
+    DgFltEnsure( p )
+    f = p->flt(col)
+    return f.op <> TKDG_FLT_NONE
+end function
+
+' Every column filter cleared. Silent.
+public sub tkDataGrid_ClearColumnFilters( byval hGrid as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    if p->fltEditCol >= 0 then DgFltClose( p, false, false )
+    DgFltEnsure( p )
+    dim as TKDG_COLFILTER none_
+    dim as boolean any_ = DgFltAny( p )
+    for k as integer = 0 to p->nFlt - 1
+        p->flt(k) = none_ : p->fltText(k) = "" : p->fltBad(k) = 0
+    next
+    if any_ then
+        p->fltSerial += 1
+        DgApplyView( p )
+    else
+        tkWidget_Invalidate( p->wSurf )
+    end if
+end sub
+
+' Opens the filter row's editor on column col, as a click there does. FALSE: no filter row, or the
+' column is hidden.
+public function tkDataGrid_EditColumnFilter( byval hGrid as TK_WIDGET ptr, byval col as integer ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return false
+    return DgFltOpen( p, col )
+end function
+
+' The filter row's editor (a tkTextBox; 0 before first use) and the column it is open on (-1: closed).
+public function tkDataGrid_GetFilterEditor( byval hGrid as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return 0
+    return p->wEdFilter
+end function
+
+public function tkDataGrid_GetFilterEditColumn( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->fltEditCol, -1 )
+end function
+
+' The filter row's height in pixels (0 while hidden).
+public function tkDataGrid_GetFilterRowHeightPx( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, DgFiltHPx( p ), 0 )
+end function

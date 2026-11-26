@@ -1,0 +1,799 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkAvatarGroup -- a row of avatars, stacked (overlapping) or spread, with a "+N" for the rest.
+' New in tkControls; the design is C:\dev\docs\tkControls\RATING-BADGE-AVATAR-CHIP.md §6.7. Phase A2.
+'
+' Items are DATA in the group, not child widgets (tkSelectBar's model), drawn with tkAvatar_PaintInto.
+' STACK overlaps 20 % (Overlap). MaxVisible (default 5): more items than that show the FIRST MaxVisible - 1 and an overflow disc
+' "+N" (D-A4); Total, when larger than the items held, counts the rest (MUI's total: 4 loaded, "+38").
+' STACK draws the first item on top (reading order: the most important whole), each with a cut-out
+' ring of BackColor; a hit on an overlap goes to the item on top.
+' Not a tab stop unless Interactive: then Left / Right / Home / End move an item focus ring (no
+' wrap) and Enter / Space click. A mouse click fires ItemClick( idx ), or OverflowClick on "+N";
+' tkAvatarGroup_ShowOverflowMenu lists the hidden names in a tkPopupMenu (a pick fires ItemClick).
+#module "tkAvatarGroup"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkImage" public
+#import "../tkBadge" public
+#import "../tkAvatar" public
+#import "../tkPopupMenu" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkImage
+using tkBadge
+using tkAvatar
+using tkPopupMenu
+
+public enum
+    TKAVGROUP_STACK = 0         ' each overlaps the one before by Overlap % of the diameter
+    TKAVGROUP_SPREAD            ' Spacing apart
+end enum
+
+public const as long TKAVGROUP_OVERFLOW      = -1     ' ItemClick / HitTest: the "+N" disc
+public const as long TKAVGROUP_HIT_NONE      = -2
+public const as long TKAVGROUP_DEFAULT_SIZE  = 32     ' design units
+public const as long TKAVGROUP_DEFAULT_MAX   = 5
+public const as long TKAVGROUP_DEFAULT_OVERLAP = 20   ' percent of the diameter (MUI's -8 px at 40)
+public const as long TKAVGROUP_DEFAULT_SPACING = 4    ' design units
+public const as long TKAVGROUP_RING          = 2      ' the cut-out ring (pixels, a rule)
+public const as long TKAVGROUP_FOCUSGAP      = 2
+public const as long TKAVGROUP_FOCUSTHICK    = 1
+
+public type TKAVGROUP_COLORS
+    BackColor      as ulong = &hFF21252Bul    ' under the group, and every item's cut-out ring
+    FocusRingColor as ulong = &hFF61AFEFul
+    OverflowBack   as ulong = &hFF2C313Aul
+    OverflowInk    as ulong = &hFFC8CDD6ul
+end type
+
+public type TKAVGROUP_MESSAGEINFO
+    hGroup as TK_WIDGET ptr
+    msg    as long
+    x      as single
+    y      as single
+    key    as long
+    idx    as long                  ' the item under (x, y): >= 0, TKAVGROUP_OVERFLOW or TKAVGROUP_HIT_NONE
+end type
+
+public type AVG_ItemClickCallbackSub as sub( byval hGroup as TK_WIDGET ptr, byval idx as long )
+public type AVG_OverflowClickCallbackSub as sub( byval hGroup as TK_WIDGET ptr )
+public type AVG_MessageCallbackFunc as function( byval m as TKAVGROUP_MESSAGEINFO ptr ) as boolean
+
+public type TKAVGROUP_ITEM
+    wszName     as ustring
+    wszColorKey as ustring
+    pImg        as tkImageFile ptr     ' drawn when valid: pOwn, or borrowed
+    pOwn        as tkImageFile ptr     ' SetItemImageFile / Pixels (new'd here, deleted here)
+    nPresence   as long = TKAVATAR_PRESENCE_NONE
+    nData       as integer
+end type
+
+public type TKAVGROUP_STATE
+    hWin             as TK_WIDGET ptr
+    id               as long
+    items(any)       as TKAVGROUP_ITEM
+    nCount           as long
+    nTotal           as long = -1
+    nMax             as long = TKAVGROUP_DEFAULT_MAX
+    nLayout          as long = TKAVGROUP_STACK
+    nOverlapPct      as long = TKAVGROUP_DEFAULT_OVERLAP
+    nSpacingDu       as long = TKAVGROUP_DEFAULT_SPACING
+    nSizeDu          as long = TKAVGROUP_DEFAULT_SIZE
+    nShape           as long = TKAVATAR_CIRCLE
+    nColorMode       as long = TKAVATAR_COLORFUL
+    bInteractive     as boolean
+    isFocused        as boolean
+    nFocusItem       as long                   ' a slot: 0 .. shown - 1, or the overflow's
+    isPressed        as boolean
+    nPressed         as long = TKAVGROUP_HIT_NONE
+    colors           as TKAVGROUP_COLORS
+    avColors         as TKAVATAR_COLORS
+    bColorsPinned    as boolean
+    bDark            as boolean = true
+    fInit            as TTF_Font ptr           ' the initials' font, owned (one diameter for all)
+    tip              as TKTIPHOST_STATE
+    hMenu            as TK_MENU ptr
+    ItemClickCallback as AVG_ItemClickCallbackSub
+    OverflowCallback  as AVG_OverflowClickCallbackSub
+    MessageCallback   as AVG_MessageCallbackFunc
+end type
+
+dim shared as TK_WIDGET ptr gMenuGroup       ' the group whose overflow menu is open (one at a time)
+
+private function AG( byval w as TK_WIDGET ptr ) as TKAVGROUP_STATE ptr
+    if w = 0 then return 0
+    return cast( TKAVGROUP_STATE ptr, w->pData )
+end function
+
+' ==========================================================================================
+' Geometry
+' ==========================================================================================
+private function Diam( byval p as TKAVGROUP_STATE ptr ) as long
+    return tkHost_Scale( p->hWin->pHost, p->nSizeDu )
+end function
+
+' The margin round the row: the cut-out ring and the focus ring's band.
+private function Margin( byval p as TKAVGROUP_STATE ptr ) as long
+    return TKAVGROUP_RING + tkHost_Scale( p->hWin->pHost, TKAVGROUP_FOCUSGAP ) + TKAVGROUP_FOCUSTHICK
+end function
+
+private function StepPx( byval p as TKAVGROUP_STATE ptr ) as long
+    dim as long d = Diam( p )
+    if p->nLayout = TKAVGROUP_SPREAD then return d + 2 * TKAVGROUP_RING + tkHost_Scale( p->hWin->pHost, p->nSpacingDu )
+    return d - cint( d * p->nOverlapPct / 100 )
+end function
+
+' How many items show, and the "+N" (0 = no overflow disc).
+private sub Shown( byval p as TKAVGROUP_STATE ptr, byref nShown as long, byref nMore as long )
+    dim as long total = iif( p->nTotal > p->nCount, p->nTotal, p->nCount )
+    nShown = p->nCount
+    nMore = 0
+    if total > p->nMax then
+        nShown = p->nMax - 1
+        if nShown < 0 then nShown = 0
+        if nShown > p->nCount then nShown = p->nCount
+        nMore = total - nShown
+    elseif total > p->nCount then
+        nMore = total - p->nCount                   ' Total beyond the items held, within MaxVisible
+    end if
+end sub
+
+' The focus slot kept inside the slots shown: RemoveItem, SetMaxVisible and SetTotal can leave it
+' past them (and Enter would then answer a "+N" that is not there).
+private sub ClampFocus( byval p as TKAVGROUP_STATE ptr )
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    dim as long nSlots = nShown + iif( nMore > 0, 1, 0 )
+    if p->nFocusItem >= nSlots then p->nFocusItem = nSlots - 1
+    if p->nFocusItem < 0 then p->nFocusItem = 0
+end sub
+
+' Slot k's avatar square (slot = item index; the overflow is the slot after the shown items).
+private sub SlotRect( byval p as TKAVGROUP_STATE ptr, byval k as long, byref rc as TKRECT )
+    dim as long d = Diam( p ), m = Margin( p )
+    dim as long top = (p->hWin->ch - d) \ 2
+    if top < m then top = m
+    dim as long l = m + k * StepPx( p )
+    tkRect_Set( rc, l, top, l + d, top + d )
+end sub
+
+' The slot under (x, y): the item on top wins an overlap (the first, in STACK).
+private function SlotAt( byval p as TKAVGROUP_STATE ptr, byval x as single, byval y as single ) as long
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    dim as long nSlots = nShown + iif( nMore > 0, 1, 0 )
+    for k as long = 0 to nSlots - 1
+        dim as TKRECT r
+        SlotRect( p, k, r )
+        dim as boolean bIn
+        if p->nShape = TKAVATAR_CIRCLE then
+            dim as double cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, rr = (r.right - r.left) / 2 + TKAVGROUP_RING
+            bIn = ((x - cx) ^ 2 + (y - cy) ^ 2) <= rr * rr
+        else
+            tkRect_Inflate( r, TKAVGROUP_RING, TKAVGROUP_RING )
+            bIn = tkRect_Contains( r, x, y )
+        end if
+        if bIn then return iif( k < nShown, k, TKAVGROUP_OVERFLOW )
+    next
+    return TKAVGROUP_HIT_NONE
+end function
+
+' ==========================================================================================
+' Painting
+' ==========================================================================================
+private function Curv( byval nShape as long, byval d as long ) as long
+    select case nShape
+    case TKAVATAR_ROUNDED : return d \ 2
+    case TKAVATAR_SQUARE  : return 0
+    end select
+    return d
+end function
+
+private sub OnPaint( byval p as TKAVGROUP_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TKRECT rcAll
+    tkRect_Set( rcAll, 0, 0, p->hWin->cw, p->hWin->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @rcAll )
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    dim as long d = Diam( p )
+    dim as boolean bEnabled = tkWidget_IsEnabled( p->hWin )
+    p->avColors.BackColor = p->colors.BackColor
+    ' the overflow first (bottom of the stack), then the items last to first: the first on top
+    for k as long = nShown + iif( nMore > 0, 0, -1 ) to 0 step -1
+        dim as TKRECT r, ring
+        SlotRect( p, k, r )
+        ring = r
+        tkRect_Inflate( ring, TKAVGROUP_RING, TKAVGROUP_RING )
+        b->SetBackColor( p->colors.BackColor )
+        b->PaintRoundRect( @ring, Curv( p->nShape, ring.right - ring.left ) )
+        if k = nShown then
+            ' "+N": the overflow disc
+            b->SetBackColor( iif( bEnabled, p->colors.OverflowBack, tkColor_WithAlpha( p->colors.OverflowBack, 128 ) ) )
+            b->PaintRoundRect( @r, Curv( p->nShape, d ) )
+            dim as ustring t = "+" & nMore
+            tkAvatar_FitFont( p->fInit, d, t )
+            ' centred in the part the item before it leaves visible (STACK), so the "+" is not covered
+            dim as TKRECT rt = r
+            if (p->nLayout = TKAVGROUP_STACK) andalso (k > 0) then rt.left += (d - StepPx( p )) \ 2
+            dim as TTF_Font ptr fWas = b->pFont
+            b->SetFont( p->fInit )
+            b->SetForeColor( p->colors.OverflowInk )
+            b->PaintText( t, @rt, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_NOCLIP )
+            b->SetFont( fWas )
+        else
+            dim as TKAVATAR_SPEC s
+            s.wszName = p->items(k).wszName
+            s.wszColorKey = p->items(k).wszColorKey
+            s.pImage = p->items(k).pImg
+            s.nPresence = p->items(k).nPresence
+            s.nShape = p->nShape
+            s.nColorMode = p->nColorMode
+            s.fText = p->fInit
+            s.fScale = p->hWin->pHost->fScale
+            s.bDark = p->bDark
+            s.pColors = @p->avColors
+            if bEnabled = false then s.nActive = TKAVATAR_ACTIVE_INACTIVE
+            tkAvatar_PaintInto( b, r, s )
+        end if
+    next
+    ' the item focus ring
+    if p->isFocused andalso p->bInteractive then
+        dim as long nSlots = nShown + iif( nMore > 0, 1, 0 )
+        if (p->nFocusItem >= 0) andalso (p->nFocusItem < nSlots) then
+            dim as TKRECT r
+            SlotRect( p, p->nFocusItem, r )
+            tkRect_Inflate( r, TKAVGROUP_RING + tkHost_Scale( p->hWin->pHost, TKAVGROUP_FOCUSGAP ) - 1, _
+                            TKAVGROUP_RING + tkHost_Scale( p->hWin->pHost, TKAVGROUP_FOCUSGAP ) - 1 )
+            b->SetPenColor( p->colors.FocusRingColor )
+            b->PaintRoundOutline( @r, Curv( p->nShape, r.right - r.left ), TKAVGROUP_FOCUSTHICK )
+        end if
+    end if
+end sub
+
+' ==========================================================================================
+' Input
+' ==========================================================================================
+private function CallMessage( byval p as TKAVGROUP_STATE ptr, byval m as TK_MSG ptr, byval idx as long ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKAVGROUP_MESSAGEINFO mi
+    mi.hGroup = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    mi.key = m->key
+    mi.idx = idx
+    return p->MessageCallback( @mi )
+end function
+
+' A user click on slot idx (an item or the overflow): the callback last, from a snapshot.
+private sub Fire( byval p as TKAVGROUP_STATE ptr, byval idx as long )
+    dim as TK_WIDGET ptr w = p->hWin
+    if idx = TKAVGROUP_OVERFLOW then
+        dim as AVG_OverflowClickCallbackSub cb = p->OverflowCallback
+        if cb then cb( w )
+    elseif idx >= 0 then
+        dim as AVG_ItemClickCallbackSub cb = p->ItemClickCallback
+        if cb then cb( w, idx )
+    end if
+end sub
+
+private sub OnMenuSelect( byval hPopup as TK_MENU ptr, byval id as long )
+    dim as TK_WIDGET ptr w = gMenuGroup
+    gMenuGroup = 0
+    dim as TKAVGROUP_STATE ptr p = AG( w )
+    if (p = 0) orelse (id < 1) orelse (id > p->nCount) then exit sub
+    Fire( p, id - 1 )
+end sub
+
+public declare sub tkAvatarGroup_ApplyTheme( byval hGroup as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+private function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKAVGROUP_STATE ptr p = AG( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE, TKM_SCALECHANGED, TKM_ENABLE
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_THEMECHANGED
+        tkAvatarGroup_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_MOUSEMOVE
+        dim as long idx = SlotAt( p, m->x, m->y )
+        tkTipHost_SetToolIndex( @p->tip, iif( idx = TKAVGROUP_HIT_NONE, -1, iif( idx = TKAVGROUP_OVERFLOW, 1000000, idx ) ) )
+        CallMessage( p, m, idx )
+        return true
+    case TKM_LBUTTONDOWN
+        dim as long idx = SlotAt( p, m->x, m->y )
+        if CallMessage( p, m, idx ) then return true
+        if tkWidget_IsEnabled( w ) = false then return true
+        if p->bInteractive then tkHost_SetFocus( w->pHost, w )
+        if idx = TKAVGROUP_HIT_NONE then return true
+        tkTipHost_Pop( @p->tip )
+        p->isPressed = true
+        p->nPressed = idx
+        tkHost_SetCapture( w )
+        return true
+    case TKM_LBUTTONUP
+        dim as boolean bWas = p->isPressed
+        dim as long nWas = p->nPressed
+        p->isPressed = false
+        p->nPressed = TKAVGROUP_HIT_NONE
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        dim as long idx = SlotAt( p, m->x, m->y )
+        CallMessage( p, m, idx )
+        if bWas andalso (idx = nWas) then
+            if p->bInteractive then
+                dim as long nShown, nMore
+                Shown( p, nShown, nMore )
+                p->nFocusItem = iif( idx = TKAVGROUP_OVERFLOW, nShown, idx )
+                tkWidget_Invalidate( w )
+            end if
+            Fire( p, idx )
+        end if
+        return true
+    case TKM_CAPTURECHANGED
+        p->isPressed = false
+        return true
+    case TKM_RBUTTONDOWN, TKM_RBUTTONUP, TKM_MOUSELEAVE
+        CallMessage( p, m, TKAVGROUP_HIT_NONE )
+        return true
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        p->isFocused = (m->msg = TKM_SETFOCUS)
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_KEYDOWN
+        if (p->bInteractive = false) orelse (tkWidget_IsEnabled( w ) = false) then return false
+        if CallMessage( p, m, p->nFocusItem ) then return true
+        if (m->mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI)) <> 0 then return false   ' a chord is not ours
+        dim as long nShown, nMore
+        Shown( p, nShown, nMore )
+        dim as long nSlots = nShown + iif( nMore > 0, 1, 0 )
+        if nSlots = 0 then return false
+        ClampFocus( p )
+        dim as long f = p->nFocusItem
+        select case m->key
+        case SDLK_LEFT  : if f > 0 then f -= 1
+        case SDLK_RIGHT : if f < nSlots - 1 then f += 1
+        case SDLK_HOME  : f = 0
+        case SDLK_END   : f = nSlots - 1
+        case SDLK_RETURN, SDLK_KP_ENTER, SDLK_SPACE
+            if m->bFlag then return true                 ' a held key does not repeat the click
+            Fire( p, iif( f >= nShown, TKAVGROUP_OVERFLOW, f ) )
+            return true
+        case else : return false
+        end select
+        if f <> p->nFocusItem then p->nFocusItem = f : tkWidget_Invalidate( w )
+        return true
+    case TKM_DESTROY
+        if gMenuGroup = w then gMenuGroup = 0
+        if p->hMenu then tkPopupMenu_Destroy( p->hMenu )
+        for i as long = 0 to p->nCount - 1
+            if p->items(i).pOwn then delete p->items(i).pOwn
+        next
+        if p->fInit then TTF_CloseFont( p->fInit )
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' The tip: the item's name; the overflow's lists the hidden names (ten, then "...").
+private function TipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKAVGROUP_STATE ptr p = AG( a )
+    if p = 0 then return ""
+    if (idx >= 0) andalso (idx < p->nCount) then return p->items(idx).wszName
+    if idx = 1000000 then
+        dim as long nShown, nMore
+        Shown( p, nShown, nMore )
+        dim as ustring s
+        dim as long n = 0
+        for i as long = nShown to p->nCount - 1
+            if n = 10 then s &= chr( 10 ) & "..." : exit for
+            s &= iif( n > 0, chr( 10 ), "" ) & p->items(i).wszName
+            n += 1
+        next
+        if (len( s ) = 0) andalso (nMore > 0) then s = nMore & " more"
+        return s
+    end if
+    return ""
+end function
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' A child of hParent, created 0x0: size it from GetIdealSize.
+public function tkAvatarGroup_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKAVGROUP_STATE ptr p = new TKAVGROUP_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @Proc, p )
+    p->hWin = w
+    dim as string fontPath = tkHost_FontDir() & TK_FONT_UI_BOLD
+    p->fInit = tkHost_OpenFontFace( fontPath, 12, 0 )
+    tkAvatarGroup_ApplyTheme( w, tkTheme_Of( w ) )
+    tkTipHost_Ensure( @p->tip, w, @TipText )
+    return w
+end function
+
+public function tkAvatarGroup_GetID( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return 0
+    return p->id
+end function
+
+public sub tkAvatarGroup_SetEnabled( byval hGroup as TK_WIDGET ptr, byval isEnabled as boolean )
+    if hGroup then tkWidget_Enable( hGroup, isEnabled )
+end sub
+
+' ---- items ------------------------------------------------------------------------------------
+' Before nBefore (-1 = at the end); returns the index. img is borrowed (it must outlive the item).
+public function tkAvatarGroup_InsertItem( byval hGroup as TK_WIDGET ptr, byval nBefore as long, byval Name_ as ustring, _
+                                          byval ColorKey as ustring = "", byval pImage as tkImageFile ptr = 0 ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return -1
+    if (nBefore < 0) orelse (nBefore > p->nCount) then nBefore = p->nCount
+    redim preserve p->items( 0 to p->nCount )
+    for i as long = p->nCount to nBefore + 1 step -1
+        p->items(i) = p->items(i - 1)
+    next
+    dim as TKAVGROUP_ITEM it
+    it.wszName = Name_
+    it.wszColorKey = ColorKey
+    it.pImg = pImage
+    p->items(nBefore) = it
+    p->nCount += 1
+    tkWidget_Invalidate( hGroup )
+    return nBefore
+end function
+
+public function tkAvatarGroup_AddItem( byval hGroup as TK_WIDGET ptr, byval Name_ as ustring, _
+                                       byval ColorKey as ustring = "", byval pImage as tkImageFile ptr = 0 ) as long
+    return tkAvatarGroup_InsertItem( hGroup, -1, Name_, ColorKey, pImage )
+end function
+
+public sub tkAvatarGroup_RemoveItem( byval hGroup as TK_WIDGET ptr, byval idx as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    if p->items(idx).pOwn then delete p->items(idx).pOwn
+    for i as long = idx to p->nCount - 2
+        p->items(i) = p->items(i + 1)
+    next
+    p->nCount -= 1
+    dim as TKAVGROUP_ITEM blank
+    p->items(p->nCount) = blank
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public sub tkAvatarGroup_Clear( byval hGroup as TK_WIDGET ptr )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    for i as long = 0 to p->nCount - 1
+        if p->items(i).pOwn then delete p->items(i).pOwn
+    next
+    erase p->items
+    p->nCount = 0
+    p->nFocusItem = 0
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public function tkAvatarGroup_GetCount( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return 0
+    return p->nCount
+end function
+
+public function tkAvatarGroup_GetItemName( byval hGroup as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return ""
+    return p->items(idx).wszName
+end function
+
+' The first item whose ColorKey (else name) is Key; -1 = none.
+public function tkAvatarGroup_FindItemByKey( byval hGroup as TK_WIDGET ptr, byval Key as ustring ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return -1
+    for i as long = 0 to p->nCount - 1
+        if iif( len( p->items(i).wszColorKey ) > 0, p->items(i).wszColorKey, p->items(i).wszName ) = Key then return i
+    next
+    return -1
+end function
+
+' The item's picture from a file (owned by the item).
+public sub tkAvatarGroup_SetItemImageFile( byval hGroup as TK_WIDGET ptr, byval idx as long, byval Path as ustring )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    if p->items(idx).pOwn = 0 then p->items(idx).pOwn = new tkImageFile
+    p->items(idx).pOwn->Load( Path )
+    p->items(idx).pImg = p->items(idx).pOwn
+    tkWidget_Invalidate( hGroup )
+end sub
+
+' The item's picture from ARGB pixels (copied, owned by the item).
+public sub tkAvatarGroup_SetItemImagePixels( byval hGroup as TK_WIDGET ptr, byval idx as long, byval w as long, _
+                                             byval h as long, byval argb as ulong ptr )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    if p->items(idx).pOwn = 0 then p->items(idx).pOwn = new tkImageFile
+    p->items(idx).pOwn->LoadFromPixels( w, h, argb )
+    p->items(idx).pImg = p->items(idx).pOwn
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public sub tkAvatarGroup_SetItemPresence( byval hGroup as TK_WIDGET ptr, byval idx as long, byval nPresence as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    if (nPresence < TKAVATAR_PRESENCE_NONE) orelse (nPresence > TKBADGE_PRESENCE_UNKNOWN) then exit sub
+    p->items(idx).nPresence = nPresence
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public sub tkAvatarGroup_SetItemData( byval hGroup as TK_WIDGET ptr, byval idx as long, byval nData as integer )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).nData = nData
+end sub
+
+public function tkAvatarGroup_GetItemData( byval hGroup as TK_WIDGET ptr, byval idx as long ) as integer
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return 0
+    return p->items(idx).nData
+end function
+
+' ---- layout -------------------------------------------------------------------------------------
+public sub tkAvatarGroup_SetLayout( byval hGroup as TK_WIDGET ptr, byval nLayout as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (nLayout < TKAVGROUP_STACK) orelse (nLayout > TKAVGROUP_SPREAD) then exit sub
+    p->nLayout = nLayout
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public function tkAvatarGroup_GetLayout( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return TKAVGROUP_STACK
+    return p->nLayout
+end function
+
+' At least 1. More items than this show MaxVisible - 1 and a "+N".
+public sub tkAvatarGroup_SetMaxVisible( byval hGroup as TK_WIDGET ptr, byval nMax as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    p->nMax = iif( nMax < 1, 1, nMax )
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public function tkAvatarGroup_GetMaxVisible( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return 0
+    return p->nMax
+end function
+
+' The real count when more exist than are held (4 loaded of 42); -1 = the items held.
+public sub tkAvatarGroup_SetTotal( byval hGroup as TK_WIDGET ptr, byval nTotal as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    p->nTotal = nTotal
+    tkWidget_Invalidate( hGroup )
+end sub
+
+' The "+N" shown now; 0 = none.
+public function tkAvatarGroup_GetOverflowCount( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return 0
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    return nMore
+end function
+
+public function tkAvatarGroup_GetShownCount( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return 0
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    return nShown
+end function
+
+' Percent of the diameter each overlaps the one before (STACK), 0 .. 60.
+public sub tkAvatarGroup_SetOverlap( byval hGroup as TK_WIDGET ptr, byval nPercent as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    p->nOverlapPct = iif( nPercent < 0, 0, iif( nPercent > 60, 60, nPercent ) )
+    tkWidget_Invalidate( hGroup )
+end sub
+
+' The gap between items in SPREAD, design units.
+public sub tkAvatarGroup_SetSpacing( byval hGroup as TK_WIDGET ptr, byval nDu as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    p->nSpacingDu = iif( nDu < 0, 0, nDu )
+    tkWidget_Invalidate( hGroup )
+end sub
+
+' Every item's diameter, design units (16 .. 128).
+public sub tkAvatarGroup_SetSize( byval hGroup as TK_WIDGET ptr, byval nDu as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    p->nSizeDu = iif( nDu < 16, 16, iif( nDu > 128, 128, nDu ) )
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public sub tkAvatarGroup_SetShape( byval hGroup as TK_WIDGET ptr, byval nShape as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (nShape < TKAVATAR_CIRCLE) orelse (nShape > TKAVATAR_SQUARE) then exit sub
+    p->nShape = nShape
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public sub tkAvatarGroup_SetColorMode( byval hGroup as TK_WIDGET ptr, byval nMode as long )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (nMode < TKAVATAR_COLORFUL) orelse (nMode > TKAVATAR_CUSTOM) then exit sub
+    p->nColorMode = nMode
+    tkWidget_Invalidate( hGroup )
+end sub
+
+' Shown items + the overflow disc, overlapped or spread, plus the margins; valid before sizing.
+public sub tkAvatarGroup_GetIdealSize( byval hGroup as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    nWidth = 0 : nHeight = 0
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    dim as long nSlots = nShown + iif( nMore > 0, 1, 0 ), d = Diam( p ), m = Margin( p )
+    nHeight = d + 2 * m
+    nWidth = 2 * m + iif( nSlots > 0, (nSlots - 1) * StepPx( p ) + d, 0 )
+end sub
+
+' Item idx's avatar square (control-local); FALSE when it is not shown.
+public function tkAvatarGroup_GetItemRect( byval hGroup as TK_WIDGET ptr, byval idx as long, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return false
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    if (idx < 0) orelse (idx >= nShown) then return false
+    SlotRect( p, idx, rc )
+    return true
+end function
+
+public function tkAvatarGroup_GetOverflowRect( byval hGroup as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return false
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    if nMore = 0 then return false
+    SlotRect( p, nShown, rc )
+    return true
+end function
+
+' An item index, TKAVGROUP_OVERFLOW or TKAVGROUP_HIT_NONE; an overlap goes to the item on top.
+public function tkAvatarGroup_HitTest( byval hGroup as TK_WIDGET ptr, byval x as long, byval y as long ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return TKAVGROUP_HIT_NONE
+    return SlotAt( p, x, y )
+end function
+
+' ---- input --------------------------------------------------------------------------------------
+' Interactive: a tab stop with an item focus ring (Left / Right / Home / End, Enter / Space click).
+public sub tkAvatarGroup_SetInteractive( byval hGroup as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    p->bInteractive = bOn
+    hGroup->isFocusable = bOn
+    if (bOn = false) andalso (tkHost_GetFocus( hGroup->pHost ) = hGroup) then tkHost_SetFocus( hGroup->pHost, 0 )
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public function tkAvatarGroup_GetFocusItem( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return 0
+    ClampFocus( p )
+    return p->nFocusItem
+end function
+
+' The tip text for item idx, or TKAVGROUP_OVERFLOW (the hidden names).
+public function tkAvatarGroup_GetTipText( byval hGroup as TK_WIDGET ptr, byval idx as long ) as ustring
+    return TipText( 0, hGroup, iif( idx = TKAVGROUP_OVERFLOW, 1000000, idx ) )
+end function
+
+' The hidden names in a tkPopupMenu under the "+N"; picking one fires ItemClick with its index.
+public sub tkAvatarGroup_ShowOverflowMenu( byval hGroup as TK_WIDGET ptr )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    dim as long nShown, nMore
+    Shown( p, nShown, nMore )
+    if nShown >= p->nCount then exit sub
+    if p->hMenu = 0 then
+        p->hMenu = tkPopupMenu_Create( hGroup->pHost )
+        tkPopupMenu_SetSelectCallback( p->hMenu, @OnMenuSelect )
+    end if
+    tkPopupMenu_Clear( p->hMenu )
+    for i as long = nShown to p->nCount - 1
+        tkPopupMenu_AddItem( p->hMenu, i + 1, p->items(i).wszName )
+    next
+    dim as TKRECT r, a
+    SlotRect( p, nShown, r )
+    tkWidget_AbsRect( hGroup, a )
+    tkRect_Offset( r, a.left, a.top )
+    gMenuGroup = hGroup
+    tkPopupMenu_ShowForRect( p->hMenu, r, PM_ALIGN_BELOW )
+end sub
+
+' The overflow menu (0 until ShowOverflowMenu first ran), for tests and theming.
+public function tkAvatarGroup_GetOverflowMenu( byval hGroup as TK_WIDGET ptr ) as TK_MENU ptr
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then return 0
+    return p->hMenu
+end function
+
+public sub tkAvatarGroup_SetItemClickCallback( byval hGroup as TK_WIDGET ptr, byval usersub as AVG_ItemClickCallbackSub )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p then p->ItemClickCallback = usersub
+end sub
+
+public sub tkAvatarGroup_SetOverflowClickCallback( byval hGroup as TK_WIDGET ptr, byval usersub as AVG_OverflowClickCallbackSub )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p then p->OverflowCallback = usersub
+end sub
+
+public sub tkAvatarGroup_SetMessageCallback( byval hGroup as TK_WIDGET ptr, byval userfunc as AVG_MessageCallbackFunc )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p then p->MessageCallback = userfunc
+end sub
+
+' ---- appearance -----------------------------------------------------------------------------
+public sub tkAvatarGroup_GetColors( byval hGroup as TK_WIDGET ptr, byval pColors as TKAVGROUP_COLORS ptr )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+public sub tkAvatarGroup_SetColors( byval hGroup as TK_WIDGET ptr, byval pColors as TKAVGROUP_COLORS ptr )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public function tkAvatarGroup_ThemeColors( byref t as TKTHEME_COLORS ) as TKAVGROUP_COLORS
+    dim as TKAVGROUP_COLORS c
+    c.BackColor = t.Window
+    c.FocusRingColor = t.FocusRing
+    c.OverflowBack = t.Surface
+    c.OverflowInk = t.Text
+    return c
+end function
+
+public sub tkAvatarGroup_ApplyTheme( byval hGroup as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hGroup, t )
+    p->bDark = tr.IsDark
+    p->avColors = tkAvatar_ThemeColors( tr )
+    if p->bColorsPinned = false then
+        p->colors = tkAvatarGroup_ThemeColors( tr )
+        tkTheme_ResolveInto( hGroup, tr, cast( ulong ptr, @p->colors ), sizeof( TKAVGROUP_COLORS ) \ 4, "AvatarGroup" )
+    end if
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public sub tkAvatarGroup_UnpinColors( byval hGroup as TK_WIDGET ptr )
+    dim as TKAVGROUP_STATE ptr p = AG( hGroup )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkAvatarGroup_ApplyTheme( hGroup, tkTheme_Of( hGroup ) )
+end sub

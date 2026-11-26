@@ -1,0 +1,532 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkRExpr -- the report expression language: small, typed, sandboxed, over tkBind's TK_VALUE.
+' Design: claude-docs docs/tkReportDesigner/SPEC.md ("The expression language"); phase RD1.
+'
+' WHY: a designed report's layout is read at run time (RD1 of the 2026-11-25 decisions), so its
+' computed values, filters, groups, totals, visibility and styles are text compiled when the
+' report is loaded. tiko has no eval; this is the eval, and nothing else: no I/O, no assignment,
+' no loops, no user functions -- only the built-in functions and those the host registers.
+'
+' THE LANGUAGE (BASIC-flavoured, names and keywords without case):
+'   [Field]  [Source.Field]  [Name with spaces]     a field of the schema
+'   @Param                                          a report parameter
+'   12  1.5  1e3  "text"  """"  #2026-11-25#  #14:30#  #14:30:15#  true  false  empty
+'   or orelse xor | and andalso | not | = <> < <= > >= like in | & | + - | * / \ mod | -x | ^
+'   iif( c, a, b ) (lazy)  Sum( [Amount] )  Format( [Price], "#,##0.00" )  PageNumber ...
+' TYPES are tkBind's kinds: text, int, float, bool, date, time, and empty. Every expression is
+' type-checked when it is compiled, against the schema; int widens to float. EMPTY (a database
+' NULL) propagates through arithmetic and most functions; a comparison with it is false; & and
+' Str / Format read it as "". IsEmpty( ) and IfEmpty( ) test it.
+'
+' TOTALS: Sum / Count / Avg / Min / Max / First / Last / GroupCount. Each call becomes an
+' AGGREGATE of the compiled expression: its argument is compiled as an expression of its own
+' (tkRExpr_AggArg), which the report engine evaluates per row into a TKREXPR_ACC; the engine sets
+' the results in the context (ctx.aggs) before it evaluates the outer expression.
+'
+' COMPILE once, EVALUATE per row: flat typed code on a value stack in the context (no allocation
+' per row). Errors at compile time carry a message and a column; errors at run time (division by
+' zero, a bad date) give EMPTY and are counted on the expression, never raised.
+#module "tkRExpr"
+
+#import "../tkBind" public
+#import "std/chrono"
+using tkBind
+using tkCalendar
+using tkTimePanel
+
+' ---- aggregates ------------------------------------------------------------------------------
+public enum
+    TKRX_AGG_SUM = 0
+    TKRX_AGG_COUNT           ' Count( e ): rows where e is not empty
+    TKRX_AGG_COUNTROWS       ' Count( ): every row
+    TKRX_AGG_AVG
+    TKRX_AGG_MIN
+    TKRX_AGG_MAX
+    TKRX_AGG_FIRST           ' the first non-empty value
+    TKRX_AGG_LAST            ' the last non-empty value
+    TKRX_AGG_GROUPCOUNT      ' GroupCount( ): rows of the innermost group (the engine resets it there)
+end enum
+
+' ---- values the report supplies (tkRExpr_UsesValue) ------------------------------------------
+public enum
+    TKRX_B_PAGENUMBER = 0
+    TKRX_B_PAGECOUNT         ' late: known when the document is complete
+    TKRX_B_ROWNUMBER
+    TKRX_B_GROUPROWNUMBER
+    TKRX_B_REPORTTITLE
+    TKRX_B_PRINTDATE         ' also Today( )
+    TKRX_B_PRINTTIME         ' also Now( )
+    TKRX_B_COUNT_
+end enum
+
+' ---- the schema an expression is compiled against ----------------------------------------------
+public type TKREXPR_SCHEMA
+    names(any)    as ustring            ' "Customer", "Lines.Qty"
+    kinds(any)    as int32              ' TKV_*
+    nFields       as int32
+    pnames(any)   as ustring            ' parameters, without the @
+    pkinds(any)   as int32
+    nParams       as int32
+    defaultSource as ustring            ' [X] also finds "<defaultSource>.X"
+    noAggregates  as boolean            ' totals refused (filters, calculated fields, group keys)
+    declare function AddField( byref name_ as const ustring, byval kind as int32 ) as int32
+    declare function AddParam( byref name_ as const ustring, byval kind as int32 ) as int32
+    declare sub Clear( )
+end type
+
+public type TKREXPR_ERROR
+    msg    as ustring
+    col    as int32                     ' 1-based character column in the source; 0 = none
+    length as int32                     ' characters from col the error covers
+end type
+
+' ---- compiled code -----------------------------------------------------------------------------
+public type RX_OP
+    op as int32
+    a  as int32
+    b  as int32
+    i  as int64
+    d  as float64
+end type
+
+' A compiled number mask ("$#,##0.00", "0.0%"): parsed once, at compile time.
+public type RX_FMT
+    mask     as ustring                 ' the mask as written
+    pre      as ustring                 ' text before the number pattern
+    post     as ustring                 ' text after it
+    dec      as int32                   ' decimals
+    grouped  as boolean                 ' thousands with ","
+    percent  as boolean                 ' x 100
+    hasNum   as boolean                 ' a number pattern was found
+end type
+
+public type TK_REXPR_
+    src          as ustring
+    ops(any)     as RX_OP
+    nOps         as int32
+    strs(any)    as ustring
+    nStrs        as int32
+    fmts(any)    as RX_FMT
+    nFmts        as int32
+    kind         as int32               ' TKV_* of the result (TKV_EMPTY: the literal empty)
+    depth        as int32               ' compile time: the stack depth after the code so far
+    maxDepth     as int32
+    aggFn(any)   as int32
+    aggArg(any)  as TK_REXPR_ ptr       ' the argument's own code (0 for Count( ) / GroupCount( ))
+    aggKind(any) as int32               ' the total's kind
+    nAggs        as int32
+    uses(0 to TKRX_B_COUNT_ - 1) as boolean
+    usesFields   as boolean
+    usesParams   as boolean
+    nRunErrors   as int32               ' run-time errors so far (each gives EMPTY)
+    runError     as ustring             ' the first one
+end type
+public type TK_REXPR as TK_REXPR_
+
+' One stack slot: the kind and the value in the field that kind uses. int / bool / date (days
+' from 1970-01-01) / time (seconds of the day) in i, float in n, text in s.
+public type RX_SLOT
+    k as int32
+    i as int64
+    n as float64
+    s as ustring
+end type
+
+' What an evaluation reads. row / params / aggs are indexed as the schema's fields, parameters and
+' the expression's aggregates. The stack is the context's, so one context per thread.
+public type TKREXPR_CTX
+    row            as TK_VALUE ptr
+    params         as TK_VALUE ptr
+    aggs           as TK_VALUE ptr
+    pageNumber     as int64 = 1
+    pageCount      as int64 = 1
+    rowNumber      as int64
+    groupRowNumber as int64
+    reportTitle    as ustring
+    printDate      as TKDATE            ' wYear = 0: read from the clock on first use
+    printTime      as TKTIME            ' wHour = -1: read from the clock on first use
+    stk(any)       as RX_SLOT
+end type
+
+' A host function: nArgs values in args (already of the declared kinds), the result in result.
+public type RX_HostFunc as sub( byval args as TK_VALUE ptr, byval nArgs as int32, byref result as TK_VALUE )
+
+' A running total: an aggregate's state between resets. The report engine keeps one per aggregate
+' and scope; tkRExpr_AccAdd feeds it a row, Result gives its value.
+public type TKREXPR_ACC
+    fn    as int32 = TKRX_AGG_SUM
+    kind  as int32                      ' the argument's kind (TKV_*)
+    rows  as int64                      ' rows added
+    n     as int64                      ' of which not empty
+    si    as int64                      ' the sum, for ints
+    sf    as float64                    ' the sum, for floats
+    best  as TK_VALUE                   ' MIN / MAX / FIRST / LAST
+    declare sub Init( byval fn_ as int32, byval kind_ as int32 )
+    declare sub Reset( )
+    declare sub Add( byref v as TK_VALUE )
+    declare sub AddRow( )
+    declare sub Result( byref r as TK_VALUE )
+end type
+
+' ---- the code (internal) -------------------------------------------------------------------------
+enum
+    RXO_NOP = 0
+    RXO_LDCI            ' i, kind b (int / bool / date / time)
+    RXO_LDCF            ' d
+    RXO_LDCS            ' strs(a)
+    RXO_LDE             ' empty
+    RXO_LDF             ' row(a) as kind b
+    RXO_LDP             ' params(a) as kind b
+    RXO_LDA             ' aggs(a) as kind b
+    RXO_LDB             ' a report value (TKRX_B_*)
+    RXO_I2F             ' the slot a below the top: int -> float
+    RXO_ADDI            ' i + i, result kind b
+    RXO_SUBI
+    RXO_MULI
+    RXO_IDIV
+    RXO_MODI
+    RXO_NEGI
+    RXO_ADDF
+    RXO_SUBF
+    RXO_MULF
+    RXO_DIVF
+    RXO_NEGF
+    RXO_POWF
+    RXO_CAT             ' a = 1: empty in -> empty out (+); a = 0: empty is "" (&)
+    RXO_TOTEXT
+    RXO_CMP             ' a = 0 = | 1 <> | 2 < | 3 <= | 4 > | 5 >=
+    RXO_LIKE
+    RXO_IN              ' the value below a items
+    RXO_NOT
+    RXO_XOR
+    RXO_JF              ' pop; jump to a unless true
+    RXO_JT              ' pop; jump to a when true
+    RXO_JMP
+    RXO_JNE             ' jump to a when the top is not empty (kept)
+    RXO_POP
+    RXO_PUSHB           ' i
+    RXO_FN              ' a built-in function (RXF_*), b values
+    RXO_FMTC            ' the top as text by fmts(a)
+    RXO_HOST            ' host function a, b values
+end enum
+
+enum
+    RXF_ISEMPTY = 0
+    RXF_CHOOSE
+    RXF_BETWEEN
+    RXF_LEN
+    RXF_LEFT
+    RXF_RIGHT
+    RXF_MID
+    RXF_UCASE
+    RXF_LCASE
+    RXF_TRIM
+    RXF_LTRIM
+    RXF_RTRIM
+    RXF_INSTR
+    RXF_INSTR3
+    RXF_REPLACE
+    RXF_STR
+    RXF_VAL
+    RXF_FORMAT
+    RXF_PADLEFT
+    RXF_PADRIGHT
+    RXF_ABS
+    RXF_INT
+    RXF_FIX
+    RXF_ROUND
+    RXF_SGN
+    RXF_SQR
+    RXF_MIN2
+    RXF_MAX2
+    RXF_YEAR
+    RXF_MONTH
+    RXF_DAY
+    RXF_WEEKDAY
+    RXF_HOUR
+    RXF_MINUTE
+    RXF_SECOND
+    RXF_DATEADD
+    RXF_DATEDIFF
+    RXF_DATESERIAL
+    RXF_TIMESERIAL
+    RXF_MONTHNAME
+    RXF_CINT
+    RXF_CFLOAT
+    RXF_CBOOL
+    RXF_CDATE
+end enum
+
+const RX_TEXT_CAP = 1048576             ' characters: longer text is cut, with a run-time error
+
+
+' ==========================================================================================
+' The schema
+' ==========================================================================================
+function TKREXPR_SCHEMA.AddField( byref name_ as const ustring, byval kind as int32 ) as int32
+    redim preserve names( 0 to nFields )
+    redim preserve kinds( 0 to nFields )
+    names(nFields) = name_
+    kinds(nFields) = kind
+    nFields += 1
+    return nFields - 1
+end function
+
+function TKREXPR_SCHEMA.AddParam( byref name_ as const ustring, byval kind as int32 ) as int32
+    redim preserve pnames( 0 to nParams )
+    redim preserve pkinds( 0 to nParams )
+    pnames(nParams) = name_
+    pkinds(nParams) = kind
+    nParams += 1
+    return nParams - 1
+end function
+
+sub TKREXPR_SCHEMA.Clear( )
+    erase names, kinds, pnames, pkinds
+    nFields = 0 : nParams = 0
+    defaultSource = "" : noAggregates = false
+end sub
+
+' ==========================================================================================
+' Compile / free / ask
+' ==========================================================================================
+' The code for src, or 0 with err_ filled (message, column, length).
+public function tkRExpr_Compile( byref src as const ustring, byref sch as TKREXPR_SCHEMA, _
+                                 byref err_ as TKREXPR_ERROR ) as TK_REXPR ptr
+    err_.msg = "" : err_.col = 0 : err_.length = 0
+    dim as TK_REXPR ptr x = new TK_REXPR
+    if RxCompileInto( src, sch, x, err_ ) = false then
+        tkRExpr_Destroy( x )
+        return 0
+    end if
+    return x
+end function
+
+public sub tkRExpr_Destroy( byval x as TK_REXPR ptr )
+    if x = 0 then exit sub
+    for k as int32 = 0 to x->nAggs - 1
+        tkRExpr_Destroy( x->aggArg(k) )
+    next
+    delete x
+end sub
+
+' The result's kind (TKV_*); TKV_EMPTY for an expression that is only 'empty'.
+public function tkRExpr_Kind( byval x as TK_REXPR ptr ) as int32
+    if x = 0 then return TKV_EMPTY
+    return x->kind
+end function
+
+public function tkRExpr_Source( byval x as TK_REXPR ptr ) as ustring
+    if x = 0 then return ""
+    return x->src
+end function
+
+' TRUE when the expression reads that report value (TKRX_B_*). PAGECOUNT makes it LATE: the
+' engine prints it into a slot filled when the document is complete.
+public function tkRExpr_UsesValue( byval x as TK_REXPR ptr, byval which as int32 ) as boolean
+    if (x = 0) orelse (which < 0) orelse (which >= TKRX_B_COUNT_) then return false
+    if x->uses(which) then return true
+    for k as int32 = 0 to x->nAggs - 1
+        if tkRExpr_UsesValue( x->aggArg(k), which ) then return true
+    next
+    return false
+end function
+
+' TRUE when the expression reads no field, parameter, total or report value: its value is fixed.
+public function tkRExpr_IsConstant( byval x as TK_REXPR ptr ) as boolean
+    if x = 0 then return true
+    if x->usesFields orelse x->usesParams orelse (x->nAggs > 0) then return false
+    for b as int32 = 0 to TKRX_B_COUNT_ - 1
+        if x->uses(b) then return false
+    next
+    return true
+end function
+
+public function tkRExpr_AggCount( byval x as TK_REXPR ptr ) as int32
+    if x = 0 then return 0
+    return x->nAggs
+end function
+
+public function tkRExpr_AggFn( byval x as TK_REXPR ptr, byval k as int32 ) as int32
+    if (x = 0) orelse (k < 0) orelse (k >= x->nAggs) then return -1
+    return x->aggFn(k)
+end function
+
+' The argument's code (owned by x), or 0 for Count( ) / GroupCount( ).
+public function tkRExpr_AggArg( byval x as TK_REXPR ptr, byval k as int32 ) as TK_REXPR ptr
+    if (x = 0) orelse (k < 0) orelse (k >= x->nAggs) then return 0
+    return x->aggArg(k)
+end function
+
+public function tkRExpr_AggKind( byval x as TK_REXPR ptr, byval k as int32 ) as int32
+    if (x = 0) orelse (k < 0) orelse (k >= x->nAggs) then return TKV_EMPTY
+    return x->aggKind(k)
+end function
+
+' Run-time errors since compiling (or the last Clear): how many, and the first.
+public function tkRExpr_GetRunErrors( byval x as TK_REXPR ptr, byref first as ustring ) as int32
+    first = ""
+    if x = 0 then return 0
+    first = x->runError
+    return x->nRunErrors
+end function
+
+public sub tkRExpr_ClearRunErrors( byval x as TK_REXPR ptr )
+    if x = 0 then exit sub
+    x->nRunErrors = 0 : x->runError = ""
+end sub
+
+sub RxRunError( byval x as TK_REXPR ptr, byref msg as const ustring )
+    if x->nRunErrors = 0 then x->runError = msg
+    x->nRunErrors += 1
+end sub
+
+' ==========================================================================================
+' Evaluate
+' ==========================================================================================
+public sub tkRExpr_Eval( byval x as TK_REXPR ptr, byref ctx as TKREXPR_CTX, byref result as TK_VALUE )
+    if x = 0 then
+        result.Clear( )
+        exit sub
+    end if
+    dim as RX_SLOT r
+    RxRun( x, ctx, r )
+    RxSlotToValue( r, result )
+end sub
+
+' For filters and visibility: TRUE only for a bool that is true (empty is false).
+public function tkRExpr_EvalBool( byval x as TK_REXPR ptr, byref ctx as TKREXPR_CTX ) as boolean
+    if x = 0 then return false
+    dim as RX_SLOT r
+    RxRun( x, ctx, r )
+    return (r.k = TKV_BOOL) andalso (r.i <> 0)
+end function
+
+' As text: plainly, or by a mask (tkRExpr_FormatValue's masks). Empty is "".
+public function tkRExpr_EvalText( byval x as TK_REXPR ptr, byref ctx as TKREXPR_CTX, _
+                                  byref mask as const ustring = "" ) as ustring
+    if x = 0 then return ""
+    dim as RX_SLOT r
+    RxRun( x, ctx, r )
+    if len( mask ) = 0 then return RxSlotText( r )
+    dim as TK_VALUE v
+    RxSlotToValue( r, v )
+    return tkRExpr_FormatValue( v, mask )
+end function
+
+' ==========================================================================================
+' Dates and times as numbers: days from 1970-01-01, seconds of the day
+' ==========================================================================================
+function RxDaysFromCivil( byval y as int64, byval m as int64, byval d as int64 ) as int64
+    if m <= 2 then y -= 1
+    dim as int64 era = iif( y >= 0, y, y - 399 ) \ 400
+    dim as int64 yoe = y - era * 400
+    dim as int64 mp = iif( m > 2, m - 3, m + 9 )
+    dim as int64 doy = (153 * mp + 2) \ 5 + d - 1
+    dim as int64 doe = yoe * 365 + yoe \ 4 - yoe \ 100 + doy
+    return era * 146097 + doe - 719468
+end function
+
+sub RxCivilFromDays( byval z as int64, byref y as int64, byref m as int64, byref d as int64 )
+    z += 719468
+    dim as int64 era = iif( z >= 0, z, z - 146096 ) \ 146097
+    dim as int64 doe = z - era * 146097
+    dim as int64 yoe = (doe - doe \ 1460 + doe \ 36524 - doe \ 146096) \ 365
+    y = yoe + era * 400
+    dim as int64 doy = doe - (365 * yoe + yoe \ 4 - yoe \ 100)
+    dim as int64 mp = (5 * doy + 2) \ 153
+    d = doy - (153 * mp + 2) \ 5 + 1
+    m = iif( mp < 10, mp + 3, mp - 9 )
+    if m <= 2 then y += 1
+end sub
+
+function RxDaysInMonth( byval y as int64, byval m as int64 ) as int64
+    if m = 12 then return 31
+    return RxDaysFromCivil( y, m + 1, 1 ) - RxDaysFromCivil( y, m, 1 )
+end function
+
+' 1 = Sunday ... 7 = Saturday (VB's Weekday); 1970-01-01 was a Thursday.
+function RxWeekday( byval days as int64 ) as int64
+    return (((days + 4) mod 7) + 7) mod 7 + 1
+end function
+
+function RxValidDate( byval y as int64, byval m as int64, byval d as int64 ) as boolean
+    if (y < 1) orelse (y > 9999) orelse (m < 1) orelse (m > 12) orelse (d < 1) then return false
+    return d <= RxDaysInMonth( y, m )
+end function
+
+' The clock, for a context whose print date / time were not set.
+sub RxClock( byref ctx as TKREXPR_CTX )
+    dim as chrono.DateTime t = chrono.WallClock.Now( )
+    if ctx.printDate.wYear = 0 then
+        ctx.printDate.wYear = t.Year : ctx.printDate.wMonth = t.Month : ctx.printDate.wDay = t.Day
+        ctx.printDate.wDayOfWeek = RxWeekday( RxDaysFromCivil( t.Year, t.Month, t.Day ) ) - 1
+    end if
+    if ctx.printTime.wHour < 0 then
+        ctx.printTime.wHour = t.Hour : ctx.printTime.wMinute = t.Minute : ctx.printTime.wSecond = t.Second
+        ctx.printTime.wMilliseconds = 0
+    end if
+end sub
+
+' ==========================================================================================
+' Host functions: name, argument kinds, result kind. Registered before compiling what calls them.
+' ==========================================================================================
+dim shared as ustring gRxHostName(any)
+dim shared as int32 gRxHostFirst(any), gRxHostN(any), gRxHostRet(any)
+dim shared as int32 gRxHostArgs(any)
+dim shared as RX_HostFunc gRxHostProc(any)
+dim shared as int32 gRxNHost, gRxNHostArgs
+
+' FALSE when the name is a built-in function, already registered, not a name, or a kind is unknown.
+public function tkRExpr_Register( byref name_ as const ustring, argKinds() as int32, byval retKind as int32, _
+                                  byval proc as RX_HostFunc ) as boolean
+    if (proc = 0) orelse (len( name_ ) = 0) then return false
+    dim as ustring nm = lcase( name_ )
+    for i as int32 = 1 to len( nm )
+        dim as ustring c = mid( nm, i, 1 )
+        if ((c >= "a") andalso (c <= "z")) orelse (c = "_") orelse ((i > 1) andalso (c >= "0") andalso (c <= "9")) then continue for
+        return false
+    next
+    if RxIsBuiltinName( nm ) then return false
+    for i as int32 = 0 to gRxNHost - 1
+        if gRxHostName(i) = nm then return false
+    next
+    if (retKind < TKV_TEXT) orelse (retKind > TKV_TIME) then return false
+    dim as int32 n = ubound( argKinds ) - lbound( argKinds ) + 1
+    if n < 0 then n = 0
+    for j as int32 = 0 to n - 1
+        dim as int32 k = argKinds(lbound( argKinds ) + j)
+        if (k < TKV_TEXT) orelse (k > TKV_TIME) then return false
+    next
+    redim preserve gRxHostName( 0 to gRxNHost )
+    redim preserve gRxHostFirst( 0 to gRxNHost )
+    redim preserve gRxHostN( 0 to gRxNHost )
+    redim preserve gRxHostRet( 0 to gRxNHost )
+    redim preserve gRxHostProc( 0 to gRxNHost )
+    gRxHostName(gRxNHost) = nm
+    gRxHostFirst(gRxNHost) = gRxNHostArgs
+    gRxHostN(gRxNHost) = n
+    gRxHostRet(gRxNHost) = retKind
+    gRxHostProc(gRxNHost) = proc
+    if n > 0 then
+        redim preserve gRxHostArgs( 0 to gRxNHostArgs + n - 1 )
+        for j as int32 = 0 to n - 1
+            gRxHostArgs(gRxNHostArgs + j) = argKinds(lbound( argKinds ) + j)
+        next
+    end if
+    gRxNHostArgs += n
+    gRxNHost += 1
+    return true
+end function
+
+function RxFindHost( byref lname as const ustring ) as int32
+    for i as int32 = 0 to gRxNHost - 1
+        if gRxHostName(i) = lname then return i
+    next
+    return -1
+end function

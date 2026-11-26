@@ -16,12 +16,6 @@ the first bad one.
 {{#include ../../examples/testing/freed.out}}
 ```
 
-````admonish warning title="Status in this version"
-`-fsanitize=address` arrives after tiko 0.1.6, the toolchain this site is
-pinned to. This example was compiled and run on Windows with the development
-toolchain.
-````
-
 Without the `#cmdline` line the program prints a second, meaningless reading
 and exits 0. Checked, it stops at line 8 and exits 1 (on macOS it aborts,
 exit 134), and the report on standard error says where the freed block was

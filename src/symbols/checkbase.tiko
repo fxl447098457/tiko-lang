@@ -319,8 +319,8 @@ private function UdtCastsScored_( byref c as Ctx, byval cs as Tko.SymbolId ) as 
     return false
 end function
 
-private function UdtArgInert_ _
-    ( byref c as Ctx, byval u as Tko.TypeId, byval callee as Tko.SymbolId ) as boolean
+'' The argument half of UdtArgInert_: a named UDT whose only conversions are casts the scoring costs.
+private function UdtCastsInert_( byref c as Ctx, byval u as Tko.TypeId ) as boolean
     if c.types->Kind( u ) <> Tko.TK_UDT then return false
     dim as Tko.InternId tn = c.types->NameOf( u )
     if tn = 0 then return false
@@ -351,6 +351,12 @@ private function UdtArgInert_ _
         end if
         t = c.types->BaseOf( t )
     next
+    return true
+end function
+
+private function UdtArgInert_ _
+    ( byref c as Ctx, byval u as Tko.TypeId, byval callee as Tko.SymbolId ) as boolean
+    if UdtCastsInert_( c, u ) = false then return false
     dim as Tko.SymbolId ck = callee
     for guard as int32 = 0 to 999
         if ck = Tko.SYMBOL_NONE then exit for
@@ -383,20 +389,88 @@ private function UdtArgInert_ _
     return true
 end function
 
+'' Has UDT 'p' a constructor ONE argument of another type can call -- the only kind that converts?
+'' A copy constructor does not count, nor one needing two arguments: chrono's LocalDate, built
+'' from '( )' or '( y, mo, d )', converts nothing, yet any constructor at all kept a DateTime given
+'' to tkBind_Loaded's LocalDate overload from being reported (RefusalTrusted_). Measured on
+'' fbc-modern 1.20, 2026-11-23: such a set is error 99. A defaulted or variadic tail still counts.
+private function CtorTakesOne_( byref c as Ctx, byval p as Tko.TypeId ) as boolean
+    dim as Tko.SymbolId cur = UdtMemberSym_( c, p, "__ctor" )
+    for guard as int32 = 0 to 999
+        if cur = Tko.SYMBOL_NONE then return false
+        dim as Tko.Symbol ptr s = c.syms->SymbolAt( cur )
+        if s = nullptr then return true
+        dim as Tko.NodeId pn = cast( Tko.NodeId, s->payload )
+        if (pn = Tko.NODE_NONE) orelse (c.ast->Kind( pn ) <> Tko.N_PROC) then return true   '' unreadable: assume it might
+        dim as Tko.StmtPayload ptr pp = c.ast->StmtOf( pn )
+        dim as int32 np = 0, needed = 0
+        dim as Tko.NodeId first = Tko.NODE_NONE
+        for i as int32 = 0 to pp->count - 1
+            dim as Tko.NodeId prm = c.ast->ChildAt( pp->first, i )
+            if c.ast->Kind( prm ) <> Tko.N_PARAM then continue for
+            if c.ast->StmtOf( prm )->op = cast( uint16, Tko.TK_ELLIPSIS ) then return true
+            np += 1
+            if np = 1 then first = prm
+            if c.ast->StmtOf( prm )->b = Tko.NODE_NONE then needed += 1
+        next
+        if (np >= 1) andalso (needed <= 1) then
+            dim as Tko.NodeId fa = c.ast->StmtOf( first )->a
+            if fa = Tko.NODE_NONE then return true
+            dim as Tko.TypeId ft = c.types->Unqualify( c.info->TypeOf_( fa ) )
+            if c.types->Kind( ft ) = Tko.TK_REFERENCE then ft = c.types->Unqualify( c.types->Inner( ft ) )
+            if ft <> p then return true   '' not the copy constructor
+        end if
+        cur = s->nextOverload
+    next
+    return true
+end function
+
 '' Can an argument of UDT 'u' reach a parameter of UDT 'p' -- p is u or a base of it, or p
-'' has a constructor (which some argument might build it through)? See UdtArgInert_.
+'' has a constructor one argument can call (CtorTakesOne_)? See UdtArgInert_.
 private function UdtReachable_ _
     ( byref c as Ctx, byval u as Tko.TypeId, byval p as Tko.TypeId ) as boolean
     if c.types->NameOf( p ) = 0 then return true
     dim as string psp = c.names->Spelling( c.types->NameOf( p ) )
     if (left( psp, 1 ) = "(") orelse (left( psp, 1 ) = "$") orelse (instr( psp, "<" ) > 0) then return true
-    if UdtMemberSym_( c, p, "__ctor" ) <> Tko.SYMBOL_NONE then return true
+    if CtorTakesOne_( c, p ) then return true
     dim as Tko.TypeId t = u
     for guard as int32 = 0 to 31
         if (t = Tko.TYPE_NONE) orelse (c.types->Kind( t ) <> Tko.TK_UDT) then exit for
         if t = p then return true
         t = c.types->BaseOf( t )
     next
+    return false
+end function
+
+'' DID THE SCORING REFUSE ARGUMENT TYPE 'a' FOR PARAMETER TYPE 'p' ON GROUNDS IT MODELS? A
+'' builtin or a pointer, as ResolveCall_'s no-match report has always trusted; or a UDT with no
+'' unscored cast against a builtin, pointer or enum parameter, or a UDT parameter it cannot
+'' reach (UdtArgInert_'s rule, asked of ONE parameter). Asked per refused candidate, so a UDT
+'' argument that fits its own parameter exactly no longer silences the report: 'Ld( t, d )' over
+'' 'Ld( byval long, byval double )' and 'Ld( byval D, byval D )', with t a third UDT, said
+'' nothing and lowering ran the first overload -- TKO0993 (byval) or a silent call (byref)
+'' where fbc-modern 1.20 says 99 (tkBind_Loaded given a DateTime, 2026-11-23).
+private function RefusalTrusted_ _
+    ( byref c as Ctx, byval a as Tko.TypeId, byval p as Tko.TypeId ) as boolean
+    if (a = Tko.TYPE_NONE) orelse (p = Tko.TYPE_NONE) then return false
+    dim as Tko.TypeId ua = c.types->Unqualify( a )
+    if c.types->Kind( ua ) = Tko.TK_REFERENCE then ua = c.types->Unqualify( c.types->Inner( ua ) )
+    select case c.types->Kind( ua )
+    case Tko.TK_BUILTIN, Tko.TK_POINTER
+        return true
+    case Tko.TK_UDT
+    case else
+        return false
+    end select
+    if UdtCastsInert_( c, ua ) = false then return false
+    dim as Tko.TypeId up = c.types->Unqualify( p )
+    if c.types->Kind( up ) = Tko.TK_REFERENCE then up = c.types->Unqualify( c.types->Inner( up ) )
+    select case c.types->Kind( up )
+    case Tko.TK_BUILTIN, Tko.TK_POINTER, Tko.TK_ENUM
+        return true
+    case Tko.TK_UDT
+        return (UdtReachable_( c, ua, up ) = false)
+    end select
     return false
 end function
 

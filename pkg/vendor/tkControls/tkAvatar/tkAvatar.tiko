@@ -1,0 +1,1068 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkAvatar -- a person's picture, falling back to initials, then a glyph, then a drawn person.
+' New in tkControls; the design is C:\dev\docs\tkControls\RATING-BADGE-AVATAR-CHIP.md §6. Phases
+' A0 + A1 (the group is tkAvatarGroup, A2).
+'
+' FALLBACK (§6.1): a valid image -> the initials (Initials, else from DisplayName) -> a glyph (Glyph
+' + a glyph font) -> the person shape. A failed load clears the image and falls through.
+' INITIALS (§6.2): brackets and punctuation dropped, phone numbers and scripts that do not take
+' initials (Arabic, Hebrew, Indic, Thai, Hangul, Kana, CJK) give none; the first letter of the first
+' word + the first letter of the last word, upper-cased; one letter below 24 px.
+' COLOUR (§6.3): COLORFUL picks one of 16 palette pairs by FNV-1a of ColorKey (else DisplayName);
+' every pair's ink is the one of black / white with the higher contrast, so each reads >= 4.5:1.
+' IMAGES are drawn round through tkPaint's PaintImageShape (cover fit). A photo much larger than
+' the avatar is drawn from a pre-scaled copy, made once per diameter (SDL has no mipmaps).
+' PRESENCE is tkBadge's presence mark at the 45-degree point; ACTIVE adds a ring, INACTIVE halves
+' the opacity. Not focusable; a Click event for "open the profile".
+#module "tkAvatar"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkImage" public
+#import "../tkBadge" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkImage
+using tkBadge
+
+public enum
+    TKAVATAR_CIRCLE = 0
+    TKAVATAR_ROUNDED            ' corner radius 25 % of the side
+    TKAVATAR_SQUARE
+end enum
+
+public enum
+    TKAVATAR_COLORFUL = 0       ' a palette pair by the hash of ColorKey / DisplayName
+    TKAVATAR_NEUTRAL
+    TKAVATAR_ACCENT
+    TKAVATAR_CUSTOM             ' SetCustomColors
+end enum
+
+public enum
+    TKAVATAR_ACTIVE_UNSET = 0
+    TKAVATAR_ACTIVE_ACTIVE      ' a ring in ActiveRingColor ("speaking", "selected")
+    TKAVATAR_ACTIVE_INACTIVE    ' half opacity
+end enum
+
+public const as long TKAVATAR_PRESENCE_NONE = -1     ' else a TKBADGE_PRESENCE_*
+public const as long TKAVATAR_PALETTE_SIZE  = 16
+public const as long TKAVATAR_DEFAULT_SIZE  = 32     ' design units: GetIdealSize's diameter
+public const as long TKAVATAR_RING_THICK    = 2      ' the active ring (pixels, a rule)
+public const as long TKAVATAR_RING_GAP      = 2
+
+public type TKAVATAR_COLORS
+    BackColor        as ulong = &hFF21252Bul     ' what the avatar sits on (and the presence's cut-out)
+    NeutralBack      as ulong = &hFF2C313Aul
+    NeutralInk       as ulong = &hFF969CA6ul
+    AccentBack       as ulong = &hFF569CD6ul
+    AccentInk        as ulong = &hFF21252Bul
+    CustomBack       as ulong = &hFF505862ul
+    CustomInk        as ulong = &hFFFFFFFFul
+    ActiveRingColor  as ulong = &hFF569CD6ul
+end type
+
+' Everything that decides an avatar's look, with or without a widget.
+public type TKAVATAR_SPEC
+    wszName      as ustring
+    wszInitials  as ustring                 ' "" = from wszName
+    pImage       as tkImageFile ptr         ' borrowed; drawn when valid
+    wszGlyph     as ustring
+    fGlyph       as TTF_Font ptr
+    fText        as TTF_Font ptr            ' the initials' font; PaintInto sizes it (TTF_SetFontSize)
+    nShape       as long = TKAVATAR_CIRCLE
+    nColorMode   as long = TKAVATAR_COLORFUL
+    wszColorKey  as ustring
+    nPresence    as long = TKAVATAR_PRESENCE_NONE
+    nActive      as long = TKAVATAR_ACTIVE_UNSET
+    bIsGroup     as boolean
+    bDark        as boolean = true          ' the palette's half (the theme's IsDark)
+    fScale       as single = 1
+    pColors      as TKAVATAR_COLORS ptr     ' 0 = the app theme's
+end type
+
+public type TKAVATAR_PAINTINFO
+    hAvatar    as TK_WIDGET ptr
+    b          as TK_PAINT ptr
+    rcClient   as TKRECT
+    rcAvatar   as TKRECT                    ' the avatar's square (the shape inside it)
+    rcPresence as TKRECT                    ' empty without presence
+    isEnabled  as boolean
+end type
+
+public type TKAVATAR_MESSAGEINFO
+    hAvatar as TK_WIDGET ptr
+    msg     as long
+    x       as single
+    y       as single
+end type
+
+public type AVT_ClickCallbackSub as sub( byval hAvatar as TK_WIDGET ptr )
+public type AVT_PaintCallbackSub as sub( byval p as TKAVATAR_PAINTINFO ptr )
+public type AVT_MessageCallbackFunc as function( byval m as TKAVATAR_MESSAGEINFO ptr ) as boolean
+
+' ==========================================================================================
+' Initials (§6.2), on UTF-8 code points
+' ==========================================================================================
+' The code point at byte i (1-based) of u8, and its byte length.
+private function CpAt( byref u8 as string, byval i as long, byref nb as long ) as long
+    dim as long b0 = u8[i - 1]
+    if b0 < &h80 then nb = 1 : return b0
+    if ((b0 and &hE0) = &hC0) andalso (i + 1 <= len( u8 )) then nb = 2 : return ((b0 and &h1F) shl 6) or (u8[i] and &h3F)
+    if ((b0 and &hF0) = &hE0) andalso (i + 2 <= len( u8 )) then
+        nb = 3 : return ((b0 and &h0F) shl 12) or ((u8[i] and &h3F) shl 6) or (u8[i + 1] and &h3F)
+    end if
+    if ((b0 and &hF8) = &hF0) andalso (i + 3 <= len( u8 )) then
+        nb = 4
+        return ((b0 and &h07) shl 18) or ((u8[i] and &h3F) shl 12) or ((u8[i + 1] and &h3F) shl 6) or (u8[i + 2] and &h3F)
+    end if
+    nb = 1 : return &hFFFD
+end function
+
+private function IsCombining( byval cp as long ) as boolean
+    return ((cp >= &h300) andalso (cp <= &h36F)) orelse ((cp >= &h1AB0) andalso (cp <= &h1AFF)) _
+           orelse ((cp >= &h1DC0) andalso (cp <= &h1DFF)) orelse ((cp >= &h20D0) andalso (cp <= &h20FF))
+end function
+
+' Scripts where "first letters" are not initials: the person shape instead (WinUI's glyph scripts,
+' Fluent's list, plus Hebrew and Indic -- D-A1).
+private function NoInitialScript( byval cp as long ) as boolean
+    if (cp >= &h590) andalso (cp <= &h8FF) then return true          ' Hebrew, Arabic, Syriac, Thaana, ...
+    if (cp >= &h900) andalso (cp <= &hDFF) then return true          ' Indic
+    if (cp >= &hE00) andalso (cp <= &hE7F) then return true          ' Thai
+    if (cp >= &h1100) andalso (cp <= &h11FF) then return true        ' Hangul Jamo
+    if (cp >= &h2E80) andalso (cp <= &h9FFF) then return true        ' CJK, Kana, Hangul compat
+    if (cp >= &hAC00) andalso (cp <= &hD7AF) then return true        ' Hangul syllables
+    if (cp >= &hF900) andalso (cp <= &hFAFF) then return true        ' CJK compatibility
+    if (cp >= &hFB1D) andalso (cp <= &hFDFF) then return true        ' Hebrew / Arabic presentation forms
+    if (cp >= &hFE70) andalso (cp <= &hFEFF) then return true
+    if (cp >= &h20000) andalso (cp <= &h3FFFF) then return true      ' CJK extensions
+    return false
+end function
+
+' A word character: an ASCII letter or digit, or anything past ASCII that is not punctuation or a
+' symbol block.
+private function IsWordCp( byval cp as long ) as boolean
+    if cp < &h80 then
+        return ((cp >= 48) andalso (cp <= 57)) orelse ((cp >= 65) andalso (cp <= 90)) orelse ((cp >= 97) andalso (cp <= 122))
+    end if
+    if (cp >= &h80) andalso (cp <= &hBF) then return false           ' Latin-1 punctuation, symbols
+    if (cp = &hD7) orelse (cp = &hF7) then return false
+    if (cp >= &h2000) andalso (cp <= &h2BFF) then return false       ' punctuation, symbols, arrows
+    if (cp >= &h3000) andalso (cp <= &h303F) then return false       ' CJK punctuation
+    return true
+end function
+
+private function IsDigitCp( byval cp as long ) as boolean
+    return (cp >= 48) andalso (cp <= 57)
+end function
+
+' The initials of a name: up to nMax (1 or 2) upper-cased letters, or "" for the person shape.
+public function tkAvatar_Initials( byval Name_ as ustring, byval nMax as long = 2 ) as ustring
+    dim as string u8 = Name_
+    ' words: runs of word characters; brackets skipped whole; punctuation dropped (not a split);
+    ' whitespace splits. Each word keeps its first code point (+ any combining marks after it).
+    dim as string firstOf(), cur
+    dim as long nWords = 0, depth = 0, nLetters = 0
+    dim as boolean inWord = false
+    redim firstOf( 0 to 0 )
+    dim as long i = 1
+    while i <= len( u8 )
+        dim as long nb
+        dim as long cp = CpAt( u8, i, nb )
+        dim as string ch = mid( u8, i, nb )
+        if (cp = 40) orelse (cp = 91) orelse (cp = 123) then
+            depth += 1
+        elseif ((cp = 41) orelse (cp = 93) orelse (cp = 125)) andalso (depth > 0) then
+            depth -= 1
+        elseif depth > 0 then
+            ' inside brackets: dropped
+        elseif (cp = 32) orelse (cp = 9) orelse (cp = &hA0) orelse (cp = &h3000) then
+            inWord = false
+        elseif IsWordCp( cp ) then
+            if IsDigitCp( cp ) = false then nLetters += 1
+            dim as boolean bStarts = (inWord = false)
+            if bStarts then
+                inWord = true
+                nWords += 1
+                redim preserve firstOf( 0 to nWords - 1 )
+                firstOf(nWords - 1) = ch
+            end if
+            ' combining marks right after a code point belong to it: kept with a word's first one
+            dim as long j = i + nb
+            while j <= len( u8 )
+                dim as long nb2
+                dim as long cp2 = CpAt( u8, j, nb2 )
+                if IsCombining( cp2 ) = false then exit while
+                if bStarts then firstOf(nWords - 1) &= mid( u8, j, nb2 )
+                j += nb2
+            wend
+            i = j
+            continue while
+        end if
+        ' anything else (punctuation, symbols): dropped, the word goes on
+        i += nb
+    wend
+    if (nWords = 0) orelse (nLetters = 0) then return ""          ' nothing, or a phone number
+    dim as long n0
+    if NoInitialScript( CpAt( firstOf(0), 1, n0 ) ) then return ""
+    dim as string res = firstOf(0)
+    if (nMax >= 2) andalso (nWords > 1) then res &= firstOf(nWords - 1)
+    dim as ustring w = res
+    return ucase( w )
+end function
+
+' ==========================================================================================
+' Colour (§6.3)
+' ==========================================================================================
+' FNV-1a 32 of the UTF-8 bytes, mod 16; -1 for an empty key.
+public function tkAvatar_PaletteIndex( byval Key as ustring ) as long
+    dim as string u8 = Key
+    if len( u8 ) = 0 then return -1
+    dim as ulong hsh = &h811C9DC5ul
+    for i as long = 0 to len( u8 ) - 1
+        hsh = hsh xor u8[i]
+        hsh = cast( ulong, (cast( ulongint, hsh ) * &h01000193ull) and &hFFFFFFFFull )
+    next
+    return cast( long, hsh and (TKAVATAR_PALETTE_SIZE - 1) )      ' 16: a power of two
+end function
+
+private function HueToRgb( byval p as double, byval q as double, byval t as double ) as double
+    if t < 0 then t += 1
+    if t > 1 then t -= 1
+    if t < 1 / 6 then return p + (q - p) * 6 * t
+    if t < 1 / 2 then return q
+    if t < 2 / 3 then return p + (q - p) * (2 / 3 - t) * 6
+    return p
+end function
+
+private function Hsl( byval h as double, byval s as double, byval l as double ) as ulong
+    dim as double q = iif( l < 0.5, l * (1 + s), l + s - l * s ), p = 2 * l - q
+    return tkRGB( cint( HueToRgb( p, q, h + 1 / 3 ) * 255 ), cint( HueToRgb( p, q, h ) * 255 ), cint( HueToRgb( p, q, h - 1 / 3 ) * 255 ) )
+end function
+
+' Palette pair idx (0..15) for a dark or a light theme: 16 hues 22.5 degrees apart, muted and dark
+' on a dark theme, pastel on a light one. The ink is black or white, whichever contrasts more --
+' which is always at least 4.58:1.
+public sub tkAvatar_PaletteColors( byval bDark as boolean, byval idx as long, byref clrBack as ulong, byref clrInk as ulong )
+    if (idx < 0) orelse (idx >= TKAVATAR_PALETTE_SIZE) then idx = 0
+    clrBack = Hsl( idx / TKAVATAR_PALETTE_SIZE, iif( bDark, 0.42, 0.62 ), iif( bDark, 0.36, 0.84 ) )
+    dim as ulong wht = &hFFFFFFFFul, blk = &hFF000000ul
+    clrInk = iif( tkBadge_Contrast( wht, clrBack ) >= tkBadge_Contrast( blk, clrBack ), wht, blk )
+end sub
+
+' The background and ink of a spec (image-less avatars).
+private sub SpecColors( byref s as TKAVATAR_SPEC, byref back as ulong, byref ink as ulong )
+    dim as TKAVATAR_COLORS ptr c = s.pColors
+    select case s.nColorMode
+    case TKAVATAR_NEUTRAL : back = c->NeutralBack : ink = c->NeutralInk
+    case TKAVATAR_ACCENT  : back = c->AccentBack : ink = c->AccentInk
+    case TKAVATAR_CUSTOM  : back = c->CustomBack : ink = c->CustomInk
+    case else
+        dim as long idx = tkAvatar_PaletteIndex( iif( len( s.wszColorKey ) > 0, s.wszColorKey, s.wszName ) )
+        if idx < 0 then
+            back = c->NeutralBack : ink = c->NeutralInk          ' an empty key: neutral, never random
+        else
+            tkAvatar_PaletteColors( s.bDark, idx, back, ink )
+        end if
+    end select
+end sub
+
+' ==========================================================================================
+' Shapes
+' ==========================================================================================
+private function Curvature( byval nShape as long, byval d as long ) as long
+    select case nShape
+    case TKAVATAR_ROUNDED : return d \ 2
+    case TKAVATAR_SQUARE  : return 0
+    end select
+    return d
+end function
+
+' The avatar's outline as a convex polygon (window-free, widget-local edges).
+private function OutlinePts( byval nShape as long, byref rc as TKRECT, pts() as SDL_FPoint ) as long
+    dim as double d = rc.right - rc.left, r = Curvature( nShape, d ) / 2
+    dim as double x0 = rc.left, y0 = rc.top, x1 = rc.right, y1 = rc.bottom
+    if r < 0.5 then
+        redim pts( 0 to 3 )
+        pts(0).x = x0 : pts(0).y = y0 : pts(1).x = x1 : pts(1).y = y0
+        pts(2).x = x1 : pts(2).y = y1 : pts(3).x = x0 : pts(3).y = y1
+        return 4
+    end if
+    const SEG_ = 10
+    dim as double cxs(0 to 3) = { x1 - r, x1 - r, x0 + r, x0 + r }
+    dim as double cys(0 to 3) = { y0 + r, y1 - r, y1 - r, y0 + r }
+    redim pts( 0 to 4 * (SEG_ + 1) - 1 )
+    dim as long k = 0
+    for corner as long = 0 to 3
+        for j as long = 0 to SEG_
+            dim as double a = (-90 + corner * 90 + j * 90 / SEG_) * 3.14159265358979 / 180
+            pts(k).x = cxs(corner) + r * cos( a ) : pts(k).y = cys(corner) + r * sin( a )
+            k += 1
+        next
+    next
+    return k
+end function
+
+' Sutherland-Hodgman: subject clipped by a CONVEX clip polygon (both clockwise on screen).
+private function ClipConvex( subj() as SDL_FPoint, byval ns as long, clp() as SDL_FPoint, byval nc as long, _
+                             outp() as SDL_FPoint ) as long
+    dim as SDL_FPoint cur(), nxt()
+    redim cur( 0 to ns - 1 )
+    for i as long = 0 to ns - 1 : cur(i) = subj(i) : next
+    dim as long n = ns
+    for e as long = 0 to nc - 1
+        if n = 0 then exit for
+        dim as SDL_FPoint a = clp(e), b = clp((e + 1) mod nc)
+        redim nxt( 0 to 2 * n + 1 )
+        dim as long m = 0
+        for i as long = 0 to n - 1
+            dim as SDL_FPoint p = cur(i), q = cur((i + 1) mod n)
+            dim as double sp = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
+            dim as double sq = (b.x - a.x) * (q.y - a.y) - (b.y - a.y) * (q.x - a.x)
+            if sp >= 0 then nxt(m) = p : m += 1
+            if (sp >= 0) <> (sq >= 0) then
+                dim as double t = sp / (sp - sq)
+                nxt(m).x = p.x + (q.x - p.x) * t : nxt(m).y = p.y + (q.y - p.y) * t : m += 1
+            end if
+        next
+        n = m
+        redim cur( 0 to iif( n > 0, n - 1, 0 ) )
+        for i as long = 0 to n - 1 : cur(i) = nxt(i) : next
+    next
+    if n = 0 then return 0
+    redim outp( 0 to n - 1 )
+    for i as long = 0 to n - 1 : outp(i) = cur(i) : next
+    return n
+end function
+
+' The generic person: a head, and shoulders that are an ellipse clipped to the avatar's own shape
+' (no rect clip could keep them inside a circle). In a square of side d at rc, scaled by k about
+' (ox, oy) for a group's second figure.
+private sub DrawPerson( byval b as TK_PAINT ptr, byref rc as TKRECT, byval nShape as long, byval ink as ulong, _
+                        byval k as double = 1, byval dx as double = 0, byval dy as double = 0 )
+    dim as double d = rc.right - rc.left
+    dim as double cx = rc.left + d / 2 + dx * d, cy = rc.top + d / 2 + dy * d
+    dim as double hr = 0.19 * d * k
+    dim as SDL_FPoint head(), shoulders(), outline(), clipped()
+    const N_ = 32
+    redim head( 0 to N_ - 1 )
+    redim shoulders( 0 to N_ - 1 )
+    for j as long = 0 to N_ - 1
+        dim as double a = j * 2 * 3.14159265358979 / N_
+        head(j).x = cx + hr * cos( a ) : head(j).y = (cy - 0.12 * d * k) + hr * sin( a )
+        shoulders(j).x = cx + 0.36 * d * k * cos( a ) : shoulders(j).y = (cy + 0.42 * d * k) + 0.3 * d * k * sin( a )
+    next
+    b->SetBackColor( ink )
+    b->PaintPolygonF( @head(0), N_ )
+    dim as long no = OutlinePts( nShape, rc, outline() )
+    dim as long nc = ClipConvex( shoulders(), N_, outline(), no, clipped() )
+    if nc >= 3 then b->PaintPolygonF( @clipped(0), nc )
+end sub
+
+' ==========================================================================================
+' The avatar itself, in its square rc (presence and the active ring are the caller's)
+' ==========================================================================================
+' Fit font f to diameter d for text: about 40 % of d high, at most 70 % wide (Adwaita / Ant).
+public sub tkAvatar_FitFont( byval f as TTF_Font ptr, byval d as long, byref Text as ustring )
+    if (f = 0) orelse (d <= 0) then exit sub
+    dim as single pt = d * 0.4
+    if pt < 4 then pt = 4
+    TTF_SetFontSize( f, pt )
+    dim as long tw = tkText_Width( f, Text )
+    if tw > d * 0.7 then
+        pt = pt * (d * 0.7) / tw
+        if pt < 4 then pt = 4
+        TTF_SetFontSize( f, pt )
+    end if
+end sub
+
+' The image to draw for diameter d: the original, or (when it is more than twice the size) a copy
+' scaled to twice the size, made into *pCache once per diameter (*pCacheFor).
+private function ImageFor( byval pImg as tkImageFile ptr, byval d as long, byval pCache as tkImageFile ptr, _
+                           byval pCacheFor as long ptr ) as tkImageFile ptr
+    if (pImg = 0) orelse (pImg->IsValid() = 0) then return 0
+    if (pCache = 0) orelse (d <= 0) then return pImg
+    dim as long nw = pImg->NaturalWidth(), nh = pImg->NaturalHeight()
+    dim as long shorter = iif( nw < nh, nw, nh )
+    if shorter <= 2 * d then *pCacheFor = 0 : return pImg        ' the original drawn (GetDrawnImageWidth)
+    if (*pCacheFor = d) andalso (pCache->IsValid() <> 0) then return pCache
+    dim as double k = (2 * d) / shorter
+    dim as SDL_Surface ptr sc = SDL_ScaleSurface( pImg->Surface(), cint( nw * k ), cint( nh * k ), SDL_SCALEMODE_LINEAR )
+    if sc = 0 then return pImg
+    pCache->LoadFromSurface( sc )
+    SDL_DestroySurface( sc )
+    *pCacheFor = d
+    return pCache
+end function
+
+private sub DrawAvatar( byval b as TK_PAINT ptr, byref rc as TKRECT, byref s as TKAVATAR_SPEC, _
+                        byval pCache as tkImageFile ptr = 0, byval pCacheFor as long ptr = 0 )
+    if (b = 0) orelse (s.pColors = 0) then exit sub
+    dim as long d = rc.right - rc.left
+    if d <= 0 then exit sub
+    dim as long curv = Curvature( s.nShape, d )
+    dim as long alpha = iif( s.nActive = TKAVATAR_ACTIVE_INACTIVE, 128, 255 )
+    ' 1. the image
+    dim as tkImageFile ptr img = ImageFor( s.pImage, d, pCache, pCacheFor )
+    if img then
+        dim as TKRECT r = rc
+        b->PaintImageShape( img->Texture( b->renderer ), @r, curv, TK_IMGFIT_COVER, alpha )
+        exit sub
+    end if
+    dim as ulong back, ink
+    SpecColors( s, back, ink )
+    if alpha < 255 then back = tkColor_WithAlpha( back, alpha ) : ink = tkColor_WithAlpha( ink, alpha )
+    dim as TKRECT r = rc
+    b->SetBackColor( back )
+    if curv > 0 then b->PaintRoundRect( @r, curv ) else b->PaintRect( @r )
+    ' 2. the initials
+    dim as ustring ini = s.wszInitials
+    if len( ini ) = 0 then ini = tkAvatar_Initials( s.wszName, iif( d < cint( 24 * s.fScale ), 1, 2 ) )
+    if (len( ini ) > 0) andalso (s.fText <> 0) then
+        tkAvatar_FitFont( s.fText, d, ini )
+        dim as TTF_Font ptr fWas = b->pFont
+        dim as ulong inkWas = b->clrFore
+        b->SetFont( s.fText )
+        b->SetForeColor( ink )
+        b->PaintText( ini, @r, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_NOCLIP )
+        b->SetFont( fWas )
+        b->SetForeColor( inkWas )
+        exit sub
+    end if
+    ' 3. a glyph
+    if (len( s.wszGlyph ) > 0) andalso (s.fGlyph <> 0) then
+        dim as TTF_Font ptr fWas = b->pFont
+        b->SetFont( s.fGlyph )
+        b->SetForeColor( ink )
+        b->PaintText( s.wszGlyph, @r, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_NOCLIP )
+        b->SetFont( fWas )
+        exit sub
+    end if
+    ' 4. the person (two for a group)
+    if s.bIsGroup then
+        DrawPerson( b, rc, s.nShape, tkColor_WithAlpha( ink, alpha \ 2 ), 0.78, -0.14, -0.06 )
+        DrawPerson( b, rc, s.nShape, ink, 0.86, 0.12, 0.04 )
+    else
+        DrawPerson( b, rc, s.nShape, ink )
+    end if
+end sub
+
+' The presence mark's rect for an avatar square rc: 30 % of the side (at least 8 px), centred on
+' the 45-degree point of a circle, else at the bottom-right corner inside.
+private sub PresenceRect( byref rc as TKRECT, byval nShape as long, byval fScale as single, byref rp as TKRECT )
+    dim as long d = rc.right - rc.left
+    dim as long pd = cint( d * 0.3 )
+    if pd < cint( 8 * fScale ) then pd = cint( 8 * fScale )
+    dim as double px, py
+    if nShape = TKAVATAR_CIRCLE then
+        dim as double k = (d / 2) * (1 - 1 / sqr( 2 ))
+        px = rc.right - k : py = rc.bottom - k
+    else
+        px = rc.right - pd / 2 : py = rc.bottom - pd / 2
+    end if
+    dim as long l = cint( px ) - pd \ 2, t = cint( py ) - pd \ 2
+    tkRect_Set( rp, l, t, l + pd, t + pd )
+end sub
+
+private sub DrawPresence( byval b as TK_PAINT ptr, byref rp as TKRECT, byref s as TKAVATAR_SPEC, byval fText as TTF_Font ptr )
+    if s.nPresence < 0 then exit sub
+    dim as TKBADGE_COLORS bc = tkBadge_ThemeColors( tkTheme_Get() )
+    bc.RingColor = s.pColors->BackColor
+    bc.BackColor = s.pColors->BackColor
+    dim as TKBADGE_SPEC bs
+    bs.nKind = TKBADGE_KIND_PRESENCE
+    bs.nPresence = s.nPresence
+    bs.nDiameter = rp.right - rp.left
+    bs.nRing = (rp.right - rp.left) \ 8
+    if bs.nRing < 1 then bs.nRing = 1
+    bs.fScale = s.fScale
+    bs.fText = fText
+    bs.pColors = @bc
+    dim as TKRECT r = rp
+    tkRect_Inflate( r, bs.nRing, bs.nRing )
+    tkBadge_PaintInto( b, r, bs )
+end sub
+
+' ==========================================================================================
+' Public: the widgetless avatar
+' ==========================================================================================
+public declare function tkAvatar_ThemeColors( byref t as TKTHEME_COLORS ) as TKAVATAR_COLORS
+
+' The avatar in the square of side min( w, h ) centred in rc, with its presence and its active ring
+' (the ring is drawn round the square, so leave TKAVATAR_RING_THICK + GAP px around it in rc).
+' s.fText, when set, is resized for the diameter (TTF_SetFontSize). s.pColors = 0: the theme's.
+public sub tkAvatar_PaintInto( byval b as TK_PAINT ptr, byref rc as TKRECT, byref s as TKAVATAR_SPEC )
+    if b = 0 then exit sub
+    dim as TKAVATAR_SPEC sp = s
+    dim as TKAVATAR_COLORS cTheme
+    if sp.pColors = 0 then
+        cTheme = tkAvatar_ThemeColors( tkTheme_Get() )
+        sp.pColors = @cTheme
+        sp.bDark = tkTheme_Get().IsDark
+    end if
+    dim as long w = rc.right - rc.left, h = rc.bottom - rc.top
+    dim as long d = iif( w < h, w, h )
+    if d <= 0 then exit sub
+    dim as TKRECT sq
+    tkRect_Set( sq, rc.left + (w - d) \ 2, rc.top + (h - d) \ 2, rc.left + (w - d) \ 2 + d, rc.top + (h - d) \ 2 + d )
+    DrawAvatar( b, sq, sp )
+    if sp.nActive = TKAVATAR_ACTIVE_ACTIVE then
+        dim as TKRECT rr = sq
+        tkRect_Inflate( rr, TKAVATAR_RING_GAP + TKAVATAR_RING_THICK, TKAVATAR_RING_GAP + TKAVATAR_RING_THICK )
+        b->SetPenColor( sp.pColors->ActiveRingColor )
+        b->PaintRoundOutline( @rr, Curvature( sp.nShape, rr.right - rr.left ), TKAVATAR_RING_THICK )
+    end if
+    if sp.nPresence >= 0 then
+        dim as TKRECT rp
+        PresenceRect( sq, sp.nShape, sp.fScale, rp )
+        DrawPresence( b, rp, sp, b->pFont )
+    end if
+end sub
+
+' ==========================================================================================
+' The widget
+' ==========================================================================================
+public type TKAVATAR_STATE
+    hWin            as TK_WIDGET ptr
+    id              as long
+    spec            as TKAVATAR_SPEC
+    colors          as TKAVATAR_COLORS
+    bColorsPinned   as boolean
+    imgOwn          as tkImageFile             ' SetImageFile / Pixels / Data
+    imgScaled       as tkImageFile             ' the pre-scaled copy
+    nScaledFor      as long = -1
+    wszImageFile    as ustring
+    fInit           as TTF_Font ptr            ' the initials' font, owned, sized per diameter
+    nSizeDu         as long = TKAVATAR_DEFAULT_SIZE
+    bClickable      as boolean
+    bNameTip        as boolean = true
+    isPressed       as boolean
+    wszTooltip      as ustring
+    tip             as TKTIPHOST_STATE
+    ClickCallback   as AVT_ClickCallbackSub
+    PaintCallback   as AVT_PaintCallbackSub
+    MessageCallback as AVT_MessageCallbackFunc
+end type
+
+private function AV( byval w as TK_WIDGET ptr ) as TKAVATAR_STATE ptr
+    if w = 0 then return 0
+    return cast( TKAVATAR_STATE ptr, w->pData )
+end function
+
+' The avatar's square: the client less the active ring's band, centred.
+private sub AvatarSquare( byval p as TKAVATAR_STATE ptr, byref sq as TKRECT )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as long band = TKAVATAR_RING_THICK + TKAVATAR_RING_GAP
+    dim as long d = iif( w->cw < w->ch, w->cw, w->ch ) - 2 * band
+    if d < 0 then d = 0
+    tkRect_Set( sq, (w->cw - d) \ 2, (w->ch - d) \ 2, (w->cw - d) \ 2 + d, (w->ch - d) \ 2 + d )
+end sub
+
+private function LiveSpec( byval p as TKAVATAR_STATE ptr ) as TKAVATAR_SPEC
+    dim as TKAVATAR_SPEC s = p->spec
+    s.fScale = p->hWin->pHost->fScale
+    s.fText = p->fInit
+    s.pColors = @p->colors
+    if tkWidget_IsEnabled( p->hWin ) = false then s.nActive = TKAVATAR_ACTIVE_INACTIVE
+    return s
+end function
+
+private sub RenderDefault( byval p as TKAVATAR_STATE ptr, byval pi as TKAVATAR_PAINTINFO ptr )
+    dim as TKAVATAR_SPEC s = LiveSpec( p )
+    DrawAvatar( pi->b, pi->rcAvatar, s, @p->imgScaled, @p->nScaledFor )
+    if p->spec.nActive = TKAVATAR_ACTIVE_ACTIVE then
+        dim as TKRECT rr = pi->rcAvatar
+        tkRect_Inflate( rr, TKAVATAR_RING_GAP + TKAVATAR_RING_THICK, TKAVATAR_RING_GAP + TKAVATAR_RING_THICK )
+        pi->b->SetPenColor( p->colors.ActiveRingColor )
+        pi->b->PaintRoundOutline( @rr, Curvature( s.nShape, rr.right - rr.left ), TKAVATAR_RING_THICK )
+    end if
+    if tkRect_IsEmpty( pi->rcPresence ) = false then DrawPresence( pi->b, pi->rcPresence, s, p->hWin->pHost->pDefaultFont )
+end sub
+
+private sub OnPaint( byval p as TKAVATAR_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TKAVATAR_PAINTINFO pi
+    pi.hAvatar = p->hWin
+    pi.b = b
+    tkRect_Set( pi.rcClient, 0, 0, p->hWin->cw, p->hWin->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @pi.rcClient )
+    AvatarSquare( p, pi.rcAvatar )
+    if p->spec.nPresence >= 0 then PresenceRect( pi.rcAvatar, p->spec.nShape, p->hWin->pHost->fScale, pi.rcPresence )
+    pi.isEnabled = tkWidget_IsEnabled( p->hWin )
+    if p->PaintCallback then
+        p->PaintCallback( @pi )
+    else
+        RenderDefault( p, @pi )
+    end if
+end sub
+
+private function CallMessage( byval p as TKAVATAR_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKAVATAR_MESSAGEINFO mi
+    mi.hAvatar = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    return p->MessageCallback( @mi )
+end function
+
+public declare sub tkAvatar_ApplyTheme( byval hAvatar as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+private function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKAVATAR_STATE ptr p = AV( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE, TKM_SCALECHANGED, TKM_ENABLE
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_THEMECHANGED
+        tkAvatar_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_LBUTTONDOWN
+        if CallMessage( p, m ) then return true
+        if (tkWidget_IsEnabled( w ) = false) orelse ((p->ClickCallback = 0) andalso (p->bClickable = false)) then return true
+        tkTipHost_Pop( @p->tip )
+        p->isPressed = true
+        tkHost_SetCapture( w )
+        return true
+    case TKM_LBUTTONUP
+        dim as boolean bWas = p->isPressed
+        p->isPressed = false
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        CallMessage( p, m )
+        if bWas andalso (m->x >= 0) andalso (m->y >= 0) andalso (m->x < w->cw) andalso (m->y < w->ch) then
+            dim as AVT_ClickCallbackSub cb = p->ClickCallback
+            if cb then cb( w )                         ' last: the callback may destroy the avatar
+        end if
+        return true
+    case TKM_CAPTURECHANGED
+        p->isPressed = false
+        return true
+    case TKM_MOUSEMOVE, TKM_MOUSELEAVE, TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        CallMessage( p, m )
+        return true
+    case TKM_DESTROY
+        tkTipHost_Destroy( @p->tip )
+        if p->fInit then TTF_CloseFont( p->fInit )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+private function TipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKAVATAR_STATE ptr p = AV( a )
+    if p = 0 then return ""
+    if len( p->wszTooltip ) then return p->wszTooltip
+    if p->bNameTip then return p->spec.wszName
+    return ""
+end function
+
+' A child of hParent, created 0x0: size it from GetIdealSize. Not focusable.
+public function tkAvatar_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKAVATAR_STATE ptr p = new TKAVATAR_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @Proc, p )
+    p->hWin = w
+    dim as string fontPath = tkHost_FontDir() & TK_FONT_UI_BOLD
+    p->fInit = tkHost_OpenFontFace( fontPath, 12, 0 )
+    tkAvatar_ApplyTheme( w, tkTheme_Of( w ) )
+    tkTipHost_Ensure( @p->tip, w, @TipText )
+    return w
+end function
+
+public function tkAvatar_GetID( byval hAvatar as TK_WIDGET ptr ) as long
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return 0
+    return p->id
+end function
+
+public sub tkAvatar_SetEnabled( byval hAvatar as TK_WIDGET ptr, byval isEnabled as boolean )
+    if hAvatar then tkWidget_Enable( hAvatar, isEnabled )
+end sub
+
+' ---- content (setters silent) ---------------------------------------------------------------
+public function tkAvatar_GetDisplayName( byval hAvatar as TK_WIDGET ptr ) as ustring
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return ""
+    return p->spec.wszName
+end function
+
+public sub tkAvatar_SetDisplayName( byval hAvatar as TK_WIDGET ptr, byval Name_ as ustring )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->spec.wszName = Name_
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public function tkAvatar_GetInitials( byval hAvatar as TK_WIDGET ptr ) as ustring
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return ""
+    return p->spec.wszInitials
+end function
+
+' Overrides the initials made from the name; "" = made from the name.
+public sub tkAvatar_SetInitials( byval hAvatar as TK_WIDGET ptr, byval Initials as ustring )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->spec.wszInitials = Initials
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+' What the avatar shows as initials at its current size ("" = no initials: glyph or person).
+public function tkAvatar_GetEffectiveInitials( byval hAvatar as TK_WIDGET ptr ) as ustring
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return ""
+    if len( p->spec.wszInitials ) then return p->spec.wszInitials
+    dim as TKRECT sq
+    AvatarSquare( p, sq )
+    return tkAvatar_Initials( p->spec.wszName, iif( sq.right - sq.left < cint( 24 * hAvatar->pHost->fScale ), 1, 2 ) )
+end function
+
+' The image comes from a file (owned); a failed load leaves none (GetImageValid FALSE).
+public sub tkAvatar_SetImageFile( byval hAvatar as TK_WIDGET ptr, byval Path as ustring )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->wszImageFile = Path
+    p->imgOwn.Dispose()
+    if len( Path ) then p->imgOwn.Load( Path )
+    p->spec.pImage = @p->imgOwn
+    p->nScaledFor = -1
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public function tkAvatar_GetImageFile( byval hAvatar as TK_WIDGET ptr ) as ustring
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return ""
+    return p->wszImageFile
+end function
+
+' A borrowed image: one decoded photo shared by many avatars. It must outlive them.
+public sub tkAvatar_SetImage( byval hAvatar as TK_WIDGET ptr, byval pImage as tkImageFile ptr )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->spec.pImage = pImage
+    p->wszImageFile = ""                                    ' no longer from a file (BindImage)
+    p->nScaledFor = -1
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+' w x h ARGB pixels (&hAARRGGBB), copied.
+public sub tkAvatar_SetImagePixels( byval hAvatar as TK_WIDGET ptr, byval w as long, byval h as long, byval argb as ulong ptr )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->imgOwn.LoadFromPixels( w, h, argb )
+    p->spec.pImage = @p->imgOwn
+    p->wszImageFile = ""
+    p->nScaledFor = -1
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+' An encoded image in memory (PNG, JPEG, BMP ... -- a database BLOB), decoded and copied.
+public sub tkAvatar_SetImageData( byval hAvatar as TK_WIDGET ptr, byval pData as const any ptr, byval nBytes as long )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->imgOwn.Dispose()
+    if (pData <> 0) andalso (nBytes > 0) then
+        dim as SDL_Surface ptr sf = IMG_Load_IO( SDL_IOFromConstMem( pData, nBytes ), true )
+        if sf then p->imgOwn.LoadFromSurface( sf ) : SDL_DestroySurface( sf )
+    end if
+    p->spec.pImage = @p->imgOwn
+    p->wszImageFile = ""
+    p->nScaledFor = -1
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public sub tkAvatar_ClearImage( byval hAvatar as TK_WIDGET ptr )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->imgOwn.Dispose()
+    p->imgScaled.Dispose()
+    p->spec.pImage = 0
+    p->wszImageFile = ""
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public function tkAvatar_GetImageValid( byval hAvatar as TK_WIDGET ptr ) as boolean
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (p->spec.pImage = 0) then return false
+    return p->spec.pImage->IsValid() <> 0
+end function
+
+' The natural width of the image last drawn (the pre-scaled copy's when one was made); 0 = none.
+public function tkAvatar_GetDrawnImageWidth( byval hAvatar as TK_WIDGET ptr ) as long
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (p->spec.pImage = 0) then return 0
+    if (p->nScaledFor > 0) andalso (p->imgScaled.IsValid() <> 0) then return p->imgScaled.NaturalWidth()
+    return p->spec.pImage->NaturalWidth()
+end function
+
+public sub tkAvatar_SetGlyph( byval hAvatar as TK_WIDGET ptr, byval Glyph as ustring )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->spec.wszGlyph = Glyph
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public sub tkAvatar_SetIsGroup( byval hAvatar as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->spec.bIsGroup = bOn
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+' ---- look -------------------------------------------------------------------------------------
+public function tkAvatar_GetColorMode( byval hAvatar as TK_WIDGET ptr ) as long
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return TKAVATAR_COLORFUL
+    return p->spec.nColorMode
+end function
+
+public sub tkAvatar_SetColorMode( byval hAvatar as TK_WIDGET ptr, byval nMode as long )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (nMode < TKAVATAR_COLORFUL) orelse (nMode > TKAVATAR_CUSTOM) then exit sub
+    p->spec.nColorMode = nMode
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+' The palette is chosen by this key (an id, an e-mail) instead of the name, so a renamed person
+' keeps their colour.
+public sub tkAvatar_SetColorKey( byval hAvatar as TK_WIDGET ptr, byval Key as ustring )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->spec.wszColorKey = Key
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+' The colours an image-less avatar is drawn in now.
+public sub tkAvatar_GetEffectiveColors( byval hAvatar as TK_WIDGET ptr, byref clrBack as ulong, byref clrInk as ulong )
+    clrBack = 0 : clrInk = 0
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    dim as TKAVATAR_SPEC s = LiveSpec( p )
+    SpecColors( s, clrBack, clrInk )
+end sub
+
+' CUSTOM mode's pair; sets the mode.
+public sub tkAvatar_SetCustomColors( byval hAvatar as TK_WIDGET ptr, byval clrBack as ulong, byval clrInk as ulong )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->colors.CustomBack = clrBack : p->colors.CustomInk = clrInk
+    p->spec.nColorMode = TKAVATAR_CUSTOM
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public function tkAvatar_GetShape( byval hAvatar as TK_WIDGET ptr ) as long
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return TKAVATAR_CIRCLE
+    return p->spec.nShape
+end function
+
+public sub tkAvatar_SetShape( byval hAvatar as TK_WIDGET ptr, byval nShape as long )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (nShape < TKAVATAR_CIRCLE) orelse (nShape > TKAVATAR_SQUARE) then exit sub
+    p->spec.nShape = nShape
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public function tkAvatar_GetSize( byval hAvatar as TK_WIDGET ptr ) as long
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return 0
+    return p->nSizeDu
+end function
+
+' GetIdealSize's diameter in design units (16 .. 256).
+public sub tkAvatar_SetSize( byval hAvatar as TK_WIDGET ptr, byval nDu as long )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    if nDu < 16 then nDu = 16
+    if nDu > 256 then nDu = 256
+    p->nSizeDu = nDu
+end sub
+
+public function tkAvatar_GetPresence( byval hAvatar as TK_WIDGET ptr ) as long
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return TKAVATAR_PRESENCE_NONE
+    return p->spec.nPresence
+end function
+
+' TKAVATAR_PRESENCE_NONE or a TKBADGE_PRESENCE_*.
+public sub tkAvatar_SetPresence( byval hAvatar as TK_WIDGET ptr, byval nPresence as long )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (nPresence < TKAVATAR_PRESENCE_NONE) orelse (nPresence > TKBADGE_PRESENCE_UNKNOWN) then exit sub
+    p->spec.nPresence = nPresence
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public function tkAvatar_GetActive( byval hAvatar as TK_WIDGET ptr ) as long
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return TKAVATAR_ACTIVE_UNSET
+    return p->spec.nActive
+end function
+
+public sub tkAvatar_SetActive( byval hAvatar as TK_WIDGET ptr, byval nActive as long )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (nActive < TKAVATAR_ACTIVE_UNSET) orelse (nActive > TKAVATAR_ACTIVE_INACTIVE) then exit sub
+    p->spec.nActive = nActive
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+' The diameter plus the active ring's band both ways; valid before sizing.
+public sub tkAvatar_GetIdealSize( byval hAvatar as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    nWidth = 0 : nHeight = 0
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    nWidth = tkHost_Scale( hAvatar->pHost, p->nSizeDu ) + 2 * (TKAVATAR_RING_THICK + TKAVATAR_RING_GAP)
+    nHeight = nWidth
+end sub
+
+public function tkAvatar_GetAvatarRect( byval hAvatar as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return false
+    AvatarSquare( p, rc )
+    return tkRect_IsEmpty( rc ) = false
+end function
+
+public function tkAvatar_GetPresenceRect( byval hAvatar as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (p->spec.nPresence < 0) then return false
+    dim as TKRECT sq
+    AvatarSquare( p, sq )
+    PresenceRect( sq, p->spec.nShape, hAvatar->pHost->fScale, rc )
+    return true
+end function
+
+' ---- input and tooltip --------------------------------------------------------------------
+' Clickable: the pointer becomes a hand (a Click callback works either way).
+public sub tkAvatar_SetClickable( byval hAvatar as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->bClickable = bOn
+    tkWidget_SetCursor( hAvatar, iif( bOn, TK_CURSOR_HAND, TK_CURSOR_ARROW ) )
+end sub
+
+public function tkAvatar_GetClickable( byval hAvatar as TK_WIDGET ptr ) as boolean
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return false
+    return p->bClickable
+end function
+
+' NameTip (default on): with no TooltipText, the tip shows the DisplayName.
+public sub tkAvatar_SetNameTip( byval hAvatar as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p then p->bNameTip = bOn
+end sub
+
+public sub tkAvatar_SetTooltipText( byval hAvatar as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p then p->wszTooltip = Text
+end sub
+
+' What the tip would show now.
+public function tkAvatar_GetTipText( byval hAvatar as TK_WIDGET ptr ) as ustring
+    return TipText( 0, hAvatar, -1 )
+end function
+
+public function tkAvatar_GetTooltipHandle( byval hAvatar as TK_WIDGET ptr ) as TK_TIP ptr
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then return 0
+    return tkTipHost_Tip( @p->tip )
+end function
+
+' ---- fonts ------------------------------------------------------------------------------------
+' The glyph's font (borrowed). The initials use the avatar's own Inter Bold, sized per diameter.
+public sub tkAvatar_SetGlyphFont( byval hAvatar as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->spec.fGlyph = f
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+' ---- appearance -----------------------------------------------------------------------------
+public sub tkAvatar_GetColors( byval hAvatar as TK_WIDGET ptr, byval pColors as TKAVATAR_COLORS ptr )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+public sub tkAvatar_SetColors( byval hAvatar as TK_WIDGET ptr, byval pColors as TKAVATAR_COLORS ptr )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public function tkAvatar_ThemeColors( byref t as TKTHEME_COLORS ) as TKAVATAR_COLORS
+    dim as TKAVATAR_COLORS c
+    c.BackColor = t.Window
+    c.NeutralBack = t.Surface
+    c.NeutralInk = t.TextDim
+    c.AccentBack = t.Accent
+    c.AccentInk = iif( tkBadge_Contrast( t.SelectedText, t.Accent ) >= tkBadge_Contrast( t.Window, t.Accent ), t.SelectedText, t.Window )
+    c.CustomBack = t.Surface
+    c.CustomInk = t.Text
+    c.ActiveRingColor = t.Accent
+    return c
+end function
+
+' The palette follows the theme's darkness even when the colours are pinned.
+public sub tkAvatar_ApplyTheme( byval hAvatar as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hAvatar, t )
+    p->spec.bDark = tr.IsDark
+    if p->bColorsPinned = false then
+        dim as ulong cb = p->colors.CustomBack, ci = p->colors.CustomInk
+        dim as boolean bCustom = (p->spec.nColorMode = TKAVATAR_CUSTOM)
+        p->colors = tkAvatar_ThemeColors( tr )
+        tkTheme_ResolveInto( hAvatar, tr, cast( ulong ptr, @p->colors ), sizeof( TKAVATAR_COLORS ) \ 4, "Avatar" )
+        if bCustom then p->colors.CustomBack = cb : p->colors.CustomInk = ci
+    end if
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public sub tkAvatar_UnpinColors( byval hAvatar as TK_WIDGET ptr )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkAvatar_ApplyTheme( hAvatar, tkTheme_Of( hAvatar ) )
+end sub
+
+' ---- callbacks -----------------------------------------------------------------------------
+public sub tkAvatar_PaintDefault( byval pi as TKAVATAR_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKAVATAR_STATE ptr p = AV( pi->hAvatar )
+    if p then RenderDefault( p, pi )
+end sub
+
+public sub tkAvatar_SetClickCallback( byval hAvatar as TK_WIDGET ptr, byval usersub as AVT_ClickCallbackSub )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p then p->ClickCallback = usersub
+end sub
+
+public sub tkAvatar_SetPaintCallback( byval hAvatar as TK_WIDGET ptr, byval usersub as AVT_PaintCallbackSub )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p = 0 then exit sub
+    p->PaintCallback = usersub
+    tkWidget_Invalidate( hAvatar )
+end sub
+
+public sub tkAvatar_SetMessageCallback( byval hAvatar as TK_WIDGET ptr, byval userfunc as AVT_MessageCallbackFunc )
+    dim as TKAVATAR_STATE ptr p = AV( hAvatar )
+    if p then p->MessageCallback = userfunc
+end sub

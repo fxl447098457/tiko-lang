@@ -1,0 +1,735 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkBarcode, part three: the control and its public API. Not focusable, no keys; a click is
+' reported when a callback is set. SETTERS ARE SILENT: invalid data puts the control in its error
+' state and nothing notifies (BARCODE.md §5); ask tkBarcode_IsValid / GetStatus / GetErrorText.
+' The symbol is encoded lazily -- once per change of data or spec, never per paint.
+#module "tkBarcode"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkPrint" public
+#import "../tkPdf" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkPrint
+using tkPdf
+
+public type TKBARCODE_PAINTINFO
+    hBarcode  as TK_WIDGET ptr
+    b         as TK_PAINT ptr
+    rcClient  as TKRECT
+    nStatus   as int32
+    isEnabled as boolean
+end type
+
+public type TKBARCODE_MESSAGEINFO
+    hBarcode as TK_WIDGET ptr
+    msg      as int32
+    x        as float32
+    y        as float32
+end type
+
+public type BC_PaintCallbackSub as sub( byval p as TKBARCODE_PAINTINFO ptr )
+public type BC_MessageCallbackFunc as function( byval m as TKBARCODE_MESSAGEINFO ptr ) as boolean
+public type BC_ClickCallbackSub as sub( byval hBarcode as TK_WIDGET ptr, byval id as int32 )
+
+public const as int32 TKBC_DEFAULT_MODULEWIDTH = 2      ' design units
+
+public type TKBARCODE_STATE
+    hWin            as TK_WIDGET ptr
+    id              as int32
+    spec            as TKBARCODE_SPEC
+    sData           as ustring
+    sym             as TKBARCODE_SYMBOL
+    bDirty          as boolean = true
+    colors          as TKBARCODE_COLORS
+    bColorsPinned   as boolean
+    nModuleWidth    as int32 = TKBC_DEFAULT_MODULEWIDTH
+    nFit            as int32 = TKBC_FIT_NORMAL
+    nRotation       as int32 = TKBC_ROT_0
+    bShowErrors     as boolean = true
+    bBorder         as boolean
+    pFont           as TTF_Font ptr
+    fXdimMm         as float32                ' paper: the module; 0 = zint's default (BC2)
+    fBarHeightMm    as float32                ' paper: 1D bars; 0 = BarHeight modules, else zint's
+    wszTooltip      as ustring
+    tip             as TKTIPHOST_STATE
+    bPressed        as boolean
+    PaintCallback   as BC_PaintCallbackSub
+    MessageCallback as BC_MessageCallbackFunc
+    ClickCallback   as BC_ClickCallbackSub
+end type
+
+private function BC( byval w as TK_WIDGET ptr ) as TKBARCODE_STATE ptr
+    if w = 0 then return 0
+    return cast( TKBARCODE_STATE ptr, w->pData )
+end function
+
+private sub Ensure( byval p as TKBARCODE_STATE ptr )
+    if p->bDirty = false then exit sub
+    p->bDirty = false
+    tkBarcode_Encode( p->spec, p->sData, p->sym )
+end sub
+
+private sub Changed( byval p as TKBARCODE_STATE ptr )
+    p->bDirty = true
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+private function TextFont( byval p as TKBARCODE_STATE ptr ) as TTF_Font ptr
+    if p->pFont then return p->pFont
+    if (p->hWin <> 0) andalso (p->hWin->pHost <> 0) then return p->hWin->pHost->pDefaultFont
+    return 0
+end function
+
+' The look as the widget draws it now: the module width scaled to whole pixels, fonts, colours.
+private function LiveLook( byval p as TKBARCODE_STATE ptr ) as TKBARCODE_LOOK
+    dim as TKBARCODE_LOOK lk
+    dim as float32 fScale = iif( p->hWin->pHost <> 0, p->hWin->pHost->fScale, 1 )
+    lk.nModulePx = cint( p->nModuleWidth * fScale )
+    if lk.nModulePx < 1 then lk.nModulePx = 1
+    lk.nFit = p->nFit
+    lk.nRotation = p->nRotation
+    lk.bShowErrors = p->bShowErrors
+    lk.bBorder = p->bBorder
+    lk.pColors = @p->colors
+    lk.pFont = TextFont( p )
+    return lk
+end function
+
+private sub RenderDefault( byval p as TKBARCODE_STATE ptr, byval pi as TKBARCODE_PAINTINFO ptr )
+    Ensure( p )
+    dim as TKBARCODE_LOOK lk = LiveLook( p )
+    tkBarcode_PaintInto( pi->b, pi->rcClient, p->sym, p->spec, lk )
+end sub
+
+private sub OnPaint( byval p as TKBARCODE_STATE ptr, byval b as TK_PAINT ptr )
+    Ensure( p )
+    dim as TKBARCODE_PAINTINFO pi
+    pi.hBarcode = p->hWin
+    pi.b = b
+    tkRect_Set( pi.rcClient, 0, 0, p->hWin->cw, p->hWin->ch )
+    pi.nStatus = p->sym.nStatus
+    pi.isEnabled = tkWidget_IsEnabled( p->hWin )
+    if p->PaintCallback then
+        p->PaintCallback( @pi )
+    else
+        RenderDefault( p, @pi )
+    end if
+end sub
+
+private function CallMessage( byval p as TKBARCODE_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKBARCODE_MESSAGEINFO mi
+    mi.hBarcode = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    return p->MessageCallback( @mi )
+end function
+
+public declare sub tkBarcode_ApplyTheme( byval hBarcode as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+private function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE, TKM_SCALECHANGED, TKM_ENABLE
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_THEMECHANGED
+        tkBarcode_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_LBUTTONDOWN
+        if CallMessage( p, m ) then return true
+        if p->ClickCallback = 0 then return false
+        tkHost_SetCapture( w )
+        p->bPressed = true
+        return true
+    case TKM_LBUTTONUP
+        if CallMessage( p, m ) then return true
+        if p->bPressed = false then return false
+        p->bPressed = false
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        if (m->x >= 0) andalso (m->x < w->cw) andalso (m->y >= 0) andalso (m->y < w->ch) then
+            if p->ClickCallback then p->ClickCallback( w, p->id )
+        end if
+        return true
+    case TKM_CAPTURECHANGED
+        p->bPressed = false
+        return true
+    case TKM_MOUSEMOVE, TKM_MOUSELEAVE, TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        return CallMessage( p, m )
+    case TKM_DESTROY
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' The tip: the host's text; else, in the error state, the class and zint's own message.
+private function TipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKBARCODE_STATE ptr p = BC( a )
+    if p = 0 then return ""
+    if len( p->wszTooltip ) > 0 then return p->wszTooltip
+    Ensure( p )
+    if p->sym.nStatus >= TKBC_ERR_FIRST then
+        if len( p->sym.wszError ) = 0 then return tkBarcode_StatusText( p->sym.nStatus )
+        return tkBarcode_StatusText( p->sym.nStatus ) & ": " & p->sym.wszError
+    end if
+    return ""
+end function
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+public function tkBarcode_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as int32, _
+                                 byval nSymbology as int32 = TKBC_CODE128 ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKBARCODE_STATE ptr p = new TKBARCODE_STATE
+    p->id = ctrlId
+    p->spec.nSymbology = nSymbology
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @Proc, p )
+    p->hWin = w
+    p->colors = tkBarcode_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKBARCODE_COLORS ) \ 4, "Barcode" )
+    tkTipHost_Ensure( @p->tip, w, @TipText )
+    return w
+end function
+
+public function tkBarcode_GetID( byval hBarcode as TK_WIDGET ptr ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->id, 0 )
+end function
+
+' ---- data and symbology ---------------------------------------------------------------------
+' The bind target (load only: BARCODE.md §9.1). Silent.
+public sub tkBarcode_SetData( byval hBarcode as TK_WIDGET ptr, byval sData as ustring )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    if p->sData = sData then exit sub
+    p->sData = sData
+    Changed( p )
+end sub
+
+public function tkBarcode_GetData( byval hBarcode as TK_WIDGET ptr ) as ustring
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return ""
+    return p->sData
+end function
+
+public sub tkBarcode_SetSymbology( byval hBarcode as TK_WIDGET ptr, byval nSymbology as int32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (nSymbology < 0) orelse (nSymbology >= TKBC_SYMBOLOGY_COUNT) then exit sub
+    p->spec.nSymbology = nSymbology
+    p->spec.nZintRaw = 0
+    Changed( p )
+end sub
+
+public function tkBarcode_GetSymbology( byval hBarcode as TK_WIDGET ptr ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->spec.nSymbology, TKBC_CODE128 )
+end function
+
+' Any zint symbology by its BARCODE_* id (§3.3: MaxiCode, DotCode, DataBar, postal ...); 0 returns
+' to the curated one. Untested beyond what BC0 measured.
+public sub tkBarcode_SetZintSymbology( byval hBarcode as TK_WIDGET ptr, byval nZintId as int32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    p->spec.nZintRaw = nZintId
+    Changed( p )
+end sub
+
+public function tkBarcode_GetZintSymbology( byval hBarcode as TK_WIDGET ptr ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->spec.nZintRaw, 0 )
+end function
+
+public sub tkBarcode_SetOption( byval hBarcode as TK_WIDGET ptr, byval nOpt as int32, byval nValue as int32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (nOpt < 0) orelse (nOpt >= TKBC_OPT_COUNT) then exit sub
+    p->spec.opts(nOpt) = nValue
+    Changed( p )
+end sub
+
+public function tkBarcode_GetOption( byval hBarcode as TK_WIDGET ptr, byval nOpt as int32 ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (nOpt < 0) orelse (nOpt >= TKBC_OPT_COUNT) then return 0
+    return p->spec.opts(nOpt)
+end function
+
+public sub tkBarcode_SetQuietZone( byval hBarcode as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    p->spec.bQuietZone = bOn
+    Changed( p )
+end sub
+
+public function tkBarcode_GetQuietZone( byval hBarcode as TK_WIDGET ptr ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->spec.bQuietZone, true )
+end function
+
+public sub tkBarcode_SetTextMode( byval hBarcode as TK_WIDGET ptr, byval nMode as int32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (nMode < TKBC_TEXT_NONE) orelse (nMode > TKBC_TEXT_ABOVE) then exit sub
+    p->spec.nTextMode = nMode
+    Changed( p )
+end sub
+
+public function tkBarcode_GetTextMode( byval hBarcode as TK_WIDGET ptr ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->spec.nTextMode, TKBC_TEXT_BELOW )
+end function
+
+' "" = zint's HRT (check digit included); else this text, one centred run (also under a 2D symbol).
+public sub tkBarcode_SetCaption( byval hBarcode as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    p->spec.wszCaption = Text
+    Changed( p )
+end sub
+
+public function tkBarcode_GetCaption( byval hBarcode as TK_WIDGET ptr ) as ustring
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return ""
+    return p->spec.wszCaption
+end function
+
+' 1D bar height in modules; 0 (the default) = the bars fill the control's height.
+public sub tkBarcode_SetBarHeight( byval hBarcode as TK_WIDGET ptr, byval fModules as float32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (fModules < 0) then exit sub
+    p->spec.fBarHeight = fModules
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public function tkBarcode_GetBarHeight( byval hBarcode as TK_WIDGET ptr ) as float32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->spec.fBarHeight, 0 )
+end function
+
+' ---- look -----------------------------------------------------------------------------------
+public sub tkBarcode_SetFitMode( byval hBarcode as TK_WIDGET ptr, byval nFit as int32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (nFit < TKBC_FIT_NORMAL) orelse (nFit > TKBC_FIT_STRETCH) then exit sub
+    p->nFit = nFit
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public function tkBarcode_GetFitMode( byval hBarcode as TK_WIDGET ptr ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->nFit, TKBC_FIT_NORMAL )
+end function
+
+' Pixels per module at FitMode NORMAL / FIT, in design units (scaled, then whole pixels).
+public sub tkBarcode_SetModuleWidth( byval hBarcode as TK_WIDGET ptr, byval nUnits as int32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (nUnits < 1) then exit sub
+    p->nModuleWidth = nUnits
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public function tkBarcode_GetModuleWidth( byval hBarcode as TK_WIDGET ptr ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->nModuleWidth, TKBC_DEFAULT_MODULEWIDTH )
+end function
+
+public sub tkBarcode_SetRotation( byval hBarcode as TK_WIDGET ptr, byval nRotation as int32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (nRotation < TKBC_ROT_0) orelse (nRotation > TKBC_ROT_270) then exit sub
+    p->nRotation = nRotation
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public function tkBarcode_GetRotation( byval hBarcode as TK_WIDGET ptr ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->nRotation, TKBC_ROT_0 )
+end function
+
+public sub tkBarcode_SetShowErrors( byval hBarcode as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    p->bShowErrors = bOn
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public function tkBarcode_GetShowErrors( byval hBarcode as TK_WIDGET ptr ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->bShowErrors, true )
+end function
+
+public sub tkBarcode_SetBorder( byval hBarcode as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    p->bBorder = bOn
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public function tkBarcode_GetBorder( byval hBarcode as TK_WIDGET ptr ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->bBorder, false )
+end function
+
+' The HRT / error-line font; 0 = the host's default.
+public sub tkBarcode_SetFont( byval hBarcode as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    p->pFont = f
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public function tkBarcode_GetFont( byval hBarcode as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return cast( TTF_Font ptr, 0 )
+    return p->pFont
+end function
+
+' ---- state ----------------------------------------------------------------------------------
+' TRUE when a symbol is drawn (OK or a warning). Empty data is not valid, but not an error.
+public function tkBarcode_IsValid( byval hBarcode as TK_WIDGET ptr ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return false
+    Ensure( p )
+    return (p->sym.nStatus <> TKBC_EMPTY) andalso (p->sym.nStatus < TKBC_ERR_FIRST)
+end function
+
+public function tkBarcode_GetStatus( byval hBarcode as TK_WIDGET ptr ) as int32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return TKBC_EMPTY
+    Ensure( p )
+    return p->sym.nStatus
+end function
+
+' zint's message for an error or a warning (untranslated); "" when there is none.
+public function tkBarcode_GetErrorText( byval hBarcode as TK_WIDGET ptr ) as ustring
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return ""
+    Ensure( p )
+    return p->sym.wszError
+end function
+
+' The module matrix's size (0 x 0 with no symbol).
+public sub tkBarcode_GetModuleCount( byval hBarcode as TK_WIDGET ptr, byref nCols as int32, byref nRows as int32 )
+    nCols = 0 : nRows = 0
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    Ensure( p )
+    nCols = p->sym.nCols : nRows = p->sym.nRows
+end sub
+
+' A copy of the encoded symbol (module units): tests, exports, a host's own painting.
+public sub tkBarcode_GetSymbol( byval hBarcode as TK_WIDGET ptr, byref sym as TKBARCODE_SYMBOL )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    Ensure( p )
+    sym = p->sym
+end sub
+
+public sub tkBarcode_GetSpec( byval hBarcode as TK_WIDGET ptr, byref spec as TKBARCODE_SPEC )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p then spec = p->spec
+end sub
+
+public sub tkBarcode_GetLook( byval hBarcode as TK_WIDGET ptr, byref lk as TKBARCODE_LOOK )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p then lk = LiveLook( p )
+end sub
+
+' Where the symbol is drawn now (client coordinates). FALSE when nothing is.
+public function tkBarcode_GetLayout( byval hBarcode as TK_WIDGET ptr, byref L as TKBC_LAYOUT ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return false
+    Ensure( p )
+    dim as TKBARCODE_LOOK lk = LiveLook( p )
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, p->hWin->cw, p->hWin->ch )
+    return tkBarcode_Layout( p->sym, p->spec, lk, rc, L )
+end function
+
+' The size the symbol needs at FitMode NORMAL (AutoSize). 0 x 0 with no symbol.
+public sub tkBarcode_GetPreferredSize( byval hBarcode as TK_WIDGET ptr, byref nWidth as int32, byref nHeight as int32 )
+    nWidth = 0 : nHeight = 0
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    Ensure( p )
+    dim as TKBARCODE_LOOK lk = LiveLook( p )
+    tkBarcode_PreferredSize( p->sym, p->spec, lk, nWidth, nHeight )
+end sub
+
+private function LinC( byval c as int32 ) as float64
+    dim as float64 v = c / 255
+    return iif( v <= 0.03928, v / 12.92, ( ( v + 0.055 ) / 1.055 ) ^ 2.4 )
+end function
+
+private function LumC( byval c as ulong ) as float64
+    return 0.2126 * LinC( ( c shr 16 ) and 255 ) + 0.7152 * LinC( ( c shr 8 ) and 255 ) + 0.0722 * LinC( c and 255 )
+end function
+
+' WCAG contrast of the bars on the background (21 = black on white). Below 3 scanners struggle.
+public function tkBarcode_GetContrast( byval hBarcode as TK_WIDGET ptr ) as float64
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return 0
+    dim as float64 a = LumC( p->colors.BarColor ), b = LumC( p->colors.BackColor )
+    if a < b then swap a, b
+    return ( a + 0.05 ) / ( b + 0.05 )
+end function
+
+' ---- tooltip --------------------------------------------------------------------------------
+' "" (the default) shows, in the error state only, the class and zint's message.
+public sub tkBarcode_SetTooltipText( byval hBarcode as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p then p->wszTooltip = Text
+end sub
+
+public function tkBarcode_GetTooltipText( byval hBarcode as TK_WIDGET ptr ) as ustring
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return ""
+    return p->wszTooltip
+end function
+
+' What the tip shows now (the host's text, or the error).
+public function tkBarcode_GetTipText( byval hBarcode as TK_WIDGET ptr ) as ustring
+    return TipText( 0, hBarcode, 0 )
+end function
+
+public function tkBarcode_GetTooltipHandle( byval hBarcode as TK_WIDGET ptr ) as TK_TIP ptr
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return 0
+    return tkTipHost_Tip( @p->tip )
+end function
+
+' ---- colours --------------------------------------------------------------------------------
+public sub tkBarcode_GetColors( byval hBarcode as TK_WIDGET ptr, byval pColors as TKBARCODE_COLORS ptr )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Copies the struct and PINS it: a theme change leaves this control alone until UnpinColors.
+public sub tkBarcode_SetColors( byval hBarcode as TK_WIDGET ptr, byval pColors as TKBARCODE_COLORS ptr )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+' The symbol stays black on white whatever the theme (D-7); the frame and the error state follow it.
+public function tkBarcode_ThemeColors( byref t as TKTHEME_COLORS ) as TKBARCODE_COLORS
+    dim as TKBARCODE_COLORS c
+    c.BorderColor = t.Border
+    c.ErrorColor = t.Error
+    c.ErrorBackColor = t.Window
+    return c
+end function
+
+public sub tkBarcode_ApplyTheme( byval hBarcode as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hBarcode, t )
+    p->colors = tkBarcode_ThemeColors( tr )
+    tkTheme_ResolveInto( hBarcode, tr, cast( ulong ptr, @p->colors ), sizeof( TKBARCODE_COLORS ) \ 4, "Barcode" )
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public sub tkBarcode_UnpinColors( byval hBarcode as TK_WIDGET ptr )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkBarcode_ApplyTheme( hBarcode, tkTheme_Of( hBarcode ) )
+end sub
+
+' ---- callbacks ------------------------------------------------------------------------------
+public sub tkBarcode_PaintDefault( byval pi as TKBARCODE_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKBARCODE_STATE ptr p = BC( pi->hBarcode )
+    if p then RenderDefault( p, pi )
+end sub
+
+public sub tkBarcode_SetPaintCallback( byval hBarcode as TK_WIDGET ptr, byval usersub as BC_PaintCallbackSub )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    p->PaintCallback = usersub
+    tkWidget_Invalidate( hBarcode )
+end sub
+
+public sub tkBarcode_SetMessageCallback( byval hBarcode as TK_WIDGET ptr, byval userfunc as BC_MessageCallbackFunc )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p then p->MessageCallback = userfunc
+end sub
+
+public sub tkBarcode_SetClickCallback( byval hBarcode as TK_WIDGET ptr, byval usersub as BC_ClickCallbackSub )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p then p->ClickCallback = usersub
+end sub
+
+' ==========================================================================================
+' Paper and exports (BC2): the control's symbol at its physical size
+' ==========================================================================================
+' The module on paper, millimetres; 0 (the default) = zint's for the symbology (EAN 0.33, QR 0.625).
+public sub tkBarcode_SetXDimension( byval hBarcode as TK_WIDGET ptr, byval fMm as float32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p <> 0) andalso (fMm >= 0) then p->fXdimMm = fMm
+end sub
+
+public function tkBarcode_GetXDimension( byval hBarcode as TK_WIDGET ptr ) as float32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->fXdimMm, 0 )
+end function
+
+' 1D bars on paper, millimetres; 0 = BarHeight (modules), else zint's 50 modules.
+public sub tkBarcode_SetBarHeightMm( byval hBarcode as TK_WIDGET ptr, byval fMm as float32 )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if (p <> 0) andalso (fMm >= 0) then p->fBarHeightMm = fMm
+end sub
+
+public function tkBarcode_GetBarHeightMm( byval hBarcode as TK_WIDGET ptr ) as float32
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    return iif( p <> 0, p->fBarHeightMm, 0 )
+end function
+
+' The control's paper look: its X-dimension, bar height, colours; fDpi 0 (exact).
+public sub tkBarcode_GetPageLook( byval hBarcode as TK_WIDGET ptr, byref pl as TKBARCODE_PAGELOOK )
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then exit sub
+    dim as TKBARCODE_PAGELOOK z
+    pl = z
+    pl.fXdimMm = p->fXdimMm
+    pl.fBarHeightMm = p->fBarHeightMm
+    pl.pColors = @p->colors
+end sub
+
+' The control's symbol on a page, in rc (points), at its physical size; fDpi > 0 snaps to a device's
+' dots (a raster printer). TRUE when drawn and it fits.
+public function tkBarcode_PrintTo( byval hBarcode as TK_WIDGET ptr, byval pg as TK_PAGE ptr, byref rc as TKRECTF, _
+                                   byval fDpi as float32 = 0, byval nAlign as int32 = TKBC_ALIGN_CENTER ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return false
+    Ensure( p )
+    dim as TKBARCODE_PAGELOOK pl
+    tkBarcode_GetPageLook( hBarcode, pl )
+    pl.fDpi = fDpi : pl.nAlign = nAlign
+    return tkBarcode_PaintPage( pg, rc, p->sym, p->spec, pl )
+end function
+
+public function tkBarcode_ExportPdf( byval hBarcode as TK_WIDGET ptr, byref path as ustring ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return false
+    Ensure( p )
+    dim as TKBARCODE_PAGELOOK pl
+    tkBarcode_GetPageLook( hBarcode, pl )
+    return tkBarcode_ExportPdfSymbol( p->sym, p->spec, pl, path )
+end function
+
+' A PNG at dpi, every module whole pixels (the X-dimension rounded to dots).
+public function tkBarcode_ExportPng( byval hBarcode as TK_WIDGET ptr, byref path as ustring, byval dpi as float32 = 300 ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return false
+    Ensure( p )
+    dim as TKBARCODE_PAGELOOK pl
+    tkBarcode_GetPageLook( hBarcode, pl )
+    return tkBarcode_ExportPngSymbol( p->sym, p->spec, pl, path, dpi )
+end function
+
+public function tkBarcode_ExportSvg( byval hBarcode as TK_WIDGET ptr, byref path as ustring ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return false
+    Ensure( p )
+    dim as TKBARCODE_PAGELOOK pl
+    tkBarcode_GetPageLook( hBarcode, pl )
+    return tkBarcode_ExportSvgSymbol( p->sym, p->spec, pl, path )
+end function
+
+' The symbol as an image (PNG + BMP, at dpi) and its data as text, on the clipboard.
+public function tkBarcode_CopyToClipboard( byval hBarcode as TK_WIDGET ptr, byval dpi as float32 = 300 ) as boolean
+    dim as TKBARCODE_STATE ptr p = BC( hBarcode )
+    if p = 0 then return false
+    Ensure( p )
+    dim as TKBARCODE_PAGELOOK pl
+    tkBarcode_GetPageLook( hBarcode, pl )
+    return tkBarcode_CopySymbolToClipboard( p->sym, p->spec, pl, p->sData, dpi )
+end function
+
+' ==========================================================================================
+' Named options (BC3): one setter per option, so the designer's inspector rows (h, value) reach
+' them. Each is tkBarcode_SetOption( h, TKBC_OPT_*, value ); 0 is always zint's default.
+' ==========================================================================================
+' 0 default; QR / Micro QR 1-4 = L M Q H; PDF417 1-9 = level 0-8; Aztec 1-4.
+public sub tkBarcode_SetEccLevel( byval hBarcode as TK_WIDGET ptr, byval n as int32 )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_ECC, n )
+end sub
+public function tkBarcode_GetEccLevel( byval hBarcode as TK_WIDGET ptr ) as int32
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_ECC )
+end function
+
+' 0 automatic; QR / Micro QR version, Data Matrix / Aztec size, PDF417 columns.
+public sub tkBarcode_SetSymbolSize( byval hBarcode as TK_WIDGET ptr, byval n as int32 )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_SIZE, n )
+end sub
+public function tkBarcode_GetSymbolSize( byval hBarcode as TK_WIDGET ptr ) as int32
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_SIZE )
+end function
+
+' 0 automatic; QR / Micro QR 1-8 = mask 0-7.
+public sub tkBarcode_SetMask( byval hBarcode as TK_WIDGET ptr, byval n as int32 )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_MASK, n )
+end sub
+public function tkBarcode_GetMask( byval hBarcode as TK_WIDGET ptr ) as int32
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_MASK )
+end function
+
+public sub tkBarcode_SetSquareOnly( byval hBarcode as TK_WIDGET ptr, byval bOn as boolean )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_DM_SQUARE, iif( bOn, 1, 0 ) )
+end sub
+public function tkBarcode_GetSquareOnly( byval hBarcode as TK_WIDGET ptr ) as boolean
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_DM_SQUARE ) <> 0
+end function
+
+public sub tkBarcode_SetCheckDigit( byval hBarcode as TK_WIDGET ptr, byval bOn as boolean )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_CHECK_DIGIT, iif( bOn, 1, 0 ) )
+end sub
+public function tkBarcode_GetCheckDigit( byval hBarcode as TK_WIDGET ptr ) as boolean
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_CHECK_DIGIT ) <> 0
+end function
+
+public sub tkBarcode_SetGs1( byval hBarcode as TK_WIDGET ptr, byval bOn as boolean )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_GS1, iif( bOn, 1, 0 ) )
+end sub
+public function tkBarcode_GetGs1( byval hBarcode as TK_WIDGET ptr ) as boolean
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_GS1 ) <> 0
+end function
+
+public sub tkBarcode_SetEscapes( byval hBarcode as TK_WIDGET ptr, byval bOn as boolean )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_ESCAPES, iif( bOn, 1, 0 ) )
+end sub
+public function tkBarcode_GetEscapes( byval hBarcode as TK_WIDGET ptr ) as boolean
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_ESCAPES ) <> 0
+end function
+
+public sub tkBarcode_SetEci( byval hBarcode as TK_WIDGET ptr, byval n as int32 )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_ECI, n )
+end sub
+public function tkBarcode_GetEci( byval hBarcode as TK_WIDGET ptr ) as int32
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_ECI )
+end function
+
+' TKBC_BEARER_*: ITF / ITF-14.
+public sub tkBarcode_SetBearer( byval hBarcode as TK_WIDGET ptr, byval n as int32 )
+    tkBarcode_SetOption( hBarcode, TKBC_OPT_BEARER, n )
+end sub
+public function tkBarcode_GetBearer( byval hBarcode as TK_WIDGET ptr ) as int32
+    return tkBarcode_GetOption( hBarcode, TKBC_OPT_BEARER )
+end function

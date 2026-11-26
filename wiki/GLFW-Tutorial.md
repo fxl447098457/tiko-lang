@@ -77,7 +77,7 @@ GLFW's documentation shows this program first: create a window, make its OpenGL 
 '' context, cleared every frame until it is closed. A number on the
 '' command line stops it after that many frames instead.
 #cinclude once "vendor/glfw/include/GLFW/glfw3.h"
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
     #foreignlib GLFW static "vendor/glfw/glfw3", "system:opengl32", _
         "system:gdi32", "system:user32", "system:shell32"
 #else
@@ -143,7 +143,7 @@ Replace the directives with:
 
 ```freebasic
 #cinclude once "vendor/glfw/include/GLFW/glfw3.h"
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
     #foreignlib GLFW dynamic "vendor/glfw/glfw3dll", "system:opengl32"
 #else
     #foreignlib GLFW dynamic "vendor/glfw/glfw3dll", "system:GL"

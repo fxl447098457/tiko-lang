@@ -59,6 +59,7 @@
 - [34. Capstone: a Concurrent Pipeline](ch34-thash.md)
 - [35. Capstone: a TUI Ledger](ch35-tledger.md)
 - [36. Capstone: a Cross-Platform Notepad](ch36-tpad-tk.md)
+- [37. Capstone: an Android App](ch37-android-app.md)
 
 # Appendices
 

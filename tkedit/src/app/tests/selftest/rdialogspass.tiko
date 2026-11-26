@@ -1,0 +1,325 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rdialogspass -- the Report Designer's dialogs in the real window (RD7). Its "done when": each
+' dialog's OK is one undo step, and the generated output compiles. A report in a small project is
+' opened; Data sources, Parameters, Group and sort, Page setup, Calculated fields (from the toolbox),
+' the conditional styles and the expression editor (from the inspector's "...") each make their edit;
+' each OK is checked to be one Undo away from the text before and one Redo from the text after. Then the report
+' is saved -- its module generated -- and the project built with the test's tiko and run.
+' A dialog is modal: the step's work is posted before it opens and done from inside its loop.
+#module "selftest"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
+#import "std/process"
+#import "tkp/platform"
+#import "tkc/cmdids"
+#import "tka/documents"
+#import "tka/mainwin"
+#import "tkd/rcanvas"
+#import "tkd/rpanels"
+#import "tkd/rdialogs"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkCheckBox"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkScrollPanel"
+#import "vendor/tkControls/tkOptionButton"
+#import "vendor/tkControls/tkPrintDialog"
+#import "vendor/tkControls/tkReportDef"
+using containers
+using cmdids
+using tkApp
+using tkHost
+using tkTest
+using tkListTree
+using tkTextBox
+using tkComboBox
+using tkCheckBox
+using tkLabel
+using tkScrollPanel
+using tkOptionButton
+using tkPrintDialog
+using tkReportDef
+using tkReport
+using tkPaint
+
+const as string RDLG_TEXT = _
+    !"format = 1\n\n[report]\ntitle = \"D\"\n\n[[source]]\nname = \"Orders\"\n\n" & _
+    !"  [[source.field]]\n  name = \"Customer\"\n\n  [[source.field]]\n  name = \"Amount\"\n  kind = \"int\"\n\n" & _
+    !"[[band]]\nid = \"d\"\nkind = \"detail\"\nsource = \"Orders\"\nheight = 16\n\n" & _
+    !"[[item]]\nid = \"amt\"\nband = \"d\"\nkind = \"field\"\nrect = [10, 0, 60, 14]\nexpr = \"[Amount]\"\n"
+
+dim shared as long gRdStep, gRdTries
+dim shared as double gRdStart
+dim shared as ustring gRdSeen, gRdRefused
+
+' OK; if the dialog refuses it, why is recorded and it is cancelled: a test never leaves one open.
+private sub RdOk( byval d as rdialogs.RecordDialog ptr )
+    d->Finish( true )
+    if d->Accepted = false then
+        gRdRefused &= tkLabel_GetText( d->LblInfo ) & " "
+        d->Finish( false )
+    end if
+end sub
+
+' A record dialog's row by key: its edit.
+private function RdRow( byval d as rdialogs.RecordDialog ptr, byref key_ as const ustring ) as long
+    for i as long = 0 to d->Rows.Count( ) - 1
+        if d->Rows[i].Key = key_ then return i
+    next
+    return -1
+end function
+
+private sub RdText( byval d as rdialogs.RecordDialog ptr, byref key_ as const ustring, byref v as ustring )
+    dim as long r = RdRow( d, key_ )
+    if r < 0 then exit sub
+    tkTextBox_SetText( d->Rows[r].Edit, v )
+    d->CommitRow( r )
+end sub
+
+private sub RdCombo( byval d as rdialogs.RecordDialog ptr, byref key_ as const ustring, byref v as ustring )
+    dim as long r = RdRow( d, key_ )
+    if r < 0 then exit sub
+    tkComboBox_SetCurSel( d->Rows[r].Edit, tkComboBox_FindItemByText( d->Rows[r].Edit, v ) )
+    d->CommitRow( r )
+end sub
+
+private sub RdCheck( byval d as rdialogs.RecordDialog ptr, byref key_ as const ustring, byval v as boolean )
+    dim as long r = RdRow( d, key_ )
+    if r < 0 then exit sub
+    tkCheckBox_SetChecked( d->Rows[r].Edit, v )
+    d->CommitRow( r )
+end sub
+
+' Posted before a dialog opens; once it is modal, the step's edits, then OK.
+private sub DriveRpt( byval payload as any ptr )
+    dim as mainwin.Window ptr w = payload
+    gRdTries += 1
+    dim as boolean ready = false
+    select case gRdStep
+    case 6 : ready = (w->RptPageDlg <> 0)
+    case 5 : ready = (w->RptExprDlg <> 0) andalso w->RptExprDlg->IsModal
+    case else : ready = (w->RptRecDlg <> 0) andalso w->RptRecDlg->IsModal
+    end select
+    if ready = false then
+        ' posted at the click that opens it: give up only after a while (wall time, not a count a
+        ' busy pump can use up before the dialog is there)
+        if timer - gRdStart < 30 then tkApp_RunOnUI( @DriveRpt, payload )
+        exit sub
+    end if
+    select case gRdStep
+    case 1          ' Data sources: a third field
+        dim as rdialogs.RecordDialog ptr d = w->RptRecDlg
+        RdText( d, "fields", "Customer, Amount:int, Paid:bool" )
+        RdOk( d )
+    case 2          ' Parameters: one, an int with a default
+        dim as rdialogs.RecordDialog ptr d = w->RptRecDlg
+        d->AddRecord( )
+        RdText( d, "name", "MinAmt" )
+        RdCombo( d, "type", "int" )
+        RdText( d, "default", "5" )
+        RdOk( d )
+    case 3          ' Group and sort: by customer, descending
+        dim as rdialogs.RecordDialog ptr d = w->RptRecDlg
+        d->AddRecord( )
+        RdText( d, "group", "[Customer]" )
+        RdCheck( d, "descending", true )
+        RdOk( d )
+    case 4          ' the item's conditional styles: bold over the minimum
+        dim as rdialogs.RecordDialog ptr d = w->RptRecDlg
+        d->AddRecord( )
+        RdText( d, "when", "[Amount] > @MinAmt" )
+        RdCombo( d, "bold", "true" )
+        RdOk( d )
+    case 5          ' the expression editor: an error stops OK; an inserted parameter; OK
+        dim as rdialogs.ExprDialog ptr x = w->RptExprDlg
+        tkTextBox_SetText( x->TxtExpr, "[Nope] * 2" )
+        x->Check( )
+        x->Finish( true )
+        gRdSeen = tkLabel_GetText( x->LblStatus ) & "|" & x->Accepted
+        tkTextBox_SetText( x->TxtExpr, "[Amount] * " )
+        tkTextBox_SetSel( x->TxtExpr, 11, 11 )
+        for i as long = 0 to x->Inserts.Count( ) - 1
+            if x->Inserts[i] = "@MinAmt" then x->InsertRow( i )
+        next
+        gRdSeen &= "|" & tkTextBox_GetText( x->TxtExpr ) & "|" & tkLabel_GetText( x->LblStatus )
+        x->Finish( true )
+        if x->Accepted = false then
+            gRdRefused &= tkLabel_GetText( x->LblStatus ) & " "
+            x->Finish( false )
+        end if
+    case 7          ' Calculated fields: one on the detail's source, named and computed
+        dim as rdialogs.RecordDialog ptr d = w->RptRecDlg
+        d->AddRecord( )
+        RdText( d, "name", "Twice" )
+        RdText( d, "expr", "[Amount] * 2" )
+        RdOk( d )
+    case 6          ' Page setup: landscape, OK -- clicked, on the dialog's own window
+        dim as TK_HOST ptr dh = w->RptPageDlg
+        tkOptionButton_SetChecked( tkPrintDialog_GetControl( dh, TKPD_ID_LANDSCAPE ), true )
+        dim as TK_WIDGET ptr ok = tkPrintDialog_GetControl( dh, TKPD_ID_OK )
+        tkTest_Click( dh, tkTest_CX( ok ), tkTest_CY( ok ) )
+        ' the click is the dialog's to handle; if it is still up after a while, Escape closes it
+        tkTest_PumpFor( dh, 40 )
+    end select
+end sub
+
+' Runs step through what opens its dialog, then checks the OK made one undoable edit: one Undo back
+' to the text before, one Redo to the text after.
+private function OneStep( byref mw as mainwin.Window, byval h as TK_HOST ptr, byval stp as long, byval c as rcanvas.ReportCanvas ptr, _
+                          byval opener as TK_WIDGET ptr, byval row as long ) as boolean
+    dim as DocRef d = mw.Active( )
+    dim as ustring before = d->Text( )
+    gRdRefused = ""
+    gRdStep = stp
+    gRdTries = 0
+    ' where to click: a list row scrolled into view first, the mouse moved there
+    dim as long x = tkTest_CX( opener ), y = tkTest_CY( opener )
+    if row >= 0 then
+        tkListTree_SetTopIndex( opener, iif( row > 0, row - 1, 0 ) )
+        tkTest_PumpFor( h, 20 )
+        dim as TKRECT rc
+        tkWidget_AbsRect( opener, rc )
+        dim as long rh = tkHost_Scale( opener->pHost, tkListTree_GetRowHeight( opener ) )
+        x = rc.left + opener->cw \ 2
+        y = rc.top + rh * (row - tkListTree_GetTopIndex( opener )) + rh \ 2
+    end if
+    tkTest_PushMotion( h, x, y )
+    tkTest_PumpFor( h, 15 )
+    ' the driver goes in last, just before the click that opens the dialog
+    gRdStart = timer
+    tkApp_RunOnUI( @DriveRpt, @mw )
+    tkTest_Click( h, x, y )
+    tkTest_PumpFor( h, 80 )
+    dim as ustring after = d->Text( )
+    if len( gRdRefused ) then print "  (step "; stp; " refused: "; gRdRefused; ")"
+    if after = before then return false
+    tkHost_SetFocus( h, c->Glass )
+    Chord( h, SDLK_Z, SDL_SCANCODE_Z, TK_KMOD_PRIMARY )
+    tkTest_PumpFor( h, 30 )
+    dim as boolean undone = (d->Text( ) = before)
+    Chord( h, SDLK_Z, SDL_SCANCODE_Z, TK_KMOD_PRIMARY or SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 30 )
+    return undone andalso (d->Text( ) = after)
+end function
+
+' An inspector row's "..." button, scrolled into view.
+private function RdRowBtn( byval ps as rpanels.ReportPanels ptr, byref key_ as const ustring ) as TK_WIDGET ptr
+    for i as long = 0 to ps->Rows.Count( ) - 1
+        if (ps->Rows[i].Key = key_) andalso (ps->Rows[i].Btn <> 0) then
+            dim as TK_WIDGET ptr b = ps->Rows[i].Btn
+            tkScrollPanel_SetPos( ps->Scroll, b->y - tkHost_Scale( b->pHost, 8 ) )
+            tkTest_PumpFor( b->pHost, 30 )
+            return b
+        end if
+    next
+    return 0
+end function
+
+public sub RDialogsPass( byref t as Tally, byval sc as single )
+    dim as ustring tk = TestCompiler( )
+    dim as mainwin.Window mw
+    mw.ConfigDir = FreshConfig( )
+    mw.Ask = @ScriptedAsk
+    mw.Pick = @ScriptedPick
+    t.Check( mw.Create( sc ), P( sc, "rdialogs: main window created" ) )
+    if mw.form = 0 then exit sub
+    mw.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( mw.form )
+    tkTest_PumpFor( h, 150 )
+    ' a small project: main.tiko uses the report's generated module
+    dim as ustring dir_ = fs.PathJoin( Files( ), "rdialogs" & cint( sc * 100 ) )
+    fs.CreateDirAll( fs.PathJoin( dir_, "rptD" ) )
+    fs.WriteAllText( fs.PathJoin( dir_, "tiko.toml" ), !"[package]\nname = \"rptdlg\"\n\n[target.main]\nmain = \"main.tiko\"\noutput = \"rptmain.exe\"\n" )
+    fs.WriteAllText( fs.PathJoin( dir_, "main.tiko" ), !"#import \"./rptD\"\ndim as rptD.Report r\nprint \"MinAmt=\" & r.MinAmt & \" groups ok\"\n" )
+    dim as ustring e
+    dim as TK_REPORTDEF ptr seed = tkReportDef_LoadText( RDLG_TEXT, e )
+    dim as ustring path = fs.PathJoin( dir_, "rptD", "rptD.tkreport" )
+    fs.WriteAllText( path, tkReportDef_SaveText( seed ) )
+    tkReportDef_Destroy( seed )
+    mw.OpenFile( path )
+    tkTest_PumpFor( h, 80 )
+    dim as DocRef d = mw.Active( )
+    dim as rcanvas.ReportCanvas ptr c = d->Report
+    dim as rpanels.ReportPanels ptr ps = @mw.RPalettes
+    if c = 0 then
+        t.Check( false, P( sc, "rdialogs: the report on its canvas" ) )
+        mw.Destroy( )
+        exit sub
+    end if
+
+    t.Check( OneStep( mw, h, 1, c, ps->ToolList, RpRowOf( ps->ToolList, "Data sources..." ) ) andalso (c->Def->sources(0).nFields = 3), _
+             P( sc, "rdialogs: Data sources: a field added, one undo step" ) )
+    t.Check( OneStep( mw, h, 2, c, ps->ToolList, RpRowOf( ps->ToolList, "Parameters..." ) ) andalso (tkReportDef_FindParam( c->Def, "MinAmt" ) = 0) _
+             andalso (c->Def->params(0).default_ = "5"), P( sc, "rdialogs: Parameters: one added, typed, a default; one undo step" ) )
+    t.Check( OneStep( mw, h, 3, c, ps->ToolList, RpRowOf( ps->ToolList, "Group and sort..." ) ) andalso (c->Def->sources(0).sort = "[Customer] desc") _
+             andalso (tkReportDef_FindBand( c->Def, "groupHeader1" ) >= 0) andalso (tkReportDef_FindBand( c->Def, "groupFooter1" ) >= 0), _
+             P( sc, "rdialogs: Group and sort: a level, its footer, the sort; one undo step: " & c->Def->sources(0).sort ) )
+    c->SelectOnly( "amt" )
+    tkTest_PumpFor( h, 60 )
+    dim as TK_WIDGET ptr rb = RdRowBtn( ps, "rules" )
+    t.Check( (rb <> 0) andalso OneStep( mw, h, 4, c, rb, -1 ) andalso (c->Def->items(tkReportDef_FindItem( c->Def, "amt" )).nRules = 1), _
+             P( sc, "rdialogs: the rules row's ... : a conditional style, one undo step" ) )
+    dim as TK_WIDGET ptr xb = RdRowBtn( ps, "expr" )
+    if xb then
+        ' its dots drawn: the button's middle is more than its fill (the default padding left them no room)
+        tkHost_RenderTo( h, false )
+        dim as TKRECT xr
+        tkWidget_AbsRect( xb, xr )
+        dim as ulong xbg
+        dim as long tones = tkTest_TonesIn( h, xr.left + (xr.right - xr.left) \ 4, xr.top + (xr.bottom - xr.top) \ 4, _
+                                            (xr.right - xr.left) \ 2, (xr.bottom - xr.top) \ 2, xbg )
+        t.Check( tones > 2, P( sc, strings.Format( "rdialogs: the ... button shows its dots ({} tones)", tones ) ) )
+    end if
+    gRdSeen = ""
+    t.Check( (xb <> 0) andalso OneStep( mw, h, 5, c, xb, -1 ) andalso (c->Def->items(tkReportDef_FindItem( c->Def, "amt" )).expr = "[Amount] * @MinAmt"), _
+             P( sc, "rdialogs: the expression row's ... : an expression, one undo step" ) )
+    t.Check( (instr( gRdSeen, "1: " ) = 1) andalso (instr( gRdSeen, "|false|[Amount] * @MinAmt|= " ) > 0), _
+             P( sc, "rdialogs: the editor shows an error at its column and keeps OK back; an insert; the type: " & gRdSeen ) )
+    t.Check( OneStep( mw, h, 6, c, ps->ToolList, RpRowOf( ps->ToolList, "Page setup..." ) ) andalso c->Def->landscape, _
+             P( sc, "rdialogs: Page setup: landscape, one undo step" ) )
+    t.Check( OneStep( mw, h, 7, c, ps->ToolList, RpRowOf( ps->ToolList, "Calculated fields..." ) ) andalso (c->Def->nCalcs = 1) _
+             andalso (c->Def->calcs(0).source = "Orders") andalso (c->Def->calcs(0).name_ = "Twice") andalso (c->Def->calcs(0).expr = "[Amount] * 2"), _
+             P( sc, "rdialogs: Calculated fields: one added on the detail's source, one undo step" ) )
+
+    ' the generated output compiles, and the program built from it runs
+    t.Check( mw.SaveDoc( d, false ) andalso fs.IsFile( fs.PathJoin( dir_, "rptD", "rptD.design.tiko" ) ), P( sc, "rdialogs: saved, its module generated" ) )
+    if len( tk ) then
+        ' on Linux the SDL3 libraries' folder, as the battery builds with it
+        dim as process.Command bc = process.Command( tk )
+        bc.Arg( "build" )
+        dim as ustring ld = environ( "LD_LIBRARY_PATH" )
+        if len( ld ) = 0 then ld = LinkPathForBuilds( )
+        if (platform.CurrentOs( ) = platform.Os.Linux) andalso (len( ld ) > 0) then bc.Arg( "--options" ).Arg( "-p " & ld )
+        bc.Cwd( dir_ ).StderrToStdout( )
+        dim as process.ProcResultOutput po = process.Capture( bc )
+        dim as boolean built = po.IsOk( ) andalso po.Value( ).Status.Success( )
+        dim as ustring outText
+        if po.IsOk( ) then outText = po.Value( ).StdoutText( )
+        t.Check( built, P( sc, "rdialogs: the generated module compiles: " & left( outText, 300 ) ) )
+        dim as ustring exe = fs.PathJoin( dir_, "rptmain.exe" )
+        if built andalso fs.IsFile( exe ) then
+            dim as process.ProcResultOutput ro = process.Capture( process.Command( exe ).Cwd( dir_ ) )
+            dim as ustring ran
+            if ro.IsOk( ) then ran = ro.Value( ).StdoutText( )
+            t.Check( instr( ran, "MinAmt=5 groups ok" ) > 0, P( sc, "rdialogs: and runs, the parameter's default in its field: " & ran ) )
+        end if
+    else
+        t.Check( false, P( sc, "rdialogs: a tiko compiler ($TKEDIT_TIKO)" ) )
+    end if
+
+    for each dd as DocRef in mw.Docs
+        dd->Main.SetSavePoint( )
+    next
+    mw.Destroy( )
+end sub

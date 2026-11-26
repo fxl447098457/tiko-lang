@@ -1,0 +1,1051 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkSlider -- a value on a track, picked by dragging a thumb; or, in range mode, a lower and an
+' upper value with a thumb each. New in tkControls (no Win32 sibling); the design is
+' C:\dev\docs\tkControls\SLIDER.md. PHASES S0 + S1 + S2: horizontal or vertical, optionally
+' reversed; jump or page track clicks; ticks, labels, the value tip; fill modes; round or rect
+' thumbs; single or range mode.
+'
+' THREE FILES, ONE MODULE: this one (types, the value model, input), tkSliderApi.tiko (the public
+' API) and tkSliderLayout.tiko (geometry, ticks and labels, painting, the value tip, the tick API).
+'
+' THE VALUE MODEL (SLIDER.md §3.1): a double in [Min, Max]. Step > 0 is a grid anchored at Min;
+' Step = 0 is continuous. Max is always reachable, even off the grid. SnapToTicks replaces the
+' grid with the tick values. Every value -- user input and setters alike -- goes through one
+' snap, computed fresh (no drift), then rounded to DecimalPlaces + 6 digits.
+'
+' RANGE MODE (§3.2): thumb 0 holds Value (the lower), thumb 1 UpperValue, and Value <= UpperValue
+' always. The USER's thumb stops at the other one (and MinDistance short of it); it never passes
+' or swaps, so thumb 0 is always the lower. SETTERS never fail: they PUSH the other thumb, so a
+' form's LoadFrom sets lower then upper correctly whatever the old values were. Two thumbs on
+' one spot: the first drag's direction picks which one moves.
+'
+' GEOMETRY (§3.4, §4): "along" is the track's axis (x horizontal, y vertical), "across" the other.
+' A vertical slider has Min at the BOTTOM; Reversed mirrors either orientation. ThumbSize is
+' (along, across), so a horizontal rect thumb set to 10 x 20 is tall and narrow.
+'
+' NOTIFICATION (§6): setters are silent. ValueChanged fires for every USER change, each move of a
+' live drag included; ValueCommitted when the user is done -- a drag released on a different
+' value, or each key / wheel / page step. Both carry the thumb that moved; a range drag reports
+' thumb 0 then thumb 1. State first, callbacks last: a callback may destroy the slider, so every
+' path notifies from snapshots and touches no state after.
+'
+' INPUT (§5): a press on a thumb drags it from where it was grabbed. A press elsewhere either jumps
+' the nearer thumb there and drags on (TKSL_CLICK_JUMP, the default) or pages it by LargeChange
+' toward the press and repeats while held (TKSL_CLICK_PAGE). With AllowRangeDrag, a press between
+' the two thumbs drags both, the distance kept. Esc during a drag puts the start values back. The
+' wheel moves the active thumb only while focused by default (refused otherwise, so it scrolls the
+' form). Keys move the active thumb: along the axis they follow the geometry, the other arrows the
+' value; in range mode Tab goes from thumb 0 to thumb 1 and Shift+Tab back, else they leave.
+' Keyboard focus always arrives on thumb 0 (tkHost does not say which way Tab went).
+#module "tkSlider"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+
+public enum
+    TKSL_MODE_SINGLE = 0
+    TKSL_MODE_RANGE            ' two thumbs: Value (lower) and UpperValue
+end enum
+
+public enum
+    TKSL_HORIZONTAL = 0
+    TKSL_VERTICAL
+end enum
+
+' What a press on the track (off the thumbs) does.
+public enum
+    TKSL_CLICK_JUMP = 0        ' the nearer thumb comes to the pointer and the drag goes on (default)
+    TKSL_CLICK_PAGE            ' LargeChange toward the pointer, repeated while held
+end enum
+
+' Where the wheel is taken.
+public enum
+    TKSL_WHEEL_FOCUSED = 0     ' only while the slider has the focus (default)
+    TKSL_WHEEL_HOVER           ' whenever the pointer is over it
+    TKSL_WHEEL_NEVER
+end enum
+
+' Single mode only; range mode always fills between the thumbs.
+public enum
+    TKSL_FILL_MIN = 0          ' from the Min end to the thumb (default)
+    TKSL_FILL_NONE
+    TKSL_FILL_ORIGIN           ' from FillOrigin to the thumb, either side
+end enum
+
+' Which side of the track gets tick marks: Top = Left when vertical.
+public enum
+    TKSL_TICKS_NONE = 0
+    TKSL_TICKS_TOPLEFT
+    TKSL_TICKS_BOTTOMRIGHT
+    TKSL_TICKS_BOTH
+end enum
+
+public enum
+    TKSL_THUMB_ROUND = 0
+    TKSL_THUMB_RECT            ' a rounded rectangle, ThumbSize along x across
+end enum
+
+' When the value tip shows over the thumb.
+public enum
+    TKSL_TIP_NONE = 0
+    TKSL_TIP_DRAG              ' while dragging or paging (default)
+    TKSL_TIP_FOCUSED           ' while focused, and so during keyboard changes too
+end enum
+
+' FormatValue's nWhere.
+public enum
+    TKSL_FMT_TICK = 0
+    TKSL_FMT_TIP
+end enum
+
+' HitTest's answers.
+public enum
+    TKSL_PART_NONE = 0
+    TKSL_PART_TRACK            ' the client outside the thumbs' targets and the tick bands
+    TKSL_PART_THUMB0
+    TKSL_PART_TICKS            ' a tick or label band (a press there acts as on the track)
+    TKSL_PART_THUMB1           ' range mode: the upper thumb
+    TKSL_PART_RANGE            ' range mode: between the thumbs, on the track band
+end enum
+
+' nPressedThumb / nDrag beyond 0 and 1.
+public const as long TKSL_THUMB_BOTH = 2         ' a range drag: both thumbs move
+const as long DRAG_NONE = -1
+const as long DRAG_PENDING = -2                  ' two thumbs on one spot: the first move decides
+
+' Sizes in design units, scaled at create and by TKM_SCALECHANGED. The two THICKNESSES (thumb
+' border, focus ring) are rules, not sizes: never scaled (tkToggle's rule).
+public const as long TKSLIDER_DEFAULT_TRACK      = 4      ' track thickness
+public const as long TKSLIDER_DEFAULT_THUMB      = 16     ' thumb, along and across
+public const as long TKSLIDER_DEFAULT_FOCUSGAP   = 3
+public const as long TKSLIDER_DEFAULT_FOCUSTHICK = 1
+public const as long TKSLIDER_DEFAULT_BORDER     = 2      ' the thumb's border
+public const as long TKSLIDER_DEFAULT_LENGTH     = 120    ' GetIdealSize's travel, beyond the thumb
+public const as long TKSLIDER_DEFAULT_TICKLEN    = 4
+public const as long TKSLIDER_DEFAULT_TICKGAP    = 2      ' thumb band -> ticks
+public const as long TKSLIDER_DEFAULT_LABELGAP   = 2      ' ticks -> labels
+public const as long TKSLIDER_MIN_TICKSPACE      = 2      ' thinning: the least gap between shown ticks
+public const as long TKSLIDER_MIN_LABELSPACE     = 6      ' thinning: the least gap between shown labels
+public const as long TKSLIDER_RECT_CORNER        = 3      ' a rect thumb's corner radius
+public const as long TKSLIDER_MIN_TARGET         = 24     ' a thumb's hit target, at least, across
+public const as long TKSLIDER_REPEAT_DELAY       = 400
+public const as long TKSLIDER_REPEAT_MS          = 80
+public const as long TKSLIDER_MAX_TICKS          = 10000  ' a finer TickFrequency draws no ticks
+public const as double TKSLIDER_DEFAULT_MIN = 0.0
+public const as double TKSLIDER_DEFAULT_MAX = 100.0
+
+' Precedence in each part: disabled > pressed > hot > normal.
+public type TKSLIDER_COLORS
+    BackColor                as ulong = &hFF21252Bul
+    FocusRingColor           as ulong = &hFF569CD6ul
+    TrackColor               as ulong = &hFF33373Ful
+    TrackColorDisabled       as ulong = &hFF2C3037ul
+    FillColor                as ulong = &hFF4A6C8Cul
+    FillColorHot             as ulong = &hFF5C84AAul
+    FillColorDisabled        as ulong = &hFF384654ul
+    ThumbColor               as ulong = &hFF2C313Aul
+    ThumbColorHot            as ulong = &hFF353B45ul
+    ThumbColorPressed        as ulong = &hFF264F78ul
+    ThumbColorDisabled       as ulong = &hFF2C3037ul
+    ThumbBorderColor         as ulong = &hFF4A6C8Cul
+    ThumbBorderColorHot      as ulong = &hFF5C84AAul
+    ThumbBorderColorDisabled as ulong = &hFF484D56ul
+    TickColor                as ulong = &hFF373C45ul
+    TickColorDisabled        as ulong = &hFF2C3037ul
+    LabelColor               as ulong = &hFF8A9099ul
+    LabelColorDisabled       as ulong = &hFF545961ul
+end type
+
+' Everything a painter needs, all rects from Layout (never re-derive one). Ticks and labels are
+' read with tkSlider_GetTickCount / GetTickPos / GetTickShown / GetLabelRect / GetLabelText.
+public type TKSLIDER_PAINTINFO
+    hSlider       as TK_WIDGET ptr
+    b             as TK_PAINT ptr          ' borrowed for this frame
+    rcClient      as TKRECT
+    rcTrack       as TKRECT
+    rcFill        as TKRECT                ' empty with TKSL_FILL_NONE; between the thumbs in range mode
+    rcThumb       as TKRECT                ' thumb 0
+    rcFocus       as TKRECT                ' the ring's rect: the ACTIVE thumb inflated by the ring band
+    nHotThumb     as long                  ' 0, 1, or -1
+    nPressedThumb as long                  ' 0 or 1 while it drags or pages, TKSL_THUMB_BOTH, or -1
+    isEnabled     as boolean
+    isFocused     as boolean
+    isReadOnly    as boolean
+    nOrientation  as long
+    bReversed     as boolean
+    nThumbShape   as long
+    nValue        as double                ' thumb 0's
+    ' range mode (S2)
+    nThumbs       as long                  ' 1, or 2 in range mode
+    rcThumb1      as TKRECT                ' empty in single mode
+    nUpperValue   as double
+    nActiveThumb  as long                  ' the one the keys move (drawn last, ringed)
+end type
+
+public type TKSLIDER_MESSAGEINFO
+    hSlider as TK_WIDGET ptr
+    msg     as long                        ' TKM_*
+    x       as single
+    y       as single
+    key     as long
+    mods    as long
+    wheelX  as single
+    wheelY  as single
+end type
+
+public type SLD_ValueChangedCallbackSub as sub( byval hSlider as TK_WIDGET ptr, byval nThumb as long, byval nValue as double )
+public type SLD_ValueCommittedCallbackSub as sub( byval hSlider as TK_WIDGET ptr, byval nThumb as long, byval nValue as double )
+public type SLD_FormatValueCallbackFunc as function( byval hSlider as TK_WIDGET ptr, byval nValue as double, byval nWhere as long ) as ustring
+public type SLD_PaintCallbackSub as sub( byval p as TKSLIDER_PAINTINFO ptr )
+public type SLD_MessageCallbackFunc as function( byval m as TKSLIDER_MESSAGEINFO ptr ) as boolean
+
+public type TKSLIDER_STATE
+    hWin              as TK_WIDGET ptr
+    id                as long
+    bColorsPinned     as boolean
+    bShapePinned      as boolean
+    wszTooltip        as ustring
+    tip               as TKTIPHOST_STATE       ' the hover tooltip (TooltipText)
+    vtip              as TKTIPHOST_STATE       ' the value tip: tracked, made on first use
+    bTipShown         as boolean
+    colors            as TKSLIDER_COLORS
+    pFont             as TTF_Font ptr          ' labels and nothing else; 0 = the host's default
+    ' value model
+    nMin              as double = TKSLIDER_DEFAULT_MIN
+    nMax              as double = TKSLIDER_DEFAULT_MAX
+    nValue            as double                ' thumb 0 (the lower in range mode)
+    nUpper            as double = TKSLIDER_DEFAULT_MAX   ' thumb 1: range mode's upper value
+    nMode             as long = TKSL_MODE_SINGLE
+    nMinDist          as double                ' range mode: the least UpperValue - Value a USER makes
+    bAllowRangeDrag   as boolean
+    nStep             as double = 1
+    nSmall            as double = 1
+    nLarge            as double = 10
+    nDecimals         as long
+    bSnapToTicks      as boolean
+    ' ticks: values (built from TickFrequency or the user's list), then laid out
+    nTickFreq         as double
+    userTicks(any)    as double
+    nUserTicks        as long
+    tickVal(any)      as double
+    nTicks            as long
+    bTicksDirty       as boolean = true
+    tickPos(any)      as long                  ' the tick's centre along the axis
+    tickShown(any)    as boolean
+    labelShown(any)   as boolean
+    labelRc(any)      as TKRECT
+    labelTxt(any)     as ustring
+    nTickPlacement    as long = TKSL_TICKS_NONE
+    bShowLabels       as boolean
+    nLabelEvery       as long = 1
+    ' behaviour
+    isEnabled         as boolean = true
+    isReadOnly        as boolean
+    isFocused         as boolean
+    nOrientation      as long = TKSL_HORIZONTAL
+    bReversed         as boolean
+    nTrackClick       as long = TKSL_CLICK_JUMP
+    nFillMode         as long = TKSL_FILL_MIN
+    nFillOrigin       as double
+    nThumbShape       as long = TKSL_THUMB_ROUND
+    nShowTip          as long = TKSL_TIP_DRAG
+    nWheelMode        as long = TKSL_WHEEL_FOCUSED
+    nWheelAccum       as long                  ' 120ths of a notch not yet applied
+    nRepeatDelay      as long = TKSLIDER_REPEAT_DELAY
+    nRepeatMs         as long = TKSLIDER_REPEAT_MS
+    nActive           as long                  ' the thumb the keys and the wheel move
+    ' gesture
+    isDragging        as boolean
+    nDrag             as long = DRAG_NONE      ' 0, 1, TKSL_THUMB_BOTH, DRAG_PENDING
+    isPaging          as boolean
+    nPageThumb        as long
+    nPageDir          as long                  ' +1 / -1 in value terms
+    nGrab             as long                  ' pointer - thumb centre at the press, along
+    nDragStart        as double                ' the values before the press (Esc, Commit)
+    nDragStart1       as double
+    nHot              as long = -1
+    lastX             as single
+    lastY             as single
+    ' geometry (pixels)
+    nTrackThick       as long
+    nThumbA           as long                  ' along
+    nThumbX           as long                  ' across
+    nBorderThick      as long = TKSLIDER_DEFAULT_BORDER
+    nFocusGap         as long
+    nFocusThick       as long = TKSLIDER_DEFAULT_FOCUSTHICK
+    nTickLen          as long
+    nTickGap          as long
+    nLabelGap         as long
+    bLayoutDirty      as boolean = true
+    a0                as long                  ' the lower-coordinate end's thumb centre, along
+    a1                as long                  ' the higher-coordinate end's
+    rcTrack           as TKRECT
+    rcFill            as TKRECT
+    rcThumb           as TKRECT                ' thumb 0
+    rcTarget          as TKRECT                ' what a press must land in to grab thumb 0
+    rcThumb1          as TKRECT                ' thumb 1 (range mode)
+    rcTarget1         as TKRECT
+    rcBody            as TKRECT                ' range mode: between the thumbs' centres, the thumb band across
+    rcTicks1          as TKRECT                ' the top / left tick band (empty when none)
+    rcTicks2          as TKRECT                ' the bottom / right tick band
+    rcLabels          as TKRECT                ' the label band
+    ' callbacks
+    ChangedCallback   as SLD_ValueChangedCallbackSub
+    CommittedCallback as SLD_ValueCommittedCallbackSub
+    FormatCallback    as SLD_FormatValueCallbackFunc
+    PaintCallback     as SLD_PaintCallbackSub
+    MessageCallback   as SLD_MessageCallbackFunc
+
+    declare function RingPad() as long
+    declare function Span() as long
+    declare function Inverted() as boolean
+    declare function IsRange() as boolean
+    declare function ValOf( byval i as long ) as double
+    declare function Snap( byval v as double ) as double
+    declare function SnapToward( byval target as double, byval from as double ) as double
+    declare function LegalAtMost( byval x as double ) as double
+    declare function LegalAtLeast( byval x as double ) as double
+    declare function LimitUser( byval i as long, byval v as double ) as double
+    declare function Differ( byval a as double, byval b as double ) as boolean
+    declare function KeyStep() as double
+    declare function CentreOf( byval v as double ) as long
+    declare function ValueAt( byval px as long ) as double
+    declare sub      Resnap()
+    declare sub      BuildTicks()
+    declare sub      Layout()
+    declare sub      Refresh()
+end type
+
+' ---- shared across the module's files --------------------------------------------------------
+declare function RoundTo( byval v as double, byval d as long ) as double
+declare function RoundHalfAway( byval v as double ) as double
+declare function Clamp_( byval v as double, byval lo as double, byval hi as double ) as double
+declare function SL( byval w as TK_WIDGET ptr ) as TKSLIDER_STATE ptr
+declare sub EnsureLayout( byval p as TKSLIDER_STATE ptr )
+declare sub OnPaint( byval p as TKSLIDER_STATE ptr, byval b as TK_PAINT ptr )
+declare sub RenderDefault( byval p as TKSLIDER_STATE ptr, byval pi as TKSLIDER_PAINTINFO ptr )
+declare sub UpdateTip( byval p as TKSLIDER_STATE ptr )
+declare sub HideTip( byval p as TKSLIDER_STATE ptr )
+declare function FormatV( byval p as TKSLIDER_STATE ptr, byval v as double, byval nWhere as long ) as ustring
+declare sub IdealSize( byval p as TKSLIDER_STATE ptr, byref nW as long, byref nH as long )
+declare function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+declare sub ApplyThemeShape( byval w as TK_WIDGET ptr )
+
+' ==========================================================================================
+' The value model
+' ==========================================================================================
+' Half away from zero, to d decimal digits: drops binary residue (0.1 * 3).
+function RoundTo( byval v as double, byval d as long ) as double
+    if d < 0 then d = 0
+    if d > 15 then d = 15
+    dim as double k = 10.0 ^ d
+    if v < 0 then return -int( (-v * k) + 0.5 ) / k
+    return int( (v * k) + 0.5 ) / k
+end function
+
+function RoundHalfAway( byval v as double ) as double
+    if v < 0 then return -int( -v + 0.5 )
+    return int( v + 0.5 )
+end function
+
+function Clamp_( byval v as double, byval lo as double, byval hi as double ) as double
+    if v < lo then return lo
+    if v > hi then return hi
+    return v
+end function
+
+function SL( byval w as TK_WIDGET ptr ) as TKSLIDER_STATE ptr
+    if w = 0 then return 0
+    return cast( TKSLIDER_STATE ptr, w->pData )
+end function
+
+sub EnsureLayout( byval p as TKSLIDER_STATE ptr )
+    if p->bLayoutDirty then p->Layout()
+end sub
+
+function TKSLIDER_STATE.IsRange() as boolean
+    return this.nMode = TKSL_MODE_RANGE
+end function
+
+function TKSLIDER_STATE.ValOf( byval i as long ) as double
+    return iif( i = 1, this.nUpper, this.nValue )
+end function
+
+' A quarter of a grid unit, or a hair of the range when continuous: below it is residue.
+function TKSLIDER_STATE.Differ( byval a as double, byval b as double ) as boolean
+    dim as double tol = (this.nMax - this.nMin) * 1e-9 + 1e-12
+    if this.nStep > 0 then tol = this.nStep / 4
+    return abs( a - b ) > tol
+end function
+
+' The tick values, sorted, inside [Min, Max]: the user's list when there is one, else Min + k *
+' TickFrequency (k >= 0) plus Max. Too many (a frequency finer than MAX_TICKS) is none.
+sub TKSLIDER_STATE.BuildTicks()
+    this.bTicksDirty = false
+    this.nTicks = 0
+    erase this.tickVal
+    dim as double tol = (this.nMax - this.nMin) * 1e-9 + 1e-12
+    if this.nUserTicks > 0 then
+        redim this.tickVal( 0 to this.nUserTicks - 1 )
+        for i as long = 0 to this.nUserTicks - 1
+            dim as double v = this.userTicks(i)
+            if (v < this.nMin - tol) orelse (v > this.nMax + tol) then continue for
+            v = Clamp_( v, this.nMin, this.nMax )
+            ' insertion, skipping duplicates
+            dim as long j = this.nTicks
+            while (j > 0) andalso (this.tickVal(j - 1) > v)
+                j -= 1
+            wend
+            if (j > 0) andalso (abs( this.tickVal(j - 1) - v ) <= tol) then continue for
+            for k as long = this.nTicks to j + 1 step -1
+                this.tickVal(k) = this.tickVal(k - 1)
+            next
+            this.tickVal(j) = v
+            this.nTicks += 1
+        next
+    elseif (this.nTickFreq > 0) andalso (this.nMax > this.nMin) then
+        dim as double nCount = (this.nMax - this.nMin) / this.nTickFreq
+        if nCount > TKSLIDER_MAX_TICKS then exit sub
+        redim this.tickVal( 0 to cint( int( nCount ) ) + 1 )
+        dim as long k = 0
+        do
+            dim as double v = RoundTo( this.nMin + k * this.nTickFreq, this.nDecimals + 6 )
+            if v >= this.nMax - tol then exit do
+            this.tickVal(this.nTicks) = v
+            this.nTicks += 1
+            k += 1
+        loop
+        this.tickVal(this.nTicks) = this.nMax
+        this.nTicks += 1
+    end if
+end sub
+
+private function UseTicks( byval p as TKSLIDER_STATE ptr ) as boolean
+    if p->bSnapToTicks = false then return false
+    if p->bTicksDirty then p->BuildTicks()
+    return p->nTicks > 0
+end function
+
+' The nearest legal value: a grid point (Min + n * Step) or Max itself, or with SnapToTicks the
+' nearest tick; clamped, residue dropped.
+function TKSLIDER_STATE.Snap( byval v as double ) as double
+    v = Clamp_( v, this.nMin, this.nMax )
+    if UseTicks( @this ) then
+        dim as double best = this.tickVal(0)
+        for i as long = 1 to this.nTicks - 1
+            if abs( this.tickVal(i) - v ) < abs( best - v ) then best = this.tickVal(i)
+        next
+        return best
+    end if
+    if this.nStep > 0 then
+        dim as double g = this.nMin + RoundHalfAway( (v - this.nMin) / this.nStep ) * this.nStep
+        g = Clamp_( g, this.nMin, this.nMax )
+        if abs( this.nMax - v ) < abs( v - g ) then g = this.nMax      ' Max is always legal
+        v = g
+    end if
+    return Clamp_( RoundTo( v, this.nDecimals + 6 ), this.nMin, this.nMax )
+end function
+
+' The greatest legal value <= x (Min when there is none), and the least >= x (Max when none).
+function TKSLIDER_STATE.LegalAtMost( byval x as double ) as double
+    dim as double tol = (this.nMax - this.nMin) * 1e-9 + 1e-12
+    if x >= this.nMax - tol then return this.nMax
+    if x <= this.nMin then return this.nMin
+    if UseTicks( @this ) then
+        dim as double g = this.nMin
+        for i as long = 0 to this.nTicks - 1
+            if this.tickVal(i) <= x + tol then g = this.tickVal(i)
+        next
+        return g
+    end if
+    if this.nStep <= 0 then return RoundTo( x, this.nDecimals + 6 )
+    return Clamp_( RoundTo( this.nMin + int( (x - this.nMin) / this.nStep + 1e-9 ) * this.nStep, this.nDecimals + 6 ), this.nMin, this.nMax )
+end function
+
+function TKSLIDER_STATE.LegalAtLeast( byval x as double ) as double
+    dim as double tol = (this.nMax - this.nMin) * 1e-9 + 1e-12
+    if x <= this.nMin + tol then return this.nMin
+    if x >= this.nMax then return this.nMax
+    if UseTicks( @this ) then
+        for i as long = 0 to this.nTicks - 1
+            if this.tickVal(i) >= x - tol then return this.tickVal(i)
+        next
+        return this.nMax
+    end if
+    if this.nStep <= 0 then return RoundTo( x, this.nDecimals + 6 )
+    return Clamp_( RoundTo( this.nMin - int( -(x - this.nMin) / this.nStep + 1e-9 ) * this.nStep, this.nDecimals + 6 ), this.nMin, this.nMax )
+end function
+
+' A USER's legal value v for thumb i, stopped at the other thumb less MinDistance (range mode).
+' When setters already left the pair closer than MinDistance, a thumb may not close it further
+' but is never pushed backward either.
+function TKSLIDER_STATE.LimitUser( byval i as long, byval v as double ) as double
+    if this.IsRange() = false then return v
+    if i = 0 then
+        dim as double hi = this.nUpper - this.nMinDist
+        if hi < this.nValue then hi = this.nValue
+        if v > hi then
+            v = this.LegalAtMost( hi )
+            if v > hi then v = this.nValue
+        end if
+    else
+        dim as double lo = this.nValue + this.nMinDist
+        if lo > this.nUpper then lo = this.nUpper
+        if v < lo then
+            v = this.LegalAtLeast( lo )
+            if v < lo then v = this.nUpper
+        end if
+    end if
+    return v
+end function
+
+' Both values back on the legal set after Min / Max / Step / ticks changed, the pair in order.
+sub TKSLIDER_STATE.Resnap()
+    this.nValue = this.Snap( this.nValue )
+    this.nUpper = this.Snap( this.nUpper )
+    if this.IsRange() andalso (this.nUpper < this.nValue) then this.nUpper = this.nValue
+end sub
+
+' A key / wheel / page step: the legal value at or before `target` seen from `from` (rounded
+' TOWARD the start, so a step never overshoots), and if that is no move at all, the next legal
+' value on. The direction is the request's, read BEFORE the clamp: at Max "up" clamps to Max
+' itself and must not be taken for a step down (S0's selftest: Right at Max gave Max - 1).
+function TKSLIDER_STATE.SnapToward( byval target as double, byval from as double ) as double
+    if target = from then return from
+    dim as boolean up = (target > from)
+    if up andalso (this.Differ( from, this.nMax ) = false) then return from
+    if (up = false) andalso (this.Differ( from, this.nMin ) = false) then return from
+    target = Clamp_( target, this.nMin, this.nMax )
+    if UseTicks( @this ) then
+        ' the last tick on the way (toward the start), else the first one past `from`
+        dim as double g = from
+        dim as boolean found = false
+        if up then
+            for i as long = this.nTicks - 1 to 0 step -1
+                if (this.tickVal(i) <= target) andalso this.Differ( this.tickVal(i), from ) andalso (this.tickVal(i) > from) then g = this.tickVal(i) : found = true : exit for
+            next
+            if found = false then
+                for i as long = 0 to this.nTicks - 1
+                    if (this.tickVal(i) > from) andalso this.Differ( this.tickVal(i), from ) then g = this.tickVal(i) : exit for
+                next
+            end if
+        else
+            for i as long = 0 to this.nTicks - 1
+                if (this.tickVal(i) >= target) andalso this.Differ( this.tickVal(i), from ) andalso (this.tickVal(i) < from) then g = this.tickVal(i) : found = true : exit for
+            next
+            if found = false then
+                for i as long = this.nTicks - 1 to 0 step -1
+                    if (this.tickVal(i) < from) andalso this.Differ( this.tickVal(i), from ) then g = this.tickVal(i) : exit for
+                next
+            end if
+        end if
+        return g
+    end if
+    if this.nStep <= 0 then return Clamp_( RoundTo( target, this.nDecimals + 6 ), this.nMin, this.nMax )
+    dim as double q = (target - this.nMin) / this.nStep
+    dim as double n = iif( up, int( q + 1e-9 ), -int( -q + 1e-9 ) )      ' floor going up, ceil going down
+    dim as double g = Clamp_( this.nMin + n * this.nStep, this.nMin, this.nMax )
+    if up andalso (target >= this.nMax) then g = this.nMax
+    if this.Differ( g, from ) = false then
+        g = Clamp_( this.nMin + (n + iif( up, 1, -1 )) * this.nStep, this.nMin, this.nMax )
+        if up andalso (g < from) then g = this.nMax
+    end if
+    return Clamp_( RoundTo( g, this.nDecimals + 6 ), this.nMin, this.nMax )
+end function
+
+' SmallChange, or Step when it is 0, or a hundredth of the range when both are.
+function TKSLIDER_STATE.KeyStep() as double
+    if this.nSmall > 0 then return this.nSmall
+    if this.nStep > 0 then return this.nStep
+    return (this.nMax - this.nMin) / 100
+end function
+
+function TKSLIDER_STATE.RingPad() as long
+    return this.nFocusGap + this.nFocusThick
+end function
+
+function TKSLIDER_STATE.Span() as long
+    return this.a1 - this.a0
+end function
+
+' Min sits at the HIGH coordinate end: a vertical slider (Min at the bottom), unless reversed;
+' a reversed horizontal one.
+function TKSLIDER_STATE.Inverted() as boolean
+    return (this.nOrientation = TKSL_VERTICAL) xor this.bReversed
+end function
+
+' The thumb centre along the axis: a0 + round( fr * span ), or a1 - round( fr * span ) inverted.
+function TKSLIDER_STATE.CentreOf( byval v as double ) as long
+    dim as double fr = 0
+    if this.nMax > this.nMin then fr = (v - this.nMin) / (this.nMax - this.nMin)
+    dim as long d = cint( RoundHalfAway( Clamp_( fr, 0, 1 ) * this.Span() ) )
+    return iif( this.Inverted(), this.a1 - d, this.a0 + d )
+end function
+
+' The snapped value under the coordinate px along the axis (clamped to the travel).
+function TKSLIDER_STATE.ValueAt( byval px as long ) as double
+    if this.Span() <= 0 then return this.nValue
+    dim as double fr = (px - this.a0) / this.Span()
+    if this.Inverted() then fr = (this.a1 - px) / this.Span()
+    return this.Snap( this.nMin + Clamp_( fr, 0, 1 ) * (this.nMax - this.nMin) )
+end function
+
+sub TKSLIDER_STATE.Refresh()
+    this.bLayoutDirty = true
+    tkWidget_Invalidate( this.hWin )
+end sub
+
+' ==========================================================================================
+' Notification: from snapshots, last, nothing touched after
+' ==========================================================================================
+' Bits: 1 = thumb 0, 2 = thumb 1. Order: Changed 0, Changed 1, Committed 0, Committed 1.
+private sub Notify( byval p as TKSLIDER_STATE ptr, byval nChanged as long, byval nCommitted as long )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as double v0 = p->nValue, v1 = p->nUpper
+    dim as SLD_ValueChangedCallbackSub cbChanged = p->ChangedCallback
+    dim as SLD_ValueCommittedCallbackSub cbCommitted = p->CommittedCallback
+    ' p may be gone after the first callback: only the snapshots are used from here
+    if cbChanged then
+        if nChanged and 1 then cbChanged( w, 0, v0 )
+        if nChanged and 2 then cbChanged( w, 1, v1 )
+    end if
+    if cbCommitted then
+        if nCommitted and 1 then cbCommitted( w, 0, v0 )
+        if nCommitted and 2 then cbCommitted( w, 1, v1 )
+    end if
+end sub
+
+private function Bit( byval i as long ) as long
+    return iif( i = 1, 2, 1 )
+end function
+
+' Thumb i moved by the USER to legal value v (stopped at the other thumb): set, re-lay out, move
+' the tip. TRUE when it changed (the caller notifies).
+private function UserSet( byval p as TKSLIDER_STATE ptr, byval i as long, byval v as double ) as boolean
+    v = p->LimitUser( i, v )
+    if p->Differ( v, p->ValOf( i ) ) = false then return false
+    if i = 1 then p->nUpper = v else p->nValue = v
+    p->Refresh()
+    UpdateTip( p )
+    return true
+end function
+
+' Both thumbs by the same amount (a range drag): the distance kept, clamped as a block. Returns
+' the changed bits.
+private function UserShift( byval p as TKSLIDER_STATE ptr, byval newLo as double ) as long
+    dim as double dist = p->nDragStart1 - p->nDragStart
+    dim as double lo = newLo, hi = newLo + dist
+    if hi > p->nMax then hi = p->nMax : lo = p->nMax - dist
+    if lo < p->nMin then lo = p->nMin : hi = p->nMin + dist
+    dim as long bits = 0
+    if p->Differ( lo, p->nValue ) then p->nValue = lo : bits or= 1
+    if p->Differ( hi, p->nUpper ) then p->nUpper = hi : bits or= 2
+    if bits then p->Refresh() : UpdateTip( p )
+    return bits
+end function
+
+private function CallMessage( byval p as TKSLIDER_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKSLIDER_MESSAGEINFO mi
+    mi.hSlider = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    mi.key = m->key : mi.mods = m->mods
+    mi.wheelX = m->wheelX : mi.wheelY = m->wheelY
+    return p->MessageCallback( @mi )
+end function
+
+private function Along( byval p as TKSLIDER_STATE ptr, byval x as single, byval y as single ) as long
+    return cint( iif( p->nOrientation = TKSL_VERTICAL, y, x ) )
+end function
+
+' Which thumb a press at (x, y) grabs: 0, 1, DRAG_PENDING (two on one spot), or -1 (none).
+private function ThumbAt( byval p as TKSLIDER_STATE ptr, byval x as single, byval y as single ) as long
+    dim as boolean in0 = tkRect_Contains( p->rcTarget, x, y )
+    if p->IsRange() = false then return iif( in0, 0, -1 )
+    dim as boolean in1 = tkRect_Contains( p->rcTarget1, x, y )
+    if (in0 = false) andalso (in1 = false) then return -1
+    if in0 xor in1 then return iif( in0, 0, 1 )
+    dim as long at = Along( p, x, y )
+    dim as long c0 = p->CentreOf( p->nValue ), c1 = p->CentreOf( p->nUpper )
+    if c0 = c1 then return DRAG_PENDING
+    return iif( abs( at - c0 ) <= abs( at - c1 ), 0, 1 )
+end function
+
+' The thumb a track press moves: the nearer; two on one spot, the one on the press's side.
+private function NearerThumb( byval p as TKSLIDER_STATE ptr, byval at as long ) as long
+    if p->IsRange() = false then return 0
+    dim as long c0 = p->CentreOf( p->nValue ), c1 = p->CentreOf( p->nUpper )
+    if c0 = c1 then return iif( p->ValueAt( at ) > p->nUpper, 1, 0 )
+    return iif( abs( at - c0 ) <= abs( at - c1 ), 0, 1 )
+end function
+
+' ==========================================================================================
+' The proc
+' ==========================================================================================
+public declare sub tkSlider_ApplyTheme( byval hSlider as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+' A drag ends without Esc: the bits of the thumbs that differ from the press's (the caller commits).
+private function EndDrag( byval p as TKSLIDER_STATE ptr ) as long
+    if p->isDragging = false then return 0
+    p->isDragging = false
+    p->nDrag = DRAG_NONE
+    tkWidget_Invalidate( p->hWin )
+    UpdateTip( p )
+    dim as long bits = 0
+    if p->Differ( p->nValue, p->nDragStart ) then bits or= 1
+    if p->IsRange() andalso p->Differ( p->nUpper, p->nDragStart1 ) then bits or= 2
+    return bits
+end function
+
+private sub StopPaging( byval p as TKSLIDER_STATE ptr )
+    if p->isPaging then tkWidget_KillTimer( p->hWin, TK_TIMER_AUTOREPEAT )
+    p->isPaging = false
+    p->nPageDir = 0
+    tkWidget_Invalidate( p->hWin )
+    UpdateTip( p )
+end sub
+
+private sub SetHot( byval p as TKSLIDER_STATE ptr, byval n as long )
+    if n = DRAG_PENDING then n = p->nActive
+    if n <> p->nHot then p->nHot = n : tkWidget_Invalidate( p->hWin )
+end sub
+
+private sub Rescale( byval p as TKSLIDER_STATE ptr, byval fOld as single, byval fNew as single )
+    if (fOld <= 0) orelse (fNew <= 0) orelse (fOld = fNew) then exit sub
+    dim as single k = fNew / fOld
+    p->nTrackThick = cint( p->nTrackThick * k )
+    p->nThumbA = cint( p->nThumbA * k )
+    p->nThumbX = cint( p->nThumbX * k )
+    p->nFocusGap = cint( p->nFocusGap * k )
+    p->nTickLen = cint( p->nTickLen * k )
+    p->nTickGap = cint( p->nTickGap * k )
+    p->nLabelGap = cint( p->nLabelGap * k )
+    if p->nTrackThick < 1 then p->nTrackThick = 1
+    if p->nThumbA < 1 then p->nThumbA = 1
+    if p->nThumbX < 1 then p->nThumbX = 1
+    p->Refresh()
+end sub
+
+' One page step of the paging thumb toward the pointer: TRUE when it moved.
+private function PageStep( byval p as TKSLIDER_STATE ptr ) as boolean
+    dim as double big = iif( p->nLarge > 0, p->nLarge, p->KeyStep() )
+    dim as double cur = p->ValOf( p->nPageThumb )
+    return UserSet( p, p->nPageThumb, p->SnapToward( cur + p->nPageDir * big, cur ) )
+end function
+
+' The paging has reached the pointer: the thumb's target covers it, or the value passed it.
+private function PageReached( byval p as TKSLIDER_STATE ptr ) as boolean
+    EnsureLayout( p )
+    dim as TKRECT rt = p->rcTarget
+    if p->nPageThumb = 1 then rt = p->rcTarget1
+    if tkRect_Contains( rt, p->lastX, p->lastY ) then return true
+    dim as double vAt = p->ValueAt( Along( p, p->lastX, p->lastY ) )
+    dim as double cur = p->ValOf( p->nPageThumb )
+    if p->nPageDir > 0 then return cur >= vAt
+    return cur <= vAt
+end function
+
+' n steps of the active thumb (keys' size): the new value.
+private function StepsFrom( byval p as TKSLIDER_STATE ptr, byval i as long, byval n as long, byval amount as double ) as double
+    dim as double v = p->ValOf( i )
+    for k as long = 1 to abs( n )
+        v = p->SnapToward( v + sgn( n ) * amount, v )
+    next
+    return v
+end function
+
+' The wheel, if this mode takes it now. Positive notches (up / right) increase.
+private function OnWheel( byval p as TKSLIDER_STATE ptr, byval notches as single ) as boolean
+    if notches = 0 then return false
+    p->nWheelAccum += cint( notches * 120 )
+    dim as long n = p->nWheelAccum \ 120
+    if n = 0 then return true                           ' owned; the remainder is kept
+    p->nWheelAccum -= n * 120
+    dim as long i = p->nActive
+    if UserSet( p, i, StepsFrom( p, i, n, p->KeyStep() ) ) then Notify( p, Bit( i ), Bit( i ) )
+    return true
+end function
+
+' Along the axis the keys follow the geometry; the cross-axis arrows follow the value (APG).
+' Range mode: Tab / Shift+Tab walk between the thumbs, and leave at either end.
+private function OnKey( byval p as TKSLIDER_STATE ptr, byval key as long, byval mods as long ) as boolean
+    dim as long i = p->nActive
+    if key = SDLK_TAB then
+        if p->IsRange() = false then return false
+        dim as boolean back = (mods and SDL_KMOD_SHIFT) <> 0
+        if (back = false) andalso (i = 0) then p->nActive = 1 : tkWidget_Invalidate( p->hWin ) : UpdateTip( p ) : return true
+        if back andalso (i = 1) then p->nActive = 0 : tkWidget_Invalidate( p->hWin ) : UpdateTip( p ) : return true
+        return false
+    end if
+    dim as double v = p->ValOf( i )
+    dim as long dirn = 0
+    dim as long geo = iif( p->bReversed, -1, 1 )
+    if p->nOrientation = TKSL_VERTICAL then
+        select case key
+        case SDLK_UP    : dirn = geo
+        case SDLK_DOWN  : dirn = -geo
+        case SDLK_RIGHT : dirn = 1
+        case SDLK_LEFT  : dirn = -1
+        end select
+    else
+        select case key
+        case SDLK_RIGHT : dirn = geo
+        case SDLK_LEFT  : dirn = -geo
+        case SDLK_UP    : dirn = 1
+        case SDLK_DOWN  : dirn = -1
+        end select
+    end if
+    dim as double big = iif( p->nLarge > 0, p->nLarge, p->KeyStep() )
+    select case key
+    case SDLK_UP, SDLK_DOWN, SDLK_LEFT, SDLK_RIGHT : v = StepsFrom( p, i, dirn, p->KeyStep() )
+    case SDLK_PAGEUP   : v = StepsFrom( p, i, 1, big )
+    case SDLK_PAGEDOWN : v = StepsFrom( p, i, -1, big )
+    case SDLK_HOME     : v = p->Snap( p->nMin )
+    case SDLK_END      : v = p->Snap( p->nMax )
+    case else : return false
+    end select
+    if UserSet( p, i, v ) then Notify( p, Bit( i ), Bit( i ) )
+    return true                                         ' claimed, moved or not (at a limit)
+end function
+
+' The press starts a drag of `which` (0, 1, DRAG_PENDING or TKSL_THUMB_BOTH).
+private sub BeginDrag( byval p as TKSLIDER_STATE ptr, byval which as long, byval grab as long )
+    p->nDrag = which
+    p->nGrab = grab
+    p->isDragging = true
+    if (which = 0) orelse (which = 1) then p->nActive = which
+    SetHot( p, iif( which = TKSL_THUMB_BOTH, -1, which ) )
+    tkHost_SetCapture( p->hWin )
+    tkWidget_Invalidate( p->hWin )
+    UpdateTip( p )
+end sub
+
+private function OnPress( byval p as TKSLIDER_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TK_WIDGET ptr w = p->hWin
+    EnsureLayout( p )
+    if p->Span() <= 0 then return true
+    p->lastX = m->x : p->lastY = m->y
+    p->nDragStart = p->nValue : p->nDragStart1 = p->nUpper
+    dim as long at = Along( p, m->x, m->y )
+    dim as long t = ThumbAt( p, m->x, m->y )
+    if t <> -1 then
+        dim as long c = p->CentreOf( p->ValOf( iif( t = 1, 1, 0 ) ) )
+        BeginDrag( p, t, at - c )
+        return true
+    end if
+    if p->IsRange() andalso p->bAllowRangeDrag andalso tkRect_Contains( p->rcBody, m->x, m->y ) then
+        BeginDrag( p, TKSL_THUMB_BOTH, at - p->CentreOf( p->nValue ) )
+        return true
+    end if
+    dim as long i = NearerThumb( p, at )
+    if p->nTrackClick = TKSL_CLICK_PAGE then
+        dim as double vAt = p->ValueAt( at )
+        if p->Differ( vAt, p->ValOf( i ) ) = false then return true
+        p->nActive = i
+        p->nPageThumb = i
+        p->nPageDir = iif( vAt > p->ValOf( i ), 1, -1 )
+        p->isPaging = true
+        SetHot( p, -1 )
+        tkHost_SetCapture( w )
+        tkWidget_SetTimer( w, TK_TIMER_AUTOREPEAT, p->nRepeatDelay )
+        if PageStep( p ) then Notify( p, Bit( i ), Bit( i ) ) else UpdateTip( p )
+        return true
+    end if
+    ' JUMP: the thumb comes to the pointer (stopped at the other one), and the drag goes on
+    dim as boolean bJumped = UserSet( p, i, p->ValueAt( at ) )
+    BeginDrag( p, i, 0 )
+    if bJumped then Notify( p, Bit( i ), 0 )
+    return true
+end function
+
+' A move under a drag: the bits that changed.
+private function OnDragMove( byval p as TKSLIDER_STATE ptr, byval at as long ) as long
+    dim as double v = p->ValueAt( at - p->nGrab )
+    select case p->nDrag
+    case TKSL_THUMB_BOTH
+        return UserShift( p, v )
+    case DRAG_PENDING
+        ' two thumbs on one spot: the first real move picks the one that can go that way
+        if p->Differ( v, p->nValue ) = false then return 0
+        p->nDrag = iif( v > p->nValue, 1, 0 )
+        p->nActive = p->nDrag
+    end select
+    if UserSet( p, p->nDrag, v ) then return Bit( p->nDrag )
+    return 0
+end function
+
+function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKSLIDER_STATE ptr p = SL( w )
+    if p = 0 then return false
+    dim as TK_HOST ptr h = w->pHost
+
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+
+    case TKM_SIZE
+        p->Refresh()
+        return true
+
+    case TKM_SCALECHANGED
+        Rescale( p, m->fOld, m->fNew )
+        return true
+
+    case TKM_THEMECHANGED
+        tkSlider_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+
+    case TKM_LBUTTONDOWN
+        ' m->clicks is not read: a second click is an ordinary press
+        if p->isEnabled = false then return true
+        tkTipHost_Pop( @p->tip )
+        tkHost_SetFocus( h, w )
+        if CallMessage( p, m ) then return true
+        if p->isReadOnly then return true
+        return OnPress( p, m )
+
+    case TKM_MOUSEMOVE
+        if p->isEnabled = false then return true
+        p->lastX = m->x : p->lastY = m->y
+        if p->isDragging then
+            ' under capture moves come from anywhere: the value clamps, it never snaps back
+            dim as long bits = OnDragMove( p, Along( p, m->x, m->y ) )
+            if bits then
+                CallMessage( p, m )
+                Notify( p, bits, 0 )
+                return true
+            end if
+        elseif p->isPaging = false then
+            EnsureLayout( p )
+            SetHot( p, ThumbAt( p, m->x, m->y ) )
+        end if
+        CallMessage( p, m )
+        return true
+
+    case TKM_MOUSELEAVE
+        if (p->isDragging = false) andalso (p->isPaging = false) then SetHot( p, -1 )
+        CallMessage( p, m )
+        return true
+
+    case TKM_LBUTTONUP
+        ' snapshot before releasing: TKM_CAPTURECHANGED arrives synchronously
+        dim as long bits = EndDrag( p )
+        if p->isPaging then StopPaging( p )
+        if tkHost_GetCapture( h ) = w then tkHost_ReleaseCapture( h )
+        EnsureLayout( p )
+        if h->pHot <> w then SetHot( p, -1 ) else SetHot( p, ThumbAt( p, m->x, m->y ) )
+        CallMessage( p, m )                              ' result ignored
+        if bits then Notify( p, 0, bits )
+        return true
+
+    case TKM_CAPTURECHANGED
+        ' lost mid-gesture (another widget took it): a drag ends where it is, and stands
+        if p->isPaging then StopPaging( p )
+        dim as long bits = EndDrag( p )
+        if bits then Notify( p, 0, bits )
+        return true
+
+    case TKM_TIMER
+        if m->timerId = TK_TIMER_AUTOREPEAT then
+            if p->isPaging = false then tkWidget_KillTimer( w, TK_TIMER_AUTOREPEAT ) : return true
+            tkWidget_SetTimer( w, TK_TIMER_AUTOREPEAT, p->nRepeatMs )
+            if PageReached( p ) then StopPaging( p ) : return true
+            dim as long i = p->nPageThumb
+            if PageStep( p ) then
+                Notify( p, Bit( i ), Bit( i ) )
+            else
+                StopPaging( p )
+            end if
+            return true
+        end if
+
+    case TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        CallMessage( p, m )                              ' reported, never acted on
+        return true
+
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        dim as boolean bFocused = (m->msg = TKM_SETFOCUS)
+        if bFocused <> p->isFocused then p->isFocused = bFocused : tkWidget_Invalidate( w )
+        if bFocused then p->nActive = 0                  ' a press then picks its own thumb
+        p->nWheelAccum = 0
+        UpdateTip( p )
+        CallMessage( p, m )                              ' result ignored: focus is a fact
+        return true
+
+    case TKM_KEYDOWN
+        if p->isEnabled = false then return false
+        if CallMessage( p, m ) then return true
+        if m->key = SDLK_ESCAPE then
+            if p->isDragging = false then return false   ' only a drag claims Esc
+            dim as long bits = 0
+            if p->Differ( p->nValue, p->nDragStart ) then bits or= 1
+            if p->Differ( p->nUpper, p->nDragStart1 ) then bits or= 2
+            p->isDragging = false
+            p->nDrag = DRAG_NONE
+            p->nValue = p->nDragStart : p->nUpper = p->nDragStart1
+            p->Refresh()
+            if tkHost_GetCapture( h ) = w then tkHost_ReleaseCapture( h )
+            UpdateTip( p )
+            if bits then Notify( p, bits, 0 )
+            return true
+        end if
+        if (m->key = SDLK_TAB) andalso (p->isDragging = false) andalso (p->isPaging = false) then return OnKey( p, m->key, m->mods )
+        if p->isReadOnly orelse p->isDragging orelse p->isPaging then return false
+        return OnKey( p, m->key, m->mods )
+
+    case TKM_MOUSEWHEEL
+        if (p->isEnabled = false) orelse p->isReadOnly orelse p->isDragging orelse p->isPaging then return false
+        select case p->nWheelMode
+        case TKSL_WHEEL_NEVER : return false
+        case TKSL_WHEEL_FOCUSED
+            if p->isFocused = false then return false    ' refused: it bubbles (a scroll panel)
+        end select
+        if CallMessage( p, m ) then return true
+        return OnWheel( p, m->wheelY + m->wheelX )
+
+    case TKM_ENABLE
+        p->isEnabled = m->bFlag
+        if p->isEnabled = false then
+            ' the host takes capture, focus and hot at once; a drag ends as it stands
+            p->isDragging = false
+            p->nDrag = DRAG_NONE
+            if p->isPaging then StopPaging( p )
+            p->nHot = -1
+            tkTipHost_Pop( @p->tip )
+        end if
+        UpdateTip( p )
+        tkWidget_Invalidate( w )
+        return true
+
+    case TKM_SHOW
+        if m->bFlag = false then
+            p->isDragging = false
+            p->nDrag = DRAG_NONE
+            if p->isPaging then StopPaging( p )
+            p->nHot = -1
+            HideTip( p )
+        end if
+        return true
+
+    case TKM_DESTROY
+        if p->isPaging then tkWidget_KillTimer( w, TK_TIMER_AUTOREPEAT )
+        tkTipHost_Destroy( @p->vtip )
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function

@@ -1,0 +1,191 @@
+' tkCheckedList self-test. Real windows, real SDL event queue: every input claim is made by
+' PUSHING the SDL event a user would have produced and pumping the host. Two passes, scale
+' pinned at 1.0 and at 1.75. The design: C:\dev\docs\tkControls\CHECKED-LISTS.md §5 (phase C2).
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkCheckedList"
+#import "vendor/tkControls/tkTest"
+using tkCheckedList
+using tkListTree
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gCheck, gChanged, gSel, gAct, gLastIdx = -9
+dim shared as boolean gLastNew, gVeto, gForceOff
+dim shared as TK_WIDGET ptr gFrom, gCheckFrom
+
+function OnItemCheck( byval h as TK_WIDGET ptr, byval idx as long, byref bNew as boolean ) as boolean
+    gCheck += 1 : gLastIdx = idx : gLastNew = bNew : gCheckFrom = h
+    if gForceOff then bNew = false
+    return gVeto = false
+end function
+sub OnChanged( byval h as TK_WIDGET ptr )
+    gChanged += 1 : gFrom = h
+end sub
+sub OnSel( byval h as TK_WIDGET ptr, byval idx as long )
+    gSel += 1 : gFrom = h
+end sub
+sub OnAct( byval h as TK_WIDGET ptr, byval idx as long )
+    gAct += 1 : gFrom = h
+end sub
+sub ResetCounts()
+    gCheck = 0 : gChanged = 0 : gSel = 0 : gAct = 0 : gLastIdx = -9 : gFrom = 0 : gCheckFrom = 0
+    gVeto = false : gForceOff = false
+end sub
+
+' Window pixels of item i's row: x surface-local (default the middle), y the row's middle.
+sub ItemXY( byval cl as TK_WIDGET ptr, byval i as long, byref x as single, byref y as single, byval lx as long = -1 )
+    dim as TK_WIDGET ptr s = tkListTree_GetSurface( tkCheckedList_GetListTree( cl ) )
+    dim as TKRECT a
+    tkWidget_AbsRect( s, a )
+    dim as long ih = tkListTree_GetItemHeightPx( tkCheckedList_GetListTree( cl ) )
+    x = a.left + iif( lx >= 0, lx, s->cw \ 2 )
+    y = a.top + i * ih + ih \ 2
+end sub
+
+sub ClickItem( byval h as TK_HOST ptr, byval cl as TK_WIDGET ptr, byval i as long, byval lx as long = -1, byval clicks as long = 1 )
+    dim as single x, y
+    ItemXY( cl, i, x, y, lx )
+    tkTest_Click( h, x, y, SDL_BUTTON_LEFT, clicks )
+end sub
+
+' The surface-local x of item i's box centre.
+function BoxX( byval cl as TK_WIDGET ptr, byval i as long ) as long
+    dim as TKRECT rc
+    tkCheckedList_GetCheckRect( cl, i, rc )
+    return (rc.left + rc.right) \ 2
+end function
+
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkCheckedList selftest", 420, 360, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host", false, *SDL_GetError() ) : exit sub
+    dim as TTF_Font ptr f10 = tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_UI, 10 )
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 300 )
+
+    dim as TK_WIDGET ptr cl = tkCheckedList_Create( tkHost_Root( h ), 700 )
+    dim as TK_WIDGET ptr lt = tkCheckedList_GetListTree( cl )
+    tkTest_Check( "created: a container holding a check-box ListTree", (cl <> 0) andalso (lt <> 0) andalso (tkWidget_Parent( lt ) = cl) _
+        andalso tkListTree_GetCheckBoxes( lt ) andalso (tkCheckedList_GetID( cl ) = 700) )
+    tkCheckedList_SetFont( cl, f10 )
+    tkCheckedList_SetItemCheckCallback( cl, @OnItemCheck )
+    tkCheckedList_SetCheckedChangedCallback( cl, @OnChanged )
+    tkCheckedList_SetSelChangeCallback( cl, @OnSel )
+    tkCheckedList_SetActivateCallback( cl, @OnAct )
+    dim as long ih = tkListTree_GetItemHeightPx( lt )
+    tkWidget_SetPos( cl, tkHost_Scale( h, 10 ), tkHost_Scale( h, 10 ), tkHost_Scale( h, 240 ), 8 * ih )
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "the list fills the container", (lt->x = 0) andalso (lt->y = 0) andalso (lt->cw = cl->cw) andalso (lt->ch = cl->ch) )
+
+    ' ---- items and keys ---------------------------------------------------------------------
+    tkTest_Check( "AddItem returns the index", (tkCheckedList_AddItem( cl, "Red", "red", 1 ) = 0) andalso (tkCheckedList_AddItem( cl, "Green" ) = 1) )
+    tkCheckedList_AddItem( cl, "Blue", "blue", 3, 33 )                ' 2
+    tkCheckedList_AddItem( cl, "Gray", "gray" )                       ' 3
+    tkTest_Check( "count, text, id, data", (tkCheckedList_GetCount( cl ) = 4) andalso (tkCheckedList_GetItemText( cl, 2 ) = "Blue") _
+        andalso (tkCheckedList_GetItemID( cl, 2 ) = 3) andalso (tkCheckedList_GetItemData( cl, 2 ) = 33) )
+    tkTest_Check( "the key: its own, else the text", (tkCheckedList_GetItemKey( cl, 0 ) = "red") andalso (tkCheckedList_GetItemKey( cl, 1 ) = "Green") )
+    tkTest_Check( "FindItemByKey is exact, FindItemByText ignores case", (tkCheckedList_FindItemByKey( cl, "blue" ) = 2) _
+        andalso (tkCheckedList_FindItemByKey( cl, "Blue" ) = -1) andalso (tkCheckedList_FindItemByText( cl, "bLUE" ) = 2) )
+    tkTest_Check( "the list's rows are the items", (tkListTree_GetCount( lt ) = 4) andalso (tkListTree_GetText( lt, 3 ) = "Gray") )
+
+    ' ---- the value, silently -----------------------------------------------------------------
+    ResetCounts()
+    tkCheckedList_SetCheckedText( cl, " blue ; red;nope;;" )
+    tkTest_Check( "SetCheckedText: trimmed keys, unknown ones ignored", tkCheckedList_GetChecked( cl, 0 ) andalso tkCheckedList_GetChecked( cl, 2 ) _
+        andalso (tkCheckedList_GetChecked( cl, 1 ) = false) andalso (tkCheckedList_GetCheckedCount( cl ) = 2) )
+    tkTest_Check( "GetCheckedText: keys in ITEM order", tkCheckedList_GetCheckedText( cl ) = "red;blue", tkCheckedList_GetCheckedText( cl ) )
+    tkTest_Check( "the setters are silent", (gCheck = 0) andalso (gChanged = 0) )
+    dim as ustring keys()
+    tkTest_Check( "GetCheckedKeys", (tkCheckedList_GetCheckedKeys( cl, keys() ) = 2) andalso (keys(0) = "red") andalso (keys(1) = "blue") )
+    dim as ustring want(0 to 1) = { "Green", "gray" }
+    tkCheckedList_SetCheckedKeys( cl, want() )
+    tkTest_Check( "SetCheckedKeys checks exactly those", (tkCheckedList_GetCheckedText( cl ) = "Green;gray"), tkCheckedList_GetCheckedText( cl ) )
+    dim as integer idx()
+    tkTest_Check( "GetCheckedIndices", (tkCheckedList_GetCheckedIndices( cl, idx() ) = 2) andalso (idx(0) = 1) andalso (idx(1) = 3) )
+    tkCheckedList_SetCheckedText( cl, "" )
+    tkTest_Check( "SetCheckedText of an empty string clears", tkCheckedList_GetCheckedCount( cl ) = 0 )
+    tkCheckedList_SetValueSeparator( cl, " | " )
+    tkCheckedList_SetCheckedText( cl, "red | gray" )
+    tkTest_Check( "another separator", tkCheckedList_GetCheckedText( cl ) = "red | gray", tkCheckedList_GetCheckedText( cl ) )
+    tkCheckedList_SetValueSeparator( cl, ";" )
+    tkCheckedList_CheckAll( cl, true )
+    tkTest_Check( "CheckAll", tkCheckedList_GetCheckedCount( cl ) = 4 )
+    tkCheckedList_CheckAll( cl, false )
+
+    ' ---- insert / delete keep items and checks together ---------------------------------------
+    tkCheckedList_SetChecked( cl, 2, true )                            ' Blue
+    tkTest_Check( "InsertItem", tkCheckedList_InsertItem( cl, 1, "Amber", "amber" ) = 1 )
+    tkTest_Check( "an insert moves the check with its item", tkCheckedList_GetChecked( cl, 3 ) andalso (tkCheckedList_GetItemText( cl, 3 ) = "Blue") _
+        andalso (tkCheckedList_GetChecked( cl, 1 ) = false) andalso (tkListTree_GetText( lt, 1 ) = "Amber") )
+    tkTest_Check( "DeleteItem", tkCheckedList_DeleteItem( cl, 1 ) andalso (tkCheckedList_GetCount( cl ) = 4) _
+        andalso (tkCheckedList_GetItemKey( cl, 2 ) = "blue") andalso tkCheckedList_GetChecked( cl, 2 ) )
+    tkCheckedList_SetChecked( cl, 2, false )
+
+    ' ---- geometry ----------------------------------------------------------------------------
+    dim as TKRECT rc
+    dim as boolean bRc = tkCheckedList_GetCheckRect( cl, 1, rc )
+    dim as long band = tkHost_Scale( h, 20 ), box = tkHost_Scale( h, 16 )
+    if box > ih - 2 * tkHost_Scale( h, 2 ) then box = ih - 2 * tkHost_Scale( h, 2 )
+    tkTest_Check( "flat: the box sits at the left, centred in its band", bRc andalso (rc.left = (band - box) \ 2) andalso (rc.right - rc.left = box) _
+        andalso (rc.top = ih + (ih - box) \ 2), rc.left & "," & rc.top & " " & (rc.right - rc.left) )
+    tkHost_RenderTo( h, false )
+    dim as TKRECT a
+    tkWidget_AbsRect( tkListTree_GetSurface( lt ), a )
+    tkTest_Check( "the stock painter draws the box (and text beside it)", tkTest_TonesIn( h, a.left + rc.left, a.top + rc.top, box, box, &hFF000000ul ) > 1 )
+
+    ' ---- the user ----------------------------------------------------------------------------
+    ResetCounts()
+    ClickItem( h, cl, 1, BoxX( cl, 1 ) )
+    tkTest_Check( "a click on the box checks the item", tkCheckedList_GetChecked( cl, 1 ) )
+    tkTest_Check( "ItemCheck (item, true) then CheckedChanged, once each, with THIS control's handle", (gCheck = 1) andalso (gLastIdx = 1) _
+        andalso gLastNew andalso (gChanged = 1) andalso (gFrom = cl) andalso (gCheckFrom = cl) )
+    tkTest_Check( "the box click does not select", gSel = 0 )
+    gVeto = true
+    ClickItem( h, cl, 1, BoxX( cl, 1 ) )
+    tkTest_Check( "ItemCheck vetoes", tkCheckedList_GetChecked( cl, 1 ) andalso (gCheck = 2) andalso (gChanged = 1) )
+    gVeto = false : gForceOff = true
+    ClickItem( h, cl, 0, BoxX( cl, 0 ) )
+    tkTest_Check( "ItemCheck rewrites: forced off stays off, no CheckedChanged", (tkCheckedList_GetChecked( cl, 0 ) = false) andalso (gCheck = 3) andalso (gChanged = 1) )
+    gForceOff = false
+    ' a row click selects (SelChange with the control's handle); Space checks the focused item
+    gFrom = 0
+    ClickItem( h, cl, 2 )
+    tkTest_Check( "a row click selects, SelChange from the control", (tkCheckedList_GetCurSel( cl ) = 2) andalso (gSel = 1) andalso (gFrom = cl) )
+    tkTest_PushKey( h, SDLK_SPACE )
+    tkTest_Check( "Space checks the focused item", tkCheckedList_GetChecked( cl, 2 ) andalso (gChanged = 2) )
+    ClickItem( h, cl, 2, -1, 2 )
+    tkTest_Check( "a double click on the row activates, from the control", (gAct = 1) andalso (gFrom = cl) )
+    ' a disabled item: no gesture reaches it
+    tkCheckedList_SetItemEnabled( cl, 3, false )
+    dim as long nc = gCheck
+    ClickItem( h, cl, 3, BoxX( cl, 3 ) )
+    tkTest_Check( "a disabled item cannot be checked (no ItemCheck)", (tkCheckedList_GetChecked( cl, 3 ) = false) andalso (gCheck = nc) _
+        andalso (tkCheckedList_GetItemEnabled( cl, 3 ) = false) )
+    ' CheckOnClick
+    tkCheckedList_SetCheckOnClick( cl, true )
+    ClickItem( h, cl, 0 )
+    tkTest_Check( "CheckOnClick: one click selects and checks", tkCheckedList_GetCheckOnClick( cl ) andalso tkCheckedList_GetChecked( cl, 0 ) _
+        andalso (tkCheckedList_GetCurSel( cl ) = 0) )
+    tkCheckedList_SetCheckOnClick( cl, false )
+    tkTest_Check( "the value follows the user", tkCheckedList_GetCheckedText( cl ) = "red;Green;blue", tkCheckedList_GetCheckedText( cl ) )
+
+    ' ---- focus -------------------------------------------------------------------------------
+    tkHost_SetFocus( h, 0 )
+    tkHost_SetFocus( h, cl )
+    tkTest_Check( "focus given to the control lands on the rows", h->pFocus = tkListTree_GetSurface( lt ) )
+
+    ' ---- clear -------------------------------------------------------------------------------
+    tkCheckedList_Clear( cl )
+    tkTest_Check( "Clear", (tkCheckedList_GetCount( cl ) = 0) andalso (tkListTree_GetCount( lt ) = 0) andalso (tkCheckedList_GetCheckedText( cl ) = "") )
+    tkHost_Destroy( h )
+end sub
+
+if tkTest_Init() = false then end 99
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkCheckedList" )
+tkTest_Quit()
+end nFail

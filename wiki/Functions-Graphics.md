@@ -8,7 +8,7 @@ The functions to draw on a graphics screen, read the mouse, build GUI controls f
 - `vendor/tkControls/<Name>`: `#import "vendor/tkControls/<Name>"`, then `using <Name>` to call it by its bare name.
 - `fbgfx.bi`: `#include "fbgfx.bi"`.
 
-Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shapes and pixels](#draw-lines-shapes-and-pixels) · [Draw text](#draw-text) · [Make colours](#make-colours) · [Create and inspect images](#create-and-inspect-images) · [Copy images to and from the screen](#copy-images-to-and-from-the-screen) · [Choose how Put combines pixels](#choose-how-put-combines-pixels) · [Load and save images](#load-and-save-images) · [Draw without flicker](#draw-without-flicker) · [Set the drawing area and coordinates](#set-the-drawing-area-and-coordinates) · [Read the mouse, keyboard and joystick](#read-the-mouse-keyboard-and-joystick) · [Run a program of controls](#run-a-program-of-controls) · [Take text, numbers and dates from the user](#take-text-numbers-and-dates-from-the-user) · [Add buttons and switches](#add-buttons-and-switches) · [Show lists and choices](#show-lists-and-choices) · [Add menus, toolbars and status bars](#add-menus-toolbars-and-status-bars) · [Split, scroll and lay out a window](#split-scroll-and-lay-out-a-window) · [Show messages, colour pickers and tooltips](#show-messages-colour-pickers-and-tooltips) · [Show progress and charts](#show-progress-and-charts) · [Paint and support your own controls](#paint-and-support-your-own-controls)
+Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shapes and pixels](#draw-lines-shapes-and-pixels) · [Draw text](#draw-text) · [Make colours](#make-colours) · [Create and inspect images](#create-and-inspect-images) · [Copy images to and from the screen](#copy-images-to-and-from-the-screen) · [Choose how Put combines pixels](#choose-how-put-combines-pixels) · [Load and save images](#load-and-save-images) · [Draw without flicker](#draw-without-flicker) · [Set the drawing area and coordinates](#set-the-drawing-area-and-coordinates) · [Read the mouse, keyboard and joystick](#read-the-mouse-keyboard-and-joystick) · [Run a program of controls](#run-a-program-of-controls) · [Take text, numbers and dates from the user](#take-text-numbers-and-dates-from-the-user) · [Add buttons and switches](#add-buttons-and-switches) · [Show lists and choices](#show-lists-and-choices) · [Add menus, toolbars and status bars](#add-menus-toolbars-and-status-bars) · [Split, scroll and lay out a window](#split-scroll-and-lay-out-a-window) · [Show messages, colour pickers and tooltips](#show-messages-colour-pickers-and-tooltips) · [Show progress and charts](#show-progress-and-charts) · [Print, preview and export reports](#print-preview-and-export-reports) · [Paint and support your own controls](#paint-and-support-your-own-controls)
 
 ## Open a graphics window
 
@@ -124,6 +124,7 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [tkApp](tkApp) | Runs a tkControls program: start-up, the event loop, forms, fonts and the theme. | `vendor/tkControls/tkApp` |
 | [tkTheme](tkTheme) | Keeps the shared light and dark theme every tkControls control takes its colours from. | `vendor/tkControls/tkTheme` |
 | [tkForms](tkForms) | Provides the base a designed form extends: a window, its layout, show and close. | `vendor/tkControls/tkForms` |
+| [tkLanguage](tkLanguage) | Shows a designed program's captions in another language, from TOML catalogs. | `vendor/tkControls/tkLanguage` |
 
 ## Take text, numbers and dates from the user
 
@@ -135,6 +136,11 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [tkCalendar](tkCalendar) | Draws a month calendar, one month or a grid of up to twelve, with drill-down to years. | `vendor/tkControls/tkCalendar` |
 | [tkCodeEdit](tkCodeEdit) | Embeds a Scintilla code editor as a tkControls widget, with lexing, folding and IME. | `vendor/tkControls/tkCodeEdit` |
 | [tkLabel](tkLabel) | Shows a line or block of text that the user can't edit. | `vendor/tkControls/tkLabel` |
+| [tkSlider](tkSlider) | Draws a slider: a value, or a low and high pair, picked by dragging along a track. | `vendor/tkControls/tkSlider` |
+| [tkTimePicker](tkTimePicker) | Shows an editable time field whose button drops down a chooser of hours and minutes. | `vendor/tkControls/tkTimePicker` |
+| [tkDateTimePicker](tkDateTimePicker) | Shows one field holding a date and a time, with a calendar and time columns beside it. | `vendor/tkControls/tkDateTimePicker` |
+| [tkTimePanel](tkTimePanel) | Draws a time chooser: a column each for the hours, minutes, seconds and AM/PM. | `vendor/tkControls/tkTimePanel` |
+| [tkAutoComplete](tkAutoComplete) | Draws a text box whose typing narrows a dropped list of suggestions, or a search box. | `vendor/tkControls/tkAutoComplete` |
 
 ## Add buttons and switches
 
@@ -153,6 +159,13 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [tkComboBox](tkComboBox) | Shows the current choice on a button that drops a scrolling list of the alternatives. | `vendor/tkControls/tkComboBox` |
 | [tkSelectBar](tkSelectBar) | Draws a strip of text panels where exactly one is current, marked by a line beneath it. | `vendor/tkControls/tkSelectBar` |
 | [tkTabBar](tkTabBar) | Draws a row of document tabs that scroll, close and reorder by drag. | `vendor/tkControls/tkTabBar` |
+| [tkDataGrid](tkDataGrid) | Draws a data grid of typed columns, edited in place, sorted, filtered and totalled. | `vendor/tkControls/tkDataGrid` |
+| [tkCheckedList](tkCheckedList) | Shows a list with a check box on each item, so several can be picked at once. | `vendor/tkControls/tkCheckedList` |
+| [tkCheckedCombo](tkCheckedCombo) | Draws a combo button whose dropdown is a checked list of several picked values. | `vendor/tkControls/tkCheckedCombo` |
+| [tkTokenBox](tkTokenBox) | Draws an input whose values are chips, typed or picked, each with a remove button. | `vendor/tkControls/tkTokenBox` |
+| [tkChip](tkChip) | Draws a chip: a compact pill with a label and an optional avatar, glyph or remove button. | `vendor/tkControls/tkChip` |
+| [tkChipGroup](tkChipGroup) | Draws a group of chips that wrap in rows, with single or multiple selection. | `vendor/tkControls/tkChipGroup` |
+| [tkRating](tkRating) | Draws a row of stars or other shapes filled to a value, which the user can set. | `vendor/tkControls/tkRating` |
 
 ## Add menus, toolbars and status bars
 
@@ -162,6 +175,7 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [tkToolbar](tkToolbar) | Draws a toolbar of command, toggle, split and dropdown buttons that overflows to a menu. | `vendor/tkControls/tkToolbar` |
 | [tkIconPanel](tkIconPanel) | Draws a row or column of icon-only buttons, toggles and separators. | `vendor/tkControls/tkIconPanel` |
 | [tkStatusBar](tkStatusBar) | Draws a status bar of text panels, one of which stretches to fill the leftover width. | `vendor/tkControls/tkStatusBar` |
+| [tkNavigator](tkNavigator) | Draws a record navigator: first, previous, the position, next, last, new and delete. | `vendor/tkControls/tkNavigator` |
 
 ## Split, scroll and lay out a window
 
@@ -169,6 +183,7 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 |---|---|---|
 | [tkSplitter](tkSplitter) | Draws a draggable divider bar between two panes and reports where the user drags it. | `vendor/tkControls/tkSplitter` |
 | [tkScrollPanel](tkScrollPanel) | Scrolls a page of ordinary child widgets that is taller than the space it is shown in. | `vendor/tkControls/tkScrollPanel` |
+| [tkStack](tkStack) | Lays out controls one after another in a column or a row, the layout of a phone screen. | `vendor/tkControls/tkStack` |
 | [tkVScrollBar](tkVScrollBar) | Draws a vertical scrollbar that you size, feed a range, and listen to. | `vendor/tkControls/tkVScrollBar` |
 | [tkHScrollBar](tkHScrollBar) | Draws a horizontal scrollbar that you size, feed a range, and listen to. | `vendor/tkControls/tkHScrollBar` |
 | [tkPanel](tkPanel) | Groups controls on a plain background, with an optional border. | `vendor/tkControls/tkPanel` |
@@ -184,6 +199,8 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [tkColorPicker](tkColorPicker) | Shows a modal colour picker popup and returns the colour and alpha the user chose. | `vendor/tkControls/tkColorPicker` |
 | [tkFileDialog](tkFileDialog) | Shows the system open, save and folder dialogs and returns the chosen paths. | `vendor/tkControls/tkFileDialog` |
 | [tkTooltip](tkTooltip) | Shows an owner-drawn tooltip for a widget after the mouse rests on it. | `vendor/tkControls/tkTooltip` |
+| [tkInfoBar](tkInfoBar) | Shows a message strip in the form's layout, with a severity, a message and actions. | `vendor/tkControls/tkInfoBar` |
+| [tkToast](tkToast) | Shows short-lived notification cards stacked in a corner of a window. | `vendor/tkControls/tkToast` |
 
 ## Show progress and charts
 
@@ -193,6 +210,22 @@ Jump to: [Open a graphics window](#open-a-graphics-window) · [Draw lines, shape
 | [tkSpinner](tkSpinner) | Shows a small animation while something takes its time. | `vendor/tkControls/tkSpinner` |
 | [tkChart](tkChart) | Draws line, column, HLOC and pie charts from series of labelled values. | `vendor/tkControls/tkChart` |
 | [tkPicture](tkPicture) | Shows an image, scaled or clipped to its area. | `vendor/tkControls/tkPicture` |
+| [tkBarcode](tkBarcode) | Draws 1D and 2D barcodes: EAN, UPC, Code 128, Code 39, QR, Data Matrix, PDF417, Aztec. | `vendor/tkControls/tkBarcode` |
+| [tkBadge](tkBadge) | Draws a badge: a dot, a count, a short text or a presence mark, alone or on a control. | `vendor/tkControls/tkBadge` |
+| [tkAvatar](tkAvatar) | Draws a person's avatar: their photo, or their initials on a colour of their own. | `vendor/tkControls/tkAvatar` |
+| [tkAvatarGroup](tkAvatarGroup) | Draws a row of avatars, overlapping or apart, with a +N disc for the rest. | `vendor/tkControls/tkAvatarGroup` |
+
+## Print, preview and export reports
+
+| Function | What it does | From |
+|---|---|---|
+| [tkPrint](tkPrint) | Builds print documents: pages drawn once in points, then shown, printed or exported. | `vendor/tkControls/tkPrint` |
+| [tkPrintPreview](tkPrintPreview) | Shows a print document's pages as paper, with zoom, columns and scrolling. | `vendor/tkControls/tkPrintPreview` |
+| [tkPdf](tkPdf) | Writes a print document as a PDF file. | `vendor/tkControls/tkPdf` |
+| [tkPrinter](tkPrinter) | Lists the printers and prints print documents on them. | `vendor/tkControls/tkPrinter` |
+| [tkPrintDialog](tkPrintDialog) | Shows the Print and Page Setup dialogs, drawn the same on every system. | `vendor/tkControls/tkPrintDialog` |
+| [tkReportViewer](tkReportViewer) | Shows a print document with a toolbar, a preview and a status bar. | `vendor/tkControls/tkReportViewer` |
+| [tkReport](tkReport) | Lays out banded reports over rows of data, with group headers, footers and totals. | `vendor/tkControls/tkReport` |
 
 ## Paint and support your own controls
 

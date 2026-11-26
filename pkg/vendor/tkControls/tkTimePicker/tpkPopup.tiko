@@ -1,0 +1,406 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkTimePicker -- the dropdown (TIMEPICKER.md §7, phase T3). A tkHost popup surface holding a frame
+' widget, a tkTimePanel and, optionally, a Now / OK band. It is built at every open (Wayland fixes
+' a popup's position at creation) and seeded from the picker: pattern, designators, step, range,
+' mode, list range, rows, font, colours, and the value.
+'
+' THE CHOICE IS PENDING. The panel's value moves with every pick, the picker's does not: the field
+' changes only on ACCEPT -- Enter, OK, a pick in the panel's last column or in the list, or Now.
+' Esc, F4, Alt+Up/Down, an outside press and focus leaving the application DISMISS: the popup
+' closes and nothing changes. On accept the popup closes FIRST, then the value is written and
+' TimeChanged fires -- once, and only for a real change (tkDatePicker's order).
+#module "tkTimePicker"
+
+#import "../tkHost"
+#import "../tkTimePanel"
+using tkHost
+using tkPaint
+using tkTimePanel
+
+' The picker behind a popup widget (the panel or the band): the popup's pUser while it is ours.
+function TpkOfPopupWidget( byval w as TK_WIDGET ptr ) as TKTIMEPICKER_STATE ptr
+    if (w = 0) orelse (w->pHost = 0) then return 0
+    dim as TKTIMEPICKER_STATE ptr p = cast( TKTIMEPICKER_STATE ptr, w->pHost->pUser )
+    if (p = 0) orelse (p->pPop <> w->pHost) then return 0
+    return p
+end function
+
+function TpkNowTime( byval p as TKTIMEPICKER_STATE ptr ) as TKTIME
+    if p->bNowPinned then return p->tNowPinned
+    return tkTimePanel_LocalNow()
+end function
+
+function TpkPanelColors( byval p as TKTIMEPICKER_STATE ptr ) as TKTIMEPANEL_COLORS
+    dim as TKTIMEPANEL_COLORS c
+    with p->colors
+        c.BackColor = .PanelBackColor
+        c.BorderColor = .PanelBorderColor
+        c.FocusRingColor = .FocusBorderColor
+        c.ItemColor = .ItemColor
+        c.ItemColorDisabled = .ItemColorDisabled
+        c.ItemBackColorHot = .ItemBackColorHot
+        c.ItemForeColorHot = .ItemForeColorHot
+        c.ItemBackColorSelected = .ItemBackColorSelected
+        c.ItemForeColorSelected = .ItemForeColorSelected
+        c.ColumnDividerColor = .ColumnDividerColor
+    end with
+    return c
+end function
+
+' The picker whose dropdown is being measured (TpkOpen's throwaway panel is not in the popup yet).
+dim shared as TKTIMEPICKER_STATE ptr gMeasuringPicker
+
+sub TpkPanelItemText( byval hPanel as TK_WIDGET ptr, byval nKind as long, byval nValue as long, byref sText as ustring )
+    if nKind <> TKTP_ITEM_TIME then exit sub
+    dim as TKTIMEPICKER_STATE ptr p = TpkOfPopupWidget( hPanel )
+    if p = 0 then p = gMeasuringPicker
+    if (p = 0) orelse (p->FormatCallback = 0) then exit sub
+    sText = TpkFormatOf( p, tkTimePanel_MsToTime( nValue * 1000 ) )
+end sub
+
+function TpkPanelItemDisabled( byval hPanel as TK_WIDGET ptr, byval nKind as long, byval nValue as long ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TpkOfPopupWidget( hPanel )
+    if (p = 0) orelse (p->ItemDisabledCallback = 0) then return false
+    return p->ItemDisabledCallback( p->hWin, nKind, nValue )
+end function
+
+sub TpkSeedPanel( byval p as TKTIMEPICKER_STATE ptr, byval c as TK_WIDGET ptr )
+    tkTimePanel_SetFont( c, TpkFont( p ) )
+    if p->FormatCallback then tkTimePanel_SetItemTextCallback( c, @TpkPanelItemText )
+    tkTimePanel_SetFormat( c, p->sPattern )
+    tkTimePanel_SetAmPmText( c, p->sAm, p->sPm )
+    tkTimePanel_SetStep( c, p->nStep )
+    tkTimePanel_SetMode( c, p->nPanelMode )
+    tkTimePanel_SetListRange( c, p->tListStart, p->tListEnd, p->nListInterval )
+    tkTimePanel_SetVisibleRows( c, p->nVisibleRows )
+    tkTimePanel_SetBorderThickness( c, 0 )
+    dim as TKTIMEPANEL_COLORS cc = TpkPanelColors( p )
+    tkTimePanel_SetColors( c, @cc )
+    tkTimePanel_SetRange( c, p->tMin, p->tMax, p->hasMin, p->hasMax )
+    tkTimePanel_SetTime( c, p->tm )
+    ' the column of the segment the keys were on
+    if TpkIsEditable( p, p->nFocusSeg ) andalso (p->nPanelMode = TKTP_PANEL_COLUMNS) then
+        dim as long kind = p->segs( p->nFocusSeg ).kind
+        if kind = TKTP_SEG_HOUR12 then kind = TKTP_SEG_HOUR24
+        for col as long = 0 to tkTimePanel_GetColumnCount( c ) - 1
+            dim as long ck = tkTimePanel_GetColumnKind( c, col )
+            if ck = TKTP_SEG_HOUR12 then ck = TKTP_SEG_HOUR24
+            if ck = kind then tkTimePanel_SetFocusedColumn( c, col ) : exit for
+        next
+    end if
+end sub
+
+' Accept t from the dropdown: close FIRST, then write and notify once, for a real change.
+sub TpkAccept( byval p as TKTIMEPICKER_STATE ptr, byval t as TKTIME )
+    tkTimePicker_CloseUp( p->hWin )
+    p->sEntry = ""
+    dim as boolean bChanged = false
+    if tkTimePanel_IsTime( t ) then bChanged = TpkUserSet( p, TpkFinish( p, t ) )
+    if bChanged then TpkNotify( p )
+end sub
+
+sub TpkPanelAccept( byval hPanel as TK_WIDGET ptr, byval pTime as TKTIME ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TpkOfPopupWidget( hPanel )
+    if (p = 0) orelse (pTime = 0) then exit sub
+    TpkAccept( p, *pTime )
+end sub
+
+sub TpkPanelDismiss( byval hPanel as TK_WIDGET ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TpkOfPopupWidget( hPanel )
+    if p then tkTimePicker_CloseUp( p->hWin )
+end sub
+
+' ---- the Now / OK band ------------------------------------------------------------------------------
+' Its buttons, band-local: Now alone, OK alone, or Now on the left half and OK on the right.
+sub TpkFooterRects( byval p as TKTIMEPICKER_STATE ptr, byval w as TK_WIDGET ptr, byref rcNow as TKRECT, byref rcOK as TKRECT )
+    tkRect_Set( rcNow, 0, 0, 0, 0 )
+    tkRect_Set( rcOK, 0, 0, 0, 0 )
+    if p->bShowNow andalso p->bShowOK then
+        tkRect_Set( rcNow, 0, 0, w->cw \ 2, w->ch )
+        tkRect_Set( rcOK, w->cw \ 2, 0, w->cw, w->ch )
+    elseif p->bShowNow then
+        tkRect_Set( rcNow, 0, 0, w->cw, w->ch )
+    elseif p->bShowOK then
+        tkRect_Set( rcOK, 0, 0, w->cw, w->ch )
+    end if
+end sub
+
+function TpkFooterProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = cast( TKTIMEPICKER_STATE ptr, w->pData )
+    if p = 0 then return false
+    dim as TKRECT rcNow, rcOK
+    TpkFooterRects( p, w, rcNow, rcOK )
+    select case m->msg
+    case TKM_PAINT
+        dim as TK_PAINT ptr b = m->pPaint
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        b->SetBackColor( p->colors.PanelBackColor )
+        b->PaintRect( @rc )
+        dim as TKRECT rcLine
+        tkRect_Set( rcLine, 0, 0, w->cw, 1 )
+        b->SetBackColor( p->colors.ColumnDividerColor )
+        b->PaintRect( @rcLine )
+        b->SetFont( TpkFont( p ) )
+        if p->bShowNow then
+            b->SetForeColor( iif( p->nFooterHot = 0, p->colors.FooterColorHot, p->colors.FooterColor ) )
+            b->PaintText( p->sNowText, @rcNow, TK_DT_CENTER )
+        end if
+        if p->bShowOK then
+            b->SetForeColor( iif( p->nFooterHot = 1, p->colors.FooterColorHot, p->colors.FooterColor ) )
+            b->PaintText( p->sOKText, @rcOK, TK_DT_CENTER )
+        end if
+        return true
+    case TKM_MOUSEMOVE
+        dim as long hot = -1
+        if tkRect_Contains( rcNow, m->x, m->y ) then hot = 0
+        if tkRect_Contains( rcOK, m->x, m->y ) then hot = 1
+        if hot <> p->nFooterHot then p->nFooterHot = hot : tkWidget_Invalidate( w )
+        return true
+    case TKM_MOUSELEAVE
+        if p->nFooterHot <> -1 then p->nFooterHot = -1 : tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONDOWN
+        if tkRect_Contains( rcNow, m->x, m->y ) then
+            TpkAccept( p, TpkNowTime( p ) )
+        elseif tkRect_Contains( rcOK, m->x, m->y ) then
+            dim as TKTIME t
+            if (p->wPanel <> 0) andalso tkTimePanel_GetTime( p->wPanel, t ) then
+                TpkAccept( p, t )
+            else
+                tkTimePicker_CloseUp( p->hWin )
+            end if
+        end if
+        return true
+    end select
+    return false
+end function
+
+' The popup's frame: the background and the hairline outline.
+function TpkPopProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = cast( TKTIMEPICKER_STATE ptr, w->pData )
+    if p = 0 then return false
+    if m->msg = TKM_PAINT then
+        dim as TK_PAINT ptr b = m->pPaint
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        b->SetBackColor( p->colors.PanelBackColor )
+        b->PaintRect( @rc )
+        b->SetPenColor( p->colors.PanelBorderColor )
+        b->PaintRoundOutline( @rc, 0, CTP_POP_BORDERTHICK )
+        return true
+    end if
+    return false
+end function
+
+' OnClosed: every close lands here, whatever caused it.
+sub TpkPopClosed( byval hPop as TK_HOST ptr )
+    dim as TKTIMEPICKER_STATE ptr p = cast( TKTIMEPICKER_STATE ptr, hPop->pUser )
+    if (p = 0) orelse (p->pPop <> hPop) then exit sub
+    hPop->pUser = 0
+    if p->wPanel then
+        tkTimePanel_SetAcceptCallback( p->wPanel, 0 )
+        tkTimePanel_SetDismissCallback( p->wPanel, 0 )
+        tkTimePanel_SetItemDisabledCallback( p->wPanel, 0 )
+    end if
+    if p->wPop then p->wPop->pData = 0
+    if p->wFooter then p->wFooter->pData = 0
+    p->pPop = 0 : p->wPop = 0 : p->wPanel = 0 : p->wFooter = 0
+    p->nFooterHot = -1
+    p->nClosedBySerial = tkHost_PressSerial()          ' the reopen guard
+    dim as boolean bWasOpen = p->isOpen
+    p->isOpen = false
+    if gOpenTimePicker = p then gOpenTimePicker = 0
+    tkWidget_Invalidate( p->hWin )
+    dim as TPK_DropDownCallbackSub cb = p->DropDownCallback
+    if bWasOpen andalso (p->bSilentClose = false) andalso (cb <> 0) then cb( p->hWin, false )
+end sub
+
+' Build, seed, place and show. The opening edge fires FIRST, before anything is built: the hook
+' for a range that depends on current state.
+sub TpkOpen( byval p as TKTIMEPICKER_STATE ptr )
+    if p->DropDownCallback then p->DropDownCallback( p->hWin, true )
+    dim as TK_HOST ptr h = p->hWin->pHost
+    ' measure with a throwaway panel on our own surface (the popup draws at our scale)
+    dim as TK_WIDGET ptr tmp = tkTimePanel_Create( p->hWin, 0 )
+    tkWidget_Show( tmp, false )
+    gMeasuringPicker = p
+    TpkSeedPanel( p, tmp )
+    dim as long cw, ch
+    tkTimePanel_GetIdealSize( tmp, cw, ch )
+    gMeasuringPicker = 0
+    tkWidget_Destroy( tmp )
+    dim as long bt = CTP_POP_BORDERTHICK
+    dim as long fh = iif( p->bShowNow orelse p->bShowOK, p->nFooterH, 0 )
+    ' at least as wide as the field, so the popup reads as the field's
+    if cw < p->hWin->cw - 2 * bt then cw = p->hWin->cw - 2 * bt
+    dim as long pw = cw + 2 * bt, ph = ch + fh + 2 * bt
+    dim as TKRECT rcAnchor
+    tkWidget_AbsRect( p->hWin, rcAnchor )
+    rcAnchor.bottom -= 1
+    dim as long x, y
+    tkHost_PlacePopup( h, rcAnchor, pw, ph, false, x, y )
+    dim as TK_HOST ptr pop = tkHost_CreatePopup( h, x, y, pw, ph )
+    if pop = 0 then
+        if p->DropDownCallback then p->DropDownCallback( p->hWin, false )     ' keep the pairing
+        exit sub
+    end if
+    pop->clrBack = p->colors.PanelBackColor
+    pop->bPassDismissClick = true          ' the dismissing click still reaches its target
+    pop->pUser = p
+    pop->OnClosed = @TpkPopClosed
+    p->pPop = pop
+    p->wPop = tkWidget_Create( pop, p->idc, @TpkPopProc, p )
+    tkWidget_SetPos( p->wPop, 0, 0, pw, ph )
+    p->wPanel = tkTimePanel_Create( p->wPop, p->idc )
+    tkWidget_SetPos( p->wPanel, bt, bt, cw, ch )
+    TpkSeedPanel( p, p->wPanel )
+    tkTimePanel_SetAcceptCallback( p->wPanel, @TpkPanelAccept )
+    tkTimePanel_SetDismissCallback( p->wPanel, @TpkPanelDismiss )
+    if p->ItemDisabledCallback then tkTimePanel_SetItemDisabledCallback( p->wPanel, @TpkPanelItemDisabled )
+    if fh > 0 then
+        p->wFooter = tkWidget_CreateChild( p->wPop, p->idc, @TpkFooterProc, p )
+        tkWidget_SetPos( p->wFooter, bt, bt + ch, cw, fh )
+    end if
+    p->isOpen = true
+    gOpenTimePicker = p
+    tkHost_Show( pop )
+    tkHost_SetFocus( pop, p->wPanel )
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' ---- public: the dropdown --------------------------------------------------------------------------
+public sub tkTimePicker_DropDown( byval hCtrl as TK_WIDGET ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    if (p->isEnabled = false) orelse p->isOpen orelse (p->nButtonStyle <> TKTP_BUTTON_DROPDOWN) then exit sub
+    if (gOpenTimePicker <> 0) andalso (gOpenTimePicker <> p) then tkTimePicker_CloseUp( gOpenTimePicker->hWin )
+    TpkOpen( p )
+end sub
+
+' Dismisses: the value is unchanged.
+public sub tkTimePicker_CloseUp( byval hCtrl as TK_WIDGET ptr )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if (p = 0) orelse (p->pPop = 0) then exit sub
+    tkHost_Close( p->pPop )        ' OnClosed does the bookkeeping and DropDown(false)
+end sub
+
+public function tkTimePicker_IsDroppedDown( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return false
+    return p->isOpen
+end function
+
+' The tkTimePanel while the dropdown is open, else 0 (it is rebuilt at every open).
+public function tkTimePicker_GetPanelHandle( byval hCtrl as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->wPanel
+end function
+
+public function tkTimePicker_GetPopup( byval hCtrl as TK_WIDGET ptr ) as TK_HOST ptr
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->pPop
+end function
+
+' The Now / OK band while open with one of them on, else 0.
+public function tkTimePicker_GetFooterHandle( byval hCtrl as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return 0
+    return p->wFooter
+end function
+
+' Band-local rects of the Now / OK buttons (empty when hidden). A test seam.
+public sub tkTimePicker_GetFooterButtonRects( byval hCtrl as TK_WIDGET ptr, byref rcNow as TKRECT, byref rcOK as TKRECT )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    tkRect_Set( rcNow, 0, 0, 0, 0 )
+    tkRect_Set( rcOK, 0, 0, 0, 0 )
+    if (p = 0) orelse (p->wFooter = 0) then exit sub
+    TpkFooterRects( p, p->wFooter, rcNow, rcOK )
+end sub
+
+public function tkTimePicker_GetPanelMode( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return TKTP_PANEL_COLUMNS
+    return p->nPanelMode
+end function
+
+public sub tkTimePicker_SetPanelMode( byval hCtrl as TK_WIDGET ptr, byval nMode as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->nPanelMode = iif( nMode = TKTP_PANEL_LIST, TKTP_PANEL_LIST, TKTP_PANEL_COLUMNS )
+end sub
+
+public sub tkTimePicker_SetListRange( byval hCtrl as TK_WIDGET ptr, byref tStart as const TKTIME, byref tEnd as const TKTIME, _
+                                      byval nIntervalSeconds as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    if tkTimePanel_IsTime( tStart ) then p->tListStart = tStart else p->tListStart = tkTimePanel_MakeTime( 0, 0 )
+    if tkTimePanel_IsTime( tEnd ) then p->tListEnd = tEnd else p->tListEnd = tkTimePanel_MakeTime( 23, 59 )
+    p->nListInterval = iif( nIntervalSeconds < 60, 60, nIntervalSeconds )
+end sub
+
+public sub tkTimePicker_GetListRange( byval hCtrl as TK_WIDGET ptr, byref tStart as TKTIME, byref tEnd as TKTIME, _
+                                      byref nIntervalSeconds as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    tStart = p->tListStart : tEnd = p->tListEnd : nIntervalSeconds = p->nListInterval
+end sub
+
+public function tkTimePicker_GetVisibleRows( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return TKTP_DEFAULT_ROWS
+    return p->nVisibleRows
+end function
+
+public sub tkTimePicker_SetVisibleRows( byval hCtrl as TK_WIDGET ptr, byval nRows as long )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    if nRows < 1 then nRows = 1
+    if nRows > 24 then nRows = 24
+    p->nVisibleRows = nRows
+end sub
+
+public function tkTimePicker_GetShowNow( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return false
+    return p->bShowNow
+end function
+
+public sub tkTimePicker_SetShowNow( byval hCtrl as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then p->bShowNow = bShow
+end sub
+
+public function tkTimePicker_GetShowOK( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then return false
+    return p->bShowOK
+end function
+
+public sub tkTimePicker_SetShowOK( byval hCtrl as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p then p->bShowOK = bShow
+end sub
+
+' The band's labels (localization); "" keeps the default.
+public sub tkTimePicker_SetFooterText( byval hCtrl as TK_WIDGET ptr, byval sNow as ustring, byval sOK as ustring )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    if len( sNow ) then p->sNowText = sNow
+    if len( sOK ) then p->sOKText = sOK
+end sub
+
+' Pins "now" for the Now button (tests, screenshots); bPin = FALSE goes back to the clock.
+public sub tkTimePicker_SetNow( byval hCtrl as TK_WIDGET ptr, byref t as const TKTIME, byval bPin as boolean = true )
+    dim as TKTIMEPICKER_STATE ptr p = TPK( hCtrl )
+    if p = 0 then exit sub
+    p->tNowPinned = t
+    p->bNowPinned = bPin andalso tkTimePanel_IsTime( t )
+end sub

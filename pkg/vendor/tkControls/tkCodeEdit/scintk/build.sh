@@ -29,11 +29,28 @@ esac
 # THE OBJECT DIRECTORY IS PER FLAVOUR AND ARCH: the objects of one are not the objects of
 # another ('machine type x64 conflicts with x86', measured), and the timestamp test
 # below would not notice a stale one -- it only compares against the SOURCE.
+# ANDROID, from Windows through build/vendorfetch.sh --target android-x86_64|android-arm64
+# (docs/tiko-android A6 step 1): the NDK's clang++ and its static libc++, the archive only.
+# tkCodeEdit links scintk in on Android always; nothing loads a libscintk.so there.
+if [ "${TIKO_VENDOR_HOST:-}" = android ]; then
+    OS=android
+    AARCH=${TIKO_VENDOR_ARCH:-x86_64}
+    NDK=${TIKO_ANDROID_NDK:?run me through build/vendorfetch.sh --target android-...}
+    case $AARCH in x86_64) TRIPLE=x86_64-linux-android29 ;; arm64) TRIPLE=aarch64-linux-android29 ;;
+        *) echo "scintk: android arch '$AARCH'" >&2; exit 1 ;; esac
+fi
 OBJ=$HERE/out/$OS
 OUT=$HERE/bin/$OS
+[ "$OS" = android ] && OBJ=$HERE/out/android-$AARCH && OUT=$HERE/bin/android-$AARCH
 mkdir -p "$OBJ" "$OUT"
 INC="-I$V/scintilla/include -I$V/scintilla/src -I$V/lexilla/include -I$V/lexilla/lexlib -I$HERE"
-if [ "$OS" = windows ]; then
+if [ "$OS" = android ]; then
+    NBIN=$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin
+    CXX=$NBIN/clang++.exe
+    FLAGS="-std=c++17 -O2 --target=$TRIPLE -fPIC -fvisibility=hidden"
+    SO=
+    O=o
+elif [ "$OS" = windows ]; then
     CXX=${CXX:-clang++}
     if [ "$FLAVOUR" = mingw ]; then
         TARGET=${TIKO_MINGW_TARGET:-x86_64-w64-mingw32}
@@ -116,7 +133,9 @@ for s in "${srcs[@]}"; do
         n=$((n+1))
     fi
 done
-if [ "$OS" = windows ]; then
+if [ "$OS" = android ]; then
+    :   # no shared library: the archive below is all Android gets
+elif [ "$OS" = windows ]; then
     if [ "$FLAVOUR" = mingw ]; then
         # libstdc++ AND libwinpthread BY NAME: the gcc driver adds both by itself and
         # clang does not ('undefined symbol: pthread_once'). Both are linked statically,
@@ -134,7 +153,7 @@ else
 fi
 
 # THE HOST'S ARCHITECTURE on Linux: aarch64 is linux-arm64 (docs/tiko-linux-arm64 L4).
-case $OS in windows) ARCH=x86_64 ;; macos) ARCH=arm64 ;; *) ARCH=x86_64; [ "$(uname -m)" = aarch64 ] && ARCH=arm64 ;; esac
+case $OS in windows) ARCH=x86_64 ;; macos) ARCH=arm64 ;; android) ARCH=$AARCH ;; *) ARCH=x86_64; [ "$(uname -m)" = aarch64 ] && ARCH=arm64 ;; esac
 # THE MinGW FLAVOUR NAMES ITS ARCH ITSELF, from the target it was asked for: i686 is 'x86',
 # the name the foreignlib probe looks for (stem_windows_x86_*.a).
 if [ "$OS" = windows ] && [ "$FLAVOUR" = mingw ]; then
@@ -163,7 +182,9 @@ stale=0
 for o in "${sobjs[@]}"; do [ "$o" -nt "$ST" ] && stale=1; done
 if [ "$stale" = 1 ]; then
     rm -f "$ST"
-    if [ "$OS" = windows ] && [ "$FLAVOUR" != mingw ]; then
+    if [ "$OS" = android ]; then
+        "$NBIN/llvm-ar.exe" rcs "$(cygpath -m "$ST")" $(for o in "${sobjs[@]}"; do cygpath -m "$o"; done)
+    elif [ "$OS" = windows ] && [ "$FLAVOUR" != mingw ]; then
         "$(dirname "$(command -v "$CXX")")/llvm-lib.exe" -out:"$(cygpath -m "$ST")" $(for o in "${sobjs[@]}"; do cygpath -m "$o"; done)
     else
         # THE MinGW ARCHIVE IS A GNU ARCHIVE: llvm-lib writes the MSVC .lib form, and the
@@ -171,4 +192,4 @@ if [ "$stale" = 1 ]; then
         "${AR:-ar}" rcs "$ST" "${sobjs[@]}"
     fi
 fi
-echo "scintk: $SO, $ST ($n compiled)"
+echo "scintk: ${SO:+$SO, }$ST ($n compiled)"

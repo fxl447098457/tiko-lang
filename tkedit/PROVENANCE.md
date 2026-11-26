@@ -38,9 +38,9 @@ the name `tiko-studio` → `tkEdit` (incl. `platform.APP_NAME` and the run-scrip
 | `src/app/documents` | `src/app/documents` | `SplitMode` / `Split` dropped (the panes own the split); `Other` is the buffer's view in pane 2 |
 | `src/app/findstrip` | `src/app/findbar` | rows of the status line's height in its place, labels, a `Sel` toggle, a Go to Line mode, Ctrl+Alt+Enter, Enter's text swallowed |
 | `src/app/popuplist` | — | new: the one chooser popup (query box + tkListTree, fuzzy filter, Ctrl-release accept) |
-| `src/core/session` | `src/core/projstate` (shape) | new: session.toml / the `.tkedit` tables, `StoredPath`/`FullPath` from projstate |
+| `src/core/session` | `src/core/projstate` (shape) | new: session.toml / a project's session file, `StoredPath`/`FullPath` from projstate |
 | `src/core/tests/sessionsuite` | — | new |
-| `src/core/project` | — | new: the `.tkedit` file; `SplitArgs` from tiko-studio's `tsc/manifest` |
+| `src/core/project` | — | new: reads the project's tiko.toml, the per-project options file; `SplitArgs` from tiko-studio's `tsc/manifest` |
 | `src/core/tests/projectsuite` | — | new |
 | `src/core/tests/fmtsuite` | `src/core/tests/fmtsuite` | — |
 | `src/core/tests/keysdoc.tiko` | — | new: KEYS.md from the command table |

@@ -1,0 +1,453 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkBarcode, part three: PAPER (BARCODE.md §7, phase BC2). On a page the size is a fact of the
+' standard, not of a widget: the module is the X-dimension in millimetres (zint's default per
+' symbology unless given), bars are drawn with tkPage_FillRectExact (no 0.1 pt snap; PDF keeps
+' 0.001 pt), and with a device resolution given (fDpi) the module, the origin and the bar height
+' are rounded to whole device dots first -- DOT-SNAP (D-6), so a raster printer or a PNG never
+' rounds two edges of one bar differently. The exports (PDF, PNG, SVG, clipboard) are built on it.
+#module "tkBarcode"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkPrint" public
+#import "../tkPdf" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkPrint
+using tkPdf
+
+public enum
+    TKBC_ALIGN_LEFT = 0
+    TKBC_ALIGN_CENTER
+    TKBC_ALIGN_RIGHT
+end enum
+
+' How a symbol is drawn on paper.
+public type TKBARCODE_PAGELOOK
+    fXdimMm      as float32               ' the module (X-dimension); 0 = zint's default for the symbology
+    fBarHeightMm as float32               ' 1D bars; 0 = the spec's BarHeight (modules), else zint's 50
+    fDpi         as float32               ' > 0: snap to this device's dots (a printer, a PNG); 0 = exact (PDF)
+    nAlign       as int32 = TKBC_ALIGN_CENTER   ' across the rect; the symbol sits at its top
+    bText        as boolean = true        ' the HRT / caption, when the spec shows it
+    fTextPt      as float32               ' HRT size; 0 = zint's size for it x the module (EAN ~9.4 pt)
+    sFontSrc     as string                ' "" = tkControls' UI font (Inter)
+    pColors      as TKBARCODE_COLORS ptr  ' 0 = black on white
+end type
+
+' Where a symbol lands on a page, in points.
+public type TKBC_PAGEGEOM
+    x       as float32                    ' the symbol's top-left (quiet zones included)
+    y       as float32
+    xdim    as float32                    ' one module, points (after dot-snap)
+    barPt   as float32                    ' 1D: the bars' height
+    wPt     as float32                    ' the whole symbol with its HRT
+    hPt     as float32
+    textPt  as float32
+    bText   as boolean
+    bFits   as boolean                    ' inside the rect it was laid out in
+end type
+
+private function DotRound( byval v as float32, byval dot as float32 ) as float32
+    if dot <= 0 then return v
+    return int( v / dot + 0.5 ) * dot
+end function
+
+private function PageMapY( byref sym as TKBARCODE_SYMBOL, byref g as TKBC_PAGEGEOM, byval ym as float32 ) as float32
+    if sym.b2D orelse (sym.fBarH <= 0) then return g.y + ym * g.xdim
+    if ym <= sym.fBarTop then return g.y + ym * g.xdim
+    dim as float32 yb = g.y + sym.fBarTop * g.xdim
+    if ym <= sym.fBarTop + sym.fBarH then return yb + ( ym - sym.fBarTop ) * g.barPt / sym.fBarH
+    return yb + g.barPt + ( ym - sym.fBarTop - sym.fBarH ) * g.xdim
+end function
+
+private function PageText( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, byref pl as TKBARCODE_PAGELOOK ) as boolean
+    if (pl.bText = false) orelse (spec.nTextMode = TKBC_TEXT_NONE) then return false
+    if len( spec.wszCaption ) > 0 then return true
+    return (sym.b2D = false) andalso (sym.nTexts > 0)
+end function
+
+' Lay sym out on a page inside rc (points). FALSE when there is no symbol to draw.
+public function tkBarcode_PageGeometry( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                        byref pl as TKBARCODE_PAGELOOK, byref rc as TKRECTF, _
+                                        byref g as TKBC_PAGEGEOM ) as boolean
+    dim as TKBC_PAGEGEOM z
+    g = z
+    if (sym.nStatus = TKBC_EMPTY) orelse (sym.nStatus >= TKBC_ERR_FIRST) orelse (sym.nW <= 0) then return false
+    dim as float32 dot = iif( pl.fDpi > 0, TK_PT_PER_INCH / pl.fDpi, 0 )
+    dim as float32 mm = iif( pl.fXdimMm > 0, pl.fXdimMm, sym.fDefaultXdimMm )
+    if mm <= 0 then mm = 0.33
+    g.xdim = mm * TK_PT_PER_MM
+    if dot > 0 then
+        g.xdim = DotRound( g.xdim, dot )
+        if g.xdim < dot then g.xdim = dot
+    end if
+    if sym.b2D = false then
+        if pl.fBarHeightMm > 0 then
+            g.barPt = pl.fBarHeightMm * TK_PT_PER_MM
+        elseif spec.fBarHeight > 0 then
+            g.barPt = spec.fBarHeight * g.xdim
+        else
+            g.barPt = sym.fBarH * g.xdim
+        end if
+        if dot > 0 then g.barPt = DotRound( g.barPt, dot )
+    end if
+    g.bText = PageText( sym, spec, pl )
+    if g.bText then
+        if pl.fTextPt > 0 then
+            g.textPt = pl.fTextPt
+        elseif (len( spec.wszCaption ) = 0) andalso (sym.nTexts > 0) then
+            g.textPt = sym.texts(0).size * g.xdim
+        else
+            g.textPt = 8
+        end if
+    end if
+    g.wPt = sym.nW * g.xdim
+    ' height: to the lowest rect, then the HRT under it (zint's baselines, or a caption line)
+    dim as float32 hSym = PageMapY( sym, g, sym.nH ) - g.y
+    g.hPt = hSym
+    if g.bText then
+        if (len( spec.wszCaption ) = 0) andalso (sym.fTextBottom > 0) then
+            dim as float32 tb = PageMapY( sym, g, sym.fTextBottom ) - g.y
+            ' our font, not zint's: keep a full line under the lowest baseline
+            dim as float32 baseMax = 0
+            for i as int32 = 0 to sym.nTexts - 1
+                dim as float32 b = PageMapY( sym, g, sym.texts(i).y ) - g.y
+                if b > baseMax then baseMax = b
+            next
+            if baseMax + g.textPt * 0.3 > tb then tb = baseMax + g.textPt * 0.3
+            if tb > g.hPt then g.hPt = tb
+        else
+            g.hPt = hSym + g.xdim + g.textPt * 1.25
+        end if
+    end if
+    ' place it: across by alignment, at the top
+    dim as float32 rw = rc.right - rc.left
+    select case pl.nAlign
+    case TKBC_ALIGN_LEFT  : g.x = rc.left
+    case TKBC_ALIGN_RIGHT : g.x = rc.right - g.wPt
+    case else             : g.x = rc.left + ( rw - g.wPt ) / 2
+    end select
+    g.y = rc.top
+    if dot > 0 then g.x = DotRound( g.x, dot ) : g.y = DotRound( g.y, dot )
+    g.bFits = (g.wPt <= rw + 0.001) andalso (g.hPt <= rc.bottom - rc.top + 0.001)
+    return true
+end function
+
+' The page size a symbol needs (points): for a report item, a label, AutoSize on paper.
+public sub tkBarcode_PageSize( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                               byref pl as TKBARCODE_PAGELOOK, byref wPt as float32, byref hPt as float32 )
+    dim as TKBC_PAGEGEOM g
+    dim as TKRECTF rc
+    tkRectF_Set( rc, 0, 0, 100000, 100000 )
+    wPt = 0 : hPt = 0
+    if tkBarcode_PageGeometry( sym, spec, pl, rc, g ) then wPt = g.wPt : hPt = g.hPt
+end sub
+
+' Draw sym on a page in rc (points). TRUE when a symbol was drawn and it fits. The error state draws
+' a thin red frame and nothing else -- never a symbol that scans wrong (§6.4); empty draws nothing.
+public function tkBarcode_PaintPage( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byref sym as TKBARCODE_SYMBOL, _
+                                     byref spec as TKBARCODE_SPEC, byref pl as TKBARCODE_PAGELOOK ) as boolean
+    if pg = 0 then return false
+    dim as TKBARCODE_COLORS cDef
+    dim as TKBARCODE_COLORS ptr c = iif( pl.pColors <> 0, pl.pColors, @cDef )
+    if sym.nStatus >= TKBC_ERR_FIRST then
+        tkPage_SetPen( pg, 0.5 )
+        tkPage_SetLineColor( pg, c->ErrorColor )
+        tkPage_StrokeRect( pg, rc )
+        return false
+    end if
+    dim as TKBC_PAGEGEOM g
+    if tkBarcode_PageGeometry( sym, spec, pl, rc, g ) = false then return false
+
+    dim as TKRECTF r
+    ' the ground (quiet zones and HRT band): drawn only when it is not white paper
+    if ( c->BackColor and &h00FFFFFFul ) <> &h00FFFFFFul then
+        tkPage_SetFillColor( pg, c->BackColor )
+        tkRectF_Set( r, g.x, g.y, g.x + g.wPt, g.y + g.hPt )
+        tkPage_FillRectExact( pg, r )
+    end if
+    tkPage_SetFillColor( pg, c->BarColor )
+    for i as int32 = 0 to sym.nRects - 1
+        dim as float32 x1 = g.x + sym.rects(i).x * g.xdim, x2 = g.x + ( sym.rects(i).x + sym.rects(i).w ) * g.xdim
+        dim as float32 y1 = PageMapY( sym, g, sym.rects(i).y ), y2 = PageMapY( sym, g, sym.rects(i).y + sym.rects(i).h )
+        tkRectF_Set( r, x1, y1, x2, y2 )
+        tkPage_FillRectExact( pg, r )
+    next
+    for i as int32 = 0 to sym.nHexes - 1
+        dim as TKPOINTF pts(0 to 5)
+        dim as float32 cx = g.x + sym.hexes(i).x * g.xdim, cy = PageMapY( sym, g, sym.hexes(i).y )
+        dim as float32 rr = sym.hexes(i).d * g.xdim / 2 / 0.8660254
+        for j as int32 = 0 to 5
+            dim as float32 a = ( 90 + 60 * j + sym.hexes(i).rot ) * 3.14159265 / 180
+            pts(j).x = cx + rr * cos( a ) : pts(j).y = cy - rr * sin( a )
+        next
+        tkPage_Polygon( pg, @pts(0), 6 )
+    next
+    for i as int32 = 0 to sym.nRings - 1
+        dim as float32 cx = g.x + sym.rings(i).x * g.xdim, cy = PageMapY( sym, g, sym.rings(i).y )
+        dim as float32 ro = ( sym.rings(i).d + sym.rings(i).w ) * g.xdim / 2, ri = ( sym.rings(i).d - sym.rings(i).w ) * g.xdim / 2
+        tkPage_SetFillColor( pg, c->BarColor )
+        tkRectF_Set( r, cx - ro, cy - ro, cx + ro, cy + ro ) : tkPage_FillEllipse( pg, r )
+        if (sym.rings(i).w > 0) andalso (ri > 0) then
+            tkPage_SetFillColor( pg, c->BackColor )
+            tkRectF_Set( r, cx - ri, cy - ri, cx + ri, cy + ri ) : tkPage_FillEllipse( pg, r )
+        end if
+    next
+
+    if g.bText then
+        dim as TKFONTSPEC fs
+        fs.src = pl.sFontSrc
+        fs.pt = g.textPt
+        tkPage_SetFont( pg, fs )
+        tkPage_SetTextColor( pg, c->TextColor )
+        dim as float32 lh = tkPage_TextHeight( pg )
+        if len( spec.wszCaption ) > 0 then
+            dim as float32 top = PageMapY( sym, g, sym.nH ) + g.xdim
+            tkRectF_Set( r, g.x - 1000, top, g.x + g.wPt + 1000, top + lh )
+            tkPage_Text( pg, spec.wszCaption, r, TK_DT_CENTER or TK_DT_TOP or TK_DT_NOCLIP )
+        else
+            for i as int32 = 0 to sym.nTexts - 1
+                dim as float32 xc = g.x + sym.texts(i).x * g.xdim
+                dim as float32 base_ = PageMapY( sym, g, sym.texts(i).y )
+                dim as float32 tw = tkPage_MeasureText( pg, sym.texts(i).s )
+                dim as float32 x1
+                select case sym.texts(i).halign
+                case 1    : x1 = xc
+                case 2    : x1 = xc - tw
+                case else : x1 = xc - tw / 2
+                end select
+                ' the line box's top: the baseline less the ascent (~0.78 of Inter's line)
+                dim as float32 top = base_ - lh * 0.78
+                tkRectF_Set( r, x1, top, x1 + tw + 0.5, top + lh )
+                tkPage_Text( pg, sym.texts(i).s, r, TK_DT_LEFT or TK_DT_TOP or TK_DT_NOCLIP )
+            next
+        end if
+    end if
+    return g.bFits
+end function
+
+' ==========================================================================================
+' Exports: a one-page document exactly the symbol's size (plus margins), then tkPdf / tkPrint
+' ==========================================================================================
+' A document holding the symbol on a page of its own size plus fMarginMm round it. The caller
+' destroys it (tkPrintDoc_Destroy). 0 when there is no symbol.
+public function tkBarcode_MakeDocument( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                        byref pl as TKBARCODE_PAGELOOK, byval fMarginMm as float32 = 1 ) as TK_PRINTDOC ptr
+    dim as float32 wPt, hPt
+    tkBarcode_PageSize( sym, spec, pl, wPt, hPt )
+    if (wPt <= 0) orelse (hPt <= 0) then return 0
+    dim as float32 m = fMarginMm * TK_PT_PER_MM
+    dim as float32 dot = iif( pl.fDpi > 0, TK_PT_PER_INCH / pl.fDpi, 0 )
+    if dot > 0 then m = DotRound( m, dot )
+    dim as TKPAGESETUP ps
+    ps.paper = TK_PAPER_CUSTOM
+    ps.widthPt = wPt + 2 * m : ps.heightPt = hPt + 2 * m
+    if dot > 0 then ps.widthPt = int( ps.widthPt / dot + 0.999 ) * dot : ps.heightPt = int( ps.heightPt / dot + 0.999 ) * dot
+    ps.marginL = 0 : ps.marginT = 0 : ps.marginR = 0 : ps.marginB = 0
+    dim as TK_PRINTDOC ptr doc = tkPrintDoc_Create( "Barcode" )
+    if doc = 0 then return 0
+    dim as TK_PAGE ptr pg = tkPrintDoc_AddPageEx( doc, ps )
+    dim as TKRECTF rc
+    tkRectF_Set( rc, m, m, m + wPt, m + hPt )
+    tkBarcode_PaintPage( pg, rc, sym, spec, pl )
+    return doc
+end function
+
+' A PDF of the symbol alone (vector bars, embedded HRT font).
+public function tkBarcode_ExportPdfSymbol( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                           byref pl as TKBARCODE_PAGELOOK, byref path as ustring ) as boolean
+    dim as TK_PRINTDOC ptr doc = tkBarcode_MakeDocument( sym, spec, pl )
+    if doc = 0 then return false
+    dim as boolean ok = tkPrintDoc_ExportPdf( doc, path )
+    tkPrintDoc_Destroy( doc )
+    return ok
+end function
+
+' The symbol as a surface at dpi, every module a whole number of pixels (dot-snap). The caller
+' destroys it (SDL_DestroySurface).
+public function tkBarcode_RenderSymbolSurface( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                               byref pl as TKBARCODE_PAGELOOK, byval dpi as float32 ) as SDL_Surface ptr
+    if dpi <= 0 then return 0
+    dim as TKBARCODE_PAGELOOK p2 = pl
+    p2.fDpi = dpi
+    dim as TK_PRINTDOC ptr doc = tkBarcode_MakeDocument( sym, spec, p2 )
+    if doc = 0 then return 0
+    dim as SDL_Surface ptr s = tkPrintDoc_RenderSurface( doc, 0, dpi )
+    tkPrintDoc_Destroy( doc )
+    return s
+end function
+
+public function tkBarcode_ExportPngSymbol( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                           byref pl as TKBARCODE_PAGELOOK, byref path as ustring, _
+                                           byval dpi as float32 = 300 ) as boolean
+    dim as SDL_Surface ptr s = tkBarcode_RenderSymbolSurface( sym, spec, pl, dpi )
+    if s = 0 then return false
+    dim as string p8 = path
+    dim as boolean ok = IMG_SavePNG( s, strptr( p8 ) )
+    SDL_DestroySurface( s )
+    return ok
+end function
+
+private function XmlEsc( byref s as string ) as string
+    dim as string o = ""
+    for i as int32 = 1 to len( s )
+        dim as string ch = mid( s, i, 1 )
+        select case ch
+        case "&" : o &= "&amp;"
+        case "<" : o &= "&lt;"
+        case ">" : o &= "&gt;"
+        case """" : o &= "&quot;"
+        case else : o &= ch
+        end select
+    next
+    return o
+end function
+
+private function Num( byval v as float32 ) as string
+    dim as string s = str( int( v * 1000 + iif( v < 0, -0.5, 0.5 ) ) / 1000 )
+    if left( s, 1 ) = "." then s = "0" & s
+    if left( s, 2 ) = "-." then s = "-0" & mid( s, 2 )
+    return s
+end function
+
+private function SvgColor( byval c as ulong ) as string
+    return "#" & right( "000000" & hex( c and &h00FFFFFFul ), 6 )
+end function
+
+' The symbol as SVG text: millimetres outside, module units inside (viewBox), one <rect> per run
+' of dark modules, the HRT as <text> at zint's positions. UTF-8.
+public function tkBarcode_SvgSymbol( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                     byref pl as TKBARCODE_PAGELOOK ) as string
+    dim as TKBC_PAGEGEOM g
+    dim as TKBARCODE_PAGELOOK p2 = pl
+    p2.fDpi = 0
+    dim as TKRECTF rc
+    tkRectF_Set( rc, 0, 0, 100000, 100000 )
+    if tkBarcode_PageGeometry( sym, spec, p2, rc, g ) = false then return ""
+    dim as TKBARCODE_COLORS cDef
+    dim as TKBARCODE_COLORS ptr c = iif( pl.pColors <> 0, pl.pColors, @cDef )
+    ' module units: x in modules; y through the bar stretch, in modules too
+    dim as float32 k = g.xdim
+    dim as float32 vw = g.wPt / k, vh = g.hPt / k
+    dim as float32 mmPerUnit = k / TK_PT_PER_MM
+    dim as string s = "<?xml version=""1.0"" encoding=""UTF-8""?>" & chr( 10 )
+    s &= "<svg xmlns=""http://www.w3.org/2000/svg"" version=""1.1"" width=""" & Num( vw * mmPerUnit ) & "mm"" height=""" & _
+         Num( vh * mmPerUnit ) & "mm"" viewBox=""0 0 " & Num( vw ) & " " & Num( vh ) & """ shape-rendering=""crispEdges"">" & chr( 10 )
+    s &= "<rect x=""0"" y=""0"" width=""" & Num( vw ) & """ height=""" & Num( vh ) & """ fill=""" & SvgColor( c->BackColor ) & """/>" & chr( 10 )
+    s &= "<g fill=""" & SvgColor( c->BarColor ) & """>" & chr( 10 )
+    for i as int32 = 0 to sym.nRects - 1
+        dim as float32 y1 = ( PageMapY( sym, g, sym.rects(i).y ) - g.y ) / k, y2 = ( PageMapY( sym, g, sym.rects(i).y + sym.rects(i).h ) - g.y ) / k
+        s &= "<rect x=""" & Num( sym.rects(i).x ) & """ y=""" & Num( y1 ) & """ width=""" & Num( sym.rects(i).w ) & _
+             """ height=""" & Num( y2 - y1 ) & """/>" & chr( 10 )
+    next
+    for i as int32 = 0 to sym.nHexes - 1
+        dim as float32 cx = sym.hexes(i).x, cy = ( PageMapY( sym, g, sym.hexes(i).y ) - g.y ) / k
+        dim as float32 rr = sym.hexes(i).d / 2 / 0.8660254
+        dim as string pts = ""
+        for j as int32 = 0 to 5
+            dim as float32 a = ( 90 + 60 * j + sym.hexes(i).rot ) * 3.14159265 / 180
+            pts &= Num( cx + rr * cos( a ) ) & "," & Num( cy - rr * sin( a ) ) & " "
+        next
+        s &= "<polygon points=""" & rtrim( pts ) & """/>" & chr( 10 )
+    next
+    for i as int32 = 0 to sym.nRings - 1
+        dim as float32 cy = ( PageMapY( sym, g, sym.rings(i).y ) - g.y ) / k
+        if sym.rings(i).w > 0 then
+            s &= "<circle cx=""" & Num( sym.rings(i).x ) & """ cy=""" & Num( cy ) & """ r=""" & Num( sym.rings(i).d / 2 ) & _
+                 """ fill=""none"" stroke=""" & SvgColor( c->BarColor ) & """ stroke-width=""" & Num( sym.rings(i).w ) & """/>" & chr( 10 )
+        else
+            s &= "<circle cx=""" & Num( sym.rings(i).x ) & """ cy=""" & Num( cy ) & """ r=""" & Num( sym.rings(i).d / 2 ) & """/>" & chr( 10 )
+        end if
+    next
+    s &= "</g>" & chr( 10 )
+    if g.bText then
+        dim as float32 fsz = g.textPt / k
+        s &= "<g fill=""" & SvgColor( c->TextColor ) & """ font-family=""Inter, Arial, Helvetica, sans-serif"" font-size=""" & Num( fsz ) & """>" & chr( 10 )
+        if len( spec.wszCaption ) > 0 then
+            dim as string t8 = spec.wszCaption
+            dim as float32 base_ = ( PageMapY( sym, g, sym.nH ) - g.y ) / k + 1 + fsz * 0.9
+            s &= "<text x=""" & Num( sym.nW / 2 ) & """ y=""" & Num( base_ ) & """ text-anchor=""middle"">" & XmlEsc( t8 ) & "</text>" & chr( 10 )
+        else
+            for i as int32 = 0 to sym.nTexts - 1
+                dim as string t8 = sym.texts(i).s
+                dim as string anchor = "middle"
+                if sym.texts(i).halign = 1 then anchor = "start"
+                if sym.texts(i).halign = 2 then anchor = "end"
+                dim as float32 base_ = ( PageMapY( sym, g, sym.texts(i).y ) - g.y ) / k
+                s &= "<text x=""" & Num( sym.texts(i).x ) & """ y=""" & Num( base_ ) & """ text-anchor=""" & anchor & """>" & XmlEsc( t8 ) & "</text>" & chr( 10 )
+            next
+        end if
+        s &= "</g>" & chr( 10 )
+    end if
+    s &= "</svg>" & chr( 10 )
+    return s
+end function
+
+public function tkBarcode_ExportSvgSymbol( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                           byref pl as TKBARCODE_PAGELOOK, byref path as ustring ) as boolean
+    dim as string s = tkBarcode_SvgSymbol( sym, spec, pl )
+    if len( s ) = 0 then return false
+    dim as string p8 = path
+    return SDL_SaveFile( strptr( p8 ), strptr( s ), len( s ) )
+end function
+
+' ---- clipboard: PNG + BMP + the data as text, held until the clipboard is replaced -------------------
+dim shared as string gClipPng, gClipBmp, gClipText
+dim shared as zstring * 32 gMimePng = "image/png", gMimeBmp = "image/bmp", gMimeText = "text/plain;charset=utf-8"
+
+private function ClipData( byval userdata as any ptr, byval mime_type as const zstring ptr, byval size as uinteger ptr ) as const any ptr
+    if (mime_type = 0) orelse (size = 0) then return 0
+    dim as string m = *mime_type
+    select case m
+    case "image/png"  : *size = len( gClipPng )  : return strptr( gClipPng )
+    case "image/bmp"  : *size = len( gClipBmp )  : return strptr( gClipBmp )
+    case "text/plain;charset=utf-8", "text/plain" : *size = len( gClipText ) : return strptr( gClipText )
+    end select
+    *size = 0
+    return 0
+end function
+
+private function SurfaceBytes( byval s as SDL_Surface ptr, byval bPng as boolean ) as string
+    dim as SDL_IOStream ptr io = SDL_IOFromDynamicMem( )
+    if io = 0 then return ""
+    dim as boolean ok = iif( bPng, IMG_SavePNG_IO( s, io, false ), SDL_SaveBMP_IO( s, io, false ) )
+    dim as string out_ = ""
+    if ok then
+        dim as integer n = SDL_GetIOSize( io )
+        dim as ubyte ptr p = SDL_GetPointerProperty( SDL_GetIOProperties( io ), SDL_PROP_IOSTREAM_DYNAMIC_MEMORY_POINTER, 0 )
+        if (p <> 0) andalso (n > 0) then
+            out_ = space( n )
+            for i as integer = 0 to n - 1
+                out_[i] = p[i]
+            next
+        end if
+    end if
+    SDL_CloseIO( io )
+    return out_
+end function
+
+' Puts the symbol on the clipboard as an image (PNG and BMP, at dpi with whole-pixel modules) and
+' its data as text. FALSE when there is no symbol or the clipboard refuses. NEEDS A WINDOW OPEN: on
+' X11 a selection is owned by a window, and SDL's clipboard used before any exists crashed the next
+' window's creation (BC5, measured under WSLg). A GUI program always has one.
+public function tkBarcode_CopySymbolToClipboard( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                                 byref pl as TKBARCODE_PAGELOOK, byref sData as ustring, _
+                                                 byval dpi as float32 = 300 ) as boolean
+    dim as SDL_Surface ptr s = tkBarcode_RenderSymbolSurface( sym, spec, pl, dpi )
+    if s = 0 then return false
+    gClipPng = SurfaceBytes( s, true )
+    gClipBmp = SurfaceBytes( s, false )
+    SDL_DestroySurface( s )
+    gClipText = sData
+    if len( gClipPng ) = 0 then return false
+    dim as const zstring ptr mimes(0 to 2) = { @gMimePng, @gMimeBmp, @gMimeText }
+    return SDL_SetClipboardData( @ClipData, 0, 0, @mimes(0), 3 )
+end function

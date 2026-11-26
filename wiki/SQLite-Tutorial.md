@@ -262,7 +262,7 @@ or, statically:
 Both paths are relative to **the file that holds them**, and `#foreignlib` picks the file that matches the target. Three things differ from the vendor package:
 
 - **`SQLITE_STATIC` and `SQLITE_TRANSIENT` are not imported**, because `#cinclude` does not import a macro that casts a number to a function pointer. Write `nullptr` for `SQLITE_STATIC` and `cast( sqlite3_destructor_type, -1 )` for `SQLITE_TRANSIENT`.
-- **On Linux, the program does not look beside itself.** Run it with `LD_LIBRARY_PATH=.`, or add `#cmdline "-Wl -rpath,$ORIGIN"` inside `#ifdef __FB_LINUX__`.
+- **On Linux, the program does not look beside itself.** Run it with `LD_LIBRARY_PATH=.`, or add `#cmdline "-Wl -rpath,$ORIGIN"` inside `#ifdef TIKO_OS_LINUX`.
 - **On Linux, forgetting that may not fail.** The program asks for `libsqlite3.so.0`, and Ubuntu has its own installed; the program quietly uses that older version (3.45.1 on Ubuntu 24.04). Ask SQLite: `select sqlite_version()`.
 
 **Installed for every program.** On Linux, `sudo apt install libsqlite3-dev` installs `sqlite3.h` and the library where they are found by default, and a program needs no paths: `#cinclude once "sqlite3.h"` and `#foreignlib SQLITE dynamic "system:sqlite3"`. That is the distribution's SQLite. On Windows, keep `vendor/sqlite/` in a shared folder and use a [binding header](Using-C-Libraries-Tutorial#5-a-binding-header).

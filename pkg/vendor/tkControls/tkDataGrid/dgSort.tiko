@@ -1,0 +1,477 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- the view: sort and filter (phase G4).
+'
+' THE VIEW MAP. While a sort or a filter is in force, viewToModel( 0 .. viewCount - 1 ) lists the
+' model rows the grid shows, in order, and modelToView( 0 .. rowCount - 1 ) is its inverse (-1:
+' filtered out). With neither, both are erased and a view row IS its model row -- no memory at all.
+' Every on-screen position (layout, paint, hit test, the keys, cell rectangles) is a VIEW row;
+' every public row number is a MODEL row (D-3). DgViewOf / DgModelOf convert; the placeholder row
+' is view row viewCount = model row rowCount.
+'
+' SORTING. Keys are (column, descending). INTERNAL: each key's column is read once per row into a
+' typed array (EMPTY first, text compared case-insensitively, dates as yyyymmdd), then a stable
+' bottom-up merge sort orders the rows. HOST (the default in virtual mode): a key change fires
+' SortChanged and the host re-queries and calls Reset; the grid only shows the glyphs. A source
+' with a Sort procedure is asked first; FALSE from it means the grid sorts.
+'
+' FILTERING. A Filter callback and / or a quick filter (a case-insensitive substring of any
+' visible column's shown text) and / or column filters (G7c, dgFilter.tiko) keep rows; filtering
+' runs before sorting, in one rebuild. A source with a Filter procedure takes the column filters
+' itself (DgFltSyncSource), and HOST mode leaves them to the host.
+'
+' A data change does not resort or refilter (Excel, WPF without live shaping): the rows stay put
+' until Sort / ApplyFilter or a header click. Inserted rows are added at the end of the view.
+' Rebuilding the view drops the cell rectangles (they are view positions) and keeps whole-row
+' selections (model rows) -- D-6.
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkColumnHeader"
+using tkHost
+using tkPaint
+using tkColumnHeader
+
+' ==========================================================================================
+' View <-> model
+' ==========================================================================================
+function DgMapActive( byval p as TKDATAGRID_STATE ptr ) as boolean
+    return p->bViewMap
+end function
+
+' The rows the view shows (without the placeholder).
+function DgViewCount( byval p as TKDATAGRID_STATE ptr ) as integer
+    return iif( p->bViewMap, p->viewCount, p->rowCount )
+end function
+
+' The model row at view row v (the placeholder past the end); -1 when v is out of range.
+function DgModelOf( byval p as TKDATAGRID_STATE ptr, byval v as integer ) as integer
+    if v < 0 then return -1
+    dim as integer n = DgViewCount( p )
+    if v >= n then return iif( v < DgViewRows( p ), p->rowCount, -1 )
+    if p->bViewMap then return p->viewToModel(v)
+    return v
+end function
+
+' The view row of model row row (the placeholder past the end); -1 when filtered out or invalid.
+function DgViewOf( byval p as TKDATAGRID_STATE ptr, byval row as integer ) as integer
+    if row < 0 then return -1
+    if row >= p->rowCount then return iif( DgHasNewRow( p ) andalso (row = p->rowCount), DgViewCount( p ), -1 )
+    if p->bViewMap then return p->modelToView(row)
+    return row
+end function
+
+private sub DgRebuildInverse( byval p as TKDATAGRID_STATE ptr )
+    if p->rowCount <= 0 then
+        erase p->modelToView
+    else
+        redim p->modelToView( 0 to p->rowCount - 1 )
+        for r as integer = 0 to p->rowCount - 1
+            p->modelToView(r) = -1
+        next
+    end if
+    for v as integer = 0 to p->viewCount - 1
+        p->modelToView( p->viewToModel(v) ) = v
+    next
+end sub
+
+' Model rows inserted (n > 0) or deleted (n < 0) at row: the map follows. New rows join the end of
+' the view; deleted ones leave it. Called after rowCount has changed.
+sub DgViewRowsMoved( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval n as integer )
+    DgSumInvalidate( p )                 ' G7b
+    ' G6: every row count change comes through here: cached blocks no longer line up
+    if n <> 0 then DgCacheClear( p )
+    if (p->bViewMap = false) orelse (n = 0) then exit sub
+    if n > 0 then
+        for v as integer = 0 to p->viewCount - 1
+            if p->viewToModel(v) >= row then p->viewToModel(v) += n
+        next
+        redim preserve p->viewToModel( 0 to p->viewCount + n - 1 )
+        for k as integer = 0 to n - 1
+            p->viewToModel( p->viewCount + k ) = row + k
+        next
+        p->viewCount += n
+    else
+        dim as integer m = -n, w = 0
+        for v as integer = 0 to p->viewCount - 1
+            dim as integer r = p->viewToModel(v)
+            if (r >= row) andalso (r < row + m) then continue for
+            p->viewToModel(w) = iif( r >= row + m, r - m, r )
+            w += 1
+        next
+        p->viewCount = w
+        if w = 0 then erase p->viewToModel else redim preserve p->viewToModel( 0 to w - 1 )
+    end if
+    DgRebuildInverse( p )
+end sub
+
+' ==========================================================================================
+' Sort keys
+' ==========================================================================================
+type DG_SORTDATA
+    kind  as long
+    bDesc as boolean
+    e(any) as ubyte                  ' 1 = EMPTY (sorts first ascending)
+    i(any) as longint                ' INT, BOOL, DATE (yyyymmdd)
+    f(any) as float64                ' FLOAT
+    s(any) as ustring                ' TEXT, lower-cased
+end type
+
+' -1 / 0 / 1 for candidates a, b on one key, ascending.
+private function DgCmpKey( byref k as DG_SORTDATA, byval a as integer, byval b as integer ) as long
+    if k.e(a) orelse k.e(b) then
+        if k.e(a) andalso k.e(b) then return 0
+        return iif( k.e(a), -1, 1 )
+    end if
+    select case k.kind
+    case TKDG_TEXT
+        if k.s(a) < k.s(b) then return -1
+        if k.s(a) > k.s(b) then return 1
+    case TKDG_FLOAT
+        if k.f(a) < k.f(b) then return -1
+        if k.f(a) > k.f(b) then return 1
+    case else
+        if k.i(a) < k.i(b) then return -1
+        if k.i(a) > k.i(b) then return 1
+    end select
+    return 0
+end function
+
+private function DgCmpAll( keys() as DG_SORTDATA, byval nKeys as integer, byval a as integer, byval b as integer ) as long
+    for k as integer = 0 to nKeys - 1
+        dim as long c = DgCmpKey( keys(k), a, b )
+        if c <> 0 then return iif( keys(k).bDesc, -c, c )
+    next
+    return 0
+end function
+
+' Orders cand() (model rows) by the grid's sort keys: stable, bottom-up merge sort.
+private sub DgSortRows( byval p as TKDATAGRID_STATE ptr, cand() as integer, byval n as integer )
+    if n < 2 then exit sub
+    dim as integer nKeys = 0
+    for k as integer = 0 to p->nSortKeys - 1
+        if DgValidCol( p, p->sortKeys(k).col ) then nKeys += 1
+    next
+    if nKeys = 0 then exit sub
+    dim as DG_SORTDATA keys( 0 to nKeys - 1 )
+    dim as integer kk = 0
+    for k as integer = 0 to p->nSortKeys - 1
+        dim as integer col = p->sortKeys(k).col
+        if DgValidCol( p, col ) = false then continue for
+        with keys(kk)
+            .kind = p->cols(col).c.valueKind
+            .bDesc = p->sortKeys(k).bDescending
+            redim .e( 0 to n - 1 )
+            select case .kind
+            case TKDG_TEXT : redim .s( 0 to n - 1 )
+            case TKDG_FLOAT : redim .f( 0 to n - 1 )
+            case else : redim .i( 0 to n - 1 )
+            end select
+            for j as integer = 0 to n - 1
+                dim as TKDG_VALUE v
+                DgRead( p, cand(j), col, v )
+                if (DgConvert( v, .kind ) = false) orelse (v.kind = TKDG_EMPTY) then .e(j) = 1 : continue for
+                select case .kind
+                case TKDG_TEXT  : .s(j) = lcase( v.s )
+                case TKDG_FLOAT : .f(j) = v.f
+                case TKDG_INT   : .i(j) = v.i
+                case TKDG_BOOL  : .i(j) = iif( v.b, 1, 0 )
+                case TKDG_DATE  : .i(j) = v.d.wYear * 10000 + v.d.wMonth * 100 + v.d.wDay
+                end select
+            next
+        end with
+        kk += 1
+    next
+    ' sort positions 0 .. n-1 by the keys, then map them back to model rows
+    dim as integer idx( 0 to n - 1 ), tmp( 0 to n - 1 )
+    for j as integer = 0 to n - 1 : idx(j) = j : next
+    dim as integer width_ = 1
+    while width_ < n
+        dim as integer lo = 0
+        while lo < n
+            dim as integer mid_ = lo + width_, hi = lo + 2 * width_
+            if mid_ > n then mid_ = n
+            if hi > n then hi = n
+            dim as integer a = lo, b = mid_, o = lo
+            while (a < mid_) andalso (b < hi)
+                if DgCmpAll( keys(), nKeys, idx(b), idx(a) ) < 0 then
+                    tmp(o) = idx(b) : b += 1
+                else
+                    tmp(o) = idx(a) : a += 1
+                end if
+                o += 1
+            wend
+            while a < mid_ : tmp(o) = idx(a) : a += 1 : o += 1 : wend
+            while b < hi : tmp(o) = idx(b) : b += 1 : o += 1 : wend
+            lo = hi
+        wend
+        for j as integer = 0 to n - 1 : idx(j) = tmp(j) : next
+        width_ *= 2
+    wend
+    dim as integer sorted( 0 to n - 1 )
+    for j as integer = 0 to n - 1 : sorted(j) = cand( idx(j) ) : next
+    for j as integer = 0 to n - 1 : cand(j) = sorted(j) : next
+end sub
+
+' ==========================================================================================
+' Building the view
+' ==========================================================================================
+' The sort mode in force: AUTO is HOST for a virtual grid, INTERNAL otherwise.
+function DgSortModeOf( byval p as TKDATAGRID_STATE ptr ) as long
+    if p->sortMode <> TKDG_SORT_AUTO then return p->sortMode
+    return iif( p->feed = DG_FEED_VIRTUAL, TKDG_SORT_HOST, TKDG_SORT_INTERNAL )
+end function
+
+private function DgRowPassesQuick( byval p as TKDATAGRID_STATE ptr, byval row as integer, byref needle as const ustring ) as boolean
+    for k as integer = 0 to p->colCount - 1
+        if p->cols(k).c.visible = false then continue for
+        if instr( lcase( DgShownText( p, row, k ) ), needle ) > 0 then return true
+    next
+    return false
+end function
+
+' Rebuilds the view from the filter and the sort keys. The edit is committed (cancelled when its
+' commit is refused); the cell rectangles go, the row selection stays; a current row filtered
+' out moves to the first row shown.
+sub DgApplyView( byval p as TKDATAGRID_STATE ptr )
+    if p->bEditing then
+        if DgEndEdit( p, true ) = false then DgEndEdit( p, false )
+    end if
+    ' G7c: a source told of changed column filters may now have other rows
+    DgFltSyncSource( p )
+    dim as boolean bColFlt = DgFltInternal( p )
+    dim as boolean bFilter = (p->FilterCallback <> 0) orelse (len( p->quickFilter ) > 0) orelse bColFlt
+    dim as boolean bSort = false
+    if (p->nSortKeys > 0) andalso (DgSortModeOf( p ) = TKDG_SORT_INTERNAL) then
+        bSort = true
+        ' a source may sort itself; then the view needs no order of its own
+        if (p->feed = DG_FEED_SOURCE) andalso (p->src.Sort <> 0) then
+            if p->src.Sort( p->src.pCtx, @p->sortKeys(0), p->nSortKeys ) then
+                bSort = false
+                p->bSrcSorted = true
+                ' G6: its rows are in a new order: cached blocks hold the old one
+                DgCacheClear( p )
+            end if
+        end if
+    elseif p->bSrcSorted andalso (p->feed = DG_FEED_SOURCE) andalso (p->src.Sort <> 0) then
+        ' G6: the keys went: a source that sorted itself is asked back to its own order (no keys)
+        p->src.Sort( p->src.pCtx, 0, 0 )
+        p->bSrcSorted = false
+        DgCacheClear( p )
+    end if
+    DgSelDropRects( p )
+    if (bFilter = false) andalso (bSort = false) then
+        p->bViewMap = false
+        p->viewCount = 0
+        erase p->viewToModel : erase p->modelToView
+    else
+        dim as integer cand( any )
+        dim as integer n = 0
+        if p->rowCount > 0 then redim cand( 0 to p->rowCount - 1 )
+        dim as ustring needle = lcase( p->quickFilter )
+        for r as integer = 0 to p->rowCount - 1
+            if p->FilterCallback then
+                if p->FilterCallback( p->hWin, r ) = false then continue for
+            end if
+            if len( needle ) then
+                if DgRowPassesQuick( p, r, needle ) = false then continue for
+            end if
+            if bColFlt then
+                if DgFltRowPasses( p, r ) = false then continue for
+            end if
+            cand(n) = r : n += 1
+        next
+        if bSort then DgSortRows( p, cand(), n )
+        p->viewCount = n
+        if n = 0 then
+            erase p->viewToModel
+        else
+            redim p->viewToModel( 0 to n - 1 )
+            for j as integer = 0 to n - 1 : p->viewToModel(j) = cand(j) : next
+        end if
+        p->bViewMap = true
+        DgRebuildInverse( p )
+    end if
+    if (p->curRow >= 0) andalso (DgViewOf( p, p->curRow ) < 0) then p->curRow = DgModelOf( p, 0 )
+    if p->hotRow >= 0 then p->hotRow = -1
+    DgChanged( p )
+end sub
+
+' A header click (dgInput): plain cycles ascending -> descending -> none on the only key, or makes
+' this column the only key; Shift adds the column as the next key, or turns or drops it there.
+sub DgHeaderSortClick( byval p as TKDATAGRID_STATE ptr, byval col as integer, byval bShift as boolean )
+    if (DgSortModeOf( p ) = TKDG_SORT_NONE) orelse (p->cols(col).c.sortable = false) then exit sub
+    if p->bEditing then
+        if DgEndEdit( p, true ) = false then exit sub
+    end if
+    dim as integer at = -1
+    for k as integer = 0 to p->nSortKeys - 1
+        if p->sortKeys(k).col = col then at = k : exit for
+    next
+    if bShift then
+        if at < 0 then
+            redim preserve p->sortKeys( 0 to p->nSortKeys )
+            p->sortKeys(p->nSortKeys).col = col : p->sortKeys(p->nSortKeys).bDescending = false
+            p->nSortKeys += 1
+        elseif p->sortKeys(at).bDescending = false then
+            p->sortKeys(at).bDescending = true
+        else
+            for k as integer = at to p->nSortKeys - 2
+                p->sortKeys(k) = p->sortKeys(k + 1)
+            next
+            p->nSortKeys -= 1
+        end if
+    else
+        if (p->nSortKeys = 1) andalso (at = 0) then
+            if p->sortKeys(0).bDescending = false then
+                p->sortKeys(0).bDescending = true
+            else
+                p->nSortKeys = 0
+            end if
+        else
+            redim p->sortKeys( 0 to 0 )
+            p->sortKeys(0).col = col : p->sortKeys(0).bDescending = false
+            p->nSortKeys = 1
+        end if
+    end if
+    if p->nSortKeys = 0 then erase p->sortKeys
+    if DgSortModeOf( p ) = TKDG_SORT_HOST then
+        tkWidget_Invalidate( p->wSurf )
+    else
+        DgApplyView( p )
+    end if
+    if p->SortChangedCallback then p->SortChangedCallback( p->hWin )
+end sub
+
+' The header painter's sort glyph for a column, and its key number (1-based; 0 = not a key).
+sub DgSortGlyphOf( byval p as TKDATAGRID_STATE ptr, byval col as integer, byref nDir as long, byref nKey as integer )
+    nDir = HDR_SORT_NONE : nKey = 0
+    for k as integer = 0 to p->nSortKeys - 1
+        if p->sortKeys(k).col = col then
+            nDir = iif( p->sortKeys(k).bDescending, HDR_SORT_DESC, HDR_SORT_ASC )
+            nKey = k + 1
+            exit sub
+        end if
+    next
+end sub
+
+' Column k is going (DeleteColumn): its keys go; later model indices shift.
+sub DgSortColumnRemoved( byval p as TKDATAGRID_STATE ptr, byval col as integer )
+    dim as integer w = 0
+    for k as integer = 0 to p->nSortKeys - 1
+        if p->sortKeys(k).col = col then continue for
+        p->sortKeys(w) = p->sortKeys(k)
+        if p->sortKeys(w).col > col then p->sortKeys(w).col -= 1
+        w += 1
+    next
+    p->nSortKeys = w
+    if w = 0 then erase p->sortKeys
+end sub
+
+sub DgSortColumnInserted( byval p as TKDATAGRID_STATE ptr, byval col as integer )
+    for k as integer = 0 to p->nSortKeys - 1
+        if p->sortKeys(k).col >= col then p->sortKeys(k).col += 1
+    next
+end sub
+
+' ==========================================================================================
+' Public API: the view
+' ==========================================================================================
+' INTERNAL: the grid sorts; HOST: a key change only fires SortChanged (the host re-queries and
+' calls Reset); NONE: header clicks do not sort; AUTO (the default): HOST when virtual, else INTERNAL.
+public sub tkDataGrid_SetSortMode( byval hGrid as TK_WIDGET ptr, byval nMode as long )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (nMode < TKDG_SORT_AUTO) orelse (nMode > TKDG_SORT_HOST) then exit sub
+    p->sortMode = nMode
+    DgApplyView( p )
+end sub
+
+public function tkDataGrid_GetSortMode( byval hGrid as TK_WIDGET ptr ) as long
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->sortMode, TKDG_SORT_AUTO )
+end function
+
+' The sort keys, most significant first; applies them (silent: no SortChanged).
+public sub tkDataGrid_SetSortKeys( byval hGrid as TK_WIDGET ptr, keys() as TKDG_SORTKEY )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    dim as integer n = ubound( keys ) - lbound( keys ) + 1
+    erase p->sortKeys
+    p->nSortKeys = 0
+    if n > 0 then
+        redim p->sortKeys( 0 to n - 1 )
+        for k as integer = 0 to n - 1
+            p->sortKeys(k) = keys( lbound( keys ) + k )
+        next
+        p->nSortKeys = n
+    end if
+    DgApplyView( p )
+end sub
+
+public function tkDataGrid_GetSortKeys( byval hGrid as TK_WIDGET ptr, keys() as TKDG_SORTKEY ) as integer
+    erase keys
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (p->nSortKeys = 0) then return 0
+    redim keys( 0 to p->nSortKeys - 1 )
+    for k as integer = 0 to p->nSortKeys - 1
+        keys(k) = p->sortKeys(k)
+    next
+    return p->nSortKeys
+end function
+
+public sub tkDataGrid_ClearSort( byval hGrid as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    erase p->sortKeys
+    p->nSortKeys = 0
+    DgApplyView( p )
+end sub
+
+' Re-applies the sort and the filter (after the data changed: neither follows it on its own).
+public sub tkDataGrid_Sort( byval hGrid as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then DgApplyView( p )
+end sub
+
+public sub tkDataGrid_ApplyFilter( byval hGrid as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then DgApplyView( p )
+end sub
+
+' Rows whose visible columns' shown text contains text (any case) stay; "" shows every row.
+public sub tkDataGrid_SetQuickFilter( byval hGrid as TK_WIDGET ptr, byval text as ustring )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->quickFilter = text
+    DgApplyView( p )
+end sub
+
+public function tkDataGrid_GetQuickFilter( byval hGrid as TK_WIDGET ptr ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return ""
+    return p->quickFilter
+end function
+
+' The rows shown (sorted and filtered), without the placeholder.
+public function tkDataGrid_GetViewCount( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, DgViewCount( p ), 0 )
+end function
+
+' The model row shown at view position v (-1 out of range).
+public function tkDataGrid_ViewToModel( byval hGrid as TK_WIDGET ptr, byval v as integer ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return -1
+    return DgModelOf( p, v )
+end function
+
+' The view position of model row row (-1: filtered out).
+public function tkDataGrid_ModelToView( byval hGrid as TK_WIDGET ptr, byval row as integer ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return -1
+    return DgViewOf( p, row )
+end function

@@ -1,0 +1,210 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- the column layout as a string, to keep between runs (phase G7a).
+'
+' GetLayout writes what the user can change about the columns: their display order, widths
+' (design units) and shown / hidden, the frozen column count, and the sort keys:
+'
+'     tkdg1;frozen=1;frows=0;sort=Name:a,Qty:d;cols=Name:120:1,Qty:80:1,Notes:200:0
+'
+' (frows, the frozen row count, came with G7b; a layout without it leaves the count as it is.)
+'
+' A column is named by its key; a column without a key by "#" and its model index. A key's
+' % ; , : = # and control characters are written %XX. The host stores the string where it likes
+' (a settings file, tkThemeFile, the registry of its own).
+'
+' SetLayout matches columns by key, so a layout survives columns added or removed since it was
+' saved: a name that matches nothing is skipped, and columns the layout does not name keep their
+' place after the ones it does, in their present order. It refuses (FALSE, nothing changed) a
+' string that does not start with "tkdg1". An edit in progress ends first (committed, or cancelled
+' when the commit is refused). The sort keys are applied as SetSortKeys applies them (in HOST
+' mode the host re-queries). Silent: no events.
+#module "tkDataGrid"
+
+#import "../tkHost"
+using tkHost
+
+private function DgLayoutEnc( byref s as const ustring ) as ustring
+    dim as ustring o
+    for k as integer = 0 to len( s ) - 1
+        dim as long c = s[k]
+        select case c
+        case 37, 59, 44, 58, 61, 35, 0 to 31     ' % ; , : = #
+            o &= "%" & right( "0" & hex( c ), 2 )
+        case else
+            o &= mid( s, k + 1, 1 )
+        end select
+    next
+    return o
+end function
+
+private function DgLayoutDec( byref s as const ustring ) as ustring
+    dim as ustring o
+    dim as integer k = 0, n = len( s )
+    while k < n
+        if (s[k] = 37) andalso (k + 2 < n) then
+            o &= wchr( valint( "&h" & mid( s, k + 2, 2 ) ) )
+            k += 3
+        else
+            o &= mid( s, k + 1, 1 )
+            k += 1
+        end if
+    wend
+    return o
+end function
+
+' The name a column has in a layout.
+private function DgLayoutName( byval p as TKDATAGRID_STATE ptr, byval col as integer ) as ustring
+    if len( p->cols(col).c.key ) then return DgLayoutEnc( p->cols(col).c.key )
+    return "#" & col
+end function
+
+' The model column a layout name means, or -1.
+private function DgLayoutCol( byval p as TKDATAGRID_STATE ptr, byref nm as const ustring ) as integer
+    if len( nm ) = 0 then return -1
+    if nm[0] = 35 then                     ' "#n": a column with no key
+        dim as ustring d = mid( nm, 2 )
+        if (len( d ) = 0) orelse (len( d ) > 9) then return -1
+        for k as integer = 0 to len( d ) - 1
+            if (d[k] < 48) orelse (d[k] > 57) then return -1
+        next
+        dim as integer col = valint( d )
+        if DgValidCol( p, col ) andalso (len( p->cols(col).c.key ) = 0) then return col
+        return -1
+    end if
+    dim as ustring key = DgLayoutDec( nm )
+    for k as integer = 0 to p->colCount - 1
+        if p->cols(k).c.key = key then return k
+    next
+    return -1
+end function
+
+' A non-negative decimal integer (at most 9 digits), or -1.
+private function DgLayoutNum( byref s as const ustring ) as integer
+    if (len( s ) = 0) orelse (len( s ) > 9) then return -1
+    for k as integer = 0 to len( s ) - 1
+        if (s[k] < 48) orelse (s[k] > 57) then return -1
+    next
+    return valint( s )
+end function
+
+' s split at ch into parts(); the count (an empty s is no parts).
+private function DgLayoutSplit( byref s as const ustring, byref ch as const ustring, parts() as ustring ) as integer
+    erase parts
+    if len( s ) = 0 then return 0
+    dim as integer n = 0, a = 1
+    do
+        dim as integer b = instr( a, s, ch )
+        redim preserve parts( 0 to n )
+        if b = 0 then parts(n) = mid( s, a ) : n += 1 : exit do
+        parts(n) = mid( s, a, b - a ) : n += 1
+        a = b + 1
+    loop
+    return n
+end function
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+public function tkDataGrid_GetLayout( byval hGrid as TK_WIDGET ptr ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return ""
+    dim as ustring s = "tkdg1;frozen=" & p->nFrozen & ";frows=" & p->nFrozenRows & ";sort="
+    dim as integer n = 0
+    for k as integer = 0 to p->nSortKeys - 1
+        dim as integer col = p->sortKeys(k).col
+        if DgValidCol( p, col ) = false then continue for
+        if n > 0 then s &= ","
+        s &= DgLayoutName( p, col ) & iif( p->sortKeys(k).bDescending, ":d", ":a" )
+        n += 1
+    next
+    s &= ";cols="
+    for d as integer = 0 to p->colCount - 1
+        dim as integer col = p->order(d)
+        if d > 0 then s &= ","
+        s &= DgLayoutName( p, col ) & ":" & p->cols(col).c.width & ":" & iif( p->cols(col).c.visible, "1", "0" )
+    next
+    return s
+end function
+
+public function tkDataGrid_SetLayout( byval hGrid as TK_WIDGET ptr, byref layout as const ustring ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return false
+    dim as ustring parts( any )
+    dim as integer nParts = DgLayoutSplit( layout, ";", parts() )
+    if (nParts = 0) orelse (parts(0) <> "tkdg1") then return false
+    if p->bEditing then
+        if DgEndEdit( p, true ) = false then DgEndEdit( p, false )
+    end if
+    dim as integer frozen = -1, frows = -1
+    dim as boolean bSort = false
+    dim as TKDG_SORTKEY keys( any )
+    dim as integer nKeys = 0
+    ' the new display order: the named columns first, then the rest as they are
+    dim as integer newOrder( 0 to iif( p->colCount > 0, p->colCount - 1, 0 ) )
+    dim as ubyte placed( 0 to iif( p->colCount > 0, p->colCount - 1, 0 ) )
+    dim as integer nPlaced = 0
+    for i as integer = 1 to nParts - 1
+        dim as integer eq = instr( parts(i), "=" )
+        if eq = 0 then continue for
+        dim as ustring nm = left( parts(i), eq - 1 ), v = mid( parts(i), eq + 1 )
+        dim as ustring items( any ), f( any )
+        select case nm
+        case "frozen"
+            frozen = DgLayoutNum( v )
+        case "frows"
+            frows = DgLayoutNum( v )
+        case "sort"
+            bSort = true
+            for j as integer = 0 to DgLayoutSplit( v, ",", items() ) - 1
+                if DgLayoutSplit( items(j), ":", f() ) <> 2 then continue for
+                dim as integer col = DgLayoutCol( p, f(0) )
+                if col < 0 then continue for
+                redim preserve keys( 0 to nKeys )
+                keys(nKeys).col = col : keys(nKeys).bDescending = (f(1) = "d")
+                nKeys += 1
+            next
+        case "cols"
+            for j as integer = 0 to DgLayoutSplit( v, ",", items() ) - 1
+                if DgLayoutSplit( items(j), ":", f() ) <> 3 then continue for
+                dim as integer col = DgLayoutCol( p, f(0) )
+                if (col < 0) orelse (placed(col) <> 0) then continue for
+                dim as integer w = DgLayoutNum( f(1) )
+                if w > 0 then p->cols(col).c.width = w
+                if (f(2) = "0") orelse (f(2) = "1") then p->cols(col).c.visible = (f(2) = "1")
+                placed(col) = 1
+                newOrder(nPlaced) = col : nPlaced += 1
+            next
+        end select
+    next
+    if p->colCount > 0 then
+        for d as integer = 0 to p->colCount - 1
+            dim as integer col = p->order(d)
+            if placed(col) = 0 then newOrder(nPlaced) = col : nPlaced += 1
+        next
+        for d as integer = 0 to p->colCount - 1 : p->order(d) = newOrder(d) : next
+        ' a layout that hides every column shows the first one
+        if DgShownColumnCount( p ) = 0 then p->cols( p->order(0) ).c.visible = true
+        DgRenumber( p )
+        DgSelDropRects( p )
+    end if
+    if frozen >= 0 then p->nFrozen = iif( frozen > p->colCount, p->colCount, frozen )
+    if frows >= 0 then p->nFrozenRows = frows
+    p->hotHdrCol = -1 : p->hotDivCol = -1
+    if bSort then
+        erase p->sortKeys
+        p->nSortKeys = nKeys
+        if nKeys > 0 then
+            redim p->sortKeys( 0 to nKeys - 1 )
+            for k as integer = 0 to nKeys - 1 : p->sortKeys(k) = keys(k) : next
+        end if
+        DgApplyView( p )                   ' lays out too
+    else
+        DgChanged( p )
+    end if
+    return true
+end function

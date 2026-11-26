@@ -1,0 +1,676 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- the surface's input (phase G1): the mouse, the keyboard, drags, autoscroll, tips.
+'
+' THE MOUSE. A press on a cell moves the current cell and selects (plain: only it; Ctrl: it
+' toggles; Shift: anchor .. it), then a drag extends from the anchor with the current cell left
+' where it was pressed (DataGridView's behaviour). A row-header press does the same with whole
+' rows, the corner selects all. A header press is a click (ColumnClick) unless the mouse moves
+' past the threshold, which makes it a reorder drag; a press on a header's gutter resizes, a
+' double click on it autosizes. Every drag holds the capture; leaving the body during a
+' selection drag starts the autoscroll timer.
+'
+' THE KEYBOARD (G2 editing keys: dgEdit.tiko's header and DgEditKey below): arrows, Ctrl+arrows to the edge, Home / End
+' (Ctrl: the first / last cell), PgUp / PgDn, Enter / Shift+Enter (down / up), Tab / Shift+Tab
+' (along the row, wrapping; at the grid's ends the key is refused, so tkHost moves the focus,
+' unless SetTabWraps), Shift extends, Shift+Space a row, Ctrl+Space a column, Ctrl+A, Ctrl+C.
+' G2: the surface takes text input, so a typed character (TKM_CHAR) starts an edit; a claimed key
+' that also types (Space with Shift, Ctrl or on a check cell) swallows the TKM_CHAR after it.
+' F2 edits, Delete deletes whole rows or empties cells, Ctrl+V pastes, Esc cancels the dirty row,
+' Enter on a cell that cannot be edited fires CellActivate (ButtonClick on a button).
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkTooltip"
+#import "../tkColumnHeader"
+using tkHost
+using tkPaint
+using tkTooltip
+using tkColumnHeader
+
+const DG_DRAG_THRESHOLD = 4          ' unscaled
+const DG_AUTOSCROLL_MS = 50
+
+' ==========================================================================================
+' Helpers
+' ==========================================================================================
+private function DgCallMsg( byval p as TKDATAGRID_STATE ptr, byval m as TK_MSG ptr, byref ht as TKDG_HITTEST ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKDATAGRID_MESSAGEINFO mi
+    mi.hGrid = p->hWin : mi.msg = m->msg : mi.x = m->x : mi.y = m->y : mi.clicks = m->clicks
+    mi.wheelX = m->wheelX : mi.wheelY = m->wheelY : mi.ht = ht
+    mi.mods = iif( m->msg = TKM_MOUSEWHEEL, m->mods, clng( SDL_GetModState( ) ) )
+    return p->MessageCallback( @mi )
+end function
+
+private function DgIsCtrl( byval mods as long ) as boolean
+    return (mods and (SDL_KMOD_CTRL or SDL_KMOD_GUI)) <> 0
+end function
+
+private function DgIsShift( byval mods as long ) as boolean
+    return (mods and SDL_KMOD_SHIFT) <> 0
+end function
+
+' A current cell when there is data and none yet: the first visible cell. Silent.
+sub DgEnsureCurrent( byval p as TKDATAGRID_STATE ptr )
+    if (DgViewRows( p ) = 0) orelse (DgFirstVisDisp( p ) < 0) then exit sub
+    if DgValidViewRow( p, p->curRow ) andalso (DgViewOf( p, p->curRow ) >= 0) andalso (DgDispOf( p, p->curCol ) >= 0) then exit sub
+    if (DgValidViewRow( p, p->curRow ) = false) orelse (DgViewOf( p, p->curRow ) < 0) then p->curRow = DgModelOf( p, 0 )
+    p->curCol = p->order( DgFirstVisDisp( p ) )
+    if (p->sel.bAll = false) andalso (p->sel.nSpans = 0) andalso (p->sel.nRects = 0) then DgSelectOnly( p, p->curRow, DgDispOf( p, p->curCol ) )
+end sub
+
+' The current cell to VIEW row v (clamped), column col: the selection becomes it, or (bExtend)
+' anchor .. it. FALSE when leaving the dirty row was refused (nothing moved).
+private function DgMoveCurrent( byval p as TKDATAGRID_STATE ptr, byval v as integer, byval col as integer, byval bExtend as boolean ) as boolean
+    if v < 0 then v = 0
+    if v > DgViewRows( p ) - 1 then v = DgViewRows( p ) - 1
+    dim as integer row = DgModelOf( p, v )
+    if (p->dirtyRow >= 0) andalso (row <> p->dirtyRow) then
+        if DgCommitRow( p ) = false then return false
+    end if
+    dim as integer d = DgDispOf( p, col )
+    if bExtend andalso p->bMulti then
+        DgExtendTo( p, row, d )
+    else
+        DgSelectOnly( p, row, d )
+    end if
+    p->curRow = row : p->curCol = col
+    DgEnsureVisible( p, row, col )
+    return true
+end function
+
+' ==========================================================================================
+' Hover and tooltips
+' ==========================================================================================
+private sub DgSetHot( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval hdrCol as integer, byval divCol as integer )
+    if (row = p->hotRow) andalso (hdrCol = p->hotHdrCol) andalso (divCol = p->hotDivCol) then exit sub
+    p->hotRow = row : p->hotHdrCol = hdrCol : p->hotDivCol = divCol
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' A new tool whenever the cell or header under the mouse changes.
+private sub DgSetTipTarget( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer )
+    if (row = p->tipRow) andalso (col = p->tipCol) then exit sub
+    p->tipRow = row : p->tipCol = col
+    p->tipSerial += 1
+    if p->tipSerial > &h3FFFFFFF then p->tipSerial = 1
+    tkTipHost_SetToolIndex( @p->tip, iif( row >= -1, p->tipSerial, -1 ) )
+end sub
+
+' The callback's text, else the whole text of a cell or caption that is cut off.
+private function DgTipFor( byval p as TKDATAGRID_STATE ptr, byval tipRow as integer, byval tipCol as integer ) as ustring
+    if (tipRow < -1) orelse (DgValidCol( p, tipCol ) = false) then return ""
+    if p->TooltipCallback then return p->TooltipCallback( p->hWin, tipRow, tipCol )
+    dim as TK_HOST ptr hh = p->hWin->pHost
+    if tipRow = -1 then
+        dim as TTF_Font ptr f = tkColumnHeader_GetFont( p->wHdr )
+        if f = 0 then f = hh->pDefaultFont
+        dim as ustring s = p->cols(tipCol).c.caption
+        if tkText_Width( f, s ) > p->cols(tipCol).wPx - 2 * tkColumnHeader_GetPadding( p->wHdr ) then return s
+        return ""
+    end if
+    if DgValidRow( p, tipRow ) = false then return ""
+    select case p->cols(tipCol).c.kind
+    case TKDG_COL_CHECK, TKDG_COL_PROGRESS : return ""
+    end select
+    dim as TTF_Font ptr f = iif( p->pFont <> 0, p->pFont, hh->pDefaultFont )
+    dim as ustring s = DgShownText( p, tipRow, tipCol )
+    if tkText_Width( f, s ) > p->cols(tipCol).wPx - 2 * DgScale( p, CDATAGRID_CELL_PAD ) then return s
+    return ""
+end function
+
+function DgTipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( tkWidget_Parent( a ) )
+    if p = 0 then return ""
+    return DgTipFor( p, p->tipRow, p->tipCol )
+end function
+
+' The tip a cell (row >= 0) or a header (row -1) shows: the callback's, else its whole text when
+' painting cuts it off; "" for none.
+public function tkDataGrid_GetTipText( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return ""
+    return DgTipFor( p, row, col )
+end function
+
+' ==========================================================================================
+' The wheel
+' ==========================================================================================
+' 3 rows per notch vertically, 3 x 16 design units across; Shift turns the vertical wheel
+' sideways. FALSE at the end it was pushed against, so the parent may scroll instead.
+private function DgWheel( byval p as TKDATAGRID_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    dim as single dx = m->wheelX, dy = m->wheelY
+    if DgIsShift( m->mods ) andalso (dx = 0) then dx = -dy : dy = 0
+    p->fWheelX += dx : p->fWheelY += dy
+    dim as integer nx = fix( p->fWheelX ), ny = fix( p->fWheelY )
+    p->fWheelX -= nx : p->fWheelY -= ny
+    if (nx = 0) andalso (ny = 0) then return true
+    dim as integer ox = p->scrollX, oy = p->scrollY
+    DgScrollTo( p, p->scrollX + nx * 3 * DgScale( p, 16 ), p->scrollY - ny * 3 * DgRowHPx( p ) )
+    return (p->scrollX <> ox) orelse (p->scrollY <> oy)
+end function
+
+' ==========================================================================================
+' The keyboard
+' ==========================================================================================
+function DgKeyDown( byval p as TKDATAGRID_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    dim as long key = m->key
+    dim as boolean bShift = DgIsShift( m->mods ), bCtrl = DgIsCtrl( m->mods )
+    p->bSwallowChar = false
+    ' G7c: keys the filter row's editor leaves
+    if p->fltEditCol >= 0 then return DgFltKey( p, key, bShift )
+    if p->bEditing then
+        ' keys an editor left unclaimed: commit and move, or cancel
+        select case key
+        case SDLK_ESCAPE
+            DgEndEdit( p, false )
+            return true
+        case SDLK_TAB, SDLK_UP, SDLK_DOWN, SDLK_PAGEUP, SDLK_PAGEDOWN, SDLK_RETURN, SDLK_KP_ENTER
+            if DgEndEdit( p, true ) = false then return true      ' refused: stay in the editor
+        case else
+            return false
+        end select
+    end if
+    ' G7a: the Menu key / Shift+F10 (claimed only when a ContextMenu callback is set)
+    if (key = SDLK_APPLICATION) orelse ((key = SDLK_F10) andalso bShift) then return DgKeyContextMenu( p )
+    if (DgViewRows( p ) = 0) orelse (DgFirstVisDisp( p ) < 0) then return false
+    dim as DG_USERMARK mk
+    DgUserBegin( p, mk )
+    DgEnsureCurrent( p )
+    ' row: the current MODEL row (values, state); v: its VIEW row (where the keys move it)
+    dim as integer row = p->curRow, d = DgDispOf( p, p->curCol )
+    dim as integer v = DgViewOf( p, row )
+    if v < 0 then v = 0
+    dim as integer dFirst = DgFirstVisDisp( p ), dLast = DgLastVisDisp( p )
+    dim as integer page = DgBodyH( p ) \ DgRowHPx( p )
+    if page < 1 then page = 1
+    dim as boolean bExtend = bShift
+    select case key
+    case SDLK_UP
+        ' G7c: up from the first row into the filter row
+        if (v = 0) andalso p->bFilterRow andalso (bShift = false) andalso (bCtrl = false) then
+            DgUserEnd( p, mk )
+            return DgFltOpen( p, p->order(d) )
+        end if
+        v = iif( bCtrl, 0, v - 1 )
+    case SDLK_DOWN
+        v = iif( bCtrl, DgViewRows( p ) - 1, v + 1 )
+    case SDLK_LEFT
+        if bCtrl then
+            d = dFirst
+        elseif DgNextVisDisp( p, d, -1 ) >= 0 then
+            d = DgNextVisDisp( p, d, -1 )
+        end if
+    case SDLK_RIGHT
+        if bCtrl then
+            d = dLast
+        elseif DgNextVisDisp( p, d, 1 ) >= 0 then
+            d = DgNextVisDisp( p, d, 1 )
+        end if
+    case SDLK_HOME
+        d = dFirst
+        if bCtrl then v = 0
+    case SDLK_END
+        d = dLast
+        if bCtrl then v = DgViewRows( p ) - 1
+    case SDLK_PAGEUP
+        v -= page
+    case SDLK_PAGEDOWN
+        v += page
+    case SDLK_RETURN, SDLK_KP_ENTER
+        if DgCellEditable( p, row, p->order(d) ) = false then
+            ' a cell that cannot be edited: Enter activates it (a button clicks)
+            if DgClickButton( p, row, p->order(d) ) = false then
+                if (row < p->rowCount) andalso (p->CellActivateCallback <> 0) then p->CellActivateCallback( p->hWin, row, p->order(d) )
+            end if
+            DgUserEnd( p, mk )
+            return true
+        end if
+        v = iif( bShift, v - 1, v + 1 )
+        bExtend = false
+    case SDLK_TAB
+        bExtend = false
+        if bShift then
+            if DgNextVisDisp( p, d, -1 ) >= 0 then
+                d = DgNextVisDisp( p, d, -1 )
+            elseif v > 0 then
+                v -= 1 : d = dLast
+            elseif p->bTabWraps then
+                v = DgViewRows( p ) - 1 : d = dLast
+            else
+                DgUserEnd( p, mk )
+                return false                    ' leave the grid backwards
+            end if
+        else
+            if DgNextVisDisp( p, d, 1 ) >= 0 then
+                d = DgNextVisDisp( p, d, 1 )
+            elseif v < DgViewRows( p ) - 1 then
+                v += 1 : d = dFirst
+            elseif p->bTabWraps then
+                v = 0 : d = dFirst
+            else
+                DgUserEnd( p, mk )
+                return false                    ' leave the grid
+            end if
+        end if
+    case SDLK_SPACE
+        if (bShift = false) andalso (bCtrl = false) then
+            ' a check cell toggles, a button clicks; any other cell: the character starts an edit
+            if DgToggleCheck( p, row, p->order(d) ) orelse DgClickButton( p, row, p->order(d) ) then
+                p->bSwallowChar = true
+                DgUserEnd( p, mk )
+                return true
+            end if
+            DgUserEnd( p, mk )
+            return false
+        end if
+        p->bSwallowChar = true
+        if bShift andalso p->bMulti then
+            DgSetClear( p->sel )
+            DgSetAddRows( p->sel, row, row )
+            DgSetAnchor( p, row, d, true )
+        elseif bCtrl andalso p->bMulti andalso (p->selUnit <> TKDG_SEL_ROW) then
+            DgSetClear( p->sel )
+            DgSetAddRect( p->sel, 0, d, DgViewCount( p ) - 1, d )
+            DgSetAnchor( p, row, d, false )
+        else
+            p->bSwallowChar = false
+            DgUserEnd( p, mk )
+            return false
+        end if
+        DgUserEnd( p, mk )
+        return true
+    case SDLK_A
+        if bCtrl = false then DgUserEnd( p, mk ) : return false
+        if p->bMulti then
+            DgSetClear( p->sel )
+            p->sel.bAll = true
+            p->selBase = p->sel
+        end if
+        DgUserEnd( p, mk )
+        return true
+    case SDLK_C
+        if bCtrl = false then DgUserEnd( p, mk ) : return false
+        tkDataGrid_CopySelection( p->hWin, false )
+        DgUserEnd( p, mk )
+        return true
+    case SDLK_V
+        if bCtrl = false then DgUserEnd( p, mk ) : return false
+        tkDataGrid_Paste( p->hWin )
+        DgUserEnd( p, mk )
+        return true
+    case SDLK_F2
+        DgUserEnd( p, mk )
+        select case p->editMode
+        case TKDG_EDIT_ONF2, TKDG_EDIT_ONKEYSTROKEORF2, TKDG_EDIT_ONENTER
+            DgBeginEdit( p, row, p->order(d), "", false, p->bEditSelectAll )
+            return true
+        end select
+        return false
+    case SDLK_DELETE
+        dim as boolean did = DgDeleteKey( p )
+        DgUserEnd( p, mk )
+        return did
+    case SDLK_ESCAPE
+        DgUserEnd( p, mk )
+        if p->dirtyRow < 0 then return false
+        DgCancelRow( p )
+        return true
+    case else
+        DgUserEnd( p, mk )
+        return false
+    end select
+    if DgMoveCurrent( p, v, p->order(d), bExtend ) andalso (p->editMode = TKDG_EDIT_ONENTER) andalso (bExtend = false) then
+        DgBeginEdit( p, p->curRow, p->curCol, "", false, p->bEditSelectAll )
+    end if
+    DgUserEnd( p, mk )
+    return true
+end function
+
+' A typed character on the surface: the start of an edit that replaces the cell's content.
+private function DgChar( byval p as TKDATAGRID_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->bSwallowChar then p->bSwallowChar = false : return true
+    if p->bEditing orelse (len( m->text ) = 0) then return false
+    select case p->editMode
+    case TKDG_EDIT_ONKEYSTROKE, TKDG_EDIT_ONKEYSTROKEORF2, TKDG_EDIT_ONENTER
+    case else
+        return true                          ' typing does not edit here; swallowed either way
+    end select
+    ' control characters arrive as keys, never as text
+    if (asc( m->text ) < 32) orelse (asc( m->text ) = 127) then return true
+    DgEnsureCurrent( p )
+    if (p->curRow < 0) orelse (p->curCol < 0) then return true
+    dim as ustring u = m->text
+    dim as boolean bReplace = (p->cols(p->curCol).c.kind <> TKDG_COL_COMBO)
+    DgBeginEdit( p, p->curRow, p->curCol, u, bReplace, false )
+    return true
+end function
+
+' ==========================================================================================
+' The mouse
+' ==========================================================================================
+' The display gap a dragged header lands in: before the first shown column whose middle is right
+' of x, or after the last (colCount).
+private function DgDropGap( byval p as TKDATAGRID_STATE ptr, byval x as integer ) as integer
+    dim as integer sl = DgScrollLeft( p )
+    for d as integer = 0 to p->colCount - 1
+        dim as integer k = p->order(d)
+        if p->cols(k).wPx <= 0 then continue for
+        dim as integer l = DgColLeft( p, k ), r = l + p->cols(k).wPx
+        if d >= p->nFrozen then
+            if r <= sl then continue for        ' under the frozen columns
+            if l < sl then l = sl
+        end if
+        if x < (l + r) \ 2 then return d
+    next
+    return p->colCount
+end function
+
+' A selection drag at surface (x, y): the cell under it, clamped into the body, extends.
+private sub DgDragSelectAt( byval p as TKDATAGRID_STATE ptr, byval x as integer, byval y as integer )
+    dim as TK_WIDGET ptr s = p->wSurf
+    dim as integer bt = DgBandTop( p ), bb = DgBodyBottom( p )
+    dim as integer cy = y
+    if cy > bb - 1 then cy = bb - 1
+    if cy < bt then cy = bt
+    dim as integer vr = DgRowAtY( p, cy )
+    if vr > DgViewCount( p ) - 1 then vr = DgViewCount( p ) - 1
+    if vr < 0 then vr = 0
+    dim as integer row = DgModelOf( p, vr )
+    dim as integer d = -1
+    if p->drag = DG_DRAG_CELLS then
+        dim as integer cx = x
+        if cx < DgRhPx( p ) then cx = DgRhPx( p )
+        if cx > s->cw - 1 then cx = s->cw - 1
+        dim as integer k = DgColAtX( p, cx )
+        if k >= 0 then
+            d = p->cols(k).disp
+        else
+            d = iif( cx < DgScrollLeft( p ), DgFirstVisDisp( p ), DgLastVisDisp( p ) )
+        end if
+    end if
+    if d < 0 then d = iif( p->anchorDisp >= 0, p->anchorDisp, DgFirstVisDisp( p ) )
+    dim as DG_USERMARK mk
+    DgUserBegin( p, mk )
+    DgExtendTo( p, row, d )
+    DgUserEnd( p, mk )
+    ' outside the body: keep scrolling while held
+    ' (G7b: over the frozen rows while the rows below are scrolled counts as above them)
+    dim as boolean outside = (y < bt) orelse (y >= bb) orelse ((y < DgBodyTop( p )) andalso (p->scrollY > 0)) _
+                             orelse ((p->drag = DG_DRAG_CELLS) andalso ((x >= s->cw) orelse ((x < DgScrollLeft( p )) andalso (p->scrollX > 0))))
+    if outside then
+        if tkWidget_HasTimer( s, TK_TIMER_AUTOSCROLL ) = false then tkWidget_SetTimer( s, TK_TIMER_AUTOSCROLL, DG_AUTOSCROLL_MS )
+    else
+        tkWidget_KillTimer( s, TK_TIMER_AUTOSCROLL )
+    end if
+end sub
+
+private sub DgEndDrag( byval p as TKDATAGRID_STATE ptr )
+    p->drag = DG_DRAG_NONE
+    p->dragCol = -1
+    p->dropBefore = -1
+    tkWidget_KillTimer( p->wSurf, TK_TIMER_AUTOSCROLL )
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+private sub DgButtonDown( byval p as TKDATAGRID_STATE ptr, byval m as TK_MSG ptr, byref ht as TKDG_HITTEST )
+    dim as TK_WIDGET ptr s = p->wSurf
+    if p->bEditing then
+        if (ht.area = TKDG_HT_CELL) andalso (ht.row = p->editRow) andalso (ht.col = p->editCol) then exit sub
+        if DgEndEdit( p, true ) = false then exit sub       ' refused: the press goes nowhere
+    end if
+    if (p->dirtyRow >= 0) andalso ((ht.area = TKDG_HT_CELL) orelse (ht.area = TKDG_HT_ROWHEADER)) andalso (ht.row <> p->dirtyRow) then
+        if DgCommitRow( p ) = false then exit sub
+    end if
+    ' G7c: a press on the filter row opens its editor there
+    if ht.area = TKDG_HT_FILTER then
+        DgFltOpen( p, ht.col )
+        exit sub
+    end if
+    dim as long km = SDL_GetModState( )        ' a button message carries no modifiers
+    dim as boolean bShift = DgIsShift( km ) andalso p->bMulti, bCtrl = DgIsCtrl( km ) andalso p->bMulti
+    dim as integer x = cint( m->x )
+    select case ht.area
+    case TKDG_HT_DIVIDER
+        if m->clicks >= 2 then
+            DgUserBestFit( p, ht.col )
+            exit sub
+        end if
+        p->drag = DG_DRAG_RESIZE : p->dragCol = ht.col
+        p->dragX0 = x : p->dragW0 = p->cols(ht.col).wPx
+        tkHost_SetCapture( s )
+    case TKDG_HT_HEADER
+        if m->clicks >= 2 then exit sub
+        p->drag = DG_DRAG_HEADER : p->dragCol = ht.col : p->dragX0 = x
+        tkHost_SetCapture( s )
+        tkWidget_Invalidate( s )
+    case TKDG_HT_CORNER
+        if p->bMulti = false then exit sub
+        dim as DG_USERMARK mk
+        DgUserBegin( p, mk )
+        DgSetClear( p->sel )
+        p->sel.bAll = true
+        p->selBase = p->sel
+        DgUserEnd( p, mk )
+    case TKDG_HT_ROWHEADER
+        dim as DG_USERMARK mk
+        DgUserBegin( p, mk )
+        DgEnsureCurrent( p )
+        dim as integer d = DgDispOf( p, p->curCol )
+        if bCtrl then
+            DgToggle( p, ht.row, d, true )
+        elseif bShift then
+            if p->bAnchorRows = false then DgSetAnchor( p, iif( p->anchorRow >= 0, p->anchorRow, p->curRow ), d, true )
+            DgExtendTo( p, ht.row, d )
+        else
+            DgSetClear( p->sel )
+            DgSetAddRows( p->sel, ht.row, ht.row )
+            DgSetAnchor( p, ht.row, d, true )
+        end if
+        p->curRow = ht.row
+        DgEnsureVisible( p, ht.row, -1 )
+        DgUserEnd( p, mk )
+        if bCtrl = false then p->drag = DG_DRAG_ROWS : tkHost_SetCapture( s )
+    case TKDG_HT_CELL
+        if m->clicks >= 2 then
+            ' a double click edits a cell that has an editor, else activates it
+            if (p->editMode <> TKDG_EDIT_PROGRAMMATIC) andalso DgCellEditable( p, ht.row, ht.col ) andalso DgCellHasEditor( p, ht.col ) then
+                DgBeginEdit( p, ht.row, ht.col, "", false, p->bEditSelectAll )
+            elseif (ht.row < p->rowCount) andalso (DgCellEditable( p, ht.row, ht.col ) = false) then
+                if p->CellActivateCallback then p->CellActivateCallback( p->hWin, ht.row, ht.col )
+            end if
+            exit sub
+        end if
+        dim as DG_USERMARK mk
+        DgUserBegin( p, mk )
+        dim as integer d = p->cols(ht.col).disp
+        if bCtrl then
+            DgToggle( p, ht.row, d, false )
+        elseif bShift then
+            DgExtendTo( p, ht.row, d )
+        else
+            DgSelectOnly( p, ht.row, d )
+        end if
+        p->curRow = ht.row : p->curCol = ht.col
+        DgEnsureVisible( p, ht.row, ht.col )
+        DgUserEnd( p, mk )
+        if p->CellClickCallback then p->CellClickCallback( p->hWin, ht.row, ht.col )
+        if (bCtrl = false) andalso (bShift = false) then
+            ' a plain click on a check cell toggles it, on a button clicks it
+            if DgToggleCheck( p, ht.row, ht.col ) orelse DgClickButton( p, ht.row, ht.col ) then exit sub
+            if p->editMode = TKDG_EDIT_ONENTER then
+                if DgBeginEdit( p, ht.row, ht.col, "", false, p->bEditSelectAll ) then exit sub
+            end if
+        end if
+        if bCtrl = false then
+            p->drag = iif( p->bAnchorRows orelse (p->selUnit = TKDG_SEL_ROW), DG_DRAG_ROWS, DG_DRAG_CELLS )
+            tkHost_SetCapture( s )
+        end if
+    end select
+end sub
+
+private sub DgMouseMove( byval p as TKDATAGRID_STATE ptr, byval m as TK_MSG ptr )
+    dim as integer x = cint( m->x ), y = cint( m->y )
+    p->lastX = x : p->lastY = y
+    select case p->drag
+    case DG_DRAG_RESIZE
+        dim as integer k = p->dragCol
+        dim as integer px = p->dragW0 + (x - p->dragX0)
+        dim as integer mn = DgScale( p, p->cols(k).c.minWidth )
+        if px < mn then px = mn
+        if (p->cols(k).c.maxWidth > 0) andalso (px > DgScale( p, p->cols(k).c.maxWidth )) then px = DgScale( p, p->cols(k).c.maxWidth )
+        dim as single sc = iif( p->hWin->pHost->fScale > 0, p->hWin->pHost->fScale, 1 )
+        dim as integer units = cint( px / sc )
+        if (units <> p->cols(k).c.width) orelse (p->cols(k).c.fillWeight <> 0) then
+            p->cols(k).c.width = units
+            p->cols(k).c.fillWeight = 0
+            DgChanged( p )
+            if p->ColumnResizeCallback then p->ColumnResizeCallback( p->hWin, k, units, true )
+        end if
+    case DG_DRAG_HEADER, DG_DRAG_REORDER
+        if (p->drag = DG_DRAG_HEADER) andalso p->bAllowReorder andalso (abs( x - p->dragX0 ) > DgScale( p, DG_DRAG_THRESHOLD )) then
+            p->drag = DG_DRAG_REORDER
+        end if
+        if p->drag = DG_DRAG_REORDER then
+            dim as integer g = DgDropGap( p, x )
+            if g <> p->dropBefore then p->dropBefore = g : tkWidget_Invalidate( p->wSurf )
+        end if
+    case DG_DRAG_CELLS, DG_DRAG_ROWS
+        DgDragSelectAt( p, x, y )
+    case else
+        dim as TKDG_HITTEST ht
+        DgHitTest( p, x, y, ht )
+        if DgCallMsg( p, m, ht ) then exit sub
+        dim as integer hr = iif( (ht.area = TKDG_HT_CELL) orelse (ht.area = TKDG_HT_ROWHEADER), ht.row, -1 )
+        DgSetHot( p, hr, iif( ht.area = TKDG_HT_HEADER, ht.col, -1 ), iif( ht.area = TKDG_HT_DIVIDER, ht.col, -1 ) )
+        tkWidget_SetCursor( p->wSurf, iif( ht.area = TKDG_HT_DIVIDER, TK_CURSOR_SIZEWE, TK_CURSOR_ARROW ) )
+        select case ht.area
+        case TKDG_HT_CELL : DgSetTipTarget( p, ht.row, ht.col )
+        case TKDG_HT_HEADER : DgSetTipTarget( p, -1, ht.col )
+        case else : DgSetTipTarget( p, -2, -1 )
+        end select
+    end select
+end sub
+
+private sub DgButtonUp( byval p as TKDATAGRID_STATE ptr, byval m as TK_MSG ptr )
+    dim as integer k = p->dragCol
+    select case p->drag
+    case DG_DRAG_RESIZE
+        if p->ColumnResizeCallback then p->ColumnResizeCallback( p->hWin, k, p->cols(k).c.width, false )
+    case DG_DRAG_HEADER
+        if p->ColumnClickCallback then p->ColumnClickCallback( p->hWin, k )
+        if p->bHeaderSelects = false then
+            DgHeaderSortClick( p, k, DgIsShift( SDL_GetModState( ) ) )
+        elseif p->bMulti andalso (p->selUnit <> TKDG_SEL_ROW) andalso (DgViewCount( p ) > 0) then
+            dim as DG_USERMARK mk
+            DgUserBegin( p, mk )
+            dim as integer d = p->cols(k).disp
+            if DgIsCtrl( SDL_GetModState( ) ) = false then DgSetClear( p->sel )
+            DgSetAddRect( p->sel, 0, d, DgViewCount( p ) - 1, d )
+            if p->curRow < 0 then p->curRow = DgModelOf( p, 0 )
+            DgSetAnchor( p, p->curRow, d, false )
+            p->curCol = k
+            DgUserEnd( p, mk )
+        end if
+    case DG_DRAG_REORDER
+        dim as integer cur = p->cols(k).disp
+        dim as integer g = p->dropBefore
+        if g >= 0 then
+            dim as integer newPos = iif( g > cur, g - 1, g )
+            if newPos <> cur then
+                tkDataGrid_SetDisplayIndex( p->hWin, k, newPos )
+                if p->ColumnReorderedCallback then p->ColumnReorderedCallback( p->hWin, k, newPos )
+            end if
+        end if
+    end select
+    DgEndDrag( p )
+    tkHost_ReleaseCapture( p->hWin->pHost )
+end sub
+
+' The autoscroll tick of a selection drag: one row (and 16 units across) toward the pointer.
+private sub DgAutoScrollTick( byval p as TKDATAGRID_STATE ptr )
+    if (p->drag <> DG_DRAG_CELLS) andalso (p->drag <> DG_DRAG_ROWS) then
+        tkWidget_KillTimer( p->wSurf, TK_TIMER_AUTOSCROLL )
+        exit sub
+    end if
+    dim as TK_WIDGET ptr s = p->wSurf
+    dim as integer dx = 0, dy = 0
+    if p->lastY < DgBodyTop( p ) then dy = -DgRowHPx( p )
+    if p->lastY >= DgBodyBottom( p ) then dy = DgRowHPx( p )
+    if p->drag = DG_DRAG_CELLS then
+        if p->lastX >= s->cw then dx = DgScale( p, 16 )
+        if p->lastX < DgScrollLeft( p ) then dx = -DgScale( p, 16 )
+    end if
+    DgScrollTo( p, p->scrollX + dx, p->scrollY + dy )
+    DgDragSelectAt( p, p->lastX, p->lastY )
+end sub
+
+function DgSurfaceProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( tkWidget_Parent( w ) )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        DgPaintSurface( p, m->pPaint )
+        return true
+    case TKM_SETFOCUS
+        DgEnsureCurrent( p )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_KILLFOCUS
+        if p->dirtyRow >= 0 then DgStartFocusWatch( p )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_KEYDOWN
+        return DgKeyDown( p, m )
+    case TKM_CHAR
+        return DgChar( p, m )
+    case TKM_MOUSEWHEEL
+        dim as TKDG_HITTEST ht
+        DgHitTest( p, cint( m->x ), cint( m->y ), ht )
+        if DgCallMsg( p, m, ht ) then return true
+        return DgWheel( p, m )
+    case TKM_MOUSEMOVE
+        DgMouseMove( p, m )
+        return true
+    case TKM_MOUSELEAVE
+        dim as TKDG_HITTEST ht
+        DgCallMsg( p, m, ht )
+        if p->drag = DG_DRAG_NONE then DgSetHot( p, -1, -1, -1 )
+        DgSetTipTarget( p, -2, -1 )
+        return true
+    case TKM_LBUTTONDOWN
+        dim as TKDG_HITTEST ht
+        DgHitTest( p, cint( m->x ), cint( m->y ), ht )
+        tkHost_SetFocus( w->pHost, w )
+        if DgCallMsg( p, m, ht ) then return true
+        DgButtonDown( p, m, ht )
+        return true
+    case TKM_LBUTTONUP
+        dim as TKDG_HITTEST ht
+        DgHitTest( p, cint( m->x ), cint( m->y ), ht )
+        DgCallMsg( p, m, ht )
+        if p->drag <> DG_DRAG_NONE then DgButtonUp( p, m )
+        return true
+    case TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        dim as TKDG_HITTEST ht
+        DgHitTest( p, cint( m->x ), cint( m->y ), ht )
+        if m->msg = TKM_RBUTTONDOWN then tkHost_SetFocus( w->pHost, w )
+        ' G7a: the release opens the chooser (header) or fires ContextMenu, unless the host took it
+        if (DgCallMsg( p, m, ht ) = false) andalso (m->msg = TKM_RBUTTONUP) then DgRightClick( p, ht, cint( m->x ), cint( m->y ) )
+        return true
+    case TKM_CAPTURECHANGED
+        if p->drag <> DG_DRAG_NONE then DgEndDrag( p )
+        return true
+    case TKM_TIMER
+        if m->timerId = TK_TIMER_AUTOSCROLL then DgAutoScrollTick( p )
+        if m->timerId = DG_TIMER_EDITFOCUS then DgFocusWatchTick( p )
+        if m->timerId = DG_TIMER_FILTER then DgFltIdleTick( p )
+        return true
+    end select
+    return false
+end function

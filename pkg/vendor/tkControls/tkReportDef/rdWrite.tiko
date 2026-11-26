@@ -1,0 +1,213 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportDef -- the model written as canonical TOML: always this order (format, [report],
+' [report.events], [[parameter]], [[source]] with [[source.field]], [[calc]], [[band]], [[item]] with
+' [[item.rule]]), a key only when it is not its default, geometry to 0.01 pt, no timestamps. So the
+' text is a function of the definition: written, read and written again, it is the same bytes.
+#module "tkReportDef"
+
+#import "../tkReport"
+#import "../tkRExpr"
+using tkReport
+using tkRExpr
+using tkBind
+
+' A TOML basic string.
+function RdQuoted( byref s as const ustring ) as ustring
+    dim as ustring r = """"
+    for i as long = 1 to len( s )
+        dim as ustring c = mid( s, i, 1 )
+        select case c
+        case """" : r &= "\"""
+        case "\" : r &= "\\"
+        case chr( 10 ) : r &= "\n"
+        case chr( 13 ) : r &= "\r"
+        case chr( 9 ) : r &= "\t"
+        case else
+            if (len( c ) = 1) andalso (asc( c ) < 32) then
+                r &= "\u00" & right( "0" & hex( asc( c ) ), 2 )
+            else
+                r &= c
+            end if
+        end select
+    next
+    return r & """"
+end function
+
+' A number of points: rounded to 0.01, no trailing zeros ("12", "42.52", "-3.5").
+function RdNum( byval x as float32 ) as string
+    dim as int64 n = clngint( int( abs( cast( float64, x ) ) * 100 + 0.5 ) )
+    dim as string s = str( n \ 100 )
+    dim as int64 f = n mod 100
+    if f then
+        s &= "." & right( "0" & f, 2 )
+        if right( s, 1 ) = "0" then s = left( s, len( s ) - 1 )
+    end if
+    if (x < 0) andalso (n <> 0) then s = "-" & s
+    return s
+end function
+
+' A bare key when it can be one, else a quoted one.
+private function RdKey( byref k as const ustring ) as ustring
+    if len( k ) = 0 then return """"""
+    for i as long = 1 to len( k )
+        dim as ustring c = mid( k, i, 1 )
+        if ((c >= "a") andalso (c <= "z")) orelse ((c >= "A") andalso (c <= "Z")) orelse ((c >= "0") andalso (c <= "9")) _
+           orelse (c = "_") orelse (c = "-") then continue for
+        return RdQuoted( k )
+    next
+    return k
+end function
+
+private sub KS( byref o as ustring, byref k as const string, byref v as const ustring, byref ind as const string = "" )
+    if len( v ) then o &= ind & k & " = " & RdQuoted( v ) & chr( 10 )
+end sub
+
+private sub KB( byref o as ustring, byref k as const string, byval v as boolean, byref ind as const string = "" )
+    o &= ind & k & " = " & iif( v, "true", "false" ) & chr( 10 )
+end sub
+
+function RdWrite( byval def as TK_REPORTDEF ptr ) as ustring
+    dim as ustring o
+    dim as string nl = chr( 10 )
+    o = "format = 1" & nl & nl & "[report]" & nl
+    KS( o, "title", def->title )
+    KS( o, "paper", def->paper )
+    if lcase( def->paper ) = "custom" then o &= "paper_size = [" & RdNum( def->paperW ) & ", " & RdNum( def->paperH ) & "]" & nl
+    if def->landscape then KB( o, "landscape", true )
+    if (RdNum( def->mL ) <> "56.69") orelse (RdNum( def->mT ) <> "56.69") orelse (RdNum( def->mR ) <> "56.69") orelse (RdNum( def->mB ) <> "56.69") then
+        o &= "margins = [" & RdNum( def->mL ) & ", " & RdNum( def->mT ) & ", " & RdNum( def->mR ) & ", " & RdNum( def->mB ) & "]" & nl
+    end if
+    if def->units <> "mm" then KS( o, "units", def->units )
+    KS( o, "data_module", def->dataModule )
+    if def->boolText <> "Yes|No" then KS( o, "bool_text", def->boolText )
+    if def->nEvents > 0 then
+        o &= nl & "[report.events]" & nl
+        for i as int32 = 0 to def->nEvents - 1
+            o &= RdKey( def->evNames(i) ) & " = " & RdQuoted( def->evHandlers(i) ) & nl
+        next
+    end if
+
+    for i as int32 = 0 to def->nParams - 1
+        dim byref as TKRD_PARAM p = def->params(i)
+        o &= nl & "[[parameter]]" & nl
+        KS( o, "name", p.name_ )
+        if p.kind <> TKV_TEXT then KS( o, "type", RdKindName( p.kind ) )
+        KS( o, "default", p.default_ )
+        KS( o, "prompt", p.prompt )
+        if p.required then KB( o, "required", true )
+    next
+
+    for i as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(i)
+        o &= nl & "[[source]]" & nl
+        KS( o, "name", s.name_ )
+        if s.kind <> "host" then KS( o, "kind", s.kind )
+        KS( o, "parent", s.parent )
+        KS( o, "relation", s.relation )
+        KS( o, "item_type", s.itemType )
+        KS( o, "items_source", s.itemsSource )
+        KS( o, "sql", s.sql )
+        if s.nPar > 0 then
+            o &= "params = { "
+            for j as int32 = 0 to s.nPar - 1
+                if j then o &= ", "
+                o &= RdKey( s.pNames(j) ) & " = " & RdQuoted( s.pExprs(j) )
+            next
+            o &= " }" & nl
+        end if
+        KS( o, "grid", s.grid )
+        KS( o, "sort", s.sort )
+        KS( o, "filter", s.filter )
+        KS( o, "design_db", s.designDb )
+        for j as int32 = 0 to s.nFields - 1
+            o &= nl & "  [[source.field]]" & nl
+            KS( o, "name", s.fields(j).name_, "  " )
+            if s.fields(j).kind <> TKV_TEXT then KS( o, "kind", RdKindName( s.fields(j).kind ), "  " )
+        next
+    next
+
+    for i as int32 = 0 to def->nCalcs - 1
+        dim byref as TKRD_CALC c = def->calcs(i)
+        o &= nl & "[[calc]]" & nl
+        KS( o, "source", c.source )
+        KS( o, "name", c.name_ )
+        KS( o, "expr", c.expr )
+    next
+
+    for i as int32 = 0 to def->nBands - 1
+        dim byref as TKRD_BAND b = def->bands(i)
+        o &= nl & "[[band]]" & nl
+        KS( o, "id", b.id )
+        KS( o, "kind", b.kind )
+        KS( o, "parent", b.parent )
+        KS( o, "source", b.source )
+        if b.level <> 0 then o &= "level = " & b.level & nl
+        KS( o, "group", b.group_ )
+        if RdNum( b.height ) <> "20" then o &= "height = " & RdNum( b.height ) & nl
+        if b.canGrow = false then KB( o, "can_grow", false )
+        if b.breakBefore then KB( o, "page_break_before", true )
+        if b.breakAfter then KB( o, "page_break_after", true )
+        if b.repeat_ then KB( o, "repeat", true )
+        if b.printOnFirstPage = false then KB( o, "print_on_first_page", false )
+        if b.printAtBottom then KB( o, "print_at_bottom", true )
+        KS( o, "visible", b.visible )
+        KS( o, "back", b.back )
+    next
+
+    for i as int32 = 0 to def->nItems - 1
+        dim byref as TKRD_ITEM it = def->items(i)
+        o &= nl & "[[item]]" & nl
+        KS( o, "id", it.id )
+        KS( o, "band", it.band )
+        if it.kind <> "text" then KS( o, "kind", it.kind )
+        o &= "rect = [" & RdNum( it.x ) & ", " & RdNum( it.y ) & ", " & RdNum( it.w ) & ", " & RdNum( it.h ) & "]" & nl
+        KS( o, "text", it.text )
+        KS( o, "expr", it.expr )
+        KS( o, "format", it.format )
+        if it.align <> "left" then KS( o, "align", it.align )
+        if it.valign <> "middle" then KS( o, "valign", it.valign )
+        if it.wrap then KB( o, "wrap", true )
+        if it.canGrow then KB( o, "can_grow", true )
+        dim as ustring f
+        if len( it.fontSrc ) then f &= "src = " & RdQuoted( it.fontSrc )
+        if RdNum( it.fontSize ) <> "10" then
+            if len( f ) then f &= ", "
+            f &= "size = " & RdNum( it.fontSize )
+        end if
+        if it.bold then
+            if len( f ) then f &= ", "
+            f &= "bold = true"
+        end if
+        if it.italic then
+            if len( f ) then f &= ", "
+            f &= "italic = true"
+        end if
+        if len( f ) then o &= "font = { " & f & " }" & nl
+        KS( o, "fore", it.fore )
+        KS( o, "back", it.back )
+        KS( o, "border", it.border )
+        KS( o, "line_color", it.lineColor )
+        if RdNum( it.pen ) <> "0.5" then o &= "pen = " & RdNum( it.pen ) & nl
+        KS( o, "visible", it.visible )
+        if it.reset <> "auto" then KS( o, "reset", it.reset )
+        if it.running then KB( o, "running", true )
+        if it.incr <> "row" then KS( o, "incr", it.incr )
+        if it.tag <> 0 then o &= "tag = " & it.tag & nl
+        for j as int32 = 0 to it.nRules - 1
+            dim byref as TKRD_RULE ru = it.rules(j)
+            o &= nl & "  [[item.rule]]" & nl
+            KS( o, "when", ru.when_, "  " )
+            KS( o, "fore", ru.fore, "  " )
+            KS( o, "back", ru.back, "  " )
+            if ru.bold >= 0 then KB( o, "bold", ru.bold = 1, "  " )
+            if ru.italic >= 0 then KB( o, "italic", ru.italic = 1, "  " )
+            if ru.hide then KB( o, "hide", true, "  " )
+        next
+    next
+    return o
+end function

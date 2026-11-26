@@ -1,0 +1,313 @@
+' The half of the form you write. The rest is frmCustomers.design.tiko, generated from
+' frmCustomers.tkform: don't edit that one.
+'
+' The main window: one customer at a time, bound to the boxes on the right (DataType
+' orderdb.Customer), stepped through by the navigator under the list. The list (grdCustomers) is a
+' DataGrid bound to Customers, and the navigator FOLLOWS it: a click in the list moves the
+' navigator, a navigator move selects the row. The orders grid (grdOrders) is bound to the
+' customer's own Orders (ItemsField), so LoadFrom fills it with every other box.
+'
+' WHAT IS GENERATED, AND WHAT IS WRITTEN HERE. LoadFrom / SaveTo / IsDirty move values between the
+' controls and a Customer; navCustomers_MoveTo / _Refresh / _Go_ keep the navigator, the list and
+' the boxes together. None of it knows about SQLite. This file adds the database: Customers is
+' read from it, and Commit writes back every record that changed. It runs before every navigator
+' action (Navigate), after every click in the list (CurrentCellChanged), on Save and on Close --
+' so moving to another customer saves the one you were on, as in an Access or VB data form.
+#module "frmCustomers"
+
+#import "std/containers"
+#import "std/fs"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkMessageBox"
+#import "vendor/tkControls/tkDataGrid"
+#import "vendor/tkControls/tkNavigator"
+#import "vendor/tkControls/tkStatusBar"
+#import "../askbox"
+#import "../orderdb"
+#import "../frmOrder"
+#import "../frmOrders"
+#import "../frmReport"
+#import "../rptSales"
+#import "vendor/sqlite3"                 ' rptSales.SetDatabase takes an sqlite3 ptr: see README, "one tiko link trap"
+using containers
+using tkApp
+using tkMessageBox
+using tkDataGrid
+using tkNavigator
+using tkStatusBar
+using tkHost
+
+' The order dialog: built the first time it is shown, then hidden and shown again.
+dim shared as frmOrder.Form dlgOrder
+
+public partial type Form
+    DataFile as ustring                         ' the database: set it before Build, or leave it ""
+                                                ' for orders.db in the user's data folder
+    Customers as Array( of orderdb.Customer )   ' what the list, the navigator and the boxes show
+    Saved as Array( of orderdb.Customer )       ' as the database has them, to see what changed
+    declare sub Reload( byval selectId as int64 = 0 )
+    declare function Commit( ) as boolean
+    declare function WriteChanges( ) as boolean
+    declare function Current( ) as int32
+    declare function SavedIndex( byval id as int64 ) as int32
+    declare sub ShowCount( )
+    declare sub SetStatus( byref text as const ustring )
+    declare function Ask( byref text as const ustring, byval icon as int32, byval buttons as int32 ) as int32
+    declare sub EditOrder( byref o as orderdb.Order )
+    declare sub OpenOrder( byval i as int32 )
+end type
+
+sub Form.Form_Load( )
+    if len( DataFile ) = 0 then
+        dim as ustring none
+        dim as ustring folder = fs.PathJoin( fs.DataDir( ).ValueOr( none ), "tkOrders" )
+        fs.CreateDirAll( folder )
+        DataFile = fs.PathJoin( folder, "orders.db" )
+    end if
+    dim as ustring e = orderdb.OpenData( DataFile )
+    if len( e ) then
+        SetStatus( "Can't open " & DataFile & ": " & e )
+        exit sub
+    end if
+    cboTier_Fill( )                         ' generated: the ComboBox's items from orderdb.Tiers( )
+    Reload( )
+end sub
+
+' Closing saves the customer on screen. If it can't be saved, ask before throwing the edit away.
+sub Form.Form_Close( byref Cancel as boolean )
+    if orderdb.Connection( ) = nullptr then exit sub
+    if Commit( ) then exit sub
+    if Ask( "This customer can't be saved. Close anyway and lose the change?", MBX_ICON_QUESTION, MBX_BTN_YESNO ) <> MBX_IDYES then
+        Cancel = true
+    end if
+end sub
+
+sub Form.Form_Destroy( )
+    orderdb.CloseData( )
+end sub
+
+' ---- the records -----------------------------------------------------------------------------------
+
+' Read every customer again and show the one with selectId (or the first).
+sub Form.Reload( byval selectId as int64 = 0 )
+    dim as ustring e = orderdb.LoadCustomers( Customers )
+    if len( e ) then SetStatus( e )
+    Saved = Customers
+    navCustomers_Refresh( )                 ' generated: the list filled, the navigator's count, the record shown
+    for i as int32 = 0 to Customers.Count( ) - 1
+        if Customers[i].Id = selectId then navCustomers_MoveTo( i ) : exit for
+    next
+    ShowCount( )
+end sub
+
+' The record on screen, an index into Customers; -1 for none.
+function Form.Current( ) as int32
+    dim as int32 i = navCustomers_Current( )
+    if (i < 0) orelse (i >= Customers.Count( )) then return -1
+    return i
+end function
+
+function Form.SavedIndex( byval id as int64 ) as int32
+    for j as int32 = 0 to Saved.Count( ) - 1
+        if Saved[j].Id = id then return j
+    next
+    return -1
+end function
+
+' The boxes into the record on screen (when they were changed), then every changed record into the
+' database. False when the boxes can't be saved (SaveTo has said why) or the database refused.
+function Form.Commit( ) as boolean
+    dim as int32 cur = Current( )
+    if (cur >= 0) andalso IsDirty( Customers[cur] ) then
+        if SaveTo( Customers[cur] ) = false then return false
+        navCustomers_ListRow_( cur )        ' generated: the list's row shows the new values
+    end if
+    return WriteChanges( )
+end function
+
+' Insert the new records, update the changed ones. A new record nobody typed in is left alone.
+function Form.WriteChanges( ) as boolean
+    dim as int32 nWritten = 0
+    for i as int32 = 0 to Customers.Count( ) - 1
+        dim byref as orderdb.Customer c = Customers[i]
+        dim as int32 j = -1
+        if c.Id = 0 then
+            if len( trim( c.Company ) ) = 0 then continue for
+        else
+            j = SavedIndex( c.Id )
+            if (j >= 0) andalso c.SameAs( Saved[j] ) then continue for
+        end if
+        c.TrimFields( )
+        dim as ustring e = orderdb.SaveCustomer( c )         ' a new one gets its Id here
+        if len( e ) then
+            SetStatus( "Not saved: " & e )
+            Ask( c.Company & " can't be saved:" & wchr( 10 ) & e, MBX_ICON_ERROR, MBX_BTN_OK )
+            return false
+        end if
+        if j >= 0 then Saved[j] = c else Saved.Push( c )
+        navCustomers_ListRow_( i )
+        nWritten += 1
+        SetStatus( "Saved " & c.Company )
+    next
+    if nWritten then ShowCount( )
+    return true
+end function
+
+' ---- the list and the navigator --------------------------------------------------------------------
+
+' A click in the list has already moved the navigator (generated: navCustomers_FromList_), saving the
+' boxes into the record it left. Now the database gets it.
+sub Form.grdCustomers_CurrentCellChanged( byval row as integer, byval col as integer )
+    WriteChanges( )
+end sub
+
+' Before the navigator moves, adds or deletes (the generated code does it after this, if Allow).
+sub Form.navCustomers_Navigate( byval action as int32, byval target as int32, byref Allow as boolean )
+    if action = TKNAV_DELETE then
+        dim as int32 cur = Current( )
+        if cur < 0 then Allow = false : exit sub
+        dim byref as orderdb.Customer c = Customers[cur]
+        dim as ustring what = c.Company
+        if len( what ) = 0 then what = "this new customer"
+        dim as int32 n = c.Orders.Count( )
+        if n = 1 then what &= " and its order" else if n > 1 then what &= " and its " & n & " orders"
+        if Ask( "Delete " & what & "?", MBX_ICON_QUESTION, MBX_BTN_YESNO ) <> MBX_IDYES then
+            Allow = false
+            exit sub
+        end if
+        if c.Id then
+            dim as ustring e = orderdb.DeleteCustomer( c.Id )
+            if len( e ) then
+                Ask( e, MBX_ICON_ERROR, MBX_BTN_OK )
+                Allow = false
+                exit sub
+            end if
+            dim as int32 j = SavedIndex( c.Id )
+            if j >= 0 then Saved.Remove( j )
+        end if
+        SetStatus( "Deleted " & what )
+        tkStatusBar_SetText( sbMain.Handle, 0, (Customers.Count( ) - 1) & " customers" )
+        exit sub
+    end if
+    ' First, Previous, Next, Last, a typed position, New: save where we are first.
+    if Commit( ) = false then Allow = false
+    if action = TKNAV_NEW then SetStatus( "A new customer: type its company, then move on (or Save) to keep it" )
+end sub
+
+' ---- the buttons -------------------------------------------------------------------------------------
+
+sub Form.btnSave_Click( )
+    if Commit( ) then SetStatus( "Everything is saved" )
+end sub
+
+' Back to what the record held: the edits on screen are dropped.
+sub Form.btnRevert_Click( )
+    dim as int32 cur = Current( )
+    if cur < 0 then exit sub
+    LoadFrom( Customers[cur] )
+    SetStatus( "Reverted" )
+end sub
+
+sub Form.btnNewOrder_Click( )
+    if Commit( ) = false then exit sub
+    dim as int32 cur = Current( )
+    if cur < 0 then exit sub
+    if Customers[cur].Id = 0 then
+        Ask( "Type the customer's company first: an order needs a saved customer.", MBX_ICON_INFO, MBX_BTN_OK )
+        exit sub
+    end if
+    dim as orderdb.Order o = orderdb.NewOrder( Customers[cur] )
+    EditOrder( o )
+end sub
+
+sub Form.btnOpenOrder_Click( )
+    OpenOrder( grdOrders_Item( ) )          ' generated: the selected row's index in the record's Orders
+end sub
+
+' A double click or Enter on an order opens it.
+sub Form.grdOrders_CellActivate( byval row as integer, byval col as integer )
+    OpenOrder( grdOrders_Item( ) )
+end sub
+
+' Amounts with two decimals: the grid shows a float64 as it is (147.4), this makes it 147.40.
+sub Form.grdOrders_CellFormatting( byval p as TKDATAGRID_FORMATINFO ptr )
+    if (p->col = 4) andalso (p->value->kind = TKDG_FLOAT) then p->text = orderdb.Money( p->value->f )
+end sub
+
+' The footer's total likewise.
+sub Form.grdOrders_SummaryFormatting( byval col as integer, byval kind as int32, byref v as TKDG_VALUE, byref text as ustring )
+    if (col = 4) andalso (v.kind = TKDG_FLOAT) then text = orderdb.Money( v.f )
+end sub
+
+sub Form.btnAllOrders_Click( )
+    if Commit( ) = false then exit sub
+    dim as frmOrders.Form f
+    f.Build( Handle )
+    f.ShowModal( Handle )
+    dim as boolean changed = f.Changed
+    f.Release( )
+    if changed then                          ' an order was edited there: its customer's totals moved
+        dim as int32 cur = Current( )
+        Reload( iif( cur >= 0, Customers[cur].Id, 0 ) )
+    end if
+end sub
+
+' Sales by customer: the designed report rptSales, whose data source is an SQL query. The report
+' runs it on the program's own connection; its FromDate and ToDate parameters are the query's
+' :FromDate and :ToDate, and the viewer's parameter strip lets the user change them and press Run.
+sub Form.btnSalesReport_Click( )
+    if Commit( ) = false then exit sub         ' the report reads the database: write the edits first
+    dim as rptSales.Report r                   ' declared before the window, so it outlives it
+    r.SetDatabase( orderdb.Connection( ) )
+    dim as frmReport.Form f
+    f.Build( Handle )
+    r.ShowIn( f.rvReport.Handle )
+    f.ShowModal( Handle )
+end sub
+
+' ---- orders ----------------------------------------------------------------------------------------
+
+' The customer's order number i (an index into its Orders), read again with its lines.
+sub Form.OpenOrder( byval i as int32 )
+    dim as int32 cur = Current( )
+    if (cur < 0) orelse (i < 0) orelse (i >= Customers[cur].Orders.Count( )) then exit sub
+    if Commit( ) = false then exit sub
+    dim as orderdb.Order o
+    if orderdb.LoadOrder( Customers[cur].Orders[i].Id, o ) = false then
+        SetStatus( "That order is gone" )
+        exit sub
+    end if
+    EditOrder( o )
+end sub
+
+' The order dialog on o; after OK the order is saved and the customer's orders are read again.
+sub Form.EditOrder( byref o as orderdb.Order )
+    if dlgOrder.IsOpen( ) = false then dlgOrder.Build( Handle )
+    dlgOrder.Edit( o )
+    if dlgOrder.ShowModal( Handle ) <> 1 then exit sub
+    dim as ustring e = orderdb.SaveOrder( dlgOrder.Ord )
+    if len( e ) then
+        Ask( "The order can't be saved:" & wchr( 10 ) & e, MBX_ICON_ERROR, MBX_BTN_OK )
+        exit sub
+    end if
+    dim as int32 cur = Current( )
+    if cur < 0 then exit sub
+    orderdb.LoadCustomerOrders( Customers[cur].Id, Customers[cur].Orders )
+    LoadFrom( Customers[cur] )               ' Commit ran first, so nothing typed is lost
+    SetStatus( "Saved order " & dlgOrder.Ord.Id & " (" & orderdb.Money( dlgOrder.Ord.Amount ) & ")" )
+end sub
+
+' ---- helpers ---------------------------------------------------------------------------------------
+
+sub Form.ShowCount( )
+    dim as int32 n = Saved.Count( )
+    tkStatusBar_SetText( sbMain.Handle, 0, n & iif( n = 1, " customer", " customers" ) )
+end sub
+
+sub Form.SetStatus( byref text as const ustring )
+    tkStatusBar_SetText( sbMain.Handle, 1, text )
+end sub
+
+function Form.Ask( byref text as const ustring, byval icon as int32, byval buttons as int32 ) as int32
+    return askbox.Ask( Handle, text, "Customers and Orders", icon, buttons )
+end function

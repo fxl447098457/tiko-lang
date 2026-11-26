@@ -176,6 +176,7 @@ end extern
 '' reads: BC, UP, PC and ospeed. They are DATA, not functions, and tputs will
 '' read PC and ospeed whether or not this file sets them -- which is why fbc
 '' assigns them and why they are declared here rather than ignored.
+#ifndef __FB_ANDROID__
 extern "c"   '' NON-FBCALL: termcap, not rtlib entry points.
 	declare function c_tgetent alias "tgetent" ( byval buf as zstring ptr, byval name_ as zstring ptr ) as int32
 	declare function c_tgetstr alias "tgetstr" ( byval id as zstring ptr, byval area as zstring ptr ptr ) as zstring ptr
@@ -188,6 +189,7 @@ extern "c"   '' NON-FBCALL: termcap, not rtlib entry points.
 	extern PC alias "PC" as int8
 	extern ospeed alias "ospeed" as int16
 end extern
+#endif
 
 extern "c"   '' NON-FBCALL: rtlib internals owned elsewhere.
 	declare sub tkrt_hAddCh2 alias "fb_hAddCh" ( byval ch as int32 )
@@ -272,6 +274,8 @@ end sub
 	#include once "hinitposixlinux.tiko"
 #elseif defined( __FB_DARWIN__ )
 	#include once "hinitposixdarwin.tiko"
+#elseif defined( __FB_ANDROID__ )
+	#include once "hinitposixandroid.tiko"
 #else
 	#error "init/hinitposix: no port-permission backend for this OS"
 #endif
@@ -479,6 +483,67 @@ sub tkort_hRecheckConsoleSize alias "fb_hRecheckConsoleSize" ( byval requery_cur
 	tkrt_DevScrnMaybeUpdateWidth( )
 end sub
 
+#ifdef __FB_ANDROID__
+'' NO TERMINFO ON ANDROID: Bionic has none and the NDK ships none (docs/tiko-android FACTS). fbc
+'' then writes no sequence at all; tiko writes xterm's (D-A1-6, the author's decision), so
+'' COLOR, LOCATE and CLS work under adb shell and Termux, whose TERM is xterm-256color. The
+'' strings are exactly what ncurses' tgetstr and tgoto give for that TERM on glibc
+'' (docs/tiko-android probes/a1/out/termcap-wsl-xterm-256color.txt), so android-x86_64 writes
+'' the bytes linux-x86_64 writes. Five are parameterised and formatted by tkort_android_tgoto
+'' ("%" marks them); "WS", the window-size capability, xterm lacks, so slot 5 stays empty.
+'' Slots are in SEQ_ order: cm ho cs cl ce WS bl AF AB me md SF ve vi dc ks ke.
+dim shared as zstring * 16 tkort_android_seq( 0 to SEQ_MAX_ - 1 )
+
+private sub tkort_init_android_seq( )
+	dim as uint8 e = 27
+	tkort_android_seq(0) = "%"                                       '' cm
+	tkort_android_seq(1) = chr( e ) + "[H"                           '' ho
+	tkort_android_seq(2) = "%"                                       '' cs
+	tkort_android_seq(3) = chr( e ) + "[H" + chr( e ) + "[2J"        '' cl
+	tkort_android_seq(4) = chr( e ) + "[K"                           '' ce
+	tkort_android_seq(6) = chr( 7 )                                  '' bl
+	tkort_android_seq(7) = "%"                                       '' AF
+	tkort_android_seq(8) = "%"                                       '' AB
+	tkort_android_seq(9) = chr( e ) + "[0m"                          '' me
+	tkort_android_seq(10) = chr( e ) + "[1m"                         '' md
+	tkort_android_seq(11) = "%"                                      '' SF
+	tkort_android_seq(12) = chr( e ) + "[?12l" + chr( e ) + "[?25h"  '' ve
+	tkort_android_seq(13) = chr( e ) + "[?25l"                       '' vi
+	tkort_android_seq(14) = chr( e ) + "[P"                          '' dc
+	tkort_android_seq(15) = chr( e ) + "[?1h" + chr( e ) + "="       '' ks
+	tkort_android_seq(16) = chr( e ) + "[?1l" + chr( e ) + ">"       '' ke
+end sub
+
+'' tgoto( cap, col = param1, row = param2 ) and tputs, for xterm's five parameterised
+'' capabilities as ncurses expands them -- its %p1 is the ROW argument, param2:
+''   cm  \E[%i%p1%d;%p2%dH       cs  \E[%i%p1%d;%p2%dr       SF  \E[%p1%dS
+''   AF  \E[3n m below 8, \E[9(n-8) m below 16, else \E[38;5;n m   (AB: 4n, 10(n-8), 48;5;n)
+'' ESC IS !"\027": tiko's escapes are FreeBASIC's, and \nnn is DECIMAL there. C's
+'' octal \033 is chr(33), '!' -- which the SEQ_SET_COLOR_EX line below still writes, as it
+'' does on Linux (docs/tiko-android FACTS, a pre-existing bug left for its own fix).
+private sub tkort_android_tgoto( byval code_ as int32, byval param1 as int32, byval param2 as int32 )
+	select case code_
+	case 0
+		c_fprintf2( stdout, @!"\027[%d;%dH", param2 + 1, param1 + 1 )
+	case 2
+		c_fprintf2( stdout, @!"\027[%d;%dr", param2 + 1, param1 + 1 )
+	case 7, 8
+		dim as int32 base_ = iif( code_ = 7, 30, 40 )
+		if( param2 < 8 ) then
+			c_fprintf2( stdout, @!"\027[%dm", base_ + param2 )
+		elseif( param2 < 16 ) then
+			c_fprintf2( stdout, @!"\027[%dm", base_ + 60 + param2 - 8 )
+		else
+			c_fprintf2( stdout, @!"\027[%d;5;%dm", base_ + 8, param2 )
+		end if
+	case 11
+		c_fprintf2( stdout, @!"\027[%dS", param2 )
+	case else
+		c_fputs2( @tkort_android_seq( code_ ), stdout )
+	end select
+end sub
+#endif
+
 '' CODES BELOW SEQ_MAX COME FROM TERMCAP; the rest are the hard-coded VT100
 '' sequences, and those are gated on __fb_enable_vt100_escapes because an old
 '' terminal that does not understand them will never answer and the program
@@ -502,9 +567,13 @@ function tkort_hTermOut alias "fb_hTermOut" _
 		end if
 	else
 		if( __fb_con.seq( code_ ) = nullptr ) then return 0
-		dim as zstring ptr str_ = c_tgoto( __fb_con.seq( code_ ), param1, param2 )
-		if( str_ = nullptr ) then return 0
-		c_tputs( str_, 1, cast( any ptr, @c_putchar2 ) )
+		#ifdef __FB_ANDROID__
+			tkort_android_tgoto( code_, param1, param2 )
+		#else
+			dim as zstring ptr str_ = c_tgoto( __fb_con.seq( code_ ), param1, param2 )
+			if( str_ = nullptr ) then return 0
+			c_tputs( str_, 1, cast( any ptr, @c_putchar2 ) )
+		#endif
 	end if
 
 	'' The terminal must SEE the sequence before anything waits on a reply.
@@ -655,7 +724,9 @@ private sub tkort_hInitInner( )
 
 	dim as int32 sigs( 0 to 6 ) = { SIGABRT, SIGFPE, SIGILL, SIGSEGV, _
 	                               SIGTERM, SIGINT, SIGQUIT }
-	dim as zstring * 2048 buffer_
+	#ifndef __FB_ANDROID__
+		dim as zstring * 2048 buffer_
+	#endif
 	dim as struct_termios tty
 	dim as zstring ptr term = any
 
@@ -664,6 +735,18 @@ private sub tkort_hInitInner( )
 
 	memset( @__fb_con, 0, sizeof( FBCONSOLE_ ) )
 
+#ifdef __FB_ANDROID__
+	'' ANDROID: xterm's table (tkort_init_android_seq) for any TERM that starts "xterm", and
+	'' plain stdout for every other -- including none at all, which is an app's case: its
+	'' stdout is no terminal. The same early exits as below leave __fb_con.inited at 0.
+	term = c_getenv( @"TERM" )
+	if( (term = nullptr) orelse (strncmp( term, @"xterm", 5 ) <> 0) ) then exit sub
+	if( c_tcgetattr2( STDOUT_FILENO, @tty ) <> 0 ) then exit sub
+	tkort_init_android_seq( )
+	for i as int32 = 0 to SEQ_MAX_ - 1
+		if( len( tkort_android_seq( i ) ) > 0 ) then __fb_con.seq( i ) = @tkort_android_seq( i )
+	next
+#else
 	'' TERMCAP. Every one of these failures returns EARLY and leaves
 	'' __fb_con.inited at 0, which is what makes every console entry point fall
 	'' back to plain stdout.
@@ -688,6 +771,7 @@ private sub tkort_hInitInner( )
 	for i as int32 = 0 to SEQ_MAX_ - 1
 		__fb_con.seq( i ) = c_tgetstr( @tkort_seqname( i ), nullptr )
 	next
+#endif
 
 	'' "console" or "linux*" is a real Linux console; everything else is
 	'' treated as X11.

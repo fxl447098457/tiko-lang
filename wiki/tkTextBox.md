@@ -157,6 +157,14 @@ an optional leading minus, digits, and at most one decimal point followed by at 
 Every keystroke is checked against the text as it would be after replacing the selection, and a
 paste is checked whole and refused whole.
 
+### The screen keyboard
+
+On a phone, the box asks for the keyboard its mode needs (`tkWidget_SetTextKind`, see
+[tkHost](tkHost)): a single-line box `TK_TEXT_LINE`, a multiline one `TK_TEXT_MULTILINE` (sentences
+capitalised), a password `TK_TEXT_PASSWORD` (not learned by the keyboard), a numeric one a number pad --
+`TK_TEXT_DECIMAL` with `DecimalPlaces` > 0, `TK_TEXT_INTEGER` with 0. Changing the mode while the box
+has the focus changes the keyboard at once. On a desktop nothing visible changes.
+
 On focus loss a non-empty value is reformatted to exactly the decimal places (`"5."` becomes
 `"5.00"`), silently and before the focus callback runs. An empty box stays empty, and shows its
 cue banner, unless `tkTextBox_SetZeroWhenEmpty` is on; turning that on stamps the formatted zero

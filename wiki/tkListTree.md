@@ -4,7 +4,7 @@
 
 Shows a scrolling list of rows you paint that is also a tree, with columns and editing.
 
-tkListTree is a list box and a tree view in one control. Rows have a fixed height and are drawn by your paint callback; the control decides which rows are visible, where they sit and what state each is in. A flat list, a grouped list (collapsible header rows), a report with resizable columns and a tree of any depth with twisties are all the same control. It also does single, multiple and extended selection, per-row tooltips, in-place label editing and drag reordering.
+tkListTree is a list box and a tree view in one control. Rows have a fixed height and are drawn by your paint callback; the control decides which rows are visible, where they sit and what state each is in. A flat list, a grouped list (collapsible header rows), a report with resizable columns and a tree of any depth with twisties are all the same control. It also does single, multiple and extended selection, per-row tooltips, in-place label editing, drag reordering and check boxes (two- or three-state, with a tri-state cascade over a tree).
 
 Reach for it for a file pane, a results list, a symbol browser or a settings tree. Rows are addressed by **model index**, the order you added them: collapsing a group or a node hides rows but never renumbers anything, and selection stays on the rows across a collapse.
 
@@ -19,7 +19,7 @@ using tkHost
 using tkPaint
 ```
 
-The module brings in [tkHost](tkHost), [tkTheme](tkTheme), [tkTooltip](tkTooltip), [tkTextBox](tkTextBox), [tkColumnHeader](tkColumnHeader), [tkVScrollBar](tkVScrollBar) and [tkScrollBar](tkScrollBar). Add `using tkColumnHeader` to name the `HDR_*` callback types for the column band.
+The module brings in [tkHost](tkHost), [tkTheme](tkTheme), [tkTooltip](tkTooltip), [tkTextBox](tkTextBox), [tkColumnHeader](tkColumnHeader), [tkVScrollBar](tkVScrollBar), [tkScrollBar](tkScrollBar) and [tkCheckBox](tkCheckBox) (for the check boxes' colour struct and painter). Add `using tkColumnHeader` to name the `HDR_*` callback types for the column band.
 
 ## Example
 
@@ -208,7 +208,8 @@ The surface handles these and they never reach the message callback:
 | Home / End | First / last visible row |
 | Left | Collapse an expanded node; otherwise jump to its parent |
 | Right | Expand a collapsed node; otherwise step to its first child |
-| Space | Toggle the caret row's selection (multiple, extended), or select it (single) |
+| Space | Toggle the caret row's selection (multiple, extended), or select it (single). With check boxes on: toggle the caret row's check, and Ctrl+Space is the selection toggle |
+| `+` / `-` | With check boxes on: check / uncheck the caret row (keypad, or the `=+` key) |
 | F2 | Edit the caret row, when label editing is on |
 | Enter | Edit (with `SetEnterEdits`), else activate (with an Activate callback) |
 
@@ -282,6 +283,41 @@ scrolling, resizing the list or a fold setter commits it first.
 - `BeginEdit` returns false when editing is off, the row is non-selectable or hidden, or the
   veto refuses; `EndEdit( h, bCommit )` returns true when the model was written.
 
+### Check boxes
+
+`SetCheckBoxes( h, true )` gives every non-header row a box, in a band after the twisty. A row's
+state is `LT_CHECK_UNCHECKED`, `LT_CHECK_CHECKED` or `LT_CHECK_MIXED` (the same values as
+[tkCheckBox](tkCheckBox)'s `CHK_STATE_*`). It travels with the row like its selection, and is
+independent of it. Check boxes are off by default; with them off, nothing about the list changes.
+
+- **Layout.** The band is 20 wide and the box 16, unscaled. The box is never taller than the row
+  less 2 a side, and it is centred in the band. Every non-header row reserves the band, so text keeps
+  its column on a row with no box. `pi->indent`, column 0's cell and the label editor all start after
+  it. Legacy header rows (`AddHeader`) never have a box. `GetCheckRect( h, row, rc )` answers the
+  box's cell, surface-local.
+- **The user.** A press on the box and a release over it toggle the check. The press is captured;
+  sliding off cancels it. The row becomes the caret row, the selection is left alone, and the press
+  neither starts a drag nor click-to-edit. A double click on the box is two toggles and never
+  activates. `SetCheckOnClick( h, true )` makes a click on the row select it and toggle it. Space
+  toggles the caret row; when the caret row is selected among others, every selected row follows it.
+  `+` / `-` check and uncheck. A non-selectable row's box is drawn disabled and never toggles.
+- **Modes.** `SetCheckMode( h, LT_CHECKMODE_THREESTATE )` makes a user toggle cycle unchecked,
+  checked, mixed. `SetCheckCascade( h, true )` makes a user toggle take the row's subtree with it and
+  re-derive its ancestors: a parent is checked when all its direct children are, unchecked when none
+  are, and mixed otherwise. Rows that are not checkable are left out. Clicking a mixed box checks it,
+  and with the cascade on a toggle is never three-state. `RecomputeChecks` derives every parent from
+  its children in one pass, for after a bulk load.
+- **Setters are silent:** `SetCheck( h, row, state, bCascade )` (bCascade applies the cascade as a user
+  toggle would), `CheckAll`, `SetRowCheckable`, `RecomputeChecks`. The queries are `GetCheck`,
+  `GetCheckedCount` (checked rows, not mixed ones), `GetCheckedItems( h, rows() )` (in row order) and
+  `GetRowCheckable`.
+- **Events.** Each gesture fires one `ItemCheck` before the change (vetoable; it may rewrite the new
+  state) and one `ItemChecked` after it, however many rows changed. See Callbacks.
+- **Painting.** The control paints the box after your row painter, as it paints the twisty, through
+  `tkCheckBox_PaintMark`. `SetCheckOwnerDraw( h, true )` leaves it to your painter, which gets
+  `rcCheck`, `checkState`, `isCheckable`, `isCheckHot` and `isCheckPressed`. The message callback's
+  `onCheck` says a press was on the box.
+
 ## Colours
 
 There is no colour struct: every row pixel is your painter's. What the control paints itself
@@ -298,6 +334,7 @@ back.
 | `SetScrollBarColors` | `Window`, `Border`, `TextDisabled` | The track, thumb and active thumb |
 | `SetEditColors` | `Surface`, `Text`, `Border`, `FocusRing` | The editor |
 | `SetHeaderBackColor` | the header's own | The column band |
+| `SetCheckColors` | `tkCheckBox_ThemeColors` | The check boxes (a `TKCHECKBOX_COLORS`, pinned on its own; `UnpinColors` unpins it too) |
 
 The border width follows the theme's `BorderWidth` until `SetBorderWidth` is called; the rows,
 scrollbar and band are inset by it. The paint callback gets the state flags and resolves them:
@@ -334,6 +371,12 @@ is independent of selection; `hasFocus` says the rows have the keyboard focus.
 - **ExpandCollapse**, `LT_ExpandCollapseCallbackSub( h, row, bExpanded )`: the user folded a
   node, with the twisty, a header click, or Left / Right.
 - **BeginLabelEdit** / **EndLabelEdit**: see In-place label editing.
+- **ItemCheck**, `LT_ItemCheckCallbackFunc( h, row, oldState, byref newState ) as boolean`: just
+  before a user's check change, for the row the user touched (not for rows a cascade or the
+  selection carries along). False vetoes the gesture; `newState` may be rewritten. `GetCheck` still
+  answers the old state.
+- **ItemChecked**, `LT_ItemCheckedCallbackSub( h, row, newState )`: once after the whole gesture
+  (cascade and selection included), only if any row changed.
 - **CanDrop**, `LT_CanDropCallbackFunc( p ) as boolean`: just before a user drop; false refuses
   it. `TKLISTTREE_DROPINFO` (source rows, insert position, whether it is on a header, the target
   row and its `TKLISTTREE_ROWINFO`) is valid only during the call; do not change the model from
@@ -360,6 +403,16 @@ const CLISTTREE_DEFAULT_TWISTY = 16 ' unscaled
 const CLISTTREE_DRAG_THRESHOLD = 4 ' scaled: SDL has no SM_CXDRAG
 const CLISTTREE_DRAGSCROLL_ZONE = 16 ' scaled
 const CLISTTREE_DRAGSCROLL_MS = 60
+const CLISTTREE_DEFAULT_CHECKBOX = 16 ' unscaled: the box's side
+const CLISTTREE_DEFAULT_CHECKBAND = 20 ' unscaled: the column the box sits in
+const LT_CHECK_UNCHECKED = CHK_STATE_UNCHECKED
+const LT_CHECK_CHECKED = CHK_STATE_CHECKED
+const LT_CHECK_MIXED = CHK_STATE_MIXED
+
+enum
+    LT_CHECKMODE_TWOSTATE = 0      ' a user toggle goes unchecked <-> checked; MIXED -> checked
+    LT_CHECKMODE_THREESTATE        ' a user toggle cycles unchecked -> checked -> mixed -> unchecked
+end enum
 ```
 
 ### Types
@@ -390,6 +443,11 @@ type TKLISTTREE_PAINTINFO
     isExpanded   as boolean
     indent       as integer
     rcTwisty     as TKRECT
+    rcCheck      as TKRECT             ' the box cell (C1); empty when the row has no box
+    checkState   as long               ' LT_CHECK_*
+    isCheckable  as boolean            ' a box is drawn on this row
+    isCheckHot   as boolean
+    isCheckPressed as boolean
     columnCount  as integer
     cells        as TKLISTTREE_CELLINFO ptr
 end type
@@ -404,6 +462,7 @@ type TKLISTTREE_MESSAGEINFO
     idx     as integer                 ' MODEL row under the mouse, or -1
     isCtrl  as boolean
     isShift as boolean
+    onCheck as boolean                 ' (C1) the point is over the row's check box
 end type
 
 type TKLISTTREE_ROWINFO
@@ -417,6 +476,8 @@ type TKLISTTREE_ROWINFO
     cells(any)    as ustring           ' columns 1..N, sparse
     itemData      as integer
     itemDataExtra as integer
+    check         as ubyte = 0         ' LT_CHECK_* (C1); travels with the row like `selected`
+    bCheckable    as boolean = true    ' false: no box, never toggled, left out of the cascade
     declare sub EnsureCells( byval n as integer )
     declare sub TrimCells( byval n as integer )
 end type
@@ -443,6 +504,8 @@ type LT_DragDropCallbackSub as sub( byval hList as TK_WIDGET ptr, byval newFirst
 type LT_BeginLabelEditCallbackFunc as function( byval hList as TK_WIDGET ptr, byval row as integer ) as boolean
 type LT_EndLabelEditCallbackFunc as function( byval hList as TK_WIDGET ptr, byval row as integer, byval newText as ustring ) as boolean
 type LT_ExpandCollapseCallbackSub as sub( byval hList as TK_WIDGET ptr, byval row as integer, byval bExpanded as boolean )
+type LT_ItemCheckCallbackFunc as function( byval hList as TK_WIDGET ptr, byval row as integer, byval oldState as long, byref newState as long ) as boolean
+type LT_ItemCheckedCallbackSub as sub( byval hList as TK_WIDGET ptr, byval row as integer, byval newState as long )
 ```
 
 ### Procedures
@@ -571,6 +634,28 @@ function tkListTree_GetHeaderHeight( byval hList as TK_WIDGET ptr ) as integer
 function tkListTree_SetHeaderHeight( byval hList as TK_WIDGET ptr, byval nHeight as integer ) as integer
 function tkListTree_GetHeader( byval hList as TK_WIDGET ptr ) as TK_WIDGET ptr
 function tkListTree_GetSurface( byval hList as TK_WIDGET ptr ) as TK_WIDGET ptr
+function tkListTree_SetCheckBoxes( byval hList as TK_WIDGET ptr, byval enable as boolean = true ) as boolean
+function tkListTree_GetCheckBoxes( byval hList as TK_WIDGET ptr ) as boolean
+function tkListTree_SetCheckMode( byval hList as TK_WIDGET ptr, byval nMode as long ) as boolean
+function tkListTree_GetCheckMode( byval hList as TK_WIDGET ptr ) as long
+function tkListTree_SetCheckCascade( byval hList as TK_WIDGET ptr, byval enable as boolean = true ) as boolean
+function tkListTree_GetCheckCascade( byval hList as TK_WIDGET ptr ) as boolean
+function tkListTree_SetCheckOnClick( byval hList as TK_WIDGET ptr, byval enable as boolean = true ) as boolean
+function tkListTree_GetCheckOnClick( byval hList as TK_WIDGET ptr ) as boolean
+function tkListTree_SetCheck( byval hList as TK_WIDGET ptr, byval row as integer, byval state as long, byval bCascade as boolean = false ) as boolean
+function tkListTree_GetCheck( byval hList as TK_WIDGET ptr, byval row as integer ) as long
+function tkListTree_SetRowCheckable( byval hList as TK_WIDGET ptr, byval row as integer, byval bCheckable as boolean = true ) as boolean
+function tkListTree_GetRowCheckable( byval hList as TK_WIDGET ptr, byval row as integer ) as boolean
+sub tkListTree_CheckAll( byval hList as TK_WIDGET ptr, byval state as long )
+sub tkListTree_RecomputeChecks( byval hList as TK_WIDGET ptr )
+function tkListTree_GetCheckedCount( byval hList as TK_WIDGET ptr ) as integer
+function tkListTree_GetCheckedItems( byval hList as TK_WIDGET ptr, checkedRows() as integer ) as integer
+function tkListTree_GetCheckRect( byval hList as TK_WIDGET ptr, byval row as integer, byref rc as TKRECT ) as boolean
+sub tkListTree_SetCheckColors( byval hList as TK_WIDGET ptr, byval pColors as TKCHECKBOX_COLORS ptr )
+sub tkListTree_GetCheckColors( byval hList as TK_WIDGET ptr, byval pColors as TKCHECKBOX_COLORS ptr )
+function tkListTree_SetCheckOwnerDraw( byval hList as TK_WIDGET ptr, byval enable as boolean = true ) as boolean
+sub tkListTree_SetItemCheckCallback( byval hList as TK_WIDGET ptr, byval userfunc as LT_ItemCheckCallbackFunc )
+sub tkListTree_SetItemCheckedCallback( byval hList as TK_WIDGET ptr, byval usersub as LT_ItemCheckedCallbackSub )
 sub tkListTree_SetPaintCallback( byval hList as TK_WIDGET ptr, byval usersub as LT_PaintCallbackSub )
 sub tkListTree_SetMessageCallback( byval hList as TK_WIDGET ptr, byval userfunc as LT_MessageCallbackFunc )
 sub tkListTree_SetTooltipCallback( byval hList as TK_WIDGET ptr, byval userfunc as LT_TooltipCallbackFunc )
@@ -599,3 +684,4 @@ sub tkListTree_PaintRowDefault( byval pi as TKLISTTREE_PAINTINFO ptr )
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
 - [tkColumnHeader](tkColumnHeader), [tkVScrollBar](tkVScrollBar), [tkTextBox](tkTextBox), [tkTooltip](tkTooltip)
+- [tkCheckBox](tkCheckBox) (the box painter), [tkCheckedList](tkCheckedList) (a checked list built on these check boxes)

@@ -1,0 +1,193 @@
+' tkDataGrid perf gate G3-P (docs/tkControls/DATAGRID.md §12): a 1920 x 1080 grid of 15 columns,
+' 300 frames scrolled 3 rows each, the frame time of tkHost_RenderTo + SDL_FlushRenderer:
+'   virtual   1,000,000 rows answered by CellValueNeeded
+'   stored    100,000 rows in the grid's own store
+' Prints the median and p95 per case. Build it with: tiko build --profile release
+' G7a adds the CSV export: GetCsvText and ExportCsv of the 100,000 stored rows, ExportCsv of the
+' 1,000,000 virtual rows (15 columns each), to a file in the temp folder that is removed after.
+'
+'   perf                 both cases at scale 1.0
+'   perf --scale 1.75    pin another scale
+#import "vendor/tkControls/tkDataGrid"
+#import "std/fs"
+using tkDataGrid
+using tkCalendar
+using tkHost
+using tkPaint
+
+const as long NFRAMES = 300
+dim shared as string gNames(0 to 7)          ' filled at start: a shared var-len string array takes no initializer
+
+' 15 columns: text x6, number x4, check, date, progress, link, text.
+sub PerfValue( byval row as integer, byval col as integer, byref v as TKDG_VALUE )
+    select case col
+    case 0 : v.SetInt( 100000 + row )
+    case 1 : v.SetText( gNames( row mod 8 ) )
+    case 2 : v.SetText( "Street " & (row mod 977) )
+    case 3 : v.SetText( "City " & (row mod 311) )
+    case 4 : v.SetText( "Region " & (row mod 17) )
+    case 5 : v.SetInt( 1 + (row * 7) mod 23 )
+    case 6 : v.SetFloat( 5 + ((row * 13) mod 997) / 10 )
+    case 7 : v.SetFloat( (1 + (row * 7) mod 23) * (5 + ((row * 13) mod 997) / 10) )
+    case 8 : v.SetInt( row mod 500 )
+    case 9 : v.SetBool( (row mod 3) <> 0 )
+    case 10 : v.SetDate( tkCalendar_MakeDate( 2026, 1 + (row mod 12), 1 + (row mod 28) ) )
+    case 11 : v.SetFloat( (row * 17) mod 101 )
+    case 12 : v.SetText( "INV-" & (100000 + row) )
+    case 13 : v.SetText( "Note for order " & row )
+    case 14 : v.SetText( "Code-" & (row mod 9973) )
+    end select
+end sub
+
+sub OnNeed( byval hg as TK_WIDGET ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE )
+    PerfValue( row, col, v )
+end sub
+
+sub AddColumns( byval g as TK_WIDGET ptr )
+    tkDataGrid_AddColumnEx( g, "Order", TKDG_COL_TEXT, 80, TKDG_INT )
+    tkDataGrid_AddColumnEx( g, "Customer", TKDG_COL_TEXT, 150 )
+    tkDataGrid_AddColumnEx( g, "Street", TKDG_COL_TEXT, 130 )
+    tkDataGrid_AddColumnEx( g, "City", TKDG_COL_TEXT, 110 )
+    tkDataGrid_AddColumnEx( g, "Region", TKDG_COL_TEXT, 100 )
+    tkDataGrid_AddColumnEx( g, "Qty", TKDG_COL_NUMBER, 60, TKDG_INT )
+    tkDataGrid_AddColumnEx( g, "Price", TKDG_COL_NUMBER, 80 )
+    tkDataGrid_AddColumnEx( g, "Total", TKDG_COL_NUMBER, 100 )
+    tkDataGrid_AddColumnEx( g, "Stock", TKDG_COL_NUMBER, 70, TKDG_INT )
+    tkDataGrid_AddColumnEx( g, "Paid", TKDG_COL_CHECK, 50 )
+    tkDataGrid_AddColumnEx( g, "Date", TKDG_COL_DATE, 100 )
+    tkDataGrid_AddColumnEx( g, "Shipped", TKDG_COL_PROGRESS, 110 )
+    tkDataGrid_AddColumnEx( g, "Invoice", TKDG_COL_LINK, 100 )
+    tkDataGrid_AddColumnEx( g, "Note", TKDG_COL_TEXT, 200 )
+    tkDataGrid_AddColumnEx( g, "Code", TKDG_COL_TEXT, 100 )
+end sub
+
+private sub SortD( a() as double, byval n as integer )
+    for i as integer = 1 to n - 1
+        dim as double x = a(i)
+        dim as integer j = i - 1
+        while (j >= 0) andalso (a(j) > x)
+            a(j + 1) = a(j) : j -= 1
+        wend
+        a(j + 1) = x
+    next
+end sub
+
+private function Ms2( byval x as double ) as string
+    return str( cint( x * 100 ) / 100 )
+end function
+
+' The frames: scrolled 3 rows each, timed from the render call to the renderer's flush.
+sub Measure( byval h as TK_HOST ptr, byval g as TK_WIDGET ptr, byref title as string )
+    dim as integer rowH = tkDataGrid_GetRowHeightPx( g )
+    for k as integer = 1 to 20                           ' warm the font atlas
+        tkDataGrid_SetScrollY( g, k * 3 * rowH )
+        tkHost_RenderTo( h, false )
+        SDL_FlushRenderer( h->renderer )
+    next
+    dim as double t( 0 to NFRAMES - 1 )
+    dim as integer y0 = 1000 * rowH
+    for k as integer = 0 to NFRAMES - 1
+        tkDataGrid_SetScrollY( g, y0 + k * 3 * rowH )
+        tkHost_Pump( h )
+        dim as double t0 = timer
+        tkHost_RenderTo( h, false )
+        SDL_FlushRenderer( h->renderer )
+        t(k) = (timer - t0) * 1000
+    next
+    SortD( t(), NFRAMES )
+    dim as integer vf, vl
+    dim as integer nRows = tkDataGrid_GetVisibleRows( g, vf, vl )
+    print title & ": " & nRows & " rows x 15 columns visible, " & NFRAMES & " frames: median " & Ms2( t( NFRAMES \ 2 ) ) _
+          & " ms, p95 " & Ms2( t( (NFRAMES * 95) \ 100 ) ) & " ms, max " & Ms2( t( NFRAMES - 1 ) ) & " ms"
+end sub
+
+private function ArgValue( byref name_ as string ) as string
+    for i as long = 1 to 20
+        if command( i ) = "" then exit for
+        if command( i ) = name_ then return command( i + 1 )
+    next
+    return ""
+end function
+
+gNames(0) = "Acme Corp" : gNames(1) = "Globex" : gNames(2) = "Initech" : gNames(3) = "Umbrella"
+gNames(4) = "Hooli" : gNames(5) = "Stark Industries" : gNames(6) = "Wayne Enterprises" : gNames(7) = "Wonka"
+if SDL_Init( SDL_INIT_VIDEO ) = false then print "SDL_Init: " & *SDL_GetError() : end 1
+if TTF_Init() = false then print "TTF_Init: " & *SDL_GetError() : end 1
+dim as single sc = val( ArgValue( "--scale" ) )
+if sc <= 0 then sc = 1.0
+dim as TK_HOST ptr h = tkHost_Create( "tkDataGrid perf", 1920, 1080, tkHost_FontDir() & TK_FONT_UI, sc )
+if h = 0 then print "host: " & *SDL_GetError() : end 1
+tkHost_Show( h )
+dim as long pw, ph
+tkHost_PixelSize( h, pw, ph )
+dim as TTF_Font ptr f10 = tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_UI, 10 )
+print "window " & pw & "x" & ph & " pixels, scale " & h->fScale
+
+dim as TK_WIDGET ptr g = tkDataGrid_Create( tkHost_Root( h ), 100 )
+tkDataGrid_SetFont( g, f10 )
+tkDataGrid_SetAlternateRows( g, true )
+tkDataGrid_ShowRowHeaders( g, true )
+tkWidget_SetPos( g, 0, 0, pw, ph )
+AddColumns( g )
+tkDataGrid_SetVirtual( g, true )
+tkDataGrid_SetCellValueNeededCallback( g, @OnNeed )
+tkDataGrid_SetRowCount( g, 1000000 )
+Measure( h, g, "virtual 1,000,000" )
+
+tkDataGrid_SetVirtual( g, false )
+tkDataGrid_SetRowCount( g, 100000 )
+dim as double tl = timer
+for r as integer = 0 to 99999
+    for c as integer = 0 to 14
+        dim as TKDG_VALUE v
+        PerfValue( r, c, v )
+        tkDataGrid_SetCell( g, r, c, v )
+    next
+next
+print "stored: 100,000 x 15 cells loaded in " & Ms2( (timer - tl) * 1000 ) & " ms"
+Measure( h, g, "stored 100,000" )
+
+' the internal sort (G4): one text key, then a float key and a second text key, on 100,000 rows
+dim as TKDG_SORTKEY k1(0 to 0)
+k1(0).col = 1 : k1(0).bDescending = false
+dim as double ts = timer
+tkDataGrid_SetSortKeys( g, k1() )
+print "sort 100,000 by Customer (text): " & Ms2( (timer - ts) * 1000 ) & " ms"
+dim as TKDG_SORTKEY k2(0 to 1)
+k2(0).col = 7 : k2(0).bDescending = true
+k2(1).col = 3 : k2(1).bDescending = false
+ts = timer
+tkDataGrid_SetSortKeys( g, k2() )
+print "sort 100,000 by Total desc, City (float + text): " & Ms2( (timer - ts) * 1000 ) & " ms"
+ts = timer
+tkDataGrid_SetQuickFilter( g, "wonka" )
+print "quick filter 100,000 rows x 15 columns (" & tkDataGrid_GetViewCount( g ) & " kept): " & Ms2( (timer - ts) * 1000 ) & " ms"
+
+' G7a: the CSV export
+tkDataGrid_SetQuickFilter( g, "" )
+tkDataGrid_ClearSort( g )
+dim as TKDG_CSVOPTIONS co
+dim as ustring csvPath = fs.TempDir( ).Value( ) & "/tkdg_perf.csv"
+ts = timer
+dim as ustring csvText = tkDataGrid_GetCsvText( g, co )
+print "GetCsvText 100,000 x 15 (stored): " & Ms2( (timer - ts) * 1000 ) & " ms, " & len( csvText ) & " characters"
+csvText = ""
+ts = timer
+dim as boolean csvOk = tkDataGrid_ExportCsv( g, csvPath, co )
+print "ExportCsv 100,000 x 15 (stored): " & Ms2( (timer - ts) * 1000 ) & " ms"
+if csvOk = false then print "  FAILED: " & tkDataGrid_GetExportError( g )
+co.bFormatted = false
+ts = timer
+csvOk = tkDataGrid_ExportCsv( g, csvPath, co )
+print "ExportCsv 100,000 x 15 (stored, invariant values): " & Ms2( (timer - ts) * 1000 ) & " ms"
+co.bFormatted = true
+tkDataGrid_SetVirtual( g, true )
+tkDataGrid_SetRowCount( g, 1000000 )
+ts = timer
+csvOk = tkDataGrid_ExportCsv( g, csvPath, co )
+print "ExportCsv 1,000,000 x 15 (virtual): " & Ms2( (timer - ts) * 1000 ) & " ms"
+if csvOk = false then print "  FAILED: " & tkDataGrid_GetExportError( g )
+fs.RemoveFile( csvPath )
+tkHost_Destroy( h )
+TTF_Quit( )
+SDL_Quit( )

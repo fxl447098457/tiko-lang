@@ -1,5 +1,5 @@
 '' CHAIN runs another program, waits for it, and returns its exit code.
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
     const CHILD = "child.exe"
 #else
     const CHILD = "./child"

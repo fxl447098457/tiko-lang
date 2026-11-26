@@ -1,0 +1,578 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkNotify -- what tkInfoBar and tkToast share: the four severities, the colours (one struct for
+' both, derived from the theme's Accent / Success / Warning / Error roles), the glyphs, and ONE
+' item -- glyph, title, message, action buttons, close button -- with its layout, its painter and
+' its hit test. Not a widget: each control owns its widget and hands its item here to measure,
+' paint and hit-test, so a bar and a toast always look like one family.
+'
+' THE TWO LAYOUTS (docs/tkControls/NOTIFICATIONS.md §4.2):
+'   LINE     [glyph] Title  message.........  [Action] [Action] [x]       one row, the message
+'                                                                       cut with an ellipsis
+'   STACKED  [glyph] Title                                         [x]
+'                    message, word-wrapped to MaxLines
+'                    [Action] [Action]
+'   AUTO is LINE when title + message fit without cutting, else STACKED (WinUI InfoBar, Fluent
+'   MessageBar "auto").
+'
+' The action and close buttons are PAINTED PARTS, not child widgets (NOTIFICATIONS N-3): one
+' painter controls every colour, so a toast can fade as one (fOpacity), and showing an item adds
+' no widget and moves no focus. Parts are numbered: TKN_PART_BODY, TKN_PART_CLOSE, then
+' TKN_PART_ACTION1 + (id - 1) for action id (1-based).
+'
+' All sizes below are DESIGN UNITS; the layout scales them at use by the fScale it is given.
+#module "tkNotify"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+using tkHost
+using tkPaint
+using tkTheme
+
+' ic_fluent_checkmark_circle_20_regular -- read from FluentSystemIcons-Regular.ttf's cmap and
+' post names (2026-11-22), the same 20-px family as TK_ICON_INFO / WARNING / ERROR / CLOSE.
+public const TKNOTIFY_GLYPH_SUCCESS = &hF298
+
+public const TKNOTIFY_PADX = 12           ' left / right inside the item
+public const TKNOTIFY_PADY = 8            ' top / bottom inside the item
+public const TKNOTIFY_GLYPHCELL = 20      ' the severity glyph's square
+public const TKNOTIFY_GLYPHGAP = 10       ' glyph -> text
+public const TKNOTIFY_TITLEGAP = 8        ' LINE: title -> message
+public const TKNOTIFY_ROWGAP = 6          ' STACKED: between rows
+public const TKNOTIFY_BTNPADX = 12        ' action button: text padding
+public const TKNOTIFY_BTNPADY = 4
+public const TKNOTIFY_BTNGAP = 8          ' between buttons, and before the close button
+public const TKNOTIFY_CLOSECELL = 28      ' the close button's square
+public const TKNOTIFY_CURVATURE = 8       ' corner ellipse DIAMETER (4-unit radius, WinUI's InfoBar)
+public const TKNOTIFY_BTNCURVATURE = 6
+public const TKNOTIFY_MAXLINES = 3        ' STACKED message lines before the rest is clipped
+public const TKNOTIFY_PROGRESSH = 3       ' the progress strip, inside the bottom padding
+public const TKNOTIFY_PROGRESSSEG = 30    ' indeterminate: the moving segment, % of the strip
+
+public enum
+    TKN_INFO = 0             ' WinUI Informational; the default everywhere
+    TKN_SUCCESS
+    TKN_WARNING
+    TKN_ERROR
+end enum
+
+' Why an item went away (WinUI's CloseReason, extended for toasts).
+public enum
+    TKN_CLOSE_BUTTON = 1     ' the x
+    TKN_CLOSE_ACTION         ' an action button (a toast; a bar's action never closes it)
+    TKN_CLOSE_KEY            ' Esc / Delete on a focused item
+    TKN_CLOSE_SWIPE          ' toasts
+    TKN_CLOSE_TIMEOUT        ' toasts: their own timer
+    TKN_CLOSE_REPLACED       ' toasts: pushed back to the queue by a HIGH-priority one
+    TKN_CLOSE_PROGRAMMATIC   ' code closed it: never reported by a callback (setters are silent)
+end enum
+
+' An item's progress: none, a moving segment (indeterminate), or 0..100.
+public enum
+    TKN_PROGRESS_NONE = -1
+    TKN_PROGRESS_INDETERMINATE = -2
+end enum
+
+public enum
+    TKN_LAYOUT_AUTO = 0
+    TKN_LAYOUT_LINE
+    TKN_LAYOUT_STACKED
+end enum
+
+public enum
+    TKN_PART_PROGRESS = -2   ' not hit-tested: only for tkNotify_PartRect (the progress strip)
+    TKN_PART_NONE = -1
+    TKN_PART_BODY = 0
+    TKN_PART_CLOSE = 1
+    TKN_PART_ACTION1 = 2     ' action id n is part TKN_PART_ACTION1 + n - 1
+end enum
+
+' Every field a ulong, in this order (tkTheme_ResolveInto and controls.toml's color_fields walk it
+' as an array). Per severity: the fill, the border and the glyph.
+public type TKNOTIFY_COLORS
+    InfoBack          as ulong
+    InfoBorder        as ulong
+    InfoGlyph         as ulong
+    SuccessBack       as ulong
+    SuccessBorder     as ulong
+    SuccessGlyph      as ulong
+    WarningBack       as ulong
+    WarningBorder     as ulong
+    WarningGlyph      as ulong
+    ErrorBack         as ulong
+    ErrorBorder       as ulong
+    ErrorGlyph        as ulong
+    TitleColor        as ulong
+    TextColor         as ulong
+    ButtonBack        as ulong
+    ButtonBackHot     as ulong
+    ButtonBackPressed as ulong
+    ButtonBorder      as ulong
+    ButtonText        as ulong
+    ButtonTextDisabled as ulong
+    CloseBackHot      as ulong
+    CloseGlyph        as ulong
+    FocusRing         as ulong
+    ProgressTrack     as ulong            ' the strip under the fill; the fill is the severity's glyph colour
+    Shadow            as ulong            ' a floating item's (a toast card's) shadow; its alpha is the strength
+end type
+
+' What is painted. Both controls fill one and keep it.
+public type TKNOTIFY_ITEM
+    severity     as long = TKN_INFO
+    title        as ustring
+    message      as ustring
+    glyph        as ustring              ' "" = the severity's
+    bIcon        as boolean = true
+    actions(any) as ustring              ' captions; action id = index + 1
+    actOff(any)  as boolean              ' TRUE = that action is disabled
+    bClosable    as boolean = true
+    progress     as long = TKN_PROGRESS_NONE   ' TKN_PROGRESS_* or 0..100
+end type
+
+public type TKNOTIFY_FONTS
+    fText  as TTF_Font ptr
+    fTitle as TTF_Font ptr
+    fGlyph as TTF_Font ptr
+end type
+
+' Where everything went, in the item's own pixels (0,0 = its top-left).
+public type TKNOTIFY_LAYOUT
+    mode         as long = TKN_LAYOUT_LINE      ' the one chosen: LINE or STACKED
+    cx           as long
+    cy           as long
+    rcGlyph      as TKRECT
+    rcTitle      as TKRECT
+    rcMessage    as TKRECT
+    rcClose      as TKRECT
+    rcProgress   as TKRECT                      ' empty when the item has no progress
+    nActions     as long
+    rcAction(any) as TKRECT
+    curvature    as long
+    btnCurvature as long
+end type
+
+
+' ---- severities -------------------------------------------------------------------------------
+
+public function tkNotify_ClampSeverity( byval sev as long ) as long
+    if (sev < TKN_INFO) orelse (sev > TKN_ERROR) then return TKN_INFO
+    return sev
+end function
+
+public function tkNotify_DefaultGlyph( byval sev as long ) as ustring
+    select case sev
+    case TKN_SUCCESS : return wchr( TKNOTIFY_GLYPH_SUCCESS )
+    case TKN_WARNING : return wchr( TK_ICON_WARNING )
+    case TKN_ERROR   : return wchr( TK_ICON_ERROR )
+    end select
+    return wchr( TK_ICON_INFO )
+end function
+
+public function tkNotify_ResolveGlyph( byref it as TKNOTIFY_ITEM ) as ustring
+    if len( it.glyph ) then return it.glyph
+    return tkNotify_DefaultGlyph( it.severity )
+end function
+
+' A severity's fill, border and glyph colour.
+public sub tkNotify_SeverityColors( byref c as TKNOTIFY_COLORS, byval sev as long, _
+                                    byref clrBack as ulong, byref clrBorder as ulong, byref clrGlyph as ulong )
+    select case sev
+    case TKN_SUCCESS : clrBack = c.SuccessBack : clrBorder = c.SuccessBorder : clrGlyph = c.SuccessGlyph
+    case TKN_WARNING : clrBack = c.WarningBack : clrBorder = c.WarningBorder : clrGlyph = c.WarningGlyph
+    case TKN_ERROR   : clrBack = c.ErrorBack : clrBorder = c.ErrorBorder : clrGlyph = c.ErrorGlyph
+    case else        : clrBack = c.InfoBack : clrBorder = c.InfoBorder : clrGlyph = c.InfoGlyph
+    end select
+end sub
+
+' Info reads the theme's Accent. The fills are the surface tinted towards the role colour, more
+' on a dark theme (where a light tint reads as grey).
+public function tkNotify_ThemeColors( byref t as TKTHEME_COLORS ) as TKNOTIFY_COLORS
+    dim as TKNOTIFY_COLORS c
+    dim as single kBack = iif( t.IsDark, 0.20, 0.12 )
+    dim as single kBorder = 0.45
+    c.InfoBack = tkColor_Lerp( t.Surface, t.Accent, kBack )
+    c.InfoBorder = tkColor_Lerp( t.Border, t.Accent, kBorder )
+    c.InfoGlyph = t.Accent
+    c.SuccessBack = tkColor_Lerp( t.Surface, t.Success, kBack )
+    c.SuccessBorder = tkColor_Lerp( t.Border, t.Success, kBorder )
+    c.SuccessGlyph = t.Success
+    c.WarningBack = tkColor_Lerp( t.Surface, t.Warning, kBack )
+    c.WarningBorder = tkColor_Lerp( t.Border, t.Warning, kBorder )
+    c.WarningGlyph = t.Warning
+    c.ErrorBack = tkColor_Lerp( t.Surface, t.Error, kBack )
+    c.ErrorBorder = tkColor_Lerp( t.Border, t.Error, kBorder )
+    c.ErrorGlyph = t.Error
+    c.TitleColor = t.TextStrong
+    c.TextColor = t.Text
+    c.ButtonBack = t.Surface
+    c.ButtonBackHot = t.SurfaceHot
+    c.ButtonBackPressed = t.Selected
+    c.ButtonBorder = t.Border
+    c.ButtonText = t.Text
+    c.ButtonTextDisabled = t.TextDisabled
+    c.CloseBackHot = t.SurfaceHot
+    c.CloseGlyph = t.TextDim
+    c.FocusRing = t.FocusRing
+    c.ProgressTrack = t.Track
+    c.Shadow = tkRGBA( 0, 0, 0, iif( t.IsDark, 120, 64 ) )
+    return c
+end function
+
+
+' ---- fonts ------------------------------------------------------------------------------------
+' What an item uses when its host gives no fonts: the surface's default for text, Inter Bold at
+' the same size for the title, the bundled icon font two points larger for glyphs. Opened on the
+' surface, which owns them and resizes them on a scale change. Call once per control and keep.
+
+public function tkNotify_DefaultPt( byval h as TK_HOST ptr ) as single
+    if h = 0 then return 9
+    for i as long = 0 to ubound( h->fonts )
+        if h->fonts(i).f = h->pDefaultFont then return h->fonts(i).pt
+    next
+    return 9
+end function
+
+public function tkNotify_OpenTitleFont( byval h as TK_HOST ptr ) as TTF_Font ptr
+    if h = 0 then return 0
+    return tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_UI_BOLD, tkNotify_DefaultPt( h ) )
+end function
+
+public function tkNotify_OpenGlyphFont( byval h as TK_HOST ptr ) as TTF_Font ptr
+    if h = 0 then return 0
+    return tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_ICONS, tkNotify_DefaultPt( h ) + 2 )
+end function
+
+
+' ---- layout -----------------------------------------------------------------------------------
+
+private function Sc_( byval v as long, byval fScale as single ) as long
+    return cint( v * fScale )
+end function
+
+public function tkNotify_ActionCount( byref it as TKNOTIFY_ITEM ) as long
+    return ubound( it.actions ) + 1
+end function
+
+private function ActionOff_( byref it as TKNOTIFY_ITEM, byval i as long ) as boolean
+    if (i < 0) orelse (i > ubound( it.actOff )) then return false
+    return it.actOff(i)
+end function
+
+' The progress strip: across the text-free bottom padding, inset like the content.
+private sub PlaceProgress_( byref it as TKNOTIFY_ITEM, byref lo as TKNOTIFY_LAYOUT, byval fScale as single )
+    if it.progress = TKN_PROGRESS_NONE then exit sub
+    dim as long ph = Sc_( TKNOTIFY_PROGRESSH, fScale )
+    if ph < 1 then ph = 1
+    dim as long bot = lo.cy - (Sc_( TKNOTIFY_PADY, fScale ) - ph) \ 2
+    tkRect_Set( lo.rcProgress, Sc_( TKNOTIFY_PADX, fScale ), bot - ph, lo.cx - Sc_( TKNOTIFY_PADX, fScale ), bot )
+end sub
+
+' Measures `it` at width cx (pixels) and places every part; returns the height. mode AUTO picks.
+' nMaxLines <= 0 means TKNOTIFY_MAXLINES.
+public function tkNotify_Layout( byref it as TKNOTIFY_ITEM, byval mode as long, byval cx as long, _
+                                 byval fScale as single, byref fo as TKNOTIFY_FONTS, _
+                                 byval nMaxLines as long, byref lo as TKNOTIFY_LAYOUT ) as long
+    dim as long padX = Sc_( TKNOTIFY_PADX, fScale ), padY = Sc_( TKNOTIFY_PADY, fScale )
+    dim as long glyphCell = Sc_( TKNOTIFY_GLYPHCELL, fScale ), glyphGap = Sc_( TKNOTIFY_GLYPHGAP, fScale )
+    dim as long titleGap = Sc_( TKNOTIFY_TITLEGAP, fScale ), rowGap = Sc_( TKNOTIFY_ROWGAP, fScale )
+    dim as long btnPadX = Sc_( TKNOTIFY_BTNPADX, fScale ), btnPadY = Sc_( TKNOTIFY_BTNPADY, fScale )
+    dim as long btnGap = Sc_( TKNOTIFY_BTNGAP, fScale ), closeCell = Sc_( TKNOTIFY_CLOSECELL, fScale )
+    if nMaxLines <= 0 then nMaxLines = TKNOTIFY_MAXLINES
+    dim as TTF_Font ptr fText = fo.fText
+    dim as TTF_Font ptr fTitle = iif( fo.fTitle <> 0, fo.fTitle, fText )
+
+    lo.cx = cx
+    lo.curvature = Sc_( TKNOTIFY_CURVATURE, fScale )
+    lo.btnCurvature = Sc_( TKNOTIFY_BTNCURVATURE, fScale )
+    lo.nActions = tkNotify_ActionCount( it )
+    if lo.nActions > 0 then
+        redim lo.rcAction( 0 to lo.nActions - 1 )
+    else
+        erase lo.rcAction
+    end if
+    tkRect_SetEmpty( lo.rcGlyph ) : tkRect_SetEmpty( lo.rcTitle ) : tkRect_SetEmpty( lo.rcMessage )
+    tkRect_SetEmpty( lo.rcClose ) : tkRect_SetEmpty( lo.rcProgress )
+
+    dim as long textH = iif( fText <> 0, tkText_Height( fText ), Sc_( 16, fScale ) )
+    dim as long titleH = iif( fTitle <> 0, tkText_Height( fTitle ), textH )
+    dim as long lineH = iif( titleH > textH, titleH, textH )
+    dim as long btnH = textH + 2 * btnPadY
+    dim as long titleW = iif( (fTitle <> 0) andalso (len( it.title ) > 0), tkText_Width( fTitle, it.title ), 0 )
+    dim as long msgW = iif( (fText <> 0) andalso (len( it.message ) > 0), tkText_Width( fText, it.message ), 0 )
+    dim as long btnW( 0 to lo.nActions )         ' one spare: never an empty array
+    dim as long allBtnW = 0
+    for i as long = 0 to lo.nActions - 1
+        btnW(i) = iif( fText <> 0, tkText_Width( fText, it.actions(i) ), 0 ) + 2 * btnPadX
+        allBtnW += btnW(i) + iif( i > 0, btnGap, 0 )
+    next
+    dim as long textX = padX + iif( it.bIcon, glyphCell + glyphGap, 0 )
+
+    ' LINE: the row is the tallest of text, button and close cell.
+    dim as long rowH = lineH
+    if (lo.nActions > 0) andalso (btnH > rowH) then rowH = btnH
+    if it.bClosable andalso (closeCell > rowH) then rowH = closeCell
+    dim as long rightW = iif( lo.nActions > 0, allBtnW + btnGap, 0 ) + iif( it.bClosable, closeCell + btnGap, 0 )
+    dim as long lineTextW = cx - textX - padX - rightW
+    dim as long needW = titleW + iif( (titleW > 0) andalso (msgW > 0), titleGap, 0 ) + msgW
+
+    dim as long m = mode
+    if (m <> TKN_LAYOUT_LINE) andalso (m <> TKN_LAYOUT_STACKED) then
+        m = iif( needW <= lineTextW, TKN_LAYOUT_LINE, TKN_LAYOUT_STACKED )
+    end if
+    lo.mode = m
+
+    if m = TKN_LAYOUT_LINE then
+        lo.cy = rowH + 2 * padY
+        dim as long midY = padY + rowH \ 2
+        if it.bIcon then tkRect_Set( lo.rcGlyph, padX, midY - glyphCell \ 2, padX + glyphCell, midY - glyphCell \ 2 + glyphCell )
+        dim as long xr = cx - padX
+        if it.bClosable then
+            tkRect_Set( lo.rcClose, xr - closeCell, midY - closeCell \ 2, xr, midY - closeCell \ 2 + closeCell )
+            xr -= closeCell + btnGap
+        end if
+        for i as long = lo.nActions - 1 to 0 step -1
+            tkRect_Set( lo.rcAction(i), xr - btnW(i), midY - btnH \ 2, xr, midY - btnH \ 2 + btnH )
+            xr -= btnW(i) + btnGap
+        next
+        dim as long textR = cx - padX - rightW
+        if textR < textX then textR = textX
+        dim as long tx = textX
+        if titleW > 0 then
+            dim as long tr = tx + titleW
+            if tr > textR then tr = textR
+            tkRect_Set( lo.rcTitle, tx, midY - lineH \ 2, tr, midY - lineH \ 2 + lineH )
+            tx = tr + titleGap
+        end if
+        if (msgW > 0) andalso (tx < textR) then tkRect_Set( lo.rcMessage, tx, midY - lineH \ 2, textR, midY - lineH \ 2 + lineH )
+        PlaceProgress_( it, lo, fScale )
+        return lo.cy
+    end if
+
+    ' STACKED: glyph and title on the first row with the close button; the message wraps below
+    ' at the text column's width; then the buttons.
+    dim as long colR = cx - padX - iif( it.bClosable, closeCell + btnGap, 0 )
+    dim as long colW = colR - textX
+    if colW < 1 then colW = 1
+    dim as long y = padY
+    dim as long row1H = iif( titleW > 0, titleH, 0 )
+    if it.bIcon andalso (glyphCell > row1H) then row1H = glyphCell
+    if it.bClosable andalso (closeCell > row1H) then row1H = closeCell
+    if row1H = 0 then row1H = lineH
+    dim as long row1Mid = y + row1H \ 2
+    if it.bIcon then tkRect_Set( lo.rcGlyph, padX, row1Mid - glyphCell \ 2, padX + glyphCell, row1Mid - glyphCell \ 2 + glyphCell )
+    if it.bClosable then tkRect_Set( lo.rcClose, cx - padX - closeCell, row1Mid - closeCell \ 2, cx - padX, row1Mid - closeCell \ 2 + closeCell )
+    dim as boolean bMsgOnRow1 = (titleW = 0)
+    if titleW > 0 then
+        tkRect_Set( lo.rcTitle, textX, row1Mid - titleH \ 2, colR, row1Mid - titleH \ 2 + titleH )
+        y += row1H
+    end if
+    if msgW > 0 then
+        dim as long wrapH = tkText_MeasureWrapped( fText, it.message, colW )
+        dim as long capH = (nMaxLines - 1) * tkText_LineSkip( fText ) + textH
+        if wrapH > capH then wrapH = capH
+        if bMsgOnRow1 then
+            ' no title: the message's first line sits on the glyph's row
+            dim as long top = row1Mid - textH \ 2
+            if top < padY then top = padY
+            tkRect_Set( lo.rcMessage, textX, top, colR, top + wrapH )
+            y = top + wrapH
+            if y < padY + row1H then y = padY + row1H
+        else
+            y += rowGap \ 2
+            tkRect_Set( lo.rcMessage, textX, y, colR, y + wrapH )
+            y += wrapH
+        end if
+    elseif bMsgOnRow1 then
+        y += row1H
+    end if
+    if lo.nActions > 0 then
+        y += rowGap
+        dim as long x = textX
+        for i as long = 0 to lo.nActions - 1
+            tkRect_Set( lo.rcAction(i), x, y, x + btnW(i), y + btnH )
+            x += btnW(i) + btnGap
+        next
+        y += btnH
+    end if
+    lo.cy = y + padY
+    PlaceProgress_( it, lo, fScale )
+    return lo.cy
+end function
+
+' The part under (x, y), item pixels: CLOSE, ACTION1 + i, BODY, or NONE outside the item.
+' A disabled action is still hit (so a press on it is not a body click); callers check it.
+public function tkNotify_HitPart( byref lo as TKNOTIFY_LAYOUT, byval x as long, byval y as long ) as long
+    if (x < 0) orelse (y < 0) orelse (x >= lo.cx) orelse (y >= lo.cy) then return TKN_PART_NONE
+    if tkRect_IsEmpty( lo.rcClose ) = false andalso tkRect_Contains( lo.rcClose, x, y ) then return TKN_PART_CLOSE
+    for i as long = 0 to lo.nActions - 1
+        if tkRect_Contains( lo.rcAction(i), x, y ) then return TKN_PART_ACTION1 + i
+    next
+    return TKN_PART_BODY
+end function
+
+public function tkNotify_PartRect( byref lo as TKNOTIFY_LAYOUT, byval part as long, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    select case part
+    case TKN_PART_BODY
+        tkRect_Set( rc, 0, 0, lo.cx, lo.cy )
+    case TKN_PART_CLOSE
+        rc = lo.rcClose
+    case TKN_PART_PROGRESS
+        rc = lo.rcProgress
+    case is >= TKN_PART_ACTION1
+        dim as long i = part - TKN_PART_ACTION1
+        if i < lo.nActions then rc = lo.rcAction(i)
+    end select
+    return tkRect_IsEmpty( rc ) = false
+end function
+
+' The parts a keyboard visits, in order: the actions that are enabled, then close.
+public function tkNotify_FocusParts( byref it as TKNOTIFY_ITEM, parts() as long ) as long
+    dim as long n = 0
+    dim as long nAct = tkNotify_ActionCount( it )
+    redim parts( 0 to nAct )
+    for i as long = 0 to nAct - 1
+        if ActionOff_( it, i ) = false then parts(n) = TKN_PART_ACTION1 + i : n += 1
+    next
+    if it.bClosable then parts(n) = TKN_PART_CLOSE : n += 1
+    return n
+end function
+
+
+' ---- painting ---------------------------------------------------------------------------------
+
+private function Fade_( byval c as ulong, byval fOpacity as single ) as ulong
+    if fOpacity >= 1 then return c
+    if fOpacity <= 0 then return c and &h00FFFFFFul
+    return tkColor_WithAlpha( c, cint( ((c shr 24) and 255) * fOpacity ) )
+end function
+
+' Paints `it` laid out by `lo`, with its top-left at (ox, oy) of b. hotPart / pressedPart /
+' focusPart are TKN_PART_* (NONE for none); fOpacity scales every colour's alpha (a toast's fade).
+' fPhase (0..1) places an indeterminate progress segment: 0 enters at the left, 1 has left at the right.
+public sub tkNotify_PaintItem( byval b as TK_PAINT ptr, byval ox as long, byval oy as long, _
+                               byref it as TKNOTIFY_ITEM, byref lo as TKNOTIFY_LAYOUT, _
+                               byref c as TKNOTIFY_COLORS, byref fo as TKNOTIFY_FONTS, _
+                               byval hotPart as long, byval pressedPart as long, byval focusPart as long, _
+                               byval fOpacity as single = 1, byval fPhase as single = 0 )
+    if (b = 0) orelse (lo.cx <= 0) orelse (lo.cy <= 0) then exit sub
+    dim as ulong clrBack, clrBorder, clrGlyph
+    tkNotify_SeverityColors( c, it.severity, clrBack, clrBorder, clrGlyph )
+    dim as TKRECT rc
+    tkRect_Set( rc, ox, oy, ox + lo.cx, oy + lo.cy )
+    b->SetBackColor( Fade_( clrBack, fOpacity ) )
+    b->PaintRoundRect( @rc, lo.curvature )
+    b->SetPenColor( Fade_( clrBorder, fOpacity ) )
+    b->PaintRoundOutline( @rc, lo.curvature, 1 )
+
+    dim as TTF_Font ptr fText = fo.fText
+    dim as TTF_Font ptr fTitle = iif( fo.fTitle <> 0, fo.fTitle, fText )
+    dim as TTF_Font ptr fGlyph = iif( fo.fGlyph <> 0, fo.fGlyph, fText )
+
+    if it.bIcon andalso (tkRect_IsEmpty( lo.rcGlyph ) = false) andalso (fGlyph <> 0) then
+        dim as TKRECT r = lo.rcGlyph
+        tkRect_Offset( r, ox, oy )
+        b->SetFont( fGlyph )
+        b->SetColors( Fade_( clrGlyph, fOpacity ), Fade_( clrBack, fOpacity ) )
+        b->PaintText( tkNotify_ResolveGlyph( it ), @r, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_NOCLIP )
+    end if
+    if (tkRect_IsEmpty( lo.rcTitle ) = false) andalso (fTitle <> 0) then
+        dim as TKRECT r = lo.rcTitle
+        tkRect_Offset( r, ox, oy )
+        b->SetFont( fTitle )
+        b->SetColors( Fade_( c.TitleColor, fOpacity ), Fade_( clrBack, fOpacity ) )
+        b->PaintText( it.title, @r, TK_DT_LEFT or TK_DT_VCENTER or TK_DT_ELLIPSIS )
+    end if
+    if (tkRect_IsEmpty( lo.rcMessage ) = false) andalso (fText <> 0) then
+        dim as TKRECT r = lo.rcMessage
+        tkRect_Offset( r, ox, oy )
+        b->SetFont( fText )
+        b->SetColors( Fade_( c.TextColor, fOpacity ), Fade_( clrBack, fOpacity ) )
+        if lo.mode = TKN_LAYOUT_LINE then
+            b->PaintText( it.message, @r, TK_DT_LEFT or TK_DT_VCENTER or TK_DT_ELLIPSIS )
+        else
+            b->PushClip( @r )
+            b->PaintTextEx( it.message, @r, TK_DT_LEFT or TK_DT_TOP or TK_DT_WORDBREAK )
+            b->PopClip()
+        end if
+    end if
+
+    for i as long = 0 to lo.nActions - 1
+        dim as TKRECT r = lo.rcAction(i)
+        tkRect_Offset( r, ox, oy )
+        dim as long part = TKN_PART_ACTION1 + i
+        dim as boolean bOff = ActionOff_( it, i )
+        dim as ulong bk = c.ButtonBack
+        if bOff = false then
+            if pressedPart = part then
+                bk = c.ButtonBackPressed
+            elseif hotPart = part then
+                bk = c.ButtonBackHot
+            end if
+        end if
+        b->SetBackColor( Fade_( bk, fOpacity ) )
+        b->PaintRoundRect( @r, lo.btnCurvature )
+        b->SetPenColor( Fade_( c.ButtonBorder, fOpacity ) )
+        b->PaintRoundOutline( @r, lo.btnCurvature, 1 )
+        if fText then
+            b->SetFont( fText )
+            b->SetColors( Fade_( iif( bOff, c.ButtonTextDisabled, c.ButtonText ), fOpacity ), Fade_( bk, fOpacity ) )
+            b->PaintText( it.actions(i), @r, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_ELLIPSIS )
+        end if
+        if focusPart = part then
+            dim as TKRECT rf = r
+            tkRect_Inflate( rf, 2, 2 )
+            b->SetPenColor( Fade_( c.FocusRing, fOpacity ) )
+            b->PaintRoundOutline( @rf, lo.btnCurvature + 4, 2 )
+        end if
+    next
+
+    if (it.progress <> TKN_PROGRESS_NONE) andalso (tkRect_IsEmpty( lo.rcProgress ) = false) then
+        dim as TKRECT r = lo.rcProgress
+        tkRect_Offset( r, ox, oy )
+        b->SetBackColor( Fade_( c.ProgressTrack, fOpacity ) )
+        b->PaintRect( @r )
+        dim as long tw = r.right - r.left
+        dim as TKRECT rf = r
+        if it.progress = TKN_PROGRESS_INDETERMINATE then
+            dim as long seg = (tw * TKNOTIFY_PROGRESSSEG) \ 100
+            dim as single ph = iif( fPhase < 0, 0.0, iif( fPhase > 1, 1.0, fPhase ) )
+            rf.left = r.left - seg + cint( (tw + seg) * ph )
+            rf.right = rf.left + seg
+            if rf.left < r.left then rf.left = r.left
+            if rf.right > r.right then rf.right = r.right
+        else
+            dim as long pct = iif( it.progress > 100, 100, it.progress )
+            rf.right = r.left + (tw * pct) \ 100
+        end if
+        if rf.right > rf.left then
+            b->SetBackColor( Fade_( clrGlyph, fOpacity ) )
+            b->PaintRect( @rf )
+        end if
+    end if
+
+    if it.bClosable andalso (tkRect_IsEmpty( lo.rcClose ) = false) then
+        dim as TKRECT r = lo.rcClose
+        tkRect_Offset( r, ox, oy )
+        dim as ulong bk = clrBack
+        if (hotPart = TKN_PART_CLOSE) orelse (pressedPart = TKN_PART_CLOSE) then
+            bk = iif( pressedPart = TKN_PART_CLOSE, c.ButtonBackPressed, c.CloseBackHot )
+            b->SetBackColor( Fade_( bk, fOpacity ) )
+            b->PaintRoundRect( @r, lo.btnCurvature )
+        end if
+        if fGlyph then
+            b->SetFont( fGlyph )
+            b->SetColors( Fade_( c.CloseGlyph, fOpacity ), Fade_( bk, fOpacity ) )
+            b->PaintText( wchr( TK_ICON_CLOSE ), @r, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_NOCLIP )
+        end if
+        if focusPart = TKN_PART_CLOSE then
+            b->SetPenColor( Fade_( c.FocusRing, fOpacity ) )
+            b->PaintRoundOutline( @r, lo.btnCurvature, 2 )
+        end if
+    end if
+end sub

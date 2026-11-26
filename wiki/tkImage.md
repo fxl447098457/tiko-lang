@@ -47,7 +47,7 @@ end tkApp_Run( f )
 
 - `Load( path )` takes a file or a name registered with [tkHost](tkHost) (`tkHost_AddResourceData` / `tkHost_AddResourceFile`, such as a Form Designer project's `res:logo`). `Load( path )`, `LoadFromSurface( s )` (copies an `SDL_Surface`; you keep yours) and `LoadFromPixels( w, h, argb )` (rows of `&hAARRGGBB`) return non-zero on success. A failed load clears the image held before.
 - `NaturalWidth` / `NaturalHeight` give the size in pixels; `IsValid` says whether an image is held; `Dispose` frees it early.
-- `TK_IMGFIT_ASPECT` fits the image inside the rect with its proportions kept, `_STRETCH` fills the rect, `_CENTER` draws it at its natural size, centred and clipped.
+- `TK_IMGFIT_ASPECT` fits the image inside the rect with its proportions kept, `_STRETCH` fills the rect, `_CENTER` draws it at its natural size, centred and clipped, `_COVER` fills the rect with its proportions kept, cropping the overflow. For a round or rounded image, pass `img.Texture( b->renderer )` to [tkPaint](tkPaint)'s `PaintImageShape`.
 - `Surface()` and `Texture( renderer )` hand out what the object owns: never destroy them.
 
 ## API
@@ -74,6 +74,7 @@ Every load starts by freeing what was held, so a failed load leaves the object e
 | `TK_IMGFIT_ASPECT` (default) | Scale to fit inside `rc`, proportions kept, then centre. |
 | `TK_IMGFIT_STRETCH` | Fill `rc` exactly, proportions ignored. |
 | `TK_IMGFIT_CENTER` | Natural size, centred, clipped by `rc` when larger. No scaling. |
+| `TK_IMGFIT_COVER` | Scale to fill `rc`, proportions kept, then centre; the overflow is cropped. |
 
 - **Decode happens once, at natural size.** Scaling is done at draw time with linear filtering, so one `tkImageFile` can be drawn into rects of different sizes without reloading.
 - **Alpha is kept.** A transparent image composites over whatever is already painted in the rect, so fill the background first if you want one.

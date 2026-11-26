@@ -1,0 +1,1017 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- layout, geometry and painting.
+'
+' LAYOUT (DgLayout) runs on a size, scale or shape change, never from a paint. The scroll bars
+' depend on each other (a horizontal bar takes height, which can make rows overflow), so the
+' pass repeats until neither changes -- at most three times. Columns are laid out in DISPLAY
+' order: each gets its scaled width clamped to [min, max]; while the natural widths leave room,
+' the fill columns share it by weight. xPx / wPx are content pixels.
+'
+' THE SURFACE, left to right: the row-header strip (rhW, 0 when hidden), the FROZEN columns
+' (display positions 0 .. nFrozen - 1, frozenW wide, never scrolled sideways), then the
+' SCROLLING columns, clipped to start after the frozen ones. Top to bottom: the header band
+' (0 .. hdrH), the filter row (G7c), the FROZEN ROWS (the first nFR view rows, never scrolled
+' vertically), the SCROLLING ROWS, and the footer (G7b) at the bottom. So:
+'     a frozen column's left    = rhW + xPx
+'     a scrolling column's left = rhW + xPx - scrollX, shown only right of rhW + frozenW
+'     a frozen row's top        = bandTop + v * rowH
+'     a scrolling row's top     = bodyTop + (v - nFR) * rowH - scrollY, shown only between bodyTop
+'                                 and the footer
+' The horizontal bar scrolls the scrolling columns: total contentW - frozenW, page the room after
+' the frozen columns; the vertical bar the scrolling rows: total (viewRows - nFR) * rowH, page
+' bodyH. Only the visible rows and columns are read and painted.
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkTheme"
+#import "../tkColumnHeader"
+#import "../tkVScrollBar"
+#import "../tkHScrollBar"
+using tkHost
+using tkPaint
+using tkTheme
+using tkColumnHeader
+using tkVScrollBar
+using tkHScrollBar
+
+' ==========================================================================================
+' Geometry helpers
+' ==========================================================================================
+function DgRhPx( byval p as TKDATAGRID_STATE ptr ) as integer
+    if p->bRowHeaders = false then return 0
+    return DgScale( p, p->RowHeaderWidth )
+end function
+
+function DgIsFrozen( byval p as TKDATAGRID_STATE ptr, byval col as integer ) as boolean
+    return p->cols(col).disp < p->nFrozen
+end function
+
+' The column's left edge on the surface (it may be scrolled under the frozen columns).
+function DgColLeft( byval p as TKDATAGRID_STATE ptr, byval col as integer ) as integer
+    dim as integer x = DgRhPx( p ) + p->cols(col).xPx
+    if DgIsFrozen( p, col ) = false then x -= p->scrollX
+    return x
+end function
+
+' Where the scrolling columns start showing.
+function DgScrollLeft( byval p as TKDATAGRID_STATE ptr ) as integer
+    return DgRhPx( p ) + p->frozenW
+end function
+
+' ---- the horizontal bands (G7b): header, filter row, frozen rows, scrolling rows, footer ----
+' The filter row's height (G7c; 0 while hidden).
+function DgFiltHPx( byval p as TKDATAGRID_STATE ptr ) as integer
+    return iif( p->bFilterRow, DgRowHPx( p ), 0 )
+end function
+
+' The footer's height (0 while hidden).
+function DgFootHPx( byval p as TKDATAGRID_STATE ptr ) as integer
+    return iif( p->bFooter, DgRowHPx( p ), 0 )
+end function
+
+' Where the rows start: under the header and the filter row.
+function DgBandTop( byval p as TKDATAGRID_STATE ptr ) as integer
+    return DgHdrHPx( p ) + DgFiltHPx( p )
+end function
+
+' The frozen rows in force: the first nFR view rows (fewer when the view has fewer).
+function DgNFR( byval p as TKDATAGRID_STATE ptr ) as integer
+    dim as integer n = DgViewRows( p )
+    return iif( p->nFrozenRows < n, p->nFrozenRows, n )
+end function
+
+' Where the scrolling rows start.
+function DgBodyTop( byval p as TKDATAGRID_STATE ptr ) as integer
+    return DgBandTop( p ) + DgNFR( p ) * DgRowHPx( p )
+end function
+
+' Where the scrolling rows end (the footer's top, or the surface's bottom).
+function DgBodyBottom( byval p as TKDATAGRID_STATE ptr ) as integer
+    return p->wSurf->ch - DgFootHPx( p )
+end function
+
+' VIEW row v's top on the surface.
+function DgRowY( byval p as TKDATAGRID_STATE ptr, byval v as integer ) as integer
+    dim as integer nfr = DgNFR( p )
+    if v < nfr then return DgBandTop( p ) + v * DgRowHPx( p )
+    return DgBodyTop( p ) + (v - nfr) * DgRowHPx( p ) - p->scrollY
+end function
+
+' The VIEW row at surface y (it may be past the last row: the caller checks), -1 outside the rows'
+' bands (header, filter row, footer).
+function DgRowAtY( byval p as TKDATAGRID_STATE ptr, byval y as integer ) as integer
+    dim as integer bt = DgBandTop( p ), top = DgBodyTop( p ), rowH = DgRowHPx( p )
+    if (y < bt) orelse (y >= DgBodyBottom( p )) then return -1
+    if y < top then return (y - bt) \ rowH
+    return DgNFR( p ) + (y - top + p->scrollY) \ rowH
+end function
+
+' ==========================================================================================
+' Layout
+' ==========================================================================================
+private sub DgLayoutColumns( byval p as TKDATAGRID_STATE ptr, byval availW as integer )
+    dim as integer natural = 0, totalWeight = 0
+    for k as integer = 0 to p->colCount - 1
+        with p->cols(k)
+            if .c.visible = false then .wPx = 0 : continue for
+            dim as integer w = DgScale( p, .c.width )
+            dim as integer mn = DgScale( p, .c.minWidth )
+            if w < mn then w = mn
+            if (.c.maxWidth > 0) andalso (w > DgScale( p, .c.maxWidth )) then w = DgScale( p, .c.maxWidth )
+            .wPx = w
+            natural += w
+            if .c.fillWeight > 0 then totalWeight += .c.fillWeight
+        end with
+    next
+    if (totalWeight > 0) andalso (natural < availW) then
+        dim as integer extra = availW - natural, given = 0, weightLeft = totalWeight
+        for d as integer = 0 to p->colCount - 1
+            dim as integer k = p->order(d)
+            with p->cols(k)
+                if (.c.visible = false) orelse (.c.fillWeight <= 0) then continue for
+                ' the last fill column takes the rounding remainder
+                dim as integer share = iif( weightLeft = .c.fillWeight, extra - given, (extra * .c.fillWeight) \ totalWeight )
+                weightLeft -= .c.fillWeight
+                if .c.maxWidth > 0 then
+                    dim as integer room = DgScale( p, .c.maxWidth ) - .wPx
+                    if share > room then share = iif( room > 0, room, 0 )
+                end if
+                .wPx += share
+                given += share
+            end with
+        next
+    end if
+    dim as integer x = 0
+    p->frozenW = 0
+    for d as integer = 0 to p->colCount - 1
+        dim as integer k = p->order(d)
+        p->cols(k).xPx = x
+        p->cols(k).disp = d
+        x += p->cols(k).wPx
+        if d < p->nFrozen then p->frozenW += p->cols(k).wPx
+    next
+    p->contentW = x
+end sub
+
+' The scrolling rows' height on screen.
+function DgBodyH( byval p as TKDATAGRID_STATE ptr ) as integer
+    dim as integer h = DgBodyBottom( p ) - DgBodyTop( p )
+    return iif( h < 0, 0, h )
+end function
+
+' The scrolling rows' total height.
+function DgScrollRowsH( byval p as TKDATAGRID_STATE ptr ) as integer
+    return (DgViewRows( p ) - DgNFR( p )) * DgRowHPx( p )
+end function
+
+private function DgMaxScrollY( byval p as TKDATAGRID_STATE ptr ) as integer
+    dim as integer m = DgScrollRowsH( p ) - DgBodyH( p )
+    return iif( m < 0, 0, m )
+end function
+
+private function DgMaxScrollX( byval p as TKDATAGRID_STATE ptr ) as integer
+    dim as integer m = p->contentW - (p->wSurf->cw - DgRhPx( p ))
+    return iif( m < 0, 0, m )
+end function
+
+private sub DgClampScroll( byval p as TKDATAGRID_STATE ptr )
+    if p->scrollY > DgMaxScrollY( p ) then p->scrollY = DgMaxScrollY( p )
+    if p->scrollY < 0 then p->scrollY = 0
+    if p->scrollX > DgMaxScrollX( p ) then p->scrollX = DgMaxScrollX( p )
+    if p->scrollX < 0 then p->scrollX = 0
+end sub
+
+private sub DgSyncBars( byval p as TKDATAGRID_STATE ptr )
+    dim as integer rowH = DgRowHPx( p )
+    tkVScrollBar_SetRange( p->wVBar, DgScrollRowsH( p ), DgBodyH( p ), p->scrollY )
+    tkVScrollBar_SetWheelStep( p->wVBar, 3 * rowH )
+    dim as integer page = p->wSurf->cw - DgRhPx( p ) - p->frozenW
+    tkHScrollBar_SetRange( p->wHBar, p->contentW - p->frozenW, iif( page < 0, 0, page ), p->scrollX )
+end sub
+
+sub DgLayout( byval p as TKDATAGRID_STATE ptr )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as integer bw = p->nBorderWidth
+    dim as integer W_ = w->cw - 2 * bw, H_ = w->ch - 2 * bw
+    if W_ < 0 then W_ = 0
+    if H_ < 0 then H_ = 0
+    dim as integer sb = DgScale( p, p->ScrollBarWidth )
+    dim as integer hdrH = DgHdrHPx( p ), rh = DgRhPx( p )
+    ' the scrolling rows' height, and what the fixed bands (header, filter row, frozen rows,
+    ' footer) take of the surface's height
+    dim as integer rowsH = DgScrollRowsH( p ), fixedH = DgBodyTop( p ) + DgFootHPx( p )
+    dim as boolean vNeed = false, hNeed = false
+    dim as integer sw, sh
+    for pass as integer = 1 to 3
+        sw = W_ - iif( vNeed, sb, 0 ) : if sw < 0 then sw = 0
+        sh = H_ - iif( hNeed, sb, 0 ) : if sh < 0 then sh = 0
+        DgLayoutColumns( p, sw - rh )
+        dim as boolean nv = rowsH > sh - fixedH
+        dim as boolean nh = p->contentW > sw - rh
+        if (nv = vNeed) andalso (nh = hNeed) then exit for
+        vNeed = nv : hNeed = nh
+    next
+    p->vShown = vNeed
+    p->hShown = hNeed
+    tkWidget_SetPos( p->wSurf, bw, bw, sw, sh )
+    tkWidget_Show( p->wVBar, vNeed )
+    if vNeed then tkWidget_SetPos( p->wVBar, bw + sw, bw + hdrH, sb, iif( sh - hdrH > 0, sh - hdrH, 0 ) )
+    tkWidget_Show( p->wHBar, hNeed )
+    dim as integer hx = rh + p->frozenW
+    if hx > sw then hx = sw
+    if hNeed then tkWidget_SetPos( p->wHBar, bw + hx, bw + sh, sw - hx, sb )
+    DgClampScroll( p )
+    DgSyncBars( p )
+    tkWidget_Invalidate( w )
+    DgPlaceEditor( p )
+    DgFltPlaceEditor( p )
+end sub
+
+' Scrolled to (x, y) pixels, clamped; the bars follow, silently.
+sub DgScrollTo( byval p as TKDATAGRID_STATE ptr, byval x as integer, byval y as integer )
+    p->scrollX = x : p->scrollY = y
+    DgClampScroll( p )
+    DgSyncBars( p )
+    tkWidget_Invalidate( p->wSurf )
+    DgPlaceEditor( p )
+    DgFltPlaceEditor( p )
+end sub
+
+sub DgInvalidateCell( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer )
+    ' one surface, repainted whole: a cell rect would only narrow the dirty flag
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' The least scroll that shows the whole cell (col -1: the row only; a MODEL row, not shown when
+' filtered out; a frozen row needs no vertical scroll). A frozen column is always in view sideways; a scrolling one is brought out from
+' under the frozen columns.
+sub DgEnsureVisible( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer )
+    dim as integer x = p->scrollX, y = p->scrollY
+    dim as integer v = DgViewOf( p, row )
+    ' a frozen row is always in view vertically
+    if v >= DgNFR( p ) then
+        dim as integer rowH = DgRowHPx( p ), top = (v - DgNFR( p )) * rowH, bh = DgBodyH( p )
+        if top < y then
+            y = top
+        elseif top + rowH > y + bh then
+            y = top + rowH - bh
+        end if
+    end if
+    if DgValidCol( p, col ) andalso (p->cols(col).wPx > 0) andalso (DgIsFrozen( p, col ) = false) then
+        ' in scroll coordinates: the scrolling region shows content [frozenW + x, frozenW + x + room)
+        dim as integer room = p->wSurf->cw - DgRhPx( p ) - p->frozenW
+        dim as integer l = p->cols(col).xPx - p->frozenW, r = l + p->cols(col).wPx
+        if l < x then
+            x = l
+        elseif r > x + room then
+            x = r - room
+        end if
+    end if
+    DgScrollTo( p, x, y )
+end sub
+
+' ==========================================================================================
+' Geometry: hit testing
+' ==========================================================================================
+' The visible model column under surface x, or -1.
+function DgColAtX( byval p as TKDATAGRID_STATE ptr, byval x as integer ) as integer
+    dim as integer rh = DgRhPx( p ), sl = DgScrollLeft( p )
+    if x < rh then return -1
+    for d as integer = 0 to p->colCount - 1
+        dim as integer k = p->order(d)
+        if p->cols(k).wPx <= 0 then continue for
+        dim as boolean fr = d < p->nFrozen
+        if fr <> (x < sl) then continue for
+        dim as integer l = DgColLeft( p, k )
+        if (x >= l) andalso (x < l + p->cols(k).wPx) then return k
+    next
+    return -1
+end function
+
+sub DgHitTest( byval p as TKDATAGRID_STATE ptr, byval x as integer, byval y as integer, byref ht as TKDG_HITTEST )
+    ht.area = TKDG_HT_NONE : ht.row = -1 : ht.col = -1
+    dim as TK_WIDGET ptr s = p->wSurf
+    if (x < 0) orelse (y < 0) orelse (x >= s->cw) orelse (y >= s->ch) then exit sub
+    dim as integer hdrH = DgHdrHPx( p ), rh = DgRhPx( p )
+    if (y >= hdrH) andalso (y < DgBandTop( p )) then
+        ' G7c: the filter row
+        if x < rh then ht.area = TKDG_HT_CORNER : exit sub
+        ht.col = DgColAtX( p, x )
+        ht.area = iif( ht.col >= 0, TKDG_HT_FILTER, TKDG_HT_EMPTY )
+        exit sub
+    end if
+    if y < hdrH then
+        if x < rh then ht.area = TKDG_HT_CORNER : exit sub
+        dim as integer gut = DgScale( p, CDATAGRID_DIVIDER_GUTTER ), sl = DgScrollLeft( p )
+        for d as integer = 0 to p->colCount - 1
+            dim as integer k = p->order(d)
+            if p->cols(k).wPx <= 0 then continue for
+            if (p->cols(k).c.resizable = false) orelse (p->bAllowResize = false) then continue for
+            dim as integer xr = DgColLeft( p, k ) + p->cols(k).wPx
+            ' a scrolling column's edge under the frozen ones is not there to grab
+            if (d >= p->nFrozen) andalso (xr <= sl) then continue for
+            if abs( x - xr ) <= gut then ht.area = TKDG_HT_DIVIDER : ht.col = k : exit sub
+        next
+        ht.col = DgColAtX( p, x )
+        ht.area = iif( ht.col >= 0, TKDG_HT_HEADER, TKDG_HT_EMPTY )
+        exit sub
+    end if
+    if y >= DgBodyBottom( p ) then
+        ' G7b: the footer
+        if x < rh then ht.area = TKDG_HT_CORNER : exit sub
+        ht.col = DgColAtX( p, x )
+        ht.area = iif( ht.col >= 0, TKDG_HT_FOOTER, TKDG_HT_EMPTY )
+        exit sub
+    end if
+    dim as integer v = DgRowAtY( p, y )
+    if (v >= 0) andalso (v < DgViewRows( p )) then ht.row = DgModelOf( p, v )
+    if x < rh then
+        ht.area = iif( ht.row >= 0, TKDG_HT_ROWHEADER, TKDG_HT_EMPTY )
+        exit sub
+    end if
+    ht.col = DgColAtX( p, x )
+    ht.area = iif( (ht.row >= 0) andalso (ht.col >= 0), TKDG_HT_CELL, TKDG_HT_EMPTY )
+end sub
+
+' The first and last SCROLLING VIEW rows (partly) on screen; the frozen ones, 0 .. nFR - 1, always
+' are. last < first when none shows.
+function DgFirstVisibleRow( byval p as TKDATAGRID_STATE ptr ) as integer
+    return DgNFR( p ) + p->scrollY \ DgRowHPx( p )
+end function
+
+function DgLastVisibleRow( byval p as TKDATAGRID_STATE ptr ) as integer
+    dim as integer bh = DgBodyH( p )
+    if bh <= 0 then return DgFirstVisibleRow( p ) - 1
+    dim as integer r = DgNFR( p ) + (p->scrollY + bh - 1) \ DgRowHPx( p )
+    return iif( r > DgViewRows( p ) - 1, DgViewRows( p ) - 1, r )
+end function
+
+function DgAlignOf( byref c as const TKDATAGRID_COLUMN ) as long
+    if c.align >= 0 then return c.align
+    select case c.kind
+    case TKDG_COL_NUMBER : return TKDG_ALIGN_RIGHT
+    case TKDG_COL_CHECK, TKDG_COL_PROGRESS, TKDG_COL_BUTTON : return TKDG_ALIGN_CENTER
+    case TKDG_COL_TEXT
+        if (c.valueKind = TKDG_INT) orelse (c.valueKind = TKDG_FLOAT) then return TKDG_ALIGN_RIGHT
+    end select
+    return TKDG_ALIGN_LEFT
+end function
+
+' ==========================================================================================
+' Autosize: the widest of the caption and the cells shown or sampled, in design units
+' ==========================================================================================
+function DgAutoWidth( byval p as TKDATAGRID_STATE ptr, byval col as integer, byval nSample as integer ) as integer
+    dim as TK_HOST ptr hh = p->hWin->pHost
+    dim as TTF_Font ptr fCell = iif( p->pFont <> 0, p->pFont, hh->pDefaultFont )
+    dim as TTF_Font ptr fHdr = tkColumnHeader_GetFont( p->wHdr )
+    if fHdr = 0 then fHdr = hh->pDefaultFont
+    dim as integer pad = DgScale( p, CDATAGRID_CELL_PAD )
+    dim as integer wPx = tkText_Width( fHdr, p->cols(col).c.caption ) + 2 * tkColumnHeader_GetPadding( p->wHdr ) + DgScale( p, 12 )
+    select case p->cols(col).c.kind
+    case TKDG_COL_CHECK
+        if DgScale( p, 14 ) + 2 * pad > wPx then wPx = DgScale( p, 14 ) + 2 * pad
+    case TKDG_COL_PROGRESS
+        if p->cols(col).wPx > wPx then wPx = p->cols(col).wPx
+    case else
+        dim as integer first = DgFirstVisibleRow( p ), last = DgLastVisibleRow( p )
+        dim as integer extra = iif( p->cols(col).c.kind = TKDG_COL_BUTTON, DgScale( p, 12 ), 0 )
+        ' the first nSample rows, then the rows on screen that are past them
+        dim as integer n = iif( nSample < p->rowCount, nSample, p->rowCount )
+        dim as integer from_ = iif( first > n, first, n )
+        for pass as integer = 0 to 1
+            dim as integer r0 = iif( pass = 0, 0, from_ ), r1 = iif( pass = 0, n - 1, last )
+            for r as integer = r0 to r1
+                ' pass 0: model rows; pass 1: view rows on screen
+                dim as integer mr = iif( pass = 0, r, DgModelOf( p, r ) )
+                if (mr < 0) orelse (mr >= p->rowCount) then continue for
+                dim as integer tw = tkText_Width( fCell, DgShownText( p, mr, col ) ) + 2 * pad + extra + 1
+                if tw > wPx then wPx = tw
+            next
+        next
+    end select
+    dim as single sc = iif( hh->fScale > 0, hh->fScale, 1 )
+    dim as integer units = -int( -wPx / sc )            ' rounded up
+    if units < p->cols(col).c.minWidth then units = p->cols(col).c.minWidth
+    if (p->cols(col).c.maxWidth > 0) andalso (units > p->cols(col).c.maxWidth) then units = p->cols(col).c.maxWidth
+    return units
+end function
+
+' ==========================================================================================
+' Painting
+' ==========================================================================================
+sub DgPaintContainer( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as integer bw = p->nBorderWidth
+    dim as integer sb = DgScale( p, p->ScrollBarWidth )
+    dim as integer sx = bw + p->wSurf->cw, sy = bw + p->wSurf->ch
+    dim as integer hdrH = DgHdrHPx( p )
+    dim as TKRECT rc
+    if p->vShown andalso (hdrH > 0) then
+        ' above the vertical bar: the header band carries on
+        dim as TKCOLUMNHEADER_COLORS hc
+        tkColumnHeader_GetColors( p->wHdr, @hc )
+        tkRect_Set( rc, sx, bw, sx + sb, bw + hdrH )
+        b->SetBackColor( hc.BackColor )
+        b->PaintRect( @rc )
+    end if
+    if p->hShown then
+        ' left of the horizontal bar, under the row headers and frozen columns
+        dim as integer hx = DgRhPx( p ) + p->frozenW
+        if hx > p->wSurf->cw then hx = p->wSurf->cw
+        if hx > 0 then
+            tkRect_Set( rc, bw, sy, bw + hx, sy + sb )
+            b->SetBackColor( p->colors.BackColor )
+            b->PaintRect( @rc )
+        end if
+    end if
+    if p->vShown andalso p->hShown then
+        tkRect_Set( rc, sx, sy, sx + sb, sy + sb )
+        b->SetBackColor( p->colors.BackColor )
+        b->PaintRect( @rc )
+    end if
+    if bw > 0 then
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        b->SetPenColor( p->colors.BorderColor )
+        b->PaintRoundOutline( @rc, 0, bw )
+    end if
+end sub
+
+private sub DgPaintCheck( byval p as TKDATAGRID_STATE ptr, byval pi as TKDATAGRID_CELLPAINTINFO ptr )
+    dim as TK_PAINT ptr b = pi->b
+    dim as TKDG_VALUE v = *pi->value
+    dim as boolean bOn = false
+    if DgConvert( v, TKDG_BOOL ) andalso (v.kind = TKDG_BOOL) then bOn = v.b
+    dim as integer side = DgScale( p, 14 )
+    dim as integer hmax = (pi->rc.bottom - pi->rc.top) - 2 * DgScale( p, 3 )
+    if side > hmax then side = hmax
+    if side < 4 then exit sub
+    dim as integer cx
+    select case pi->align
+    case TKDG_ALIGN_LEFT : cx = pi->rc.left + DgScale( p, CDATAGRID_CELL_PAD ) + side \ 2
+    case TKDG_ALIGN_RIGHT : cx = pi->rc.right - DgScale( p, CDATAGRID_CELL_PAD ) - side \ 2
+    case else : cx = (pi->rc.left + pi->rc.right) \ 2
+    end select
+    dim as integer cy = (pi->rc.top + pi->rc.bottom) \ 2
+    dim as TKRECT box
+    tkRect_Set( box, cx - side \ 2, cy - side \ 2, cx - side \ 2 + side, cy - side \ 2 + side )
+    dim as long curv = DgScale( p, 5 )
+    if bOn then
+        b->SetBackColor( p->colors.AccentColor )
+        b->PaintRoundRect( @box, curv )
+        dim as TKPOINT pts(0 to 2)
+        pts(0).x = box.left + side * 22 \ 100 : pts(0).y = box.top + side * 52 \ 100
+        pts(1).x = box.left + side * 42 \ 100 : pts(1).y = box.top + side * 72 \ 100
+        pts(2).x = box.left + side * 78 \ 100 : pts(2).y = box.top + side * 30 \ 100
+        b->SetPenColor( &hFFFFFFFFul )
+        b->PaintPolyline( @pts(0), 3, DgScale( p, 2 ) )
+    else
+        b->SetPenColor( pi->foreColor )
+        b->PaintRoundOutline( @box, curv, DgScale( p, 1 ) )
+    end if
+end sub
+
+private sub DgPaintProgress( byval p as TKDATAGRID_STATE ptr, byval pi as TKDATAGRID_CELLPAINTINFO ptr )
+    dim as TK_PAINT ptr b = pi->b
+    dim as TKDG_VALUE v = *pi->value
+    dim as float64 x = 0
+    if DgConvert( v, TKDG_FLOAT ) andalso (v.kind = TKDG_FLOAT) then x = v.f
+    if x < 0 then x = 0
+    if x > 100 then x = 100
+    dim as integer pad = DgScale( p, CDATAGRID_CELL_PAD )
+    dim as integer barH = DgScale( p, 6 )
+    dim as integer cy = (pi->rc.top + pi->rc.bottom) \ 2
+    dim as TKRECT track
+    tkRect_Set( track, pi->rc.left + pad, cy - barH \ 2, pi->rc.right - pad, cy - barH \ 2 + barH )
+    if track.right <= track.left then exit sub
+    b->SetBackColor( p->colors.GridLineColor )
+    b->PaintRoundRect( @track, barH )
+    dim as TKRECT fill = track
+    fill.right = track.left + cint( (track.right - track.left) * x / 100 )
+    if fill.right > fill.left then
+        b->SetBackColor( p->colors.AccentColor )
+        b->PaintRoundRect( @fill, barH )
+    end if
+end sub
+
+' The grid's own cell painter: background, then the kind's content. A CellPaint callback may
+' call it before or after drawing of its own.
+public sub tkDataGrid_PaintCellDefault( byval pi as TKDATAGRID_CELLPAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKDATAGRID_STATE ptr p = DgState( pi->hGrid )
+    if p = 0 then exit sub
+    dim as TK_PAINT ptr b = pi->b
+    b->SetBackColor( pi->backColor )
+    b->PaintRect( @pi->rc )
+    dim as integer pad = DgScale( p, CDATAGRID_CELL_PAD )
+    dim as TKRECT rt = pi->rc
+    rt.left += pad : rt.right -= pad
+    dim as long flags = TK_DT_ELLIPSIS
+    select case pi->align
+    case TKDG_ALIGN_CENTER : flags or= TK_DT_CENTER
+    case TKDG_ALIGN_RIGHT : flags or= TK_DT_RIGHT
+    end select
+    select case pi->kind
+    case TKDG_COL_CHECK
+        DgPaintCheck( p, pi )
+    case TKDG_COL_PROGRESS
+        DgPaintProgress( p, pi )
+    case TKDG_COL_BUTTON
+        dim as TKRECT face = pi->rc
+        dim as integer ins = DgScale( p, 3 )
+        tkRect_Inflate( face, -ins, -ins )
+        b->SetBackColor( p->colors.ButtonBackColor )
+        b->PaintRoundRect( @face, DgScale( p, 6 ) )
+        b->SetForeColor( p->colors.ButtonForeColor )
+        b->PaintText( pi->text, @rt, (flags and not 3) or TK_DT_CENTER )
+    case TKDG_COL_LINK
+        dim as ulong lc = iif( pi->isSelected andalso pi->hasFocus, pi->foreColor, p->colors.LinkColor )
+        b->SetForeColor( lc )
+        b->PaintText( pi->text, @rt, flags )
+        if (b->pFont <> 0) andalso (len( pi->text ) > 0) then
+            dim as integer tw = tkText_Width( b->pFont, pi->text )
+            if tw > rt.right - rt.left then tw = rt.right - rt.left
+            dim as integer x0 = rt.left
+            if pi->align = TKDG_ALIGN_CENTER then x0 = rt.left + ((rt.right - rt.left) - tw) \ 2
+            if pi->align = TKDG_ALIGN_RIGHT then x0 = rt.right - tw
+            dim as integer fh = tkText_Height( b->pFont )
+            dim as integer uy = (rt.top + rt.bottom) \ 2 + fh \ 2
+            dim as TKRECT ul
+            tkRect_Set( ul, x0, uy, x0 + tw, uy + DgScale( p, 1 ) )
+            b->SetBackColor( lc )
+            b->PaintRect( @ul )
+        end if
+    case else
+        b->SetForeColor( pi->foreColor )
+        b->PaintText( pi->text, @rt, flags )
+    end select
+end sub
+
+' One cell: read, format, selection colours, CellPaint or the default.
+private sub DgPaintCell( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr, byval font_ as TTF_Font ptr, _
+                         byval r as integer, byval k as integer, byval x as integer, byval y as integer, _
+                         byval rowBack as ulong, byval isAlt as boolean, byval isHot as boolean, byval hasFocus as boolean )
+    dim as integer rowH = DgRowHPx( p )
+    dim as TKDG_VALUE v
+    if r >= p->rowCount then
+        ' the placeholder row: its background and the current frame, nothing to read
+        dim as TKRECT rc
+        tkRect_Set( rc, x, y, x + p->cols(k).wPx, y + rowH )
+        b->SetBackColor( iif( DgCellSelected( p, r, k ), iif( hasFocus, p->colors.SelBackColor, p->colors.SelBackInactive ), rowBack ) )
+        b->PaintRect( @rc )
+        exit sub
+    end if
+    if DgCacheOn( p ) then
+        ' G6: a block not loaded yet paints a placeholder (and is asked for once)
+        if DgCachePaintRead( p, r, k, v ) = false then
+            dim as TKRECT rc
+            tkRect_Set( rc, x, y, x + p->cols(k).wPx, y + rowH )
+            DgPaintPlaceholder( p, b, rc, iif( DgCellSelected( p, r, k ), iif( hasFocus, p->colors.SelBackColor, p->colors.SelBackInactive ), rowBack ) )
+            exit sub
+        end if
+    else
+        DgRead( p, r, k, v )
+    end if
+    dim as TKDATAGRID_FORMATINFO fi
+    fi.hGrid = p->hWin : fi.row = r : fi.col = k : fi.value = @v
+    fi.text = DgDisplayText( p, k, v )
+    fi.foreColor = p->colors.ForeColor
+    fi.backColor = rowBack
+    fi.align = DgAlignOf( p->cols(k).c )
+    if p->CellFormattingCallback then p->CellFormattingCallback( @fi )
+    dim as TKDATAGRID_CELLPAINTINFO pi
+    pi.hGrid = p->hWin : pi.row = r : pi.col = k : pi.kind = p->cols(k).c.kind
+    pi.b = b
+    tkRect_Set( pi.rc, x, y, x + p->cols(k).wPx, y + rowH )
+    pi.value = @v
+    pi.text = fi.text
+    pi.foreColor = fi.foreColor
+    pi.backColor = fi.backColor
+    pi.align = fi.align
+    pi.isAlt = isAlt
+    pi.isHot = isHot
+    pi.hasFocus = hasFocus
+    pi.isCurrent = (r = p->curRow) andalso (k = p->curCol)
+    pi.isSelected = DgCellSelected( p, r, k )
+    if pi.isSelected then
+        ' the selection wins over formatting and hover
+        pi.backColor = iif( hasFocus, p->colors.SelBackColor, p->colors.SelBackInactive )
+        if hasFocus then pi.foreColor = p->colors.SelForeColor
+    end if
+    b->SetFont( font_ )
+    dim as boolean handled = false
+    if p->CellPaintCallback then handled = p->CellPaintCallback( @pi )
+    if handled = false then tkDataGrid_PaintCellDefault( @pi )
+end sub
+
+' The cells, grid lines and current-cell frame of one region -- the frozen columns or the
+' scrolling ones, in one row band (the frozen rows, or the scrolling rows first .. last) -- clipped
+' to it.
+private sub DgPaintRegion( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr, byval bFrozen as boolean, _
+                           byref clip as TKRECT, byval first as integer, byval last as integer, byval hasFocus as boolean )
+    if clip.right <= clip.left then exit sub
+    dim as integer hdrH = DgHdrHPx( p ), rowH = DgRowHPx( p )
+    dim as TTF_Font ptr font_ = iif( p->pFont <> 0, p->pFont, p->wSurf->pHost->pDefaultFont )
+    b->PushClip( @clip )
+    ' the columns of this region that show
+    dim as integer d0 = iif( bFrozen, 0, p->nFrozen ), d1 = iif( bFrozen, p->nFrozen - 1, p->colCount - 1 )
+    if d1 > p->colCount - 1 then d1 = p->colCount - 1
+    dim as integer rightX = clip.left
+    for v as integer = first to last
+        ' v: the view row (position, stripes); r: the model row (value, state)
+        dim as integer r = DgModelOf( p, v )
+        dim as integer y = DgRowY( p, v )
+        dim as boolean isAlt = p->bAltRows andalso ((v and 1) = 1)
+        dim as boolean isHot = (r = p->hotRow)
+        dim as ulong rowBack = p->colors.BackColor
+        if isAlt then rowBack = p->colors.AltBackColor
+        if isHot then rowBack = p->colors.HotBackColor
+        for d as integer = d0 to d1
+            dim as integer k = p->order(d)
+            if p->cols(k).wPx <= 0 then continue for
+            dim as integer x = DgColLeft( p, k )
+            if x >= clip.right then exit for
+            if x + p->cols(k).wPx <= clip.left then continue for
+            DgPaintCell( p, b, font_, r, k, x, y, rowBack, isAlt, isHot, hasFocus )
+            if x + p->cols(k).wPx > rightX then rightX = x + p->cols(k).wPx
+        next
+    next
+    if rightX > clip.right then rightX = clip.right
+    ' the grid lines, over the cells
+    dim as TKRECT rc
+    b->SetBackColor( p->colors.GridLineColor )
+    dim as integer bottomY = iif( last >= first, DgRowY( p, last ) + rowH, clip.top )
+    if bottomY > clip.bottom then bottomY = clip.bottom
+    if (p->nGridLines and TKDG_GRID_HORZ) andalso (rightX > clip.left) then
+        for r as integer = first to last
+            dim as integer y = DgRowY( p, r ) + rowH - 1
+            tkRect_Set( rc, clip.left, y, rightX, y + 1 )
+            b->PaintRect( @rc )
+        next
+    end if
+    if (p->nGridLines and TKDG_GRID_VERT) andalso (bottomY > clip.top) then
+        for d as integer = d0 to d1
+            dim as integer k = p->order(d)
+            if p->cols(k).wPx <= 0 then continue for
+            dim as integer x = DgColLeft( p, k ) + p->cols(k).wPx - 1
+            if x >= clip.right then exit for
+            if x < clip.left then continue for
+            tkRect_Set( rc, x, clip.top, x + 1, bottomY )
+            b->PaintRect( @rc )
+        next
+    end if
+    ' the current cell's frame, while the grid has the focus
+    dim as integer cv = DgViewOf( p, p->curRow )
+    if hasFocus andalso DgValidRow( p, p->curRow ) andalso DgValidCol( p, p->curCol ) andalso (cv >= 0) then
+        dim as integer k = p->curCol
+        if (p->cols(k).wPx > 0) andalso (DgIsFrozen( p, k ) = bFrozen) andalso (cv >= first) andalso (cv <= last) then
+            dim as integer x = DgColLeft( p, k ), y = DgRowY( p, cv )
+            tkRect_Set( rc, x, y, x + p->cols(k).wPx, y + rowH )
+            b->SetPenColor( p->colors.CurrentBorder )
+            b->PaintRoundOutline( @rc, 0, DgScale( p, 2 ) )
+        end if
+    end if
+    b->PopClip( )
+end sub
+
+private sub DgPaintHeaderRegion( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr, byval bFrozen as boolean, byref clip as TKRECT )
+    if clip.right <= clip.left then exit sub
+    dim as integer hdrH = DgHdrHPx( p )
+    b->PushClip( @clip )
+    dim as integer d0 = iif( bFrozen, 0, p->nFrozen ), d1 = iif( bFrozen, p->nFrozen - 1, p->colCount - 1 )
+    if d1 > p->colCount - 1 then d1 = p->colCount - 1
+    for d as integer = d0 to d1
+        dim as integer k = p->order(d)
+        if p->cols(k).wPx <= 0 then continue for
+        dim as integer x = DgColLeft( p, k )
+        if x >= clip.right then exit for
+        if x + p->cols(k).wPx <= clip.left then continue for
+        dim as TKCOLUMNHEADER_PAINTINFO pi
+        pi.hHeader = p->wHdr
+        pi.itemID = k
+        pi.b = b
+        tkRect_Set( pi.rc, x, 0, x + p->cols(k).wPx, hdrH )
+        pi.isHot = (k = p->hotHdrCol) andalso (p->drag = DG_DRAG_NONE)
+        pi.isPressed = (k = p->dragCol) andalso ((p->drag = DG_DRAG_HEADER) orelse (p->drag = DG_DRAG_REORDER))
+        pi.isResizeHot = (k = p->hotDivCol) andalso (p->drag = DG_DRAG_NONE)
+        pi.isResizing = (k = p->dragCol) andalso (p->drag = DG_DRAG_RESIZE)
+        pi.wszCaption = p->cols(k).c.caption
+        dim as integer nKey
+        DgSortGlyphOf( p, k, pi.nSortDir, nKey )
+        if p->HeaderPaintCallback then p->HeaderPaintCallback( @pi ) else tkColumnHeader_PaintColumnDefault( @pi )
+        if (nKey > 0) andalso (p->nSortKeys > 1) then
+            ' which key it is, left of the arrow (the painter draws the arrow 1..3 x 4 units in)
+            dim as TTF_Font ptr fh = tkColumnHeader_GetFont( p->wHdr )
+            if fh = 0 then fh = p->wSurf->pHost->pDefaultFont
+            dim as TKCOLUMNHEADER_COLORS hc
+            tkColumnHeader_GetColors( p->wHdr, @hc )
+            dim as TKRECT rn = pi.rc
+            rn.right -= tkColumnHeader_GetPadding( p->wHdr ) + DgScale( p, 4 ) * 3
+            b->SetFont( fh )
+            b->SetForeColor( hc.SortMarkColor )
+            b->PaintText( str( nKey ), @rn, TK_DT_RIGHT )
+        end if
+    next
+    b->PopClip( )
+end sub
+
+' The row headers of one row band (clipTop .. clipBottom: the frozen rows or the scrolling ones).
+private sub DgPaintRowHeaders( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr, byval first as integer, _
+                               byval last as integer, byval hasFocus as boolean, byval clipTop as integer, byval clipBottom as integer )
+    dim as integer rh = DgRhPx( p ), rowH = DgRowHPx( p )
+    if clipBottom <= clipTop then exit sub
+    dim as TKRECT clip, rc
+    tkRect_Set( clip, 0, clipTop, rh, clipBottom )
+    b->PushClip( @clip )
+    b->SetBackColor( p->colors.RowHeaderBackColor )
+    b->PaintRect( @clip )
+    for v as integer = first to last
+        dim as integer r = DgModelOf( p, v )
+        dim as integer y = DgRowY( p, v )
+        if DgSetHasRow( p->sel, r ) then
+            tkRect_Set( rc, 0, y, rh, y + rowH )
+            b->SetBackColor( iif( hasFocus, p->colors.SelBackColor, p->colors.SelBackInactive ) )
+            b->PaintRect( @rc )
+        end if
+        if r = p->dirtyRow then
+            ' the dirty row: a pencil (a thick slash with a nib)
+            dim as integer s = DgScale( p, 5 ), cx = rh \ 2, cy = y + rowH \ 2
+            b->SetPenColor( p->colors.RowHeaderForeColor )
+            b->PaintLine( DgScale( p, 2 ), cx - s, cy + s, cx + s, cy - s )
+            tkRect_Set( rc, cx - s - 1, cy + s - 1, cx - s + DgScale( p, 2 ), cy + s + 1 )
+            b->SetBackColor( p->colors.RowHeaderForeColor )
+            b->PaintRect( @rc )
+        elseif r >= p->rowCount then
+            ' the placeholder row: a star
+            b->SetFont( iif( p->pFont <> 0, p->pFont, p->wSurf->pHost->pDefaultFont ) )
+            b->SetForeColor( p->colors.RowHeaderForeColor )
+            tkRect_Set( rc, 0, y, rh, y + rowH )
+            b->PaintText( "*", @rc, TK_DT_CENTER )
+        elseif r = p->curRow then
+            ' the current row: a small right-pointing triangle
+            dim as integer s = DgScale( p, 4 ), cx = rh \ 2, cy = y + rowH \ 2
+            dim as TKPOINT tri(0 to 2)
+            tri(0).x = cx - s \ 2 : tri(0).y = cy - s
+            tri(1).x = cx - s \ 2 : tri(1).y = cy + s
+            tri(2).x = cx + s : tri(2).y = cy
+            b->SetBackColor( p->colors.RowHeaderForeColor )
+            b->PaintPolygon( @tri(0), 3 )
+        end if
+        b->SetBackColor( p->colors.GridLineColor )
+        tkRect_Set( rc, 0, y + rowH - 1, rh, y + rowH )
+        b->PaintRect( @rc )
+    next
+    b->SetBackColor( p->colors.GridLineColor )
+    tkRect_Set( rc, rh - 1, clipTop, rh, clipBottom )
+    b->PaintRect( @rc )
+    b->PopClip( )
+end sub
+
+' The x of the gap before display position g (g = colCount: after the last visible column).
+function DgGapX( byval p as TKDATAGRID_STATE ptr, byval g as integer ) as integer
+    dim as integer sl = DgScrollLeft( p )
+    if g < p->colCount then
+        dim as integer k = p->order(g)
+        dim as integer x = DgColLeft( p, k )
+        if (g >= p->nFrozen) andalso (x < sl) then x = sl
+        return x
+    end if
+    dim as integer x = DgRhPx( p )
+    for d as integer = 0 to p->colCount - 1
+        dim as integer k = p->order(d)
+        if p->cols(k).wPx > 0 then
+            dim as integer r = DgColLeft( p, k ) + p->cols(k).wPx
+            if r > x then x = r
+        end if
+    next
+    return x
+end function
+
+sub DgPaintSurface( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TK_WIDGET ptr s = p->wSurf
+    dim as integer cw = s->cw, ch = s->ch
+    dim as integer hdrH = DgHdrHPx( p ), rh = DgRhPx( p ), sl = DgScrollLeft( p )
+    dim as TK_WIDGET ptr f = s->pHost->pFocus
+    dim as boolean hasFocus = (f = s) orelse (p->bEditing andalso tkWidget_IsAncestorOf( p->wEditor, f ))
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, cw, ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @rc )
+    dim as integer first = DgFirstVisibleRow( p ), last = DgLastVisibleRow( p )
+    dim as integer nfr = DgNFR( p ), bandTop = DgBandTop( p ), bodyTop = DgBodyTop( p ), bodyBot = DgBodyBottom( p )
+    if bodyTop > bodyBot then bodyTop = bodyBot
+    if sl > cw then sl = cw
+    if p->colCount > 0 then
+        dim as TKRECT clip
+        ' the scrolling rows, then the frozen rows over them (each: scrolling columns, then frozen)
+        tkRect_Set( clip, sl, bodyTop, cw, bodyBot )
+        DgPaintRegion( p, b, false, clip, first, last, hasFocus )
+        tkRect_Set( clip, rh, bodyTop, sl, bodyBot )
+        DgPaintRegion( p, b, true, clip, first, last, hasFocus )
+        if nfr > 0 then
+            tkRect_Set( clip, sl, bandTop, cw, bodyTop )
+            DgPaintRegion( p, b, false, clip, 0, nfr - 1, hasFocus )
+            tkRect_Set( clip, rh, bandTop, sl, bodyTop )
+            DgPaintRegion( p, b, true, clip, 0, nfr - 1, hasFocus )
+        end if
+    end if
+    if rh > 0 then
+        DgPaintRowHeaders( p, b, first, last, hasFocus, bodyTop, bodyBot )
+        if nfr > 0 then DgPaintRowHeaders( p, b, 0, nfr - 1, hasFocus, bandTop, bodyTop )
+    end if
+    ' G7b: the footer; G7c: the filter row
+    DgPaintFooter( p, b, hasFocus )
+    DgPaintFilterRow( p, b )
+    if hdrH > 0 then
+        dim as TKCOLUMNHEADER_COLORS hc
+        tkColumnHeader_GetColors( p->wHdr, @hc )
+        dim as TKRECT band
+        tkRect_Set( band, 0, 0, cw, hdrH )
+        b->SetBackColor( hc.BackColor )
+        b->PaintRect( @band )
+        dim as TKRECT clip
+        tkRect_Set( clip, sl, 0, cw, hdrH )
+        DgPaintHeaderRegion( p, b, false, clip )
+        tkRect_Set( clip, rh, 0, sl, hdrH )
+        DgPaintHeaderRegion( p, b, true, clip )
+        tkRect_Set( rc, 0, hdrH - 1, cw, hdrH )
+        b->SetBackColor( hc.DividerColor )
+        b->PaintRect( @rc )
+        if rh > 0 then
+            tkRect_Set( rc, rh - 1, 0, rh, hdrH )
+            b->PaintRect( @rc )
+        end if
+    end if
+    ' the line after the frozen columns
+    if (p->nFrozen > 0) andalso (p->frozenW > 0) andalso (sl < cw) then
+        dim as integer t = DgScale( p, 2 )
+        tkRect_Set( rc, sl - t \ 2, 0, sl - t \ 2 + t, ch )
+        b->SetBackColor( p->colors.FrozenLineColor )
+        b->PaintRect( @rc )
+    end if
+    ' G7b: the line under the frozen rows
+    if (nfr > 0) andalso (bodyTop < bodyBot) then
+        dim as integer t = DgScale( p, 2 )
+        tkRect_Set( rc, 0, bodyTop - t \ 2, cw, bodyTop - t \ 2 + t )
+        b->SetBackColor( p->colors.FrozenLineColor )
+        b->PaintRect( @rc )
+    end if
+    ' where a dragged header will land
+    if (p->drag = DG_DRAG_REORDER) andalso (p->dropBefore >= 0) then
+        dim as integer t = DgScale( p, 2 ), gx = DgGapX( p, p->dropBefore )
+        tkRect_Set( rc, gx - t \ 2, 0, gx - t \ 2 + t, ch )
+        b->SetBackColor( p->colors.DropMarkColor )
+        b->PaintRect( @rc )
+    end if
+end sub
+
+' ==========================================================================================
+' Public API: scrolling and geometry
+' ==========================================================================================
+public function tkDataGrid_GetTopRow( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return 0
+    return DgModelOf( p, DgFirstVisibleRow( p ) )
+end function
+
+' Scrolls so (model) row is the top row (clamped at the end); returns the top row it got. A row
+' filtered out does not scroll.
+public function tkDataGrid_SetTopRow( byval hGrid as TK_WIDGET ptr, byval row as integer ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return 0
+    if row < 0 then row = 0
+    dim as integer v = DgViewOf( p, row )
+    ' a frozen row: the scrolling rows go back to their start
+    if v >= 0 then DgScrollTo( p, p->scrollX, iif( v > DgNFR( p ), v - DgNFR( p ), 0 ) * DgRowHPx( p ) )
+    return DgModelOf( p, DgFirstVisibleRow( p ) )
+end function
+
+public function tkDataGrid_GetScrollX( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->scrollX, 0 )
+end function
+
+public function tkDataGrid_GetScrollY( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->scrollY, 0 )
+end function
+
+' Pixels, clamped; returns the offset it got. The horizontal offset moves only the scrolling columns.
+public function tkDataGrid_SetScrollX( byval hGrid as TK_WIDGET ptr, byval x as integer ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return 0
+    DgScrollTo( p, x, p->scrollY )
+    return p->scrollX
+end function
+
+public function tkDataGrid_SetScrollY( byval hGrid as TK_WIDGET ptr, byval y as integer ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return 0
+    DgScrollTo( p, p->scrollX, y )
+    return p->scrollY
+end function
+
+' The SCROLLING rows (partly) on screen as VIEW positions (the frozen rows, 0 .. GetFrozenRows - 1,
+' always are) (ViewToModel gives their rows; they are the model
+' rows while nothing is sorted or filtered); returns how many. first > last when there are none.
+public function tkDataGrid_GetVisibleRows( byval hGrid as TK_WIDGET ptr, byref first as integer, byref last as integer ) as integer
+    first = 0 : last = -1
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgViewRows( p ) = 0) then return 0
+    first = DgFirstVisibleRow( p )
+    last = DgLastVisibleRow( p )
+    return iif( last >= first, last - first + 1, 0 )
+end function
+
+' Scrolls the least that shows the whole cell (col -1: the row only, horizontally untouched).
+public sub tkDataGrid_EnsureVisible( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer = -1 )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then DgEnsureVisible( p, row, col )
+end sub
+
+' Surface-local: the whole cell, unclipped. FALSE (rc empty) when no part of it shows: above or
+' below the body, past the right edge, or a scrolling column wholly under the frozen ones.
+public function tkDataGrid_GetCellRect( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidViewRow( p, row ) = false) orelse (DgValidCol( p, col ) = false) then return false
+    if p->cols(col).wPx <= 0 then return false
+    dim as integer rowH = DgRowHPx( p )
+    dim as integer v = DgViewOf( p, row )
+    if v < 0 then return false
+    dim as integer x = DgColLeft( p, col ), y = DgRowY( p, v )
+    tkRect_Set( rc, x, y, x + p->cols(col).wPx, y + rowH )
+    dim as TK_WIDGET ptr s = p->wSurf
+    dim as integer lim = iif( DgIsFrozen( p, col ), DgRhPx( p ), DgScrollLeft( p ) )
+    ' a scrolling row shows between the frozen rows and the footer; a frozen row in its band
+    dim as integer top = iif( v < DgNFR( p ), DgBandTop( p ), DgBodyTop( p ) )
+    if (rc.right <= lim) orelse (rc.left >= s->cw) orelse (rc.bottom <= top) orelse (rc.top >= DgBodyBottom( p )) then
+        tkRect_SetEmpty( rc )
+        return false
+    end if
+    return true
+end function
+
+' Surface-local: the column's header cell (top 0, the header's height). FALSE when hidden or
+' scrolled out of view.
+public function tkDataGrid_GetColumnRect( byval hGrid as TK_WIDGET ptr, byval col as integer, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return false
+    if p->cols(col).wPx <= 0 then return false
+    dim as integer x = DgColLeft( p, col )
+    tkRect_Set( rc, x, 0, x + p->cols(col).wPx, DgHdrHPx( p ) )
+    dim as integer lim = iif( DgIsFrozen( p, col ), DgRhPx( p ), DgScrollLeft( p ) )
+    if (rc.right <= lim) orelse (rc.left >= p->wSurf->cw) then
+        tkRect_SetEmpty( rc )
+        return false
+    end if
+    return true
+end function
+
+' The columns' total laid-out width in pixels (fill applied).
+public function tkDataGrid_GetContentWidth( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->contentW, 0 )
+end function
+
+' Pixels: the row-header strip (0 when hidden) and the frozen columns.
+public function tkDataGrid_GetFrozenWidthPx( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->frozenW, 0 )
+end function
+
+public function tkDataGrid_GetRowHeaderWidthPx( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, DgRhPx( p ), 0 )
+end function
+
+' (x, y) surface-local; returns ht.area.
+public function tkDataGrid_HitTest( byval hGrid as TK_WIDGET ptr, byval x as integer, byval y as integer, byref ht as TKDG_HITTEST ) as long
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    ht.area = TKDG_HT_NONE : ht.row = -1 : ht.col = -1
+    if p = 0 then return TKDG_HT_NONE
+    DgHitTest( p, x, y, ht )
+    return ht.area
+end function
+
+public function tkDataGrid_GetHotRow( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->hotRow, -1 )
+end function
+
+' Sets the column to the width its caption and cells need: the rows on screen plus the first
+' nSampleRows. Returns the new width (design units). Silent.
+public function tkDataGrid_AutoSizeColumn( byval hGrid as TK_WIDGET ptr, byval col as integer, byval nSampleRows as integer = 200 ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return 0
+    dim as integer w = DgAutoWidth( p, col, nSampleRows )
+    p->cols(col).c.width = w
+    p->cols(col).c.fillWeight = 0
+    DgChanged( p )
+    return w
+end function

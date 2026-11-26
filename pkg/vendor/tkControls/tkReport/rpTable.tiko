@@ -1,0 +1,276 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReport -- the table printer: a list as the user sees it, on paper (PRINTING.md §9).
+'
+' tkTablePrint_FromListTree takes a snapshot of a tkListTree -- its columns' captions and widths,
+' its rows' text and tree levels (only the selected rows when asked) -- and CreateDoc lays it out:
+' a title on the first page, the column headers on every page (repeatHeader), alternate row shading,
+' grid lines, "Page {p} of {n}". Too wide for the page: shrink to fit, but not below minScale; past
+' that, the columns that do not fit go on further pages ("page across", decision P-12), the first
+' column repeated on each, pages ordered down then across. A column whose every value reads as a
+' number is right-aligned.
+#module "tkReport"
+
+#import "../tkPrint"
+#import "../tkListTree"
+using tkPrint
+using tkListTree
+using tkColumnHeader
+using tkHost
+using tkPaint
+
+public enum
+    TKTP_FIT_NONE = 0         ' never scale: columns that do not fit go across pages
+    TKTP_FIT_SHRINK           ' scale down to the width, not below minScale (then across pages)
+    TKTP_FIT_ALWAYS           ' scale to the width, up or down
+end enum
+
+public type TKTABLEPRINT_OPTIONS
+    title             as ustring
+    subtitle          as ustring
+    repeatHeader      as boolean = true
+    fitWidth          as long = TKTP_FIT_SHRINK
+    minScale          as single = 0.6
+    repeatFirstColumn as boolean = true      ' across pages
+    selectionOnly     as boolean
+    gridLines         as boolean = true
+    alternateRows     as boolean = true
+    pageFooter        as ustring = "Page {p} of {n}"
+    fontPt            as single = 9
+    headerBack        as ulong = &hFFE4EAF2ul
+    altBack           as ulong = &hFFF5F7FAul
+    lineColor         as ulong = &hFFC8CDD4ul
+end type
+
+public type TK_TABLEPRINT
+    opts      as TKTABLEPRINT_OPTIONS
+    nCols     as long
+    caption(any) as ustring
+    widthPt(any) as single
+    rightAl(any) as boolean
+    nRows     as long
+    cells(any) as ustring                    ' row * nCols + col
+    level(any) as long
+    setup     as TKPAGESETUP
+    ' the layout of the last generation
+    scale     as single = 1
+    nCp       as long                        ' column pages
+    cpFirst(any) as long                     ' its first column (after a repeated column 0)
+    cpLast(any) as long
+    pgCp(any) as long                        ' per page: column page, first row, row count
+    pgRow(any) as long
+    pgCount(any) as long
+    nPages    as long
+end type
+
+private function LooksNumeric( byref s as ustring ) as boolean
+    dim as string t = trim( s )
+    if len( t ) = 0 then return true
+    for i as long = 1 to len( t )
+        if instr( "0123456789.,-+%$ ", mid( t, i, 1 ) ) = 0 then return false
+    next
+    return true
+end function
+
+' A snapshot of the list as it is now. Free it with tkTablePrint_Destroy (after its documents).
+public function tkTablePrint_FromListTree( byval hList as TK_WIDGET ptr, byref opts as TKTABLEPRINT_OPTIONS, _
+                                           byval pSetup as TKPAGESETUP ptr = 0 ) as TK_TABLEPRINT ptr
+    if hList = 0 then return 0
+    dim as TK_TABLEPRINT ptr t = new TK_TABLEPRINT
+    t->opts = opts
+    if pSetup then t->setup = *pSetup
+    tkPageSetup_Resolve( t->setup )
+    dim as long nc = tkListTree_GetColumnCount( hList )
+    if nc < 1 then nc = 1
+    t->nCols = nc
+    redim t->caption( 0 to nc - 1 )
+    redim t->widthPt( 0 to nc - 1 )
+    redim t->rightAl( 0 to nc - 1 )
+    dim as TK_WIDGET ptr hdr = tkListTree_GetHeader( hList )
+    dim as single toPt = 0.75 / iif( hList->pHost <> 0, hList->pHost->fScale, 1 )
+    for c as long = 0 to nc - 1
+        if hdr then
+            t->caption(c) = tkColumnHeader_GetColumnText( hdr, c )
+            t->widthPt(c) = tkColumnHeader_GetColumnWidth( hdr, c ) * toPt
+        end if
+        if t->widthPt(c) <= 0 then t->widthPt(c) = iif( nc = 1, hList->cw * toPt, 100 )
+        t->rightAl(c) = (c > 0)
+    next
+    dim as long n = tkListTree_GetCount( hList )
+    redim t->cells( 0 to iif( n > 0, n * nc - 1, 0 ) )
+    redim t->level( 0 to iif( n > 0, n - 1, 0 ) )
+    dim as long k = 0
+    for r as long = 0 to n - 1
+        if opts.selectionOnly andalso (tkListTree_GetSel( hList, r ) = false) then continue for
+        t->level(k) = tkListTree_GetLevel( hList, r )
+        for c as long = 0 to nc - 1
+            dim as ustring s = iif( c = 0, tkListTree_GetText( hList, r ), tkListTree_GetCellText( hList, r, c ) )
+            t->cells(k * nc + c) = s
+            if (c > 0) andalso (LooksNumeric( s ) = false) then t->rightAl(c) = false
+        next
+        k += 1
+    next
+    t->nRows = k
+    return t
+end function
+
+public sub tkTablePrint_Destroy( byval t as TK_TABLEPRINT ptr )
+    if t then delete t
+end sub
+
+' The page layout for a printable area: scale, column pages, rows per page.
+private sub TpLayout( byval t as TK_TABLEPRINT ptr, byval pw as single, byval ph as single )
+    dim as single total = 0
+    for c as long = 0 to t->nCols - 1 : total += t->widthPt(c) : next
+    if total <= 0 then total = 1
+    select case t->opts.fitWidth
+    case TKTP_FIT_ALWAYS : t->scale = pw / total
+    case TKTP_FIT_SHRINK : t->scale = iif( total > pw, pw / total, 1 )
+    case else : t->scale = 1
+    end select
+    if (t->opts.fitWidth = TKTP_FIT_SHRINK) andalso (t->scale < t->opts.minScale) then t->scale = t->opts.minScale
+    ' column pages: as many columns as fit, column 0 again at the left of each later one
+    t->nCp = 0
+    dim as long c = 0
+    while c < t->nCols
+        dim as single used = 0
+        if (t->nCp > 0) andalso t->opts.repeatFirstColumn then used = t->widthPt(0) * t->scale
+        dim as long first = c
+        while c < t->nCols
+            dim as single cw = t->widthPt(c) * t->scale
+            if (used + cw > pw + 0.01) andalso (c > first) then exit while
+            used += cw
+            c += 1
+        wend
+        redim preserve t->cpFirst( 0 to t->nCp ) : redim preserve t->cpLast( 0 to t->nCp )
+        t->cpFirst(t->nCp) = first : t->cpLast(t->nCp) = c - 1
+        t->nCp += 1
+    wend
+    ' pages: down, then across
+    dim as single rowH = t->opts.fontPt * t->scale * 1.7, titleH = 0
+    if len( t->opts.title ) then titleH = 30
+    if len( t->opts.subtitle ) then titleH += 16
+    t->nPages = 0
+    for cp as long = 0 to t->nCp - 1
+        dim as long r0 = 0
+        do
+            dim as single avail = ph - iif( (cp = 0) andalso (r0 = 0), titleH, 0 )
+            if t->opts.repeatHeader orelse (r0 = 0) then avail -= rowH
+            dim as long fit = int( avail / rowH )
+            if fit < 1 then fit = 1
+            if r0 + fit > t->nRows then fit = t->nRows - r0
+            redim preserve t->pgCp( 0 to t->nPages ) : redim preserve t->pgRow( 0 to t->nPages ) : redim preserve t->pgCount( 0 to t->nPages )
+            t->pgCp(t->nPages) = cp : t->pgRow(t->nPages) = r0 : t->pgCount(t->nPages) = iif( fit < 0, 0, fit )
+            t->nPages += 1
+            r0 += iif( fit < 1, 1, fit )
+        loop while r0 < t->nRows
+    next
+end sub
+
+private function TpPage( byval doc as TK_PRINTDOC ptr, byval pg as TK_PAGE ptr, byval page as long ) as boolean
+    dim as TK_TABLEPRINT ptr t = tkPrintDoc_GetUserData( doc )
+    if t = 0 then return false
+    dim as TKRECTF m
+    tkPage_GetMarginRect( pg, m )
+    dim as single footH = iif( len( t->opts.pageFooter ), 16, 0 )
+    if page = 0 then TpLayout( t, m.right - m.left, m.bottom - m.top - footH )
+    if page >= t->nPages then return false
+    dim as long cp = t->pgCp(page), r0 = t->pgRow(page), nr = t->pgCount(page)
+    dim as single s = t->scale, rowH = t->opts.fontPt * s * 1.7, y = m.top
+    dim as TKFONTSPEC fs
+    dim as TKRECTF rc
+    if (cp = 0) andalso (r0 = 0) andalso len( t->opts.title ) then
+        fs.pt = 16 : fs.bold = true
+        tkPage_SetFont( pg, fs )
+        tkRectF_Set( rc, m.left, y, m.right, y + 26 )
+        tkPage_Text( pg, t->opts.title, rc, TK_DT_LEFT )
+        y += 30
+        if len( t->opts.subtitle ) then
+            fs.pt = 10 : fs.bold = false
+            tkPage_SetFont( pg, fs )
+            tkRectF_Set( rc, m.left, y - 4, m.right, y + 12 )
+            tkPage_Text( pg, t->opts.subtitle, rc, TK_DT_LEFT )
+            y += 16
+        end if
+    end if
+    ' the columns of this page: column 0 again on a later column page
+    dim as long cols( 0 to t->nCols ), nc = 0
+    if (cp > 0) andalso t->opts.repeatFirstColumn then cols(nc) = 0 : nc += 1
+    for c as long = t->cpFirst(cp) to t->cpLast(cp) : cols(nc) = c : nc += 1 : next
+    dim as single xs( 0 to nc )
+    xs(0) = m.left
+    for k as long = 0 to nc - 1 : xs(k + 1) = xs(k) + t->widthPt(cols(k)) * s : next
+    dim as single pad = 3 * s
+    ' header
+    if t->opts.repeatHeader orelse (r0 = 0) then
+        tkPage_SetFillColor( pg, t->opts.headerBack )
+        tkRectF_Set( rc, xs(0), y, xs(nc), y + rowH )
+        tkPage_FillRect( pg, rc )
+        fs.pt = t->opts.fontPt * s : fs.bold = true
+        tkPage_SetFont( pg, fs )
+        for k as long = 0 to nc - 1
+            tkRectF_Set( rc, xs(k) + pad, y, xs(k + 1) - pad, y + rowH )
+            tkPage_Text( pg, t->caption(cols(k)), rc, iif( t->rightAl(cols(k)), TK_DT_RIGHT, TK_DT_LEFT ) or TK_DT_ELLIPSIS )
+        next
+        y += rowH
+    end if
+    fs.pt = t->opts.fontPt * s : fs.bold = false
+    tkPage_SetFont( pg, fs )
+    dim as single yTop = y
+    for i as long = 0 to nr - 1
+        dim as long r = r0 + i
+        if t->opts.alternateRows andalso ((r and 1) = 1) then
+            tkPage_SetFillColor( pg, t->opts.altBack )
+            tkRectF_Set( rc, xs(0), y, xs(nc), y + rowH )
+            tkPage_FillRect( pg, rc )
+        end if
+        for k as long = 0 to nc - 1
+            dim as long c = cols(k)
+            dim as single indent = iif( c = 0, t->level(r) * 10 * s, 0 )
+            tkRectF_Set( rc, xs(k) + pad + indent, y, xs(k + 1) - pad, y + rowH )
+            tkPage_Text( pg, t->cells(r * t->nCols + c), rc, iif( t->rightAl(c), TK_DT_RIGHT, TK_DT_LEFT ) or TK_DT_ELLIPSIS )
+        next
+        y += rowH
+        if t->opts.gridLines then
+            tkPage_SetLineColor( pg, t->opts.lineColor )
+            tkPage_SetPen( pg, 0.5 )
+            tkPage_Line( pg, xs(0), y, xs(nc), y )
+        end if
+    next
+    if t->opts.gridLines andalso (nr > 0) then
+        tkPage_SetLineColor( pg, t->opts.lineColor )
+        tkPage_SetPen( pg, 0.5 )
+        for k as long = 0 to nc
+            tkPage_Line( pg, xs(k), yTop - iif( t->opts.repeatHeader orelse (r0 = 0), rowH, 0 ), xs(k), y )
+        next
+    end if
+    if len( t->opts.pageFooter ) then
+        fs.pt = 8 : fs.bold = false
+        tkPage_SetFont( pg, fs )
+        tkRectF_Set( rc, m.left, m.bottom - 14, m.right, m.bottom )
+        tkPage_LateText( pg, rc, t->opts.pageFooter, TK_DT_RIGHT )
+    end if
+    return page + 1 < t->nPages
+end function
+
+' A document laid out from the snapshot (generated when shown, or by tkPrintDoc_Generate). The
+' table print must outlive it.
+public function tkTablePrint_CreateDoc( byval t as TK_TABLEPRINT ptr ) as TK_PRINTDOC ptr
+    if t = 0 then return 0
+    dim as TK_PRINTDOC ptr doc = tkPrintDoc_Create( t->opts.title )
+    tkPrintDoc_SetPageSetup( doc, t->setup )
+    tkPrintDoc_SetUserData( doc, t )
+    tkPrintDoc_SetPrintPageCallback( doc, @TpPage )
+    return doc
+end function
+
+' The scale and the number of column pages of the last layout (tests, a status line).
+public sub tkTablePrint_GetLayout( byval t as TK_TABLEPRINT ptr, byref scale as single, byref colPages as long )
+    scale = 1 : colPages = 0
+    if t = 0 then exit sub
+    scale = t->scale : colPages = t->nCp
+end sub

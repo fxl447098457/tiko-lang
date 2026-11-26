@@ -1,0 +1,602 @@
+' tkToast self-test (notifications N2). Real windows, real SDL events; scale pinned at 1.0 and 1.75.
+' Placement is asserted against tkToast_ComputeLayout and the settings scaled; time is stepped on
+' the toaster's pinned clock (tkToast_TickForTest), so every deadline is exact.
+' One check per distinct behaviour (the author's rule, 2026-11-23): what was folded or cut is listed
+' in docs/tkControls/NOTIFICATIONS.md §18.
+#import "vendor/tkControls/tkToast"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkTest"
+using tkToast
+using tkNotify
+using tkButton
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gDismissed, gLastReason, gLastId, gActions, gLastAction, gClicks, gBtnClicks, gOwn
+dim shared as string gSeq
+dim shared as any ptr gLastCtx
+dim shared as TK_WIDGET ptr gReenter
+dim shared as long gCtxTag = 42
+
+sub OnDismissedDefault( byval hT as TK_WIDGET ptr, byval id as long, byval reason as long, byval pCtx as any ptr )
+    gDismissed += 1 : gLastReason = reason : gLastId = id
+    gSeq &= "D" & reason & " "
+end sub
+
+sub OnActionDefault( byval hT as TK_WIDGET ptr, byval id as long, byval nAction as long, byval pCtx as any ptr )
+    gActions += 1 : gLastAction = nAction : gLastId = id
+    gSeq &= "A" & nAction & " "
+end sub
+
+sub OnOwnDismissed( byval hT as TK_WIDGET ptr, byval id as long, byval reason as long, byval pCtx as any ptr )
+    gOwn += 1 : gLastReason = reason : gLastCtx = pCtx
+    gSeq &= "d" & reason & " "
+end sub
+
+sub OnOwnAction( byval hT as TK_WIDGET ptr, byval id as long, byval nAction as long, byval pCtx as any ptr )
+    gOwn += 1 : gLastAction = nAction : gLastCtx = pCtx
+    gSeq &= "a" & nAction & " "
+end sub
+
+' A callback that dismisses everything and posts again: the toaster must survive it.
+sub OnReenter( byval hT as TK_WIDGET ptr, byval id as long, byval reason as long, byval pCtx as any ptr )
+    tkToast_DismissAll( hT )
+    tkToast_ShowText( hT, "posted from a callback" )
+    gSeq &= "R "
+end sub
+
+sub OnClick( byval hT as TK_WIDGET ptr, byval id as long, byval pCtx as any ptr )
+    gClicks += 1 : gLastId = id
+end sub
+
+sub OnBtn( byval h as TK_WIDGET ptr, byval id as long )
+    gBtnClicks += 1
+end sub
+
+function Px( byval h as TK_HOST ptr, byval v as long ) as long
+    return cint( v * h->fScale )
+end function
+
+function RS( byref rc as TKRECT ) as string
+    return tkRect_Str( rc )
+end function
+
+function SameRect( byref a as TKRECT, byref b as TKRECT ) as boolean
+    return (a.left = b.left) andalso (a.top = b.top) andalso (a.right = b.right) andalso (a.bottom = b.bottom)
+end function
+
+function RootKids( byval root_ as TK_WIDGET ptr ) as long
+    dim as long n = 0
+    dim as TK_WIDGET ptr c = root_->pFirst
+    while c
+        n += 1
+        c = c->pNext
+    wend
+    return n
+end function
+
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkToast selftest", 800, 600, tkHost_FontDir() & TK_FONT_UI, fScale )
+    h->clrBack = &hFF102030ul
+    dim as TK_WIDGET ptr root_ = tkHost_Root( h )
+    dim as TK_WIDGET ptr btn = tkButton_Create( root_, 8 )
+    tkButton_SetText( btn, "Beneath" )
+    tkButton_SetClickCallback( btn, @OnBtn )
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 50 )
+    dim as long W = root_->cw, HH = root_->ch
+    gDismissed = 0 : gActions = 0 : gClicks = 0 : gBtnClicks = 0 : gOwn = 0 : gSeq = ""
+
+    ' ---- placement: the pure procedure ----
+    dim as TKTOASTER_SETTINGS st
+    dim as TKRECT rcRoot, rects(any)
+    tkRect_Set( rcRoot, 0, 0, W, HH )
+    dim as long hs(0 to 2) = { Px( h, 100 ), Px( h, 50 ), Px( h, 70 ) }
+    dim as long mg = Px( h, st.margin ), gp = Px( h, st.gap ), cw = Px( h, st.cardWidth )
+    tkToast_ComputeLayout( st, rcRoot, h->fScale, hs(), 3, rects() )
+    tkTest_Check( "default: bottom right, the setting's width, newest in the corner, older ones a gap above", _
+                  (rects(0).right = W - mg) andalso (rects(0).bottom = HH - mg) andalso (rects(0).right - rects(0).left = cw) andalso _
+                  (rects(1).bottom = rects(0).top - gp) andalso (rects(2).bottom = rects(1).top - gp), RS( rects(0) ) & " " & RS( rects(1) ) & " " & RS( rects(2) ) )
+    st.position = TST_POS_TOP_LEFT
+    tkToast_ComputeLayout( st, rcRoot, h->fScale, hs(), 3, rects() )
+    tkTest_Check( "top left: from the corner down", (rects(0).left = mg) andalso (rects(0).top = mg) andalso (rects(1).top = rects(0).bottom + gp), RS( rects(0) ) & " " & RS( rects(1) ) )
+    st.position = TST_POS_TOP_CENTER
+    tkToast_ComputeLayout( st, rcRoot, h->fScale, hs(), 3, rects() )
+    tkTest_Check( "top centre: centred in the area", rects(0).left = mg + ((W - 2 * mg) - cw) \ 2, RS( rects(0) ) )
+    st.position = TST_POS_BOTTOM_RIGHT
+    st.bNewestNearEdge = false
+    tkToast_ComputeLayout( st, rcRoot, h->fScale, hs(), 3, rects() )
+    tkTest_Check( "oldest near the edge when asked", rects(2).bottom = HH - mg, RS( rects(2) ) )
+    st.bNewestNearEdge = true
+    st.insetB = 30 : st.insetR = 10
+    tkToast_ComputeLayout( st, rcRoot, h->fScale, hs(), 3, rects() )
+    tkTest_Check( "insets keep the cards clear", (rects(0).bottom = HH - Px( h, 30 ) - mg) andalso (rects(0).right = W - Px( h, 10 ) - mg), RS( rects(0) ) )
+    st.insetB = 0 : st.insetR = 0
+    dim as TKRECT rcNarrow
+    tkRect_Set( rcNarrow, 0, 0, Px( h, 500 ), HH )
+    st.position = TST_POS_TOP_LEFT
+    tkToast_ComputeLayout( st, rcNarrow, h->fScale, hs(), 3, rects() )
+    tkTest_Check( "narrow window: full width, from the bottom", _
+                  (rects(0).left = mg) andalso (rects(0).right = Px( h, 500 ) - mg) andalso (rects(0).bottom = HH - mg), RS( rects(0) ) )
+    st.position = TST_POS_BOTTOM_RIGHT
+
+    ' ---- the toaster: made on first use, a hidden listener; focus never moves ----
+    dim as long kids0 = RootKids( root_ )
+    dim as TK_WIDGET ptr hT = tkToast_GetToaster( root_ )
+    tkTest_Check( "a toaster made on first use, one per window, zero-size, animating by default", (hT <> 0) andalso (RootKids( root_ ) = kids0 + 1) andalso _
+                  (tkToast_GetToaster( btn ) = hT) andalso (hT->cw = 0) andalso (hT->ch = 0) andalso tkToast_GetAnimate( root_ ) )
+    tkToast_SetAnimate( root_, false )   ' the N2 checks below are about where things land; N3's motion follows
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_FOCUS_GAINED )
+    tkToast_SetDismissedCallback( root_, @OnDismissedDefault )
+    tkToast_SetActionCallback( root_, @OnActionDefault )
+    dim as longint t0 = 1000000
+    tkToast_TickForTest( root_, t0 )
+
+    dim as long id1 = tkToast_ShowText( root_, "Saved", TKN_SUCCESS )
+    dim as TK_WIDGET ptr card1 = tkToast_GetCard( root_, id1 )
+    tkTest_Check( "shown at once: no focus moved, its card a root child and not a tab stop", (id1 > 0) andalso tkToast_IsShown( root_, id1 ) andalso _
+                  (tkHost_GetFocus( h ) = 0) andalso (card1 <> 0) andalso (card1->pParent = root_) andalso (card1->isFocusable = false) )
+    dim as TKRECT rc1, rcWant
+    tkToast_GetCardRect( root_, id1, rc1 )
+    dim as long hs1(0 to 0) = { rc1.bottom - rc1.top }
+    tkToast_ComputeLayout( st, rcRoot, h->fScale, hs1(), 1, rects() )
+    tkTest_Check( "the card sits where ComputeLayout says", SameRect( rc1, rects(0) ), RS( rc1 ) & " vs " & RS( rects(0) ) )
+    tkTest_Check( "success: 5000 ms, the one-shot clock at that deadline", (tkToast_GetRemaining( root_, id1 ) = 5000) andalso (tkToast_GetClockMs( root_ ) = 5000), _
+                  tkToast_GetRemaining( root_, id1 ) & " / " & tkToast_GetClockMs( root_ ) )
+    tkHost_RenderTo( h, false )
+    dim as TKNOTIFY_COLORS c
+    tkToast_GetColors( root_, @c )
+    dim as ulong c0
+    tkTest_Check( "the card paints in its severity's fill", (tkTest_PixelAt( h, rc1.left + Px( h, 4 ), (rc1.top + rc1.bottom) \ 2 ) and &hFFFFFFul) = (c.SuccessBack and &hFFFFFFul), _
+                  hex( tkTest_PixelAt( h, rc1.left + Px( h, 4 ), (rc1.top + rc1.bottom) \ 2 ) ) )
+
+    ' ---- time ----
+    tkToast_TickForTest( root_, t0 + 1000 )
+    tkTest_Check( "counts down, the clock re-armed at the new deadline", (tkToast_GetRemaining( root_, id1 ) = 4000) andalso (tkToast_GetClockMs( root_ ) = 4000), _
+                  tkToast_GetRemaining( root_, id1 ) & " / " & tkToast_GetClockMs( root_ ) )
+    tkToast_TickForTest( root_, t0 + 4999 )
+    dim as boolean bAlive4999 = tkToast_IsLive( root_, id1 )
+    tkToast_TickForTest( root_, t0 + 5000 )
+    tkTest_Check( "alive at 4999, gone at 5000", bAlive4999 andalso (tkToast_IsLive( root_, id1 ) = false) )
+    dim as TKTOAST_RECORD recs(any)
+    dim as long nH = tkToast_GetHistory( root_, recs() )
+    tkTest_Check( "a timeout tells the toaster's callback and the history", (gDismissed = 1) andalso (gLastReason = TKN_CLOSE_TIMEOUT) andalso (gLastId = id1) andalso _
+                  (nH = 1) andalso (recs(0).id = id1) andalso (recs(0).reason = TKN_CLOSE_TIMEOUT) andalso (recs(0).message = "Saved"), gDismissed & " r " & gLastReason & " h " & nH )
+    tkToast_TickForTest( root_, t0 + 5001 )
+    tkTest_Check( "nothing left: no timer, the dead card reaped", (tkToast_GetClockMs( root_ ) = 0) andalso (tkWidget_HasTimer( hT, TKTOAST_TIMER ) = false) andalso _
+                  (RootKids( root_ ) = kids0 + 1), str( RootKids( root_ ) ) )
+
+    dim as TK_TOAST t
+    t.message = "Disk almost full" : t.severity = TKN_WARNING
+    dim as long idW = tkToast_Show( root_, t )
+    dim as long rWarn = tkToast_GetRemaining( root_, idW )
+    t.message = "Update ready" : t.severity = TKN_INFO : t.action1 = "Restart"
+    dim as long idA = tkToast_Show( root_, t )
+    dim as long rAct = tkToast_GetRemaining( root_, idA )
+    t.action1 = "" : t.message = "Pinned" : t.duration = 0
+    dim as long idS = tkToast_Show( root_, t )
+    dim as long rSticky = tkToast_GetRemaining( root_, idS )
+    tkToast_DismissAll( root_ )
+    nH = tkToast_GetHistory( root_, recs() )
+    tkTest_Check( "DismissAll: none left, silently, recorded as programmatic", (tkToast_GetVisibleCount( root_ ) = 0) andalso (gDismissed = 1) andalso _
+                  (nH = 4) andalso (recs(3).reason = TKN_CLOSE_PROGRAMMATIC), str( nH ) )
+    t.duration = 1234 : t.message = "Exact"
+    dim as long idE = tkToast_Show( root_, t )
+    tkTest_Check( "the duration rule: warning 8000, an action sticky, 0 sticky, an explicit duration wins", _
+                  (rWarn = 8000) andalso (rAct = -1) andalso (rSticky = -1) andalso (tkToast_GetRemaining( root_, idE ) = 1234), rWarn & " " & rAct & " " & rSticky )
+    tkToast_Dismiss( root_, idE )
+    t.duration = -1
+
+    ' ---- the queue ----
+    dim as longint t1 = t0 + 100000
+    tkToast_TickForTest( root_, t1 )
+    dim as long q(0 to 3)
+    for k as long = 0 to 3
+        q(k) = tkToast_ShowText( root_, "Message " & k )
+    next
+    tkTest_Check( "three show; the fourth waits, with no time yet", (tkToast_GetVisibleCount( root_ ) = 3) andalso (tkToast_GetQueuedCount( root_ ) = 1) andalso _
+                  (tkToast_IsShown( root_, q(3) ) = false) andalso (tkToast_GetRemaining( root_, q(3) ) = -2) )
+    dim as TKRECT rq0, rq2
+    tkToast_GetCardRect( root_, q(0), rq0 )
+    tkToast_GetCardRect( root_, q(2), rq2 )
+    tkTest_Check( "the newest in the corner, the oldest farthest", (rq2.bottom = HH - mg) andalso (rq0.bottom < rq2.top), RS( rq0 ) & " " & RS( rq2 ) )
+    dim as long dBefore = gDismissed
+    tkToast_Dismiss( root_, q(0) )
+    tkTest_Check( "a freed slot: the waiting one shows, silently, the stack closing up", tkToast_IsShown( root_, q(3) ) andalso (tkToast_GetQueuedCount( root_ ) = 0) andalso _
+                  (gDismissed = dBefore) andalso tkToast_GetCardRect( root_, q(1), rq0 ) andalso (rq0.bottom < HH - mg) )
+    tkToast_DismissAll( root_ )
+
+    ' HIGH priority with every slot full
+    for k as long = 0 to 2
+        q(k) = tkToast_ShowText( root_, "Normal " & k )
+    next
+    tkToast_TickForTest( root_, t1 + 1000 )
+    dim as long leftOld = tkToast_GetRemaining( root_, q(0) )
+    t.message = "Connection lost" : t.severity = TKN_ERROR : t.priority = TST_PRIO_HIGH
+    dim as long idHi = tkToast_Show( root_, t )
+    t.priority = TST_PRIO_NORMAL
+    tkTest_Check( "HIGH shows at once; the oldest NORMAL goes back to the queue keeping its time", tkToast_IsShown( root_, idHi ) andalso _
+                  (tkToast_GetVisibleCount( root_ ) = 3) andalso (tkToast_IsShown( root_, q(0) ) = false) andalso tkToast_IsLive( root_, q(0) ) andalso _
+                  (tkToast_GetRemaining( root_, q(0) ) = leftOld), tkToast_GetRemaining( root_, q(0) ) & " vs " & leftOld )
+    dim as long q3 = tkToast_ShowText( root_, "Later" )
+    tkToast_Dismiss( root_, idHi )
+    tkTest_Check( "the pushed-back toast is first back, before a newer one", tkToast_IsShown( root_, q(0) ) andalso (tkToast_IsShown( root_, q3 ) = false) )
+    tkToast_DismissAll( root_ )
+
+    ' keys and repeats
+    tkToast_TickForTest( root_, t1 + 2000 )
+    t.key = "sync" : t.message = "Syncing 1 of 3" : t.severity = TKN_INFO
+    dim as long idK = tkToast_Show( root_, t )
+    tkToast_TickForTest( root_, t1 + 3000 )
+    t.message = "Syncing 2 of 3"
+    dim as long idK2nd = tkToast_Show( root_, t )
+    tkTest_Check( "same key: the same id, one card, its time re-armed", (idK2nd = idK) andalso (tkToast_GetVisibleCount( root_ ) = 1) andalso _
+                  (tkToast_GetRemaining( root_, idK ) = 5000), str( tkToast_GetRemaining( root_, idK ) ) )
+    dim as boolean bFound = (tkToast_FindKey( root_, "sync" ) = idK)
+    tkToast_DismissKey( root_, "sync" )
+    tkTest_Check( "FindKey finds it, DismissKey dismisses it", bFound andalso (tkToast_FindKey( root_, "sync" ) = 0) )
+    t.key = ""
+    dim as long idR = tkToast_ShowText( root_, "Connection lost", TKN_WARNING )
+    tkToast_TickForTest( root_, t1 + 4000 )
+    dim as long idR2nd = tkToast_ShowText( root_, "Connection lost", TKN_WARNING )
+    tkTest_Check( "a repeat counts on the same card and re-arms it", (idR2nd = idR) andalso (tkToast_GetRepeat( root_, idR ) = 2) andalso _
+                  (tkToast_GetVisibleCount( root_ ) = 1) andalso (tkToast_GetRemaining( root_, idR ) = 8000), str( tkToast_GetRemaining( root_, idR ) ) )
+    tkToast_SetCoalesceRepeats( root_, false )
+    tkTest_Check( "coalescing off: a new card", tkToast_ShowText( root_, "Connection lost", TKN_WARNING ) <> idR )
+    tkToast_SetCoalesceRepeats( root_, true )
+    tkToast_DismissAll( root_ )
+
+    ' ---- holds ----
+    dim as longint t2 = t1 + 100000
+    tkToast_TickForTest( root_, t2 )
+    dim as long idH = tkToast_ShowText( root_, "Hover me" )
+    tkToast_TickForTest( root_, t2 + 4700 )                          ' 300 ms left
+    dim as TKRECT rcH
+    tkToast_GetCardRect( root_, idH, rcH )
+    tkTest_PushMotion( h, (rcH.left + rcH.right) \ 2, (rcH.top + rcH.bottom) \ 2 )
+    dim as boolean bHeldNoClock = tkToast_IsHeld( root_ ) andalso (tkToast_GetClockMs( root_ ) = 0)
+    tkToast_TickForTest( root_, t2 + 60000 )
+    tkTest_Check( "hovering a card holds time: no timer, nothing expires", bHeldNoClock andalso tkToast_IsLive( root_, idH ) andalso _
+                  (tkToast_GetRemaining( root_, idH ) = 300), str( tkToast_GetRemaining( root_, idH ) ) )
+    tkTest_PushMotion( h, Px( h, 20 ), Px( h, 20 ) )
+    tkTest_Check( "leaving lets it go, with at least 1 s left", (tkToast_IsHeld( root_ ) = false) andalso (tkToast_GetRemaining( root_, idH ) = TKTOAST_HOLD_MIN_MS), _
+                  str( tkToast_GetRemaining( root_, idH ) ) )
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_FOCUS_LOST )
+    dim as boolean bBlurHeld = tkToast_IsHeld( root_ )
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_FOCUS_GAINED )
+    tkTest_Check( "the window losing focus holds, regaining it releases", bBlurHeld andalso (tkToast_IsHeld( root_ ) = false) )
+    tkToast_SetPauseOnWindowBlur( root_, false )
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_FOCUS_LOST )
+    tkTest_Check( "blur hold can be turned off", tkToast_IsHeld( root_ ) = false )
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_FOCUS_GAINED )
+    tkToast_SetPauseOnWindowBlur( root_, true )
+    tkToast_SetPauseOnHover( root_, false )
+    tkTest_PushMotion( h, (rcH.left + rcH.right) \ 2, (rcH.top + rcH.bottom) \ 2 )
+    tkTest_Check( "hover hold can be turned off", tkToast_IsHeld( root_ ) = false )
+    tkTest_PushMotion( h, Px( h, 20 ), Px( h, 20 ) )
+    tkToast_SetPauseOnHover( root_, true )
+    ' a press holds even with hover off; released outside, it does nothing
+    dim as TKRECT rcX
+    tkToast_GetPartRect( root_, idH, TKN_PART_CLOSE, rcX )
+    dim as long xx = rcH.left + (rcX.left + rcX.right) \ 2, xy = rcH.top + (rcX.top + rcX.bottom) \ 2
+    tkToast_SetPauseOnHover( root_, false )
+    tkTest_PushButton( h, true, xx, xy )
+    tkTest_Check( "a press holds", tkToast_IsHeld( root_ ) )
+    tkTest_PushMotion( h, Px( h, 20 ), Px( h, 20 ) )
+    tkTest_PushButton( h, false, Px( h, 20 ), Px( h, 20 ) )
+    tkTest_Check( "...released outside: still there, not held", tkToast_IsLive( root_, idH ) andalso (tkToast_IsHeld( root_ ) = false) )
+    tkToast_SetPauseOnHover( root_, true )
+    tkToast_DismissAll( root_ )
+
+    ' ---- clicks and callbacks ----
+    gSeq = "" : gOwn = 0 : gDismissed = 0 : gActions = 0
+    dim as TK_TOAST tt
+    tt.message = "Own callbacks" : tt.OnDismissed = @OnOwnDismissed : tt.OnAction = @OnOwnAction : tt.pCtx = @gCtxTag
+    dim as long idO = tkToast_Show( root_, tt )
+    dim as TKRECT rcO
+    tkToast_GetCardRect( root_, idO, rcO )
+    tkToast_GetPartRect( root_, idO, TKN_PART_CLOSE, rcX )
+    tkTest_Click( h, rcO.left + (rcX.left + rcX.right) \ 2, rcO.top + (rcX.top + rcX.bottom) \ 2 )
+    tkTest_Check( "close: the toast's own callback with its pCtx, not the toaster's", (gOwn = 1) andalso (gLastReason = TKN_CLOSE_BUTTON) andalso _
+                  (gLastCtx = @gCtxTag) andalso (gDismissed = 0), gOwn & " r " & gLastReason )
+    dim as boolean bGoneNow = (tkToast_IsLive( root_, idO ) = false) andalso (tkToast_GetCard( root_, idO ) = 0)
+    tkToast_TickForTest( root_, t2 + 70000 )
+    tkTest_Check( "gone at once, the card reaped on the next tick", bGoneNow andalso (RootKids( root_ ) = kids0 + 1), str( RootKids( root_ ) ) )
+
+    gSeq = ""
+    tt.action1 = "Undo" : tt.action2 = "Details" : tt.message = "Deleted 3 files"
+    idO = tkToast_Show( root_, tt )
+    tkToast_GetCardRect( root_, idO, rcO )
+    dim as TKRECT rcA2
+    tkToast_GetPartRect( root_, idO, TKN_PART_ACTION1 + 1, rcA2 )
+    tkTest_Click( h, rcO.left + (rcA2.left + rcA2.right) \ 2, rcO.top + (rcA2.top + rcA2.bottom) \ 2 )
+    tkTest_Check( "action 2: its number, then dismissed as ACTION", gSeq = "a2 d" & TKN_CLOSE_ACTION & " ", gSeq )
+    tt.bKeepOnAction = true
+    idO = tkToast_Show( root_, tt )
+    tkToast_GetCardRect( root_, idO, rcO )
+    dim as TKRECT rcA1
+    tkToast_GetPartRect( root_, idO, TKN_PART_ACTION1, rcA1 )
+    gSeq = ""
+    tkTest_Click( h, rcO.left + (rcA1.left + rcA1.right) \ 2, rcO.top + (rcA1.top + rcA1.bottom) \ 2 )
+    tkTest_Check( "keep-on-action: the action, and it stays", (gSeq = "a1 ") andalso tkToast_IsLive( root_, idO ), gSeq )
+    tkToast_DismissAll( root_ )
+
+    ' the toaster's callbacks for toasts without their own
+    gSeq = ""
+    t.message = "Default" : t.action1 = "Open" : t.severity = TKN_INFO
+    dim as long idD = tkToast_Show( root_, t )
+    tkToast_GetCardRect( root_, idD, rcO )
+    tkToast_GetPartRect( root_, idD, TKN_PART_ACTION1, rcA1 )
+    tkTest_Click( h, rcO.left + (rcA1.left + rcA1.right) \ 2, rcO.top + (rcA1.top + rcA1.bottom) \ 2 )
+    tkTest_Check( "no own callbacks: the toaster's", gSeq = "A1 D" & TKN_CLOSE_ACTION & " ", gSeq )
+    t.action1 = ""
+
+    ' body clicks: only with a click callback; never through to what is beneath
+    tkWidget_SetPos( btn, W - Px( h, 200 ), HH - Px( h, 60 ), Px( h, 180 ), Px( h, 40 ) )
+    idD = tkToast_ShowText( root_, "Over the button" )
+    tkToast_GetCardRect( root_, idD, rcO )
+    dim as boolean bCovers = (rcO.left < btn->x + 4) andalso (rcO.bottom > btn->y + 4)
+    tkTest_Click( h, btn->x + 4, btn->y + 4 )
+    tkTest_Check( "a click on a card never reaches the widget beneath it", bCovers andalso (gBtnClicks = 0), RS( rcO ) & " " & gBtnClicks )
+    tkToast_SetClickCallback( root_, @OnClick )
+    tkTest_Click( h, btn->x + 4, btn->y + 4 )
+    tkTest_Check( "a body click with a callback", (gClicks = 1) andalso (gLastId = idD), str( gClicks ) )
+    tkToast_DismissAll( root_ )
+    tkTest_Click( h, btn->x + 4, btn->y + 4 )
+    tkTest_Check( "with the card gone the button takes the click", gBtnClicks = 1, str( gBtnClicks ) )
+    tkToast_SetClickCallback( root_, 0 )
+
+    ' re-entrancy: a callback that dismisses everything and posts again
+    dim as TK_TOAST tr
+    tr.message = "Re-enter" : tr.OnDismissed = @OnReenter
+    dim as long idX = tkToast_Show( root_, tr )
+    tkToast_ShowText( root_, "Bystander" )
+    tkToast_GetCardRect( root_, idX, rcO )
+    tkToast_GetPartRect( root_, idX, TKN_PART_CLOSE, rcX )
+    gSeq = ""
+    tkTest_Click( h, rcO.left + (rcX.left + rcX.right) \ 2, rcO.top + (rcX.top + rcX.bottom) \ 2 )
+    dim as boolean bReenter = (gSeq = "R ") andalso (tkToast_GetVisibleCount( root_ ) = 1)
+    tkToast_TickForTest( root_, t2 + 80000 )
+    tkTest_Check( "a callback may dismiss all and post; the cards it dropped are reaped", bReenter andalso (RootKids( root_ ) = kids0 + 2), gSeq & " / " & RootKids( root_ ) )
+    tkToast_DismissAll( root_ )
+
+    ' ---- the window resizes: the cards follow (tkHost's size hook) ----
+    dim as long idZ = tkToast_ShowText( root_, "Stay in the corner" )
+    SDL_SetWindowSize( h->win, cint( 700 * h->fScale / h->fDensity ), cint( 500 * h->fScale / h->fDensity ) )
+    tkTest_PumpFor( h, 150 )
+    dim as TKRECT rcZ
+    tkToast_GetCardRect( root_, idZ, rcZ )
+    dim as boolean bResized = (root_->cw <> W)
+    tkRect_Set( rcRoot, 0, 0, root_->cw, root_->ch )
+    dim as long hsZ(0 to 0) = { rcZ.bottom - rcZ.top }
+    tkToast_ComputeLayout( st, rcRoot, h->fScale, hsZ(), 1, rects() )
+    tkTest_Check( "after a resize the card is where ComputeLayout says", bResized andalso SameRect( rcZ, rects(0) ), RS( rcZ ) & " vs " & RS( rects(0) ) )
+    tkToast_DismissAll( root_ )
+
+    ' ==== N3: motion, swipe, keyboard ====
+    tkToast_DismissAll( root_ )
+    tkToast_SetAnimate( root_, true )
+    gDismissed = 0 : gActions = 0 : gSeq = ""
+    dim as long sm = Px( h, TKTOAST_SHADOW ), sl = Px( h, TKTOAST_SLIDE )
+    dim as longint t3 = t2 + 500000
+    tkToast_TickForTest( root_, t3 )
+    dim as long idM = tkToast_ShowText( root_, "Moving in" )
+    dim as TK_WIDGET ptr cM = tkToast_GetCard( root_, idM )
+    dim as TKRECT rcM
+    tkToast_GetCardRect( root_, idM, rcM )
+    tkTest_Check( "enter: transparent, a slide below its place, the 15 ms clock; the widget has room for the shadow", _
+                  (tkToast_GetCardOpacity( root_, idM ) = 0) andalso (cM->y = rcM.top - sm + sl) andalso (tkToast_GetClockMs( root_ ) = 15) andalso _
+                  (cM->cw = (rcM.right - rcM.left) + 2 * sm) andalso (cM->ch = (rcM.bottom - rcM.top) + 2 * sm), cM->y & " vs " & (rcM.top - sm + sl) )
+    tkToast_TickForTest( root_, t3 + TKTOAST_ENTER_MS \ 2 )
+    tkTest_Check( "half way in (ease-out): 3/4 opaque, a quarter of the slide left", (abs( tkToast_GetCardOpacity( root_, idM ) - 0.75 ) < 0.01) andalso _
+                  (abs( cM->y - (rcM.top - sm + cint( 0.25 * sl )) ) <= 1), tkToast_GetCardOpacity( root_, idM ) & " " & cM->y )
+    tkToast_TickForTest( root_, t3 + TKTOAST_ENTER_MS )
+    tkTest_Check( "in: opaque, in its place, the clock back to the deadline", (tkToast_GetCardOpacity( root_, idM ) = 1) andalso (cM->y = rcM.top - sm) andalso _
+                  (cM->x = rcM.left - sm) andalso (tkToast_IsAnimating( root_ ) = false) andalso (tkToast_GetClockMs( root_ ) = tkToast_GetRemaining( root_, idM )), cM->x & "," & cM->y )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "the shadow darkens just outside the card", (tkTest_PixelAt( h, rcM.left - 1, (rcM.top + rcM.bottom) \ 2 ) and &hFFFFFFul) <> &h102030ul, hex( tkTest_PixelAt( h, rcM.left - 1, (rcM.top + rcM.bottom) \ 2 ) ) )
+
+    ' a second card: the first travels up; dismissing the second, it leaves and the first comes back
+    tkToast_TickForTest( root_, t3 + 1000 )
+    dim as long idM2 = tkToast_ShowText( root_, "Second" )
+    dim as TKRECT rcM1b
+    tkToast_GetCardRect( root_, idM, rcM1b )
+    dim as boolean bStill = (rcM1b.top < rcM.top) andalso (cM->y = rcM.top - sm)
+    tkToast_TickForTest( root_, t3 + 1000 + TKTOAST_MOVE_MS \ 2 )
+    dim as boolean bThreeQ = abs( cM->y - (rcM.top - sm + cint( (rcM1b.top - rcM.top) * 0.75 )) ) <= 1
+    tkToast_TickForTest( root_, t3 + 1000 + TKTOAST_MOVE_MS )
+    tkTest_Check( "reflow: the older card travels to its new place, 3/4 of the way at half time", bStill andalso bThreeQ andalso (cM->y = rcM1b.top - sm), str( cM->y ) )
+    dim as TK_WIDGET ptr cM2 = tkToast_GetCard( root_, idM2 )
+    dim as long kidsBefore = RootKids( root_ )
+    tkToast_TickForTest( root_, t3 + 2000 )
+    tkToast_Dismiss( root_, idM2 )
+    tkTest_Check( "leave: gone from the queue at once, its card still on screen, leaving", (tkToast_IsLive( root_, idM2 ) = false) andalso _
+                  cM2->isVisible andalso tkToast_IsAnimating( root_ ) )
+    tkToast_TickForTest( root_, t3 + 2000 + TKTOAST_LEAVE_MS )
+    tkTest_Check( "out: reaped, and the first card back down", (RootKids( root_ ) = kidsBefore - 1) andalso (cM->y = rcM.top - sm) andalso _
+                  (tkToast_IsAnimating( root_ ) = false), RootKids( root_ ) & " " & cM->y )
+
+    ' ---- swipe ----
+    dim as long px0 = rcM.left + Px( h, 30 ), py0 = (rcM.top + rcM.bottom) \ 2
+    tkToast_TickForTest( root_, t3 + 3000 )
+    tkTest_PushButton( h, true, px0, py0 )
+    tkTest_PushMotion( h, px0 + Px( h, 20 ), py0 )
+    tkTest_Check( "a drag: the card follows the pointer and fades", (cM->x = rcM.left - sm + Px( h, 20 )) andalso (tkToast_GetCardOpacity( root_, idM ) < 1), _
+                  cM->x & " vs " & (rcM.left - sm + Px( h, 20 )) )
+    tkTest_PushButton( h, false, px0 + Px( h, 20 ), py0 )
+    dim as boolean bKept = tkToast_IsLive( root_, idM ) andalso (gDismissed = 0)
+    tkToast_TickForTest( root_, t3 + 3000 + TKTOAST_MOVE_MS \ 2 )
+    dim as boolean bQuarter = abs( cM->x - (rcM.left - sm + cint( Px( h, 20 ) * 0.25 )) ) <= 1
+    tkToast_TickForTest( root_, t3 + 3000 + TKTOAST_MOVE_MS )
+    tkTest_Check( "a short drag does not dismiss: it springs back (a quarter left at half time)", bKept andalso bQuarter andalso _
+                  (cM->x = rcM.left - sm) andalso (tkToast_GetCardOpacity( root_, idM ) = 1), str( cM->x ) )
+    tkTest_PushButton( h, true, px0, py0 )
+    tkTest_PushMotion( h, px0 - Px( h, 60 ), py0 )
+    tkTest_PushButton( h, false, px0 - Px( h, 60 ), py0 )
+    tkTest_Check( "a right-hand stack does not swipe left", tkToast_IsLive( root_, idM ) andalso (cM->x = rcM.left - sm), str( cM->x ) )
+    tkTest_PushButton( h, true, px0, py0 )
+    tkTest_PushMotion( h, px0 + Px( h, TKTOAST_SWIPE + 2 ), py0 )
+    tkTest_PushButton( h, false, px0 + Px( h, TKTOAST_SWIPE + 2 ), py0 )
+    tkTest_Check( "a drag past the threshold dismisses: SWIPE", (tkToast_IsLive( root_, idM ) = false) andalso (gDismissed = 1) andalso (gLastReason = TKN_CLOSE_SWIPE), gDismissed & " r " & gLastReason )
+    tkToast_TickForTest( root_, t3 + 4000 )
+    ' a flick: short, but fast
+    dim as long idF = tkToast_ShowText( root_, "Flick me" )
+    tkToast_TickForTest( root_, t3 + 4000 + TKTOAST_ENTER_MS )
+    tkToast_GetCardRect( root_, idF, rcM )
+    px0 = rcM.left + Px( h, 30 ) : py0 = (rcM.top + rcM.bottom) \ 2
+    tkToast_TickForTest( root_, t3 + 5000 )
+    tkTest_PushButton( h, true, px0, py0 )
+    tkToast_TickForTest( root_, t3 + 5010 )
+    tkTest_PushMotion( h, px0 + Px( h, 12 ), py0 )
+    tkTest_PushButton( h, false, px0 + Px( h, 12 ), py0 )
+    tkTest_Check( "a flick dismisses though it is short", (tkToast_IsLive( root_, idF ) = false) andalso (gLastReason = TKN_CLOSE_SWIPE), str( tkToast_IsLive( root_, idF ) ) )
+    ' a drag that starts on a button cancels the button
+    dim as TK_TOAST tb
+    tb.message = "Drag from the button" : tb.action1 = "Open"
+    dim as long idB = tkToast_Show( root_, tb )
+    tkToast_TickForTest( root_, t3 + 6000 )
+    tkToast_GetCardRect( root_, idB, rcM )
+    dim as TKRECT rcBA
+    tkToast_GetPartRect( root_, idB, TKN_PART_ACTION1, rcBA )
+    dim as long bx = rcM.left + (rcBA.left + rcBA.right) \ 2, by = rcM.top + (rcBA.top + rcBA.bottom) \ 2
+    gActions = 0
+    tkTest_PushButton( h, true, bx, by )
+    tkTest_PushMotion( h, bx + Px( h, 20 ), by )
+    tkTest_PushMotion( h, bx, by )
+    tkTest_PushButton( h, false, bx, by )
+    tkTest_Check( "a drag from a button cancels it", (gActions = 0) andalso tkToast_IsLive( root_, idB ), str( gActions ) )
+    tkToast_DismissAll( root_ )
+    tkToast_TickForTest( root_, t3 + 7000 )
+
+    ' ---- keyboard ----
+    tkToast_SetAnimate( root_, false )
+    gDismissed = 0 : gActions = 0
+    tkHost_SetFocus( h, btn )
+    dim as TK_TOAST tk1
+    tk1.message = "First, with an action" : tk1.action1 = "Open"
+    dim as long idK1 = tkToast_Show( root_, tk1 )
+    dim as long idK2 = tkToast_ShowText( root_, "Second" )
+    tkTest_Check( "showing never takes focus", tkHost_GetFocus( h ) = btn )
+    dim as boolean bFocused = tkToast_FocusToasts( root_ )
+    tkTest_Check( "FocusToasts: the newest card, on its first part; time holds", bFocused andalso (tkHost_GetFocus( h ) = tkToast_GetCard( root_, idK2 )) andalso _
+                  tkToast_IsKeyMode( root_ ) andalso (tkToast_GetFocusPart( root_, idK2 ) = TKN_PART_CLOSE) andalso tkToast_IsHeld( root_ ), str( tkToast_GetFocusPart( root_, idK2 ) ) )
+    tkTest_PushKey( h, SDLK_TAB, SDL_KMOD_SHIFT )
+    tkTest_Check( "Shift+Tab: the card above, on its last part", (tkHost_GetFocus( h ) = tkToast_GetCard( root_, idK1 )) andalso (tkToast_GetFocusPart( root_, idK1 ) = TKN_PART_CLOSE), str( tkToast_GetFocusPart( root_, idK1 ) ) )
+    tkTest_PushKey( h, SDLK_TAB, SDL_KMOD_SHIFT )
+    tkTest_Check( "Shift+Tab: its previous part", tkToast_GetFocusPart( root_, idK1 ) = TKN_PART_ACTION1, str( tkToast_GetFocusPart( root_, idK1 ) ) )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab past a card's parts: the card below", tkHost_GetFocus( h ) = tkToast_GetCard( root_, idK2 ) )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "Up: the card above, on its first part", (tkHost_GetFocus( h ) = tkToast_GetCard( root_, idK1 )) andalso (tkToast_GetFocusPart( root_, idK1 ) = TKN_PART_ACTION1) )
+    dim as TK_MSG mch
+    mch.msg = TKM_CHAR : mch.text = " "
+    tkTest_Check( "Space's character is swallowed", tkWidget_Send( tkToast_GetCard( root_, idK1 ), @mch ) )
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_Check( "Enter presses the action; focus moves to the card left", (gActions = 1) andalso (tkToast_IsLive( root_, idK1 ) = false) andalso _
+                  (tkHost_GetFocus( h ) = tkToast_GetCard( root_, idK2 )), str( gActions ) )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "Esc dismisses with KEY; the last one gone, focus goes back and time runs", (tkToast_IsLive( root_, idK2 ) = false) andalso _
+                  (gLastReason = TKN_CLOSE_KEY) andalso (tkHost_GetFocus( h ) = btn) andalso (tkToast_IsKeyMode( root_ ) = false) andalso (tkToast_IsHeld( root_ ) = false), str( gLastReason ) )
+    ' Tab past the last card goes back too
+    idK2 = tkToast_ShowText( root_, "Only one" )
+    tkToast_FocusToasts( root_ )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab past the last card: focus goes back; the cards are tab stops no more", (tkHost_GetFocus( h ) = btn) andalso _
+                  (tkToast_IsKeyMode( root_ ) = false) andalso (tkToast_GetCard( root_, idK2 )->isFocusable = false) )
+    ' Delete; Shift+Esc dismisses all, each told
+    tkToast_FocusToasts( root_ )
+    tkTest_PushKey( h, SDLK_DELETE )
+    tkTest_Check( "Delete dismisses too", tkToast_IsLive( root_, idK2 ) = false )
+    for k as long = 1 to 3
+        tkToast_ShowText( root_, "All of us " & k )
+    next
+    tkToast_FocusToasts( root_ )
+    dim as long dAll = gDismissed
+    tkTest_PushKey( h, SDLK_ESCAPE, SDL_KMOD_SHIFT )
+    tkTest_Check( "Shift+Esc: every card, each told, focus back", (tkToast_GetVisibleCount( root_ ) = 0) andalso (gDismissed = dAll + 3) andalso _
+                  (tkHost_GetFocus( h ) = btn), str( gDismissed - dAll ) )
+    ' a non-closable card: Esc does nothing
+    dim as TK_TOAST tn
+    tn.message = "Can't close me" : tn.bClosable = false
+    dim as long idN = tkToast_Show( root_, tn )
+    tkToast_FocusToasts( root_ )
+    dim as boolean bWhole = (tkToast_GetFocusPart( root_, idN ) = TKN_PART_NONE)
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "not closable: focus on the card itself, and Esc does nothing", bWhole andalso tkToast_IsLive( root_, idN ) )
+    ' a click elsewhere ends keyboard mode
+    tkTest_Click( h, btn->x + btn->cw - 4, btn->y + 4 )
+    tkTest_Check( "a click elsewhere ends keyboard mode", (tkToast_IsKeyMode( root_ ) = false) andalso (tkToast_GetCard( root_, idN )->isFocusable = false) )
+    tkToast_DismissAll( root_ )
+
+    ' ==== N4: loading -> result, the time scale, timeouts off, the background ====
+    tkToast_SetAnimate( root_, false )
+    dim as longint t4 = t3 + 100000
+    tkToast_TickForTest( root_, t4 )
+    gDismissed = 0
+    dim as long idL = tkToast_Begin( root_, "Exporting 12,408 rows..." )
+    dim as TKRECT rcLp, rcLx
+    tkTest_Check( "Begin: sticky, not closable, a moving strip on the 30 ms clock", (tkToast_GetRemaining( root_, idL ) = -1) andalso _
+                  tkToast_GetPartRect( root_, idL, TKN_PART_PROGRESS, rcLp ) andalso (tkToast_GetPartRect( root_, idL, TKN_PART_CLOSE, rcLx ) = false) andalso _
+                  (tkToast_GetClockMs( root_ ) = 30), str( tkToast_GetClockMs( root_ ) ) )
+    tkToast_SetProgress( root_, idL, 40 )
+    tkTest_Check( "SetProgress: determinate, and no clock for a still, sticky toast", tkToast_GetPartRect( root_, idL, TKN_PART_PROGRESS, rcLp ) andalso _
+                  (tkToast_GetClockMs( root_ ) = 0), str( tkToast_GetClockMs( root_ ) ) )
+    tkTest_Check( "Finish: the same toast, now closable, timed by the rule, no strip", (tkToast_Finish( root_, idL, TKN_SUCCESS, "Exported" ) = idL) andalso _
+                  tkToast_GetPartRect( root_, idL, TKN_PART_CLOSE, rcLx ) andalso (tkToast_GetPartRect( root_, idL, TKN_PART_PROGRESS, rcLp ) = false) andalso _
+                  (tkToast_GetRemaining( root_, idL ) = 5000), str( tkToast_GetRemaining( root_, idL ) ) )
+    tkToast_Dismiss( root_, idL )
+    dim as long idL2 = tkToast_Finish( root_, idL, TKN_SUCCESS, "Exported (late)" )
+    tkTest_Check( "Finish after it is gone posts the result anew", (idL2 <> idL) andalso tkToast_IsShown( root_, idL2 ) )
+    tkToast_DismissAll( root_ )
+    tkToast_SetTimeScale( root_, 10 )
+    dim as long idTS = tkToast_ShowText( root_, "Scaled" )
+    dim as TK_TOAST te
+    te.message = "Explicit" : te.duration = 1234
+    dim as long idTE = tkToast_Show( root_, te )
+    tkTest_Check( "a time scale multiplies the rule's and an explicit duration", (tkToast_GetRemaining( root_, idTS ) = 50000) andalso _
+                  (tkToast_GetRemaining( root_, idTE ) = 12340), tkToast_GetRemaining( root_, idTS ) & " " & tkToast_GetRemaining( root_, idTE ) )
+    tkToast_SetTimeScale( root_, 1 )
+    tkToast_SetTimeouts( root_, false )
+    dim as long idOff = tkToast_ShowText( root_, "Timeouts off" )
+    tkTest_Check( "timeouts off: new and showing toasts are sticky", (tkToast_GetRemaining( root_, idOff ) = -1) andalso (tkToast_GetRemaining( root_, idTS ) = -1) )
+    tkToast_SetTimeouts( root_, true )
+    tkToast_DismissAll( root_ )
+    dim as long idBg = tkToast_ShowText( root_, "Backgrounded" )
+    tkTest_PushMotion( h, Px( h, 20 ), Px( h, 20 ) )               ' no hover hold to mistake for it
+    dim as boolean bFreeBefore = (tkToast_IsHeld( root_ ) = false)
+    tkTest_PushWindowEvent( h, SDL_EVENT_DID_ENTER_BACKGROUND )
+    dim as boolean bBgHeld = tkToast_IsHeld( root_ )
+    tkToast_TickForTest( root_, t4 + 60000 )
+    dim as boolean bBgLive = tkToast_IsLive( root_, idBg )
+    tkTest_PushWindowEvent( h, SDL_EVENT_WILL_ENTER_FOREGROUND )
+    tkTest_Check( "the background holds time (nothing expires); the foreground releases it", bFreeBefore andalso bBgHeld andalso bBgLive andalso (tkToast_IsHeld( root_ ) = false) )
+    tkToast_DismissAll( root_ )
+
+    ' ---- colours ----
+    dim as TKNOTIFY_COLORS cp = c
+    cp.InfoBack = &hFF123456ul
+    tkToast_SetColors( root_, @cp )
+    dim as TKNOTIFY_COLORS cr
+    tkToast_ApplyTheme( root_, tkTheme_Get( ) )
+    tkToast_GetColors( root_, @cr )
+    tkTest_Check( "pinned colours survive a theme", cr.InfoBack = &hFF123456ul )
+    tkToast_UnpinColors( root_ )
+    tkToast_GetColors( root_, @cr )
+    tkTest_Check( "unpin returns to the theme", cr.InfoBack = tkNotify_ThemeColors( tkTheme_Get( ) ).InfoBack )
+
+    ' a live toast when the window goes: nothing may fault
+    tkToast_ShowText( root_, "Left up at the end" )
+    tkHost_Destroy( h )
+    tkTest_Check( "destroyed with a live toast", true )
+end sub
+
+if tkTest_Init() = false then end 99
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkToast" )
+tkTest_Quit()
+end nFail

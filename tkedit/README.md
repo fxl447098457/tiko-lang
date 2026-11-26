@@ -22,7 +22,8 @@ brings the window to the front) and exits; `[ui] single_instance = false` gives 
   Ctrl+Shift+F searches every project file; Ctrl+P searches files and definitions; F4 lists the
   functions of the buffer (F4 again: of every open buffer). F12 goes to a definition, Alt+Left
   comes back.
-- **Building:** a `.tkedit` project (Project menu) names the main file or a tiko.toml target.
+- **Building:** a project is a folder's `tiko.toml` (Project menu; New Project writes one); the
+  target to build and the program's arguments are tkEdit's own, kept in its config folder.
   Ctrl+F5 compiles, F5 builds and runs, Shift+F5 runs, Ctrl+F7 checks the file, Ctrl+Shift+F5
   runs the buffer as it is. Errors open the output pane; Alt+PgDn walks them.
 - **Debugging:** the Debug menu (lldb-dap from LLVM; `docs/tkEdit/DEBUGGER.md`). F9 sets a

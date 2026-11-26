@@ -1,0 +1,486 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDateTimePicker -- the dropdown. A tkHost popup surface holding a frame widget with a tkCalendar
+' on the left, a tkTimePanel (columns) on the right, and a band with Now and OK under both. It is
+' built at every open (Wayland fixes a popup's position at creation) and seeded from the picker.
+'
+' THE CHOICE IS PENDING (decided 2026-11-23). A day in the calendar and an item in the panel move
+' p->pend, never the field. OK, Enter (in either part) and Now ACCEPT: the popup closes first, then
+' the value is written and DateTimeChanged fires -- once, and only for a real change. Esc, F4,
+' Alt+Up/Down, an outside press and focus leaving the application DISMISS: nothing changes.
+'
+' THE RANGE: the calendar gets the min and max dates; the panel gets the time limits only while the
+' pending day is the min or max day (Qt's rule), re-seeded whenever the day changes.
+#module "tkDateTimePicker"
+
+#import "../tkHost"
+#import "../tkTimePanel"
+#import "../tkCalendar"
+using tkHost
+using tkPaint
+using tkTimePanel
+using tkCalendar
+
+' The picker behind a popup widget: the popup's pUser while it is ours.
+function DtmOfPopupWidget( byval w as TK_WIDGET ptr ) as TKDATETIMEPICKER_STATE ptr
+    if (w = 0) orelse (w->pHost = 0) then return 0
+    dim as TKDATETIMEPICKER_STATE ptr p = cast( TKDATETIMEPICKER_STATE ptr, w->pHost->pUser )
+    if (p = 0) orelse (p->pPop <> w->pHost) then return 0
+    return p
+end function
+
+function DtmPanelColors( byval p as TKDATETIMEPICKER_STATE ptr ) as TKTIMEPANEL_COLORS
+    dim as TKTIMEPANEL_COLORS c
+    with p->colors
+        c.BackColor = .PanelBackColor
+        c.BorderColor = .PanelBorderColor
+        c.FocusRingColor = .FocusBorderColor
+        c.ItemColor = .ItemColor
+        c.ItemColorDisabled = .ItemColorDisabled
+        c.ItemBackColorHot = .ItemBackColorHot
+        c.ItemForeColorHot = .ItemForeColorHot
+        c.ItemBackColorSelected = .ItemBackColorSelected
+        c.ItemForeColorSelected = .ItemForeColorSelected
+        c.ColumnDividerColor = .ColumnDividerColor
+    end with
+    return c
+end function
+
+' tkDatePicker's calendar mapping.
+function DtmCalColors( byval p as TKDATETIMEPICKER_STATE ptr ) as TKCALENDAR_COLORS
+    dim as TKCALENDAR_COLORS c
+    with p->colors
+        c.BackColor = .PanelBackColor
+        c.BorderColor = .PanelBorderColor
+        c.FocusRingColor = .FocusBorderColor
+        c.TitleColor = .TitleColor
+        c.TitleColorHot = .TitleColorHot
+        c.CaptionColor = .TitleColor
+        c.NavGlyphColor = .NavGlyphColor
+        c.NavGlyphColorHot = .NavGlyphColorHot
+        c.NavGlyphColorDisabled = .NavGlyphColorDisabled
+        c.WeekdayColor = .WeekdayColor
+        c.DayColor = .DayColor
+        c.DayColorWeekend = .DayColorWeekend
+        c.DayColorAdjacent = .DayColorAdjacent
+        c.DayColorDisabled = .DayColorDisabled
+        c.DayBackColorHot = .DayBackColorHot
+        c.DayForeColorHot = .DayForeColorHot
+        c.DayBackColorSelected = .DayBackColorSelected
+        c.DayForeColorSelected = .DayForeColorSelected
+        c.TodayRingColor = .TodayRingColor
+    end with
+    return c
+end function
+
+function DtmDateOf( byref t as const TKDATETIME ) as TKDATE
+    return tkCalendar_MakeDate( t.wYear, t.wMonth, t.wDay )
+end function
+
+function DtmPanelItemDisabled( byval hPanel as TK_WIDGET ptr, byval nKind as long, byval nValue as long ) as boolean
+    dim as TKDATETIMEPICKER_STATE ptr p = DtmOfPopupWidget( hPanel )
+    if (p = 0) orelse (p->ItemDisabledCallback = 0) then return false
+    return p->ItemDisabledCallback( p->hWin, nKind, nValue )
+end function
+
+' The panel's time limits for the pending day: the min's time on the min day, the max's on the max
+' day, none on any other.
+sub DtmSeedPanelRange( byval p as TKDATETIMEPICKER_STATE ptr, byval c as TK_WIDGET ptr )
+    dim as TKTIME lo = tkTimePanel_MakeTime( 0, 0 ), hi = tkTimePanel_MakeTime( 23, 59, 59, 999 )
+    dim as boolean bLo = false, bHi = false
+    if p->hasMin andalso (p->tMin.wYear = p->pend.wYear) andalso (p->tMin.wMonth = p->pend.wMonth) andalso (p->tMin.wDay = p->pend.wDay) then
+        lo = tkTimePanel_TimeOf( p->tMin ) : bLo = true
+    end if
+    if p->hasMax andalso (p->tMax.wYear = p->pend.wYear) andalso (p->tMax.wMonth = p->pend.wMonth) andalso (p->tMax.wDay = p->pend.wDay) then
+        hi = tkTimePanel_TimeOf( p->tMax ) : bHi = true
+    end if
+    tkTimePanel_SetRange( c, lo, hi, bLo, bHi )
+end sub
+
+sub DtmSeedPanel( byval p as TKDATETIMEPICKER_STATE ptr, byval c as TK_WIDGET ptr )
+    tkTimePanel_SetFont( c, DtmFont( p ) )
+    ' the panel reads only the time tokens of the pattern (its date letters are literal text to it)
+    tkTimePanel_SetFormat( c, p->sPattern )
+    tkTimePanel_SetAmPmText( c, p->sAm, p->sPm )
+    tkTimePanel_SetStep( c, p->nStep )
+    tkTimePanel_SetMode( c, TKTP_PANEL_COLUMNS )
+    tkTimePanel_SetVisibleRows( c, p->nVisibleRows )
+    tkTimePanel_SetBorderThickness( c, 0 )
+    dim as TKTIMEPANEL_COLORS cc = DtmPanelColors( p )
+    tkTimePanel_SetColors( c, @cc )
+    DtmSeedPanelRange( p, c )
+    tkTimePanel_SetTime( c, tkTimePanel_TimeOf( p->pend ) )
+end sub
+
+sub DtmSeedCalendar( byval p as TKDATETIMEPICKER_STATE ptr, byval c as TK_WIDGET ptr )
+    dim as TKDATETIME now_ = DtmNow( p )
+    tkCalendar_SetFont( c, DtmFont( p ) )
+    tkCalendar_SetPanelGrid( c, 1, 1 )
+    tkCalendar_SetNavStep( c, 1 )
+    tkCalendar_SetWeekStart( c, p->nWeekStart )
+    tkCalendar_SetShowTodayRing( c, true )
+    tkCalendar_SetToday( c, DtmDateOf( now_ ) )
+    dim as ustring mn( 1 to 12 )
+    for i as long = 1 to 12
+        mn( i ) = p->names.month( i )
+    next
+    tkCalendar_SetMonthNames( c, mn() )
+    dim as TKDATE dMin, dMax
+    if p->hasMin then dMin = DtmDateOf( p->tMin )
+    if p->hasMax then dMax = DtmDateOf( p->tMax )
+    tkCalendar_SetRange( c, dMin, dMax, p->hasMin, p->hasMax )
+    tkCalendar_SetSelDate( c, DtmDateOf( p->pend ) )
+    tkCalendar_SetAnchorDate( c, DtmDateOf( p->pend ) )
+    tkCalendar_SetView( c, CAL_VIEW_DAYS )
+    tkCalendar_SetBorderThickness( c, 0 )
+    dim as TKCALENDAR_COLORS cc = DtmCalColors( p )
+    tkCalendar_SetColors( c, @cc )
+end sub
+
+' Accept: close FIRST, then write and notify once, for a real change.
+sub DtmAccept( byval p as TKDATETIMEPICKER_STATE ptr, byval t as TKDATETIME )
+    tkDateTimePicker_CloseUp( p->hWin )
+    p->sEntry = ""
+    dim as boolean bChanged = false
+    if tkTimePanel_IsDateTime( t ) then bChanged = DtmUserSet( p, DtmFinish( p, t ) )
+    if bChanged then DtmNotify( p )
+end sub
+
+' ---- the parts' callbacks: they move the pending value only ----------------------------------------
+sub DtmCalSelChange( byval hCal as TK_WIDGET ptr, byval pDate as TKDATE ptr, byval bHasDate as boolean )
+    dim as TKDATETIMEPICKER_STATE ptr p = DtmOfPopupWidget( hCal )
+    if (p = 0) orelse (pDate = 0) orelse (bHasDate = false) then exit sub
+    p->pend.wYear = pDate->wYear : p->pend.wMonth = pDate->wMonth : p->pend.wDay = pDate->wDay
+    ' the day decides the panel's limits; the pending time is kept within them
+    p->pend = DtmFinish( p, p->pend )
+    if p->wPanel then
+        DtmSeedPanelRange( p, p->wPanel )
+        tkTimePanel_SetTime( p->wPanel, tkTimePanel_TimeOf( p->pend ) )
+    end if
+end sub
+
+' Enter on a day (and a double click): accept the pending value with that day.
+sub DtmCalActivated( byval hCal as TK_WIDGET ptr, byval pDate as TKDATE ptr )
+    dim as TKDATETIMEPICKER_STATE ptr p = DtmOfPopupWidget( hCal )
+    if (p = 0) orelse (pDate = 0) then exit sub
+    DtmCalSelChange( hCal, pDate, true )
+    DtmAccept( p, p->pend )
+end sub
+
+' F4 and Alt+Up/Down close the dropdown from the calendar too.
+function DtmCalMessage( byval mi as TKCALENDAR_MESSAGEINFO ptr ) as boolean
+    dim as TKDATETIMEPICKER_STATE ptr p = DtmOfPopupWidget( mi->hCtrl )
+    if p = 0 then return false
+    if mi->msg = TKM_KEYDOWN then
+        dim as boolean bAlt = ((mi->mods and SDL_KMOD_ALT) <> 0)
+        if (mi->key = SDLK_F4) orelse (bAlt andalso ((mi->key = SDLK_DOWN) orelse (mi->key = SDLK_UP))) then
+            tkDateTimePicker_CloseUp( p->hWin )
+            return true
+        end if
+    end if
+    return false
+end function
+
+sub DtmPanelSelChange( byval hPanel as TK_WIDGET ptr, byval pTime as TKTIME ptr )
+    dim as TKDATETIMEPICKER_STATE ptr p = DtmOfPopupWidget( hPanel )
+    if (p = 0) orelse (pTime = 0) then exit sub
+    p->pend.wHour = pTime->wHour : p->pend.wMinute = pTime->wMinute
+    p->pend.wSecond = pTime->wSecond : p->pend.wMilliseconds = pTime->wMilliseconds
+end sub
+
+sub DtmPanelDismiss( byval hPanel as TK_WIDGET ptr )
+    dim as TKDATETIMEPICKER_STATE ptr p = DtmOfPopupWidget( hPanel )
+    if p then tkDateTimePicker_CloseUp( p->hWin )
+end sub
+
+' ---- the Now / OK band ------------------------------------------------------------------------------
+' Its buttons, band-local: OK always; Now on the left half when shown.
+sub DtmFooterRects( byval p as TKDATETIMEPICKER_STATE ptr, byval w as TK_WIDGET ptr, byref rcNow as TKRECT, byref rcOK as TKRECT )
+    tkRect_Set( rcNow, 0, 0, 0, 0 )
+    if p->bShowNow then
+        tkRect_Set( rcNow, 0, 0, w->cw \ 2, w->ch )
+        tkRect_Set( rcOK, w->cw \ 2, 0, w->cw, w->ch )
+    else
+        tkRect_Set( rcOK, 0, 0, w->cw, w->ch )
+    end if
+end sub
+
+function DtmFooterProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKDATETIMEPICKER_STATE ptr p = cast( TKDATETIMEPICKER_STATE ptr, w->pData )
+    if p = 0 then return false
+    dim as TKRECT rcNow, rcOK
+    DtmFooterRects( p, w, rcNow, rcOK )
+    select case m->msg
+    case TKM_PAINT
+        dim as TK_PAINT ptr b = m->pPaint
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        b->SetBackColor( p->colors.PanelBackColor )
+        b->PaintRect( @rc )
+        dim as TKRECT rcLine
+        tkRect_Set( rcLine, 0, 0, w->cw, 1 )
+        b->SetBackColor( p->colors.ColumnDividerColor )
+        b->PaintRect( @rcLine )
+        b->SetFont( DtmFont( p ) )
+        if p->bShowNow then
+            b->SetForeColor( iif( p->nFooterHot = 0, p->colors.FooterColorHot, p->colors.FooterColor ) )
+            b->PaintText( p->sNowText, @rcNow, TK_DT_CENTER )
+        end if
+        b->SetForeColor( iif( p->nFooterHot = 1, p->colors.FooterColorHot, p->colors.FooterColor ) )
+        b->PaintText( p->sOKText, @rcOK, TK_DT_CENTER )
+        return true
+    case TKM_MOUSEMOVE
+        dim as long hot = -1
+        if tkRect_Contains( rcNow, m->x, m->y ) then hot = 0
+        if tkRect_Contains( rcOK, m->x, m->y ) then hot = 1
+        if hot <> p->nFooterHot then p->nFooterHot = hot : tkWidget_Invalidate( w )
+        return true
+    case TKM_MOUSELEAVE
+        if p->nFooterHot <> -1 then p->nFooterHot = -1 : tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONDOWN
+        if tkRect_Contains( rcNow, m->x, m->y ) then
+            DtmAccept( p, DtmNow( p ) )
+        elseif tkRect_Contains( rcOK, m->x, m->y ) then
+            DtmAccept( p, p->pend )
+        end if
+        return true
+    end select
+    return false
+end function
+
+' The popup's frame: the background, the divider between calendar and panel, the hairline outline;
+' and Enter that the panel left unclaimed (it has no Accept callback here) accepts.
+function DtmPopProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKDATETIMEPICKER_STATE ptr p = cast( TKDATETIMEPICKER_STATE ptr, w->pData )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        dim as TK_PAINT ptr b = m->pPaint
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        b->SetBackColor( p->colors.PanelBackColor )
+        b->PaintRect( @rc )
+        if (p->wCal <> 0) andalso (p->wPanel <> 0) then
+            dim as TKRECT rcDiv
+            tkRect_Set( rcDiv, p->wPanel->x - 1, p->wPanel->y, p->wPanel->x, p->wPanel->y + p->wPanel->ch )
+            b->SetBackColor( p->colors.ColumnDividerColor )
+            b->PaintRect( @rcDiv )
+        end if
+        b->SetPenColor( p->colors.PanelBorderColor )
+        b->PaintRoundOutline( @rc, 0, CDTM_POP_BORDERTHICK )
+        return true
+    case TKM_KEYDOWN
+        if (m->key = SDLK_RETURN) orelse (m->key = SDLK_KP_ENTER) then
+            DtmAccept( p, p->pend )
+            return true
+        end if
+    end select
+    return false
+end function
+
+' OnClosed: every close lands here, whatever caused it.
+sub DtmPopClosed( byval hPop as TK_HOST ptr )
+    dim as TKDATETIMEPICKER_STATE ptr p = cast( TKDATETIMEPICKER_STATE ptr, hPop->pUser )
+    if (p = 0) orelse (p->pPop <> hPop) then exit sub
+    hPop->pUser = 0
+    if p->wPanel then
+        tkTimePanel_SetSelChangeCallback( p->wPanel, 0 )
+        tkTimePanel_SetDismissCallback( p->wPanel, 0 )
+        tkTimePanel_SetItemDisabledCallback( p->wPanel, 0 )
+    end if
+    if p->wCal then
+        tkCalendar_SetSelChangeCallback( p->wCal, 0 )
+        tkCalendar_SetDateActivatedCallback( p->wCal, 0 )
+        tkCalendar_SetMessageCallback( p->wCal, 0 )
+    end if
+    if p->wPop then p->wPop->pData = 0
+    if p->wFooter then p->wFooter->pData = 0
+    p->pPop = 0 : p->wPop = 0 : p->wCal = 0 : p->wPanel = 0 : p->wFooter = 0
+    p->nFooterHot = -1
+    p->nClosedBySerial = tkHost_PressSerial()          ' the reopen guard
+    dim as boolean bWasOpen = p->isOpen
+    p->isOpen = false
+    if gOpenDateTimePicker = p then gOpenDateTimePicker = 0
+    tkWidget_Invalidate( p->hWin )
+    dim as DTM_DropDownCallbackSub cb = p->DropDownCallback
+    if bWasOpen andalso (p->bSilentClose = false) andalso (cb <> 0) then cb( p->hWin, false )
+end sub
+
+' Build, seed, place and show. The opening edge fires FIRST, before anything is built.
+sub DtmOpen( byval p as TKDATETIMEPICKER_STATE ptr )
+    if p->DropDownCallback then p->DropDownCallback( p->hWin, true )
+    dim as TK_HOST ptr h = p->hWin->pHost
+    p->pend = DtmBase( p )
+    ' measure with throwaway parts on our own surface (the popup draws at our scale)
+    dim as TK_WIDGET ptr tc = tkCalendar_Create( p->hWin, 0 )
+    tkWidget_Show( tc, false )
+    DtmSeedCalendar( p, tc )
+    dim as long calW, calH
+    tkCalendar_GetIdealSize( tc, calW, calH )
+    tkWidget_Destroy( tc )
+    dim as TK_WIDGET ptr tp = tkTimePanel_Create( p->hWin, 0 )
+    tkWidget_Show( tp, false )
+    DtmSeedPanel( p, tp )
+    dim as long panW, panH
+    tkTimePanel_GetIdealSize( tp, panW, panH )
+    tkWidget_Destroy( tp )
+    dim as long bt = CDTM_POP_BORDERTHICK, fh = p->nFooterH
+    dim as long pw = calW + 1 + panW + 2 * bt, ph = calH + fh + 2 * bt
+    dim as TKRECT rcAnchor
+    tkWidget_AbsRect( p->hWin, rcAnchor )
+    rcAnchor.bottom -= 1
+    dim as long x, y
+    tkHost_PlacePopup( h, rcAnchor, pw, ph, false, x, y )
+    dim as TK_HOST ptr pop = tkHost_CreatePopup( h, x, y, pw, ph )
+    if pop = 0 then
+        if p->DropDownCallback then p->DropDownCallback( p->hWin, false )     ' keep the pairing
+        exit sub
+    end if
+    pop->clrBack = p->colors.PanelBackColor
+    pop->bPassDismissClick = true
+    pop->pUser = p
+    pop->OnClosed = @DtmPopClosed
+    p->pPop = pop
+    p->wPop = tkWidget_Create( pop, p->idc, @DtmPopProc, p )
+    tkWidget_SetPos( p->wPop, 0, 0, pw, ph )
+    p->wCal = tkCalendar_Create( p->wPop, p->idc )
+    tkWidget_SetPos( p->wCal, bt, bt, calW, calH )
+    DtmSeedCalendar( p, p->wCal )
+    tkCalendar_SetSelChangeCallback( p->wCal, @DtmCalSelChange )
+    tkCalendar_SetDateActivatedCallback( p->wCal, @DtmCalActivated )
+    tkCalendar_SetMessageCallback( p->wCal, @DtmCalMessage )
+    ' the panel as tall as the calendar: it shows as many rows as fit
+    p->wPanel = tkTimePanel_Create( p->wPop, p->idc )
+    tkWidget_SetPos( p->wPanel, bt + calW + 1, bt, panW, calH )
+    DtmSeedPanel( p, p->wPanel )
+    tkTimePanel_SetSelChangeCallback( p->wPanel, @DtmPanelSelChange )
+    tkTimePanel_SetDismissCallback( p->wPanel, @DtmPanelDismiss )
+    if p->ItemDisabledCallback then tkTimePanel_SetItemDisabledCallback( p->wPanel, @DtmPanelItemDisabled )
+    p->wFooter = tkWidget_CreateChild( p->wPop, p->idc, @DtmFooterProc, p )
+    tkWidget_SetPos( p->wFooter, bt, bt + calH, pw - 2 * bt, fh )
+    p->isOpen = true
+    gOpenDateTimePicker = p
+    tkHost_Show( pop )
+    ' the keys start in the calendar unless the field was on a time segment
+    dim as boolean bOnTime = false
+    if DtmIsEditable( p, p->nFocusSeg ) then
+        select case p->segs( p->nFocusSeg ).kind
+        case TKTP_SEG_YEAR, TKTP_SEG_MONTH, TKTP_SEG_MONTHNAME, TKTP_SEG_DAY
+        case else : bOnTime = true
+        end select
+    end if
+    tkHost_SetFocus( pop, iif( bOnTime, p->wPanel, p->wCal ) )
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' ---- public: the dropdown --------------------------------------------------------------------------
+public sub tkDateTimePicker_DropDown( byval hCtrl as TK_WIDGET ptr )
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then exit sub
+    if (p->isEnabled = false) orelse p->isOpen orelse (p->nButtonStyle <> TKDTM_BUTTON_DROPDOWN) then exit sub
+    if (gOpenDateTimePicker <> 0) andalso (gOpenDateTimePicker <> p) then tkDateTimePicker_CloseUp( gOpenDateTimePicker->hWin )
+    DtmOpen( p )
+end sub
+
+' Dismisses: the value is unchanged.
+public sub tkDateTimePicker_CloseUp( byval hCtrl as TK_WIDGET ptr )
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if (p = 0) orelse (p->pPop = 0) then exit sub
+    tkHost_Close( p->pPop )        ' OnClosed does the bookkeeping and DropDown(false)
+end sub
+
+public function tkDateTimePicker_IsDroppedDown( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then return false
+    return p->isOpen
+end function
+
+' The open dropdown's tkCalendar, else 0 (rebuilt at every open).
+public function tkDateTimePicker_GetCalendarHandle( byval hCtrl as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then return 0
+    return p->wCal
+end function
+
+' The open dropdown's tkTimePanel, else 0.
+public function tkDateTimePicker_GetPanelHandle( byval hCtrl as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then return 0
+    return p->wPanel
+end function
+
+public function tkDateTimePicker_GetPopup( byval hCtrl as TK_WIDGET ptr ) as TK_HOST ptr
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then return 0
+    return p->pPop
+end function
+
+public function tkDateTimePicker_GetFooterHandle( byval hCtrl as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then return 0
+    return p->wFooter
+end function
+
+' Band-local rects of Now (empty when hidden) and OK. A test seam.
+public sub tkDateTimePicker_GetFooterButtonRects( byval hCtrl as TK_WIDGET ptr, byref rcNow as TKRECT, byref rcOK as TKRECT )
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    tkRect_Set( rcNow, 0, 0, 0, 0 )
+    tkRect_Set( rcOK, 0, 0, 0, 0 )
+    if (p = 0) orelse (p->wFooter = 0) then exit sub
+    DtmFooterRects( p, p->wFooter, rcNow, rcOK )
+end sub
+
+' The open dropdown's pending choice (the empty value while closed). A test seam.
+public function tkDateTimePicker_GetPendingDateTime( byval hCtrl as TK_WIDGET ptr ) as TKDATETIME
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if (p = 0) orelse (p->isOpen = false) then return tkTimePanel_EmptyDateTime( )
+    return p->pend
+end function
+
+public function tkDateTimePicker_GetVisibleRows( byval hCtrl as TK_WIDGET ptr ) as long
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then return TKTP_DEFAULT_ROWS
+    return p->nVisibleRows
+end function
+
+' The time panel's rows when measured; the panel is then made as tall as the calendar.
+public sub tkDateTimePicker_SetVisibleRows( byval hCtrl as TK_WIDGET ptr, byval nRows as long )
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then exit sub
+    if nRows < 1 then nRows = 1
+    if nRows > 24 then nRows = 24
+    p->nVisibleRows = nRows
+end sub
+
+public function tkDateTimePicker_GetShowNow( byval hCtrl as TK_WIDGET ptr ) as boolean
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then return false
+    return p->bShowNow
+end function
+
+public sub tkDateTimePicker_SetShowNow( byval hCtrl as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p then p->bShowNow = bShow
+end sub
+
+' The band's labels (localization); "" keeps the default.
+public sub tkDateTimePicker_SetFooterText( byval hCtrl as TK_WIDGET ptr, byval sNow as ustring, byval sOK as ustring )
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then exit sub
+    if len( sNow ) then p->sNowText = sNow
+    if len( sOK ) then p->sOKText = sOK
+end sub
+
+' Pins "now" -- Now's value, the calendar's today, an empty field's start -- for tests and
+' screenshots; bPin = FALSE goes back to the clock.
+public sub tkDateTimePicker_SetNow( byval hCtrl as TK_WIDGET ptr, byref t as const TKDATETIME, byval bPin as boolean = true )
+    dim as TKDATETIMEPICKER_STATE ptr p = DTM( hCtrl )
+    if p = 0 then exit sub
+    p->tNowPinned = t
+    p->bNowPinned = bPin andalso tkTimePanel_IsDateTime( t )
+end sub

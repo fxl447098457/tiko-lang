@@ -20,6 +20,7 @@ Normally not. Toolchains are published ready-built as GitHub [Releases](https://
 - `linux-x86_64`: the default on x86-64 Linux.
 - `linux-arm64`: the default on arm64 (aarch64) Linux, with glibc 2.35 or newer.
 - `macos-arm64`: the default on macOS (Apple Silicon, macOS 13 or newer). Programs for it link on a Mac, because the link needs Apple's linker and SDK; elsewhere `-c` compiles an object.
+- `android-arm64` (phones and tablets) and `android-x86_64` (the emulator): *experimental*. Android 10 or newer, built from the Windows toolchain with Android's NDK; `-app` makes an installable APK. See [Android](Android).
 
 ARM64 means Linux and macOS: there is no Windows ARM64 target. `-m32` and `-target win32` are refused.
 

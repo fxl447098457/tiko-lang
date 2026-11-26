@@ -1,0 +1,616 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkItemPopup -- the dropdown of the checked-list controls: a popup holding a check-box tkListTree,
+' with an optional select-all row, a filter line and an OK / Cancel footer. Not a control of its
+' own: an owner (tkCheckedCombo; tkTokenBox's suggestions next) embeds a TKITEMPOPUP_STATE, fills its
+' items, sets its callbacks and opens it under itself. The design is C:\dev\docs\tkControls\
+' CHECKED-LISTS.md §6 (phase C3).
+'
+' THE POPUP is created per open with SDL_WINDOW_NOT_FOCUSABLE: the owner keeps the OS focus and its
+' text input (a popup that takes the focus loses typed text on X11 / Wayland -- Learnings
+' 2026-10-28). tkHost routes keys, text and IME events to the top popup's focused widget, which
+' here is the popup's own key widget (not the list): it keeps the commit / cancel / filter keys,
+' passes the navigation keys and Space / + / - to the list's rows, offers a main-window accelerator
+' to the owner, and hands everything else to the owner's OnKey. A click in the list moves the
+' popup's focus to the rows; the list's message hook puts it back.
+'
+' SIZE is fixed at open (a popup cannot be resized on every backend -- Wayland): MaxRows rows or
+' fewer; filtering only changes what the list shows, and the list scrolls.
+'
+' THE ITEMS are the owner's working copy (TKITEMPOPUP_STATE.items): the popup reads and writes their
+' bChecked. Select-all is a parent row with the visible items as its children and the ListTree
+' cascade on, so it is derived (all / none / mixed) and checks or unchecks the VISIBLE, enabled
+' items only (D-6). A disabled item cannot be toggled, and select-all leaves it as it was.
+'
+' EVENTS (to the owner): OnItemCheck BEFORE a user's toggle (idx -1 = select-all; FALSE vetoes),
+' OnChanged AFTER it, OnPick( idx ) for a row picked in a list without check boxes, OnClosed(
+' bCommit ) once whenever the popup closes -- bCommit is TRUE for Enter, Tab, Alt+Up / F4, OK, and
+' FALSE for Escape, Cancel and a click outside.
+#module "tkItemPopup"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkListTree" public
+#import "../tkButton" public
+#import "../tkMatch" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkListTree
+using tkButton
+using tkMatch
+
+public const TKITEMPOPUP_DEFAULT_MAXROWS = 12
+public const TKITEMPOPUP_DEFAULT_ROWHEIGHT = 24      ' unscaled
+public const TKITEMPOPUP_DEFAULT_FOOTERHEIGHT = 40   ' unscaled
+public const TKITEMPOPUP_DEFAULT_BUTTONWIDTH = 76    ' unscaled
+
+public type TKITEMPOPUP_ITEM
+    Text     as ustring
+    bChecked as boolean
+    bEnabled as boolean = true
+end type
+
+public type IPOP_ItemCheckFunc as function( byval pCtx as any ptr, byval idx as long, byval bNew as boolean ) as boolean
+public type IPOP_NotifySub as sub( byval pCtx as any ptr )
+public type IPOP_PickSub as sub( byval pCtx as any ptr, byval idx as long )
+public type IPOP_ClosedSub as sub( byval pCtx as any ptr, byval bCommit as boolean )
+public type IPOP_KeyFunc as function( byval pCtx as any ptr, byval m as TK_MSG ptr ) as boolean
+
+public type TKITEMPOPUP_STATE
+    ' ---- the owner sets these before Open ----
+    items(any)   as TKITEMPOPUP_ITEM
+    nItems       as long
+    bChecks      as boolean = true
+    bSelectAll   as boolean
+    bFilter      as boolean
+    bButtons     as boolean
+    nMaxChecked  as long                ' 0 = no limit
+    nMaxRows     as long = TKITEMPOPUP_DEFAULT_MAXROWS
+    nRowHeight   as long = TKITEMPOPUP_DEFAULT_ROWHEIGHT     ' unscaled
+    nMatchMode   as long = TKMATCH_CONTAINS
+    bPassDismissClick as boolean        ' the press that closes the popup still reaches its target
+    wszSelectAll as ustring = "(Select all)"
+    wszOK        as ustring = "OK"
+    wszCancel    as ustring = "Cancel"
+    wszFilterCue as ustring = "Type to filter"
+    pFont        as TTF_Font ptr        ' 0 = the owner window's
+    pCtx         as any ptr
+    OnItemCheck  as IPOP_ItemCheckFunc
+    OnChanged    as IPOP_NotifySub
+    OnPick       as IPOP_PickSub
+    OnClosed     as IPOP_ClosedSub
+    OnKey        as IPOP_KeyFunc
+    ' ---- live while open ----
+    pHost        as TK_HOST ptr
+    wPop         as TK_WIDGET ptr       ' the key widget, filling the popup
+    hList        as TK_WIDGET ptr
+    wOK          as TK_WIDGET ptr
+    wCancel      as TK_WIDGET ptr
+    owner        as TK_WIDGET ptr
+    sFilter      as ustring
+    vis(any)     as long                ' the shown items, in item order
+    nVis         as long
+    bCommit      as boolean
+    nBorder      as long
+    nFilterH     as long
+    nFooterH     as long
+end type
+
+public declare function tkItemPopup_Close( byref ip as TKITEMPOPUP_STATE, byval bCommit as boolean ) as boolean
+
+
+' ---- plumbing ---------------------------------------------------------------------------------
+private function IpOf( byval w as TK_WIDGET ptr ) as TKITEMPOPUP_STATE ptr
+    if w = 0 then return 0
+    return cast( TKITEMPOPUP_STATE ptr, w->pData )
+end function
+
+' The list's callbacks hand over the list; its parent is the key widget.
+private function IpOfList( byval hList as TK_WIDGET ptr ) as TKITEMPOPUP_STATE ptr
+    return IpOf( tkWidget_Parent( hList ) )
+end function
+
+private function IpHasSA( byval ip as TKITEMPOPUP_STATE ptr ) as boolean
+    return ip->bChecks andalso ip->bSelectAll andalso (ip->nVis > 0)
+end function
+
+' list row -> item index; -1 for the select-all row (or no item)
+private function IpItemOfRow( byval ip as TKITEMPOPUP_STATE ptr, byval row as integer ) as long
+    dim as long k = row - iif( IpHasSA( ip ), 1, 0 )
+    if (k < 0) orelse (k >= ip->nVis) then return -1
+    return ip->vis(k)
+end function
+
+private function IpRowOfVis( byval ip as TKITEMPOPUP_STATE ptr, byval k as long ) as integer
+    return k + iif( IpHasSA( ip ), 1, 0 )
+end function
+
+private function IpCountChecked( byval ip as TKITEMPOPUP_STATE ptr ) as long
+    dim as long n = 0
+    for i as long = 0 to ip->nItems - 1
+        if ip->items(i).bChecked then n += 1
+    next
+    return n
+end function
+
+' Select-all's state from the shown ENABLED items (the list's own cascade would count a disabled
+' one, and select-all could then never read "checked").
+private sub IpDeriveSA( byval ip as TKITEMPOPUP_STATE ptr )
+    if (IpHasSA( ip ) = false) orelse (ip->hList = 0) then exit sub
+    dim as long nOn = 0, nOff = 0
+    for k as long = 0 to ip->nVis - 1
+        dim as long i = ip->vis(k)
+        if ip->items(i).bEnabled then
+            if ip->items(i).bChecked then nOn += 1 else nOff += 1
+        end if
+    next
+    dim as long st = LT_CHECK_MIXED
+    if nOff = 0 then st = LT_CHECK_CHECKED
+    if nOn = 0 then st = LT_CHECK_UNCHECKED
+    tkListTree_SetCheck( ip->hList, 0, st )
+end sub
+
+private function IpFont( byval ip as TKITEMPOPUP_STATE ptr ) as TTF_Font ptr
+    if ip->pFont then return ip->pFont
+    if ip->owner then return ip->owner->pHost->pDefaultFont
+    return 0
+end function
+
+private function IpScale( byval ip as TKITEMPOPUP_STATE ptr, byval v as long ) as long
+    return tkHost_Scale( ip->owner->pHost, v )
+end function
+
+' The shown items: every one with no filter, else those tkMatch accepts, in item order.
+private sub IpFilterItems( byval ip as TKITEMPOPUP_STATE ptr )
+    erase ip->vis
+    ip->nVis = 0
+    if ip->nItems <= 0 then exit sub
+    redim ip->vis( 0 to ip->nItems - 1 )
+    dim as TKMATCH_QUERY q
+    dim as boolean bAll = (ip->bFilter = false) orelse (len( ip->sFilter ) = 0)
+    if bAll = false then tkMatch_Prepare( q, ip->nMatchMode, ip->sFilter )
+    for i as long = 0 to ip->nItems - 1
+        if bAll orelse tkMatch_Test( q, ip->items(i).Text, tkMatch_KeyOf( q, ip->items(i).Text ) ) then
+            ip->vis(ip->nVis) = i : ip->nVis += 1
+        end if
+    next
+end sub
+
+' The list's rows from the shown items; the focus row is the first enabled item.
+private sub IpRebuild( byval ip as TKITEMPOPUP_STATE ptr )
+    if ip->hList = 0 then exit sub
+    IpFilterItems( ip )
+    dim as TK_WIDGET ptr L = ip->hList
+    tkListTree_BeginUpdate( L )
+    tkListTree_Clear( L )
+    dim as boolean bSA = IpHasSA( ip )
+    tkListTree_SetCheckCascade( L, bSA )
+    if bSA then tkListTree_AddNode( L, -1, ip->wszSelectAll )
+    for k as long = 0 to ip->nVis - 1
+        dim as long i = ip->vis(k)
+        if bSA then tkListTree_AddNode( L, 0, ip->items(i).Text ) else tkListTree_AddString( L, ip->items(i).Text )
+        dim as integer r = IpRowOfVis( ip, k )
+        if ip->bChecks then tkListTree_SetCheck( L, r, iif( ip->items(i).bChecked, LT_CHECK_CHECKED, LT_CHECK_UNCHECKED ) )
+        if ip->items(i).bEnabled = false then tkListTree_SetRowSelectable( L, r, false )
+    next
+    IpDeriveSA( ip )
+    tkListTree_EndUpdate( L )
+    for k as long = 0 to ip->nVis - 1
+        if ip->items(ip->vis(k)).bEnabled then tkListTree_SetCurSel( L, IpRowOfVis( ip, k ) ) : exit for
+    next
+    if ip->wPop then tkWidget_Invalidate( ip->wPop )
+end sub
+
+' After the list changed checks: its rows -> the items. A disabled item keeps its state (select-all
+' set it in the list): it is put back. Select-all is re-derived over the enabled items.
+private sub IpSyncFromList( byval ip as TKITEMPOPUP_STATE ptr )
+    dim as TK_WIDGET ptr L = ip->hList
+    for k as long = 0 to ip->nVis - 1
+        dim as long i = ip->vis(k)
+        dim as integer r = IpRowOfVis( ip, k )
+        dim as boolean bOn = (tkListTree_GetCheck( L, r ) = LT_CHECK_CHECKED)
+        if ip->items(i).bEnabled then
+            ip->items(i).bChecked = bOn
+        elseif bOn <> ip->items(i).bChecked then
+            tkListTree_SetCheck( L, r, iif( ip->items(i).bChecked, LT_CHECK_CHECKED, LT_CHECK_UNCHECKED ) )
+        end if
+    next
+    IpDeriveSA( ip )
+end sub
+
+' Every visible enabled item checked (or not), as the user's one gesture (Ctrl+A).
+private sub IpUserSetAll( byval ip as TKITEMPOPUP_STATE ptr )
+    if (ip->bChecks = false) orelse (ip->nVis = 0) then exit sub
+    dim as boolean bAllOn = true
+    dim as long nAdd = 0
+    for k as long = 0 to ip->nVis - 1
+        dim as long i = ip->vis(k)
+        if ip->items(i).bEnabled andalso (ip->items(i).bChecked = false) then bAllOn = false : nAdd += 1
+    next
+    dim as boolean bNew = (bAllOn = false)
+    if bNew andalso (ip->nMaxChecked > 0) andalso (IpCountChecked( ip ) + nAdd > ip->nMaxChecked) then exit sub
+    if ip->OnItemCheck then
+        if ip->OnItemCheck( ip->pCtx, -1, bNew ) = false then exit sub
+    end if
+    for k as long = 0 to ip->nVis - 1
+        dim as long i = ip->vis(k)
+        if ip->items(i).bEnabled then
+            ip->items(i).bChecked = bNew
+            tkListTree_SetCheck( ip->hList, IpRowOfVis( ip, k ), iif( bNew, LT_CHECK_CHECKED, LT_CHECK_UNCHECKED ) )
+        end if
+    next
+    IpDeriveSA( ip )
+    tkWidget_Invalidate( ip->wPop )
+    if ip->OnChanged then ip->OnChanged( ip->pCtx )
+end sub
+
+
+' ---- the list's callbacks ---------------------------------------------------------------------
+private function IpItemCheck( byval hList as TK_WIDGET ptr, byval row as integer, byval oldState as long, byref newState as long ) as boolean
+    dim as TKITEMPOPUP_STATE ptr ip = IpOfList( hList )
+    if ip = 0 then return false
+    dim as long idx = IpItemOfRow( ip, row )
+    dim as boolean bNew = (newState = LT_CHECK_CHECKED)
+    if bNew andalso (ip->nMaxChecked > 0) then
+        dim as long nAfter = IpCountChecked( ip )
+        if idx >= 0 then
+            nAfter += 1
+        else
+            for k as long = 0 to ip->nVis - 1
+                if ip->items(ip->vis(k)).bEnabled andalso (ip->items(ip->vis(k)).bChecked = false) then nAfter += 1
+            next
+        end if
+        if nAfter > ip->nMaxChecked then return false
+    end if
+    if ip->OnItemCheck then
+        if ip->OnItemCheck( ip->pCtx, idx, bNew ) = false then return false
+    end if
+    newState = iif( bNew, LT_CHECK_CHECKED, LT_CHECK_UNCHECKED )
+    return true
+end function
+
+private sub IpItemChecked( byval hList as TK_WIDGET ptr, byval row as integer, byval newState as long )
+    dim as TKITEMPOPUP_STATE ptr ip = IpOfList( hList )
+    if ip = 0 then exit sub
+    IpSyncFromList( ip )
+    tkWidget_Invalidate( ip->wPop )
+    if ip->OnChanged then ip->OnChanged( ip->pCtx )
+end sub
+
+' The rows: the stock painter, always showing the current row (the popup's key widget, not the
+' rows, holds the focus), and at MaxChecked an unchecked row is drawn disabled.
+private sub IpPaintRow( byval pi as TKLISTTREE_PAINTINFO ptr )
+    dim as TKITEMPOPUP_STATE ptr ip = IpOfList( pi->hList )
+    pi->hasFocus = true
+    if (ip <> 0) andalso (ip->nMaxChecked > 0) andalso (pi->checkState <> LT_CHECK_CHECKED) then
+        if IpCountChecked( ip ) >= ip->nMaxChecked then pi->isSelectable = false
+    end if
+    tkListTree_PaintRowDefault( pi )
+end sub
+
+' A click in the list: the rows take the popup's focus -- give it back to the key widget. Without
+' check boxes, a press on an item picks it.
+private function IpListMsg( byval m as TKLISTTREE_MESSAGEINFO ptr ) as boolean
+    dim as TKITEMPOPUP_STATE ptr ip = IpOfList( m->hList )
+    if ip = 0 then return false
+    if m->msg = TKM_LBUTTONDOWN then
+        if (ip->pHost <> 0) andalso (ip->wPop <> 0) then tkHost_SetFocus( ip->pHost, ip->wPop )
+        if (ip->bChecks = false) andalso (ip->OnPick <> 0) then
+            dim as long idx = IpItemOfRow( ip, m->idx )
+            if idx >= 0 then ip->OnPick( ip->pCtx, idx )
+        end if
+    end if
+    return false
+end function
+
+private sub IpButtonClick( byval hButton as TK_WIDGET ptr, byval id as long )
+    dim as TKITEMPOPUP_STATE ptr ip = IpOf( tkWidget_Parent( hButton ) )
+    if ip then tkItemPopup_Close( *ip, hButton = ip->wOK )
+end sub
+
+
+' ---- the key widget -----------------------------------------------------------------------------
+private sub IpPaint( byval ip as TKITEMPOPUP_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TK_WIDGET ptr w = ip->wPop
+    dim as TKTHEME_COLORS t = tkTheme_RolesFor( ip->owner )
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, w->cw, w->ch )
+    b->SetBackColor( t.Window )
+    b->PaintRect( @rc )
+    if ip->nFilterH > 0 then
+        dim as TKRECT rf
+        tkRect_Set( rf, ip->nBorder + IpScale( ip, 8 ), ip->nBorder, w->cw - ip->nBorder - IpScale( ip, 8 ), ip->nBorder + ip->nFilterH )
+        b->SetFont( IpFont( ip ) )
+        if len( ip->sFilter ) then
+            b->SetColors( t.Text, t.Window )
+            b->PaintText( ip->sFilter, @rf, TK_DT_LEFT or TK_DT_ELLIPSIS )
+            ' a caret after the text
+            dim as long cx = rf.left + tkText_Width( IpFont( ip ), ip->sFilter ) + 1
+            if cx < rf.right then
+                dim as TKRECT rcar
+                tkRect_Set( rcar, cx, rf.top + IpScale( ip, 4 ), cx + IpScale( ip, 1 ), rf.bottom - IpScale( ip, 4 ) )
+                b->SetBackColor( t.Text )
+                b->PaintRect( @rcar )
+            end if
+        else
+            b->SetColors( t.TextDim, t.Window )
+            b->PaintText( ip->wszFilterCue, @rf, TK_DT_LEFT or TK_DT_ELLIPSIS )
+        end if
+        dim as TKRECT rl
+        tkRect_Set( rl, ip->nBorder, ip->nBorder + ip->nFilterH - 1, w->cw - ip->nBorder, ip->nBorder + ip->nFilterH )
+        b->SetBackColor( t.Divider )
+        b->PaintRect( @rl )
+    end if
+    ' the outline last, as edges -- never PaintBorderRect, which fills (Learnings)
+    b->SetPenColor( t.Border )
+    b->PaintRoundOutline( @rc, 0, ip->nBorder )
+end sub
+
+private sub IpSetFilter( byval ip as TKITEMPOPUP_STATE ptr, byref s as const ustring )
+    if s = ip->sFilter then exit sub
+    ip->sFilter = s
+    IpRebuild( ip )
+end sub
+
+' The last code point off a UTF-16 ustring (a surrogate pair is one).
+private function IpDropLast( byref s as const ustring ) as ustring
+    dim as long n = len( s )
+    if n = 0 then return s
+    dim as long c = s[n - 1]
+    if (n >= 2) andalso (c >= &hDC00) andalso (c <= &hDFFF) then return left( s, n - 2 )
+    return left( s, n - 1 )
+end function
+
+private function IpKey( byval ip as TKITEMPOPUP_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    dim as long mods = m->mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI or SDL_KMOD_SHIFT)
+    dim as boolean plain = (mods = 0)
+    dim as boolean bAlt = ((mods and SDL_KMOD_ALT) <> 0) andalso ((mods and (SDL_KMOD_CTRL or SDL_KMOD_GUI)) = 0)
+    dim as boolean bShiftOnly = ((mods and SDL_KMOD_SHIFT) <> 0) andalso ((mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI)) = 0)
+    dim as boolean bPrimary = ((m->mods and TK_KMOD_PRIMARY) <> 0)
+    select case m->key
+    case SDLK_ESCAPE
+        if ip->bFilter andalso (len( ip->sFilter ) > 0) then IpSetFilter( ip, "" ) else tkItemPopup_Close( *ip, false )
+        return true
+    case SDLK_RETURN, SDLK_KP_ENTER
+        if ip->bChecks = false then
+            dim as long idx = IpItemOfRow( ip, tkListTree_GetCurSel( ip->hList ) )
+            if (idx >= 0) andalso (ip->OnPick <> 0) then ip->OnPick( ip->pCtx, idx ) : return true
+        end if
+        tkItemPopup_Close( *ip, true )
+        return true
+    case SDLK_TAB
+        if plain orelse bShiftOnly then
+            dim as TK_HOST ptr oh = ip->owner->pHost
+            ' without check boxes Tab picks the current row first (D-13)
+            if (ip->bChecks = false) andalso (ip->OnPick <> 0) then
+                dim as long idxTab = IpItemOfRow( ip, tkListTree_GetCurSel( ip->hList ) )
+                if idxTab >= 0 then ip->OnPick( ip->pCtx, idxTab )
+            end if
+            tkItemPopup_Close( *ip, true )
+            tkHost_FocusNext( oh, bShiftOnly )
+            return true
+        end if
+    case SDLK_F4
+        tkItemPopup_Close( *ip, true )
+        return true
+    case SDLK_UP
+        if bAlt then tkItemPopup_Close( *ip, true ) : return true
+    case SDLK_A
+        if ip->bChecks andalso bPrimary andalso ((m->mods and (SDL_KMOD_ALT or SDL_KMOD_SHIFT)) = 0) then IpUserSetAll( ip ) : return true
+    case SDLK_BACKSPACE
+        if ip->bFilter andalso plain then
+            if len( ip->sFilter ) then IpSetFilter( ip, IpDropLast( ip->sFilter ) )
+            return true
+        end if
+    end select
+    ' the rows' keys
+    ' (with a filter, + and - are the filter's text, not keys; Space is always the toggle, and its
+    ' character is dropped -- TKM_CHAR below)
+    ' (without check boxes -- a suggestion list -- only the up / down keys are the rows'; Home, End,
+    ' Space and the rest belong to the owner's edit)
+    dim as boolean bRowKey = false
+    select case m->key
+    case SDLK_UP, SDLK_DOWN, SDLK_PAGEUP, SDLK_PAGEDOWN
+        bRowKey = true
+    case SDLK_HOME, SDLK_END, SDLK_SPACE
+        bRowKey = ip->bChecks
+    case SDLK_KP_PLUS, SDLK_PLUS, SDLK_EQUALS, SDLK_KP_MINUS, SDLK_MINUS
+        bRowKey = ip->bChecks andalso (ip->bFilter = false)
+    end select
+    if bRowKey andalso ((m->mods and (SDL_KMOD_ALT or SDL_KMOD_GUI)) = 0) then
+        if ip->hList then tkWidget_Send( tkListTree_GetSurface( ip->hList ), m )
+        return true
+    end if
+    ' a command's key (Ctrl+S ...) is the main window's (as tkAutoComplete's list does)
+    if (mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI)) <> 0 then
+        dim as TK_HOST ptr o = ip->owner->pHost
+        if (o <> 0) andalso (o->OnPreKey <> 0) then
+            if o->OnPreKey( o, m ) then tkItemPopup_Close( *ip, true ) : return true
+        end if
+    end if
+    if ip->OnKey then return ip->OnKey( ip->pCtx, m )
+    return true                  ' the popup has the keys while it is up: nothing leaks to the owner
+end function
+
+private function IpProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKITEMPOPUP_STATE ptr ip = IpOf( w )
+    if ip = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        IpPaint( ip, m->pPaint )
+        return true
+    case TKM_KEYDOWN
+        return IpKey( ip, m )
+    case TKM_CHAR
+        if ip->bFilter then
+            ' Space's character is dropped (the key toggled the row); + and - are text here. The
+            ' text is UTF-8; a ustring assignment converts it (as tkTextBox_GetText does).
+            if m->text = " " then return true
+            dim as ustring u = m->text
+            IpSetFilter( ip, ip->sFilter & u )
+            return true
+        end if
+        if ip->OnKey then return ip->OnKey( ip->pCtx, m )
+        return true
+    case TKM_IMECOMPOSE
+        if ip->OnKey then return ip->OnKey( ip->pCtx, m )
+        return true
+    end select
+    return false
+end function
+
+' Fired once whenever the popup closes, for any reason.
+private sub IpHostClosed( byval hPop as TK_HOST ptr )
+    dim as TKITEMPOPUP_STATE ptr ip = cast( TKITEMPOPUP_STATE ptr, hPop->pUser )
+    if (ip = 0) orelse (ip->pHost <> hPop) then exit sub
+    if ip->wPop then ip->wPop->pData = 0
+    ip->pHost = 0 : ip->wPop = 0 : ip->hList = 0 : ip->wOK = 0 : ip->wCancel = 0
+    dim as boolean bCommit = ip->bCommit
+    ip->bCommit = false
+    if ip->OnClosed then ip->OnClosed( ip->pCtx, bCommit )      ' last: it may destroy the owner
+end sub
+
+
+' ---- public -----------------------------------------------------------------------------------
+public function tkItemPopup_IsOpen( byref ip as TKITEMPOPUP_STATE ) as boolean
+    return ip.pHost <> 0
+end function
+
+' The list inside (0 while closed), for queries and tests.
+public function tkItemPopup_GetList( byref ip as TKITEMPOPUP_STATE ) as TK_WIDGET ptr
+    return ip.hList
+end function
+
+public function tkItemPopup_GetHost( byref ip as TKITEMPOPUP_STATE ) as TK_HOST ptr
+    return ip.pHost
+end function
+
+' The footer's OK (bOK) or Cancel button; 0 without a footer or while closed.
+public function tkItemPopup_GetButton( byref ip as TKITEMPOPUP_STATE, byval bOK as boolean ) as TK_WIDGET ptr
+    return iif( bOK, ip.wOK, ip.wCancel )
+end function
+
+public function tkItemPopup_GetFilter( byref ip as TKITEMPOPUP_STATE ) as ustring
+    return ip.sFilter
+end function
+
+' The list row showing item idx, or -1 (filtered out, or closed).
+public function tkItemPopup_RowOfItem( byref ip as TKITEMPOPUP_STATE, byval idx as long ) as integer
+    for k as long = 0 to ip.nVis - 1
+        if ip.vis(k) = idx then return IpRowOfVis( @ip, k )
+    next
+    return -1
+end function
+
+' Sets the filter (silent) and re-filters the rows; for the owner's type-to-open and for tests.
+public sub tkItemPopup_SetFilter( byref ip as TKITEMPOPUP_STATE, byval s as ustring )
+    if ip.pHost = 0 then ip.sFilter = s : exit sub
+    IpSetFilter( @ip, s )
+end sub
+
+' The items' check states changed outside the popup (the owner's setter): show them.
+public sub tkItemPopup_Refresh( byref ip as TKITEMPOPUP_STATE )
+    if ip.pHost then IpRebuild( @ip )
+end sub
+
+' Opens under owner (above it when the display ends first). FALSE with no items or no popup.
+public function tkItemPopup_Open( byref ip as TKITEMPOPUP_STATE, byval owner as TK_WIDGET ptr ) as boolean
+    if (owner = 0) orelse (ip.pHost <> 0) then return false
+    if ip.nItems <= 0 then return false
+    ip.owner = owner
+    dim as TK_HOST ptr h = owner->pHost
+    ip.nBorder = tkHost_Scale( h, 1 )
+    dim as long rowH = tkHost_Scale( h, ip.nRowHeight )
+    ip.nFilterH = iif( ip.bFilter, rowH, 0 )
+    ip.nFooterH = iif( ip.bButtons andalso ip.bChecks, tkHost_Scale( h, TKITEMPOPUP_DEFAULT_FOOTERHEIGHT ), 0 )
+    IpFilterItems( @ip )
+    dim as long nRows = ip.nVis + iif( IpHasSA( @ip ), 1, 0 )
+    if nRows > ip.nMaxRows then nRows = ip.nMaxRows
+    if nRows < 1 then nRows = 1
+    ' width: the owner's, or the widest row (band + padding + a scroll bar's room)
+    dim as TTF_Font ptr f = IpFont( @ip )
+    dim as long wText = tkText_Width( f, ip.wszSelectAll )
+    for i as long = 0 to ip.nItems - 1
+        dim as long tw = tkText_Width( f, ip.items(i).Text )
+        if tw > wText then wText = tw
+    next
+    dim as long lw = wText + tkHost_Scale( h, 20 + 6 + 6 + 12 + 8 ) + 2 * ip.nBorder
+    if lw < owner->cw then lw = owner->cw
+    if ip.nFooterH > 0 then
+        dim as long minW = 2 * tkHost_Scale( h, TKITEMPOPUP_DEFAULT_BUTTONWIDTH ) + tkHost_Scale( h, 24 )
+        if lw < minW then lw = minW
+    end if
+    dim as long lh = 2 * ip.nBorder + ip.nFilterH + nRows * rowH + ip.nFooterH
+    dim as TKRECT anchor
+    tkWidget_AbsRect( owner, anchor )
+    dim as long x, y
+    tkHost_PlacePopup( h, anchor, lw, lh, false, x, y )
+    dim as TK_HOST ptr pop = tkHost_CreatePopup( h, x, y, lw, lh, TK_SURF_POPUP, SDL_WINDOW_NOT_FOCUSABLE )
+    if pop = 0 then return false
+    ip.pHost = pop
+    ip.bCommit = false
+    if f then pop->pDefaultFont = f
+    pop->clrBack = tkTheme_RolesFor( owner ).Window
+    pop->pUser = @ip
+    pop->OnClosed = @IpHostClosed
+    pop->bPassDismissClick = ip.bPassDismissClick
+    ip.wPop = tkWidget_Create( pop, owner->ctrlId, @IpProc, @ip )
+    ip.wPop->isFocusable = true
+    tkWidget_SetPos( ip.wPop, 0, 0, lw, lh )
+    ' the list, between the filter line and the footer
+    ip.hList = tkListTree_Create( ip.wPop, owner->ctrlId )
+    dim as TK_WIDGET ptr L = ip.hList
+    if f then tkListTree_SetFont( L, f )
+    tkListTree_SetRowHeight( L, ip.nRowHeight )
+    tkListTree_SetTreeIndent( L, false )
+    tkListTree_ShowTwisty( L, false )
+    tkListTree_SetCheckBoxes( L, ip.bChecks )
+    tkListTree_SetCheckOnClick( L, ip.bChecks )
+    tkListTree_SetPaintCallback( L, @IpPaintRow )
+    tkListTree_SetItemCheckCallback( L, @IpItemCheck )
+    tkListTree_SetItemCheckedCallback( L, @IpItemChecked )
+    tkListTree_SetMessageCallback( L, @IpListMsg )
+    tkWidget_SetPos( L, ip.nBorder, ip.nBorder + ip.nFilterH, lw - 2 * ip.nBorder, nRows * rowH )
+    if ip.nFooterH > 0 then
+        dim as long bw = tkHost_Scale( h, TKITEMPOPUP_DEFAULT_BUTTONWIDTH ), bh = tkHost_Scale( h, 26 )
+        dim as long gap = tkHost_Scale( h, 8 )
+        dim as long by = lh - ip.nBorder - ip.nFooterH + (ip.nFooterH - bh) \ 2
+        ip.wCancel = tkButton_Create( ip.wPop, owner->ctrlId + 2 )
+        ip.wOK = tkButton_Create( ip.wPop, owner->ctrlId + 1 )
+        tkButton_SetText( ip.wOK, ip.wszOK ) : tkButton_SetText( ip.wCancel, ip.wszCancel )
+        if f then tkButton_SetFont( ip.wOK, f ) : tkButton_SetFont( ip.wCancel, f )
+        tkWidget_SetPos( ip.wCancel, lw - ip.nBorder - gap - bw, by, bw, bh )
+        tkWidget_SetPos( ip.wOK, lw - ip.nBorder - 2 * gap - 2 * bw, by, bw, bh )
+        tkWidget_Show( ip.wOK, true ) : tkWidget_Show( ip.wCancel, true )
+        ip.wOK->isFocusable = false : ip.wCancel->isFocusable = false     ' the key widget keeps the keys
+        tkButton_SetClickCallback( ip.wOK, @IpButtonClick )
+        tkButton_SetClickCallback( ip.wCancel, @IpButtonClick )
+    end if
+    IpRebuild( @ip )
+    tkHost_Show( pop )
+    tkHost_SetFocus( pop, ip.wPop )        ' the POPUP's focus: the window never takes the OS's
+    return true
+end function
+
+' Closes it; OnClosed( bCommit ) fires (synchronously). FALSE when it was not open.
+public function tkItemPopup_Close( byref ip as TKITEMPOPUP_STATE, byval bCommit as boolean ) as boolean
+    if ip.pHost = 0 then return false
+    ip.bCommit = bCommit
+    tkHost_Close( ip.pHost )
+    return true
+end function
+
+' The owner is going away: close without telling it.
+public sub tkItemPopup_Detach( byref ip as TKITEMPOPUP_STATE )
+    if ip.pHost = 0 then exit sub
+    dim as TK_HOST ptr pop = ip.pHost
+    pop->pUser = 0
+    if ip.wPop then ip.wPop->pData = 0
+    ip.pHost = 0 : ip.wPop = 0 : ip.hList = 0 : ip.wOK = 0 : ip.wCancel = 0
+    tkHost_Close( pop )
+end sub

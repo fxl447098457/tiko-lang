@@ -1,0 +1,431 @@
+' tkGridData self-test (tkDataGrid G6). One check per behaviour.
+'   Cache: a virtual grid of 100,000 rows behind tkDataGrid_SetBlockCache -- a paint asks for the
+'   blocks it shows once and paints placeholders; SupplyRows loads them; a read past the cache goes
+'   to the feed (D-5); the least recently painted block goes first; with no DataRequest the grid
+'   fills a block itself, once; a write reaches the feed and the block; Reset drops them; a worker
+'   thread answers through tkApp_RunOnUI.
+'   SQLite: tkDataGridSqlite over an in-memory table of 10,000 people.
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkDataGrid"
+#import "vendor/tkControls/tkDataGridSqlite"
+#import "vendor/sqlite3"
+using tkApp
+using tkDataGrid
+using tkDataGridSqlite
+using tkHost
+using tkPaint
+using tkTest
+
+const ROWS = 100000
+
+' ---- the cache's host ---------------------------------------------------------------------------
+enum ReqMode
+    ReqHold = 0          ' remember the request, answer later (the test does)
+    ReqNow               ' answer inside DataRequest
+    ReqThread            ' a worker thread answers through tkApp_RunOnUI
+end enum
+
+dim shared as TK_WIDGET ptr gGrid
+dim shared as long gMode, gReqN, gReqFirst, gReqCount, gNeedN, gPushN
+
+sub Supply( byval first as integer, byval count as integer, byref prefix as const ustring )
+    dim as TKDG_VALUE vals( any )
+    redim vals( 0 to count * 2 - 1 )
+    for i as integer = 0 to count - 1
+        vals(i * 2).SetText( prefix & (first + i) )
+        vals(i * 2 + 1).SetFloat( first + i )
+    next
+    tkDataGrid_SupplyRows( gGrid, first, count, vals() )
+end sub
+
+type WorkItem
+    first as integer
+    count as integer
+end type
+
+sub Deliver( byval payload as any ptr )
+    dim as WorkItem ptr w = payload
+    Supply( w->first, w->count, "w" )
+    delete w
+end sub
+
+sub Worker( byval payload as any ptr )
+    sleep 30                                ' the slow fetch
+    tkApp_RunOnUI( @Deliver, payload )
+end sub
+
+dim shared as any ptr gThread
+
+sub OnRequest( byval hg as TK_WIDGET ptr, byval first as integer, byval count as integer )
+    gReqN += 1 : gReqFirst = first : gReqCount = count
+    select case gMode
+    case ReqNow : Supply( first, count, "r" )
+    case ReqThread
+        dim as WorkItem ptr w = new WorkItem
+        w->first = first : w->count = count
+        gThread = threadcreate( @Worker, w )
+    end select
+end sub
+
+sub OnNeed( byval hg as TK_WIDGET ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE )
+    gNeedN += 1
+    if col = 0 then v.SetText( "feed" & row ) else v.SetFloat( -row )
+end sub
+
+function OnPush( byval hg as TK_WIDGET ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE ) as boolean
+    gPushN += 1
+    return true
+end function
+
+function CellPx( byval h as TK_HOST ptr, byval g as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ulong
+    dim as TKRECT rc, a
+    tkHost_RenderTo( h, false )             ' this frame, not the one presented last
+    tkDataGrid_GetCellRect( g, row, col, rc )
+    tkWidget_AbsRect( tkDataGrid_GetSurface( g ), a )
+    return tkTest_PixelAt( h, a.left + (rc.left + rc.right) \ 2, a.top + (rc.top + rc.bottom) \ 2 ) and &hFFFFFFul
+end function
+
+sub Cache( byval owner as TK_FORM ptr )
+    tkTest_Begin( "the block cache" )
+    dim as TK_HOST ptr h = tkForm_Host( owner )
+    dim as TK_WIDGET ptr g = tkDataGrid_Create( tkForm_Widget( owner ), 10 )
+    gGrid = g
+    tkWidget_SetPos( g, 10, 10, 360, 300 )
+    tkDataGrid_AddColumnEx( g, "Name", TKDG_COL_TEXT, 140 )
+    tkDataGrid_AddColumnEx( g, "N", TKDG_COL_NUMBER, 80 )
+    tkDataGrid_SetVirtual( g, true )
+    tkDataGrid_SetRowCount( g, ROWS )
+    tkDataGrid_SetDataRequestCallback( g, @OnRequest )
+    tkDataGrid_SetBlockCache( g, 50, 4 )
+    gMode = ReqHold
+    tkTest_PumpFor( h, 60 )
+    dim as TKDATAGRID_COLORS c_
+    tkDataGrid_GetColors( g, @c_ )
+    dim as long nAfterOne = gReqN
+    tkTest_PumpFor( h, 60 )
+    tkTest_Check( "a paint asks once for the block it shows and paints placeholders", (nAfterOne = 1) andalso (gReqN = 1) _
+        andalso (gReqFirst = 0) andalso (gReqCount = 50) andalso (tkDataGrid_IsRowLoaded( g, 0 ) = false) _
+        andalso (CellPx( h, g, 0, 0 ) = (c_.GridLineColor and &hFFFFFFul)), gReqN & " " & gReqFirst & " " & gReqCount & " " & tkDataGrid_IsRowLoaded( g, 0 ) & " " & hex( CellPx( h, g, 0, 0 ) ) & " grid " & hex( c_.GridLineColor and &hFFFFFFul ) )
+
+    Supply( 0, 50, "r" )
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "SupplyRows loads the block: the value is shown and read", tkDataGrid_IsRowLoaded( g, 49 ) _
+        andalso (tkDataGrid_GetCellText( g, 7, 0 ) = "r7") andalso (CellPx( h, g, 0, 0 ) <> (c_.GridLineColor and &hFFFFFFul)), tkDataGrid_IsRowLoaded( g, 49 ) & " [" & tkDataGrid_GetCellText( g, 7, 0 ) & "] " & hex( CellPx( h, g, 0, 0 ) ) )
+
+    tkDataGrid_SetCellValueNeededCallback( g, @OnNeed )
+    tkDataGrid_SetCurrentCell( g, 5000, 0 )
+    tkTest_Check( "a read outside the loaded blocks goes to the feed, copy too (D-5)", (tkDataGrid_GetCellText( g, 5000, 0 ) = "feed5000") _
+        andalso (tkDataGrid_IsRowLoaded( g, 5000 ) = false) andalso (instr( tkDataGrid_GetSelectionText( g ), "feed5000" ) = 1) andalso (len( tkDataGrid_GetSelectionText( g ) ) <= 10), tkDataGrid_GetCellText( g, 5000, 0 ) & " [" & tkDataGrid_GetSelectionText( g ) & "]" )
+
+    ' LRU: four slots; painting five blocks drops the one painted longest ago
+    gMode = ReqNow
+    for b as integer = 1 to 4
+        tkDataGrid_SetTopRow( g, b * 50 )
+        tkTest_PumpFor( h, 20 )
+    next
+    tkTest_Check( "past its blocks, the least recently painted goes", (tkDataGrid_IsRowLoaded( g, 0 ) = false) andalso tkDataGrid_IsRowLoaded( g, 200 ) _
+        andalso (tkDataGrid_GetCellText( g, 210, 0 ) = "r210") )
+
+    gPushN = 0
+    tkDataGrid_SetCellValuePushedCallback( g, @OnPush )
+    tkTest_Check( "a write reaches the feed and the loaded block", tkDataGrid_SetCellText( g, 210, 0, "edited" ) andalso (gPushN = 1) _
+        andalso (tkDataGrid_GetCellText( g, 210, 0 ) = "edited") )
+
+    tkDataGrid_Reset( g )
+    tkTest_Check( "Reset drops every block", tkDataGrid_IsRowLoaded( g, 210 ) = false )
+
+    ' no DataRequest: the grid reads a block from the feed itself, once
+    tkDataGrid_SetDataRequestCallback( g, 0 )
+    tkDataGrid_SetTopRow( g, 1000 )
+    gNeedN = 0
+    tkTest_PumpFor( h, 30 )
+    dim as long nOnce = gNeedN
+    tkWidget_Invalidate( tkDataGrid_GetSurface( g ) )
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "with no DataRequest the grid fills a block from the feed, once", (nOnce > 0) andalso (nOnce mod 100 = 0) andalso (gNeedN = nOnce) _
+        andalso (tkDataGrid_GetCellText( g, 1001, 0 ) = "feed1001"), str( nOnce ) & " " & str( gNeedN ) )
+
+    ' a worker thread fetches, the UI thread supplies
+    tkDataGrid_SetDataRequestCallback( g, @OnRequest )
+    tkDataGrid_SetCellValueNeededCallback( g, 0 )
+    gMode = ReqThread
+    tkDataGrid_SetTopRow( g, 50000 )
+    tkTest_PumpFor( h, 20 )
+    dim as boolean waiting = tkDataGrid_IsRowLoaded( g, 50000 ) = false
+    for t as integer = 1 to 50
+        if tkDataGrid_IsRowLoaded( g, 50000 ) then exit for
+        tkTest_PumpFor( h, 20 )
+    next
+    if gThread then threadwait( gThread ) : gThread = 0
+    tkTest_Check( "a worker thread answers through tkApp_RunOnUI", waiting andalso tkDataGrid_IsRowLoaded( g, 50000 ) _
+        andalso (tkDataGrid_GetCellText( g, 50001, 0 ) = "w50001") )
+    tkWidget_Destroy( g )
+end sub
+
+' ---- SQLite -------------------------------------------------------------------------------------
+function Scalar( byval db as sqlite3 ptr, byref sql as const string ) as string
+    dim as sqlite3_stmt ptr st
+    dim as string r
+    if sqlite3_prepare_v2( db, sql, -1, @st, nullptr ) = SQLITE_OK then
+        if sqlite3_step( st ) = SQLITE_ROW then
+            dim as const zstring ptr z = cast( const zstring ptr, sqlite3_column_text( st, 0 ) )
+            if z then r = *z
+        end if
+        sqlite3_finalize( st )
+    end if
+    return r
+end function
+
+sub Sql( byval owner as TK_FORM ptr )
+    tkTest_Begin( "tkDataGridSqlite" )
+    dim as TK_HOST ptr h = tkForm_Host( owner )
+    dim as sqlite3 ptr db
+    sqlite3_open( ":memory:", @db )
+    sqlite3_exec( db, "create table person( id integer primary key, name text, age int, born date, vip bool )", nullptr, nullptr, nullptr )
+    sqlite3_exec( db, "begin", nullptr, nullptr, nullptr )
+    for i as integer = 1 to 10000
+        dim as string nm = "p" & right( "0000" & i, 5 )
+        if i = 1 then nm = "aardvark"
+        sqlite3_exec( db, "insert into person( name, age, born, vip ) values( '" & nm & "', " & (i mod 90) & ", '2000-01-" _
+            & right( "0" & (1 + i mod 28), 2 ) & "', " & (i and 1) & " )", nullptr, nullptr, nullptr )
+    next
+    sqlite3_exec( db, "commit", nullptr, nullptr, nullptr )
+
+    dim as TK_WIDGET ptr g = tkDataGrid_Create( tkForm_Widget( owner ), 11 )
+    tkWidget_SetPos( g, 10, 10, 520, 300 )
+    dim as TKDGSQL ptr q = tkDataGridSqlite_Open( g, db, "select id, name, age, born, vip from person" )
+    dim as TKDATAGRID_COLUMN ci(4)
+    for k as integer = 0 to 4
+        tkDataGrid_GetColumnInfo( g, k, ci(k) )
+    next
+    tkTest_Check( "Open: the query's columns in their kinds, the rows counted", (q <> 0) andalso (tkDataGrid_GetColumnCount( g ) = 5) _
+        andalso (tkDataGrid_GetRowCount( g ) = 10000) andalso (ci(0).valueKind = TKDG_INT) andalso (ci(1).kind = TKDG_COL_TEXT) _
+        andalso (ci(3).kind = TKDG_COL_DATE) andalso (ci(4).kind = TKDG_COL_CHECK) )
+
+    tkTest_PumpFor( h, 40 )
+    tkTest_Check( "a paint costs a query per block, not per cell", (tkDataGridSqlite_GetFetchCount( q ) = 1) _
+        andalso (tkDataGrid_GetCellText( g, 5, 1 ) = "p00006") andalso (tkDataGrid_GetCellText( g, 5, 3 ) = "2000-01-07"), _
+        str( tkDataGridSqlite_GetFetchCount( q ) ) )
+
+    dim as TKDG_SORTKEY keys(0)
+    keys(0).col = 1 : keys(0).bDescending = true
+    tkDataGrid_SetSortKeys( g, keys() )
+    tkTest_Check( "the sort keys become the query's ORDER BY", (tkDataGridSqlite_GetOrderBy( q ) = """name"" collate nocase desc") _
+        andalso (tkDataGrid_GetCellText( g, 0, 1 ) = "p10000") andalso (tkDataGrid_GetCellText( g, 9999, 1 ) = "aardvark") _
+        andalso (tkDataGrid_ViewToModel( g, 0 ) = 0), tkDataGridSqlite_GetOrderBy( q ) )
+    tkDataGrid_ClearSort( g )
+    tkTest_Check( "the keys cleared: the query's own order", (len( tkDataGridSqlite_GetOrderBy( q ) ) = 0) andalso (tkDataGrid_GetCellInt( g, 0, 0 ) = 1) )
+
+    tkTest_Check( "read-only until SetWritable", tkDataGrid_SetCellText( g, 3, 1, "nope" ) = false )
+    tkDataGridSqlite_SetWritable( q, "person", "id" )
+    tkTest_Check( "an edit updates the row by its key", tkDataGrid_SetCellText( g, 3, 1, "Zed" ) andalso (Scalar( db, "select name from person where id = 4" ) = "Zed") _
+        andalso (tkDataGrid_GetCellText( g, 3, 1 ) = "Zed") )
+    tkTest_Check( "a delete removes the rows by key", tkDataGrid_DeleteRows( g, 0, 2 ) andalso (Scalar( db, "select count(*) from person" ) = "9998") _
+        andalso (tkDataGrid_GetRowCount( g ) = 9998) andalso (tkDataGrid_GetCellInt( g, 0, 0 ) = 3) )
+
+    sqlite3_exec( db, "insert into person( name ) values( 'new' )", nullptr, nullptr, nullptr )
+    tkDataGridSqlite_Refresh( q )
+    tkTest_Check( "Refresh: rows added under the grid are counted", (tkDataGrid_GetRowCount( g ) = 9999) andalso (tkDataGrid_GetCellText( g, 9998, 1 ) = "new") )
+    tkDataGridSqlite_Close( q )
+    tkTest_Check( "Close: the grid has no source", tkDataGrid_HasSource( g ) = false )
+    tkWidget_Destroy( g )
+    sqlite3_close( db )
+end sub
+
+' Parameters, and writes that keep to one row inside the host's own transaction.
+sub SqlSafe( byval owner as TK_FORM ptr )
+    tkTest_Begin( "tkDataGridSqlite: parameters and savepoints" )
+    dim as TK_HOST ptr h = tkForm_Host( owner )
+    dim as sqlite3 ptr db
+    sqlite3_open( ":memory:", @db )
+    sqlite3_exec( db, "create table person( id integer primary key, name text, age int )", nullptr, nullptr, nullptr )
+    sqlite3_exec( db, "begin", nullptr, nullptr, nullptr )
+    for i as integer = 1 to 300
+        sqlite3_exec( db, "insert into person( name, age ) values( 'p" & right( "000" & i, 3 ) & "', " & (i mod 10) & " )", nullptr, nullptr, nullptr )
+    next
+    sqlite3_exec( db, "commit", nullptr, nullptr, nullptr )
+    dim as TK_WIDGET ptr g = tkDataGrid_Create( tkForm_Widget( owner ), 12 )
+    tkWidget_SetPos( g, 10, 10, 520, 300 )
+
+    const as string FILTERED = "select id, name, age from person where name like ? and age = ?"
+    tkTest_Check( "Open refuses a query with parameters", tkDataGridSqlite_Open( g, db, FILTERED ) = 0 )
+    dim as TKDG_VALUE one_(0)
+    one_(0).SetText( "p%" )
+    tkTest_Check( "OpenEx refuses the wrong number of parameters", tkDataGridSqlite_OpenEx( g, db, FILTERED, one_() ) = 0 )
+
+    dim as TKDG_VALUE p(1)
+    p(0).SetText( "p1%" ) : p(1).SetInt( 3 )          ' p100 .. p199 with age 3: p103, p113, ... p193
+    dim as TKDGSQL ptr q = tkDataGridSqlite_OpenEx( g, db, FILTERED, p(), true, 4 )    ' 4-row blocks: LIMIT / OFFSET after the parameters
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "OpenEx: the parameters filter the count and every block", (q <> 0) andalso (tkDataGrid_GetRowCount( g ) = 10) _
+        andalso (tkDataGrid_GetCellText( g, 0, 1 ) = "p103") andalso (tkDataGrid_GetCellText( g, 9, 1 ) = "p193"), _
+        str( tkDataGrid_GetRowCount( g ) ) & " " & tkDataGrid_GetCellText( g, 9, 1 ) )
+
+    dim as TKDG_SORTKEY keys(0)
+    keys(0).col = 1 : keys(0).bDescending = true
+    tkDataGrid_SetSortKeys( g, keys() )
+    tkTest_Check( "a sort prepares the block query again, its parameters bound", (tkDataGrid_GetCellText( g, 0, 1 ) = "p193") _
+        andalso (tkDataGrid_GetRowCount( g ) = 10), tkDataGrid_GetCellText( g, 0, 1 ) )
+    tkDataGrid_ClearSort( g )
+
+    p(0).SetText( "x' or '1'='1" )
+    tkTest_Check( "SetParams: a quote in a value is only text", tkDataGridSqlite_SetParams( q, p() ) andalso (tkDataGrid_GetRowCount( g ) = 0) )
+    p(0).SetText( "p2%" ) : p(1).SetInt( 0 )
+    tkTest_Check( "SetParams: new values, rows counted and read again", tkDataGridSqlite_SetParams( q, p() ) _
+        andalso (tkDataGrid_GetRowCount( g ) = 10) andalso (tkDataGrid_GetCellText( g, 0, 1 ) = "p200") )
+    tkTest_Check( "SetParams refuses the wrong number", (tkDataGridSqlite_SetParams( q, one_() ) = false) _
+        andalso (tkDataGrid_GetRowCount( g ) = 10) andalso (instr( tkDataGridSqlite_LastError( q ), "2 parameters" ) > 0), _
+        tkDataGridSqlite_LastError( q ) )
+
+    ' writes inside the host's transaction: the host's COMMIT / ROLLBACK stays the host's
+    tkDataGridSqlite_SetWritable( q, "person", "id" )
+    sqlite3_exec( db, "begin", nullptr, nullptr, nullptr )
+    sqlite3_exec( db, "insert into person( name, age ) values( 'host', 0 )", nullptr, nullptr, nullptr )
+    dim as boolean deleted = tkDataGrid_DeleteRows( g, 0, 2 )
+    dim as boolean edited = tkDataGrid_SetCellText( g, 0, 1, "Zed" )
+    tkTest_Check( "a delete and an edit inside the host's transaction leave it open", deleted andalso edited _
+        andalso (sqlite3_get_autocommit( db ) = 0) andalso (Scalar( db, "select count(*) from person" ) = "299") _
+        andalso (Scalar( db, "select name from person where id = 220" ) = "Zed"), tkDataGridSqlite_LastError( q ) )
+    sqlite3_exec( db, "rollback", nullptr, nullptr, nullptr )
+    tkTest_Check( "the host's ROLLBACK undoes them with its own work", (Scalar( db, "select count(*) from person" ) = "300") _
+        andalso (Scalar( db, "select name from person where id = 220" ) = "p220") )
+    tkDataGridSqlite_Refresh( q )
+
+    ' an edit or a delete that would not change exactly one row is undone and refused
+    tkTest_Check( "the rows are back after Refresh", tkDataGrid_GetCellText( g, 0, 1 ) = "p200" )   ' (and the block is held)
+    sqlite3_exec( db, "delete from person where id = 200", nullptr, nullptr, nullptr )    ' behind the grid's back
+    tkTest_Check( "an edit of a row that is gone is refused", (tkDataGrid_SetCellText( g, 0, 1, "ghost" ) = false) _
+        andalso (instr( tkDataGridSqlite_LastError( q ), "matched 0 rows" ) > 0), tkDataGridSqlite_LastError( q ) )
+    tkTest_Check( "a delete that includes a row that is gone deletes none", (tkDataGrid_DeleteRows( g, 0, 2 ) = false) _
+        andalso (Scalar( db, "select count(*) from person" ) = "299") andalso (sqlite3_get_autocommit( db ) <> 0), tkDataGridSqlite_LastError( q ) )
+    tkDataGridSqlite_Refresh( q )
+    tkDataGridSqlite_SetWritable( q, "person", "age" )            ' not a key: 30 rows share each age
+    tkTest_Check( "an edit by a column that is not unique is refused, nothing written", (tkDataGrid_SetCellText( g, 0, 1, "many" ) = false) _
+        andalso (Scalar( db, "select count(*) from person where name = 'many'" ) = "0") _
+        andalso (instr( tkDataGridSqlite_LastError( q ), "it must match one" ) > 0), tkDataGridSqlite_LastError( q ) )
+    tkTest_Check( "no savepoint is left open", sqlite3_get_autocommit( db ) <> 0 )
+
+    tkDataGridSqlite_Close( q )
+    tkWidget_Destroy( g )
+    sqlite3_close( db )
+end sub
+
+' ---- G7b / G7c: SQLite filters (WHERE) and totals (aggregates) ----------------------------------
+function SumOf( byval g as TK_WIDGET ptr, byval col as integer ) as string
+    dim as TKDG_VALUE v
+    if tkDataGrid_GetSummary( g, col, v ) = false then return "none"
+    return tkDataGrid_GetSummaryText( g, col )
+end function
+
+sub SqlFilter( byval owner as TK_FORM ptr )
+    tkTest_Begin( "tkDataGridSqlite: filters and totals" )
+    dim as TK_HOST ptr h = tkForm_Host( owner )
+    dim as sqlite3 ptr db
+    sqlite3_open( ":memory:", @db )
+    sqlite3_exec( db, "create table item( id integer primary key, name text, qty int, price real, made date )", nullptr, nullptr, nullptr )
+    sqlite3_exec( db, "begin", nullptr, nullptr, nullptr )
+    for i as integer = 1 to 300
+        dim as string nm = "n" & right( "000" & i, 3 )
+        if i = 7 then nm = "a_b%c"
+        if i = 8 then nm = "axbyc"
+        if i = 9 then nm = "back\slash"
+        if i = 10 then nm = "Banana"
+        dim as string pr = iif( (i mod 4) = 0, "null", str( i / 2 ) )
+        sqlite3_exec( db, "insert into item( name, qty, price, made ) values( '" & nm & "', " & (i mod 10) & ", " & pr & ", '2026-" _
+            & right( "0" & (1 + i mod 12), 2 ) & "-01' )", nullptr, nullptr, nullptr )
+    next
+    sqlite3_exec( db, "commit", nullptr, nullptr, nullptr )
+    dim as TK_WIDGET ptr g = tkDataGrid_Create( tkForm_Widget( owner ), 13 )
+    tkWidget_SetPos( g, 10, 10, 520, 300 )
+    dim as TKDGSQL ptr q = tkDataGridSqlite_Open( g, db, "select id, name, qty, price, made from item", true, 8 )
+    tkTest_PumpFor( h, 30 )
+
+    tkDataGrid_SetColumnFilterText( g, 2, "3" )
+    tkTest_Check( "a column filter is a WHERE with a parameter; the rows counted again", (tkDataGridSqlite_GetWhere( q ) = """qty"" = ?1") _
+        andalso (tkDataGrid_GetRowCount( g ) = 30) andalso (tkDataGrid_GetViewCount( g ) = 30) andalso (tkDataGrid_GetCellInt( g, 29, 2 ) = 3), _
+        tkDataGridSqlite_GetWhere( q ) & " / " & tkDataGrid_GetRowCount( g ) )
+    tkDataGrid_SetColumnFilterText( g, 1, "^N29" )
+    tkTest_Check( "two filters AND; starts-with as LIKE without case", (tkDataGrid_GetRowCount( g ) = 1) andalso (tkDataGrid_GetCellText( g, 0, 1 ) = "n293"), _
+        tkDataGridSqlite_GetWhere( q ) & " / " & tkDataGrid_GetRowCount( g ) )
+    tkDataGrid_ClearColumnFilters( g )
+    tkTest_Check( "cleared: no WHERE, every row", (tkDataGridSqlite_GetWhere( q ) = "") andalso (tkDataGrid_GetRowCount( g ) = 300) )
+    tkDataGrid_SetColumnFilterText( g, 1, "_b%" )
+    tkTest_Check( "contains: % and _ are only characters (escaped)", (tkDataGrid_GetRowCount( g ) = 1) andalso (tkDataGrid_GetCellText( g, 0, 1 ) = "a_b%c"), _
+        "" & tkDataGrid_GetRowCount( g ) )
+    tkDataGrid_SetColumnFilterText( g, 1, "k\s" )
+    tkTest_Check( "contains: a backslash is only a character", (tkDataGrid_GetRowCount( g ) = 1) andalso (tkDataGrid_GetCellText( g, 0, 1 ) = "back\slash"), _
+        "" & tkDataGrid_GetRowCount( g ) )
+    tkDataGrid_SetColumnFilterText( g, 1, "" )
+    tkDataGrid_SetColumnFilterText( g, 3, """""" )
+    tkTest_Check( "empty: NULL", tkDataGrid_GetRowCount( g ) = 75, "" & tkDataGrid_GetRowCount( g ) )
+    tkDataGrid_SetColumnFilterText( g, 3, "" )
+    tkDataGrid_SetColumnFilterText( g, 4, "2026-02-01..2026-03-01" )
+    tkTest_Check( "between two dates", tkDataGrid_GetRowCount( g ) = 50, "" & tkDataGrid_GetRowCount( g ) )
+    tkDataGrid_SetColumnFilterText( g, 4, "" )
+    tkDataGrid_SetColumnFilterText( g, 1, "=banana" )
+    tkTest_Check( "equals without case on text", (tkDataGrid_GetRowCount( g ) = 1) andalso (tkDataGrid_GetCellText( g, 0, 1 ) = "Banana") )
+    tkDataGrid_ClearColumnFilters( g )
+
+    ' a sort and a filter together, blocks of 8 rows past the WHERE's parameter
+    tkDataGrid_SetColumnFilterText( g, 2, ">=8" )
+    dim as TKDG_SORTKEY keys(0)
+    keys(0).col = 0 : keys(0).bDescending = true
+    tkDataGrid_SetSortKeys( g, keys() )
+    tkTest_Check( "sorted and filtered: ORDER BY and WHERE, LIMIT / OFFSET after the filter's parameter", (tkDataGrid_GetRowCount( g ) = 60) _
+        andalso (tkDataGrid_GetCellInt( g, 0, 0 ) = 299) andalso (tkDataGrid_GetCellInt( g, 59, 0 ) = 8), _
+        tkDataGrid_GetCellInt( g, 0, 0 ) & " .. " & tkDataGrid_GetCellInt( g, 59, 0 ) )
+    tkDataGrid_ClearSort( g )
+
+    ' totals by SQL, over the filter
+    tkDataGrid_SetColumnSummary( g, 2, TKDG_SUM_SUM )
+    tkDataGrid_SetColumnSummary( g, 1, TKDG_SUM_COUNT )
+    tkDataGrid_SetColumnSummary( g, 3, TKDG_SUM_AVG )
+    tkDataGrid_SetColumnSummary( g, 4, TKDG_SUM_MAX )
+    tkDataGrid_SetColumnSummary( g, 0, TKDG_SUM_MIN )
+    dim as integer f0 = tkDataGridSqlite_GetFetchCount( q )
+    tkTest_Check( "totals by SQL over the WHERE: sum, count, min", (SumOf( g, 2 ) = Scalar( db, "select sum( qty ) from item where qty >= 8" )) _
+        andalso (SumOf( g, 1 ) = "60") andalso (SumOf( g, 0 ) = "8"), SumOf( g, 2 ) & " " & SumOf( g, 1 ) & " " & SumOf( g, 0 ) )
+    tkTest_Check( "... avg over the non-null, max of a date; no block read", (abs( val( SumOf( g, 3 ) ) - val( Scalar( db, "select avg( price ) from item where qty >= 8" ) ) ) < 1e-9) _
+        andalso (SumOf( g, 4 ) = Scalar( db, "select max( made ) from item where qty >= 8" )) andalso (tkDataGridSqlite_GetFetchCount( q ) = f0), _
+        SumOf( g, 3 ) & " " & SumOf( g, 4 ) )
+    tkDataGrid_ClearColumnFilters( g )
+    tkDataGrid_SetColumnSummary( g, 1, TKDG_SUM_MIN )
+    tkTest_Check( "a text MIN without case, as the grid compares", SumOf( g, 1 ) = "a_b%c", SumOf( g, 1 ) )
+    tkDataGrid_SetColumnFilterText( g, 2, ">99" )
+    tkTest_Check( "no rows: SUM 0", (tkDataGrid_GetRowCount( g ) = 0) andalso (SumOf( g, 2 ) = "0"), SumOf( g, 2 ) )
+
+    ' a parameterized query: the filter's parameters come after its own
+    tkDataGridSqlite_Close( q )
+    dim as TKDG_VALUE pr(0)
+    pr(0).SetInt( 5 )
+    q = tkDataGridSqlite_OpenEx( g, db, "select id, name, qty from item where qty = ?", pr(), true, 4 )
+    tkDataGrid_SetColumnFilterText( g, 1, "^n1" )
+    tkTest_Check( "a parameterized query and a filter: ?1 is the query's, ?2 the filter's", (tkDataGridSqlite_GetWhere( q ) = """name"" like ?2 escape '\'") _
+        andalso (tkDataGrid_GetRowCount( g ) = 10) andalso (tkDataGrid_GetCellText( g, 9, 1 ) = "n195"), _
+        tkDataGridSqlite_GetWhere( q ) & " / " & tkDataGrid_GetRowCount( g ) & " " & tkDataGrid_GetCellText( g, 9, 1 ) )
+    tkDataGrid_SetColumnFilterText( g, 1, "" )
+    tkDataGrid_SetColumnFilterText( g, 0, ">=150" )
+    tkTest_Check( "... and a comparison: ?2 too (ids 155 .. 295 with qty 5)", (tkDataGridSqlite_GetWhere( q ) = """id"" >= ?2") _
+        andalso (tkDataGrid_GetRowCount( g ) = 15), tkDataGridSqlite_GetWhere( q ) & " / " & tkDataGrid_GetRowCount( g ) )
+    tkDataGridSqlite_Close( q )
+    tkWidget_Destroy( g )
+    sqlite3_close( db )
+end sub
+
+if tkTest_Init() = false then end 99
+dim as TKAPP_OPTIONS opts
+if tkApp_Init( opts ) = false then
+    print "tkApp_Init failed"
+    end 98
+end if
+dim as TK_FORM ptr mainForm = tkApp_NewForm( "tkGridData", 560, 340, 0, 1.0 )
+tkForm_Show( mainForm )
+tkTest_PumpFor( tkForm_Host( mainForm ), 50 )
+Cache( mainForm )
+Sql( mainForm )
+SqlSafe( mainForm )
+SqlFilter( mainForm )
+dim as long nFail = tkTest_Report( "tkGridData" )
+tkApp_Shutdown( )
+end nFail

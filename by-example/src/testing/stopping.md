@@ -4,11 +4,6 @@ tiko has no exceptions to catch, so a test that ends the program would end
 every test after it. `tiko test` restarts the program after such a test, and
 stops a test that runs too long.
 
-````admonish warning title="Status in this version"
-`tiko test` arrives after tiko 0.1.6, the toolchain this site is pinned to.
-This example was compiled and run on Windows with the development toolchain.
-````
-
 ```tiko
 {{#include ../../examples/testing/crashing/ages/ages.tiko}}
 ```

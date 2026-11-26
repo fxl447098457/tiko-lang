@@ -68,7 +68,7 @@ All four libraries in these tutorials allow both. Check the licence of any other
   #cmdline "-Wl -rpath,$ORIGIN"
   ```
 
-  The program and its `.so` files can then be copied anywhere together. `-Wl` passes its value to the linker, split at commas. In a shell, single-quote it so the shell leaves `$ORIGIN` alone: `tiko game.tiko -Wl '-rpath,$ORIGIN'`. In `#cmdline` or in `tiko.toml`'s `options`, no quoting is needed. Put `#cmdline` lines that only make sense on Linux inside `#ifdef __FB_LINUX__`: on Windows, `-Wl` talks to `lld-link`, which has no `-rpath`.
+  The program and its `.so` files can then be copied anywhere together. `-Wl` passes its value to the linker, split at commas. In a shell, single-quote it so the shell leaves `$ORIGIN` alone: `tiko game.tiko -Wl '-rpath,$ORIGIN'`. In `#cmdline` or in `tiko.toml`'s `options`, no quoting is needed. Put `#cmdline` lines that only make sense on Linux inside `#ifdef TIKO_OS_LINUX`: on Windows, `-Wl` talks to `lld-link`, which has no `-rpath`.
 
 - **macOS** loads a library by its **install name**, recorded in the program when it links. Homebrew's libraries name their own absolute path (`/opt/homebrew/opt/sdl3/lib/libSDL3.0.dylib`), so they load from there. A library you build names `@rpath/libname.dylib`, and a program that links a `.dylib` from `#foreignlib` has the run path `@loader_path`, its own directory: put the library beside the program. If it is missing, dyld stops the program before it starts (exit 134):
 
@@ -150,7 +150,7 @@ Move the `#cinclude` and `#foreignlib` lines into a `.ti` file next to the libra
 
 #cinclude once "raylib/raylib.h"
 
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
     #foreignlib RAYLIB static "raylib/raylib", _
         "system:winmm", "system:gdi32", "system:user32", _
         "system:shell32"
@@ -189,7 +189,7 @@ A binding can also be a **module**. Inside a module, write **`public #cinclude`*
 
 public #cinclude once "../../vendor/raylib/raylib.h"
 
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
     #foreignlib RAYLIB static "../../vendor/raylib/raylib", _
         "system:winmm", "system:gdi32", "system:user32", _
         "system:shell32"

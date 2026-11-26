@@ -35,8 +35,10 @@ tiko is honest about where it stops:
 | `linux-x86_64` | The default on x86-64 Linux. |
 | `linux-arm64` | The default on arm64 (aarch64) Linux, with glibc 2.35 or newer. |
 | `macos-arm64` | The default on macOS (Apple Silicon, macOS 13 or newer). It links with Apple's linker and SDK, so on a Mac. |
+| `android-arm64` | *Experimental.* Android phones and tablets, Android 10 or newer. Built from Windows with the Android NDK; `-app` makes an APK. See [Android](Android). |
+| `android-x86_64` | *Experimental.* The Android emulator on a PC, as `android-arm64`. |
 
-x86-64 on Windows and Linux, and ARM64 on Linux and macOS. `-m32` and `-target win32` are refused (`TKO0104`, `TKO0103`). There is **one backend**: LLVM IR through clang. See [LLVM Backend](Category-LLVM-Backend).
+x86-64 on Windows and Linux, and ARM64 on Linux and macOS; Android on both, built from Windows. `-m32` and `-target win32` are refused (`TKO0104`, `TKO0103`). There is **one backend**: LLVM IR through clang. See [LLVM Backend](Category-LLVM-Backend).
 
 ## Where the syntax comes from
 

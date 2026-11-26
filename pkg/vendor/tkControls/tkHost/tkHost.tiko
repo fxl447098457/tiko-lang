@@ -20,6 +20,48 @@
 ' tooltips) and each modal dialog. Each has its own renderer, text engine, widget tree, focus,
 ' capture and hot widget. One global router hands each SDL event to the surface whose window
 ' it names, so a host never sees another window's events by mistake.
+'
+' VIRTUAL SURFACES (docs/tiko-android A5, D-A5-1). Android's SDL has ONE window: a popup window
+' cannot be made (SDL_CreatePopupWindow fails, so a combo box opened and closed at once) and nor
+' can a dialog or a second form. With virtual surfaces on -- always on Android, TK_VIRTUAL=1
+' elsewhere, which is how the self-tests exercise them on the desktop -- every surface after the
+' first main window is a rectangle INSIDE it (bVirtual, pBase, vx/vy/vw/vh in the base's
+' pixels): it shares the base's renderer and text engine, is painted after the base's own tree in
+' creation order (so a submenu is above its menu), and is handed the events that land in it --
+' the router translates them into its own pixels, so widgets and controls cannot tell. Each also
+' has a window id of its own that no SDL window has (from &h40000000): an event that NAMES it -- a
+' test's, or code addressing that surface -- goes to it directly, in its own coordinates, exactly as
+' one addressed to a hidden window still reaches it on the desktop; only events naming the real
+' window are routed by position. A second
+' tkHost_Create is a PAGE: a virtual main surface covering the whole window, on top of the one
+' before (D-A5-2). Everything that is a window operation on the desktop (show, hide, modal,
+' raise, drag) is a flag here.
+'
+' THE SAFE AREA. With virtual surfaces on, a window's own tree lives in its safe area (ix, iy and
+' root->cw/ch, from SDL_GetWindowSafeArea): Android 15's windows run under the status and
+' navigation bars, and the first row of every demo was under the clock. The tree is painted
+' through a viewport there, tkHost_PixelSize answers its size, and pointer events are moved into
+' it, exactly as for a virtual surface. On the desktop the safe area is the whole window: 0, 0.
+'
+' TOUCH (D-A5-3). SDL turns a finger into the mouse, so a tap is a click everywhere already. The
+' gesture layer adds what a phone expects, and touches no control. SDL sends its touch-mouse
+' events before the finger's own; the layer HOLDS the press, as Android's tap timeout does:
+'   a finger that lifts first is a tap -- press and release, a click
+'   one still down after TK_PRESS_DELAY_MS gets its press (a scroll thumb, a splitter, a text
+'     selection drag as on the desktop)
+'   one that moves past the slop first is a SCROLL: no press at all -- a list selected the row a
+'     swipe began on when the press went through at once (measured) -- and the movement becomes
+'     fractional TKM_MOUSEWHEEL at the first point, so whatever scrolls under the finger, or an
+'     ancestor that does, scrolls, with a fling after the finger lifts; a press already delivered
+'     is cancelled with a release far outside (a button sees a press slid off)
+'   one held still for TK_LONGPRESS_MS is the right button there: a context menu opens
+' Touch-mouse motion is held back until a press is delivered, so a touch makes no hover, and a
+' finger that lifts is the pointer leaving the window: a hover tooltip opened under a finger
+' that had gone (measured).
+'
+' BACK (Android's button, SDLK_AC_BACK, trapped from SDL) goes back one level: the top popup
+' closes, else the top dialog or page is asked to close as its close button would, else the
+' window is.
 #module "tkHost"
 
 #import "../tkPaint" public
@@ -127,6 +169,9 @@ public enum
     TKM_CONTEXTMENU          ' to a CONTEXT-MENU COMPONENT (tkWidget_SetContextMenu): m->pOther = the widget
                              ' it opens for, m->x / y = where, in the surface's window pixels; m->bFlag =
                              ' from the keyboard (the Menu key, Shift+F10)
+    TKM_ADORNLAYOUT          ' to an ADORNMENT just before it paints: place yourself against your parent
+                             ' (the target) as it is now. Invalidations made while handling it are
+                             ' dropped: this frame already paints the new rect.
 end enum
 
 public enum
@@ -149,6 +194,16 @@ public enum
     TK_CURSOR_COUNT
 end enum
 
+' What a focused text widget's screen keyboard is (tkWidget_SetTextKind; docs/fasting-android F4).
+public enum
+    TK_TEXT_DEFAULT = 0      ' SDL's default: multi-line text with autocorrect (what every widget had)
+    TK_TEXT_LINE             ' one line of text
+    TK_TEXT_MULTILINE        ' paragraphs; sentences capitalised
+    TK_TEXT_DECIMAL          ' a number with a point (and a sign)
+    TK_TEXT_INTEGER          ' a whole number (and a sign)
+    TK_TEXT_PASSWORD         ' hidden, never learned by the keyboard
+end enum
+
 ' Reserved timer ids. A control's own ids start at TK_TIMER_APP.
 public enum
     TK_TIMER_CARET = 900
@@ -158,6 +213,7 @@ public enum
     TK_TIMER_HOVER
     TK_TIMER_TIPSHOW
     TK_TIMER_TIPPOP
+    TK_TIMER_TEXTRESTART     ' the host's own: a field of another keyboard kind (F4)
     TK_TIMER_APP = 1000
 end enum
 
@@ -198,6 +254,8 @@ public type tkHostCloseFunc as function( byval h as TK_HOST ptr ) as boolean
 public type tkHostKeyFunc as function( byval h as TK_HOST ptr, byval m as TK_MSG ptr ) as boolean
 ' Files or text dropped where no widget claimed them: TKM_DROPFILES / TKM_DROPTEXT, window pixels.
 public type tkHostDropSub as sub( byval h as TK_HOST ptr, byval m as TK_MSG ptr )
+' Told after the surface's size or scale changed (tkHost_AddSizeHook): pUser is what was added.
+public type tkHostSizeHookSub as sub( byval h as TK_HOST ptr, byval pUser as any ptr )
 
 public type TK_WIDGET_
     pHost         as TK_HOST ptr
@@ -217,6 +275,7 @@ public type TK_WIDGET_
     nTabIndex     as long = 0           ' its place among its siblings in Tab order; 0 = none (tree order, after)
     bClipChildren as boolean = true
     bWantsText    as boolean = false    ' focus here starts SDL text input (and the IME)
+    nTextKind     as long = 0           ' TK_TEXT_*: the screen keyboard a focused text widget asks for
     cursor        as long = TK_CURSOR_ARROW
     proc          as tkWidgetProc
     pData         as any ptr            ' the control's own state
@@ -225,6 +284,8 @@ public type TK_WIDGET_
     pColorRecipe  as any ptr            ' per-field colour overrides (tkTheme_SetRecipe)
     pContextMenu  as TK_WIDGET ptr      ' the component that is this widget's right-click menu, 0 = none
     pOnMouseMove  as TK_MouseMoveSub    ' told of moves over it, and over descendants with none of their own
+    bAdorner      as boolean = false    ' an ADORNMENT of its parent (tkWidget_SetAdorner): painted after the
+                                        ' parent's subtree with the parent's own clip, never hit-tested
 end type
 
 public type TK_FONT
@@ -243,6 +304,16 @@ end type
 public type TK_HOST_
     kind         as long = TK_SURF_MAIN
     pOwner       as TK_HOST ptr       ' popups and dialogs: the surface they belong to
+    bVirtual     as boolean           ' a rectangle inside pBase's window, not a window (see top)
+    pBase        as TK_HOST ptr       ' virtual: the real surface whose window and renderer it uses
+    vx           as long              ' virtual: its rectangle, in pBase's pixels
+    vy           as long
+    vw           as long
+    vh           as long
+    bShown       as boolean           ' virtual: tkHost_Show'n and not hidden
+    sTitle       as string            ' virtual: the title a window would have shown (UTF-8)
+    ix           as long              ' a window with virtual surfaces: its safe area's corner,
+    iy           as long              ' in window pixels (see top); its size is root->cw/ch
     win          as SDL_Window ptr
     renderer     as SDL_Renderer ptr
     engine       as TTF_TextEngine ptr
@@ -257,6 +328,7 @@ public type TK_HOST_
     pLastDown    as TK_WIDGET ptr     ' for demoting a double click that changed widgets
     bCaptureOS   as boolean           ' did SDL_CaptureMouse succeed for the live capture?
     bTextInput   as boolean
+    nTextKindOn  as long              ' the TK_TEXT_* the live text input was started with
     bDirty       as boolean = true
     bQuit        as boolean
     bClosed      as boolean           ' closed, waiting to be reaped after this event
@@ -274,6 +346,7 @@ public type TK_HOST_
     fonts(any)   as TK_FONT
     rcDrag       as TKRECT            ' window pixels; a press here drags the window (dialogs)
     nFrames      as long              ' frames rendered, for the idle-CPU claim
+    bResumed     as boolean           ' back in the foreground: the next render presents twice
     pUser        as any ptr           ' the host's own payload
     OnPaint      as tkHostPaintSub    ' the surface's own background (labels, hairlines)
     OnSize       as tkHostSub
@@ -285,6 +358,10 @@ public type TK_HOST_
     sDropFiles   as string            ' a drop in progress: the paths so far, LF-separated
     nDropFiles   as long
     sDropText    as string
+    ' MORE SIZE WATCHERS than OnSize's one slot (which tkApp's form owns): a toaster keeping its
+    ' cards in a corner. Run after OnSize on every path that runs it, live resize included.
+    sizeHooks(0 to 3)    as tkHostSizeHookSub
+    sizeHookData(0 to 3) as any ptr
 end type
 
 
@@ -299,11 +376,70 @@ dim shared as long gCursorNow = -1
 dim shared as long gTrace = -1
 dim shared as ulong gPressSerial          ' +1 per mouse press, BEFORE the dismissal rule runs
 dim shared as long gDispatching           ' >0: an event is being delivered, so a surface is on the stack
+dim shared as long gVirtual = -1          ' virtual surfaces: -1 not yet decided, 0 off, 1 on (see top)
+dim shared as TK_HOST ptr gMouseHost      ' the surface the last pointer event went to (virtual)
+dim shared as SDL_WindowID gVirtualIdNext = &h40000000ul   ' virtual surfaces' own window ids
+
+' Are surfaces virtual? Decided once: always on Android, which has one window; elsewhere only
+' when TK_VIRTUAL=1 asks, so the desktop's own behaviour is exactly what it was.
+private function Virtual_() as boolean
+    if gVirtual < 0 then
+        #ifdef TIKO_OS_ANDROID
+            gVirtual = 1
+        #else
+            gVirtual = iif( environ( "TK_VIRTUAL" ) = "1", 1, 0 )
+        #endif
+    end if
+    return gVirtual = 1
+end function
+
+' Are surfaces virtual in this process (Android; TK_VIRTUAL=1)?
+public function tkHost_VirtualSurfaces() as boolean
+    return Virtual_()
+end function
+
+public function tkHost_IsVirtual( byval h as TK_HOST ptr ) as boolean
+    return (h <> 0) andalso h->bVirtual
+end function
 
 ' Called with each renderer just before it is destroyed, so caches of textures that belong to
 ' it (tkImage) can drop them. One hook: the only client is tkImage.
 public type tkRendererGoneSub as sub( byval r as SDL_Renderer ptr )
 dim shared as tkRendererGoneSub gOnRendererGone
+
+' Adds a size watcher to h: f( h, pUser ) runs after h's size or scale changed, after OnSize --
+' including inside Windows' live-resize loop. Up to 4 per surface; adding the same pair twice is
+' one. FALSE when all 4 are taken.
+public function tkHost_AddSizeHook( byval h as TK_HOST ptr, byval f as tkHostSizeHookSub, byval pUser as any ptr = 0 ) as boolean
+    if (h = 0) orelse (f = 0) then return false
+    for i as long = 0 to 3
+        if (h->sizeHooks(i) = f) andalso (h->sizeHookData(i) = pUser) then return true
+    next
+    for i as long = 0 to 3
+        if h->sizeHooks(i) = 0 then
+            h->sizeHooks(i) = f
+            h->sizeHookData(i) = pUser
+            return true
+        end if
+    next
+    return false
+end function
+
+public sub tkHost_RemoveSizeHook( byval h as TK_HOST ptr, byval f as tkHostSizeHookSub, byval pUser as any ptr = 0 )
+    if h = 0 then exit sub
+    for i as long = 0 to 3
+        if (h->sizeHooks(i) = f) andalso (h->sizeHookData(i) = pUser) then
+            h->sizeHooks(i) = 0
+            h->sizeHookData(i) = 0
+        end if
+    next
+end sub
+
+private sub RunSizeHooks_( byval h as TK_HOST ptr )
+    for i as long = 0 to 3
+        if h->sizeHooks(i) then h->sizeHooks(i)( h, h->sizeHookData(i) )
+    next
+end sub
 
 public sub tkHost_SetRendererGoneHook( byval f as tkRendererGoneSub )
     gOnRendererGone = f
@@ -316,6 +452,16 @@ dim shared as tkHotChangedSub gOnHotChanged
 
 public sub tkHost_SetHotChangedHook( byval f as tkHotChangedSub )
     gOnHotChanged = f
+end sub
+
+' Called after tkWidget_Show changed a widget's visibility (not when it was already in that
+' state), so a watcher that does not subclass the widget -- tkLayout, whose hidden docks take no
+' slice -- can place its siblings again. One hook.
+public type tkShowChangedSub as sub( byval w as TK_WIDGET ptr, byval bShow as boolean )
+dim shared as tkShowChangedSub gOnShowChanged
+
+public sub tkHost_SetShowChangedHook( byval f as tkShowChangedSub )
+    gOnShowChanged = f
 end sub
 
 ' Offered every event tkHost_Dispatch sees, before anything else -- in tkHost_Run, in
@@ -516,6 +662,43 @@ end function
 
 ' A font file or a registered name, at 'pt' points (unscaled) and face 'face' of a collection.
 ' The one place a font is opened from a name, so a registered one is honoured everywhere.
+' The font-source registry (tkHost_FontSource). A font's slot is reused when SDL_ttf hands out the
+' same pointer again, so a font closed without tkHost_CloseFont leaves nothing that can mislead.
+dim shared as TTF_Font ptr gFontSrcF()
+dim shared as string gFontSrcPath()
+dim shared as long gFontSrcFace()
+dim shared as long gnFontSrc
+
+private sub NoteFontSource_( byval f as TTF_Font ptr, byref path as string, byval face as long )
+    dim as long k = -1
+    for i as long = 0 to gnFontSrc - 1
+        if gFontSrcF(i) = f then k = i : exit for
+    next
+    if k < 0 then
+        k = gnFontSrc
+        if k > ubound( gFontSrcF ) then
+            dim as long n = iif( k < 16, 16, k * 2 )
+            redim preserve gFontSrcF( 0 to n - 1 )
+            redim preserve gFontSrcPath( 0 to n - 1 )
+            redim preserve gFontSrcFace( 0 to n - 1 )
+        end if
+        gnFontSrc += 1
+    end if
+    gFontSrcF(k) = f : gFontSrcPath(k) = path : gFontSrcFace(k) = face
+end sub
+
+private sub ForgetFontSource_( byval f as TTF_Font ptr )
+    for i as long = 0 to gnFontSrc - 1
+        if gFontSrcF(i) = f then
+            gnFontSrc -= 1
+            gFontSrcF(i) = gFontSrcF(gnFontSrc) : gFontSrcPath(i) = gFontSrcPath(gnFontSrc)
+            gFontSrcFace(i) = gFontSrcFace(gnFontSrc)
+            gFontSrcPath(gnFontSrc) = ""
+            exit sub
+        end if
+    next
+end sub
+
 public function tkHost_OpenFontFace( byref path as string, byval pt as single, byval face as long ) as TTF_Font ptr
     dim as SDL_PropertiesID props = SDL_CreateProperties()
     if props = 0 then return 0
@@ -532,8 +715,50 @@ public function tkHost_OpenFontFace( byref path as string, byval pt as single, b
     SDL_SetNumberProperty( props, TTF_PROP_FONT_CREATE_FACE_NUMBER, face )
     dim as TTF_Font ptr f = TTF_OpenFontWithProperties( props )
     SDL_DestroyProperties( props )
+    if f then NoteFontSource_( f, path, face )
     return f
 end function
+
+' Where a font came from: the name or path tkHost_OpenFontFace was given, and the face. tkPrint
+' re-opens a recorded font at a page's size this way (and a PDF writer will embed its bytes).
+' FALSE for a font SDL_ttf opened without tkHost.
+public function tkHost_FontSource( byval f as TTF_Font ptr, byref path as string, byref face as long ) as boolean
+    if f = 0 then return false
+    for i as long = 0 to gnFontSrc - 1
+        if gFontSrcF(i) = f then path = gFontSrcPath(i) : face = gFontSrcFace(i) : return true
+    next
+    return false
+end function
+
+' A font file's bytes, by the name or path tkHost_OpenFontFace takes: a registered resource's own
+' bytes (bOwned = FALSE: they live as long as the registration), else the file read whole
+' (bOwned = TRUE: SDL_free them). FALSE when there is nothing to read. For a PDF writer's embedding.
+public function tkHost_FontBytes( byref path as string, byref pData as const any ptr, byref nBytes as integer, _
+                                  byref bOwned as boolean ) as boolean
+    pData = 0 : nBytes = 0 : bOwned = false
+    dim as string file = path
+    dim as long k = ResIndex_( path )
+    if k >= 0 then
+        if gResData(k) then
+            pData = gResData(k) : nBytes = gResSize(k)
+            return nBytes > 0
+        end if
+        file = gResFile(k)
+    end if
+    if len( file ) = 0 then return false
+    dim as uinteger sz
+    dim as any ptr p = SDL_LoadFile( strptr( file ), @sz )
+    if p = 0 then return false
+    pData = p : nBytes = sz : bOwned = true
+    return true
+end function
+
+' Close a font tkHost_OpenFontFace opened, and forget where it came from.
+public sub tkHost_CloseFont( byval f as TTF_Font ptr )
+    if f = 0 then exit sub
+    ForgetFontSource_( f )
+    TTF_CloseFont( f )
+end sub
 
 public function tkHost_OpenFont( byval h as TK_HOST ptr, byref path as ustring, byval pt as single ) as TTF_Font ptr
     if h = 0 then return 0
@@ -558,9 +783,68 @@ end function
 
 private sub SizeRoot( byval h as TK_HOST ptr )
     dim as long pw, ph
-    SDL_GetRenderOutputSize( h->renderer, @pw, @ph )
+    if h->bVirtual then
+        pw = h->vw : ph = h->vh
+    else
+        SDL_GetRenderOutputSize( h->renderer, @pw, @ph )
+        h->ix = 0 : h->iy = 0
+        if Virtual_() then
+            dim as SDL_Rect sa
+            if SDL_GetWindowSafeArea( h->win, @sa ) andalso (sa.w > 0) andalso (sa.h > 0) then
+                h->ix = cint( sa.x * h->fDensity ) : h->iy = cint( sa.y * h->fDensity )
+                pw = cint( sa.w * h->fDensity ) : ph = cint( sa.h * h->fDensity )
+            end if
+            ' TK_SAFE_INSET=l,t,r,b (pixels): a safe area on a desktop, whose is the whole window --
+            ' how the inset is tested off Android
+            dim as string si = environ( "TK_SAFE_INSET" )
+            if len( si ) then
+                dim as long l, t, r, b, k1 = instr( si, "," ), k2 = instr( k1 + 1, si, "," ), k3 = instr( k2 + 1, si, "," )
+                if (k1 > 0) andalso (k2 > 0) andalso (k3 > 0) then
+                    l = valint( left( si, k1 - 1 ) ) : t = valint( mid( si, k1 + 1, k2 - k1 - 1 ) )
+                    r = valint( mid( si, k2 + 1, k3 - k2 - 1 ) ) : b = valint( mid( si, k3 + 1 ) )
+                    h->ix = l : h->iy = t : pw -= l + r : ph -= t + b
+                end if
+            end if
+        end if
+    end if
     h->root->cw = pw : h->root->ch = ph
 end sub
+
+' The real surface a new virtual one draws in: the owner's base, or the owner itself; with no
+' owner (a page, an ownerless dialog), the first real main window.
+private function BaseOf_( byval owner as TK_HOST ptr ) as TK_HOST ptr
+    if owner then return iif( owner->bVirtual, owner->pBase, owner )
+    for i as long = 0 to gnHosts - 1
+        if (gHosts(i)->bVirtual = false) andalso (gHosts(i)->bClosed = false) then return gHosts(i)
+    next
+    return 0
+end function
+
+' A virtual surface: base's window, renderer and text engine; rectangle x, y, w, hgt in BASE
+' pixels. Hidden until tkHost_Show, like a window.
+private function FinishVirtual_( byval h as TK_HOST ptr, byval base_ as TK_HOST ptr, _
+                                 byval x as long, byval y as long, byval w as long, byval hgt as long ) as boolean
+    if base_ = 0 then return false
+    h->bVirtual = true
+    h->pBase = base_
+    h->win = base_->win
+    h->winId = gVirtualIdNext             ' named only by events addressed to it (see top)
+    gVirtualIdNext += 1
+    h->renderer = base_->renderer
+    h->engine = base_->engine
+    h->vx = x : h->vy = y : h->vw = w : h->vh = hgt
+    h->fDensity = base_->fDensity
+    if h->fScaleForced > 0 then
+        h->fScale = h->fScaleForced
+    else
+        h->fScale = iif( h->pOwner <> 0, h->pOwner->fScale, base_->fScale )
+    end if
+    h->root = NewRoot( h )
+    SizeRoot( h )
+    if gEvTimer = 0 then gEvTimer = SDL_RegisterEvents( 1 )
+    Register( h )
+    return true
+end function
 
 private function FinishSurface( byval h as TK_HOST ptr ) as boolean
     h->winId = SDL_GetWindowID( h->win )
@@ -582,13 +866,36 @@ public function tkHost_Create( byref title as ustring, byval w as long, byval hg
     dim as TK_HOST ptr h = new TK_HOST
     h->kind = TK_SURF_MAIN
     h->fScaleForced = forcedScale
+    ' A SECOND MAIN WINDOW WITH VIRTUAL SURFACES IS A PAGE over the whole window (D-A5-2).
+    if Virtual_() then
+        dim as TK_HOST ptr b = BaseOf_( 0 )
+        if b then
+            h->clrBack = b->clrBack
+            h->sTitle = title
+            if FinishVirtual_( h, b, 0, 0, b->root->cw, b->root->ch ) = false then delete h : return 0
+            if len( defaultFont ) then h->pDefaultFont = tkHost_OpenFont( h, defaultFont, 9 )
+            return h
+        end if
+    end if
     ' The close button is OnCloseRequest's alone (DispatchTo: not vetoed = bQuit). By default SDL
     ' also queues a QUIT behind its last window's close request; a modal box opened from the veto
     ' ("save the changes?") then takes that QUIT in tkHost_RunModal, ends as 0 and re-posts it, and
     ' the app quits past the veto (tkEdit, 2026-10-27). SDL reads the hint when a close is requested.
     SDL_SetHint( SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0" )
+    ' ANDROID'S BACK BUTTON comes to tkHost as SDLK_AC_BACK (Back_) instead of ending the Activity.
+    #ifdef TIKO_OS_ANDROID
+        SDL_SetHint( SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1" )
+    #endif
     dim as string t8 = title
-    h->win = SDL_CreateWindow( strptr( t8 ), w, hgt, SDL_WINDOW_HIGH_PIXEL_DENSITY or SDL_WINDOW_RESIZABLE or SDL_WINDOW_HIDDEN )
+    ' ANDROID'S ONE WINDOW IS THE ACTIVITY, on screen whatever SDL is told; created HIDDEN, SDL skips
+    ' every draw until tkHost_Show, so a back buffer read before it held zeros (measured, A5 step 7)
+    ' where a hidden desktop window renders all the same.
+    #ifdef TIKO_OS_ANDROID
+        dim as SDL_WindowFlags hid = 0
+    #else
+        dim as SDL_WindowFlags hid = SDL_WINDOW_HIDDEN
+    #endif
+    h->win = SDL_CreateWindow( strptr( t8 ), w, hgt, SDL_WINDOW_HIGH_PIXEL_DENSITY or SDL_WINDOW_RESIZABLE or hid )
     if h->win = 0 then delete h : return 0
     UpdateScale( h )
     ' Resize to the design size now the scale is known. The size is in WINDOW coordinates, so
@@ -618,6 +925,12 @@ public function tkHost_CreatePopup( byval owner as TK_HOST ptr, byval x as long,
     h->pOwner = owner
     h->pDefaultFont = owner->pDefaultFont
     h->clrBack = owner->clrBack
+    if Virtual_() then
+        dim as long ox = 0, oy = 0
+        if owner->bVirtual then ox = owner->vx : oy = owner->vy
+        if FinishVirtual_( h, BaseOf_( owner ), ox + x, oy + y, w, hgt ) = false then delete h : return 0
+        return h
+    end if
     dim as Uint64 fl = SDL_WINDOW_HIGH_PIXEL_DENSITY or SDL_WINDOW_HIDDEN or extraFlags
     fl or= iif( kind = TK_SURF_TOOLTIP, SDL_WINDOW_TOOLTIP, SDL_WINDOW_POPUP_MENU )
     if OnTop_( owner ) then fl or= SDL_WINDOW_ALWAYS_ON_TOP
@@ -643,6 +956,16 @@ public function tkHost_CreateDialog( byval owner as TK_HOST ptr, byref title as 
         h->pDefaultFont = owner->pDefaultFont
         h->clrBack = owner->clrBack
         h->fScaleForced = owner->fScaleForced
+    end if
+    ' Virtual: centred in the base's window, and never larger than it.
+    if Virtual_() then
+        dim as TK_HOST ptr b = BaseOf_( owner )
+        if b then
+            dim as long dw = iif( w < b->root->cw, w, b->root->cw ), dh = iif( hgt < b->root->ch, hgt, b->root->ch )
+            h->sTitle = title
+            if FinishVirtual_( h, b, (b->root->cw - dw) \ 2, (b->root->ch - dh) \ 2, dw, dh ) = false then delete h : return 0
+            return h
+        end if
     end if
     dim as single d = iif( owner <> 0, owner->fDensity, 1.0 )
     dim as Uint64 fl = SDL_WINDOW_HIGH_PIXEL_DENSITY or SDL_WINDOW_HIDDEN
@@ -671,21 +994,132 @@ end function
 
 public sub tkHost_Show( byval h as TK_HOST ptr )
     if h = 0 then exit sub
-    SDL_ShowWindow( h->win )
+    if h->bVirtual then
+        h->bShown = true
+        h->pBase->bDirty = true
+    else
+        SDL_ShowWindow( h->win )
+    end if
     SizeRoot( h )
     h->bDirty = true
+end sub
+
+' An owned window (a dialog, a floating palette) about to be hidden or destroyed while it is the
+' active one gives activation to its owner FIRST, as tkHost_RunModal does. Hidden while active,
+' the OS activates the next window in z-order -- often another application's ("docking a floating
+' pane sent tkEdit behind another app", 2026-11-22). Popups and tooltips never take activation.
+private sub GiveActivationToOwner_( byval h as TK_HOST ptr )
+    if (h = 0) orelse (h->win = 0) orelse (h->pOwner = 0) then exit sub
+    if h->kind <> TK_SURF_DIALOG then exit sub
+    if (h->pOwner->win = 0) orelse (SDL_GetKeyboardFocus() <> h->win) then exit sub
+    if (SDL_GetWindowFlags( h->pOwner->win ) and SDL_WINDOW_HIDDEN) <> 0 then exit sub
+    SDL_RaiseWindow( h->pOwner->win )
 end sub
 
 ' Hides the window and keeps everything in it. tkHost_Show brings it back.
 public sub tkHost_Hide( byval h as TK_HOST ptr )
     if h = 0 then exit sub
-    SDL_HideWindow( h->win )
+    if h->bVirtual then
+        h->bShown = false
+        h->pBase->bDirty = true
+    else
+        ' master's f643496b3: an owned dialog hidden while active hands activation to its owner first.
+        ' Not for a virtual surface: it is a rectangle in its owner's window, never active on its own.
+        GiveActivationToOwner_( h )
+        SDL_HideWindow( h->win )
+    end if
     if h->pOwner then h->pOwner->bDirty = true
 end sub
 
 public sub tkHost_PixelSize( byval h as TK_HOST ptr, byref w as long, byref hgt as long )
     w = 0 : hgt = 0
-    if h then SDL_GetRenderOutputSize( h->renderer, @w, @hgt )
+    if h = 0 then exit sub
+    if h->bVirtual then w = h->vw : hgt = h->vh : exit sub
+    if Virtual_() andalso (h->root <> 0) then w = h->root->cw : hgt = h->root->ch : exit sub
+    SDL_GetRenderOutputSize( h->renderer, @w, @hgt )
+end sub
+
+' Where h's pixel 0,0 is in its window's back buffer: 0,0 for a window, the rectangle's corner for
+' a virtual surface. What a test reading pixels adds (tkTest).
+public sub tkHost_Origin( byval h as TK_HOST ptr, byref ox as long, byref oy as long )
+    ox = 0 : oy = 0
+    if h = 0 then exit sub
+    if h->bVirtual then
+        ox = h->pBase->ix + h->vx : oy = h->pBase->iy + h->vy
+    else
+        ox = h->ix : oy = h->iy
+    end if
+end sub
+
+' A surface's size in pixels: a window's (in window coordinates, so divided by its density), or a
+' virtual surface's rectangle, which keeps its corner unless it no longer fits in its base.
+public sub tkHost_SetPixelSize( byval h as TK_HOST ptr, byval w as long, byval hgt as long )
+    if h = 0 then exit sub
+    if h->bVirtual = false then
+        SDL_SetWindowSize( h->win, cint( w / h->fDensity ), cint( hgt / h->fDensity ) )
+        exit sub
+    end if
+    dim as TK_HOST ptr b = h->pBase
+    h->vw = iif( w < b->root->cw, w, b->root->cw ) : h->vh = iif( hgt < b->root->ch, hgt, b->root->ch )
+    if h->vx + h->vw > b->root->cw then h->vx = b->root->cw - h->vw
+    if h->vy + h->vh > b->root->ch then h->vy = b->root->ch - h->vh
+    SizeRoot( h )
+    if h->OnSize then h->OnSize( h )
+    h->bDirty = true
+    b->bDirty = true
+end sub
+
+' Is h on screen: a window not hidden, or a virtual surface shown and not closed.
+public function tkHost_IsShown( byval h as TK_HOST ptr ) as boolean
+    if (h = 0) orelse h->bClosed then return false
+    if h->bVirtual then return h->bShown
+    return (SDL_GetWindowFlags( h->win ) and SDL_WINDOW_HIDDEN) = 0
+end function
+
+' h's title: its window's, or the one a virtual page was created with.
+public function tkHost_GetTitle( byval h as TK_HOST ptr ) as ustring
+    if h = 0 then return ""
+    if h->bVirtual then return h->sTitle
+    dim as const zstring ptr t = SDL_GetWindowTitle( h->win )
+    if t = 0 then return ""
+    return *t
+end function
+
+' A virtual surface centred in its base (a dialog after it was sized). Nothing for a window.
+public sub tkHost_CentreVirtual( byval h as TK_HOST ptr )
+    if (h = 0) orelse (h->bVirtual = false) then exit sub
+    h->vx = (h->pBase->root->cw - h->vw) \ 2 : h->vy = (h->pBase->root->ch - h->vh) \ 2
+    h->pBase->bDirty = true
+end sub
+
+' The back buffer's pixels in a rect of h's own pixels (render with tkHost_RenderTo( h, false )
+' first): SDL_RenderReadPixels, moved by h's origin -- a virtual surface's place, the safe area's
+' corner -- and read with no viewport. A window on the desktop reads exactly what it did.
+public function tkHost_ReadPixels( byval h as TK_HOST ptr, byval rc as const SDL_Rect ptr ) as SDL_Surface ptr
+    if (h = 0) orelse (rc = 0) then return 0
+    dim as SDL_Rect r = *rc
+    dim as long ox, oy
+    tkHost_Origin( h, ox, oy )
+    r.x += ox : r.y += oy
+    if Virtual_() then SDL_SetRenderViewport( h->renderer, 0 )
+    return SDL_RenderReadPixels( h->renderer, @r )
+end function
+
+' The window id an SDL event addressed to h carries: its own, or a virtual surface's base's.
+public function tkHost_WindowId( byval h as TK_HOST ptr ) as SDL_WindowID
+    if h = 0 then return 0
+    return h->winId
+end function
+
+' A point in h's pixels as an SDL event addressed to h carries it: h's window id and WINDOW
+' coordinates (a virtual surface's own id, so the event reaches it directly). What a test pushes.
+public sub tkHost_ToWindow( byval h as TK_HOST ptr, byval px as single, byval py as single, _
+                            byref wid as SDL_WindowID, byref wx as single, byref wy as single )
+    wid = 0 : wx = px : wy = py
+    if h = 0 then exit sub
+    wid = h->winId
+    if h->bVirtual = false then px += h->ix : py += h->iy
+    wx = px / h->fDensity : wy = py / h->fDensity
 end sub
 
 public sub tkHost_Invalidate( byval h as TK_HOST ptr )
@@ -701,6 +1135,27 @@ public sub tkHost_PlacePopup( byval owner as TK_HOST ptr, byref rcAnchor as TKRE
     x = rcAnchor.left : y = rcAnchor.bottom
     if bSide then x = rcAnchor.right : y = rcAnchor.top
     if owner = 0 then exit sub
+    ' VIRTUAL: the room is the base window's, in the owner's pixels; flipped as below, then kept
+    ' inside it, since nothing can be drawn outside the one window.
+    if Virtual_() then
+        dim as TK_HOST ptr b = BaseOf_( owner )
+        if b = 0 then exit sub
+        dim as long ox = 0, oy = 0
+        if owner->bVirtual then ox = owner->vx : oy = owner->vy
+        dim as long bw = b->root->cw, bh = b->root->ch
+        if bSide then
+            if ox + x + w > bw then x = rcAnchor.left - w
+            if oy + y + hgt > bh then y = rcAnchor.bottom - hgt
+        else
+            if oy + y + hgt > bh then y = rcAnchor.top - hgt
+            if ox + x + w > bw then x = rcAnchor.right - w
+        end if
+        if ox + x + w > bw then x = bw - w - ox
+        if oy + y + hgt > bh then y = bh - hgt - oy
+        if ox + x < 0 then x = -ox
+        if oy + y < 0 then y = -oy
+        exit sub
+    end if
     dim as SDL_Rect rd
     if SDL_GetDisplayUsableBounds( SDL_GetDisplayForWindow( owner->win ), @rd ) = false then exit sub
     dim as long wx, wy
@@ -889,12 +1344,120 @@ public function tkHost_GetFocus( byval h as TK_HOST ptr ) as TK_WIDGET ptr
     return h->pFocus
 end function
 
+' THE SOFT KEYBOARD AND WHERE IT LOOKS (A5 step 6). On Android SDL puts a hidden EditText at the
+' text input area, and the window is panned until that EditText clears the keyboard (measured: a
+' box at the bottom moved up 730 px). A control gives the caret's line, so the pan stopped with
+' the rest of the box under the keyboard; with virtual surfaces the area is the whole focused
+' widget, and it is set before the keyboard is asked for, so the first pan is the right one.
+private sub WholeWidgetArea_( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byval cursorX as long )
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    dim as long ox, oy
+    tkHost_Origin( h, ox, oy )
+    dim as SDL_Rect r
+    r.x = cint( (a.left + ox) / h->fDensity ) : r.y = cint( (a.top + oy) / h->fDensity )
+    r.w = cint( (a.right - a.left) / h->fDensity ) : r.h = cint( (a.bottom - a.top) / h->fDensity )
+    SDL_SetTextInputArea( h->win, @r, cint( cursorX / h->fDensity ) )
+end sub
+
+' THE KIND OF KEYBOARD (docs/fasting-android F4 X1): a text widget says what it takes -- a line, a
+' multi-line note, a decimal, a whole number, a password -- and the text input is started with
+' those properties, so a phone shows a number pad, or a keyboard that does not learn a password.
+' SDL has no decimal type: its NUMBER is Android's TYPE_CLASS_NUMBER without the DECIMAL flag
+' (measured, F0-FACTS c), so Android's own input type is given as well (0x3002 = NUMBER | SIGNED |
+' DECIMAL; 0x1002 NUMBER | SIGNED; 0x81 TEXT | PASSWORD, no autocorrect). TK_TEXT_DEFAULT is SDL's
+' own default, as every text widget had before. On a desktop the properties change nothing visible.
+private sub StartText_( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr )
+    dim as long k = 0
+    if w then k = w->nTextKind
+    h->nTextKindOn = k
+    if k = TK_TEXT_DEFAULT then SDL_StartTextInput( h->win ) : exit sub
+    dim as SDL_PropertiesID p = SDL_CreateProperties( )
+    select case k
+    case TK_TEXT_LINE
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_TEXT )
+        SDL_SetBooleanProperty( p, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN, false )
+    case TK_TEXT_MULTILINE
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_TEXT )
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_CAPITALIZATION_NUMBER, SDL_CAPITALIZE_SENTENCES )
+        SDL_SetBooleanProperty( p, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN, true )
+    case TK_TEXT_DECIMAL
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_NUMBER )
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_ANDROID_INPUTTYPE_NUMBER, &h3002 )
+        SDL_SetBooleanProperty( p, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN, false )
+    case TK_TEXT_INTEGER
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_NUMBER )
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_ANDROID_INPUTTYPE_NUMBER, &h1002 )
+        SDL_SetBooleanProperty( p, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN, false )
+    case TK_TEXT_PASSWORD
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_TEXT_PASSWORD_HIDDEN )
+        SDL_SetNumberProperty( p, SDL_PROP_TEXTINPUT_ANDROID_INPUTTYPE_NUMBER, &h81 )
+        SDL_SetBooleanProperty( p, SDL_PROP_TEXTINPUT_AUTOCORRECT_BOOLEAN, false )
+        SDL_SetBooleanProperty( p, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN, false )
+    end select
+    SDL_StartTextInputWithProperties( h->win, p )
+    SDL_DestroyProperties( p )
+end sub
+
+' THE KEYBOARD AGAIN: Android ignores the request made while the window is not focused (a field
+' focused at start-up got none, measured), and BACK hides it with the field still focused. As an
+' Android field does, a tap on the focused text widget -- or the window gaining focus -- asks again.
+private sub KeyboardAgain_( byval h as TK_HOST ptr )
+    if (h = 0) orelse (h->bTextInput = false) orelse (h->pFocus = 0) then exit sub
+    if SDL_HasScreenKeyboardSupport( ) = false then exit sub        ' a desktop: no keyboard to bring back
+    if (h->pFocus->bWantsText = false) orelse SDL_ScreenKeyboardShown( h->win ) then exit sub
+    WholeWidgetArea_( h, h->pFocus, 0 )
+    SDL_StopTextInput( h->win )
+    StartText_( h, h->pFocus )
+end sub
+
+public declare sub tkWidget_SetTimer( byval w as TK_WIDGET ptr, byval id as long, byval ms as long )
+public declare sub tkWidget_KillTimer( byval w as TK_WIDGET ptr, byval id as long )
+
 private sub UpdateTextInput( byval h as TK_HOST ptr )
     dim as boolean bWant = (h->pFocus <> 0) andalso h->pFocus->bWantsText
-    if bWant = h->bTextInput then exit sub
+    dim as long k = 0
+    if bWant then k = h->pFocus->nTextKind
+    ' the same state -- or text input on for a field of the same kind -- needs nothing; a field of
+    ' ANOTHER kind restarts it, or the keyboard would stay the previous field's
+    if bWant = false then tkWidget_KillTimer( h->root, TK_TIMER_TEXTRESTART )    ' a restart still due is moot
+    if (bWant = h->bTextInput) andalso ((bWant = false) orelse (k = h->nTextKindOn)) then exit sub
+    ' ANOTHER KIND WHILE TYPING: stopped and started again -- but on a phone the start comes
+    ' 120 ms later (TK_TIMER_TEXTRESTART). Measured on Android (F4): a start straight after the
+    ' stop lost to the stop's hide, so every other field got no keyboard at all; and a second
+    ' start without a stop is ignored, so the keyboard stayed the previous field's kind.
+    if bWant andalso h->bTextInput then
+        SDL_StopTextInput( h->win )
+        if SDL_HasScreenKeyboardSupport( ) then
+            h->nTextKindOn = k
+            if Virtual_() then WholeWidgetArea_( h, h->pFocus, 0 )
+            tkWidget_SetTimer( h->root, TK_TIMER_TEXTRESTART, 120 )
+            exit sub
+        end if
+    end if
     h->bTextInput = bWant
-    if bWant then SDL_StartTextInput( h->win ) else SDL_StopTextInput( h->win )
+    if bWant andalso Virtual_() then WholeWidgetArea_( h, h->pFocus, 0 )
+    if bWant then StartText_( h, h->pFocus ) else SDL_StopTextInput( h->win )
 end sub
+
+' A widget's keyboard kind (TK_TEXT_*); a focused one's text input restarts with it.
+public sub tkWidget_SetTextKind( byval w as TK_WIDGET ptr, byval kind as long )
+    if w = 0 then exit sub
+    if w->nTextKind = kind then exit sub
+    w->nTextKind = kind
+    if (w->pHost <> 0) andalso (w->pHost->pFocus = w) then UpdateTextInput( w->pHost )
+end sub
+
+public function tkWidget_GetTextKind( byval w as TK_WIDGET ptr ) as long
+    if w = 0 then return 0
+    return w->nTextKind
+end function
+
+' What the live text input was started with: -1 when none is on (self-tests).
+public function tkHost_TextKindOn( byval h as TK_HOST ptr ) as long
+    if (h = 0) orelse (h->bTextInput = false) then return -1
+    return h->nTextKindOn
+end function
 
 public sub tkHost_SetFocus( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr )
     if h = 0 then exit sub
@@ -914,11 +1477,15 @@ end sub
 public sub tkHost_SetTextInputArea( byval w as TK_WIDGET ptr, byref rc as TKRECT, byval cursorX as long )
     if (w = 0) orelse (w->pHost = 0) then exit sub
     dim as TK_HOST ptr h = w->pHost
+    if Virtual_() then WholeWidgetArea_( h, w, rc.left + cursorX ) : exit sub   ' see UpdateTextInput
     dim as TKRECT a
     tkWidget_AbsRect( w, a )
     dim as SDL_Rect r
     r.x = cint( (a.left + rc.left) / h->fDensity ) : r.y = cint( (a.top + rc.top) / h->fDensity )
     r.w = cint( (rc.right - rc.left) / h->fDensity ) : r.h = cint( (rc.bottom - rc.top) / h->fDensity )
+    dim as long ox, oy
+    tkHost_Origin( h, ox, oy )
+    r.x += cint( ox / h->fDensity ) : r.y += cint( oy / h->fDensity )
     SDL_SetTextInputArea( h->win, @r, cint( cursorX / h->fDensity ) )
 end sub
 
@@ -1032,7 +1599,32 @@ public sub tkWidget_Show( byval w as TK_WIDGET ptr, byval bShow as boolean )
     m.bFlag = bShow
     tkWidget_Send( w, @m )
     tkWidget_Invalidate( w )
+    if gOnShowChanged then gOnShowChanged( w, bShow )
 end sub
+
+' ---- adornments: a child that decorates its parent (an attached badge, a validation mark). It is
+' ---- painted right after the parent's own subtree, with the clip the PARENT was given -- so it
+' ---- may overhang the parent and sits above it and its other children -- after a TKM_ADORNLAYOUT
+' ---- that lets it place itself against the parent's current size. It is never hit-tested (a
+' ---- click on it reaches whatever is below), never in the Tab order, and otherwise an ordinary
+' ---- child: hidden, moved, rescaled, rethemed and destroyed with its parent. A sibling above the
+' ---- parent in z-order covers it as it covers the parent. ----------------------------------------
+public sub tkWidget_SetAdorner( byval w as TK_WIDGET ptr, byval bOn as boolean )
+    if (w = 0) orelse (w->bAdorner = bOn) then exit sub
+    w->bAdorner = bOn
+    dim as TK_HOST ptr h = w->pHost
+    if bOn andalso (h <> 0) then
+        ' it takes no input from now on: let go of whatever input state it held
+        if IsWithin( w, h->pCapture ) then tkHost_ReleaseCapture( h )
+        if IsWithin( w, h->pFocus ) then tkHost_SetFocus( h, 0 )
+        if IsWithin( w, h->pHot ) then h->pHot = 0
+    end if
+    tkWidget_Invalidate( w )
+end sub
+
+public function tkWidget_IsAdorner( byval w as TK_WIDGET ptr ) as boolean
+    return (w <> 0) andalso w->bAdorner
+end function
 
 ' ---- context menus: a component (tkContextMenu) a right-click or the Menu key opens. The
 ' ---- release of the right button over w, or over anything inside it, goes to the component as
@@ -1195,13 +1787,24 @@ private sub DestroyNow( byval h as TK_HOST ptr )
         while h->root->pLast
             tkWidget_Destroy( h->root->pLast )
         wend
+        ' the root's own timers too (the keyboard restart, F4): a tick after this would reach a
+        ' freed widget -- measured, a SIGSEGV in tkHost_Dispatch on the next host's pump
+        for i as long = 0 to ubound( gTimers )
+            if gTimers(i).active andalso (gTimers(i).pW = h->root) then tkWidget_KillTimer( h->root, gTimers(i).id )
+        next
         delete h->root
         h->root = 0
     end if
     for k as long = 0 to ubound( h->fonts )
-        TTF_CloseFont( h->fonts(k).f )
+        tkHost_CloseFont( h->fonts(k).f )
     next
     Unregister( h )
+    if gMouseHost = h then gMouseHost = 0
+    if h->bVirtual then
+        if h->pBase then h->pBase->bDirty = true
+        delete h
+        exit sub
+    end if
     if h->engine then TTF_DestroyRendererTextEngine( h->engine )
     if h->renderer then
         if gOnRendererGone then gOnRendererGone( h->renderer )
@@ -1221,7 +1824,15 @@ public sub tkHost_Close( byval h as TK_HOST ptr )
     next
     h->bClosed = true
     if h->pCapture then tkHost_ReleaseCapture( h )
-    SDL_HideWindow( h->win )
+    if h->bVirtual then
+        h->bShown = false
+        h->pBase->bDirty = true
+    else
+        ' master's f643496b3: an owned dialog hidden while active hands activation to its owner first.
+        ' Not for a virtual surface: it is a rectangle in its owner's window, never active on its own.
+        GiveActivationToOwner_( h )
+        SDL_HideWindow( h->win )
+    end if
     if h->pOwner then h->pOwner->bDirty = true
     if h->OnClosed then h->OnClosed( h )
 end sub
@@ -1258,29 +1869,52 @@ end sub
 
 
 ' ---- painting ----------------------------------------------------------------------------
+' One widget at window pixels (cx, cy), then its children, inside rcClip.
+private sub PaintOne( byval h as TK_HOST ptr, byval c as TK_WIDGET ptr, byval cx as long, byval cy as long, _
+                      byref rcClip as TKRECT )
+    dim as TK_PAINT wp
+    wp.renderer = h->renderer
+    wp.engine = h->engine
+    wp.pFont = h->pDefaultFont
+    wp.fScale = h->fScale
+    wp.Begin( cx, cy, c->cw, c->ch, @rcClip )
+    if tkRect_IsEmpty( wp.rcClip ) then exit sub
+    dim as TK_MSG m
+    m.msg = TKM_PAINT
+    m.pPaint = @wp
+    tkWidget_Send( c, @m )
+    if c->pFirst then
+        dim as TKRECT rcKids = rcClip
+        if c->bClipChildren then rcKids = wp.rcClip
+        PaintTree( h, c, cx, cy, rcKids )
+    end if
+end sub
+
+' c's adornments, after c's own subtree: placed (TKM_ADORNLAYOUT) against c as it is now, then
+' painted with the clip c itself was given, so they may overhang c and sit above it and its children.
+private sub PaintAdornments( byval h as TK_HOST ptr, byval c as TK_WIDGET ptr, byval cx as long, byval cy as long, _
+                             byref rcClip as TKRECT )
+    dim as TK_WIDGET ptr a = c->pFirst
+    while a
+        if a->bAdorner andalso a->isVisible then
+            dim as boolean bWasDirty = h->bDirty
+            SendSimple( a, TKM_ADORNLAYOUT )
+            h->bDirty = bWasDirty                ' this frame paints the new rect already
+            if (a->cw > 0) andalso (a->ch > 0) then PaintOne( h, a, cx + a->x, cy + a->y, rcClip )
+        end if
+        a = a->pNext
+    wend
+end sub
+
 private sub PaintTree( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byval ax as long, byval ay as long, _
                        byref rcClip as TKRECT )
     dim as TK_WIDGET ptr c = w->pFirst
     while c
-        if c->isVisible andalso (c->cw > 0) andalso (c->ch > 0) then
+        ' an adornment is painted by its target's turn (PaintAdornments), never in the child order
+        if (c->bAdorner = false) andalso c->isVisible andalso (c->cw > 0) andalso (c->ch > 0) then
             dim as long cx = ax + c->x, cy = ay + c->y
-            dim as TK_PAINT wp
-            wp.renderer = h->renderer
-            wp.engine = h->engine
-            wp.pFont = h->pDefaultFont
-            wp.fScale = h->fScale
-            wp.Begin( cx, cy, c->cw, c->ch, @rcClip )
-            if tkRect_IsEmpty( wp.rcClip ) = false then
-                dim as TK_MSG m
-                m.msg = TKM_PAINT
-                m.pPaint = @wp
-                tkWidget_Send( c, @m )
-                if c->pFirst then
-                    dim as TKRECT rcKids = rcClip
-                    if c->bClipChildren then rcKids = wp.rcClip
-                    PaintTree( h, c, cx, cy, rcKids )
-                end if
-            end if
+            PaintOne( h, c, cx, cy, rcClip )
+            PaintAdornments( h, c, cx, cy, rcClip )
         end if
         c = c->pNext
     wend
@@ -1288,9 +1922,49 @@ end sub
 
 ' Paint the whole surface into the back buffer; present it when bPresent. Reading pixels for a
 ' test means NOT presenting first -- the back buffer is undefined after a present.
+' One virtual surface over its base, already painted: its rectangle is the viewport, so its
+' tree and OnPaint draw in its own pixels and are clipped to it.
+private sub PaintVirtual_( byval v as TK_HOST ptr )
+    dim as SDL_Rect vr = ( v->pBase->ix + v->vx, v->pBase->iy + v->vy, v->vw, v->vh )
+    SDL_SetRenderViewport( v->renderer, @vr )
+    SDL_SetRenderClipRect( v->renderer, 0 )
+    v->root->cw = v->vw : v->root->ch = v->vh
+    SDL_SetRenderDrawColor( v->renderer, (v->clrBack shr 16) and 255, (v->clrBack shr 8) and 255, v->clrBack and 255, (v->clrBack shr 24) and 255 )
+    dim as SDL_FRect fr = ( 0, 0, v->vw, v->vh )
+    SDL_RenderFillRect( v->renderer, @fr )
+    dim as TK_PAINT p
+    p.renderer = v->renderer
+    p.engine = v->engine
+    p.pFont = v->pDefaultFont
+    p.fScale = v->fScale
+    p.Begin( 0, 0, v->vw, v->vh )
+    if v->OnPaint then v->OnPaint( v, @p )
+    dim as TKRECT rcAll
+    tkRect_Set( rcAll, 0, 0, v->vw, v->vh )
+    PaintTree( v, v->root, 0, 0, rcAll )
+    SDL_SetRenderClipRect( v->renderer, 0 )
+    v->bDirty = false
+end sub
+
 public sub tkHost_RenderTo( byval h as TK_HOST ptr, byval bPresent as boolean )
     if (h = 0) orelse h->bClosed then exit sub
+    ' A virtual surface is painted as part of its base. Not presenting leaves the viewport on it,
+    ' so SDL_RenderReadPixels reads ITS pixels (SDL3 reads relative to the viewport), as a test
+    ' reading a popup's window did.
+    if h->bVirtual then
+        tkHost_RenderTo( h->pBase, bPresent )
+        ' a render to READ a surface that is not shown yet paints it anyway, as a hidden window's
+        ' back buffer is painted on the desktop (a test measuring a box before it is run)
+        if (bPresent = false) andalso (h->bShown = false) then PaintVirtual_( h )
+        if bPresent = false then
+            dim as SDL_Rect vr = ( h->pBase->ix + h->vx, h->pBase->iy + h->vy, h->vw, h->vh )
+            SDL_SetRenderViewport( h->renderer, @vr )
+        end if
+        h->bDirty = false
+        exit sub
+    end if
     h->bDirty = false
+    if Virtual_() then SDL_SetRenderViewport( h->renderer, 0 )   ' a read of a virtual surface left it on that
     dim as long pw, ph
     tkHost_PixelSize( h, pw, ph )
     h->root->cw = pw : h->root->ch = ph
@@ -1298,6 +1972,10 @@ public sub tkHost_RenderTo( byval h as TK_HOST ptr, byval bPresent as boolean )
     ' The clear honours clrBack's ALPHA: a transparent surface (a rounded tooltip) clears to 0.
     SDL_SetRenderDrawColor( h->renderer, (h->clrBack shr 16) and 255, (h->clrBack shr 8) and 255, h->clrBack and 255, (h->clrBack shr 24) and 255 )
     SDL_RenderClear( h->renderer )
+    if Virtual_() andalso ((h->ix <> 0) orelse (h->iy <> 0)) then
+        dim as SDL_Rect sr = ( h->ix, h->iy, pw, ph )
+        SDL_SetRenderViewport( h->renderer, @sr )
+    end if
     dim as TK_PAINT p
     p.renderer = h->renderer
     p.engine = h->engine
@@ -1309,9 +1987,20 @@ public sub tkHost_RenderTo( byval h as TK_HOST ptr, byval bPresent as boolean )
     tkRect_Set( rcAll, 0, 0, pw, ph )
     PaintTree( h, h->root, 0, 0, rcAll )
     SDL_SetRenderClipRect( h->renderer, 0 )
+    ' the virtual surfaces over it, in creation order: a submenu after its menu
+    if Virtual_() then
+        for i as long = 0 to gnHosts - 1
+            dim as TK_HOST ptr v = gHosts(i)
+            if v->bVirtual andalso (v->pBase = h) andalso v->bShown andalso (v->bClosed = false) then PaintVirtual_( v )
+        next
+        SDL_SetRenderViewport( h->renderer, 0 )
+    end if
     if bPresent then
         SDL_RenderPresent( h->renderer )
         h->nFrames += 1
+        ' The first present after a return to the foreground is never shown (see ResumeWatch):
+        ' paint and present once more.
+        if h->bResumed then h->bResumed = false : tkHost_RenderTo( h, true )
     end if
 end sub
 
@@ -1319,6 +2008,24 @@ end sub
 public sub tkHost_Render( byval h as TK_HOST ptr )
     tkHost_RenderTo( h, true )
 end sub
+
+' BACK IN THE FOREGROUND (Android). HOME destroys the Activity's surface; on the return SDL makes a
+' new one and restores the GL context, and the window comes back RESTORED -- but no EXPOSED, so
+' nothing was dirty and the window stayed black until something repainted. Worse, the first
+' SDL_RenderPresent after the return is never shown: a plain SDL program that presents once per
+' tap shows black for the first tap and the right frame from the second, with no lag after it
+' (measured, API 36 emulator, SDL 3.4.14, 2026-11-25). So every window is dirty again AND its
+' next render presents twice. SDL only calls watchers for this event (it is never queued); the
+' RESTORED it sends next wakes the loop that renders, after the renderer stops counting the
+' window hidden. Main thread only, as below.
+private function ResumeWatch( byval e as SDL_Event ptr ) as boolean
+    if SDL_IsMainThread( ) = false then return true
+    for i as long = 0 to gnHosts - 1
+        dim as TK_HOST ptr h = gHosts(i)
+        if (h->bVirtual = false) andalso (h->bClosed = false) then h->bDirty = true : h->bResumed = true
+    next
+    return true
+end function
 
 ' LIVE RESIZE. While a window edge is dragged, Windows runs its own loop: the application's loop
 ' sees no event until the drag ends, so the window's contents kept their old layout until then.
@@ -1328,12 +2035,14 @@ end sub
 ' when the drag ends, which costs one layout. Main thread only: a watcher also sees events pushed
 ' from other threads (tkFileDialog's answer).
 function LiveResizeWatch( byval userdata as any ptr, byval e as SDL_Event ptr ) as boolean
+    if e->type = SDL_EVENT_DID_ENTER_FOREGROUND then return ResumeWatch( e )
     if (e->type <> SDL_EVENT_WINDOW_EXPOSED) orelse (e->window.data1 <> 1) then return true
     if SDL_IsMainThread( ) = false then return true
     dim as TK_HOST ptr h = HostOfWindow( e->window.windowID )
     if (h = 0) orelse h->bClosed then return true
     SizeRoot( h )
     if h->OnSize then h->OnSize( h )
+    RunSizeHooks_( h )
     tkHost_Render( h )
     return true
 end function
@@ -1346,7 +2055,7 @@ private function HitIn( byval w as TK_WIDGET ptr, byval px as single, byval py a
                         byval ax as long, byval ay as long ) as TK_WIDGET ptr
     dim as TK_WIDGET ptr c = w->pLast
     while c
-        if c->isVisible then
+        if c->isVisible andalso (c->bAdorner = false) then     ' an adornment is never hit
             dim as long cx = ax + c->x, cy = ay + c->y
             dim as boolean bIn = (px >= cx) andalso (px < cx + c->cw) andalso (py >= cy) andalso (py < cy + c->ch)
             if bIn orelse (c->bClipChildren = false) then
@@ -1462,7 +2171,7 @@ private sub CollectFocusable( byval w as TK_WIDGET ptr, list() as TK_WIDGET ptr,
     next
     for i as long = 0 to nk - 1
         c = kids( i )
-        if c->isVisible andalso c->isEnabled then
+        if c->isVisible andalso c->isEnabled andalso (c->bAdorner = false) then
             if c->isFocusable andalso (n <= ubound( list )) then list(n) = c : n += 1
             CollectFocusable( c, list(), n )
         end if
@@ -1523,6 +2232,7 @@ private sub RescaleAll( byval h as TK_HOST ptr )
     RescaleTree( h->root, fOld, h->fScale )
     if h->OnScale then h->OnScale( h )
     if h->OnSize then h->OnSize( h )
+    RunSizeHooks_( h )
     h->bDirty = true
 end sub
 
@@ -1532,6 +2242,14 @@ end sub
 public sub tkHost_WorkRect( byval h as TK_HOST ptr, byref rc as TKRECT )
     tkRect_Set( rc, -1000000, -1000000, 1000000, 1000000 )
     if h = 0 then exit sub
+    ' virtual: the base window, in h's pixels -- nothing can be drawn outside it
+    if Virtual_() then
+        dim as TK_HOST ptr b = BaseOf_( h )
+        if h->bVirtual = false then b = h
+        if b then tkRect_Set( rc, iif( h->bVirtual, -h->vx, 0 ), iif( h->bVirtual, -h->vy, 0 ), _
+                              b->root->cw - iif( h->bVirtual, h->vx, 0 ), b->root->ch - iif( h->bVirtual, h->vy, 0 ) )
+        exit sub
+    end if
     if *SDL_GetCurrentVideoDriver() = "wayland" then exit sub
     dim as SDL_Rect rd
     if SDL_GetDisplayUsableBounds( SDL_GetDisplayForWindow( h->win ), @rd ) = false then exit sub
@@ -1698,6 +2416,7 @@ private sub DispatchTo( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, SDL_EVENT_WINDOW_RESIZED
         SizeRoot( h )
         if h->OnSize then h->OnSize( h )
+        RunSizeHooks_( h )
         h->bDirty = true
 
     case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED
@@ -1845,6 +2564,300 @@ private function EventWindow( byval e as SDL_Event ptr ) as SDL_WindowID
     return 0
 end function
 
+' Is v an open, shown virtual surface of base?
+private function LiveVirtual_( byval v as TK_HOST ptr, byval base_ as TK_HOST ptr ) as boolean
+    return v->bVirtual andalso (v->pBase = base_) andalso v->bShown andalso (v->bClosed = false)
+end function
+
+' THE VIRTUAL ROUTER: which surface an event that SDL addressed to base's window belongs to, and
+' the event as that surface would have received it (`ev`, coordinates in its own window space).
+'   pointer   the surface holding the capture; else the topmost live virtual surface under the
+'             point (a tooltip takes no input); else the topmost modal one -- a dialog or a page
+'             -- when the point is outside it (the modal loop then drops it); else base
+'   keys      the top popup (the dispatcher's own rule, after this); else the topmost dialog or
+'             page; else base
+'   the rest  base (window events, drops begun)
+private function VirtualTarget_( byval base_ as TK_HOST ptr, byval e as SDL_Event ptr, byref ev as SDL_Event ) as TK_HOST ptr
+    ev = *e
+    dim as single wx, wy
+    dim as boolean bPointer = true
+    select case e->type
+    case SDL_EVENT_MOUSE_MOTION : wx = e->motion.x : wy = e->motion.y
+    case SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP : wx = e->button.x : wy = e->button.y
+    case SDL_EVENT_MOUSE_WHEEL : wx = e->wheel.mouse_x : wy = e->wheel.mouse_y
+    case SDL_EVENT_DROP_COMPLETE : wx = e->drop.x : wy = e->drop.y
+    case SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP, SDL_EVENT_TEXT_INPUT, SDL_EVENT_TEXT_EDITING
+        bPointer = false
+        for i as long = gnHosts - 1 to 0 step -1
+            dim as TK_HOST ptr v = gHosts(i)
+            if LiveVirtual_( v, base_ ) andalso ((v->kind = TK_SURF_DIALOG) orelse (v->kind = TK_SURF_MAIN)) then return v
+        next
+        return base_
+    case else
+        return base_
+    end select
+    dim as TK_HOST ptr t = 0
+    if base_->pCapture = 0 then
+        for i as long = gnHosts - 1 to 0 step -1
+            dim as TK_HOST ptr v = gHosts(i)
+            if LiveVirtual_( v, base_ ) andalso (v->pCapture <> 0) then t = v : exit for
+        next
+    end if
+    if t = 0 andalso (base_->pCapture = 0) then
+        dim as single px = wx * base_->fDensity - base_->ix, py = wy * base_->fDensity - base_->iy
+        for i as long = gnHosts - 1 to 0 step -1
+            dim as TK_HOST ptr v = gHosts(i)
+            if LiveVirtual_( v, base_ ) andalso (v->kind <> TK_SURF_TOOLTIP) then
+                if (px >= v->vx) andalso (py >= v->vy) andalso (px < v->vx + v->vw) andalso (py < v->vy + v->vh) then t = v : exit for
+                ' a modal surface keeps the pointer: what falls outside it is no one else's
+                if (v->kind = TK_SURF_DIALOG) orelse (v->kind = TK_SURF_MAIN) then t = v : exit for
+            end if
+        next
+    end if
+    if t = 0 then t = base_
+    dim as single ox = base_->ix / base_->fDensity, oy = base_->iy / base_->fDensity
+    if t->bVirtual then ox += t->vx / base_->fDensity : oy += t->vy / base_->fDensity
+    if (ox <> 0) orelse (oy <> 0) then
+        select case e->type
+        case SDL_EVENT_MOUSE_MOTION : ev.motion.x -= ox : ev.motion.y -= oy
+        case SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP : ev.button.x -= ox : ev.button.y -= oy
+        case SDL_EVENT_MOUSE_WHEEL : ev.wheel.mouse_x -= ox : ev.wheel.mouse_y -= oy
+        case SDL_EVENT_DROP_COMPLETE : ev.drop.x -= ox : ev.drop.y -= oy
+        end select
+    end if
+    ' the pointer moved to another surface: the one it left loses its hot widget, as a window
+    ' the mouse leaves gets SDL_EVENT_WINDOW_MOUSE_LEAVE
+    if (gMouseHost <> 0) andalso (gMouseHost <> t) andalso (gMouseHost->bClosed = false) andalso (gMouseHost->pCapture = 0) then SetHot( gMouseHost, 0 )
+    gMouseHost = t
+    return t
+end function
+
+' On a base's resize: pages keep covering it, dialogs are centred again, popups close -- as a
+' window's popups close when the window moves.
+private sub RelayoutVirtual_( byval base_ as TK_HOST ptr )
+    for i as long = gnHosts - 1 to 0 step -1
+        if i >= gnHosts then continue for
+        dim as TK_HOST ptr v = gHosts(i)
+        if v->bVirtual andalso (v->pBase = base_) andalso (v->bClosed = false) then
+            select case v->kind
+            case TK_SURF_MAIN
+                v->vw = base_->root->cw : v->vh = base_->root->ch
+                SizeRoot( v )
+                if v->OnSize then v->OnSize( v )
+            case TK_SURF_DIALOG
+                if v->vw > base_->root->cw then v->vw = base_->root->cw
+                if v->vh > base_->root->ch then v->vh = base_->root->ch
+                v->vx = (base_->root->cw - v->vw) \ 2 : v->vy = (base_->root->ch - v->vh) \ 2
+                SizeRoot( v )
+                if v->OnSize then v->OnSize( v )
+            case else
+                tkHost_Close( v )
+            end select
+            v->bDirty = true
+        end if
+    next
+end sub
+
+' ---- touch gestures (see top) ----------------------------------------------------------------
+const TK_LONGPRESS_MS = 500
+const TK_TOUCH_SLOP_DP = 8           ' how far a finger moves before it is a drag, in design units
+const TK_TOUCH_NOTCH_DP = 60         ' finger travel per wheel notch: about three rows of a list
+dim shared as Uint32 gEvTouch        ' this module's event: code 1 long-press, 2 fling step, 3 tap timeout
+dim shared as long gTouchMode        ' 0 none, 1 pressed, 2 scrolling, 3 long-pressed
+dim shared as SDL_FingerID gTouchFinger
+dim shared as SDL_WindowID gTouchWin
+dim shared as single gTouchX0, gTouchY0, gTouchX, gTouchY    ' window coordinates
+dim shared as single gTouchVX, gTouchVY                      ' window units per ms, while scrolling
+dim shared as Uint64 gTouchT
+dim shared as long gTouchSerial
+dim shared as single gFlingVX, gFlingVY
+const TK_PRESS_DELAY_MS = 120
+dim shared as boolean gPressHeld     ' SDL's touch-mouse press, held (see top)
+dim shared as boolean gPressSent     ' ...and delivered
+dim shared as SDL_WindowID gPressWin
+dim shared as single gPressX, gPressY
+
+private function TouchTick_( byval userdata as any ptr, byval timerID as SDL_TimerID, byval interval as Uint32 ) as Uint32
+    dim as SDL_Event e
+    e.type = gEvTouch
+    e.user.code = cast( long, cast( integer, userdata ) and &hFFFF )
+    e.user.data1 = cast( any ptr, cast( integer, userdata ) shr 16 )
+    SDL_PushEvent( @e )
+    return 0
+end function
+
+private sub PushMouse_( byval t as Uint32, byval wid as SDL_WindowID, byval x as single, byval y as single, byval btn as Uint8 )
+    dim as SDL_Event e
+    e.type = t
+    e.button.windowID = wid
+    e.button.which = 0                  ' not SDL_TOUCH_MOUSEID: these are the layer's own
+    e.button.button = btn
+    e.button.down = (t = SDL_EVENT_MOUSE_BUTTON_DOWN)
+    e.button.clicks = 1
+    e.button.x = x : e.button.y = y
+    SDL_PushEvent( @e )
+end sub
+
+private sub PushWheel_( byval wid as SDL_WindowID, byval x as single, byval y as single, byval wx as single, byval wy as single )
+    dim as SDL_Event e
+    e.type = SDL_EVENT_MOUSE_WHEEL
+    e.wheel.windowID = wid
+    e.wheel.which = 0
+    e.wheel.x = wx : e.wheel.y = wy
+    e.wheel.mouse_x = x : e.wheel.mouse_y = y
+    e.wheel.direction = SDL_MOUSEWHEEL_NORMAL
+    SDL_PushEvent( @e )
+end sub
+
+' The press the touched widget already has, taken back: released far outside it.
+private sub CancelPress_()
+    PushMouse_( SDL_EVENT_MOUSE_BUTTON_UP, gTouchWin, -100000, -100000, SDL_BUTTON_LEFT )
+end sub
+
+' Finger travel in window units as wheel notches, for the window's base surface.
+private function NotchUnits_( byval wid as SDL_WindowID ) as single
+    dim as TK_HOST ptr b = HostOfWindow( wid )
+    dim as single sc = 1, d = 1
+    if b then sc = b->fScale : d = b->fDensity
+    return TK_TOUCH_NOTCH_DP * sc / d
+end function
+
+' TRUE = the event is the gesture layer's (consumed).
+private sub SendHeldPress_()
+    if gPressHeld andalso (gPressSent = false) then
+        gPressSent = true
+        PushMouse_( SDL_EVENT_MOUSE_BUTTON_DOWN, gPressWin, gPressX, gPressY, SDL_BUTTON_LEFT )
+    end if
+end sub
+
+' TRUE = the event is the gesture layer's (consumed).
+private function Touch_( byval e as SDL_Event ptr ) as boolean
+    if gEvTouch = 0 then gEvTouch = SDL_RegisterEvents( 1 )
+    select case e->type
+    case SDL_EVENT_FINGER_DOWN
+        if gTouchMode <> 0 then return true          ' one finger drives; the rest are ignored
+        dim as SDL_Window ptr w = SDL_GetWindowFromID( e->tfinger.windowID )
+        if w = 0 then return true
+        dim as long ww, wh
+        SDL_GetWindowSize( w, @ww, @wh )
+        gTouchFinger = e->tfinger.fingerID : gTouchWin = e->tfinger.windowID
+        gTouchX0 = e->tfinger.x * ww : gTouchY0 = e->tfinger.y * wh
+        gTouchX = gTouchX0 : gTouchY = gTouchY0
+        gTouchVX = 0 : gTouchVY = 0 : gTouchT = SDL_GetTicks()
+        gFlingVX = 0 : gFlingVY = 0
+        gTouchMode = 1
+        gTouchSerial += 1
+        dim as integer ser = (gTouchSerial and &hFFFF) shl 16
+        SDL_AddTimer( TK_PRESS_DELAY_MS, @TouchTick_, cast( any ptr, ser or 3 ) )
+        SDL_AddTimer( TK_LONGPRESS_MS, @TouchTick_, cast( any ptr, ser or 1 ) )
+        return true
+    case SDL_EVENT_FINGER_MOTION
+        if (gTouchMode = 0) orelse (e->tfinger.fingerID <> gTouchFinger) then return true
+        dim as SDL_Window ptr w = SDL_GetWindowFromID( e->tfinger.windowID )
+        if w = 0 then return true
+        dim as long ww, wh
+        SDL_GetWindowSize( w, @ww, @wh )
+        dim as single x = e->tfinger.x * ww, y = e->tfinger.y * wh
+        if gTouchMode = 1 then
+            dim as TK_HOST ptr b = HostOfWindow( gTouchWin )
+            dim as single slop = TK_TOUCH_SLOP_DP * iif( b <> 0, b->fScale / b->fDensity, 1.0 )
+            if (abs( x - gTouchX0 ) > slop) orelse (abs( y - gTouchY0 ) > slop) then
+                gTouchMode = 2
+                if gPressSent then CancelPress_()
+            end if
+        end if
+        if gTouchMode = 2 then
+            dim as single n = NotchUnits_( gTouchWin )
+            dim as single dx = x - gTouchX, dy = y - gTouchY
+            if (dx <> 0) orelse (dy <> 0) then PushWheel_( gTouchWin, gTouchX0, gTouchY0, -dx / n, dy / n )
+            dim as Uint64 now = SDL_GetTicks()
+            dim as single dt = iif( now > gTouchT, now - gTouchT, 1 )
+            gTouchVX = 0.6 * gTouchVX + 0.4 * (dx / dt) : gTouchVY = 0.6 * gTouchVY + 0.4 * (dy / dt)
+            gTouchT = now
+        end if
+        gTouchX = x : gTouchY = y
+        return true
+    case SDL_EVENT_FINGER_UP, SDL_EVENT_FINGER_CANCELED
+        if (gTouchMode = 0) orelse (e->tfinger.fingerID <> gTouchFinger) then return true
+        ' a scroll that was still moving goes on, slowing: the fling
+        if (gTouchMode = 2) andalso ((abs( gTouchVX ) + abs( gTouchVY )) > 0.3) andalso (SDL_GetTicks() - gTouchT < 100) then
+            gFlingVX = gTouchVX : gFlingVY = gTouchVY
+            gTouchSerial += 1
+            SDL_AddTimer( 16, @TouchTick_, cast( any ptr, cast( integer, ((gTouchSerial and &hFFFF) shl 16) or 2 ) ) )
+        end if
+        gTouchMode = 0
+        gPressHeld = false : gPressSent = false
+        ' the finger is gone: so is the pointer (hover, tooltips)
+        dim as SDL_Event lv
+        lv.type = SDL_EVENT_WINDOW_MOUSE_LEAVE
+        lv.window.windowID = gTouchWin
+        SDL_PushEvent( @lv )
+        return true
+    case SDL_EVENT_MOUSE_MOTION
+        if e->motion.which <> SDL_TOUCH_MOUSEID then return false
+        ' held back until a press is delivered, and while the layer has the gesture
+        return (gPressSent = false) orelse (gTouchMode = 2) orelse (gTouchMode = 3)
+    case SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP
+        if e->button.which <> SDL_TOUCH_MOUSEID then return false
+        if e->type = SDL_EVENT_MOUSE_BUTTON_DOWN then
+            ' held (see top): it arrives before the finger does
+            gPressHeld = true : gPressSent = false
+            gPressWin = e->button.windowID : gPressX = e->button.x : gPressY = e->button.y
+            return true
+        end if
+        ' the release: nothing of a scroll or a long-press; a tap delivers its press with it
+        if (gTouchMode = 2) orelse (gTouchMode = 3) then return true
+        if gPressSent then return false
+        if gPressHeld then
+            SendHeldPress_()
+            PushMouse_( SDL_EVENT_MOUSE_BUTTON_UP, e->button.windowID, e->button.x, e->button.y, SDL_BUTTON_LEFT )
+        end if
+        return true
+    end select
+    if (gEvTouch <> 0) andalso (e->type = gEvTouch) then
+        if cast( long, cast( integer, e->user.data1 ) ) <> (gTouchSerial and &hFFFF) then return true
+        select case e->user.code
+        case 3      ' the tap timeout: a finger still down and still gets its press
+            if gTouchMode = 1 then SendHeldPress_()
+        case 1      ' long-press: still pressed and still
+            if gTouchMode = 1 then
+                gTouchMode = 3
+                if gPressSent then CancelPress_()
+                PushMouse_( SDL_EVENT_MOUSE_BUTTON_DOWN, gTouchWin, gTouchX, gTouchY, SDL_BUTTON_RIGHT )
+                PushMouse_( SDL_EVENT_MOUSE_BUTTON_UP, gTouchWin, gTouchX, gTouchY, SDL_BUTTON_RIGHT )
+            end if
+        case 2      ' a fling step
+            gFlingVX *= 0.95 : gFlingVY *= 0.95
+            dim as single n = NotchUnits_( gTouchWin )
+            if (abs( gFlingVX ) + abs( gFlingVY )) * 16 > 0.5 then
+                PushWheel_( gTouchWin, gTouchX0, gTouchY0, -gFlingVX * 16 / n, gFlingVY * 16 / n )
+                SDL_AddTimer( 16, @TouchTick_, cast( any ptr, cast( integer, ((gTouchSerial and &hFFFF) shl 16) or 2 ) ) )
+            end if
+        end select
+        return true
+    end if
+    return false
+end function
+
+' BACK: the top popup closes; else the top dialog or page gets the close its button would send;
+' else the surface the key came to does (its window: the app's close, OnCloseRequest's to veto).
+private sub Back_( byval target as TK_HOST ptr )
+    dim as TK_HOST ptr tp = TopPopup()
+    if tp then tkHost_Close( tp ) : exit sub
+    dim as TK_HOST ptr t = target
+    for i as long = gnHosts - 1 to 0 step -1
+        dim as TK_HOST ptr v = gHosts(i)
+        if v->bVirtual andalso v->bShown andalso (v->bClosed = false) andalso ((v->kind = TK_SURF_DIALOG) orelse (v->kind = TK_SURF_MAIN)) then t = v : exit for
+    next
+    if t = 0 then exit sub
+    dim as SDL_Event c
+    c.type = SDL_EVENT_WINDOW_CLOSE_REQUESTED
+    c.window.windowID = t->winId
+    gDispatching += 1
+    DispatchTo( t, @c )
+    gDispatching -= 1
+end sub
+
 ' One SDL event, routed to the surface it belongs to. The `h` argument is kept for callers of
 ' the single-window API and is used only for SDL_EVENT_QUIT.
 public sub tkHost_Dispatch( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
@@ -1854,8 +2867,15 @@ public sub tkHost_Dispatch( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
         if (gHooks(i) <> 0) andalso gHooks(i)( e ) then exit sub
     next
     if gTrace < 0 then gTrace = iif( environ( "TK_TRACE" ) = "1", 1, 0 )
+    if Virtual_() andalso Touch_( e ) then exit sub
     dim as SDL_WindowID wid = EventWindow( e )
     dim as TK_HOST ptr target = iif( wid <> 0, HostOfWindow( wid ), cast( TK_HOST ptr, 0 ) )
+    ' VIRTUAL: the surface inside the window, and the event in its coordinates
+    dim as SDL_Event ev
+    if (target <> 0) andalso Virtual_() andalso (target->bVirtual = false) then
+        target = VirtualTarget_( target, e, ev )
+        e = @ev
+    end if
     ' TK_TRACE=1: one line per event -- the trace that separates "SDL never sent it" from "it
     ' went elsewhere".
     if gTrace = 1 then
@@ -1875,6 +2895,15 @@ public sub tkHost_Dispatch( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
         ' the dismissal rule runs BEFORE the press is delivered
         if DismissFor( target ) then exit sub
     case SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP, SDL_EVENT_TEXT_INPUT, SDL_EVENT_TEXT_EDITING
+        ' BACK goes back a level (see top); its release is BACK's too
+        if Virtual_() andalso ((e->type = SDL_EVENT_KEY_DOWN) orelse (e->type = SDL_EVENT_KEY_UP)) andalso (e->key.key = SDLK_AC_BACK) then
+            ' with the soft keyboard up, BACK is the keyboard's: SDL hides it on the key's release (its
+            ' SDLDummyEdit) and still sends the key, which closed an edit page too (measured, A5 step 8)
+            if (e->type = SDL_EVENT_KEY_DOWN) andalso (e->key.repeat = false) then
+                if SDL_ScreenKeyboardShown( target->win ) = false then Back_( target )
+            end if
+            exit sub
+        end if
         ' keys go to the top popup while one is up, even when the compositor still routes them
         ' to the owner -- otherwise the arrows would drive whatever had focus behind it
         dim as TK_HOST ptr tp = TopPopup()
@@ -1885,7 +2914,12 @@ public sub tkHost_Dispatch( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
     if (gEvTimer <> 0) andalso (e->type = gEvTimer) then
         dim as TK_TIMER ptr t = cast( TK_TIMER ptr, e->user.data1 )
         ' drop a tick that was already queued when its timer was killed
-        if t andalso t->active andalso (t->gen = e->user.code) then
+        if t andalso t->active andalso (t->gen = e->user.code) andalso (t->id = TK_TIMER_TEXTRESTART) then
+            dim as TK_WIDGET ptr tw = t->pW
+            tkWidget_KillTimer( tw, TK_TIMER_TEXTRESTART )
+            dim as TK_HOST ptr th = tw->pHost
+            if (th <> 0) andalso th->bTextInput andalso (th->pFocus <> 0) andalso th->pFocus->bWantsText then StartText_( th, th->pFocus )
+        elseif t andalso t->active andalso (t->gen = e->user.code) then
             dim as TK_MSG m
             m.msg = TKM_TIMER
             m.timerId = t->id
@@ -1900,12 +2934,39 @@ public sub tkHost_Dispatch( byval h as TK_HOST ptr, byval e as SDL_Event ptr )
         gDispatching += 1
         DispatchTo( target, e )
         gDispatching -= 1
+        if Virtual_() andalso (target->bClosed = false) then
+            if ((e->type = SDL_EVENT_MOUSE_BUTTON_UP) andalso (e->button.button = SDL_BUTTON_LEFT)) orelse _
+               (e->type = SDL_EVENT_WINDOW_FOCUS_GAINED) then KeyboardAgain_( target )
+        end if
+        if target->bVirtual = false andalso Virtual_() then
+            if (e->type = SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) orelse (e->type = SDL_EVENT_WINDOW_RESIZED) then RelayoutVirtual_( target )
+            ' the bars moved (rotation): the tree's safe area did
+            if e->type = SDL_EVENT_WINDOW_SAFE_AREA_CHANGED then
+                SizeRoot( target )
+                if target->OnSize then target->OnSize( target )
+                target->bDirty = true
+                RelayoutVirtual_( target )
+            end if
+            ' the pointer left the window, so every surface in it: their hot widgets go too
+            if e->type = SDL_EVENT_WINDOW_MOUSE_LEAVE then
+                for i as long = 0 to gnHosts - 1
+                    if LiveVirtual_( gHosts(i), target ) andalso (gHosts(i)->pCapture = 0) then SetHot( gHosts(i), 0 )
+                next
+            end if
+        end if
     end if
 end sub
 
 private sub RenderDirty()
+    ' a dirty virtual surface is a dirty base: the window is painted once, whole
     for i as long = 0 to gnHosts - 1
-        if gHosts(i)->bDirty andalso (gHosts(i)->bClosed = false) then tkHost_Render( gHosts(i) )
+        if gHosts(i)->bVirtual andalso gHosts(i)->bDirty then
+            gHosts(i)->bDirty = false
+            if gHosts(i)->bClosed = false then gHosts(i)->pBase->bDirty = true
+        end if
+    next
+    for i as long = 0 to gnHosts - 1
+        if (gHosts(i)->bVirtual = false) andalso gHosts(i)->bDirty andalso (gHosts(i)->bClosed = false) then tkHost_Render( gHosts(i) )
     next
 end sub
 
@@ -1928,6 +2989,8 @@ public sub tkHost_Pump( byval h as TK_HOST ptr )
         wend
         if SDL_HasEvents( SDL_EVENT_FIRST, SDL_EVENT_LAST ) = false then exit for
     next
+    ' a virtual surface closes without a window event to pump, so nothing above reaped it
+    if Virtual_() then tkHost_Reap()
     RenderDirty()
 end sub
 
@@ -1959,6 +3022,14 @@ private function ForDialog( byval dlg as TK_HOST ptr, byval e as SDL_Event ptr )
     if wid = 0 then return true                 ' timers, quit: not window events
     dim as TK_HOST ptr t = HostOfWindow( wid )
     if t = 0 then return false
+    ' virtual: the surface the router would pick (a window event stays the base's, and so is the
+    ' owner's to repaint, not the dialog's input)
+    if Virtual_() andalso (t->bVirtual = false) then
+        dim as SDL_Event ev
+        dim as TK_HOST ptr saved = gMouseHost
+        t = VirtualTarget_( t, e, ev )
+        gMouseHost = saved
+    end if
     return InChainOf( t, dlg )
 end function
 
@@ -1967,7 +3038,7 @@ end function
 ' still sees it. The owner keeps being repainted (expose) but gets no input.
 public function tkHost_RunModal( byval dlg as TK_HOST ptr ) as long
     if dlg = 0 then return 0
-    if dlg->pOwner then SDL_SetWindowModal( dlg->win, true )
+    if (dlg->pOwner <> 0) andalso (dlg->bVirtual = false) then SDL_SetWindowModal( dlg->win, true )
     tkHost_Show( dlg )
     if dlg->pFocus = 0 then tkHost_FocusNext( dlg )
     dlg->bEndModal = false
@@ -1998,7 +3069,9 @@ public function tkHost_RunModal( byval dlg as TK_HOST ptr ) as long
     ' re-enable it, then activate it. Hiding the active dialog first lets the OS activate the
     ' next window in z-order -- often another application's -- and the owner, still disabled
     ' or merely behind, never gets it back.
-    if dlg->pOwner then
+    if (dlg->pOwner <> 0) andalso dlg->bVirtual then
+        dlg->pOwner->bDirty = true
+    elseif dlg->pOwner then
         SDL_SetWindowModal( dlg->win, false )
         if (SDL_GetWindowFlags( dlg->pOwner->win ) and SDL_WINDOW_HIDDEN) = 0 then SDL_RaiseWindow( dlg->pOwner->win )
         dlg->pOwner->bDirty = true
@@ -2029,7 +3102,7 @@ end function
 public sub tkHost_SetDragRect( byval h as TK_HOST ptr, byref rc as TKRECT )
     if h = 0 then exit sub
     h->rcDrag = rc
-    SDL_SetWindowHitTest( h->win, @HitTestCb, h )
+    if h->bVirtual = false then SDL_SetWindowHitTest( h->win, @HitTestCb, h )
 end sub
 
 

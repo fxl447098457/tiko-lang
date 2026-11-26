@@ -16,12 +16,16 @@ Define without a value created at compile time when targeting `android` platform
 
 ## Remarks
 
+In tiko, `__FB_ANDROID__` is defined with `-target android-x86_64` and `-target android-arm64` ([experimental](Android)), together with `__FB_UNIX__`; `__FB_LINUX__` is not. New tiko code tests [`TIKO_OS_ANDROID`](Category-Tiko-Compiler-Define) instead.
+
 ### Differences from QB
 
 - New to FreeBASIC
 
 ### See also
 
+- [Android](Android)
+- [`TIKO_OS_ANDROID`](Category-Tiko-Compiler-Define)
 
 ## Examples
 

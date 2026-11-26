@@ -229,7 +229,7 @@ On Linux use `cp -L` (or copy the real file `libraylib.so.6.0.0`), so that you c
 
 ```freebasic
 #cinclude once "vendor/raylib/raylib.h"
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
     #foreignlib RAYLIB static "vendor/raylib/raylib", _
         "system:winmm", "system:gdi32", "system:user32", _
         "system:shell32"

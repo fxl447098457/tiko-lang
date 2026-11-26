@@ -39,13 +39,19 @@ targets.
 
 | Symbol | Defined when building for |
 |---|---|
-| `__FB_WIN32__` | Windows (the name is historical: it is defined for 64-bit Windows) |
-| `__FB_LINUX__` | Linux |
-| `__FB_DARWIN__` | macOS |
-| `__FB_UNIX__` | Linux, macOS, and other Unix-like systems |
-| `__FB_ARM__` | arm64: `linux-arm64` and `macos-arm64` |
+| `TIKO_OS_WINDOWS` | Windows |
+| `TIKO_OS_LINUX` | Linux |
+| `TIKO_OS_MACOS` | macOS |
+| `TIKO_ARCH_X86_64` | x86-64: `windows-x86_64` and `linux-x86_64` |
+| `TIKO_ARCH_ARM64` | arm64: `linux-arm64` and `macos-arm64` |
 | `__FB_64BIT__` | every 64-bit target, which today is every target |
 | `__TIKO_COMPILER__` | always, by tiko |
+
+tiko has no single name for "a Unix-like system": test
+`defined( TIKO_OS_LINUX ) orelse defined( TIKO_OS_MACOS )`, as the example
+does. The older `__FB_` spellings (`__FB_WIN32__`, `__FB_LINUX__`,
+`__FB_DARWIN__`, `__FB_UNIX__`, `__FB_ARM__`) are defined too, for existing
+headers; tiko code uses the `TIKO_` names.
 
 The `#else` branch ends in `#error`, so a build for any other platform stops
 with a clear message instead of failing later on a constant that was never

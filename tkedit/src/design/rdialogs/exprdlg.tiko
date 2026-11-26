@@ -1,0 +1,203 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rdialogs -- the expression editor (RD7): an inspector row's "..." opens it on that row's expression.
+' The text box; under it, LIVE, the expression's type or its first error with the column, checked
+' against the report as it is (rmodel.CheckExpr: the band's own source, the other sources'
+' Source.Field, calculated fields, parameters; no totals in a group key); beside it what can be
+' inserted (fields, parameters, report values, functions), a double click putting it in at the caret.
+' OK takes the text when it checks (an empty one too: "no expression"); the caller applies it as the
+' row's edit, one undoable change.
+#module "rdialogs"
+
+#import "std/containers"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkReportDef"
+#import "../rmodel"
+using containers
+using tkApp
+using tkListTree
+using tkButton
+using tkLabel
+using tkTextBox
+using tkHost
+using tkReportDef
+using tkReport
+
+const as long EXPR_WIN_CX = 600
+const as long EXPR_WIN_CY = 360
+
+public type ExprDialog
+    Win      as TK_FORM ptr
+    Def      as TK_REPORTDEF ptr        ' the report as it is (not owned)
+    BandId   as ustring
+    NoAgg    as boolean
+    Text     as ustring                 ' what OK took
+    IsValid  as boolean
+    Accepted as boolean
+    IsModal  as boolean
+    Inserts  as Array( of ustring )
+    TxtExpr  as TK_WIDGET ptr
+    LblStatus as TK_WIDGET ptr
+    Lst      as TK_WIDGET ptr
+    BtnOk    as TK_WIDGET ptr
+    BtnCancel as TK_WIDGET ptr
+
+    declare sub Open( byval owner_ as TK_FORM ptr, byval def_ as TK_REPORTDEF ptr, byref bandId_ as const ustring, _
+                      byval noAgg_ as boolean, byref initial as const ustring )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub Finish( byval ok as boolean )
+    declare sub Layout( )
+    declare sub Check( )
+    declare sub InsertRow( byval row as long )
+end type
+
+private function ExprDlgOf( byval w as TK_WIDGET ptr ) as ExprDialog ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub OnExprButton( byval h as TK_WIDGET ptr, byval id as long )
+    dim as ExprDialog ptr d = ExprDlgOf( h )
+    if d = 0 then exit sub
+    if h = d->BtnOk then d->Finish( true )
+    if h = d->BtnCancel then d->Finish( false )
+end sub
+
+private sub OnExprChanged( byval h as TK_WIDGET ptr )
+    dim as ExprDialog ptr d = ExprDlgOf( h )
+    if d then d->Check( )
+end sub
+
+private sub OnExprEnter( byval h as TK_WIDGET ptr )
+    dim as ExprDialog ptr d = ExprDlgOf( h )
+    if d then d->Finish( true )
+end sub
+
+private sub OnExprInsert( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as ExprDialog ptr d = ExprDlgOf( h )
+    if d then d->InsertRow( row )
+end sub
+
+sub ExprDialog.Open( byval owner_ as TK_FORM ptr, byval def_ as TK_REPORTDEF ptr, byref bandId_ as const ustring, _
+                     byval noAgg_ as boolean, byref initial as const ustring )
+    Def = def_
+    BandId = bandId_
+    NoAgg = noAgg_
+    dim as single sc = 0
+    if owner_ then sc = tkForm_Host( owner_ )->fScaleForced
+    Win = tkApp_NewForm( i18n.Tr( "report.expression", "Expression" ), EXPR_WIN_CX, EXPR_WIN_CY, owner_, sc )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    TxtExpr = tkTextBox_Create( root_, 1, false )
+    tkTextBox_SetChangeCallback( TxtExpr, @OnExprChanged )
+    tkTextBox_SetEnterPressedCallback( TxtExpr, @OnExprEnter )
+    LblStatus = tkLabel_Create( root_, 2 )
+    tkLabel_SetWordWrap( LblStatus, true )
+    Lst = tkListTree_Create( root_, 3 )
+    tkListTree_SetPaintCallback( Lst, @tkListTree_PaintRowDefault )   ' a tkListTree draws no row by itself
+    tkListTree_SetActivateCallback( Lst, @OnExprInsert )
+    rmodel.Insertables( Def, BandId, Inserts )
+    for i as long = 0 to Inserts.Count( ) - 1
+        tkListTree_AddString( Lst, Inserts[i], i )
+    next
+    BtnOk = tkButton_Create( root_, 4 )
+    tkButton_SetText( BtnOk, i18n.Tr( "designer.ok", "OK" ) )
+    tkButton_SetClickCallback( BtnOk, @OnExprButton )
+    BtnCancel = tkButton_Create( root_, 5 )
+    tkButton_SetText( BtnCancel, i18n.Tr( "designer.cancel", "Cancel" ) )
+    tkButton_SetClickCallback( BtnCancel, @OnExprButton )
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        cast( ExprDialog ptr, f->Tag )->Layout( )
+    end sub )
+    tkForm_Show( Win )
+    tkTextBox_SetText( TxtExpr, initial )
+    this.Layout( )
+    this.Check( )
+    tkHost_SetFocus( tkForm_Host( Win ), TxtExpr )
+end sub
+
+function ExprDialog.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub ExprDialog.Close( )
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+end sub
+
+' The text box's expression: its type, or what is wrong and where.
+sub ExprDialog.Check( )
+    dim as ustring t = tkTextBox_GetText( TxtExpr )
+    if len( trim( t ) ) = 0 then
+        IsValid = true
+        tkLabel_SetText( LblStatus, "" )
+        exit sub
+    end if
+    dim as ustring kindName
+    dim as int32 col
+    dim as ustring e = rmodel.CheckExpr( Def, BandId, NoAgg, t, kindName, col )
+    IsValid = (len( e ) = 0)
+    if IsValid then
+        tkLabel_SetText( LblStatus, "= " & kindName )
+    elseif col > 0 then
+        tkLabel_SetText( LblStatus, col & ": " & e )
+    else
+        tkLabel_SetText( LblStatus, e )
+    end if
+end sub
+
+' A double-clicked entry into the text at the caret (a function with its caret between the brackets).
+sub ExprDialog.InsertRow( byval row as long )
+    if (row < 0) orelse (row >= Inserts.Count( )) then exit sub
+    dim as ustring s = Inserts[row]
+    tkTextBox_ReplaceSel( TxtExpr, s )
+    if right( s, 3 ) = "( )" then
+        dim as integer a, b
+        tkTextBox_GetSel( TxtExpr, a, b )
+        tkTextBox_SetSel( TxtExpr, b - 2, b - 2 )
+    end if
+    tkHost_SetFocus( tkForm_Host( Win ), TxtExpr )
+    this.Check( )
+end sub
+
+sub ExprDialog.Finish( byval ok as boolean )
+    if ok then
+        this.Check( )
+        if IsValid = false then exit sub          ' the status says why
+        Text = trim( tkTextBox_GetText( TxtExpr ) )
+    end if
+    Accepted = ok
+    if IsModal then
+        if (Win <> 0) andalso (Win->pOwner <> 0) then SDL_RaiseWindow( Win->pOwner->host->win )
+        tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+    end if
+end sub
+
+sub ExprDialog.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long g = tkForm_Scale( Win, 8 ), rh = tkForm_Scale( Win, 28 ), bw = tkForm_Scale( Win, 96 )
+    dim as long cw = root_->cw, ch = root_->ch, lw = tkForm_Scale( Win, 200 )
+    dim as long left_ = cw - 3 * g - lw
+    tkWidget_SetPos( TxtExpr, g, g, left_, rh )
+    tkWidget_SetPos( LblStatus, g, 2 * g + rh, left_, 3 * rh )
+    tkWidget_SetPos( Lst, 2 * g + left_, g, lw, ch - 3 * g - rh )
+    tkWidget_SetPos( BtnCancel, cw - g - bw, ch - g - rh, bw, rh )
+    tkWidget_SetPos( BtnOk, cw - 2 * (g + bw), ch - g - rh, bw, rh )
+end sub

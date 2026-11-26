@@ -1,0 +1,343 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rpanelspass -- the Report Designer's palettes in the real window (RD6). Its "done when": a grouped
+' report drawn from the field list without typing TOML. A report with one source and a detail band
+' is opened; the toolbox inserts a group header, the inspector sets its group, the field list places
+' the group's field and a detail field (its caption goes into the header), the toolbox adds a footer,
+' the tree picks an item, the inspector gives it a total. The text the palettes wrote is then printed
+' over a host source: grouped, captioned, totalled. Everything through SDL events.
+#module "selftest"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
+#import "tkc/cmdids"
+#import "tka/documents"
+#import "tka/mainwin"
+#import "tkd/rcanvas"
+#import "tkd/rpanels"
+#import "tkd/redits"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkScrollPanel"
+#import "vendor/tkControls/tkPrint"
+#import "vendor/tkControls/tkReportDef"
+#import "vendor/tkControls/tkBind"
+#import "vendor/tkControls/tkPopupMenu"
+using containers
+using cmdids
+using tkApp
+using tkHost
+using tkTest
+using tkListTree
+using tkScrollPanel
+using tkPrint
+using tkPaint
+using tkReportDef
+using tkReport
+using tkBind
+using tkPopupMenu
+
+const as string RPANELS_TEXT = _
+    !"format = 1\n\n[report]\ntitle = \"G\"\n\n[[source]]\nname = \"Orders\"\n\n" & _
+    !"  [[source.field]]\n  name = \"Customer\"\n\n  [[source.field]]\n  name = \"Amount\"\n  kind = \"int\"\n\n" & _
+    !"[[band]]\nid = \"d\"\nkind = \"detail\"\nsource = \"Orders\"\nheight = 16\n"
+
+' ---- the host's rows: Avery 10, Avery 5, Blake 7 ----
+dim shared as long gRpRow = -1
+private function RpCount( byval p as any ptr ) as long : return 2 : end function
+private function RpName( byval p as any ptr, byval f as long ) as ustring
+    if f = 0 then return "Customer"
+    return "Amount"
+end function
+private function RpKind( byval p as any ptr, byval f as long ) as long
+    if f = 0 then return TKV_TEXT
+    return TKV_INT
+end function
+private function RpRows( byval p as any ptr ) as integer : return 3 : end function
+private function RpNext( byval p as any ptr ) as boolean
+    gRpRow += 1
+    return gRpRow < 3
+end function
+private sub RpGet( byval p as any ptr, byval f as long, byref v as TK_VALUE )
+    select case gRpRow
+    case 0 : if f = 0 then v.SetText( "Avery" ) else v.SetInt( 10 )
+    case 1 : if f = 0 then v.SetText( "Avery" ) else v.SetInt( 5 )
+    case else : if f = 0 then v.SetText( "Blake" ) else v.SetInt( 7 )
+    end select
+end sub
+private function RpRewind( byval p as any ptr ) as boolean
+    gRpRow = -1
+    return true
+end function
+
+private function RpRowOf( byval list as TK_WIDGET ptr, byref text as const ustring ) as long
+    for r as long = 0 to tkListTree_GetCount( list ) - 1
+        if tkListTree_GetText( list, r ) = text then return r
+    next
+    return -1
+end function
+
+' An Object Tree row by its name (the second column).
+private function RpTreeRow( byval list as TK_WIDGET ptr, byref name_ as const ustring ) as long
+    for r as long = 0 to tkListTree_GetCount( list ) - 1
+        if tkListTree_GetCellText( list, r, 1 ) = name_ then return r
+    next
+    return -1
+end function
+
+private function RpEditOf( byval p as rpanels.ReportPanels ptr, byref key_ as const ustring ) as TK_WIDGET ptr
+    for i as long = 0 to p->Rows.Count( ) - 1
+        if p->Rows[i].Key = key_ then return p->Rows[i].Edit
+    next
+    return 0
+end function
+
+' Click into an inspector row's box, replace its text by typing, press Enter.
+private sub RpTypeIn( byval h as TK_HOST ptr, byval p as rpanels.ReportPanels ptr, byref key_ as const ustring, byref text as ustring )
+    dim as TK_WIDGET ptr e = RpEditOf( p, key_ )
+    if e = 0 then exit sub
+    tkScrollPanel_SetPos( p->Scroll, e->y - tkHost_Scale( h, 8 ) )
+    tkTest_PumpFor( h, 20 )
+    tkTest_Click( h, tkTest_CX( e ), tkTest_CY( e ) )
+    tkTest_PumpFor( h, 30 )
+    Chord( h, SDLK_A, SDL_SCANCODE_A, TK_KMOD_PRIMARY )
+    tkTest_PushText( h, text )
+    tkTest_PumpFor( h, 20 )
+    Chord( h, SDLK_RETURN, SDL_SCANCODE_RETURN, 0 )
+    tkTest_PumpFor( h, 40 )
+end sub
+
+' A list row, scrolled into view first (the toolbox is longer than its pane), then clicked.
+private sub RpClickRow( byval h as TK_HOST ptr, byval list as TK_WIDGET ptr, byval row as long )
+    if row < 0 then exit sub
+    tkListTree_SetTopIndex( list, iif( row > 0, row - 1, 0 ) )
+    tkTest_PumpFor( h, 20 )
+    ClickRow( h, list, row )
+end sub
+
+private function RpSel0( byval c as rcanvas.ReportCanvas ptr ) as ustring
+    if c->Selected.Count( ) then return c->Selected[0]
+    return ""
+end function
+
+private function RpExpr( byval c as rcanvas.ReportCanvas ptr, byref id as const ustring ) as ustring
+    dim as int32 i = tkReportDef_FindItem( c->Def, id )
+    if i < 0 then return "(none)"
+    return c->Def->items(i).expr
+end function
+
+' A click in band bandId's body, x points across, 2 points down.
+private sub RpClickBand( byval h as TK_HOST ptr, byval c as rcanvas.ReportCanvas ptr, byref bandId as const ustring, byval xPt as single, _
+                         byval mods as long = 0 )
+    dim as TKRECT body = c->BandBodyRect( tkReportDef_FindBand( c->Def, bandId ) ), a
+    tkWidget_AbsRect( c->Glass, a )
+    dim as single s = rcanvas.PX_PER_PT * h->fScale
+    dim as long x = a.left + body.left + cint( xPt * s ) + 1, y = a.top + body.top + cint( 2 * s ) + 1
+    tkTest_PushMotion( h, x, y )
+    tkTest_PumpFor( h, 15 )
+    SDL_SetModState( mods )
+    tkTest_Click( h, x, y )
+    tkTest_PumpFor( h, 30 )
+    SDL_SetModState( SDL_KMOD_NONE )
+end sub
+
+private function RpBandOfKind( byval c as rcanvas.ReportCanvas ptr, byref kind as const ustring ) as ustring
+    for i as int32 = 0 to c->Def->nBands - 1
+        if c->Def->bands(i).kind = kind then return c->Def->bands(i).id
+    next
+    return ""
+end function
+
+' The items of band bandId as "kind:expr-or-text" in their order.
+private function RpItemsIn( byval c as rcanvas.ReportCanvas ptr, byref bandId as const ustring ) as ustring
+    dim as ustring s
+    for i as int32 = 0 to c->Def->nItems - 1
+        dim byref as TKRD_ITEM it = c->Def->items(i)
+        if lcase( it.band ) <> lcase( bandId ) then continue for
+        if it.kind = "text" then s &= "text:" & it.text & " " else s &= it.kind & ":" & it.expr & " "
+    next
+    return rtrim( s )
+end function
+
+public sub RPanelsPass( byref t as Tally, byval sc as single )
+    dim as mainwin.Window mw
+    mw.ConfigDir = FreshConfig( )
+    mw.Ask = @ScriptedAsk
+    mw.Pick = @ScriptedPick
+    t.Check( mw.Create( sc ), P( sc, "rpanels: main window created" ) )
+    if mw.form = 0 then exit sub
+    mw.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( mw.form )
+    tkTest_PumpFor( h, 150 )
+    dim as ustring e
+    dim as TK_REPORTDEF ptr seed = tkReportDef_LoadText( RPANELS_TEXT, e )
+    dim as ustring path = fs.PathJoin( mw.ConfigDir, "rptG.tkreport" )
+    fs.WriteAllText( path, tkReportDef_SaveText( seed ) )
+    tkReportDef_Destroy( seed )
+    mw.OpenFile( path )
+    tkTest_PumpFor( h, 80 )
+    dim as DocRef d = mw.Active( )
+    dim as rcanvas.ReportCanvas ptr c = d->Report
+    dim as rpanels.ReportPanels ptr ps = @mw.RPalettes
+    if c = 0 then
+        t.Check( false, P( sc, "rpanels: the report on its canvas" ) )
+        mw.Destroy( )
+        exit sub
+    end if
+    dim as TKRECT rl, rr, rc
+    tkWidget_AbsRect( ps->FrameL, rl )
+    tkWidget_AbsRect( ps->FrameR, rr )
+    tkWidget_AbsRect( c->Frame, rc )
+    t.Check( ps->IsShown andalso ps->FrameL->isVisible andalso ps->FrameR->isVisible andalso (mw.Palettes.IsShown = false) _
+             andalso (rl.right <= rc.left) andalso (rc.right <= rr.left), _
+             P( sc, strings.Format( "rpanels: its palettes either side of the canvas ({}|{}..{}|{}), the form's hidden", rl.right, rc.left, rc.right, rr.left ) ) )
+    t.Check( (RpRowOf( ps->FieldTree, "Orders" ) = 0) andalso (RpRowOf( ps->FieldTree, "Customer" ) = 1) andalso (RpRowOf( ps->FieldTree, "Amount" ) = 2) _
+             andalso (RpRowOf( ps->FieldTree, "PageNumber" ) > 2), P( sc, "rpanels: the field list: the source, its fields, the built-ins" ) )
+
+    ' Insert band from the toolbox: a group header, picked
+    RpClickRow( h, ps->ToolList, RpRowOf( ps->ToolList, "+ group_header" ) )
+    dim as ustring gh = RpBandOfKind( c, "group_header" )
+    t.Check( (len( gh ) > 0) andalso (c->SelBand = gh) andalso (RpEditOf( ps, "group" ) <> 0), P( sc, "rpanels: + group_header inserts one, picked, its rows in the inspector: " & gh ) )
+    RpClickRow( h, ps->ToolList, RpRowOf( ps->ToolList, "+ page_header" ) )
+    RpClickRow( h, ps->ToolList, RpRowOf( ps->ToolList, "+ page_header" ) )
+    t.Check( instr( mw.Message, "page_header" ) > 0, P( sc, "rpanels: a second page header is refused, and says why: " & mw.Message ) )
+    c->SelectBand( RpBandOfKind( c, "page_header" ) )
+    Chord( h, SDLK_DELETE, SDL_SCANCODE_DELETE, 0 )
+    t.Check( len( RpBandOfKind( c, "page_header" ) ) = 0, P( sc, "rpanels: Delete removes a picked band" ) )
+
+    ' the group, typed in the inspector
+    c->SelectBand( gh )
+    tkTest_PumpFor( h, 30 )
+    RpTypeIn( h, ps, "group", "[Customer]" )
+    t.Check( c->Def->bands(tkReportDef_FindBand( c->Def, gh )).group_ = "[Customer]", P( sc, "rpanels: the inspector sets the band's group" ) )
+    t.Check( rcanvas.BandCaption( c->Def->bands(tkReportDef_FindBand( c->Def, gh )) ) = "group_header (" & gh & ":[Customer])", _
+             P( sc, "rpanels: the band's caption: kind (id:group): " & rcanvas.BandCaption( c->Def->bands(tkReportDef_FindBand( c->Def, gh )) ) ) )
+
+    ' the field list: Customer into the group header, Amount into the detail (its caption above)
+    RpClickRow( h, ps->FieldTree, RpRowOf( ps->FieldTree, "Customer" ) )
+    t.Check( (c->Tool = "field:f|Orders|Customer") andalso (tkHost_GetFocus( h ) = c->Glass), P( sc, "rpanels: a field arms the canvas, which takes the keyboard" ) )
+    RpClickBand( h, c, gh, 0 )
+    t.Check( (RpItemsIn( c, gh ) = "field:[Customer]") andalso (len( c->Tool ) = 0), P( sc, "rpanels: a click in the header places it: " & RpItemsIn( c, gh ) ) )
+    RpClickRow( h, ps->FieldTree, RpRowOf( ps->FieldTree, "Amount" ) )
+    RpClickBand( h, c, "d", 100 )
+    dim as int32 amt = tkReportDef_FindItem( c->Def, RpSel0( c ) )
+    dim as int32 cap = tkReportDef_FindItem( c->Def, "text1" )
+    t.Check( (RpItemsIn( c, "d" ) = "field:[Amount]") andalso (RpItemsIn( c, gh ) = "field:[Customer] text:Amount") _
+             andalso (cap >= 0) andalso (amt >= 0) andalso (c->Def->items(cap).x = c->Def->items(amt).x) andalso c->Def->items(cap).bold, _
+             P( sc, "rpanels: a detail field brings its bold caption into the header, at its x: " & RpItemsIn( c, gh ) ) )
+
+    ' a group footer, a field there alone (Shift), picked in the tree, made a total in the inspector
+    RpClickRow( h, ps->ToolList, RpRowOf( ps->ToolList, "+ group_footer" ) )
+    dim as ustring gf = RpBandOfKind( c, "group_footer" )
+    RpClickRow( h, ps->FieldTree, RpRowOf( ps->FieldTree, "Amount" ) )
+    RpClickBand( h, c, gf, 100, SDL_KMOD_SHIFT )
+    t.Check( (RpItemsIn( c, gf ) = "field:[Amount]") andalso (RpItemsIn( c, gh ) = "field:[Customer] text:Amount"), P( sc, "rpanels: Shift places a field alone" ) )
+    dim as ustring tot = RpSel0( c )
+    c->SelectNone( )
+    tkTest_PumpFor( h, 40 )
+    RpClickRow( h, ps->Tree, RpTreeRow( ps->Tree, tot ) )
+    t.Check( (c->Selected.Count( ) = 1) andalso (RpSel0( c ) = tot) andalso (RpEditOf( ps, "expr" ) <> 0), P( sc, "rpanels: the tree picks an item, the inspector shows it" ) )
+    t.Check( tkListTree_GetText( ps->Tree, RpTreeRow( ps->Tree, tot ) ) = "field", P( sc, "rpanels: the tree's first column is the type, the second the name" ) )
+    ' a right click on a band's caption: the band picked, the menu up, Delete live, Cut grey
+    scope
+        dim as TKRECT cr = c->CaptionRect( tkReportDef_FindBand( c->Def, gf ) )
+        c->OnRightPress( (cr.left + cr.right) \ 2, (cr.top + cr.bottom) \ 2 )
+        tkTest_PumpFor( h, 30 )
+        t.Check( (c->SelBand = gf) andalso tkPopupMenu_IsOpen( mw.reportMenu ) andalso tkPopupMenu_GetItemEnabled( mw.reportMenu, 9020 ) _
+                 andalso (tkPopupMenu_GetItemEnabled( mw.reportMenu, clng( Cmd.Cut ) ) = false), P( sc, "rpanels: a right click on a band picks it and opens the menu, Delete live" ) )
+        tkPopupMenu_Hide( mw.reportMenu )
+        c->SelectOnly( tot )                     ' back to the item the inspector checks below
+        tkTest_PumpFor( h, 40 )
+    end scope
+    RpTypeIn( h, ps, "expr", "Sum([Amount])" )
+    t.Check( RpExpr( c, tot ) = "Sum([Amount])", P( sc, "rpanels: the inspector sets its expression" ) )
+    dim as ustring before = d->Text( )
+    RpTypeIn( h, ps, "x", "abc" )
+    t.Check( (d->Text( ) = before) andalso (instr( mw.Message, "x:" ) = 1), P( sc, "rpanels: a value that isn't one is refused, and says why: " & mw.Message ) )
+    RpTypeIn( h, ps, "fore", "red" )
+    t.Check( (d->Text( ) = before) andalso (instr( mw.Message, "fore:" ) = 1), P( sc, "rpanels: what the file's reader refuses is refused: " & mw.Message ) )
+    ' back on the canvas (a text box keeps its own Ctrl+Z): one Undo takes the edit back, Redo again
+    tkHost_SetFocus( h, c->Glass )
+    Chord( h, SDLK_Z, SDL_SCANCODE_Z, TK_KMOD_PRIMARY )
+    tkTest_PumpFor( h, 40 )
+    t.Check( RpExpr( c, tot ) = "[Amount]", P( sc, "rpanels: one Undo takes the inspector's edit back" ) )
+    Chord( h, SDLK_Z, SDL_SCANCODE_Z, TK_KMOD_PRIMARY or SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 40 )
+
+    ' what the palettes wrote, printed: grouped by customer, captioned, totalled
+    dim as TK_REPORTDEF ptr def = tkReportDef_LoadText( d->Text( ), e )
+    dim as ustring s
+    if def then
+        dim as TKREPORT_SOURCE src
+        src.FieldCount = @RpCount : src.FieldName = @RpName : src.FieldKind = @RpKind
+        src.RowCount = @RpRows : src.MoveNext = @RpNext : src.GetValue = @RpGet : src.Rewind = @RpRewind
+        tkReportDef_BindSource( def, "Orders", src )
+        dim as TK_PRINTDOC ptr doc = tkReportDef_CreateDoc( def, e )
+        if doc then
+            tkPrintDoc_Generate( doc )
+            for i as long = 0 to tkPrintDoc_GetOpCount( doc, 0 ) - 1
+                dim as TKPRINT_OPINFO oi
+                tkPrintDoc_GetOp( doc, 0, i, oi )
+                if oi.op = TKREC_TEXT then s &= oi.text & "|"
+            next
+            tkPrintDoc_Destroy( doc )
+        end if
+        tkReportDef_Destroy( def )
+    end if
+    t.Check( s = "Avery|Amount|10|5|15|Blake|Amount|7|7|", P( sc, "rpanels: the report drawn from the palettes prints grouped: " & s & " " & e ) )
+
+    ' ---- the bars: beside the canvas, and in a palette (author 2026-11-25)
+    tkTest_PumpFor( h, 30 )
+    dim as long tool0 = ps->FrameL->cw, canv0 = c->Frame->cw, dragBy = tkHost_Scale( h, 40 )
+    dim as single barX = tkTest_CX( ps->BarL ), barY = tkTest_CY( ps->BarL )
+    tkTest_PushMotion( h, barX, barY )
+    tkTest_PumpFor( h, 15 )
+    tkTest_PushButton( h, true, barX, barY )
+    tkTest_PumpFor( h, 15 )
+    tkTest_PushMotion( h, barX + dragBy, barY )
+    tkTest_PumpFor( h, 15 )
+    tkTest_PushButton( h, false, barX + dragBy, barY )
+    tkTest_PumpFor( h, 30 )
+    t.Check( (abs( ps->FrameL->cw - (tool0 + dragBy) ) <= 1) andalso (abs( c->Frame->cw - (canv0 - dragBy) ) <= 1), _
+             P( sc, strings.Format( "rpanels: the bar widens the toolbox ({} -> {}), the canvas gives way", tool0, ps->FrameL->cw ) ) )
+    ps->ToolCX = 0
+    ps->OnLayout( ps->Owner )
+    tkTest_PumpFor( h, 30 )
+    dim as long list0 = ps->ToolList->ch
+    barX = tkTest_CX( ps->Pal( 0 ).Split ) : barY = tkTest_CY( ps->Pal( 0 ).Split )
+    tkTest_PushMotion( h, barX, barY )
+    tkTest_PumpFor( h, 15 )
+    tkTest_PushButton( h, true, barX, barY )
+    tkTest_PumpFor( h, 15 )
+    tkTest_PushMotion( h, barX, barY + dragBy )
+    tkTest_PumpFor( h, 15 )
+    tkTest_PushButton( h, false, barX, barY + dragBy )
+    tkTest_PumpFor( h, 30 )
+    t.Check( abs( ps->ToolList->ch - (list0 + dragBy) ) <= 1, P( sc, strings.Format( "rpanels: the palette's bar gives the toolbox more ({} -> {})", list0, ps->ToolList->ch ) ) )
+    ps->Pal( 0 ).SplitPm = 0
+    ps->LayoutPalette( 0 )
+
+    ' ---- the tree's palette floats (Float Properties), its tree rebuilt there; then docks
+    dim as long wide0 = c->Frame->cw
+    mw.Execute( Cmd.FormFloatProperties )
+    tkTest_PumpFor( h, 120 )
+    t.Check( (ps->Pal( 1 ).Float <> 0) andalso (ps->FrameR->pHost = tkForm_Host( ps->Pal( 1 ).Float )) andalso (c->Frame->cw > wide0) _
+             andalso (tkWidget_IsVisible( ps->BarR ) = false) andalso (RpTreeRow( ps->Tree, tot ) >= 0), _
+             P( sc, strings.Format( "rpanels: the tree palette floats with its tree, the canvas wider ({} -> {})", wide0, c->Frame->cw ) ) )
+    mw.Execute( Cmd.FormFloatProperties )
+    tkTest_PumpFor( h, 120 )
+    t.Check( (ps->Pal( 1 ).Float = 0) andalso (ps->FrameR->pHost = h) andalso (c->Frame->cw = wide0) andalso tkWidget_IsVisible( ps->BarR ), _
+             P( sc, strings.Format( "rpanels: and docks back ({})", c->Frame->cw ) ) )
+
+    for each dd as DocRef in mw.Docs
+        dd->Main.SetSavePoint( )
+    next
+    mw.Destroy( )
+end sub

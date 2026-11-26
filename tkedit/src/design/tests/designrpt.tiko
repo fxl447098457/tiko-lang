@@ -1,0 +1,334 @@
+' designall: the Report Designer's generator (RD4). The golden .tkreport (every source kind, both
+' events, a parameter of each kind) generates its golden .design.tiko byte for byte; the rules the
+' golden stands for are spelled out so a careless --accept still shows; Check refuses what can't be
+' generated; formtree generates and checks .tkreport files like forms.
+
+private function LoadRpt( byref text as const ustring ) as TK_REPORTDEF ptr
+    dim as ustring errs
+    dim as TK_REPORTDEF ptr d = tkReportDef_LoadText( text, errs )
+    if d = 0 then print "  (load: "; errs; ")"
+    return d
+end function
+
+private function CheckProblems( byref text as const ustring, byref moduleName as const ustring = "rptTest" ) as ustring
+    dim as TK_REPORTDEF ptr d = LoadRpt( text )
+    if d = 0 then return "(does not load)"
+    dim as Array( of ustring ) p
+    rcodegen.Check( d, moduleName, p )
+    tkReportDef_Destroy( d )
+    dim as ustring all_
+    for each s as ustring in p
+        all_ &= s & LF
+    next
+    return all_
+end function
+
+sub RptRefused( byref text as const ustring, byref want as const ustring, byref moduleName as const ustring = "rptTest" )
+    dim as ustring got = CheckProblems( text, moduleName )
+    Check( instr( got, want ) > 0, "report refused: " & want, got )
+end sub
+
+sub ReportCodegenSuite( byval bAccept as boolean )
+    const as string dir_ = "tests/golden/rptGolden/"
+    dim as ustring none_
+    dim as ustring source = fs.ReadAllText( dir_ & "rptGolden.tkreport" ).ValueOr( none_ )
+    Check( len( source ) > 0, "report: the golden .tkreport was found" )
+    dim as TK_REPORTDEF ptr d = LoadRpt( source )
+    Check( d <> 0, "report: the golden loads" )
+    if d = 0 then exit sub
+    dim as Array( of ustring ) p
+    rcodegen.Check( d, "rptGolden", p )
+    Check( p.Count( ) = 0, "report: the golden passes Check" )
+    dim as ustring t = rcodegen.Generate( d, "rptGolden", "rptGolden.tkreport", source )
+    tkReportDef_Destroy( d )
+    if bAccept then fs.WriteAllText( dir_ & "rptGolden.design.tiko", t )
+    dim as ustring golden = codegen.WithoutCr( fs.ReadAllText( dir_ & "rptGolden.design.tiko" ).ValueOr( none_ ) )
+    Check( t = golden, "report: the generator matches its golden", len( t ) & " vs " & len( golden ) )
+    ' the rules the golden stands for
+    Check( instr( t, LF & "#embed rptGolden_Layout_ ""rptGolden.tkreport""" & LF ) > 0, "report: the layout embedded" )
+    Check( instr( t, "' source-hash: " & codegen.SourceHash( source ) & LF ) > 0, "report: the source's hash" )
+    Check( instr( t, "#import ""../shopdata""" & LF ) > 0, "report: the data module imported" )
+    Check( (instr( t, "#import ""vendor/tkControls/tkReportSqlite""" ) > 0) andalso (instr( t, "#import ""vendor/tkControls/tkReportGrid""" ) > 0), _
+           "report: the sqlite and grid modules when a source needs them" )
+    HasLine( t, "Label as ustring", "report: a text parameter" )
+    HasLine( t, "Min as int64", "report: an int parameter" )
+    HasLine( t, "Rate as float64", "report: a float parameter" )
+    HasLine( t, "Paid as boolean", "report: a bool parameter" )
+    HasLine( t, "From as TKDATE", "report: a date parameter" )
+    HasLine( t, "At as TKTIME", "report: a time parameter" )
+    HasLine( t, "declare sub SetOrders( byref rows as Array( of shopdata.Order ) )", "report: an array master's setter" )
+    Check( instr( t, "SetLines" ) = 0, "report: no setter for a child" )
+    HasLine( t, "declare sub SetStockGrid( byval hGrid as TK_WIDGET ptr )", "report: a grid's setter" )
+    HasLine( t, "declare sub SetExtraSource( byref src as TKREPORT_SOURCE )", "report: a host source's setter" )
+    HasLine( t, "declare sub SetDatabase( byval db as sqlite3 ptr )", "report: the database setter" )
+    HasLine( t, "declare function OnBefore( byval band as TK_RBAND ptr, byval row as TK_VALUE ptr ) as boolean", "report: BeforePrint's handler" )
+    HasLine( t, "declare sub OnPaint( byval item as TKREPORT_ITEM ptr, byval pg as TK_PAGE ptr, byref rc as TKRECTF, byval row as TK_VALUE ptr )", "report: PaintItem's handler" )
+    HasLine( t, "case 1 : tkBind_ToValue( r_.Ship.City, @v )", "report: a field path read by tkBind_ToValue" )
+    HasLine( t, "dim byref as shopdata.Line r_ = a_[m].Lines[row]", "report: a child's row through its relation" )
+    HasLine( t, "tkReportDef_BindArrayChild( def_, ""Lines"", @rows, @Lines_Count_, @Lines_Value_ )", "report: the child bound with its master" )
+    HasLine( t, "    Orders_Rows_ = shopdata.Orders( )", "report: items_source when the program gives no rows" )
+    HasLine( t, "tkReportDef_SetReportMadeCallback( def_, @rptGolden_Made_, @this )", "report: the handlers attached to every report made" )
+    HasLine( t, "From = v_.d", "report: a parameter starts at its default" )
+    HasLine( t, "v_.SetTime( At )", "report: a parameter set into the definition" )
+    ' a report with no events, arrays or sql: none of their code
+    dim as ustring plain = "format = 1" & LF & "[[source]]" & LF & "name = ""S""" & LF & "[[band]]" & LF & "id = ""d""" & LF & "kind = ""detail""" & LF
+    d = LoadRpt( plain )
+    dim as ustring tp = rcodegen.Generate( d, "rptPlain", "rptPlain.tkreport", plain )
+    tkReportDef_Destroy( d )
+    Check( (instr( tp, "_Made_" ) = 0) andalso (instr( tp, "Array(" ) = 0) andalso (instr( tp, "sqlite" ) = 0) andalso (instr( tp, "containers" ) = 0), _
+           "report: a plain report has no event, array or sql code", tp )
+    ' Check
+    dim as ustring hdr = "format = 1" & LF
+    RptRefused( hdr & "[[source]]" & LF & "name = ""A""" & LF & "kind = ""array""" & LF, "needs its item_type" )
+    RptRefused( hdr & "[[source]]" & LF & "name = ""A""" & LF & "kind = ""array""" & LF & "item_type = ""T""" & LF, "lists its fields" )
+    RptRefused( hdr & "[[source]]" & LF & "name = ""A""" & LF & "kind = ""array""" & LF & "item_type = ""T""" & LF & _
+                "  [[source.field]]" & LF & "  name = ""a b""" & LF, "field 'a b' is not a field" )
+    RptRefused( hdr & "[[source]]" & LF & "name = ""M""" & LF & "kind = ""sqlite""" & LF & "sql = ""x""" & LF & _
+                "[[source]]" & LF & "name = ""C""" & LF & "kind = ""array""" & LF & "parent = ""M""" & LF & "item_type = ""T""" & LF & _
+                "  [[source.field]]" & LF & "  name = ""a""" & LF, "an array child needs an array master" )
+    RptRefused( hdr & "[[source]]" & LF & "name = ""My Grid""" & LF & "kind = ""grid""" & LF, "must be a name" )
+    RptRefused( hdr & "[[source]]" & LF & "name = ""L""" & LF & "kind = ""listtree""" & LF, "not generated yet" )
+    RptRefused( hdr & "[[parameter]]" & LF & "name = ""CreateDoc""" & LF, "a member the report already has" )
+    RptRefused( hdr & "[[parameter]]" & LF & "name = ""SetX""" & LF & "[[source]]" & LF & "name = ""X""" & LF, "a member the report already has" )
+    RptRefused( hdr & "[report]" & LF & "[report.events]" & LF & "BeforePrint = ""On Before""" & LF, "is not a name" )
+    RptRefused( hdr, "is not a name", "rpt-1" )
+    Check( CheckProblems( hdr & "[[parameter]]" & LF & "name = ""Settle""" & LF ) = "", "report: a parameter may start with Set when no setter has its name" )
+    ' formtree: a .tkreport is generated and checked like a form
+    dim as ustring tmp = fs.CreateTempDir( "rdtree" ).ValueOr( none_ )
+    fs.WriteAllText( fs.PathJoin( tmp, "rptTree.tkreport" ), plain )
+    dim as Array( of ustring ) rep
+    dim as long nBad = formtree.Process( tmp, false, rep )
+    Check( (nBad = 1) andalso (rep.Count( ) = 1) andalso (instr( rep[0], "rptTree.design.tiko: stale" ) > 0), "report: --check-forms finds a report with no module" )
+    dim as Array( of ustring ) rep1
+    formtree.Process( tmp, true, rep1 )
+    dim as Array( of ustring ) rep2
+    Check( (formtree.Process( tmp, false, rep2 ) = 0) andalso fs.IsFile( fs.PathJoin( tmp, "rptTree.design.tiko" ) ), "report: --generate-forms writes it; then it is current" )
+    fs.WriteAllText( fs.PathJoin( tmp, "rptBad.tkreport" ), "format = 1" & LF & "[[band]]" & LF & "id = ""b""" & LF & "kind = ""nope""" & LF )
+    dim as Array( of ustring ) rep3
+    formtree.Process( tmp, false, rep3 )
+    dim as boolean named
+    for each s as ustring in rep3
+        if (instr( s, "rptBad.tkreport: band 'b'" ) > 0) then named = true
+    next
+    Check( named, "report: a file that does not read: its problem, with the file's name" )
+    fs.RemoveDirAll( tmp )
+end sub
+
+' ---- the Report Designer's edits (RD5): redits, GUI-free ------------------------------------------
+private function RptIds( byval d as TK_REPORTDEF ptr ) as ustring
+    dim as ustring s
+    for i as int32 = 0 to d->nItems - 1
+        s &= d->items(i).id & " "
+    next
+    return rtrim( s )
+end function
+
+private function RptNames( byval a as ustring, byval b as ustring = "", byval c_ as ustring = "" ) as Array( of ustring )
+    dim as Array( of ustring ) r
+    r.Push( a )
+    if len( b ) then r.Push( b )
+    if len( c_ ) then r.Push( c_ )
+    return r
+end function
+
+sub ReportEditsSuite( )
+    dim as ustring src = "format = 1" & LF & "[[source]]" & LF & "name = ""S""" & LF _
+        & "[[band]]" & LF & "id = ""rf""" & LF & "kind = ""report_footer""" & LF _
+        & "[[band]]" & LF & "id = ""d""" & LF & "kind = ""detail""" & LF & "source = ""S""" & LF _
+        & "[[band]]" & LF & "id = ""g0f""" & LF & "kind = ""group_footer""" & LF _
+        & "[[band]]" & LF & "id = ""g1h""" & LF & "kind = ""group_header""" & LF & "level = 1" & LF & "group = ""[a]""" & LF _
+        & "[[band]]" & LF & "id = ""g0h""" & LF & "kind = ""group_header""" & LF & "group = ""[b]""" & LF _
+        & "[[band]]" & LF & "id = ""g1f""" & LF & "kind = ""group_footer""" & LF & "level = 1" & LF _
+        & "[[band]]" & LF & "id = ""rh""" & LF & "kind = ""report_header""" & LF _
+        & "[[item]]" & LF & "id = ""a""" & LF & "band = ""d""" & LF & "rect = [10, 0, 50, 10]" & LF _
+        & "[[item]]" & LF & "id = ""b""" & LF & "band = ""d""" & LF & "rect = [100, 4, 20, 10]" & LF _
+        & "[[item]]" & LF & "id = ""c""" & LF & "band = ""d""" & LF & "rect = [200, 8, 30, 10]" & LF
+    dim as TK_REPORTDEF ptr d = LoadRpt( src )
+    Check( d <> 0, "redits: the report loads" )
+    if d = 0 then exit sub
+    dim as Array( of int32 ) bandOrder, depths
+    redits.BandOrder( d, bandOrder, depths )
+    dim as ustring o
+    for each i as int32 in bandOrder
+        o &= d->bands(i).id & " "
+    next
+    Check( rtrim( o ) = "rh g0h g1h d g1f g0f rf", "redits: the bands stacked as the report prints them", o )
+    Check( (redits.GridPt( d ) > 2.83) andalso (redits.GridPt( d ) < 2.84) andalso (abs( redits.Snap( 10, redits.GridPt( d ) ) - 11.34 ) < 0.001), _
+           "redits: a 1 mm grid, snapping to 0.01 pt", str( redits.Snap( 10, redits.GridPt( d ) ) ) )
+    Check( (redits.NewItemId( d, "x" ) = "x") andalso (redits.NewItemId( d, "a" ) = "a1"), "redits: a new id is the wanted one, else numbered" )
+    redits.AlignItems( d, RptNames( "c", "a" ), redits.RAlign.RAlignRights )
+    Check( d->items(0).x = 180, "redits: Align Rights puts the right edges on the anchor's", str( d->items(0).x ) )
+    redits.AlignItems( d, RptNames( "c", "b" ), redits.RAlign.RSameSize )
+    Check( (d->items(1).w = 30) andalso (d->items(1).h = 10), "redits: Same Size takes the anchor's" )
+    d->items(0).x = 0 : d->items(1).x = 10
+    redits.SpaceEqual( d, RptNames( "a", "b", "c" ), false )
+    Check( d->items(1).x = 110, "redits: equal spacing moves the middle one, the outer two stay", str( d->items(1).x ) )
+    redits.ToFront( d, RptNames( "a" ) )
+    Check( RptIds( d ) = "b c a", "redits: to the front draws it last", RptIds( d ) )
+    redits.ToBack( d, RptNames( "a", "c" ) )
+    Check( RptIds( d ) = "c a b", "redits: to the back keeps their own order", RptIds( d ) )
+    dim as ustring clip = redits.CopyText( d, RptNames( "a" ) )
+    Check( redits.IsClipText( clip ) andalso (redits.IsClipText( src ) = false), "redits: a copy is report items; a report is not", clip )
+    dim as Array( of ustring ) ids
+    Check( redits.PasteText( d, clip, "rh", 2, 3, ids ) andalso (ids.Count( ) = 1) andalso (ids[0] = "a1") _
+           andalso (d->items(3).band = "rh") andalso (d->items(3).x = 2) andalso (d->items(3).y = 3), "redits: a paste goes into the band, moved, renamed", RptIds( d ) )
+    redits.DeleteItems( d, RptNames( "a", "a1" ) )
+    Check( RptIds( d ) = "c b", "redits: delete", RptIds( d ) )
+    tkReportDef_Destroy( d )
+end sub
+
+' ---- the palettes' model (RD6): rmodel and redits' placing, GUI-free --------------------------------
+sub ReportPalettesSuite( )
+    dim as ustring src = "format = 1" & LF & "[[source]]" & LF & "name = ""O""" & LF _
+        & "[[source]]" & LF & "name = ""L""" & LF & "parent = ""O""" & LF & "  [[source.field]]" & LF & "  name = ""Qty""" & LF & "  kind = ""int""" & LF _
+        & "[[band]]" & LF & "id = ""d""" & LF & "kind = ""detail""" & LF & "source = ""O""" & LF _
+        & "[[band]]" & LF & "id = ""dr""" & LF & "kind = ""detail_report""" & LF & "parent = ""d""" & LF & "source = ""L""" & LF _
+        & "[[band]]" & LF & "id = ""ld""" & LF & "kind = ""detail""" & LF & "parent = ""dr""" & LF _
+        & "[[item]]" & LF & "id = ""a""" & LF & "band = ""d""" & LF
+    dim as TK_REPORTDEF ptr d = LoadRpt( src )
+    if d = 0 then exit sub
+    Check( (redits.FieldExpr( d, "ld", "L", "Qty" ) = "[Qty]") andalso (redits.FieldExpr( d, "d", "L", "Qty" ) = "[L.Qty]"), _
+           "rpalettes: a field is [Field] in its own source's band, [Source.Field] elsewhere" )
+    Check( redits.InsertBand( d, "group_footer" ) = "", "rpalettes: no group footer without a header" )
+    Check( (redits.InsertBand( d, "group_header" ) = "groupHeader1") andalso (redits.InsertBand( d, "group_header" ) = "groupHeader2") _
+           andalso (redits.InsertBand( d, "group_footer" ) = "groupFooter2"), "rpalettes: a footer closes the innermost open group" )
+    Check( (rmodel.SetProp( d, "band:d", "id", "body" ) = "") andalso (d->items(0).band = "body") andalso (d->bands(tkReportDef_FindBand( d, "dr" )).parent = "body"), _
+           "rpalettes: a band renamed takes its items and its bands along" )
+    Check( (rmodel.SetProp( d, "band:body", "height", "x" ) <> "") andalso (rmodel.SetProp( d, "item:a", "id", "dr" ) = "") _
+           andalso (rmodel.SetProp( d, "item:a", "id", "1a" ) <> ""), "rpalettes: a number and a name are checked" )
+    Check( (rmodel.NumText( 19.84 ) = "19.84") andalso (rmodel.NumText( 20 ) = "20") andalso (rmodel.NumText( 2.5 ) = "2.5"), "rpalettes: numbers shown to 0.01, no trailing zeros" )
+    dim as Array( of rmodel.RField ) f
+    rmodel.FieldList( d, f )
+    Check( (f[0].Label = "O") andalso (f[1].Label = "L") andalso (f[1].Level = 1) andalso (f[2].Label = "Qty") andalso (f[2].Level = 2), _
+           "rpalettes: a child source and its fields sit under the master" )
+    ' a master-detail section from the toolbox: under the detail, over its child source, with its own bands; once per child
+    dim as ustring ee
+    dim as TK_REPORTDEF ptr m = LoadRpt( "format = 1" & LF & "[[source]]" & LF & "name = ""O""" & LF & "[[source]]" & LF & "name = ""Lines""" & LF _
+        & "parent = ""O""" & LF & "[[band]]" & LF & "id = ""d""" & LF & "kind = ""detail""" & LF & "source = ""O""" & LF )
+    if m then
+        dim as ustring dr = redits.InsertBand( m, "detail_report", "d" )
+        dim as int32 dri = tkReportDef_FindBand( m, dr ), lhi = tkReportDef_FindBand( m, "linesHeader" )
+        dim as int32 ldi = tkReportDef_FindBand( m, "linesDetail" ), lfi = tkReportDef_FindBand( m, "linesFooter" )
+        dim as TK_REPORTDEF ptr back = tkReportDef_LoadText( tkReportDef_SaveText( m ), ee )
+        Check( (dr = "lines") andalso (dri >= 0) andalso (m->bands(dri).parent = "d") andalso (m->bands(dri).source = "Lines") _
+               andalso (lhi >= 0) andalso (ldi >= 0) andalso (lfi >= 0) andalso (m->bands(lhi).kind = "report_header") _
+               andalso (m->bands(ldi).parent = "lines") andalso (m->bands(lfi).kind = "report_footer") _
+               andalso (redits.InsertBand( m, "detail_report", "d" ) = "") andalso (back <> 0), _
+               "rpalettes: + detail_report adds a section under the detail over its child source, with its header, detail, footer; once per child", dr & " " & ee )
+        if back then tkReportDef_Destroy( back )
+        tkReportDef_Destroy( m )
+    end if
+    redits.DeleteBand( d, "body" )
+    Check( (tkReportDef_FindBand( d, "dr" ) < 0) andalso (tkReportDef_FindBand( d, "ld" ) < 0) andalso (d->nItems = 0), _
+           "rpalettes: deleting a band takes its items and its own bands" )
+    tkReportDef_Destroy( d )
+end sub
+
+' ---- the dialogs' models (RD7): rrecords and the expression check, GUI-free ---------------------------
+sub ReportDialogsSuite( )
+    dim as ustring src = "format = 1" & LF & "[[source]]" & LF & "name = ""O""" & LF _
+        & "  [[source.field]]" & LF & "  name = ""Customer""" & LF _
+        & "  [[source.field]]" & LF & "  name = ""Amount""" & LF & "  kind = ""int""" & LF _
+        & "[[band]]" & LF & "id = ""d""" & LF & "kind = ""detail""" & LF & "source = ""O""" & LF _
+        & "[[item]]" & LF & "id = ""a""" & LF & "band = ""d""" & LF & "kind = ""field""" & LF & "expr = ""[Amount]""" & LF
+    dim as TK_REPORTDEF ptr d = LoadRpt( src )
+    if d = 0 then exit sub
+    dim as Array( of ustring ) keys
+    rrecords.SplitSort( "[A], Format([B], "",""), [C] desc", keys )
+    Check( (keys.Count( ) = 3) andalso (keys[1] = "Format([B], "","")"), "rdialogs: a sort splits at its top-level commas only" )
+
+    ' Group and sort: a level with its footer, its group descending, extra keys after; read back
+    dim as rrecords.RecordSet g
+    g.Init( d, rrecords.RSet.RSetGroups )
+    g.Add( )
+    g.SetValue( 0, "group", "[Customer]" )
+    g.SetValue( 0, "descending", "true" )
+    g.SetValue( -1, "sort", "[Amount]" )
+    Check( (g.Count( ) = 1) andalso (g.FooterOf( 0 ) >= 0) andalso (d->sources(0).sort = "[Customer] desc, [Amount]"), _
+           "rdialogs: a group level brings its footer, and the sort that orders the rows by it", d->sources(0).sort )
+    dim as rrecords.RecordSet g2
+    g2.Init( d, rrecords.RSet.RSetGroups )
+    Check( (g2.GetValue( 0, "descending" ) = "true") andalso (g2.GetValue( -1, "sort" ) = "[Amount]"), "rdialogs: the sort read back into levels and extra keys" )
+    g.Add( )
+    g.SetValue( 1, "group", "[Amount]" )
+    g.Move( 1, -1 )
+    Check( (d->bands(g.HeaderOf( 0 )).group_ = "[Amount]") andalso (left( d->sources(0).sort, 26 ) = "[Amount], [Customer] desc,"), _
+           "rdialogs: moving a level swaps the bands' levels and the sort", d->sources(0).sort )
+    g.Remove( 0 )
+    Check( (g.Count( ) = 1) andalso (d->bands(g.HeaderOf( 0 )).group_ = "[Customer]") andalso (g.FooterOf( 0 ) >= 0), "rdialogs: removing a level moves the inner ones up" )
+
+    ' sources: the snapshot as one line; a rename followed; a source in use stays
+    dim as rrecords.RecordSet so
+    so.Init( d, rrecords.RSet.RSetSources )
+    Check( (so.GetValue( 0, "fields" ) = "Customer, Amount:int") andalso (so.SetValue( 0, "fields", "Customer, Amount:float, Paid:bool" ) = "") _
+           andalso (d->sources(0).nFields = 3) andalso (so.SetValue( 0, "fields", "X:money" ) <> ""), "rdialogs: a source's fields as one line, kinds checked" )
+    Check( (so.SetValue( 0, "name", "Orders" ) = "") andalso (d->bands(tkReportDef_FindBand( d, "d" )).source = "Orders") _
+           andalso (len( so.Remove( 0 ) ) > 0), "rdialogs: a source renamed in its bands; one in use is not removed" )
+
+    ' parameters and rules
+    dim as rrecords.RecordSet pa
+    pa.Init( d, rrecords.RSet.RSetParams )
+    pa.Add( )
+    Check( (pa.SetValue( 0, "type", "int" ) = "") andalso (pa.SetValue( 0, "name", "Min" ) = "") andalso (d->params(0).kind = TKV_INT), "rdialogs: a parameter added and typed" )
+    ' a keyword names no field of the generated report ("To = v_.d" is TKO0408): the dialog and the generator refuse it
+    Check( (pa.SetValue( 0, "name", "To" ) <> "") andalso (d->params(0).name_ = "Min") _
+           andalso (instr( CheckProblems( "format = 1" & LF & "[[parameter]]" & LF & "name = ""To""" & LF ), "reserved word" ) > 0), _
+           "rdialogs: a parameter named like a keyword is refused, in the dialog and by the generator" )
+    dim as rrecords.RecordSet ru
+    ru.Init( d, rrecords.RSet.RSetRules, "a" )
+    ru.Add( )
+    ru.SetValue( 0, "when", "[Amount] > @Min" )
+    ru.SetValue( 0, "bold", "true" )
+    Check( (d->items(0).nRules = 1) andalso (d->items(0).rules(0).bold = 1) andalso (ru.GetValue( 0, "italic" ) = ""), "rdialogs: a rule added, a style set, the rest unchanged" )
+
+    ' the expression check: a type, an error with its column, no totals in a group key
+    dim as ustring kindName
+    dim as int32 col
+    Check( (rmodel.CheckExpr( d, "d", false, "[Amount] * 2", kindName, col ) = "") andalso (kindName = "float"), "rdialogs: an expression's type", kindName )
+    Check( (rmodel.CheckExpr( d, "d", false, "1 + [Nope]", kindName, col ) <> "") andalso (col = 5), "rdialogs: an error and its column", str( col ) )
+    Check( (rmodel.CheckExpr( d, "d", true, "Sum([Amount])", kindName, col ) <> "") andalso (rmodel.CheckExpr( d, "d", false, "Sum([Amount])", kindName, col ) = ""), _
+           "rdialogs: no totals where they mean nothing" )
+
+    ' the page from a page setup
+    dim as TKPAGESETUP ps
+    ps.paper = TK_PAPER_LETTER
+    ps.landscape = true
+    ps.marginL = 36
+    tkReportDef_SetPageSetup( d, ps )
+    Check( (d->paper = "Letter") andalso d->landscape andalso (d->mL = 36), "rdialogs: the page from a page setup" )
+    tkReportDef_Destroy( d )
+end sub
+
+' ---- the wizard and the design rows (RD8), GUI-free --------------------------------------------------
+sub ReportWizardSuite( )
+    dim as rwizard.RWizardSpec sp
+    sp.Source = "Orders"
+    sp.Fields = "Customer, Amount:float, When:date"
+    sp.Layout = "columnar"
+    dim as ustring text
+    Check( (rwizard.MakeReport( sp, text ) = "") andalso (instr( text, "[[band]]" ) > 0), "rwizard: a columnar report made" )
+    dim as TK_REPORTDEF ptr d = LoadRpt( text )
+    if d then
+        Check( (tkReportDef_FindBand( d, "pageHeader" ) < 0) andalso (d->bands(tkReportDef_FindBand( d, "detail" )).height = 52), _
+               "rwizard: columnar: no captions over columns, a line a field", str( d->bands(tkReportDef_FindBand( d, "detail" )).height ) )
+        tkReportDef_Destroy( d )
+    end if
+    sp.GroupBy = "Region"
+    Check( instr( rwizard.MakeReport( sp, text ), "not one of the fields" ) > 0, "rwizard: a group on no field is refused" )
+
+    ' the sample rows: generated by kind, a child's rows under their masters; read back
+    dim as ustring src = "format = 1" & LF & "[[source]]" & LF & "name = ""O""" & LF & "  [[source.field]]" & LF & "  name = ""C""" & LF _
+        & "  [[source.field]]" & LF & "  name = ""N""" & LF & "  kind = ""int""" & LF _
+        & "[[source]]" & LF & "name = ""L""" & LF & "parent = ""O""" & LF & "  [[source.field]]" & LF & "  name = ""Q""" & LF & "  kind = ""int""" & LF
+    d = LoadRpt( src )
+    if d = 0 then exit sub
+    dim as rpreview.RDesignData dd
+    dim as ustring e
+    rpreview.ReadSample( d, rpreview.GenerateSample( d ), dd, e )
+    Check( (e = "") andalso (dd.Sources[0].RowCount( ) = 5) andalso (dd.Sources[1].RowCount( ) = 10) andalso (dd.Sources[1].Master[9] = 4) _
+           andalso (dd.Sources[0].Vals[0].s = "C 1") andalso (dd.Sources[0].Vals[2].s = "C 1") andalso (dd.Sources[0].Vals[1].i = 7), _
+           "rpreview: generated rows: five masters, two children each, text repeating for groups", e )
+    rpreview.ReadSample( d, "[[O]]" & LF & "C = ""x""" & LF & "N = 4" & LF & "[[L]]" & LF & "_master = 1" & LF & "Q = 2" & LF, dd, e )
+    Check( (dd.Sources[0].RowCount( ) = 1) andalso (dd.Sources[0].Vals[1].i = 4) andalso (dd.Sources[1].Master[0] = 0), "rpreview: a sample file read" )
+    tkReportDef_Destroy( d )
+end sub

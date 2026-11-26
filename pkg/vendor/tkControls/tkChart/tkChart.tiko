@@ -239,6 +239,7 @@ public type TKCHART_STATE
     updateDepth    as long
     bLayoutDirty   as boolean = true
     bEnabled       as boolean = true
+    bTapInspect    as boolean = false      ' a phone's rule: a tap picks a point and keeps it (F4)
 
     wszTitle       as ustring
     wszSubtitle    as ustring
@@ -1620,6 +1621,39 @@ private sub CHT_Rescale( byval pChart as TKCHART_STATE ptr, byval fOld as single
     pChart->Refresh()
 end sub
 
+' TAP TO INSPECT (docs/fasting-android F4): on a phone there is no hover, so a tap picks the point
+' under the finger -- or, off every point, the nearest one across (a bar's column, a line's
+' vertex), inside the plot -- makes it the hot point (HotChange fires) and shows its tip at once,
+' until the next tap: on another point, on the same one (which lets it go), or off the plot.
+' Hover tracking and the leave are ignored meanwhile, as the finger's lift is a leave.
+private sub CHT_Tap( byval pChart as TKCHART_STATE ptr, byval x as long, byval y as long )
+    CHT_EnsureLayout( pChart )
+    dim as long iSer = -1, iPt = -1
+    if CHT_HitTest( pChart, x, y, iSer, iPt ) = false then
+        iSer = -1 : iPt = -1
+        if tkRect_Contains( pChart->rcPlot, x, y ) andalso (pChart->nChartType <> TKCHART_TYPE_PIE) then
+            dim as long best = &h7FFFFFFF
+            for i as long = 0 to pChart->seriesCount - 1
+                if pChart->series(i).bVisible = false then continue for
+                for j as long = 0 to pChart->series(i).pointCount - 1
+                    dim as TKRECT r = pChart->series(i).points(j).rc
+                    if r.right <= r.left then continue for
+                    dim as long d = abs( (r.left + r.right) \ 2 - x )
+                    if d < best then best = d : iSer = i : iPt = j
+                next
+            next
+        end if
+    end if
+    if (iPt >= 0) andalso (iSer = pChart->nHotSeries) andalso (iPt = pChart->nHotPoint) then iSer = -1 : iPt = -1
+    CHT_SetHot( pChart, iSer, iPt )
+    if iPt < 0 then
+        tkTipHost_TrackHide( @pChart->tip )
+    else
+        tkTipHost_TrackShow( @pChart->tip, pChart->series(iSer).points(iPt).rc, CHT_ResolveTooltipText( pChart ), TIP_ALIGN_ABOVE )
+    end if
+    tkWidget_Invalidate( pChart->hWin )
+end sub
+
 ' A DISPLAY control: no focus, no keyboard, no capture. Every message but DESTROY is offered
 ' to the host first.
 private function tkChart_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
@@ -1643,14 +1677,14 @@ private function tkChart_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr )
         tkChart_ApplyTheme( w, tkTheme_Of( w ) )
         return true
     case TKM_MOUSEMOVE
-        if pChart->bEnabled = false then return true
+        if (pChart->bEnabled = false) orelse pChart->bTapInspect then return true
         CHT_EnsureLayout( pChart )
         dim as long iSer, iPt
         CHT_HitTest( pChart, cint( m->x ), cint( m->y ), iSer, iPt )
         CHT_SetHot( pChart, iSer, iPt )
         return true
     case TKM_MOUSELEAVE
-        CHT_SetHot( pChart, -1, -1 )
+        if pChart->bTapInspect = false then CHT_SetHot( pChart, -1, -1 )
         return true
     case TKM_ENABLE
         pChart->bEnabled = m->bFlag
@@ -1660,7 +1694,10 @@ private function tkChart_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr )
         end if
         tkWidget_Invalidate( w )
         return true
-    case TKM_LBUTTONDOWN, TKM_LBUTTONUP, TKM_RBUTTONDOWN, TKM_RBUTTONUP
+    case TKM_LBUTTONDOWN
+        if pChart->bTapInspect andalso pChart->bEnabled then CHT_Tap( pChart, cint( m->x ), cint( m->y ) )
+        return true
+    case TKM_LBUTTONUP, TKM_RBUTTONDOWN, TKM_RBUTTONUP
         return true
     case TKM_DESTROY
         tkTipHost_Destroy( @pChart->tip )
@@ -2547,6 +2584,21 @@ public function tkChart_GetTooltipHandle( byval hChart as TK_WIDGET ptr ) as TK_
     dim as TKCHART_STATE ptr pChart = GetChartPointer( hChart )
     if pChart = 0 then return 0
     return tkTipHost_Tip( @pChart->tip )
+end function
+
+' Tap to inspect (see CHT_Tap) instead of hover; off by default. Turning it off lets the point go.
+public sub tkChart_SetTapToInspect( byval hChart as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHART_STATE ptr pChart = GetChartPointer( hChart )
+    if (pChart = 0) orelse (pChart->bTapInspect = bOn) then exit sub
+    pChart->bTapInspect = bOn
+    CHT_SetHot( pChart, -1, -1 )
+    tkTipHost_TrackHide( @pChart->tip )
+end sub
+
+public function tkChart_GetTapToInspect( byval hChart as TK_WIDGET ptr ) as boolean
+    dim as TKCHART_STATE ptr pChart = GetChartPointer( hChart )
+    if pChart = 0 then return false
+    return pChart->bTapInspect
 end function
 
 public sub tkChart_SetHoverTime( byval hChart as TK_WIDGET ptr, byval ms as long )

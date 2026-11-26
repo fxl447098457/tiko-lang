@@ -1,0 +1,861 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPrintPreview -- a tkPrint document's pages as paper on a backdrop: zoom, columns, scrolling,
+' links. Design: docs/tkControls/PRINTING.md (claude-docs) §8.1; phase R1.
+'
+' THE VIEW is the widget (backdrop, pages, mouse, keys) plus a tkVScrollBar and a tkHScrollBar that
+' show only when the pages do not fit. Pages are laid out in rows of Columns pages (continuous
+' view, scrolled by the pixel), or one row at a time (single view, PgUp / PgDn turn it).
+'
+' ZOOM is a factor: 1 = 100% = a point is 96/72 pixels at the surface's scale. FIT WIDTH and FIT
+' PAGE work it out from the view on every layout; a custom zoom stays. Ctrl+wheel and +/- zoom
+' about the pointer / the view's centre.
+'
+' PAINTING replays pages through tkPrint. Each visible page is rendered once into a texture at the
+' zoom in force and drawn from it until the zoom or the document changes (SetCacheSize( 0 ) turns
+' that off: every frame replays). A page too large for a texture (4096 px a side) is replayed.
+'
+' A DOCUMENT STILL BEING MADE (tkPrintDoc_BeginGenerate without the rest) is generated here, a few
+' pages per timer tick, so the first pages show while the rest are made.
+'
+' Setters are silent; only user interaction notifies (PageChanged, ZoomChanged, LinkClick).
+#module "tkPrintPreview"
+
+#import "../tkPrint" public
+#import "../tkTheme" public
+#import "../tkVScrollBar" public
+#import "../tkHScrollBar" public
+using tkPrint
+using tkTheme
+using tkVScrollBar
+using tkHScrollBar
+using tkScrollBar
+using tkHost
+using tkPaint
+
+public enum
+    TKPV_ZOOM_CUSTOM = 0
+    TKPV_ZOOM_FITWIDTH        ' the widest row fills the view's width (the default)
+    TKPV_ZOOM_FITPAGE         ' the widest row and the tallest page fit the view
+end enum
+
+public enum
+    TKPV_VIEW_CONTINUOUS = 0  ' every row, one under the other
+    TKPV_VIEW_SINGLE          ' one row at a time
+end enum
+
+' Sizes in design units, scaled at use.
+public const as long TKPV_DEFAULT_GAP = 12        ' between pages and around them
+public const as long TKPV_DEFAULT_SHADOW = 3
+public const as long TKPV_DEFAULT_CACHE = 8       ' page textures kept
+public const as single TKPV_ZOOM_MIN = 0.1
+public const as single TKPV_ZOOM_MAX = 8.0
+const as long PV_TEXMAX = 4096
+const as long PV_TIMER = TK_TIMER_APP
+
+public type TKPRINTPREVIEW_COLORS
+    BackColor       as ulong = &hFF3A3F47ul       ' the backdrop
+    PaperColor      as ulong = &hFFFFFFFFul
+    ShadowColor     as ulong = &h50000000ul
+    PageBorderColor as ulong = &hFF5A606Aul
+end type
+
+public type PV_PageChangedSub as sub( byval hPreview as TK_WIDGET ptr, byval nPage as long )
+public type PV_ZoomChangedSub as sub( byval hPreview as TK_WIDGET ptr, byval fZoom as single )
+' A link was clicked: TRUE = handled. Unhandled, a URL opens (SDL_OpenURL) and a page link scrolls.
+public type PV_LinkClickFunc as function( byval hPreview as TK_WIDGET ptr, byval nPage as long, byref url as ustring, _
+                                          byval nTargetPage as long, byval fTargetY as single ) as boolean
+
+public type PV_CACHE
+    page    as long = -1
+    serial  as long
+    q       as long                    ' pixels per point x 4096
+    tex     as SDL_Texture ptr
+    used    as long
+end type
+
+public type TKPRINTPREVIEW_STATE
+    hWin           as TK_WIDGET ptr
+    id             as long
+    hV             as TK_WIDGET ptr
+    hH             as TK_WIDGET ptr
+    doc            as TK_PRINTDOC ptr
+    rp             as TK_PRINTREPLAY ptr
+    colors         as TKPRINTPREVIEW_COLORS
+    bColorsPinned  as boolean
+    nZoomMode      as long = TKPV_ZOOM_FITWIDTH
+    fZoomSet       as single = 1      ' the custom zoom
+    fZoom          as single = 1      ' the zoom in force
+    nView          as long = TKPV_VIEW_CONTINUOUS
+    nCols          as long = 1
+    nPage          as long            ' the current page
+    scrollX        as long
+    scrollY        as long
+    ' layout: page rects in CONTENT pixels (before scrolling and centring)
+    pr(any)        as TKRECT
+    nLaid          as long
+    firstLaid      as long            ' single view: the first page of the row shown
+    contentW       as long
+    contentH       as long
+    viewW          as long
+    viewH          as long
+    offX           as long            ' centring when the content is narrower than the view
+    bDirty         as boolean = true
+    laidSerial     as long = -1
+    ' the texture cache
+    cache(any)     as PV_CACHE
+    nCache         as long = TKPV_DEFAULT_CACHE
+    useTick        as long
+    bTimer         as boolean
+    bOverLink      as boolean
+    PageChanged    as PV_PageChangedSub
+    ZoomChanged    as PV_ZoomChangedSub
+    LinkClick      as PV_LinkClickFunc
+end type
+
+function PV( byval w as TK_WIDGET ptr ) as TKPRINTPREVIEW_STATE ptr
+    if w = 0 then return 0
+    return cast( TKPRINTPREVIEW_STATE ptr, w->pData )
+end function
+
+private function Sc( byval p as TKPRINTPREVIEW_STATE ptr, byval v as long ) as long
+    return tkHost_Scale( p->hWin->pHost, v )
+end function
+
+' Pixels per point at a zoom on this surface.
+private function PxPerPt( byval p as TKPRINTPREVIEW_STATE ptr, byval z as single ) as single
+    return z * 96 / 72 * p->hWin->pHost->fScale
+end function
+
+private function PageCount( byval p as TKPRINTPREVIEW_STATE ptr ) as long
+    if p->doc = 0 then return 0
+    return tkPrintDoc_GetPageCount( p->doc )
+end function
+
+private sub FlushCache( byval p as TKPRINTPREVIEW_STATE ptr )
+    for i as long = 0 to ubound( p->cache )
+        if p->cache(i).tex then SDL_DestroyTexture( p->cache(i).tex )
+        p->cache(i).tex = 0
+        p->cache(i).page = -1
+    next
+end sub
+
+private sub ClampScroll( byval p as TKPRINTPREVIEW_STATE ptr )
+    if p->scrollX > p->contentW - p->viewW then p->scrollX = p->contentW - p->viewW
+    if p->scrollY > p->contentH - p->viewH then p->scrollY = p->contentH - p->viewH
+    if p->scrollX < 0 then p->scrollX = 0
+    if p->scrollY < 0 then p->scrollY = 0
+end sub
+
+' The pages of the rows laid out: all of them (continuous) or the current one's row (single).
+private sub RowRange( byval p as TKPRINTPREVIEW_STATE ptr, byref first as long, byref last as long )
+    dim as long n = PageCount( p )
+    first = 0 : last = n - 1
+    if (p->nView = TKPV_VIEW_SINGLE) andalso (n > 0) then
+        first = (p->nPage \ p->nCols) * p->nCols
+        last = first + p->nCols - 1
+        if last > n - 1 then last = n - 1
+    end if
+end sub
+
+' The zoom FIT WIDTH / FIT PAGE give for a view of vw x vh pixels.
+private function FitZoom( byval p as TKPRINTPREVIEW_STATE ptr, byval vw as long, byval vh as long ) as single
+    dim as long first, last
+    RowRange( p, first, last )
+    if last < first then return p->fZoom
+    dim as single maxRowW = 0, maxH = 0
+    dim as long gap = Sc( p, TKPV_DEFAULT_GAP )
+    dim as long i = first
+    while i <= last
+        dim as single rw = 0
+        for c as long = 0 to p->nCols - 1
+            if i + c > last then exit for
+            dim as single w, h
+            tkPrintDoc_GetPageSize( p->doc, i + c, w, h )
+            rw += w
+            if h > maxH then maxH = h
+        next
+        if rw > maxRowW then maxRowW = rw
+        i += p->nCols
+    wend
+    if maxRowW <= 0 then return p->fZoom
+    dim as single unit = PxPerPt( p, 1 )
+    dim as single z = (vw - gap * (p->nCols + 1)) / (maxRowW * unit)
+    if (p->nZoomMode = TKPV_ZOOM_FITPAGE) andalso (maxH > 0) then
+        dim as single zh = (vh - gap * 2) / (maxH * unit)
+        if zh < z then z = zh
+    end if
+    if z < TKPV_ZOOM_MIN then z = TKPV_ZOOM_MIN
+    if z > TKPV_ZOOM_MAX then z = TKPV_ZOOM_MAX
+    return z
+end function
+
+' Page rects at the zoom in force, rows top to bottom; content size.
+private sub PlacePages( byval p as TKPRINTPREVIEW_STATE ptr )
+    dim as long first, last
+    RowRange( p, first, last )
+    dim as long n = PageCount( p )
+    if n > ubound( p->pr ) + 1 then redim p->pr( 0 to n - 1 )
+    for i as long = 0 to n - 1 : tkRect_SetEmpty( p->pr(i) ) : next
+    p->firstLaid = first
+    p->nLaid = 0
+    dim as long gap = Sc( p, TKPV_DEFAULT_GAP )
+    dim as single s = PxPerPt( p, p->fZoom )
+    dim as long y = gap, maxW = 0
+    dim as long i = first
+    while i <= last
+        dim as long x = gap, rowH = 0
+        for c as long = 0 to p->nCols - 1
+            if i + c > last then exit for
+            dim as single w, h
+            tkPrintDoc_GetPageSize( p->doc, i + c, w, h )
+            dim as long pw = clng( int( w * s + 0.5 ) ), ph = clng( int( h * s + 0.5 ) )
+            tkRect_Set( p->pr(i + c), x, y, x + pw, y + ph )
+            p->nLaid += 1
+            x += pw + gap
+            if ph > rowH then rowH = ph
+        next
+        if x > maxW then maxW = x
+        y += rowH + gap
+        i += p->nCols
+    wend
+    p->contentW = maxW
+    p->contentH = y
+end sub
+
+' Zoom, page rects, scroll bars. The bars' visibility and a fit zoom depend on each other: a few
+' passes settle it.
+sub PvLayout( byval p as TKPRINTPREVIEW_STATE ptr )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as long sb = Sc( p, TKSCROLL_DEFAULT_THICKNESS )
+    dim as boolean bV = false, bH = false
+    for pass as long = 1 to 3
+        p->viewW = w->cw - iif( bV, sb, 0 )
+        p->viewH = w->ch - iif( bH, sb, 0 )
+        if p->nZoomMode <> TKPV_ZOOM_CUSTOM then p->fZoom = FitZoom( p, p->viewW, p->viewH )
+        PlacePages( p )
+        dim as boolean nV = p->contentH > w->ch - iif( bH, sb, 0 )
+        dim as boolean nH = p->contentW > w->cw - iif( nV, sb, 0 )
+        if (nV = bV) andalso (nH = bH) then exit for
+        bV = nV : bH = nH
+    next
+    p->viewW = w->cw - iif( bV, sb, 0 )
+    p->viewH = w->ch - iif( bH, sb, 0 )
+    p->offX = iif( p->contentW < p->viewW, (p->viewW - p->contentW) \ 2, 0 )
+    ClampScroll( p )
+    tkWidget_SetPos( p->hV, p->viewW, 0, sb, p->viewH )
+    tkWidget_SetPos( p->hH, 0, p->viewH, p->viewW, sb )
+    tkWidget_Show( p->hV, bV )
+    tkWidget_Show( p->hH, bH )
+    tkVScrollBar_SetRange( p->hV, p->contentH, p->viewH, p->scrollY )
+    tkHScrollBar_SetRange( p->hH, p->contentW, p->viewW, p->scrollX )
+    tkVScrollBar_SetWheelStep( p->hV, Sc( p, 48 ) )
+    p->bDirty = false
+    p->laidSerial = iif( p->doc, tkPrintDoc_GetSerial( p->doc ), -1 )
+end sub
+
+private sub EnsureLayout( byval p as TKPRINTPREVIEW_STATE ptr )
+    dim as long ser = iif( p->doc, tkPrintDoc_GetSerial( p->doc ), -1 )
+    if p->bDirty orelse (ser <> p->laidSerial) then PvLayout( p )
+end sub
+
+' A page's rect in WIDGET pixels (scrolled and centred). FALSE when it is not laid out.
+private function PageRectW( byval p as TKPRINTPREVIEW_STATE ptr, byval i as long, byref rc as TKRECT ) as boolean
+    if (i < 0) orelse (i > ubound( p->pr )) then return false
+    if tkRect_IsEmpty( p->pr(i) ) then return false
+    rc = p->pr(i)
+    tkRect_Offset( rc, p->offX - p->scrollX, -p->scrollY )
+    return true
+end function
+
+' The page at a widget point (-1: none), and the point in page points.
+private function PageAt( byval p as TKPRINTPREVIEW_STATE ptr, byval x as single, byval y as single, _
+                         byref xPt as single, byref yPt as single ) as long
+    dim as single s = PxPerPt( p, p->fZoom )
+    for i as long = 0 to ubound( p->pr )
+        dim as TKRECT rc
+        if PageRectW( p, i, rc ) andalso tkRect_Contains( rc, x, y ) then
+            xPt = (x - rc.left) / s : yPt = (y - rc.top) / s
+            return i
+        end if
+    next
+    return -1
+end function
+
+' The current page, from the scroll position (continuous): the page under a line a third of the
+' way down the view, else the nearest row above it.
+private function PageFromScroll( byval p as TKPRINTPREVIEW_STATE ptr ) as long
+    if p->nView = TKPV_VIEW_SINGLE then return p->nPage
+    dim as long n = PageCount( p )
+    if n = 0 then return 0
+    dim as long probe = p->scrollY + p->viewH \ 3, best = 0
+    for i as long = 0 to n - 1 step p->nCols
+        if (i > ubound( p->pr )) orelse tkRect_IsEmpty( p->pr(i) ) then exit for
+        if p->pr(i).top <= probe then best = i else exit for
+    next
+    return best
+end function
+
+private sub SyncBars( byval p as TKPRINTPREVIEW_STATE ptr )
+    tkVScrollBar_SetPos( p->hV, p->scrollY )
+    tkHScrollBar_SetPos( p->hH, p->scrollX )
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' After a user scroll: the current page follows; PageChanged when it moved.
+private sub UserScrolled( byval p as TKPRINTPREVIEW_STATE ptr )
+    ClampScroll( p )
+    SyncBars( p )
+    dim as long np = PageFromScroll( p )
+    if np <> p->nPage then
+        p->nPage = np
+        if p->PageChanged then p->PageChanged( p->hWin, np )
+    end if
+end sub
+
+' Scroll so page i's row is at the top (continuous) or show its row (single).
+private sub GoToPage( byval p as TKPRINTPREVIEW_STATE ptr, byval i as long, byval yPt as single = 0 )
+    dim as long n = PageCount( p )
+    if n = 0 then exit sub
+    if i < 0 then i = 0
+    if i > n - 1 then i = n - 1
+    p->nPage = i
+    if p->nView = TKPV_VIEW_SINGLE then
+        p->bDirty = true
+        EnsureLayout( p )
+        p->scrollY = 0
+    else
+        EnsureLayout( p )
+        p->scrollY = p->pr(i).top - Sc( p, TKPV_DEFAULT_GAP ) + clng( yPt * PxPerPt( p, p->fZoom ) )
+    end if
+    ClampScroll( p )
+    SyncBars( p )
+end sub
+
+' A new zoom, keeping the page point under widget point (ax, ay) where it is.
+private sub ZoomAbout( byval p as TKPRINTPREVIEW_STATE ptr, byval z as single, byval ax as single, byval ay as single, _
+                       byval bUser as boolean )
+    if z < TKPV_ZOOM_MIN then z = TKPV_ZOOM_MIN
+    if z > TKPV_ZOOM_MAX then z = TKPV_ZOOM_MAX
+    EnsureLayout( p )
+    dim as single xPt, yPt
+    dim as long pg = PageAt( p, ax, ay, xPt, yPt )
+    p->nZoomMode = TKPV_ZOOM_CUSTOM
+    p->fZoomSet = z
+    p->fZoom = z
+    p->bDirty = true
+    EnsureLayout( p )
+    if pg >= 0 then
+        dim as single s = PxPerPt( p, z )
+        p->scrollX = p->pr(pg).left + p->offX + clng( xPt * s ) - clng( ax )
+        p->scrollY = p->pr(pg).top + clng( yPt * s ) - clng( ay )
+        ClampScroll( p )
+        PvLayout( p )                    ' the centring offset may have changed with the scroll
+    end if
+    SyncBars( p )
+    if bUser andalso (p->ZoomChanged <> 0) then p->ZoomChanged( p->hWin, z )
+    if bUser then UserScrolled( p )
+end sub
+
+' Generate more of a document still being made: ~12 ms of pages per tick.
+private sub GenerateTick( byval p as TKPRINTPREVIEW_STATE ptr )
+    if (p->doc = 0) orelse tkPrintDoc_IsComplete( p->doc ) then
+        if p->bTimer then tkWidget_KillTimer( p->hWin, PV_TIMER ) : p->bTimer = false
+        exit sub
+    end if
+    dim as Uint64 t0 = SDL_GetTicks()
+    while tkPrintDoc_GenerateStep( p->doc, 1 )
+        if SDL_GetTicks() - t0 >= 12 then exit while
+    wend
+    if tkPrintDoc_IsComplete( p->doc ) andalso p->bTimer then
+        tkWidget_KillTimer( p->hWin, PV_TIMER )
+        p->bTimer = false
+    end if
+    p->bDirty = true
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+private sub StartGenerating( byval p as TKPRINTPREVIEW_STATE ptr )
+    if (p->doc = 0) orelse tkPrintDoc_IsComplete( p->doc ) orelse p->bTimer then exit sub
+    tkWidget_SetTimer( p->hWin, PV_TIMER, 1 )
+    p->bTimer = true
+end sub
+
+' ---- painting ------------------------------------------------------------------------------
+private function CachedPage( byval p as TKPRINTPREVIEW_STATE ptr, byval b as TK_PAINT ptr, byval i as long, _
+                             byval pw as long, byval ph as long, byval s as single ) as SDL_Texture ptr
+    if (p->nCache <= 0) orelse (pw > PV_TEXMAX) orelse (ph > PV_TEXMAX) orelse (pw < 1) orelse (ph < 1) then return 0
+    if ubound( p->cache ) + 1 <> p->nCache then
+        FlushCache( p )
+        redim p->cache( 0 to p->nCache - 1 )
+    end if
+    dim as long ser = tkPrintDoc_GetSerial( p->doc ), q = clng( s * 4096 )
+    p->useTick += 1
+    dim as long victim = 0
+    for k as long = 0 to p->nCache - 1
+        dim byref as PV_CACHE c = p->cache(k)
+        if (c.page = i) andalso (c.serial = ser) andalso (c.q = q) andalso (c.tex <> 0) then
+            c.used = p->useTick
+            return c.tex
+        end if
+        if c.used < p->cache(victim).used then victim = k
+    next
+    dim byref as PV_CACHE c = p->cache(victim)
+    if c.tex then SDL_DestroyTexture( c.tex ) : c.tex = 0
+    dim as SDL_Renderer ptr r = b->renderer
+    dim as SDL_Texture ptr t = SDL_CreateTexture( r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, pw, ph )
+    if t = 0 then return 0
+    SDL_SetTextureBlendMode( t, SDL_BLENDMODE_BLEND )
+    dim as SDL_Texture ptr old = SDL_GetRenderTarget( r )
+    SDL_SetRenderTarget( r, t )
+    SDL_SetRenderClipRect( r, 0 )
+    dim as ulong pc = p->colors.PaperColor
+    SDL_SetRenderDrawColor( r, (pc shr 16) and 255, (pc shr 8) and 255, pc and 255, (pc shr 24) and 255 )
+    SDL_RenderClear( r )
+    tkPrintReplay_Page( p->rp, p->doc, i, 0, 0, s )
+    SDL_SetRenderTarget( r, old )
+    b->ApplyClip( 0 )
+    c.page = i : c.serial = ser : c.q = q : c.tex = t : c.used = p->useTick
+    return t
+end function
+
+private sub OnPaint( byval p as TKPRINTPREVIEW_STATE ptr, byval b as TK_PAINT ptr )
+    EnsureLayout( p )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, w->cw, w->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @rc )
+    if p->doc = 0 then exit sub
+    if p->rp = 0 then p->rp = tkPrintReplay_Create( b->renderer, b->engine )
+    dim as TKRECT view_
+    tkRect_Set( view_, 0, 0, p->viewW, p->viewH )
+    b->PushClip( @view_ )
+    dim as single s = PxPerPt( p, p->fZoom )
+    dim as long sh = Sc( p, TKPV_DEFAULT_SHADOW )
+    for i as long = 0 to ubound( p->pr )
+        dim as TKRECT pr
+        if PageRectW( p, i, pr ) = false then continue for
+        if tkRect_IsEmpty( tkRect_Intersect( pr, view_ ) ) then continue for
+        dim as TKRECT shd = pr
+        tkRect_Offset( shd, sh, sh )
+        b->SetBackColor( p->colors.ShadowColor ) : b->PaintRect( @shd )
+        b->SetBackColor( p->colors.PaperColor ) : b->PaintRect( @pr )
+        dim as SDL_Texture ptr t = CachedPage( p, b, i, pr.right - pr.left, pr.bottom - pr.top, s )
+        if t then
+            dim as SDL_FRect d
+            d.x = pr.left + b->ox : d.y = pr.top + b->oy : d.w = pr.right - pr.left : d.h = pr.bottom - pr.top
+            SDL_RenderTexture( b->renderer, t, 0, @d )
+        else
+            tkPrintReplay_Page( p->rp, p->doc, i, pr.left + b->ox, pr.top + b->oy, s, @b->rcCur )
+            b->ApplyClip( 0 )
+        end if
+        b->SetPenColor( p->colors.PageBorderColor )
+        b->PaintRoundOutline( @pr, 0, 1 )
+    next
+    b->PopClip()
+end sub
+
+' ---- input ---------------------------------------------------------------------------------
+private function OnKey( byval p as TKPRINTPREVIEW_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    dim as long n = PageCount( p )
+    dim as boolean ctrl = (m->mods and SDL_KMOD_CTRL) <> 0
+    dim as long line_ = Sc( p, 48 )
+    select case m->key
+    case SDLK_PAGEDOWN, SDLK_PAGEUP
+        dim as long dirn = iif( m->key = SDLK_PAGEDOWN, 1, -1 )
+        if p->nView = TKPV_VIEW_SINGLE then
+            dim as long np = (p->nPage \ p->nCols + dirn) * p->nCols
+            if (np >= 0) andalso (np < n) then
+                GoToPage( p, np )
+                if p->PageChanged then p->PageChanged( p->hWin, p->nPage )
+            end if
+        else
+            p->scrollY += dirn * p->viewH
+            UserScrolled( p )
+        end if
+    case SDLK_HOME, SDLK_END
+        if n > 0 then
+            dim as long np = iif( m->key = SDLK_HOME, 0, ((n - 1) \ p->nCols) * p->nCols )
+            dim as long was = p->nPage
+            GoToPage( p, np )
+            if (p->nView = TKPV_VIEW_CONTINUOUS) andalso (m->key = SDLK_END) then p->scrollY = p->contentH : ClampScroll( p ) : SyncBars( p )
+            if (p->nPage <> was) andalso (p->PageChanged <> 0) then p->PageChanged( p->hWin, p->nPage )
+        end if
+    case SDLK_DOWN : p->scrollY += line_ : UserScrolled( p )
+    case SDLK_UP : p->scrollY -= line_ : UserScrolled( p )
+    case SDLK_RIGHT : p->scrollX += line_ : UserScrolled( p )
+    case SDLK_LEFT : p->scrollX -= line_ : UserScrolled( p )
+    case SDLK_EQUALS, SDLK_PLUS, SDLK_KP_PLUS
+        ZoomAbout( p, p->fZoom * 1.25, p->viewW / 2, p->viewH / 2, true )
+    case SDLK_MINUS, SDLK_KP_MINUS
+        ZoomAbout( p, p->fZoom / 1.25, p->viewW / 2, p->viewH / 2, true )
+    case SDLK_0
+        if ctrl = false then return false
+        p->nZoomMode = TKPV_ZOOM_FITWIDTH
+        p->bDirty = true
+        EnsureLayout( p )
+        SyncBars( p )
+        if p->ZoomChanged then p->ZoomChanged( p->hWin, p->fZoom )
+    case else
+        return false
+    end select
+    return true
+end function
+
+private sub OnClick( byval p as TKPRINTPREVIEW_STATE ptr, byval x as single, byval y as single )
+    dim as single xPt, yPt
+    dim as long pg = PageAt( p, x, y, xPt, yPt )
+    if pg < 0 then exit sub
+    dim as ustring url
+    dim as long target
+    dim as single ty
+    if tkPrintDoc_LinkAt( p->doc, pg, xPt, yPt, url, target, ty ) = false then exit sub
+    if p->LinkClick then
+        if p->LinkClick( p->hWin, pg, url, target, ty ) then exit sub
+    end if
+    if target >= 0 then
+        dim as long was = p->nPage
+        GoToPage( p, target, ty )
+        if (p->nPage <> was) andalso (p->PageChanged <> 0) then p->PageChanged( p->hWin, p->nPage )
+    elseif len( url ) then
+        dim as string u8 = url
+        SDL_OpenURL( strptr( u8 ) )
+    end if
+end sub
+
+' The scroll bars' callbacks: the bar is a child of the preview.
+private sub OnVScroll( byval hSB as TK_WIDGET ptr, byval newPos as integer )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( tkWidget_Parent( hSB ) )
+    if p = 0 then exit sub
+    p->scrollY = newPos
+    UserScrolled( p )
+end sub
+
+private sub OnHScroll( byval hSB as TK_WIDGET ptr, byval newPos as integer )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( tkWidget_Parent( hSB ) )
+    if p = 0 then exit sub
+    p->scrollX = newPos
+    UserScrolled( p )
+end sub
+
+function PvProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE, TKM_SCALECHANGED
+        FlushCache( p )
+        p->bDirty = true
+        return true
+    case TKM_THEMECHANGED
+        tkPrintPreview_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_TIMER
+        if m->timerId = PV_TIMER then GenerateTick( p ) : return true
+    case TKM_LBUTTONDOWN
+        tkHost_SetFocus( w->pHost, w )
+        EnsureLayout( p )
+        OnClick( p, m->x, m->y )
+        return true
+    case TKM_MOUSEMOVE
+        EnsureLayout( p )
+        dim as single xPt, yPt
+        dim as long pg = PageAt( p, m->x, m->y, xPt, yPt )
+        dim as ustring url
+        dim as long target
+        dim as single ty
+        dim as boolean over = (pg >= 0) andalso tkPrintDoc_LinkAt( p->doc, pg, xPt, yPt, url, target, ty )
+        if over <> p->bOverLink then
+            p->bOverLink = over
+            tkWidget_SetCursor( w, iif( over, TK_CURSOR_HAND, TK_CURSOR_ARROW ) )
+        end if
+        return true
+    case TKM_MOUSEWHEEL
+        EnsureLayout( p )
+        dim as long mods = SDL_GetModState()
+        if mods and SDL_KMOD_CTRL then
+            ZoomAbout( p, p->fZoom * iif( m->wheelY > 0, 1.25, 1 / 1.25 ), m->x, m->y, true )
+            return true
+        end if
+        dim as long dx = clng( m->wheelX * Sc( p, 48 ) ), dy = clng( m->wheelY * Sc( p, 48 ) )
+        if mods and SDL_KMOD_SHIFT then dx = dy : dy = 0
+        dim as long ox = p->scrollX, oy = p->scrollY
+        p->scrollX += dx : p->scrollY -= dy
+        ClampScroll( p )
+        if (p->scrollX = ox) andalso (p->scrollY = oy) then return false      ' at the end: let the parent scroll
+        UserScrolled( p )
+        return true
+    case TKM_KEYDOWN
+        EnsureLayout( p )
+        return OnKey( p, m )
+    case TKM_CHAR
+        ' + and - are claimed as keys: their characters must not go anywhere
+        if (m->text = "+") orelse (m->text = "-") orelse (m->text = "=") then return true
+    case TKM_DESTROY
+        if p->bTimer then tkWidget_KillTimer( w, PV_TIMER )
+        FlushCache( p )
+        tkPrintReplay_Destroy( p->rp )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' ---- public --------------------------------------------------------------------------------
+public function tkPrintPreview_ThemeColors( byref t as TKTHEME_COLORS ) as TKPRINTPREVIEW_COLORS
+    dim as TKPRINTPREVIEW_COLORS c
+    c.BackColor = t.Track
+    c.PaperColor = &hFFFFFFFFul
+    c.ShadowColor = &h50000000ul
+    c.PageBorderColor = t.Border
+    return c
+end function
+
+public sub tkPrintPreview_ApplyTheme( byval hPreview as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hPreview, t )
+    p->colors = tkPrintPreview_ThemeColors( tr )
+    tkTheme_ResolveInto( hPreview, tr, cast( ulong ptr, @p->colors ), sizeof( TKPRINTPREVIEW_COLORS ) \ 4, "PrintPreview" )
+    FlushCache( p )
+    tkWidget_Invalidate( hPreview )
+end sub
+
+public function tkPrintPreview_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKPRINTPREVIEW_STATE ptr p = new TKPRINTPREVIEW_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @PvProc, p )
+    w->isFocusable = true
+    p->hWin = w
+    p->hV = tkVScrollBar_Create( w, ctrlId )
+    p->hH = tkHScrollBar_Create( w, ctrlId )
+    tkVScrollBar_SetScrollCallback( p->hV, @OnVScroll )
+    tkHScrollBar_SetScrollCallback( p->hH, @OnHScroll )
+    tkWidget_Show( p->hV, false )
+    tkWidget_Show( p->hH, false )
+    redim p->cache( 0 to p->nCache - 1 )
+    p->colors = tkPrintPreview_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKPRINTPREVIEW_COLORS ) \ 4, "PrintPreview" )
+    return w
+end function
+
+public function tkPrintPreview_GetID( byval hPreview as TK_WIDGET ptr ) as long
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 0
+    return p->id
+end function
+
+' The document shown (borrowed: it must outlive the preview or be replaced first). One still
+' being generated is finished here, a few pages per tick. The view goes to page 1.
+public sub tkPrintPreview_SetDocument( byval hPreview as TK_WIDGET ptr, byval doc as TK_PRINTDOC ptr )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then exit sub
+    if p->bTimer then tkWidget_KillTimer( hPreview, PV_TIMER ) : p->bTimer = false
+    p->doc = doc
+    FlushCache( p )
+    if p->rp then tkPrintReplay_Flush( p->rp )
+    p->nPage = 0 : p->scrollX = 0 : p->scrollY = 0
+    p->bDirty = true
+    StartGenerating( p )
+    tkWidget_Invalidate( hPreview )
+end sub
+
+public function tkPrintPreview_GetDocument( byval hPreview as TK_WIDGET ptr ) as TK_PRINTDOC ptr
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 0
+    return p->doc
+end function
+
+' The document changed (generated again, page setup changed): drop what was rendered, lay out
+' again, finish a generation that was started. The page and scroll stay where they can.
+public sub tkPrintPreview_Refresh( byval hPreview as TK_WIDGET ptr )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then exit sub
+    FlushCache( p )
+    if p->rp then tkPrintReplay_Flush( p->rp )
+    p->bDirty = true
+    StartGenerating( p )
+    tkWidget_Invalidate( hPreview )
+end sub
+
+public function tkPrintPreview_GetPageCount( byval hPreview as TK_WIDGET ptr ) as long
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 0
+    return PageCount( p )
+end function
+
+public function tkPrintPreview_GetPage( byval hPreview as TK_WIDGET ptr ) as long
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 0
+    return p->nPage
+end function
+
+' Show page nPage (from 0): its row at the top, or its row alone in the single view.
+public sub tkPrintPreview_SetPage( byval hPreview as TK_WIDGET ptr, byval nPage as long )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p then GoToPage( p, nPage )
+end sub
+
+' The zoom in force (1 = 100%), fitted or set.
+public function tkPrintPreview_GetZoom( byval hPreview as TK_WIDGET ptr ) as single
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 1
+    EnsureLayout( p )
+    return p->fZoom
+end function
+
+' A custom zoom (clamped to 0.1 .. 8), about the view's centre.
+public sub tkPrintPreview_SetZoom( byval hPreview as TK_WIDGET ptr, byval fZoom as single )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then exit sub
+    ZoomAbout( p, fZoom, p->viewW / 2, p->viewH / 2, false )
+end sub
+
+public function tkPrintPreview_GetZoomMode( byval hPreview as TK_WIDGET ptr ) as long
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return TKPV_ZOOM_FITWIDTH
+    return p->nZoomMode
+end function
+
+' TKPV_ZOOM_FITWIDTH / FITPAGE / CUSTOM (the last custom zoom).
+public sub tkPrintPreview_SetZoomMode( byval hPreview as TK_WIDGET ptr, byval nMode as long )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if (p = 0) orelse (nMode < TKPV_ZOOM_CUSTOM) orelse (nMode > TKPV_ZOOM_FITPAGE) then exit sub
+    p->nZoomMode = nMode
+    if nMode = TKPV_ZOOM_CUSTOM then p->fZoom = p->fZoomSet
+    p->bDirty = true
+    tkWidget_Invalidate( hPreview )
+end sub
+
+public function tkPrintPreview_GetViewMode( byval hPreview as TK_WIDGET ptr ) as long
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return TKPV_VIEW_CONTINUOUS
+    return p->nView
+end function
+
+public sub tkPrintPreview_SetViewMode( byval hPreview as TK_WIDGET ptr, byval nView as long )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if (p = 0) orelse (nView < TKPV_VIEW_CONTINUOUS) orelse (nView > TKPV_VIEW_SINGLE) then exit sub
+    p->nView = nView
+    p->bDirty = true
+    GoToPage( p, p->nPage )
+end sub
+
+public function tkPrintPreview_GetColumns( byval hPreview as TK_WIDGET ptr ) as long
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 1
+    return p->nCols
+end function
+
+' Pages side by side in a row: 1 .. 8 (2 = facing pages).
+public sub tkPrintPreview_SetColumns( byval hPreview as TK_WIDGET ptr, byval nCols as long )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then exit sub
+    if nCols < 1 then nCols = 1
+    if nCols > 8 then nCols = 8
+    p->nCols = nCols
+    p->bDirty = true
+    GoToPage( p, p->nPage )
+end sub
+
+' A page's rect in widget pixels as it is drawn now. FALSE when it is not laid out (single view,
+' another row) or there is no such page.
+public function tkPrintPreview_GetPageRect( byval hPreview as TK_WIDGET ptr, byval nPage as long, byref rc as TKRECT ) as boolean
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return false
+    EnsureLayout( p )
+    return PageRectW( p, nPage, rc )
+end function
+
+public sub tkPrintPreview_GetScrollPos( byval hPreview as TK_WIDGET ptr, byref x as long, byref y as long )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    x = 0 : y = 0
+    if p = 0 then exit sub
+    EnsureLayout( p )
+    x = p->scrollX : y = p->scrollY
+end sub
+
+public sub tkPrintPreview_SetScrollPos( byval hPreview as TK_WIDGET ptr, byval x as long, byval y as long )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then exit sub
+    EnsureLayout( p )
+    p->scrollX = x : p->scrollY = y
+    ClampScroll( p )
+    p->nPage = PageFromScroll( p )
+    SyncBars( p )
+end sub
+
+' Page textures kept (0: none, every frame replays the pages).
+public sub tkPrintPreview_SetCacheSize( byval hPreview as TK_WIDGET ptr, byval n as long )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then exit sub
+    FlushCache( p )
+    p->nCache = iif( n < 0, 0, n )
+    redim p->cache( 0 to iif( p->nCache > 0, p->nCache - 1, 0 ) )
+    tkWidget_Invalidate( hPreview )
+end sub
+
+public function tkPrintPreview_GetCacheSize( byval hPreview as TK_WIDGET ptr ) as long
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 0
+    return p->nCache
+end function
+
+public function tkPrintPreview_GetVScrollBar( byval hPreview as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 0
+    return p->hV
+end function
+
+public function tkPrintPreview_GetHScrollBar( byval hPreview as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then return 0
+    return p->hH
+end function
+
+public sub tkPrintPreview_GetColors( byval hPreview as TK_WIDGET ptr, byval pColors as TKPRINTPREVIEW_COLORS ptr )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Copies the struct and PINS it: a theme change leaves this preview alone until UnpinColors.
+public sub tkPrintPreview_SetColors( byval hPreview as TK_WIDGET ptr, byval pColors as TKPRINTPREVIEW_COLORS ptr )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    FlushCache( p )
+    tkWidget_Invalidate( hPreview )
+end sub
+
+public sub tkPrintPreview_UnpinColors( byval hPreview as TK_WIDGET ptr )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkPrintPreview_ApplyTheme( hPreview, tkTheme_Of( hPreview ) )
+end sub
+
+public sub tkPrintPreview_SetPageChangedCallback( byval hPreview as TK_WIDGET ptr, byval cb as PV_PageChangedSub )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p then p->PageChanged = cb
+end sub
+
+public sub tkPrintPreview_SetZoomChangedCallback( byval hPreview as TK_WIDGET ptr, byval cb as PV_ZoomChangedSub )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p then p->ZoomChanged = cb
+end sub
+
+public sub tkPrintPreview_SetLinkClickCallback( byval hPreview as TK_WIDGET ptr, byval cb as PV_LinkClickFunc )
+    dim as TKPRINTPREVIEW_STATE ptr p = PV( hPreview )
+    if p then p->LinkClick = cb
+end sub

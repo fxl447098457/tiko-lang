@@ -229,7 +229,7 @@ Copy `SDL3-3.4.18/include/` to `vendor/sdl3/include/`, `build/libSDL3.a` to `ven
 For a static link, build `SDL3-static.lib` from the source with the Visual Studio Build Tools (`cmake -S SDL3-3.4.18 -B build -DSDL_STATIC=ON -DSDL_SHARED=OFF`, then `cmake --build build --config Release`), copy it to `vendor/sdl3/SDL3-static_windows_x86_64.lib`, and link it with the system libraries it needs:
 
 ```freebasic
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
     #foreignlib SDL3 static "vendor/sdl3/SDL3-static", _
         "system:cfgmgr32", "system:ole32", "system:oleaut32", _
         "system:setupapi", "system:shell32"

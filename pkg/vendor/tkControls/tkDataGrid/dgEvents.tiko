@@ -1,0 +1,321 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- the callback types and their setters, together.
+'
+' THEY MUST STAY IN ONE FILE. A procedure-pointer type declared in one file of the module and used
+' as a parameter of a procedure defined in another mangles there as void(*)(void*) instead of
+' void(*)(TK_WIDGET_*), and the link fails (tiko, found 2026-11-22; being fixed separately). So
+' every DG_* type is declared here, and every setter that takes one is defined here.
+'
+' Every callback is single-slot. Only user interaction fires the notifications.
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkColumnHeader"
+#import "../tkTooltip"
+using tkHost
+using tkPaint
+using tkColumnHeader
+using tkTooltip
+
+' ==========================================================================================
+' The types
+' ==========================================================================================
+public type DG_CellPaintFunc as function( byval p as TKDATAGRID_CELLPAINTINFO ptr ) as boolean
+public type DG_CellFormattingSub as sub( byval p as TKDATAGRID_FORMATINFO ptr )
+public type DG_MessageFunc as function( byval m as TKDATAGRID_MESSAGEINFO ptr ) as boolean
+' CurrentCellChanged, CellClick, CellActivate (a double click): model row and column.
+public type DG_CellSub as sub( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer )
+public type DG_GridSub as sub( byval hGrid as TK_WIDGET ptr )
+public type DG_ColumnSub as sub( byval hGrid as TK_WIDGET ptr, byval col as integer )
+public type DG_ColumnResizeSub as sub( byval hGrid as TK_WIDGET ptr, byval col as integer, byval nWidth as integer, byval bLive as boolean )
+public type DG_ColumnReorderedSub as sub( byval hGrid as TK_WIDGET ptr, byval col as integer, byval dispPos as integer )
+' row -1: the header of col. "" = no tip.
+public type DG_TooltipFunc as function( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer ) as ustring
+' G2. CellBeginEdit: FALSE vetoes the edit.
+public type DG_CellBeginEditFunc as function( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer ) as boolean
+' CellParse: the editor's text, whether the grid's own parse took it (v is then its value, else
+' errText says why); the callback may change v or errText, and returns FALSE to refuse.
+public type DG_CellParseFunc as function( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer, _
+                                          byval text as ustring, byval bParsed as boolean, byref v as TKDG_VALUE, _
+                                          byref errText as ustring ) as boolean
+public type DG_CellEndEditSub as sub( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer, byval bCommitted as boolean )
+' RowValidating: FALSE keeps the current cell in the row.
+public type DG_RowFunc as function( byval hGrid as TK_WIDGET ptr, byval row as integer ) as boolean
+public type DG_RowSub as sub( byval hGrid as TK_WIDGET ptr, byval row as integer )
+' RowsDeleting: FALSE keeps rows row .. row + count - 1.
+public type DG_RowsDeletingFunc as function( byval hGrid as TK_WIDGET ptr, byval row as integer, byval count as integer ) as boolean
+' G6: DataRequest -- the block cache wants rows firstRow .. firstRow + count - 1 (tkDataGrid_SupplyRows).
+public type DG_RowsSub as sub( byval hGrid as TK_WIDGET ptr, byval firstRow as integer, byval count as integer )
+' G4: Filter keeps a model row when it returns TRUE.
+public type DG_FilterFunc as function( byval hGrid as TK_WIDGET ptr, byval row as integer ) as boolean
+' G7b: SummaryFormatting -- a footer total was worked out: v its value (EMPTY when the grid could not
+' add up: HOST mode), text prefilled from it; change either (set both to change both).
+public type DG_SummarySub as sub( byval hGrid as TK_WIDGET ptr, byval col as integer, byval kind as long, _
+                                  byref v as TKDG_VALUE, byref text as ustring )
+' G7a: ColumnVisibilityChanged -- the user showed or hid col (the column chooser).
+public type DG_ColumnVisibleSub as sub( byval hGrid as TK_WIDGET ptr, byval col as integer, byval bVisible as boolean )
+' G7a: ContextMenu -- a right-click (bKeyboard FALSE) or the Menu key / Shift+F10 (TRUE). row and
+' col are model (-1: none; row -1 with a col: that column's header). x, y are the WINDOW pixels
+' tkPopupMenu_Show takes.
+public type DG_ContextMenuSub as sub( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer, _
+                                      byval x as long, byval y as long, byval bKeyboard as boolean )
+
+' G3, virtual mode: the host answers every cell the grid reads, and takes every value it writes
+' (FALSE refuses it).
+public type DG_CellValueNeededSub as sub( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE )
+public type DG_CellValuePushedFunc as function( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE ) as boolean
+
+' G3, a source: a procedure table and its context, for code that is not a form's handlers
+' (generated binding adapters, a database adapter, a library). A procedure left 0 means "cannot":
+' no SetCell is read-only, no InsertRows / DeleteRows refuses those changes, no Sort lets the grid sort.
+public type TKDATAGRID_SOURCE
+    pCtx       as any ptr
+    RowCount   as function( byval pCtx as any ptr ) as integer
+    GetCell    as sub( byval pCtx as any ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE )
+    SetCell    as function( byval pCtx as any ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE ) as boolean
+    InsertRows as function( byval pCtx as any ptr, byval row as integer, byval n as integer ) as boolean
+    DeleteRows as function( byval pCtx as any ptr, byval row as integer, byval n as integer ) as boolean
+    ' G4: the source sorts itself by the keys (most significant first); FALSE: the grid sorts.
+    ' G6: keys 0, nKeys 0 once the keys are cleared after it sorted: back to its own order.
+    Sort       as function( byval pCtx as any ptr, byval keys as TKDG_SORTKEY ptr, byval nKeys as integer ) as boolean
+    ' G7b: the source adds up column col (kind: TKDG_SUM_*) over its rows into v; FALSE: the grid
+    ' does (when it may read every row). 0 = never asked.
+    Aggregate  as function( byval pCtx as any ptr, byval col as integer, byval kind as long, byref v as TKDG_VALUE ) as boolean
+    ' G7c: the source applies the column filters (filters(k) for model column k, nCols of them; a
+    ' database makes a WHERE) and its RowCount answers for the filtered rows; FALSE: the grid
+    ' filters. filters 0 / nCols 0 once they are all cleared after it took some.
+    Filter     as function( byval pCtx as any ptr, byval filters as TKDG_COLFILTER ptr, byval nCols as integer ) as boolean
+end type
+
+' ==========================================================================================
+' The setters
+' ==========================================================================================
+' ---- G0: painting and raw messages -----------------------------------------------------------
+' Paints a cell: return TRUE when it painted it, FALSE for the default (the callback may call
+' tkDataGrid_PaintCellDefault itself, before or after its own drawing, and return TRUE).
+public sub tkDataGrid_SetCellPaintCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellPaintFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->CellPaintCallback = cb
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' Per visible cell per paint: keep it cheap.
+public sub tkDataGrid_SetCellFormattingCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellFormattingSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->CellFormattingCallback = cb
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' pi->hHeader is the grid's style header (tkDataGrid_GetHeader); itemID is the MODEL column.
+public sub tkDataGrid_SetHeaderPaintCallback( byval hGrid as TK_WIDGET ptr, byval cb as HDR_PaintCallbackSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->HeaderPaintCallback = cb
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' Raw mouse messages on the surface, hit-tested; TRUE = handled (the grid does nothing more).
+public sub tkDataGrid_SetMessageCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_MessageFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->MessageCallback = cb
+end sub
+
+' ---- G1: navigation and columns ---------------------------------------------------------------
+public sub tkDataGrid_SetCurrentCellChangedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CurrentCellChangedCallback = cb
+end sub
+
+public sub tkDataGrid_SetSelChangeCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_GridSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->SelChangeCallback = cb
+end sub
+
+' A press on a cell, after the selection and the current cell have moved.
+public sub tkDataGrid_SetCellClickCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CellClickCallback = cb
+end sub
+
+' A double click on a cell.
+public sub tkDataGrid_SetCellActivateCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CellActivateCallback = cb
+end sub
+
+' A header clicked and released without a drag (G4 sorts here).
+public sub tkDataGrid_SetColumnClickCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_ColumnSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->ColumnClickCallback = cb
+end sub
+
+' A user resize: bLive while dragging, FALSE once at the end (and after a double-click autosize).
+' nWidth is design units.
+public sub tkDataGrid_SetColumnResizeCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_ColumnResizeSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->ColumnResizeCallback = cb
+end sub
+
+public sub tkDataGrid_SetColumnReorderedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_ColumnReorderedSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->ColumnReorderedCallback = cb
+end sub
+
+' The tip for a cell (row >= 0) or a header (row -1); without it, a cell or header whose text is
+' cut off shows its whole text.
+public sub tkDataGrid_SetTooltipCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_TooltipFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->TooltipCallback = cb
+end sub
+
+' ---- G2: editing and the row transaction -------------------------------------------------------
+' Before an edit starts (after the grid's own read-only checks).
+public sub tkDataGrid_SetCellBeginEditCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellBeginEditFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CellBeginEditCallback = cb
+end sub
+
+' On a commit: see DG_CellParseFunc. A refusal keeps the editor open, framed in ErrorColor.
+public sub tkDataGrid_SetCellParseCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellParseFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CellParseCallback = cb
+end sub
+
+' After an edit ends, committed or cancelled.
+public sub tkDataGrid_SetCellEndEditCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellEndEditSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CellEndEditCallback = cb
+end sub
+
+' A value the user changed: an edit, a check toggle, Delete on cells, a paste.
+public sub tkDataGrid_SetCellValueChangedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CellValueChangedCallback = cb
+end sub
+
+' A BUTTON or LINK cell clicked (or Space / Enter on it).
+public sub tkDataGrid_SetButtonClickCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->ButtonClickCallback = cb
+end sub
+
+' Leaving the dirty row: FALSE keeps the user in it.
+public sub tkDataGrid_SetRowValidatingCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_RowFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->RowValidatingCallback = cb
+end sub
+
+' The dirty row was accepted: where a database host writes the record.
+public sub tkDataGrid_SetRowCommittedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_RowSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->RowCommittedCallback = cb
+end sub
+
+' Esc on the dirty row: the grid has put its stored values back (or removed a new row).
+public sub tkDataGrid_SetCancelRowEditCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_RowSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CancelRowEditCallback = cb
+end sub
+
+' A row made from the placeholder, before the edit that made it starts.
+public sub tkDataGrid_SetRowAddedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_RowSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->RowAddedCallback = cb
+end sub
+
+' Delete on whole rows, once per contiguous run, last run first.
+public sub tkDataGrid_SetRowsDeletingCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_RowsDeletingFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->RowsDeletingCallback = cb
+end sub
+
+' ---- G3: virtual mode and sources -----------------------------------------------------------------
+' Virtual mode: every cell read asks CellValueNeeded (none: the cell is EMPTY).
+' G6: the block cache's requests (tkDataGrid_SetBlockCache); none: it reads the feed itself.
+public sub tkDataGrid_SetDataRequestCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_RowsSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->DataRequestCallback = cb
+end sub
+
+public sub tkDataGrid_SetCellValueNeededCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellValueNeededSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->CellValueNeededCallback = cb
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' Virtual mode: every write (an edit, a toggle, Delete, a paste, a cancelled row's old values)
+' offers the value, already converted to the column's kind; FALSE refuses it. None: read-only.
+public sub tkDataGrid_SetCellValuePushedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_CellValuePushedFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->CellValuePushedCallback = cb
+end sub
+
+' Feeds the grid from a source (copied; its pCtx must outlive the binding). 0: back to the grid's
+' own store, empty. The row count is the source's RowCount; the grid's own rows are dropped.
+public sub tkDataGrid_SetSource( byval hGrid as TK_WIDGET ptr, byval src as TKDATAGRID_SOURCE ptr )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    DgSwitchFeed( p, iif( src <> 0, DG_FEED_SOURCE, DG_FEED_STORE ) )
+    if src then
+        p->src = *src
+        p->rowCount = iif( p->src.RowCount <> 0, p->src.RowCount( p->src.pCtx ), 0 )
+        if p->rowCount < 0 then p->rowCount = 0
+    end if
+    ' G7c: column filters in force apply to the new rows (a source with Filter is handed them)
+    if DgFltAny( p ) then DgApplyView( p ) else DgChanged( p )
+end sub
+
+' ---- G4: sort and filter --------------------------------------------------------------------------
+' The sort keys changed by a header click (after the view was rebuilt, or -- HOST -- for the host
+' to re-query; GetSortKeys has them).
+public sub tkDataGrid_SetSortChangedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_GridSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->SortChangedCallback = cb
+end sub
+
+' Rows the callback refuses are not shown. Applied at once, and again by Sort / ApplyFilter.
+public sub tkDataGrid_SetFilterCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_FilterFunc )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->FilterCallback = cb
+    DgApplyView( p )
+end sub
+
+' ---- G7a: the column chooser and the context menu ---------------------------------------------------
+' The user showed or hid a column from the chooser (once per column "Show all columns" showed).
+public sub tkDataGrid_SetColumnVisibilityChangedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_ColumnVisibleSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->ColumnVisibilityChangedCallback = cb
+end sub
+
+' A right-click the MessageCallback left alone (on a header only while the chooser is off), or the
+' Menu key / Shift+F10 at the current cell. The grid shows no menu of its own there.
+public sub tkDataGrid_SetContextMenuCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_ContextMenuSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->ContextMenuCallback = cb
+end sub
+
+' ---- G7b: the footer ---------------------------------------------------------------------------
+' Once per summary column each time the totals are worked out (not per paint).
+public sub tkDataGrid_SetSummaryFormattingCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_SummarySub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->SummaryFormattingCallback = cb
+    DgSumInvalidate( p )
+end sub
+
+' ---- G7c: column filters -----------------------------------------------------------------------
+' The user changed a column filter (the filter row). In HOST mode the host re-queries (the grid
+' applies nothing), as for SortChanged; GetColumnFilter / GetColumnFilterText have them.
+public sub tkDataGrid_SetFilterChangedCallback( byval hGrid as TK_WIDGET ptr, byval cb as DG_GridSub )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->FilterChangedCallback = cb
+end sub

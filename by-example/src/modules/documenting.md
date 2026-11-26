@@ -4,11 +4,6 @@
 names: a page per module in Markdown and HTML, an index with a search box, and
 `doc.json` for tools.
 
-````admonish warning title="Status in this version"
-`tiko doc` arrives after tiko 0.1.6, the toolchain this site is pinned to.
-This example was compiled and run on Windows with the development toolchain.
-````
-
 A module, `money/money.tiko`, in a project whose `tiko.toml` names the package
 `shop`:
 
@@ -21,9 +16,9 @@ A module, `money/money.tiko`, in a project whose `tiko.toml` names the package
 
 **Output**
 
-```text
+````text
 {{#include ../../examples/modules/documented/main.out}}
-```
+````
 
 - **The `''` lines directly above a public name document it.** A blank line
   ends the block.

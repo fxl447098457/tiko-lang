@@ -34,6 +34,7 @@ RANGES = [
     (1100, 1149, "128-bit integers"),
     (1150, 1199, "Flow analysis"),
     (1200, 1239, "Tests and documentation"),
+    (1240, 1279, "Pattern matching"),
 ]
 
 

@@ -1,0 +1,1084 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkCheckedCombo -- a combo button whose dropdown is a checked list: several values picked at once.
+' New in tkControls (no Win32 sibling); the design is C:\dev\docs\tkControls\CHECKED-LISTS.md §7
+' (phase C3).
+'
+' THE BUTTON is tkComboBox's (D-3): its four-rect layout, moods (disabled > open > hot > idle),
+' chevron of four strokes and focus ring, copied rather than shared (tkComboBox's painter is
+' private), and its colours: TKCHECKEDCOMBO_COLORS has TKCOMBOBOX_COLORS's fields, filled from
+' tkComboBox_ThemeColors, so the two combos look the same under every theme (the designer's table
+' needs the struct in this module). A theme's "CheckedComboBox" recipes apply on top. Its text is
+' the SUMMARY of the checked items: their names joined (", "), a count ("3 selected"), or as many
+' names as fit and "+k"; the placeholder when none; AllText when all (if set).
+'
+' THE LIST is a tkItemPopup (§6): a check-box tkListTree in a NOT_FOCUSABLE popup, with an optional
+' select-all row, filter line and OK / Cancel footer. The combo hands it a working copy of the
+' items' states each time it opens.
+'
+' COMMIT (D-7): immediate by default -- each toggle is the value at once (ItemCheck before,
+' CheckedChanged after). With ShowButtons the toggles edit the working copy; OK / Enter / Tab put it
+' in (one CheckedChanged if anything differs), Cancel / Escape / a click outside throw it away.
+'
+' THE VALUE is the checked keys in item order (an item's key, else its text): Get/SetCheckedKeys and
+' the bind pair Get/SetCheckedText, joined / split by the ValueSeparator (";"). Setters are silent.
+'
+' KEYS, closed: F4, Alt+Down, Alt+Up, Space, Enter open; Delete clears every check (one
+' CheckedChanged, D-9); with ShowFilter a printable character opens the list filtered by it (the
+' combo then wants text input, so it starts SDL's while it has the focus). Up / Down do nothing (no
+' single value to step). Open: tkItemPopup's keys.
+#module "tkCheckedCombo"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkComboBox" public
+#import "../tkItemPopup" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkComboBox
+using tkItemPopup
+
+public enum
+    CCB_SUMMARY_JOIN = 0     ' "Red, Green, Blue" (ellipsised)
+    CCB_SUMMARY_COUNT        ' CountFormat: "{n} selected"
+    CCB_SUMMARY_FIT          ' as many names as fit, then MoreFormat: "Red, Green +2"
+end enum
+
+public const TKCHECKEDCOMBO_DEFAULT_SEPARATOR = ";"
+
+' TKCOMBOBOX_COLORS's fields, in its order (tkCheckedCombo_ThemeColors copies them over).
+public type TKCHECKEDCOMBO_COLORS
+    BackColor            as ulong = &hFF2C313Aul
+    ForeColor            as ulong = &hFFC8CDD6ul
+    BorderColor          as ulong = &hFF2C313Aul
+    ChevronColor         as ulong = &hFFC8CDD6ul
+    BackColorHot         as ulong = &hFF373D48ul
+    ForeColorHot         as ulong = &hFFE2E6EEul
+    BorderColorHot       as ulong = &hFF373D48ul
+    ChevronColorHot      as ulong = &hFFE2E6EEul
+    BackColorOpen        as ulong = &hFF2C313Aul
+    ForeColorOpen        as ulong = &hFF61AFEFul
+    BorderColorOpen      as ulong = &hFF2C313Aul
+    ChevronColorOpen     as ulong = &hFF61AFEFul
+    BackColorDisabled    as ulong = &hFF282C33ul
+    ForeColorDisabled    as ulong = &hFF606670ul
+    BorderColorDisabled  as ulong = &hFF282C33ul
+    ChevronColorDisabled as ulong = &hFF606670ul
+    ForeColorPlaceholder as ulong = &hFF787E88ul
+    FocusRingColor       as ulong = &hFF61AFEFul
+end type
+
+public type TKCHECKEDCOMBO_ITEM
+    Text     as ustring
+    Key      as ustring          ' "" = the text is the key
+    id       as long
+    itemData as integer
+    bChecked as boolean
+    bEnabled as boolean = true
+end type
+
+public type TKCHECKEDCOMBO_PAINTINFO
+    hCombo        as TK_WIDGET ptr
+    b             as TK_PAINT ptr
+    rcClient      as TKRECT
+    rcButton      as TKRECT
+    rcText        as TKRECT
+    rcChevron     as TKRECT
+    rcVisual      as TKRECT
+    isHot         as boolean
+    isOpen        as boolean
+    isEnabled     as boolean
+    isFocused     as boolean
+    wszSummary    as ustring         ' what the button says (the placeholder when none checked)
+    isPlaceholder as boolean
+    nChecked      as long
+    nShown        as long            ' names in wszSummary (JOIN / FIT); 0 for COUNT
+    nMore         as long            ' names left out (FIT's +k)
+end type
+
+public type TKCHECKEDCOMBO_MESSAGEINFO
+    hCombo as TK_WIDGET ptr
+    msg    as long                   ' TKM_*
+    x      as single
+    y      as single
+    key    as long
+    mods   as long
+end type
+
+public type CCB_PaintCallbackSub as sub( byval p as TKCHECKEDCOMBO_PAINTINFO ptr )
+public type CCB_MessageCallbackFunc as function( byval m as TKCHECKEDCOMBO_MESSAGEINFO ptr ) as boolean
+' BEFORE a user's toggle in the list (idx -1 = select-all): FALSE vetoes.
+public type CCB_ItemCheckCallbackFunc as function( byval hCombo as TK_WIDGET ptr, byval idx as long, byval bNewChecked as boolean ) as boolean
+' AFTER the value changed by the user (each toggle; with ShowButtons, once on OK).
+public type CCB_CheckedChangedCallbackSub as sub( byval hCombo as TK_WIDGET ptr )
+public type CCB_DropDownCallbackSub as sub( byval hCombo as TK_WIDGET ptr, byval isOpen as boolean )
+
+public type TKCHECKEDCOMBO_STATE
+    hWin            as TK_WIDGET ptr
+    id              as long
+    items(any)      as TKCHECKEDCOMBO_ITEM
+    itemCount       as long
+    colors          as TKCHECKEDCOMBO_COLORS
+    bColorsPinned   as boolean
+    pTextFont       as TTF_Font ptr
+    isEnabled       as boolean = true
+    isHot           as boolean
+    isFocused       as boolean
+    wszPlaceholder  as ustring
+    wszValueSep     as ustring = TKCHECKEDCOMBO_DEFAULT_SEPARATOR
+    wszDisplaySep   as ustring = ", "
+    wszCountFormat  as ustring = "{n} selected"
+    wszMoreFormat   as ustring = "+{k}"
+    wszAllText      as ustring
+    nSummaryMode    as long = CCB_SUMMARY_JOIN
+    bShowSelectAll  as boolean
+    bShowFilter     as boolean
+    bShowButtons    as boolean
+    nMaxChecked     as long
+    nListMaxRows    as long = TKITEMPOPUP_DEFAULT_MAXROWS
+    wszSelectAll    as ustring = "(Select all)"
+    wszOK           as ustring = "OK"
+    wszCancel       as ustring = "Cancel"
+    wszTooltip      as ustring
+    tip             as TKTIPHOST_STATE
+    pop             as TKITEMPOPUP_STATE
+    ' metrics, scaled
+    nPadLeft        as long
+    nPadRight       as long
+    nPadTop         as long
+    nPadBottom      as long
+    nTextGap        as long
+    nChevronWidth   as long
+    nChevronHeight  as long
+    nChevronGap     as long
+    nChevronThick   as long = 1
+    nCurvature      as long
+    nBorderThick    as long = TKCOMBOBOX_DEFAULT_BORDERTHICK
+    nFocusGap       as long
+    nFocusThick     as long = TKCOMBOBOX_DEFAULT_FOCUSTHICK
+    rcButton        as TKRECT
+    rcText          as TKRECT
+    rcChevron       as TKRECT
+    rcVisual        as TKRECT
+    bLayoutDirty    as boolean = true
+    PaintCallback          as CCB_PaintCallbackSub
+    MessageCallback        as CCB_MessageCallbackFunc
+    ItemCheckCallback      as CCB_ItemCheckCallbackFunc
+    CheckedChangedCallback as CCB_CheckedChangedCallbackSub
+    DropDownCallback       as CCB_DropDownCallbackSub
+end type
+
+public declare sub tkCheckedCombo_ApplyTheme( byval hCombo as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+public declare function tkCheckedCombo_ThemeColors( byref t as TKTHEME_COLORS ) as TKCHECKEDCOMBO_COLORS
+
+
+' ---- plumbing ---------------------------------------------------------------------------------
+private function CC( byval h as TK_WIDGET ptr ) as TKCHECKEDCOMBO_STATE ptr
+    if h = 0 then return 0
+    return cast( TKCHECKEDCOMBO_STATE ptr, h->pData )
+end function
+
+private function CcValid( byval p as TKCHECKEDCOMBO_STATE ptr, byval idx as long ) as boolean
+    return (p <> 0) andalso (idx >= 0) andalso (idx < p->itemCount)
+end function
+
+private function CcFont( byval p as TKCHECKEDCOMBO_STATE ptr ) as TTF_Font ptr
+    if p->pTextFont then return p->pTextFont
+    return p->hWin->pHost->pDefaultFont
+end function
+
+private function CcRingPad( byval p as TKCHECKEDCOMBO_STATE ptr ) as long
+    return p->nFocusGap + p->nFocusThick
+end function
+
+private function CcKeyOf( byval p as TKCHECKEDCOMBO_STATE ptr, byval idx as long ) as ustring
+    if len( p->items(idx).Key ) then return p->items(idx).Key
+    return p->items(idx).Text
+end function
+
+private function CcCheckedCount( byval p as TKCHECKEDCOMBO_STATE ptr ) as long
+    dim as long n = 0
+    for i as long = 0 to p->itemCount - 1
+        if p->items(i).bChecked then n += 1
+    next
+    return n
+end function
+
+private function CcSubst( byref fmt as const ustring, byref tag as const ustring, byval v as long ) as ustring
+    dim as ustring s = fmt
+    dim as long at = instr( s, tag )
+    if at > 0 then s = left( s, at - 1 ) & str( v ) & mid( s, at + len( tag ) )
+    return s
+end function
+
+' The checked names joined by the display separator, the first nMax of them (all when nMax < 0).
+private function CcJoin( byval p as TKCHECKEDCOMBO_STATE ptr, byval nMax as long ) as ustring
+    dim as ustring s
+    dim as long n = 0
+    for i as long = 0 to p->itemCount - 1
+        if p->items(i).bChecked then
+            if (nMax >= 0) andalso (n >= nMax) then exit for
+            if n > 0 then s &= p->wszDisplaySep
+            s &= p->items(i).Text
+            n += 1
+        end if
+    next
+    return s
+end function
+
+' The button's text for the width w (FIT measures with the button font).
+private sub CcSummary( byval p as TKCHECKEDCOMBO_STATE ptr, byval w as long, byref s as ustring, _
+                       byref bPlaceholder as boolean, byref nShown as long, byref nMore as long )
+    dim as long n = CcCheckedCount( p )
+    bPlaceholder = false : nShown = 0 : nMore = 0
+    if n = 0 then
+        s = p->wszPlaceholder : bPlaceholder = (len( s ) > 0)
+        exit sub
+    end if
+    if (n = p->itemCount) andalso (len( p->wszAllText ) > 0) then s = p->wszAllText : exit sub
+    select case p->nSummaryMode
+    case CCB_SUMMARY_COUNT
+        s = CcSubst( CcSubst( p->wszCountFormat, "{n}", n ), "{total}", p->itemCount )
+    case CCB_SUMMARY_FIT
+        dim as TTF_Font ptr f = CcFont( p )
+        for k as long = n to 1 step -1
+            dim as ustring t = CcJoin( p, k )
+            if k < n then t &= " " & CcSubst( p->wszMoreFormat, "{k}", n - k )
+            if (w <= 0) orelse (tkText_Width( f, t ) <= w) orelse (k = 1) then
+                s = t : nShown = k : nMore = n - k
+                if (k = 1) andalso (w > 0) andalso (tkText_Width( f, t ) > w) andalso (n > 1) then
+                    s = CcSubst( p->wszMoreFormat, "{k}", n ) : nShown = 0 : nMore = n
+                end if
+                exit sub
+            end if
+        next
+    case else
+        s = CcJoin( p, -1 ) : nShown = n
+    end select
+end sub
+
+' tkComboBox's LayoutCombo, minus the measuring of items (the summary has no ideal width).
+private sub CcLayout( byval p as TKCHECKEDCOMBO_STATE ptr )
+    p->bLayoutDirty = false
+    dim as long cw = p->hWin->cw, chh = p->hWin->ch
+    if (cw <= 0) orelse (chh <= 0) then p->bLayoutDirty = true : exit sub
+    dim as long rp = CcRingPad( p )
+    dim as long nTextH = tkText_Height( CcFont( p ) )
+    tkRect_Set( p->rcButton, 0, 0, cw, chh )
+    tkRect_Inflate( p->rcButton, -rp, -rp )
+    dim as long chevRight = p->rcButton.right - p->nPadRight
+    dim as long chevTop = p->rcButton.top + (((p->rcButton.bottom - p->rcButton.top) - p->nChevronHeight) \ 2)
+    tkRect_Set( p->rcChevron, chevRight - p->nChevronWidth, chevTop, chevRight, chevTop + p->nChevronHeight )
+    dim as long tl = p->rcButton.left + p->nPadLeft
+    dim as long tr = p->rcChevron.left - p->nTextGap
+    if tr < tl then tr = tl
+    dim as long tt = p->rcButton.top + (((p->rcButton.bottom - p->rcButton.top) - nTextH) \ 2)
+    tkRect_Set( p->rcText, tl, tt, tr, tt + nTextH )
+    p->rcVisual = p->rcButton
+    tkRect_Inflate( p->rcVisual, rp, rp )
+end sub
+
+private sub CcRefresh( byval p as TKCHECKEDCOMBO_STATE ptr )
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+private function CcCall( byval p as TKCHECKEDCOMBO_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKCHECKEDCOMBO_MESSAGEINFO mi
+    mi.hCombo = p->hWin : mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y : mi.key = m->key : mi.mods = m->mods
+    return p->MessageCallback( @mi )
+end function
+
+
+' ---- painting (tkComboBox's) ------------------------------------------------------------------
+private sub CcFillPaintInfo( byval p as TKCHECKEDCOMBO_STATE ptr, byval b as TK_PAINT ptr, byval pi as TKCHECKEDCOMBO_PAINTINFO ptr )
+    pi->hCombo = p->hWin : pi->b = b
+    tkRect_Set( pi->rcClient, 0, 0, p->hWin->cw, p->hWin->ch )
+    pi->rcButton = p->rcButton : pi->rcText = p->rcText
+    pi->rcChevron = p->rcChevron : pi->rcVisual = p->rcVisual
+    pi->isOpen = tkItemPopup_IsOpen( p->pop )
+    pi->isHot = p->isHot andalso (pi->isOpen = false)
+    pi->isEnabled = p->isEnabled
+    pi->isFocused = p->isFocused
+    pi->nChecked = CcCheckedCount( p )
+    CcSummary( p, p->rcText.right - p->rcText.left, pi->wszSummary, pi->isPlaceholder, pi->nShown, pi->nMore )
+end sub
+
+private sub CcMoodColors( byval p as TKCHECKEDCOMBO_STATE ptr, byval pi as TKCHECKEDCOMBO_PAINTINFO ptr, _
+                          byref cBack as ulong, byref cFore as ulong, byref cBorder as ulong, byref cChev as ulong )
+    with p->colors
+        if pi->isEnabled = false then
+            cBack = .BackColorDisabled : cFore = .ForeColorDisabled : cBorder = .BorderColorDisabled : cChev = .ChevronColorDisabled
+        elseif pi->isOpen then
+            cBack = .BackColorOpen : cFore = .ForeColorOpen : cBorder = .BorderColorOpen : cChev = .ChevronColorOpen
+        elseif pi->isHot then
+            cBack = .BackColorHot : cFore = .ForeColorHot : cBorder = .BorderColorHot : cChev = .ChevronColorHot
+        else
+            cBack = .BackColor : cFore = .ForeColor : cBorder = .BorderColor : cChev = .ChevronColor
+        end if
+    end with
+end sub
+
+private sub CcRenderDefault( byval p as TKCHECKEDCOMBO_STATE ptr, byval b as TK_PAINT ptr, byval pi as TKCHECKEDCOMBO_PAINTINFO ptr )
+    if tkRect_IsEmpty( pi->rcButton ) then exit sub
+    dim as ulong cBack, cFore, cBorder, cChev
+    CcMoodColors( p, pi, cBack, cFore, cBorder, cChev )
+    b->SetBackColor( cBack )
+    if p->nBorderThick > 0 then
+        b->SetPenColor( cBorder )
+        b->PaintRoundBorderRect( @pi->rcButton, p->nCurvature, p->nBorderThick )
+    else
+        b->PaintRoundRect( @pi->rcButton, p->nCurvature )
+    end if
+    if len( pi->wszSummary ) > 0 then
+        b->SetFont( CcFont( p ) )
+        b->SetColors( iif( pi->isPlaceholder, p->colors.ForeColorPlaceholder, cFore ), cBack )
+        b->PaintText( pi->wszSummary, @pi->rcText, TK_DT_LEFT or TK_DT_ELLIPSIS )
+    end if
+    dim as long cl = pi->rcChevron.left, cr = pi->rcChevron.right
+    dim as long ct = pi->rcChevron.top, cbot = pi->rcChevron.bottom
+    dim as long cx = cl + ((cr - cl) \ 2)
+    dim as long chh = ((cbot - ct) - p->nChevronGap) \ 2
+    if (chh >= 1) andalso (cx > cl) andalso (cr > cx) then
+        dim as long thick = cint( iif( p->nChevronThick < 1, 1, p->nChevronThick ) * p->hWin->pHost->fScale )
+        if thick < 1 then thick = 1
+        b->SetPenColor( cChev )
+        b->PaintLine( thick, cl, ct + chh, cx, ct )
+        b->PaintLine( thick, cx, ct, cr, ct + chh )
+        b->PaintLine( thick, cl, cbot - chh, cx, cbot )
+        b->PaintLine( thick, cx, cbot, cr, cbot - chh )
+    end if
+    if pi->isFocused andalso (p->nFocusThick > 0) then
+        b->SetPenColor( p->colors.FocusRingColor )
+        b->PaintRoundOutline( @pi->rcVisual, p->nCurvature + (2 * CcRingPad( p )), p->nFocusThick )
+    end if
+end sub
+
+private sub CcOnPaint( byval p as TKCHECKEDCOMBO_STATE ptr, byval b as TK_PAINT ptr )
+    if p->bLayoutDirty then CcLayout( p )
+    dim as TKCHECKEDCOMBO_PAINTINFO pi
+    CcFillPaintInfo( p, b, @pi )
+    dim as ulong cBack, cFore, cBorder, cChev
+    CcMoodColors( p, @pi, cBack, cFore, cBorder, cChev )
+    b->SetBackColor( cBack )
+    b->PaintRect( @pi.rcClient )
+    if p->PaintCallback then p->PaintCallback( @pi ) else CcRenderDefault( p, b, @pi )
+end sub
+
+
+' ---- the list ---------------------------------------------------------------------------------
+private function CcPopItemCheck( byval pCtx as any ptr, byval idx as long, byval bNew as boolean ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = pCtx
+    if (p = 0) orelse (p->ItemCheckCallback = 0) then return true
+    return p->ItemCheckCallback( p->hWin, idx, bNew )
+end function
+
+' The working copy -> the items; TRUE when any state differs.
+private function CcTakeWorking( byval p as TKCHECKEDCOMBO_STATE ptr ) as boolean
+    dim as boolean bDiff = false
+    for i as long = 0 to p->itemCount - 1
+        if i >= p->pop.nItems then exit for
+        if p->items(i).bChecked <> p->pop.items(i).bChecked then
+            p->items(i).bChecked = p->pop.items(i).bChecked
+            bDiff = true
+        end if
+    next
+    return bDiff
+end function
+
+private sub CcPopChanged( byval pCtx as any ptr )
+    dim as TKCHECKEDCOMBO_STATE ptr p = pCtx
+    if p = 0 then exit sub
+    if p->bShowButtons then exit sub                ' deferred: the working copy waits for OK
+    dim as boolean bDiff = CcTakeWorking( p )
+    CcRefresh( p )
+    if bDiff andalso (p->CheckedChangedCallback <> 0) then p->CheckedChangedCallback( p->hWin )
+end sub
+
+private sub CcPopClosed( byval pCtx as any ptr, byval bCommit as boolean )
+    dim as TKCHECKEDCOMBO_STATE ptr p = pCtx
+    if p = 0 then exit sub
+    dim as boolean bDiff = false
+    if p->bShowButtons andalso bCommit then bDiff = CcTakeWorking( p )
+    p->hWin->bWantsText = p->bShowFilter
+    CcRefresh( p )
+    ' callbacks last: either may destroy the combo
+    dim as TK_WIDGET ptr hw = p->hWin
+    dim as CCB_CheckedChangedCallbackSub cbChanged = p->CheckedChangedCallback
+    dim as CCB_DropDownCallbackSub cbDrop = p->DropDownCallback
+    if bDiff andalso (cbChanged <> 0) then cbChanged( hw )
+    if cbDrop then cbDrop( hw, false )
+end sub
+
+private function CcDropDown( byval p as TKCHECKEDCOMBO_STATE ptr, byref sFilter as const ustring = "" ) as boolean
+    if (p->isEnabled = false) orelse tkItemPopup_IsOpen( p->pop ) then return false
+    if p->itemCount <= 0 then return false
+    tkTipHost_Pop( @p->tip )
+    with p->pop
+        erase .items
+        redim .items( 0 to p->itemCount - 1 )
+        for i as long = 0 to p->itemCount - 1
+            .items(i).Text = p->items(i).Text
+            .items(i).bChecked = p->items(i).bChecked
+            .items(i).bEnabled = p->items(i).bEnabled
+        next
+        .nItems = p->itemCount
+        .bChecks = true
+        .bSelectAll = p->bShowSelectAll
+        .bFilter = p->bShowFilter
+        .bButtons = p->bShowButtons
+        .nMaxChecked = p->nMaxChecked
+        .nMaxRows = p->nListMaxRows
+        .wszSelectAll = p->wszSelectAll
+        .wszOK = p->wszOK
+        .wszCancel = p->wszCancel
+        .pFont = p->pTextFont
+        .pCtx = p
+        .OnItemCheck = @CcPopItemCheck
+        .OnChanged = @CcPopChanged
+        .OnClosed = @CcPopClosed
+        .sFilter = sFilter
+    end with
+    if tkItemPopup_Open( p->pop, p->hWin ) = false then return false
+    CcRefresh( p )
+    if p->DropDownCallback then p->DropDownCallback( p->hWin, true )
+    return true
+end function
+
+
+' ---- the proc ---------------------------------------------------------------------------------
+private function CcTipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( a )
+    if p = 0 then return ""
+    if len( p->wszTooltip ) then return p->wszTooltip
+    ' else the full list of names, when the button cannot show it
+    dim as ustring s = CcJoin( p, -1 )
+    if (len( s ) > 0) andalso (tkText_Width( CcFont( p ), s ) > p->rcText.right - p->rcText.left) then return s
+    return ""
+end function
+
+private sub CcRescale( byval p as TKCHECKEDCOMBO_STATE ptr, byval k as single )
+    p->nPadLeft = cint( p->nPadLeft * k ) : p->nPadRight = cint( p->nPadRight * k )
+    p->nPadTop = cint( p->nPadTop * k ) : p->nPadBottom = cint( p->nPadBottom * k )
+    p->nTextGap = cint( p->nTextGap * k )
+    p->nChevronWidth = cint( p->nChevronWidth * k ) : p->nChevronHeight = cint( p->nChevronHeight * k )
+    p->nChevronGap = cint( p->nChevronGap * k )
+    p->nCurvature = cint( p->nCurvature * k )
+    p->nFocusGap = cint( p->nFocusGap * k )
+end sub
+
+private function CcUserClear( byval p as TKCHECKEDCOMBO_STATE ptr ) as boolean
+    if CcCheckedCount( p ) = 0 then return false
+    for i as long = 0 to p->itemCount - 1
+        if p->items(i).bEnabled then p->items(i).bChecked = false
+    next
+    CcRefresh( p )
+    if p->CheckedChangedCallback then p->CheckedChangedCallback( p->hWin )
+    return true
+end function
+
+private function CcProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( w )
+    if p = 0 then return false
+    dim as TK_HOST ptr h = w->pHost
+    select case m->msg
+    case TKM_PAINT
+        CcOnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE
+        CcRefresh( p )
+        return true
+    case TKM_SCALECHANGED
+        if (m->fOld > 0) andalso (m->fNew > 0) then CcRescale( p, m->fNew / m->fOld )
+        tkItemPopup_Close( p->pop, false )
+        CcRefresh( p )
+        return true
+    case TKM_THEMECHANGED
+        tkCheckedCombo_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_MOUSEMOVE
+        if p->isEnabled = false then return true
+        dim as boolean bOver = (m->x >= 0) andalso (m->x < w->cw) andalso (m->y >= 0) andalso (m->y < w->ch)
+        if bOver <> p->isHot then p->isHot = bOver : tkWidget_Invalidate( w )
+        CcCall( p, m )
+        return true
+    case TKM_MOUSELEAVE
+        if p->isHot then p->isHot = false : tkWidget_Invalidate( w )
+        CcCall( p, m )
+        return true
+    case TKM_LBUTTONDOWN
+        if p->isEnabled = false then return true
+        tkTipHost_Pop( @p->tip )
+        tkHost_SetFocus( h, w )
+        if CcCall( p, m ) then return true
+        ' (a click while open never gets here: the popup's dismissal consumes it)
+        CcDropDown( p )
+        return true
+    case TKM_LBUTTONUP, TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        CcCall( p, m )
+        return true
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        dim as boolean bF = (m->msg = TKM_SETFOCUS)
+        if bF <> p->isFocused then p->isFocused = bF : tkWidget_Invalidate( w )
+        CcCall( p, m )
+        return true
+    case TKM_KEYDOWN
+        if p->isEnabled = false then return false
+        if tkItemPopup_IsOpen( p->pop ) then return true
+        if CcCall( p, m ) then return true
+        dim as boolean bAlt = (m->mods and SDL_KMOD_ALT) <> 0
+        select case m->key
+        case SDLK_F4, SDLK_SPACE, SDLK_RETURN, SDLK_KP_ENTER
+            CcDropDown( p )
+            return true
+        case SDLK_DOWN, SDLK_UP
+            if bAlt then CcDropDown( p )
+            return true                  ' claimed either way: no single value to step
+        case SDLK_DELETE
+            CcUserClear( p )
+            return true
+        end select
+        return false
+    case TKM_CHAR
+        ' ShowFilter: a printable character typed on the closed combo opens it, filtered by it
+        if p->bShowFilter andalso p->isEnabled andalso (tkItemPopup_IsOpen( p->pop ) = false) then
+            if (m->text <> "") andalso (m->text <> " ") then
+                dim as ustring u = m->text
+                CcDropDown( p, u )
+            end if
+            return true
+        end if
+        return false
+    case TKM_ENABLE
+        p->isEnabled = m->bFlag
+        if p->isEnabled = false then
+            p->isHot = false
+            tkItemPopup_Close( p->pop, false )
+            tkTipHost_Pop( @p->tip )
+        end if
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_DESTROY
+        tkItemPopup_Detach( p->pop )
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+
+' ---- create -----------------------------------------------------------------------------------
+public function tkCheckedCombo_Create( byval hParent as TK_WIDGET ptr, byval CtrlID as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TK_HOST ptr hh = hParent->pHost
+    dim as TKCHECKEDCOMBO_STATE ptr p = new TKCHECKEDCOMBO_STATE
+    p->id = CtrlID
+    p->nPadLeft = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_PADLEFT )
+    p->nPadRight = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_PADRIGHT )
+    p->nPadTop = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_PADTOP )
+    p->nPadBottom = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_PADBOTTOM )
+    p->nTextGap = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_TEXTGAP )
+    p->nChevronWidth = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_CHEVRONW )
+    p->nChevronHeight = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_CHEVRONH )
+    p->nChevronGap = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_CHEVRONGAP )
+    p->nCurvature = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_CURVATURE )
+    p->nFocusGap = tkHost_Scale( hh, TKCOMBOBOX_DEFAULT_FOCUSGAP )
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, CtrlID, @CcProc, p )
+    if w = 0 then delete p : return 0
+    w->isFocusable = true
+    p->hWin = w
+    p->colors = tkCheckedCombo_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKCHECKEDCOMBO_COLORS ) \ 4, "CheckedComboBox" )
+    tkTipHost_Ensure( @p->tip, w, @CcTipText )
+    return w
+end function
+
+public function tkCheckedCombo_GetID( byval h as TK_WIDGET ptr ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    return iif( p <> 0, p->id, 0 )
+end function
+
+
+' ---- items (silent) ---------------------------------------------------------------------------
+public function tkCheckedCombo_InsertItem( byval h as TK_WIDGET ptr, byval idx as long, byval Text as ustring, _
+                                           byval Key as ustring = "", byval id as long = 0, byval itemData as integer = 0 ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return -1
+    tkItemPopup_Close( p->pop, false )
+    if idx < 0 then idx = 0
+    if idx > p->itemCount then idx = p->itemCount
+    redim preserve p->items( 0 to p->itemCount )
+    for i as long = p->itemCount to idx + 1 step -1
+        p->items(i) = p->items(i - 1)
+    next
+    with p->items(idx)
+        .Text = Text : .Key = Key : .id = id : .itemData = itemData : .bChecked = false : .bEnabled = true
+    end with
+    p->itemCount += 1
+    CcRefresh( p )
+    return idx
+end function
+
+public function tkCheckedCombo_AddItem( byval h as TK_WIDGET ptr, byval Text as ustring, byval Key as ustring = "", _
+                                        byval id as long = 0, byval itemData as integer = 0 ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return -1
+    return tkCheckedCombo_InsertItem( h, p->itemCount, Text, Key, id, itemData )
+end function
+
+public function tkCheckedCombo_DeleteItem( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return false
+    tkItemPopup_Close( p->pop, false )
+    for i as long = idx to p->itemCount - 2
+        p->items(i) = p->items(i + 1)
+    next
+    p->itemCount -= 1
+    if p->itemCount = 0 then erase p->items else redim preserve p->items( 0 to p->itemCount - 1 )
+    CcRefresh( p )
+    return true
+end function
+
+public sub tkCheckedCombo_Clear( byval h as TK_WIDGET ptr )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then exit sub
+    tkItemPopup_Close( p->pop, false )
+    erase p->items
+    p->itemCount = 0
+    CcRefresh( p )
+end sub
+
+public function tkCheckedCombo_GetCount( byval h as TK_WIDGET ptr ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    return iif( p <> 0, p->itemCount, 0 )
+end function
+
+public function tkCheckedCombo_GetItemText( byval h as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return ""
+    return p->items(idx).Text
+end function
+
+public function tkCheckedCombo_SetItemText( byval h as TK_WIDGET ptr, byval idx as long, byval Text as ustring ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return false
+    p->items(idx).Text = Text
+    CcRefresh( p )
+    return true
+end function
+
+public function tkCheckedCombo_GetItemKey( byval h as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return ""
+    return CcKeyOf( p, idx )
+end function
+
+public function tkCheckedCombo_GetItemID( byval h as TK_WIDGET ptr, byval idx as long ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return 0
+    return p->items(idx).id
+end function
+
+public function tkCheckedCombo_GetItemData( byval h as TK_WIDGET ptr, byval idx as long ) as integer
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return 0
+    return p->items(idx).itemData
+end function
+
+public function tkCheckedCombo_SetItemEnabled( byval h as TK_WIDGET ptr, byval idx as long, byval bEnabled as boolean ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return false
+    p->items(idx).bEnabled = bEnabled
+    return true
+end function
+
+public function tkCheckedCombo_GetItemEnabled( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return false
+    return p->items(idx).bEnabled
+end function
+
+public function tkCheckedCombo_FindItemByKey( byval h as TK_WIDGET ptr, byval Key as ustring ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return -1
+    for i as long = 0 to p->itemCount - 1
+        if CcKeyOf( p, i ) = Key then return i
+    next
+    return -1
+end function
+
+
+' ---- the value (silent) -----------------------------------------------------------------------
+public function tkCheckedCombo_SetChecked( byval h as TK_WIDGET ptr, byval idx as long, byval bChecked as boolean ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return false
+    p->items(idx).bChecked = bChecked
+    if tkItemPopup_IsOpen( p->pop ) andalso (idx < p->pop.nItems) then
+        p->pop.items(idx).bChecked = bChecked
+        tkItemPopup_Refresh( p->pop )
+    end if
+    CcRefresh( p )
+    return true
+end function
+
+public function tkCheckedCombo_GetChecked( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if CcValid( p, idx ) = false then return false
+    return p->items(idx).bChecked
+end function
+
+public function tkCheckedCombo_GetCheckedCount( byval h as TK_WIDGET ptr ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return 0
+    return CcCheckedCount( p )
+end function
+
+public sub tkCheckedCombo_CheckAll( byval h as TK_WIDGET ptr, byval bChecked as boolean )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then exit sub
+    for i as long = 0 to p->itemCount - 1
+        tkCheckedCombo_SetChecked( h, i, bChecked )
+    next
+end sub
+
+public function tkCheckedCombo_GetCheckedKeys( byval h as TK_WIDGET ptr, keys() as ustring ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    dim as long n = tkCheckedCombo_GetCheckedCount( h )
+    if n = 0 then erase keys : return 0
+    redim keys( 0 to n - 1 )
+    dim as long k = 0
+    for i as long = 0 to p->itemCount - 1
+        if p->items(i).bChecked then keys(k) = CcKeyOf( p, i ) : k += 1
+    next
+    return n
+end function
+
+public sub tkCheckedCombo_SetCheckedKeys( byval h as TK_WIDGET ptr, keys() as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then exit sub
+    for i as long = 0 to p->itemCount - 1
+        dim as ustring ki = CcKeyOf( p, i )
+        dim as boolean bOn = false
+        for j as long = lbound( keys ) to ubound( keys )
+            if keys(j) = ki then bOn = true : exit for
+        next
+        tkCheckedCombo_SetChecked( h, i, bOn )
+    next
+end sub
+
+public sub tkCheckedCombo_SetValueSeparator( byval h as TK_WIDGET ptr, byval Sep as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if (p <> 0) andalso (len( Sep ) > 0) then p->wszValueSep = Sep
+end sub
+
+' The bind pair (CHECKED-LISTS.md §9.2): the checked keys joined by the ValueSeparator, item order.
+public function tkCheckedCombo_GetCheckedText( byval h as TK_WIDGET ptr ) as ustring
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return ""
+    dim as ustring s
+    dim as long n = 0
+    for i as long = 0 to p->itemCount - 1
+        if p->items(i).bChecked then
+            if n > 0 then s &= p->wszValueSep
+            s &= CcKeyOf( p, i )
+            n += 1
+        end if
+    next
+    return s
+end function
+
+' Splits on the ValueSeparator, trims, drops empty pieces; exactly those keys checked. Silent.
+public sub tkCheckedCombo_SetCheckedText( byval h as TK_WIDGET ptr, byval s as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then exit sub
+    dim as ustring keys()
+    dim as long n = 0, nPos = 1, sepLen = len( p->wszValueSep )
+    do
+        dim as long nAt = instr( nPos, s, p->wszValueSep )
+        dim as ustring piece = trim( iif( nAt > 0, mid( s, nPos, nAt - nPos ), mid( s, nPos ) ) )
+        if len( piece ) then
+            redim preserve keys( 0 to n )
+            keys(n) = piece : n += 1
+        end if
+        if nAt = 0 then exit do
+        nPos = nAt + sepLen
+    loop
+    if n = 0 then tkCheckedCombo_CheckAll( h, false ) else tkCheckedCombo_SetCheckedKeys( h, keys() )
+end sub
+
+' What the button shows now (the summary, or the placeholder), for tests and tooltips.
+public function tkCheckedCombo_GetDisplayText( byval h as TK_WIDGET ptr ) as ustring
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return ""
+    if p->bLayoutDirty then CcLayout( p )
+    dim as ustring s
+    dim as boolean bPh
+    dim as long nShown, nMore
+    CcSummary( p, p->rcText.right - p->rcText.left, s, bPh, nShown, nMore )
+    return s
+end function
+
+
+' ---- behaviour and look -----------------------------------------------------------------------
+public sub tkCheckedCombo_SetSummaryMode( byval h as TK_WIDGET ptr, byval nMode as long )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if (p = 0) orelse (nMode < CCB_SUMMARY_JOIN) orelse (nMode > CCB_SUMMARY_FIT) then exit sub
+    p->nSummaryMode = nMode : CcRefresh( p )
+end sub
+
+public function tkCheckedCombo_GetSummaryMode( byval h as TK_WIDGET ptr ) as long
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    return iif( p <> 0, p->nSummaryMode, CCB_SUMMARY_JOIN )
+end function
+
+public sub tkCheckedCombo_SetDisplaySeparator( byval h as TK_WIDGET ptr, byval Sep as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->wszDisplaySep = Sep : CcRefresh( p )
+end sub
+
+' "{n}" = the checked count, "{total}" = the item count.
+public sub tkCheckedCombo_SetCountFormat( byval h as TK_WIDGET ptr, byval Fmt as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->wszCountFormat = Fmt : CcRefresh( p )
+end sub
+
+' "{k}" = the names FIT left out.
+public sub tkCheckedCombo_SetMoreFormat( byval h as TK_WIDGET ptr, byval Fmt as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->wszMoreFormat = Fmt : CcRefresh( p )
+end sub
+
+' Shown when every item is checked ("" = the summary as usual).
+public sub tkCheckedCombo_SetAllText( byval h as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->wszAllText = Text : CcRefresh( p )
+end sub
+
+public sub tkCheckedCombo_SetPlaceholderText( byval h as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->wszPlaceholder = Text : CcRefresh( p )
+end sub
+
+public function tkCheckedCombo_GetPlaceholderText( byval h as TK_WIDGET ptr ) as ustring
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return ""
+    return p->wszPlaceholder
+end function
+
+public sub tkCheckedCombo_SetShowSelectAll( byval h as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->bShowSelectAll = bShow
+end sub
+
+public sub tkCheckedCombo_SetSelectAllText( byval h as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->wszSelectAll = Text
+end sub
+
+' Type-to-filter in the list. The combo then wants text input (SDL starts it while the combo has
+' the focus), so a character typed on the closed combo opens the list filtered by it.
+public sub tkCheckedCombo_SetShowFilter( byval h as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then exit sub
+    p->bShowFilter = bShow
+    if p->hWin->bWantsText <> bShow then
+        p->hWin->bWantsText = bShow
+        ' text input is started on a focus change: re-take the focus so it follows now
+        dim as TK_HOST ptr hh = p->hWin->pHost
+        if tkHost_GetFocus( hh ) = p->hWin then tkHost_SetFocus( hh, 0 ) : tkHost_SetFocus( hh, p->hWin )
+    end if
+end sub
+
+' OK / Cancel in the list: the toggles wait for OK (D-7).
+public sub tkCheckedCombo_SetShowButtons( byval h as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->bShowButtons = bShow
+end sub
+
+public sub tkCheckedCombo_SetButtonTexts( byval h as TK_WIDGET ptr, byval OkText as ustring, byval CancelText as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->wszOK = OkText : p->wszCancel = CancelText
+end sub
+
+' 0 = no limit. At the limit the list refuses further checks and draws unchecked rows disabled.
+public sub tkCheckedCombo_SetMaxChecked( byval h as TK_WIDGET ptr, byval nMax as long )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->nMaxChecked = iif( nMax < 0, 0, nMax )
+end sub
+
+public sub tkCheckedCombo_SetListMaxRows( byval h as TK_WIDGET ptr, byval nRows as long )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if (p <> 0) andalso (nRows > 0) then p->nListMaxRows = nRows
+end sub
+
+public sub tkCheckedCombo_SetFont( byval h as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->pTextFont = f : CcRefresh( p )
+end sub
+
+public function tkCheckedCombo_GetFont( byval h as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    return iif( p <> 0, p->pTextFont, 0 )
+end function
+
+public sub tkCheckedCombo_SetTooltipText( byval h as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->wszTooltip = Text
+end sub
+
+public sub tkCheckedCombo_SetEnabled( byval h as TK_WIDGET ptr, byval bEnabled as boolean )
+    tkWidget_Enable( h, bEnabled )
+end sub
+
+public function tkCheckedCombo_GetEnabled( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    return (p <> 0) andalso p->isEnabled
+end function
+
+' The button's rects (client-local), for hosts and tests; FALSE before the first layout.
+public function tkCheckedCombo_GetTextRect( byval h as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return false
+    if p->bLayoutDirty then CcLayout( p )
+    rc = p->rcText
+    return tkRect_IsEmpty( rc ) = false
+end function
+
+' ---- the list, from code --------------------------------------------------------------------------
+public function tkCheckedCombo_DropDown( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return false
+    return CcDropDown( p )
+end function
+
+' Closes the list. bCommit: with ShowButtons, as OK (TRUE) or Cancel.
+public sub tkCheckedCombo_CloseUp( byval h as TK_WIDGET ptr, byval bCommit as boolean = false )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then tkItemPopup_Close( p->pop, bCommit )
+end sub
+
+public function tkCheckedCombo_IsDroppedDown( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    return (p <> 0) andalso tkItemPopup_IsOpen( p->pop )
+end function
+
+' The popup's list (a tkListTree; 0 while closed) and the list row of item idx (-1 if hidden).
+public function tkCheckedCombo_GetListTree( byval h as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return 0
+    return tkItemPopup_GetList( p->pop )
+end function
+
+public function tkCheckedCombo_GetListRow( byval h as TK_WIDGET ptr, byval idx as long ) as integer
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return -1
+    return tkItemPopup_RowOfItem( p->pop, idx )
+end function
+
+public function tkCheckedCombo_GetListHost( byval h as TK_WIDGET ptr ) as TK_HOST ptr
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return 0
+    return tkItemPopup_GetHost( p->pop )
+end function
+
+' The list's OK (bOK) or Cancel button (ShowButtons); 0 while closed.
+public function tkCheckedCombo_GetListButton( byval h as TK_WIDGET ptr, byval bOK as boolean ) as TK_WIDGET ptr
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return 0
+    return tkItemPopup_GetButton( p->pop, bOK )
+end function
+
+public function tkCheckedCombo_GetFilterText( byval h as TK_WIDGET ptr ) as ustring
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then return ""
+    return tkItemPopup_GetFilter( p->pop )
+end function
+
+
+' ---- colours and theme ------------------------------------------------------------------------
+public sub tkCheckedCombo_GetColors( byval h as TK_WIDGET ptr, byval pColors as TKCHECKEDCOMBO_COLORS ptr )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if (p <> 0) andalso (pColors <> 0) then *pColors = p->colors
+end sub
+
+public sub tkCheckedCombo_SetColors( byval h as TK_WIDGET ptr, byval pColors as TKCHECKEDCOMBO_COLORS ptr )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( h )
+end sub
+
+' tkComboBox's colours for a theme, field by field.
+public function tkCheckedCombo_ThemeColors( byref t as TKTHEME_COLORS ) as TKCHECKEDCOMBO_COLORS
+    dim as TKCOMBOBOX_COLORS k = tkComboBox_ThemeColors( t )
+    dim as TKCHECKEDCOMBO_COLORS c
+    c.BackColor = k.BackColor : c.ForeColor = k.ForeColor : c.BorderColor = k.BorderColor : c.ChevronColor = k.ChevronColor
+    c.BackColorHot = k.BackColorHot : c.ForeColorHot = k.ForeColorHot : c.BorderColorHot = k.BorderColorHot : c.ChevronColorHot = k.ChevronColorHot
+    c.BackColorOpen = k.BackColorOpen : c.ForeColorOpen = k.ForeColorOpen : c.BorderColorOpen = k.BorderColorOpen : c.ChevronColorOpen = k.ChevronColorOpen
+    c.BackColorDisabled = k.BackColorDisabled : c.ForeColorDisabled = k.ForeColorDisabled
+    c.BorderColorDisabled = k.BorderColorDisabled : c.ChevronColorDisabled = k.ChevronColorDisabled
+    c.ForeColorPlaceholder = k.ForeColorPlaceholder : c.FocusRingColor = k.FocusRingColor
+    return c
+end function
+
+public sub tkCheckedCombo_ApplyTheme( byval hCombo as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( hCombo )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hCombo, t )
+    p->colors = tkCheckedCombo_ThemeColors( tr )
+    tkTheme_ResolveInto( hCombo, tr, cast( ulong ptr, @p->colors ), sizeof( TKCHECKEDCOMBO_COLORS ) \ 4, "CheckedComboBox" )
+    tkWidget_Invalidate( hCombo )
+end sub
+
+public sub tkCheckedCombo_UnpinColors( byval h as TK_WIDGET ptr )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkCheckedCombo_ApplyTheme( h, tkTheme_Of( h ) )
+end sub
+
+
+' ---- callbacks (0 removes) --------------------------------------------------------------------
+' A paint callback's way to draw the button as it would have been drawn, then add to it.
+public sub tkCheckedCombo_PaintDefault( byval pi as TKCHECKEDCOMBO_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( pi->hCombo )
+    if p then CcRenderDefault( p, pi->b, pi )
+end sub
+
+public sub tkCheckedCombo_SetPaintCallback( byval h as TK_WIDGET ptr, byval usersub as CCB_PaintCallbackSub )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->PaintCallback = usersub : tkWidget_Invalidate( h )
+end sub
+
+public sub tkCheckedCombo_SetMessageCallback( byval h as TK_WIDGET ptr, byval userfunc as CCB_MessageCallbackFunc )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->MessageCallback = userfunc
+end sub
+
+public sub tkCheckedCombo_SetItemCheckCallback( byval h as TK_WIDGET ptr, byval userfunc as CCB_ItemCheckCallbackFunc )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->ItemCheckCallback = userfunc
+end sub
+
+public sub tkCheckedCombo_SetCheckedChangedCallback( byval h as TK_WIDGET ptr, byval usersub as CCB_CheckedChangedCallbackSub )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->CheckedChangedCallback = usersub
+end sub
+
+public sub tkCheckedCombo_SetDropDownCallback( byval h as TK_WIDGET ptr, byval usersub as CCB_DropDownCallbackSub )
+    dim as TKCHECKEDCOMBO_STATE ptr p = CC( h )
+    if p then p->DropDownCallback = usersub
+end sub

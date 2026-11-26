@@ -1,0 +1,464 @@
+' tkRExpr self-test (Report Designer phase RD1). A golden table: each expression, compiled against
+' one schema and evaluated on one row, gives the value (kind:value) or the compile error (a part
+' of its message @ its column) written beside it. Then: totals through TKREXPR_ACC, run-time
+' errors, lazy iif / and / or, host functions, a row value of another kind than the schema's, and
+' tkRExpr_FormatValue against tkReport_FormatValue on the same values and masks. One pass.
+'
+'   selftest            exit code = number of failures
+' In the table, ' stands for " (so "Left('abc', 2)" is Left("abc", 2)).
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkRExpr"
+#import "vendor/tkControls/tkReport"
+using tkTest
+using tkRExpr
+using tkReport
+using tkBind
+using tkCalendar
+using tkTimePanel
+
+dim shared as TKREXPR_SCHEMA gSch
+dim shared as TK_VALUE gRow(0 to 10), gPar(0 to 2)
+dim shared as TKREXPR_CTX gCtx
+
+function Q( byref s as const string ) as string
+    dim as string r = s
+    for i as long = 1 to len( r )
+        if mid( r, i, 1 ) = "'" then mid( r, i, 1 ) = """"
+    next
+    return r
+end function
+
+function P2( byval n as long ) as string
+    return right( "0" & n, 2 )
+end function
+
+' kind:value, as the table writes it
+function KV( byref v as TK_VALUE ) as string
+    select case v.kind
+    case TKV_EMPTY : return "empty"
+    case TKV_INT : return "int:" & v.i
+    case TKV_FLOAT : return "float:" & str( v.f )
+    case TKV_TEXT : return "text:" & v.s
+    case TKV_BOOL : return "bool:" & iif( v.b, "true", "false" )
+    case TKV_DATE : return "date:" & v.d.wYear & "-" & P2( v.d.wMonth ) & "-" & P2( v.d.wDay )
+    case TKV_TIME : return "time:" & P2( v.t.wHour ) & ":" & P2( v.t.wMinute ) & ":" & P2( v.t.wSecond )
+    end select
+    return "?"
+end function
+
+function DtOf( byval y as long, byval m as long, byval d as long ) as TKDATE
+    dim as TKDATE t
+    t.wYear = y : t.wMonth = m : t.wDay = d
+    return t
+end function
+
+function TmOf( byval h as long, byval m as long, byval s as long ) as TKTIME
+    dim as TKTIME t
+    t.wHour = h : t.wMinute = m : t.wSecond = s
+    return t
+end function
+
+sub SetUp( )
+    gSch.AddField( "Id", TKV_INT )          ' 0
+    gSch.AddField( "Qty", TKV_INT )         ' 1
+    gSch.AddField( "Price", TKV_FLOAT )     ' 2
+    gSch.AddField( "Disc", TKV_FLOAT )      ' 3
+    gSch.AddField( "First", TKV_TEXT )      ' 4
+    gSch.AddField( "Last", TKV_TEXT )       ' 5
+    gSch.AddField( "Paid", TKV_BOOL )       ' 6
+    gSch.AddField( "Born", TKV_DATE )       ' 7
+    gSch.AddField( "At", TKV_TIME )         ' 8
+    gSch.AddField( "Note", TKV_TEXT )       ' 9 (empty on the row)
+    gSch.AddField( "Lines.Qty", TKV_INT )   ' 10
+    gSch.AddParam( "From", TKV_DATE )
+    gSch.AddParam( "Min", TKV_INT )
+    gSch.AddParam( "Name", TKV_TEXT )
+    gRow(0).SetInt( 1007 ) : gRow(1).SetInt( 8 ) : gRow(2).SetFloat( 13.75 ) : gRow(3).SetFloat( 0.15 )
+    gRow(4).SetText( "Cara" ) : gRow(5).SetText( "Jones" ) : gRow(6).SetBool( true )
+    gRow(7).SetDate( DtOf( 1990, 2, 28 ) ) : gRow(8).SetTime( TmOf( 14, 30, 15 ) ) : gRow(9).Clear( )
+    gRow(10).SetInt( 3 )
+    gPar(0).SetDate( DtOf( 2026, 1, 1 ) ) : gPar(1).SetInt( 5 ) : gPar(2).SetText( "Zed" )
+    gCtx.row = @gRow(0)
+    gCtx.params = @gPar(0)
+    gCtx.pageNumber = 3 : gCtx.pageCount = 12 : gCtx.rowNumber = 41 : gCtx.groupRowNumber = 5
+    gCtx.reportTitle = "Sales"
+    gCtx.printDate = DtOf( 2026, 11, 25 )
+    gCtx.printTime = TmOf( 9, 30, 0 )
+end sub
+
+' The outcome of one expression: KV of its value, or "err:<message>@<column>".
+function Outcome( byref src as const string, byref sch as TKREXPR_SCHEMA = gSch ) as string
+    dim as TKREXPR_ERROR e
+    dim as TK_REXPR ptr x = tkRExpr_Compile( Q( src ), sch, e )
+    if x = 0 then return "err:" & e.msg & "@" & e.col
+    dim as TK_VALUE v
+    tkRExpr_Eval( x, gCtx, v )
+    tkRExpr_Destroy( x )
+    return KV( v )
+end function
+
+' want: an exact KV, or "err:<part of the message>@<column>"
+sub Gold( byref src as const string, byref want as const string )
+    dim as string got = Outcome( src )
+    dim as boolean ok
+    if left( want, 4 ) = "err:" then
+        dim as long at = instrrev( want, "@" )
+        dim as string part = mid( want, 5, at - 5 ), col = mid( want, at )
+        ok = (left( got, 4 ) = "err:") andalso (instr( got, part ) > 0) andalso (right( got, len( col ) ) = col)
+    else
+        ok = (got = Q( want ))
+    end if
+    tkTest_Check( Q( src ) & "  ->  " & want, ok, got )
+end sub
+
+dim shared as long gHostCalls
+sub HostDouble( byval args as TK_VALUE ptr, byval nArgs as int32, byref result as TK_VALUE )
+    gHostCalls += 1
+    result.SetInt( args[0].i * 2 )
+end sub
+
+sub GoldTable( )
+    tkTest_Begin( "golden: arithmetic and text" )
+    Gold( "1 + 2", "int:3" )
+    Gold( "7 \ 2", "int:3" )
+    Gold( "7 mod 3", "int:1" )
+    Gold( "7 / 2", "float:3.5" )
+    Gold( "2 ^ 10", "float:1024" )
+    Gold( "-2 ^ 2", "float:-4" )
+    Gold( "1.5 * 2", "float:3" )
+    Gold( "1e3", "float:1000" )
+    Gold( "[Qty] * [Price]", "float:110" )
+    Gold( "[Qty] + 1", "int:9" )
+    Gold( "10 - [Qty] * 2", "int:-6" )
+    Gold( "(10 - [Qty]) * 2", "int:4" )
+    Gold( "'a' + 'b'", "text:ab" )
+    Gold( "'say ''hi'''", "text:say 'hi'" )
+    Gold( "[First] & ' ' & [Last]", "text:Cara Jones" )
+    Gold( "'n=' & [Qty]", "text:n=8" )
+    Gold( "[Note] & 'x'", "text:x" )
+    Gold( "[Note] + 'x'", "empty" )
+    Gold( "[Qty] + [Note]", "err:can't add@7" )
+    Gold( "[Qty] \ 2.5", "err:whole numbers@7" )
+    Gold( "'a' * 2", "err:needs numbers@5" )
+
+    tkTest_Begin( "golden: empty" )
+    Gold( "empty + 1", "empty" )
+    Gold( "IsEmpty([Note])", "bool:true" )
+    Gold( "IsEmpty([Qty])", "bool:false" )
+    Gold( "IfEmpty([Note], 'none')", "text:none" )
+    Gold( "IfEmpty([First], 'none')", "text:Cara" )
+    Gold( "IfEmpty(empty, 2.5)", "float:2.5" )
+    Gold( "IfEmpty([Qty], 2.5)", "float:8" )
+    Gold( "[Note] = ''", "bool:false" )
+    Gold( "[Qty] = empty", "err:IsEmpty@7" )
+
+    tkTest_Begin( "golden: comparisons, like, in, logic" )
+    Gold( "[Qty] > 5", "bool:true" )
+    Gold( "[Qty] = 8.0", "bool:true" )
+    Gold( "[Last] = 'Jones'", "bool:true" )
+    Gold( "[Last] < 'K'", "bool:true" )
+    Gold( "[Paid] = true", "bool:true" )
+    Gold( "[Born] < #2000-01-01#", "bool:true" )
+    Gold( "[At] >= #14:30#", "bool:true" )
+    Gold( "[Qty] = '8'", "err:can't compare@7" )
+    Gold( "[Paid] < true", "err:only be compared@8" )
+    Gold( "1 < 2 < 3", "err:one comparison@7" )
+    Gold( "[Last] like 'J*s'", "bool:true" )
+    Gold( "[Last] like 'j*'", "bool:false" )
+    Gold( "'A12' like 'A##'", "bool:true" )
+    Gold( "'abc' like 'a?c'", "bool:true" )
+    Gold( "'abc' like '*z*'", "bool:false" )
+    Gold( "[Qty] in (1, 8, 9)", "bool:true" )
+    Gold( "[Last] in ('Smith', 'Lee')", "bool:false" )
+    Gold( "[Qty] in (8.0)", "bool:true" )
+    Gold( "[Qty] > 5 and [Paid]", "bool:true" )
+    Gold( "[Qty] > 50 or not [Paid]", "bool:false" )
+    Gold( "[Qty] > 50 orelse [Paid]", "bool:true" )
+    Gold( "true xor true", "bool:false" )
+    Gold( "[Qty] and true", "err:true / false@7" )
+    Gold( "not 1", "err:not@1" )
+
+    tkTest_Begin( "golden: iif" )
+    Gold( "iif([Qty] > 5, 'big', 'small')", "text:big" )
+    Gold( "iif([Qty] > 50, 1, 2.5)", "float:2.5" )
+    Gold( "iif([Qty] > 5, 1, 2.5)", "float:1" )
+    Gold( "iif(1, 2, 3)", "err:condition@5" )
+    Gold( "iif([Paid], 1, 'x')", "err:different kinds@13" )
+
+    tkTest_Begin( "golden: dates and times" )
+    Gold( "#2026-11-25# + 7", "date:2026-12-02" )
+    Gold( "#2026-03-01# - #2026-02-01#", "int:28" )
+    Gold( "[Born] - 1", "date:1990-02-27" )
+    Gold( "#23:30# + 3600", "time:00:30:00" )
+    Gold( "#10:00# - #09:30#", "int:1800" )
+    Gold( "Year([Born])", "int:1990" )
+    Gold( "Month(#2026-11-25#)", "int:11" )
+    Gold( "Day(#2026-11-25#)", "int:25" )
+    Gold( "Weekday(#2026-11-25#)", "int:4" )
+    Gold( "DateAdd('m', 1, #2026-01-31#)", "date:2026-02-28" )
+    Gold( "DateAdd('yyyy', 1, #2024-02-29#)", "date:2025-02-28" )
+    Gold( "DateAdd('ww', -1, #2026-11-25#)", "date:2026-11-18" )
+    Gold( "DateDiff('m', #2026-01-31#, #2026-03-01#)", "int:2" )
+    Gold( "DateDiff('d', #2026-01-01#, #2026-12-31#)", "int:364" )
+    Gold( "DateSerial(2026, 13, 1)", "date:2027-01-01" )
+    Gold( "DateSerial(2026, 3, 0)", "date:2026-02-28" )
+    Gold( "TimeSerial(25, 0, 0)", "time:01:00:00" )
+    Gold( "Hour([At]) * 100 + Minute([At])", "int:1430" )
+    Gold( "Second([At])", "int:15" )
+    Gold( "MonthName(11)", "text:November" )
+    Gold( "MonthName(2, true)", "text:Feb" )
+    Gold( "DateAdd('x', 1, [Born])", "err:no unit@1" )
+    Gold( "#2026-02-30#", "err:is not a date@1" )
+
+    tkTest_Begin( "golden: text functions" )
+    Gold( "Len([Last])", "int:5" )
+    Gold( "Left([Last], 3)", "text:Jon" )
+    Gold( "Right([Last], 2)", "text:es" )
+    Gold( "Mid([Last], 2, 3)", "text:one" )
+    Gold( "Mid([Last], 3)", "text:nes" )
+    Gold( "UCase([First])", "text:CARA" )
+    Gold( "LCase('AbC')", "text:abc" )
+    Gold( "Trim('  x  ')", "text:x" )
+    Gold( "InStr([Last], 'n')", "int:3" )
+    Gold( "InStr(4, 'banana', 'a')", "int:4" )
+    Gold( "Replace('a-b-c', '-', '+')", "text:a+b+c" )
+    Gold( "Str(1.5)", "text:1.5" )
+    Gold( "Val('12.5kg')", "float:12.5" )
+    Gold( "PadLeft('7', 3, '0')", "text:007" )
+    Gold( "PadRight('ab', 4) & '|'", "text:ab  |" )
+    Gold( "Left([Note], 2)", "empty" )
+    Gold( "Len(1)", "err:must be text@1" )
+    Gold( "Left('a')", "err:takes 2 values@1" )
+
+    tkTest_Begin( "golden: numbers, choices, conversions" )
+    Gold( "Abs(-3)", "int:3" )
+    Gold( "Abs(-2.5)", "float:2.5" )
+    Gold( "Int(2.7)", "int:2" )
+    Gold( "Int(-2.5)", "int:-3" )
+    Gold( "Fix(-2.5)", "int:-2" )
+    Gold( "Round(2.5)", "float:3" )
+    Gold( "Round(2.346, 2)", "float:2.35" )
+    Gold( "Round(-2.5)", "float:-3" )
+    Gold( "Sgn(-4)", "int:-1" )
+    Gold( "Sqr(16)", "float:4" )
+    Gold( "Min(3, 2.5)", "float:2.5" )
+    Gold( "Max('a', 'b')", "text:b" )
+    Gold( "Choose(2, 'a', 'b', 'c')", "text:b" )
+    Gold( "Choose(5, 1, 2)", "empty" )
+    Gold( "Between([Qty], 1, 10)", "bool:true" )
+    Gold( "CInt('42')", "int:42" )
+    Gold( "CInt(2.5)", "int:2" )
+    Gold( "CFloat('1.25')", "float:1.25" )
+    Gold( "CBool('yes')", "bool:true" )
+    Gold( "CDate('2026-11-25')", "date:2026-11-25" )
+    Gold( "CDate('nope')", "empty" )
+
+    tkTest_Begin( "golden: Format" )
+    Gold( "Format([Price] * [Qty], '$#,##0.00')", "text:$110.00" )
+    Gold( "Format(1234567, '#,##0')", "text:1,234,567" )
+    Gold( "Format([Disc], '0.0%')", "text:15.0%" )
+    Gold( "Format([Born], 'dd/mm/yyyy')", "text:28/02/1990" )
+    Gold( "Format([At], 'hh:nn')", "text:14:30" )
+    Gold( "Format([Paid], 'Y|N')", "text:Y" )
+    Gold( "Format([Qty], [First])", "text:Cara8" )
+    Gold( "Format([Note], '#')", "text:" )
+
+    tkTest_Begin( "golden: fields, parameters, report values" )
+    Gold( "[lines.qty]", "int:3" )
+    Gold( "[ Qty ]", "int:8" )
+    Gold( "@Min + 1", "int:6" )
+    Gold( "[Born] < @From", "bool:true" )
+    Gold( "Param('Name')", "text:Zed" )
+    Gold( "PageNumber & '/' & PageCount", "text:3/12" )
+    Gold( "RowNumber", "int:41" )
+    Gold( "GroupRowNumber()", "int:5" )
+    Gold( "ReportTitle", "text:Sales" )
+    Gold( "Today()", "date:2026-11-25" )
+    Gold( "Now", "time:09:30:00" )
+    Gold( "PrintDate", "date:2026-11-25" )
+
+    tkTest_Begin( "golden: compile errors and their columns" )
+    Gold( "[Nope]", "err:no field [Nope]@1" )
+    Gold( "@Nope", "err:no parameter @Nope@1" )
+    Gold( "1 +", "err:a value expected at the end@4" )
+    Gold( "(1 + 2", "err:')' expected@7" )
+    Gold( "1 + 2)", "err:without its@6" )
+    Gold( "'abc", "err:no closing@1" )
+    Gold( "[Qty", "err:no closing ]@1" )
+    Gold( "foo(1)", "err:no function 'foo'@1" )
+    Gold( "Sum([First])", "err:needs numbers@5" )
+    Gold( "Sum(Sum([Qty]))", "err:a total inside a total@5" )
+    Gold( "1 $ 2", "err:unexpected '$'@3" )
+    Gold( "Qty", "err:is not known@1" )
+    Gold( "", "err:empty@1" )
+    Gold( "1 2", "err:unexpected '2'@3" )
+end sub
+
+sub Totals( )
+    tkTest_Begin( "totals" )
+    ' ten rows: Qty 1..10, Last alternating, Note empty on odd rows, Born 2026-01-k
+    dim as TK_VALUE rows(0 to 9, 0 to 10)
+    for k as long = 0 to 9
+        for f as long = 0 to 10
+            rows(k, f) = gRow(f)
+        next
+        rows(k, 1).SetInt( k + 1 )
+        rows(k, 5).SetText( iif( k mod 2, "Lee", "Abbot" ) )
+        if k mod 2 then rows(k, 9).Clear( ) else rows(k, 9).SetText( "n" )
+        rows(k, 7).SetDate( DtOf( 2026, 1, k + 1 ) )
+    next
+    dim as string srcs(0 to 9) = { "Sum([Qty]) * 2", "Avg([Qty])", "Count()", "Count([Note])", "Min([Last])", _
+                                   "Max([Born])", "Sum([Qty]) / Count()", "First([Last]) & Last([Last])", _
+                                   "GroupCount()", "Sum([Qty] * [Price])" }
+    dim as string wants(0 to 9) = { "int:110", "float:5.5", "int:10", "int:5", "text:Abbot", _
+                                    "date:2026-01-10", "float:5.5", "text:AbbotLee", "int:10", "float:756.25" }
+    for e as long = 0 to 9
+        dim as TKREXPR_ERROR er
+        dim as TK_REXPR ptr x = tkRExpr_Compile( srcs(e), gSch, er )
+        if x = 0 then
+            tkTest_Check( srcs(e), false, er.msg )
+            continue for
+        end if
+        dim as long na = tkRExpr_AggCount( x )
+        dim as TKREXPR_ACC acc(0 to 3)
+        dim as TK_VALUE res(0 to 3)
+        for k as long = 0 to na - 1
+            tkRExpr_AccInit( acc(k), x, k )
+        next
+        for r as long = 0 to 9
+            dim as TKREXPR_CTX c = gCtx
+            c.row = @rows(r, 0)
+            for k as long = 0 to na - 1
+                tkRExpr_AccAdd( acc(k), x, k, c )
+            next
+        next
+        for k as long = 0 to na - 1
+            acc(k).Result( res(k) )
+        next
+        dim as TKREXPR_CTX c = gCtx
+        c.aggs = @res(0)
+        dim as TK_VALUE v
+        tkRExpr_Eval( x, c, v )
+        tkTest_Check( srcs(e) & "  ->  " & wants(e), KV( v ) = wants(e), KV( v ) & " (" & na & " totals)" )
+        tkRExpr_Destroy( x )
+    next
+    ' the shape the engine reads
+    dim as TKREXPR_ERROR er
+    dim as TK_REXPR ptr x = tkRExpr_Compile( "Sum([Qty]) / Count() + Min(1, 2)", gSch, er )
+    tkTest_Check( "two totals; Min with two values is not one", (tkRExpr_AggCount( x ) = 2) andalso _
+        (tkRExpr_AggFn( x, 0 ) = TKRX_AGG_SUM) andalso (tkRExpr_AggFn( x, 1 ) = TKRX_AGG_COUNTROWS) andalso _
+        (tkRExpr_AggArg( x, 1 ) = 0) andalso (tkRExpr_Kind( tkRExpr_AggArg( x, 0 ) ) = TKV_INT) andalso (tkRExpr_Kind( x ) = TKV_FLOAT), _
+        "aggs " & tkRExpr_AggCount( x ) )
+    tkRExpr_Destroy( x )
+    dim as TKREXPR_SCHEMA noAgg = gSch
+    noAgg.noAggregates = true
+    tkTest_Check( "totals refused where the schema says so", left( Outcome( "Sum([Qty])", noAgg ), 4 ) = "err:", Outcome( "Sum([Qty])", noAgg ) )
+end sub
+
+sub Others( )
+    tkTest_Begin( "run time, laziness, hosts, kinds" )
+    dim as TKREXPR_ERROR er
+    dim as TK_REXPR ptr x = tkRExpr_Compile( "1 \ 0", gSch, er )
+    dim as TK_VALUE v
+    tkRExpr_Eval( x, gCtx, v )
+    tkRExpr_Eval( x, gCtx, v )
+    dim as ustring first
+    dim as long n = tkRExpr_GetRunErrors( x, first )
+    tkTest_Check( "division by zero: empty, counted, never raised", (v.kind = TKV_EMPTY) andalso (n = 2) andalso (first = "division by zero"), n & " " & first )
+    tkRExpr_Destroy( x )
+    x = tkRExpr_Compile( "false and (1 \ 0 = 1) or (true or 1 \ 0 = 1)", gSch, er )
+    tkRExpr_Eval( x, gCtx, v )
+    tkTest_Check( "and / or evaluate only what they need", (KV( v ) = "bool:true") andalso (tkRExpr_GetRunErrors( x, first ) = 0), KV( v ) )
+    tkRExpr_Destroy( x )
+    x = tkRExpr_Compile( "iif([Qty] > 5, 1, 1 \ 0)", gSch, er )
+    tkRExpr_Eval( x, gCtx, v )
+    tkTest_Check( "iif evaluates only the branch taken", (KV( v ) = "int:1") andalso (tkRExpr_GetRunErrors( x, first ) = 0) )
+    tkRExpr_Destroy( x )
+
+    dim as int32 ak(0 to 0) = { TKV_INT }
+    tkTest_Check( "a host function registers", tkRExpr_Register( "Double", ak(), TKV_INT, @HostDouble ) )
+    tkTest_Check( "a built-in name can't be registered", tkRExpr_Register( "Left", ak(), TKV_TEXT, @HostDouble ) = false )
+    tkTest_Check( "nor one twice", tkRExpr_Register( "double", ak(), TKV_INT, @HostDouble ) = false )
+    dim as string hd = Outcome( "Double([Qty]) + 1" )
+    tkTest_Check( "a host function is called", (hd = "int:17") andalso (gHostCalls = 1), hd & " calls " & gHostCalls )
+    tkTest_Check( "a host function's kinds are checked", instr( Outcome( "Double('x')" ), "must be a whole number" ) > 0, Outcome( "Double('x')" ) )
+
+    dim as TK_VALUE keep = gRow(2)
+    gRow(2).SetInt( 14 )
+    tkTest_Check( "a row's int where the schema says float is read as float", Outcome( "[Price] / 4" ) = "float:3.5", Outcome( "[Price] / 4" ) )
+    gRow(2).SetText( "2.5" )
+    tkTest_Check( "a row's text where the schema says float is read as tkBind reads it", Outcome( "[Price] * 2" ) = "float:5", Outcome( "[Price] * 2" ) )
+    gRow(2) = keep
+
+    x = tkRExpr_Compile( "PageCount + 1", gSch, er )
+    tkTest_Check( "PageCount marks an expression late", tkRExpr_UsesValue( x, TKRX_B_PAGECOUNT ) andalso _
+        (tkRExpr_UsesValue( x, TKRX_B_PAGENUMBER ) = false) )
+    tkRExpr_Destroy( x )
+    x = tkRExpr_Compile( "Sum(PageNumber)", gSch, er )
+    tkTest_Check( "a value used inside a total's argument counts", tkRExpr_UsesValue( x, TKRX_B_PAGENUMBER ) )
+    tkRExpr_Destroy( x )
+    x = tkRExpr_Compile( "Len('abc') * 2", gSch, er )
+    dim as TK_REXPR ptr y = tkRExpr_Compile( "[Qty] * 2", gSch, er )
+    tkTest_Check( "constants are told from what reads the row", tkRExpr_IsConstant( x ) andalso (tkRExpr_IsConstant( y ) = false) )
+    tkRExpr_Destroy( x )
+    tkRExpr_Destroy( y )
+
+    dim as TKREXPR_SCHEMA s2
+    s2.AddField( "Orders.Customer", TKV_TEXT )
+    s2.AddField( "Lines.Qty", TKV_INT )
+    s2.defaultSource = "Lines"
+    gRow(0).SetText( "Acme" ) : gRow(1).SetInt( 4 )
+    tkTest_Check( "[Qty] finds the default source's field; [Orders.Customer] the master's", _
+        (Outcome( "[Qty] * 2", s2 ) = "int:8") andalso (Outcome( "[Orders.Customer]", s2 ) = "text:Acme") andalso _
+        (left( Outcome( "[Customer]", s2 ), 4 ) = "err:"), Outcome( "[Qty] * 2", s2 ) )
+    gRow(0).SetInt( 1007 ) : gRow(1).SetInt( 8 )
+
+    x = tkRExpr_Compile( "[Qty] > 5 and [Paid]", gSch, er )
+    tkTest_Check( "EvalBool", tkRExpr_EvalBool( x, gCtx ) )
+    tkRExpr_Destroy( x )
+    x = tkRExpr_Compile( "[Price] * [Qty]", gSch, er )
+    tkTest_Check( "EvalText with a mask", tkRExpr_EvalText( x, gCtx, "#,##0.0" ) = "110.0", tkRExpr_EvalText( x, gCtx, "#,##0.0" ) )
+    tkRExpr_Destroy( x )
+    ' deep but legal, then too deep
+    dim as string deep = "1"
+    for i as long = 1 to 40
+        deep = "(" & deep & " + 1)"
+    next
+    tkTest_Check( "40 levels of brackets", Outcome( deep ) = "int:41", left( Outcome( deep ), 60 ) )
+    deep = "1"
+    for i as long = 1 to 60
+        deep = "(" & deep & ")"
+    next
+    tkTest_Check( "60 levels are refused", instr( Outcome( deep ), "nested too deeply" ) > 0, left( Outcome( deep ), 60 ) )
+end sub
+
+sub FormatSame( )
+    tkTest_Begin( "tkRExpr_FormatValue = tkReport_FormatValue" )
+    dim as TK_VALUE vs(0 to 11)
+    vs(0).SetFloat( 1234.5 ) : vs(1).SetFloat( -0.004 ) : vs(2).SetInt( -1234567 ) : vs(3).SetInt( 0 )
+    vs(4).SetBool( true ) : vs(5).SetBool( false ) : vs(6).SetDate( DtOf( 2026, 3, 7 ) )
+    vs(7).SetTime( TmOf( 9, 5, 3 ) ) : vs(8).SetText( "abc" ) : vs(9).Clear( ) : vs(10).SetFloat( 0.256 )
+    vs(11).SetFloat( 1e15 )
+    dim as string masks(0 to 11) = { "", "$#,##0.00", "0.0%", "#,##0", "x", "#,##0 kg", "Y|N", "Yes", _
+                                     "dd/mm/yyyy", "yyyy", "hh:nn:ss", "0" }
+    dim as long nSame, nAll
+    dim as string diffs
+    for i as long = 0 to 11
+        for m as long = 0 to 11
+            dim as string a = tkRExpr_FormatValue( vs(i), masks(m) ), b = tkReport_FormatValue( vs(i), masks(m) )
+            nAll += 1
+            if a = b then nSame += 1 else diffs &= KV( vs(i) ) & " [" & masks(m) & "] " & a & " / " & b & "; "
+        next
+    next
+    tkTest_Check( "144 value x mask pairs format the same", nSame = nAll, nSame & " / " & nAll & " " & left( diffs, 200 ) )
+end sub
+
+if tkTest_Init() = false then end 1
+SetUp( )
+GoldTable( )
+Totals( )
+Others( )
+FormatSame( )
+dim as long nFail = tkTest_Report( "tkRExpr" )
+tkTest_Quit()
+end nFail

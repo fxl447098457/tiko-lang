@@ -1,0 +1,566 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkToastCard -- the second file of module tkToast: a card's painting (shadow, item, focus), its
+' motion frames (enter, leave, move, spring), its mouse (parts, swipe) and its keyboard, and the
+' toaster's keyboard mode. The toaster, the queue and the API that takes callback types are in
+' tkToast.tiko (a procedure-pointer type used across the files of one module mangles wrongly in a
+' public procedure of the other file -- Learnings, tkDataGrid G1 -- so none is used here).
+#module "tkToast"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkNotify" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkNotify
+
+private function CardEase_( byval t as single ) as single
+    if t <= 0 then return 0
+    if t >= 1 then return 1
+    return 1 - (1 - t) * (1 - t)
+end function
+
+private function CardOf_( byval w as TK_WIDGET ptr ) as TKTOAST_CARD ptr
+    if (w = 0) orelse (w->proc <> @Card_Proc) then return 0
+    return cast( TKTOAST_CARD ptr, w->pData )
+end function
+
+' Is the card entering, moving, leaving or springing back?
+function CardMoving_( byval w as TK_WIDGET ptr ) as boolean
+    dim as TKTOAST_CARD ptr pc = CardOf_( w )
+    if pc = 0 then return false
+    return (pc->tEnter >= 0) orelse (pc->tMove >= 0) orelse pc->bLeaving orelse (pc->tSpring >= 0)
+end function
+
+' Advances a card's motion to tNow and puts its widget there: the item at curX/curY plus the
+' enter / leave / drag offsets, inside a margin for the shadow. A leave that ends hides the card.
+' Returns whether it is still moving.
+function CardFrame_( byval pT as TKTOASTER_STATE ptr, byval w as TK_WIDGET ptr, byval tNow as longint ) as boolean
+    dim as TKTOAST_CARD ptr pc = CardOf_( w )
+    if (pc = 0) orelse (pc->bPlaced = false) then return false
+    dim as single fScale = pT->pHost->fScale
+    dim as long slide = cint( TKTOAST_SLIDE * fScale )
+    dim as long sm = cint( TKTOAST_SHADOW * fScale )
+    dim as long iw = pc->rcItem.right - pc->rcItem.left, ih = pc->rcItem.bottom - pc->rcItem.top
+    ' where the item is: travelling from its last place, or there
+    dim as long x = pc->rcItem.left, y = pc->rcItem.top
+    if pc->tMove >= 0 then
+        dim as single tm = (tNow - pc->tMove) / TKTOAST_MOVE_MS
+        if tm >= 1 then
+            pc->tMove = -1
+        else
+            dim as single em = CardEase_( tm )
+            x = pc->fromX + cint( (pc->rcItem.left - pc->fromX) * em )
+            y = pc->fromY + cint( (pc->rcItem.top - pc->fromY) * em )
+        end if
+    end if
+    pc->curX = x : pc->curY = y
+    dim as single op = 1
+    dim as long dy = 0
+    if pc->tEnter >= 0 then
+        dim as single te = (tNow - pc->tEnter) / TKTOAST_ENTER_MS
+        if te >= 1 then
+            pc->tEnter = -1
+        else
+            dim as single ee = CardEase_( te )
+            op *= ee
+            dy += cint( (1 - ee) * slide ) * pc->nVSign
+        end if
+    end if
+    if pc->tSpring >= 0 then
+        dim as single ts = (tNow - pc->tSpring) / TKTOAST_MOVE_MS
+        if ts >= 1 then
+            pc->tSpring = -1
+            pc->dragX = 0
+        else
+            pc->dragX = cint( pc->springFrom * (1 - CardEase_( ts )) )
+        end if
+    end if
+    dim as long dx = pc->dragX
+    if pc->bLeaving then
+        dim as single tl = (tNow - pc->tLeave) / TKTOAST_LEAVE_MS
+        if tl >= 1 then
+            pc->bLeaving = false
+            pc->fOpacity = 0
+            tkWidget_Show( w, false )
+            return false
+        end if
+        dim as single el = CardEase_( tl )
+        op *= (1 - el)
+        if pc->leaveDX <> 0 then
+            dx = pc->leaveDX + cint( sgn( pc->leaveDX ) * iw * el )      ' a swiped card flies on
+        else
+            dy += cint( el * slide ) * pc->nVSign                          ' else back towards the edge
+        end if
+    end if
+    if (dx <> 0) andalso (iw > 0) then
+        dim as single fd = 1 - abs( dx ) / iw
+        op *= iif( fd < 0, 0.0, fd )
+    end if
+    pc->fOpacity = op
+    tkWidget_SetPos( w, x + dx - sm, y + dy - sm, iw + 2 * sm, ih + 2 * sm )
+    tkWidget_Invalidate( w )
+    return CardMoving_( w )
+end function
+
+private sub CardPaint_( byval pT as TKTOASTER_STATE ptr, byval pc as TKTOAST_CARD ptr, byval w as TK_WIDGET ptr, _
+                        byval b as TK_PAINT ptr )
+    dim as long sm = cint( TKTOAST_SHADOW * pT->pHost->fScale )
+    dim as TKRECT rcIt
+    tkRect_Set( rcIt, sm, sm, w->cw - sm, w->ch - sm )
+    dim as single op = pc->fOpacity
+    ' the shadow: rings outside the card, fainter outwards (tkPaint has no blur)
+    dim as ulong base_ = pT->colors.Shadow
+    dim as long ba = (base_ shr 24) and 255
+    for k as long = sm to 1 step -1
+        dim as TKRECT rs = rcIt
+        tkRect_Inflate( rs, k, k )
+        rs.top += 1 : rs.bottom += 1
+        b->SetBackColor( tkColor_WithAlpha( base_, cint( ba * op * (sm - k + 1) / (sm * 3) ) ) )
+        b->PaintRoundRect( @rs, pc->lo.curvature + 2 * k )
+    next
+    dim as TKNOTIFY_FONTS fo = Fonts_( pT )
+    dim as long nPr = iif( pc->nPressed = pc->nHot, pc->nPressed, TKN_PART_NONE )
+    dim as long nFoc = iif( pc->bFocused, pc->nFocusPart, TKN_PART_NONE )
+    dim as single fPhase = 0
+    if pc->it.progress = TKN_PROGRESS_INDETERMINATE then fPhase = (Now_( pT ) mod TKTOAST_MARQUEE_MS) / TKTOAST_MARQUEE_MS
+    tkNotify_PaintItem( b, sm, sm, pc->it, pc->lo, pT->colors, fo, pc->nHot, nPr, nFoc, op, fPhase )
+    if pc->bFocused andalso (pc->nFocusPart = TKN_PART_NONE) then
+        ' a card with nothing to press shows its focus round the whole card
+        b->SetPenColor( tkColor_WithAlpha( pT->colors.FocusRing, cint( 255 * op ) ) )
+        b->PaintRoundOutline( @rcIt, pc->lo.curvature, 2 )
+    end if
+end sub
+
+private function Pressable_( byval pc as TKTOAST_CARD ptr, byval part as long ) as boolean
+    if part = TKN_PART_CLOSE then return pc->it.bClosable
+    if part >= TKN_PART_ACTION1 then return (part - TKN_PART_ACTION1) < tkNotify_ActionCount( pc->it )
+    if part = TKN_PART_BODY then return (pc->pT <> 0) andalso (pc->pT->ClickCb <> 0)
+    return false
+end function
+
+private function HitCard_( byval pT as TKTOASTER_STATE ptr, byval pc as TKTOAST_CARD ptr, byval x as single, byval y as single ) as long
+    dim as long sm = cint( TKTOAST_SHADOW * pT->pHost->fScale )
+    return tkNotify_HitPart( pc->lo, cint( x ) - sm, cint( y ) - sm )
+end function
+
+' A user's dismissal of this card (button, swipe, key): through the queue, then the callback.
+private sub UserDismiss_( byval pT as TKTOASTER_STATE ptr, byval pc as TKTOAST_CARD ptr, byval reason as long )
+    dim as long idx = IndexOf_( pT, pc->id )
+    if idx < 0 then exit sub
+    gCardDepth += 1
+    DismissIdx_( pT, idx, reason, true )
+    gCardDepth -= 1
+    SyncClock_( pT )                      ' a card dropped in there is reaped on the next tick
+end sub
+
+private sub Fire_( byval pc as TKTOAST_CARD ptr, byval part as long )
+    dim as TKTOASTER_STATE ptr pT = pc->pT
+    if (pT = 0) orelse (pc->id = 0) then exit sub
+    dim as long idx = IndexOf_( pT, pc->id )
+    if idx < 0 then exit sub
+    if part = TKN_PART_CLOSE then
+        UserDismiss_( pT, pc, TKN_CLOSE_BUTTON )
+        exit sub
+    end if
+    gCardDepth += 1
+    if part >= TKN_PART_ACTION1 then
+        dim as long nAction = pc->nActOf(part - TKN_PART_ACTION1)
+        dim as TK_TOAST t = pT->items(idx).t
+        dim as long id = pT->items(idx).id
+        if t.bKeepOnAction = false then
+            Account_( pT, Now_( pT ) )
+            Remove_( pT, idx, TKN_CLOSE_ACTION, t )
+            Pump_( pT )
+            Relayout_( pT, true )
+            if pT->bRefocus then Refocus_( pT )
+            SyncHold_( pT )
+        end if
+        if t.OnAction then
+            t.OnAction( pT->hWin, id, nAction, t.pCtx )
+        elseif pT->ActionCb then
+            pT->ActionCb( pT->hWin, id, nAction, t.pCtx )
+        end if
+        if t.bKeepOnAction = false then NotifyDismissed_( pT, t, id, TKN_CLOSE_ACTION )
+    elseif part = TKN_PART_BODY then
+        if pT->ClickCb then pT->ClickCb( pT->hWin, pc->id, pT->items(idx).t.pCtx )
+    end if
+    gCardDepth -= 1
+    SyncClock_( pT )
+end sub
+
+' ---- keyboard ---------------------------------------------------------------------------------
+' Is target still a widget of this tree? (A saved pointer is compared, never followed.)
+private function InTree_( byval w as TK_WIDGET ptr, byval target as TK_WIDGET ptr ) as boolean
+    dim as TK_WIDGET ptr c = w->pFirst
+    while c
+        if c = target then return true
+        if InTree_( c, target ) then return true
+        c = c->pNext
+    wend
+    return false
+end function
+
+sub LeaveKeyMode_( byval pT as TKTOASTER_STATE ptr, byval bRestore as boolean )
+    if pT->bKeyMode = false then exit sub
+    pT->bKeyMode = false
+    for i as long = 0 to pT->nItems - 1
+        if pT->items(i).card then pT->items(i).card->isFocusable = false
+    next
+    dim as TK_WIDGET ptr target = pT->pSavedFocus
+    pT->pSavedFocus = 0
+    if bRestore = false then exit sub
+    dim as TK_HOST ptr h = pT->pHost
+    if (target <> 0) andalso InTree_( h->root, target ) andalso tkWidget_IsVisible( target ) andalso tkWidget_IsEnabled( target ) then
+        tkHost_SetFocus( h, target )
+    elseif CardOf_( h->pFocus ) <> 0 then
+        tkHost_SetFocus( h, 0 )
+    end if
+end sub
+
+private function NewestCard_( byval pT as TKTOASTER_STATE ptr ) as TK_WIDGET ptr
+    dim as long best = -1
+    for i as long = 0 to pT->nItems - 1
+        if (pT->items(i).state = TST_SHOWN) andalso (pT->items(i).card <> 0) then
+            if best < 0 then
+                best = i
+            elseif pT->items(i).showSeq > pT->items(best).showSeq then
+                best = i
+            end if
+        end if
+    next
+    return iif( best >= 0, pT->items(best).card, cast( TK_WIDGET ptr, 0 ) )
+end function
+
+' The focused card went: the newest card takes focus, or, with none left, the saved widget.
+sub Refocus_( byval pT as TKTOASTER_STATE ptr )
+    pT->bRefocus = false
+    dim as TK_WIDGET ptr w = NewestCard_( pT )
+    if pT->bKeyMode andalso (w <> 0) then
+        w->isFocusable = true
+        tkHost_SetFocus( pT->pHost, w )
+    else
+        LeaveKeyMode_( pT, true )
+    end if
+end sub
+
+' Shown cards top to bottom on the screen; returns how many.
+private function CardsByTop_( byval pT as TKTOASTER_STATE ptr, cards() as TK_WIDGET ptr ) as long
+    dim as long n = 0
+    redim cards( 0 to pT->nItems )
+    for i as long = 0 to pT->nItems - 1
+        if (pT->items(i).state = TST_SHOWN) andalso (pT->items(i).card <> 0) then cards(n) = pT->items(i).card : n += 1
+    next
+    for a as long = 1 to n - 1
+        dim as TK_WIDGET ptr v = cards(a)
+        dim as long b = a - 1
+        while (b >= 0) andalso (CardOf_( cards(b) )->rcItem.top > CardOf_( v )->rcItem.top)
+            cards(b + 1) = cards(b)
+            b -= 1
+        wend
+        cards(b + 1) = v
+    next
+    return n
+end function
+
+' To the card dir (+1 down, -1 up) of w. bLeave: past the end, keyboard mode ends and focus goes back.
+private sub StepCard_( byval pT as TKTOASTER_STATE ptr, byval w as TK_WIDGET ptr, byval nDir as long, _
+                       byval bLeave as boolean, byval bLandLast as boolean )
+    dim as TK_WIDGET ptr cards(any)
+    dim as long n = CardsByTop_( pT, cards() )
+    dim as long me_ = -1
+    for i as long = 0 to n - 1
+        if cards(i) = w then me_ = i
+    next
+    dim as long nxt = me_ + nDir
+    if (me_ >= 0) andalso (nxt >= 0) andalso (nxt < n) then
+        pT->bFocusBack = bLandLast
+        tkHost_SetFocus( pT->pHost, cards(nxt) )
+    elseif bLeave then
+        LeaveKeyMode_( pT, true )
+    end if
+end sub
+
+private function CardKey_( byval pT as TKTOASTER_STATE ptr, byval pc as TKTOAST_CARD ptr, byval w as TK_WIDGET ptr, _
+                           byval m as TK_MSG ptr ) as boolean
+    dim as boolean bShift = (m->mods and SDL_KMOD_SHIFT) <> 0
+    select case m->key
+    case SDLK_TAB
+        dim as long parts(any)
+        dim as long n = tkNotify_FocusParts( pc->it, parts() )
+        dim as long cur = -1
+        for i as long = 0 to n - 1
+            if parts(i) = pc->nFocusPart then cur = i
+        next
+        dim as long nxt = iif( bShift, cur - 1, cur + 1 )
+        if (cur >= 0) andalso (nxt >= 0) andalso (nxt < n) then
+            pc->nFocusPart = parts(nxt)
+            tkWidget_Invalidate( w )
+        else
+            StepCard_( pT, w, iif( bShift, -1, 1 ), true, bShift )
+        end if
+        return true
+    case SDLK_UP
+        StepCard_( pT, w, -1, false, false )
+        return true
+    case SDLK_DOWN
+        StepCard_( pT, w, 1, false, false )
+        return true
+    case SDLK_RETURN, SDLK_KP_ENTER, SDLK_SPACE
+        if Pressable_( pc, pc->nFocusPart ) then
+            Fire_( pc, pc->nFocusPart )
+        elseif Pressable_( pc, TKN_PART_BODY ) then
+            Fire_( pc, TKN_PART_BODY )
+        end if
+        return true
+    case SDLK_ESCAPE, SDLK_DELETE
+        if bShift andalso (m->key = SDLK_ESCAPE) then
+            ' every closable toast, shown or waiting: each told, as a user's dismissal
+            dim as long ids( 0 to pT->nItems ), nIds = 0
+            for i as long = 0 to pT->nItems - 1
+                if pT->items(i).t.bClosable then ids(nIds) = pT->items(i).id : nIds += 1
+            next
+            gCardDepth += 1
+            for i as long = 0 to nIds - 1
+                dim as long idx = IndexOf_( pT, ids(i) )
+                if idx >= 0 then DismissIdx_( pT, idx, TKN_CLOSE_KEY, true )
+            next
+            gCardDepth -= 1
+            SyncClock_( pT )
+        elseif pc->it.bClosable then
+            UserDismiss_( pT, pc, TKN_CLOSE_KEY )
+        end if
+        return true
+    end select
+    return false
+end function
+
+' ---- the card's widget procedure ----------------------------------------------------------------
+function Card_Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKTOAST_CARD ptr pc = cast( TKTOAST_CARD ptr, w->pData )
+    if pc = 0 then return false
+    if m->msg = TKM_DESTROY then
+        if pc->pT then CardGone_( pc->pT, w )
+        delete pc
+        w->pData = 0
+        return true
+    end if
+    dim as TKTOASTER_STATE ptr pT = pc->pT
+    if pT = 0 then return false
+    if m->msg = TKM_PAINT then
+        CardPaint_( pT, pc, w, m->pPaint )            ' a leaving card still paints
+        return true
+    end if
+    if pc->id = 0 then return (m->msg <> TKM_KEYDOWN) andalso (m->msg <> TKM_CHAR)   ' leaving: takes no input
+    select case m->msg
+    case TKM_MOUSEMOVE
+        if pc->bPress then
+            dim as single rootX = w->x + m->x
+            dim as single dxRaw = rootX - pc->pressX
+            if (pc->bDragging = false) andalso (abs( dxRaw ) > TKTOAST_SWIPE_SLOP * pT->pHost->fScale) then
+                pc->bDragging = true
+                pc->nPressed = TKN_PART_NONE          ' a drag that began on a button cancels it
+                pc->nHot = TKN_PART_NONE
+            end if
+            if pc->bDragging then
+                dim as long d = cint( dxRaw )
+                if (pc->nSwipeSign > 0) andalso (d < 0) then d = 0
+                if (pc->nSwipeSign < 0) andalso (d > 0) then d = 0
+                pc->dragX = d
+                pc->prevX = pc->lastX : pc->prevT = pc->lastT
+                pc->lastX = rootX : pc->lastT = Now_( pT )
+                CardFrame_( pT, w, Now_( pT ) )
+                return true
+            end if
+        end if
+        dim as long partM = HitCard_( pT, pc, m->x, m->y )
+        if Pressable_( pc, partM ) = false then partM = TKN_PART_NONE
+        if partM <> pc->nHot then
+            pc->nHot = partM
+            tkWidget_Invalidate( w )
+        end if
+        w->cursor = iif( partM <> TKN_PART_NONE, TK_CURSOR_HAND, TK_CURSOR_ARROW )
+        return true
+    case TKM_MOUSEENTER
+        SyncHold_( pT )
+        return true
+    case TKM_MOUSELEAVE
+        if (pc->nPressed = TKN_PART_NONE) andalso (pc->nHot <> TKN_PART_NONE) then
+            pc->nHot = TKN_PART_NONE
+            tkWidget_Invalidate( w )
+        end if
+        SyncHold_( pT )
+        return true
+    case TKM_LBUTTONDOWN
+        dim as long partD = HitCard_( pT, pc, m->x, m->y )
+        if partD = TKN_PART_NONE then return true                     ' the shadow
+        pc->bPress = true
+        pc->bDragging = false
+        pc->tSpring = -1
+        pc->pressX = w->x + m->x
+        pc->prevX = pc->pressX : pc->lastX = pc->pressX
+        pc->prevT = Now_( pT ) : pc->lastT = pc->prevT
+        pc->nPressed = iif( Pressable_( pc, partD ), partD, TKN_PART_NONE )
+        pc->nHot = pc->nPressed
+        tkHost_SetCapture( w )
+        SyncHold_( pT )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONUP
+        dim as long was = pc->nPressed
+        dim as boolean bWasDrag = pc->bDragging
+        pc->bPress = false
+        pc->bDragging = false
+        pc->nPressed = TKN_PART_NONE
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        if bWasDrag then
+            dim as single fScale = pT->pHost->fScale
+            dim as single v = 0
+            if pc->lastT > pc->prevT then v = (pc->lastX - pc->prevX) / (pc->lastT - pc->prevT)
+            dim as boolean bFlick = (abs( v ) >= TKTOAST_SWIPE_SPEED * fScale) andalso (pc->dragX <> 0) andalso (sgn( v ) = sgn( pc->dragX ))
+            if (abs( pc->dragX ) >= cint( TKTOAST_SWIPE * fScale )) orelse bFlick then
+                SyncHold_( pT )
+                UserDismiss_( pT, pc, TKN_CLOSE_SWIPE )
+            else
+                pc->springFrom = pc->dragX
+                pc->tSpring = Now_( pT )
+                SyncHold_( pT )
+            end if
+            return true
+        end if
+        dim as long partU = HitCard_( pT, pc, m->x, m->y )
+        pc->nHot = iif( Pressable_( pc, partU ), partU, TKN_PART_NONE )
+        tkWidget_Invalidate( w )
+        SyncHold_( pT )
+        if (was <> TKN_PART_NONE) andalso (partU = was) then Fire_( pc, was )
+        return true
+    case TKM_CAPTURECHANGED
+        if pc->bDragging then
+            pc->springFrom = pc->dragX
+            pc->tSpring = Now_( pT )
+            SyncClock_( pT )
+        end if
+        pc->bPress = false
+        pc->bDragging = false
+        if pc->nPressed <> TKN_PART_NONE then
+            pc->nPressed = TKN_PART_NONE
+            tkWidget_Invalidate( w )
+        end if
+        return true
+    case TKM_SETFOCUS
+        pc->bFocused = true
+        dim as long parts(any)
+        dim as long n = tkNotify_FocusParts( pc->it, parts() )
+        pc->nFocusPart = TKN_PART_NONE
+        if n > 0 then pc->nFocusPart = iif( pT->bFocusBack, parts(n - 1), parts(0) )
+        pT->bFocusBack = false
+        tkWidget_Invalidate( w )
+        SyncHold_( pT )
+        return true
+    case TKM_KILLFOCUS
+        pc->bFocused = false
+        tkWidget_Invalidate( w )
+        if IsOurCard_( pT, m->pOther ) = false then LeaveKeyMode_( pT, false )
+        SyncHold_( pT )
+        return true
+    case TKM_KEYDOWN
+        return CardKey_( pT, pc, w, m )
+    case TKM_CHAR
+        return m->text = " "                       ' Space was claimed as a key (the beep rule)
+    end select
+    return false
+end function
+
+
+' ==========================================================================================
+' Public: keyboard and motion (no callback types here -- see the banner)
+' ==========================================================================================
+' Moves keyboard focus to the newest card, remembering what had it; FALSE when no card shows.
+' Bind it to a chord of the app's choosing (tkKeys): there is no default (NOTIFICATIONS N-7).
+public function tkToast_FocusToasts( byval hWnd as TK_WIDGET ptr ) as boolean
+    dim as TKTOASTER_STATE ptr pT = Find_( hWnd )
+    if pT = 0 then return false
+    dim as TK_WIDGET ptr w = NewestCard_( pT )
+    if w = 0 then return false
+    if pT->bKeyMode = false then
+        dim as TK_WIDGET ptr cur = pT->pHost->pFocus
+        pT->pSavedFocus = iif( CardOf_( cur ) <> 0, cast( TK_WIDGET ptr, 0 ), cur )
+        pT->bKeyMode = true
+    end if
+    for i as long = 0 to pT->nItems - 1
+        if pT->items(i).card then pT->items(i).card->isFocusable = true
+    next
+    tkHost_SetFocus( pT->pHost, w )
+    return pT->pHost->pFocus = w
+end function
+
+' TRUE while tkToast_FocusToasts is in force (a card has, or is about to have, focus).
+public function tkToast_IsKeyMode( byval hWnd as TK_WIDGET ptr ) as boolean
+    dim as TKTOASTER_STATE ptr pT = Find_( hWnd )
+    return iif( pT <> 0, pT->bKeyMode, false )
+end function
+
+' The part a focused card's keyboard user is on (TKN_PART_*); NONE when the card is not focused.
+public function tkToast_GetFocusPart( byval hWnd as TK_WIDGET ptr, byval id as long ) as long
+    dim as TKTOASTER_STATE ptr pT = Find_( hWnd )
+    if pT = 0 then return TKN_PART_NONE
+    dim as long idx = IndexOf_( pT, id )
+    if (idx < 0) orelse (pT->items(idx).card = 0) then return TKN_PART_NONE
+    dim as TKTOAST_CARD ptr pc = CardOf_( pT->items(idx).card )
+    return iif( pc->bFocused, pc->nFocusPart, TKN_PART_NONE )
+end function
+
+' A shown card's opacity now (0..1): it fades in, out, and with a swipe.
+public function tkToast_GetCardOpacity( byval hWnd as TK_WIDGET ptr, byval id as long ) as single
+    dim as TKTOASTER_STATE ptr pT = Find_( hWnd )
+    if pT = 0 then return 0
+    dim as long idx = IndexOf_( pT, id )
+    if (idx < 0) orelse (pT->items(idx).card = 0) then return 0
+    return CardOf_( pT->items(idx).card )->fOpacity
+end function
+
+' TRUE while any card moves (enters, leaves, travels, springs back).
+public function tkToast_IsAnimating( byval hWnd as TK_WIDGET ptr ) as boolean
+    dim as TKTOASTER_STATE ptr pT = Find_( hWnd )
+    if pT = 0 then return false
+    for i as long = 0 to pT->nItems - 1
+        if (pT->items(i).card <> 0) andalso CardMoving_( pT->items(i).card ) then return true
+    next
+    for i as long = 0 to pT->nReap - 1
+        if CardMoving_( pT->reap(i) ) then return true
+    next
+    return false
+end function
+
+public function tkToast_GetAnimate( byval hWnd as TK_WIDGET ptr ) as boolean
+    dim as TKTOASTER_STATE ptr pT = Find_( hWnd )
+    return iif( pT <> 0, pT->st.bAnimate, gDefaults.bAnimate )
+end function
+
+' Off: every card lands where it belongs now, a leaving one is gone, and nothing moves again.
+public sub tkToast_SetAnimate( byval hWnd as TK_WIDGET ptr, byval bAnimate as boolean )
+    dim as TKTOASTER_STATE ptr pT = Get_( hWnd )
+    if pT = 0 then exit sub
+    pT->st.bAnimate = bAnimate
+    if bAnimate then exit sub
+    for i as long = 0 to pT->nItems - 1
+        dim as TKTOAST_CARD ptr pc = CardOf_( pT->items(i).card )
+        if pc then
+            pc->tEnter = -1 : pc->tMove = -1 : pc->tSpring = -1 : pc->dragX = 0
+            pc->curX = pc->rcItem.left : pc->curY = pc->rcItem.top
+            CardFrame_( pT, pT->items(i).card, Now_( pT ) )
+        end if
+    next
+    for i as long = 0 to pT->nReap - 1
+        dim as TKTOAST_CARD ptr pc = CardOf_( pT->reap(i) )
+        if pc then pc->bLeaving = false
+        tkWidget_Show( pT->reap(i), false )
+    next
+    Reap_( pT )
+    SyncClock_( pT )
+end sub

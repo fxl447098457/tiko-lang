@@ -80,7 +80,9 @@ parameters, usable in module-level code only), an empty `__FB_BUILD_SHA1__`, eve
 | Define | fbc | tiko |
 |---|---|---|
 | `__TIKO_COMPILER__` | not defined | `1`: how a source tree asks "is this tiko?" |
-| `__TIKO_VERSION__` | not defined | `"0.1.6"` |
+| `__TIKO_VERSION__` | not defined | `"0.1.8"` |
+| `TIKO_OS_WINDOWS`, `TIKO_OS_LINUX`, `TIKO_OS_MACOS` | not defined | `1` on that target: tiko's own names for the platform, the ones tiko code tests |
+| `TIKO_ARCH_X86_64`, `TIKO_ARCH_ARM64` | not defined | `1` on that target |
 | `__FB_SIGNATURE__` | `"FreeBASIC 1.20.0"` | `"tiko-lang"` |
 | `__FB_BACKEND__` | `"gcc"` | `"llvm"` |
 | `__FB_GCC__` | `-1` | `0` |
@@ -161,12 +163,16 @@ The usual mistakes, side by side:
   `swap`, and writes a property passed `byref` back through its setter, which fbc does not.
 - **The ten fixed-width type names**, `int8` to `float64`, are predeclared typedefs. A program's own
   declaration of one replaces tiko's.
-- **Graphics is Windows-only.** The Linux and macOS toolchains ship no graphics library, so a
-  program that uses `screen` builds on Windows only.
+- **Graphics works on all four targets.** Every toolchain ships libtkogfx, tiko's graphics
+  library, so a `screen` program builds and runs unchanged on `windows-x86_64`, `linux-x86_64`,
+  `linux-arm64` and `macos-arm64`. It draws through GDI on Windows and Cocoa on macOS. On Linux
+  it loads X11 at run time: the program links no X11 library and needs an X display (XWayland
+  included) only when it opens a window.
 - **tiko targets x86-64 on Windows and Linux, and arm64 on Linux and macOS** (`linux-arm64`,
   and `macos-arm64` for Apple Silicon). Both arm64 targets define `__FB_ARM__` and not
   `__FB_X86__`: `linux-arm64` with `__FB_LINUX__` and `__FB_UNIX__`, `macos-arm64` with
-  `__FB_DARWIN__` and `__FB_UNIX__`. `-m32` is `TKO0104`.
+  `__FB_DARWIN__` and `__FB_UNIX__`, and each defines its `TIKO_OS_` and `TIKO_ARCH_` names too.
+  `-m32` is `TKO0104`.
 
 ## What fbc 1.20 does not have
 

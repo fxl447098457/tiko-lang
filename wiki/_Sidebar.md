@@ -4,6 +4,7 @@
 - [What Is tiko-lang](What-Is-tiko-lang)
 - [Quick Start](Quick-Start)
 - [Installing on macOS](Quick-Start#installing-on-macos)
+- [Android (experimental)](Android)
 - [Debugging](Debugging)
 - [Feature Index](Feature-Index)
 - [Compatibility](Compatibility)

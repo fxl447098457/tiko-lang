@@ -48,7 +48,7 @@ Both are built in. A `[profile.name]` table changes one or declares another:
 | Key | Sets |
 |---|---|
 | `inherits` | the profile this one starts from |
-| `opt` | the optimisation level, `0` to `3` |
+| `opt` | the optimisation level, `0` to `3`, or `"s"` for size |
 | `errors` | the checks: `"e"`, `"ex"`, `"exx"`, or `""` for none |
 | `debug` | whether `-g` is given |
 | `options` | further compiler options |

@@ -1,0 +1,370 @@
+' tkReport self-test, Report Designer phase RD2: expressions in the engine. One check per behaviour:
+' calculated fields, the filter, a group on an expression; late values (a group's total in its
+' header, the report's in the report header, the page's in the page header, Page n of N); page
+' totals counting the rows drawn on their page; rules and visibility; totals once per master row
+' (flattened master-detail); the no-data band; the report footer at the bottom; sorting (the table
+' source's map, SQLite's ORDER BY wrap) and named SQLite parameters; a DataGrid as the data (visible
+' columns in display order, view order); compile errors from Prepare; parameters.
+' Expressions in this file write ' for " (Q2).
+
+function Q2( byref s as const string ) as string
+    dim as string r = s
+    for i as long = 1 to len( r )
+        if mid( r, i, 1 ) = "'" then mid( r, i, 1 ) = """"
+    next
+    return r
+end function
+
+function Money2( byval x as double ) as string
+    dim as TK_VALUE v
+    v.SetFloat( x )
+    return tkReport_FormatValue( v, "0.00" )
+end function
+
+' 60 / n rows: Region A for the first half, B after; Qty row+1; Price (row+1)*1.5; Paid unless row mod 3 = 0.
+function MakeSales( byval n as long ) as TK_REPORT ptr
+    dim as TK_REPORT ptr r = tkReport_Create( "RD2" )
+    tkReport_TableAddField( r, "Region" )
+    tkReport_TableAddField( r, "Product" )
+    tkReport_TableAddField( r, "Qty" )
+    tkReport_TableAddField( r, "Price" )
+    tkReport_TableAddField( r, "Paid" )
+    for row as long = 0 to n - 1
+        dim as integer k = tkReport_TableAddRow( r )
+        tkReport_TableCell( r, k, 0 )->SetText( iif( row < n \ 2, "A", "B" ) )
+        tkReport_TableCell( r, k, 1 )->SetText( "P" & row )
+        tkReport_TableCell( r, k, 2 )->SetInt( row + 1 )
+        tkReport_TableCell( r, k, 3 )->SetFloat( (row + 1) * 1.5 )
+        tkReport_TableCell( r, k, 4 )->SetBool( (row mod 3) <> 0 )
+    next
+    return r
+end function
+
+' Every text run of page pg in order, a LATE run resolved as replay resolves it; colours and tops too.
+function Runs( byval doc as TK_PRINTDOC ptr, byval pg as long, texts() as string, cols() as ulong, tops() as single ) as long
+    dim as long n
+    dim as long np = tkPrintDoc_GetPageCount( doc )
+    for i as long = 0 to tkPrintDoc_GetOpCount( doc, pg ) - 1
+        dim as TKPRINT_OPINFO oi
+        tkPrintDoc_GetOp( doc, pg, i, oi )
+        if (oi.op <> TKREC_TEXT) andalso (oi.op <> TKPRINT_OP_LATE) then continue for
+        redim preserve texts( 0 to n )
+        redim preserve cols( 0 to n )
+        redim preserve tops( 0 to n )
+        texts(n) = oi.text
+        if oi.op = TKPRINT_OP_LATE then texts(n) = PrLateText( oi.text, pg, np, doc )
+        cols(n) = oi.c
+        tops(n) = oi.y
+        n += 1
+    next
+    return n
+end function
+
+function AllRuns( byval doc as TK_PRINTDOC ptr ) as string
+    dim as string s
+    for pg as long = 0 to tkPrintDoc_GetPageCount( doc ) - 1
+        dim as string t()
+        dim as ulong c()
+        dim as single y()
+        dim as long n = Runs( doc, pg, t(), c(), y() )
+        for i as long = 0 to n - 1 : s &= t(i) & "|" : next
+    next
+    return s
+end function
+
+function RcF( byval l as single, byval t as single, byval r as single, byval b as single ) as TKRECTF
+    dim as TKRECTF rc
+    tkRectF_Set( rc, l, t, r, b )
+    return rc
+end function
+
+sub Rd2Calc( )
+    dim as TK_REPORT ptr r = MakeSales( 60 )
+    tkReport_AddCalcField( r, "Amount", "[Qty] * [Price]" )
+    tkReport_SetFilter( r, "[Paid]" )
+    dim as long L = tkReport_AddGroupExpr( r, Q2( "'Region ' & [Region]" ) )
+    tkRBand_SetHeight( tkReport_GetBand( r, TKRB_GROUP_HEADER, L ), 16 )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_GROUP_HEADER, L ), RcF( 0, 0, 200, 14 ), Q2( "{'Region ' & [Region]}" ) )
+    tkRBand_SetHeight( tkReport_GetBand( r, TKRB_DETAIL ), 12 )
+    tkRBand_AddExpr( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 200, 12 ), "[Amount]", "0.00" )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_GROUP_FOOTER, L ), RcF( 0, 0, 300, 14 ), Q2( "Sub {Format(Sum([Amount]), '0.00')}" ) )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_REPORT_FOOTER ), RcF( 0, 0, 400, 14 ), Q2( "Rows {Count()} Sum {Format(Sum([Amount]), '0.00')}" ) )
+    dim as ustring errs
+    dim as boolean ok = tkReport_Prepare( r, errs )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    dim as string s = AllRuns( doc )
+    dim as double subA, subB
+    for row as long = 0 to 59
+        if (row mod 3) = 0 then continue for
+        if row < 30 then subA += (row + 1) * (row + 1) * 1.5 else subB += (row + 1) * (row + 1) * 1.5
+    next
+    tkTest_Check( "RD2: expressions compile (Prepare)", ok, errs )
+    tkTest_Check( "RD2 filter: 20 rows left out, 40 read", (tkReport_GetFilteredCount( r ) = 20) andalso (tkReport_GetRowsRead( r ) = 40), _
+                  tkReport_GetFilteredCount( r ) & " / " & tkReport_GetRowsRead( r ) )
+    tkTest_Check( "RD2 group on an expression; a calculated field totalled per group", (instr( s, "Region A|" ) > 0) andalso (instr( s, "Region B|" ) > 0) _
+                  andalso (instr( s, "|Sub " & Money2( subA ) & "|" ) > 0) andalso (instr( s, "|Sub " & Money2( subB ) & "|" ) > 0), left( s, 120 ) )
+    tkTest_Check( "RD2 report footer: Count( ) and Sum( ) over what the filter kept", instr( s, "|Rows 40 Sum " & Money2( subA + subB ) & "|" ) > 0, right( s, 60 ) )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+end sub
+
+sub Rd2Late( )
+    dim as TK_REPORT ptr r = MakeSales( 300 )
+    tkReport_AddCalcField( r, "Amount", "[Qty] * [Price]" )
+    dim as long L = tkReport_AddGroup( r, 0 )
+    tkRBand_SetHeight( tkReport_GetBand( r, TKRB_PAGE_HEADER ), 14 )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_PAGE_HEADER ), RcF( 0, 0, 300, 14 ), Q2( "PH {Format(Sum([Amount]), '0.00')}" ) )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_REPORT_HEADER ), RcF( 0, 0, 300, 14 ), Q2( "RH {Format(Sum([Amount]), '0.00')}" ) )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_GROUP_HEADER, L ), RcF( 0, 0, 300, 14 ), Q2( "GH {Format(Sum([Amount]), '0.00')}" ), TK_DT_RIGHT )
+    tkRBand_SetHeight( tkReport_GetBand( r, TKRB_DETAIL ), 12 )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 300, 12 ), Q2( "D {Format([Amount], '0.00')}" ) )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_GROUP_FOOTER, L ), RcF( 0, 0, 300, 14 ), Q2( "GF {Format(Sum([Amount]), '0.00')}" ) )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_REPORT_FOOTER ), RcF( 0, 0, 300, 14 ), Q2( "RF {Format(Sum([Amount]), '0.00')}" ) )
+    tkRBand_SetHeight( tkReport_GetBand( r, TKRB_PAGE_FOOTER ), 28 )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_PAGE_FOOTER ), RcF( 0, 0, 300, 14 ), Q2( "PF {Format(Sum([Amount]), '0.00')}" ) )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_PAGE_FOOTER ), RcF( 0, 14, 300, 28 ), "Page {PageNumber} of {PageCount}", TK_DT_RIGHT )
+    dim as ustring errs
+    dim as boolean ok = tkReport_Prepare( r, errs )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    dim as long np = tkPrintDoc_GetPageCount( doc )
+    dim as long pagesOk, pageNoOk, unresolved
+    dim as string gh, gf, rh, rfs
+    for pg as long = 0 to np - 1
+        dim as string t()
+        dim as ulong c()
+        dim as single y()
+        dim as long n = Runs( doc, pg, t(), c(), y() )
+        dim as double dsum
+        dim as string ph, pf
+        for i as long = 0 to n - 1
+            if left( t(i), 2 ) = "D " then dsum += val( mid( t(i), 3 ) )
+            select case left( t(i), 3 )
+            case "PH " : ph = mid( t(i), 4 )
+            case "PF " : pf = mid( t(i), 4 )
+            case "GH " : gh &= mid( t(i), 4 ) & "|"
+            case "GF " : gf &= mid( t(i), 4 ) & "|"
+            case "RH " : rh = mid( t(i), 4 )
+            case "RF " : rfs = mid( t(i), 4 )
+            end select
+            if (t(i) = "PH ") orelse (t(i) = "GH ") orelse (t(i) = "RH ") orelse (len( t(i) ) = 0) then unresolved += 1
+            if t(i) = "Page " & (pg + 1) & " of " & np then pageNoOk += 1
+        next
+        if (pf = Money2( dsum )) andalso (ph = pf) then pagesOk += 1
+    next
+    tkTest_Check( "RD2 late values compile", ok, errs )
+    tkTest_Check( "RD2 late: every slot filled", (np >= 3) andalso (unresolved = 0), np & " pages, " & unresolved & " empty" )
+    tkTest_Check( "RD2 late: each group header shows its group's total (= its footer's)", (len( gh ) > 0) andalso (gh = gf), gh & " / " & gf )
+    tkTest_Check( "RD2 late: the report header shows the report's total", (len( rh ) > 0) andalso (rh = rfs), rh & " / " & rfs )
+    tkTest_Check( "RD2 page totals: the footer's = the rows drawn on the page = the header's (late)", pagesOk = np, pagesOk & " / " & np )
+    tkTest_Check( "RD2 Page {PageNumber} of {PageCount} on every page", pageNoOk = np, pageNoOk & " / " & np )
+    ' laid out again (as after a page setup change): the slots are made afresh, the same values
+    tkPrintDoc_Generate( doc )
+    tkTest_Check( "RD2 late: laid out again, the same text", AllRuns( doc ) <> "" andalso (instr( AllRuns( doc ), "|RH " & rh & "|" ) > 0), left( AllRuns( doc ), 40 ) )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+end sub
+
+sub Rd2Rules( )
+    dim as TK_REPORT ptr r = MakeSales( 30 )
+    dim as TK_RBAND ptr d = tkReport_GetBand( r, TKRB_DETAIL )
+    tkRBand_SetHeight( d, 12 )
+    d->visibleExpr = "[Qty] <= 25"
+    dim as TKREPORT_ITEM ptr it = tkRBand_AddExpr( d, RcF( 0, 0, 100, 12 ), "[Qty]", "0" )
+    dim as TKREPORT_RULE ru
+    ru.when_ = "[Qty] > 20" : ru.setFore = true : ru.fore = &hFFC00000ul : ru.setBold = true : ru.bold = true
+    tkRItem_AddRule( it, ru )
+    it = tkRBand_AddText( d, RcF( 100, 0, 200, 12 ), "E{[Qty]}" )
+    it->visibleExpr = "[Qty] mod 2 = 0"
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    dim as long nNum, nRed, nRedWrong, nE
+    for pg as long = 0 to tkPrintDoc_GetPageCount( doc ) - 1
+        dim as string t()
+        dim as ulong c()
+        dim as single y()
+        dim as long n = Runs( doc, pg, t(), c(), y() )
+        for i as long = 0 to n - 1
+            if left( t(i), 1 ) = "E" then
+                nE += 1
+            else
+                nNum += 1
+                dim as long q = valint( t(i) )
+                if c(i) = &hFFC00000ul then nRed += 1
+                if (c(i) = &hFFC00000ul) <> (q > 20) then nRedWrong += 1
+            end if
+        next
+    next
+    tkTest_Check( "RD2 a band's visible expression: rows 1..25 shown", nNum = 25, str( nNum ) )
+    tkTest_Check( "RD2 a rule colours the rows it is true for (21..25)", (nRed = 5) andalso (nRedWrong = 0), nRed & " red, " & nRedWrong & " wrong" )
+    tkTest_Check( "RD2 an item's visible expression (even rows only)", nE = 12, str( nE ) )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+end sub
+
+sub Rd2Master( )
+    ' orders flattened with their lines: C1 has orders 1 (3 lines) and 2 (2 lines), C2 order 3 (1 line)
+    dim as TK_REPORT ptr r = tkReport_Create( "orders" )
+    tkReport_TableAddField( r, "Customer" )
+    tkReport_TableAddField( r, "Order" )
+    tkReport_TableAddField( r, "Amt" )
+    dim as string cs(0 to 5) = { "C1", "C1", "C1", "C1", "C1", "C2" }
+    dim as long os(0 to 5) = { 1, 1, 1, 2, 2, 3 }
+    for k as long = 0 to 5
+        dim as integer row = tkReport_TableAddRow( r )
+        tkReport_TableCell( r, row, 0 )->SetText( cs(k) )
+        tkReport_TableCell( r, row, 1 )->SetInt( os(k) )
+        tkReport_TableCell( r, row, 2 )->SetFloat( 10 * (k + 1) )
+    next
+    dim as long gC = tkReport_AddGroup( r, 0 ), gO = tkReport_AddGroup( r, 1 )
+    dim as TK_RBAND ptr f = tkReport_GetBand( r, TKRB_GROUP_FOOTER, gC )
+    dim as TKREPORT_ITEM ptr it = tkRBand_AddText( f, RcF( 0, 0, 100, 14 ), "O{Count()}" )
+    it->incrLevel = gO                      ' once per order: the master's rows
+    tkRBand_AddText( f, RcF( 100, 0, 200, 14 ), "L{Count()} S{Sum([Amt])}" )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    dim as string s = AllRuns( doc )
+    tkTest_Check( "RD2 totals once per master row (incrLevel) beside per-line totals", _
+                  (instr( s, "O2|L5 S150|" ) > 0) andalso (instr( s, "O1|L1 S60|" ) > 0), s )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+end sub
+
+sub Rd2NoDataBottom( )
+    dim as TK_REPORT ptr r = MakeSales( 10 )
+    tkReport_SetFilter( r, "false" )
+    tkRBand_AddExpr( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 100, 12 ), "[Qty]" )
+    tkRBand_AddLabel( tkReport_GetBand( r, TKRB_NO_DATA ), RcF( 0, 0, 100, 14 ), "Nothing" )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    dim as string s = AllRuns( doc )
+    tkTest_Check( "RD2 no rows after the filter: the no-data band, no details", (s = "Nothing|") andalso (tkReport_GetFilteredCount( r ) = 10), s )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+
+    r = MakeSales( 3 )
+    tkRBand_AddExpr( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 100, 12 ), "[Qty]" )
+    dim as TK_RBAND ptr rfoot = tkReport_GetBand( r, TKRB_REPORT_FOOTER )
+    tkRBand_SetHeight( rfoot, 20 )
+    rfoot->printAtBottom = true
+    tkRBand_AddLabel( rfoot, RcF( 0, 0, 100, 20 ), "END" )
+    doc = tkReport_Run( r )
+    dim as string t()
+    dim as ulong c()
+    dim as single y()
+    dim as long n = Runs( doc, 0, t(), c(), y() )
+    dim as single bottom = r->setup.heightPt - r->setup.marginB
+    if r->setup.landscape then bottom = r->setup.widthPt - r->setup.marginB
+    dim as boolean atBottom
+    for i as long = 0 to n - 1
+        if t(i) = "END" then atBottom = (y(i) >= bottom - 20 - 0.01) andalso (y(i) < bottom)
+    next
+    tkTest_Check( "RD2 printAtBottom: the report footer in the last 20 pt above the bottom margin", atBottom, "bottom " & bottom )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+end sub
+
+sub Rd2Sort( )
+    dim as TK_REPORT ptr r = MakeSales( 20 )
+    tkReport_AddSortKey( r, 0 )
+    tkReport_AddSortKey( r, 2, true )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 100, 12 ), "{[Region]}{[Qty]}" )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    dim as string s = AllRuns( doc )
+    tkTest_Check( "RD2 sort: the table source by Region, then Qty descending", left( s, len( "A10|A9|A8|" ) ) = "A10|A9|A8|" _
+                  andalso (instr( s, "|A1|B20|B19|" ) > 0), left( s, 60 ) )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+
+    dim as sqlite3 ptr db
+    sqlite3_open( ":memory:", @db )
+    sqlite3_exec( db, "create table t( region text, qty integer ); begin;", 0, 0, 0 )
+    for k as long = 1 to 20
+        sqlite3_exec( db, "insert into t values( '" & iif( k mod 2, "A", "B" ) & "', " & k & " )", 0, 0, 0 )
+    next
+    sqlite3_exec( db, "commit;", 0, 0, 0 )
+    r = tkReport_Create( "sql" )
+    dim as ustring pn(0 to 0) = { "Min" }
+    dim as TK_VALUE pv(0 to 0)
+    pv(0).SetInt( 5 )
+    dim as boolean opened = tkReportSqlite_OpenNamed( r, db, "select region, qty from t where qty >= :Min", pn(), pv() )
+    tkReport_AddSortKey( r, 1, true )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 100, 12 ), "{[qty]}" )
+    doc = tkReport_Run( r )
+    s = AllRuns( doc )
+    tkTest_Check( "RD2 SQLite: a named parameter bound, rows sorted by wrapping the query", opened andalso _
+                  (tkReport_GetRowsRead( r ) = 16) andalso (left( s, len( "20|19|18|" ) ) = "20|19|18|") andalso (right( s, 2 ) = "5|"), left( s, 40 ) )
+    tkPrintDoc_Destroy( doc )
+    tkReportSqlite_Close( r )
+    dim as ustring pn2(0 to 0) = { "Other" }
+    tkTest_Check( "RD2 SQLite: a parameter with no value is refused", _
+                  tkReportSqlite_OpenNamed( r, db, "select qty from t where qty >= :Min", pn2(), pv() ) = false )
+    tkReport_Destroy( r )
+    sqlite3_close( db )
+end sub
+
+sub Rd2Grid( )
+    dim as TK_HOST ptr h = tkHost_Create( "RD2 grid", 400, 300, tkHost_FontDir() & TK_FONT_UI, 1.0 )
+    dim as TK_WIDGET ptr g = tkDataGrid_Create( tkHost_Root( h ), 1 )
+    tkDataGrid_AddColumnEx( g, "Name" )
+    tkDataGrid_AddColumnEx( g, "Qty", TKDG_COL_TEXT, 80, TKDG_INT )
+    tkDataGrid_AddColumnEx( g, "Secret" )
+    dim as long qs(0 to 4) = { 3, 1, 5, 2, 4 }
+    for k as long = 0 to 4
+        dim as integer row = tkDataGrid_AddRow( g )
+        tkDataGrid_SetCellText( g, row, 0, "N" & (k + 1) )
+        tkDataGrid_SetCellInt( g, row, 1, qs(k) )
+        tkDataGrid_SetCellText( g, row, 2, "x" )
+    next
+    tkDataGrid_SetColumnVisible( g, 2, false )
+    tkDataGrid_SetDisplayIndex( g, 1, 0 )
+    dim as TKDG_SORTKEY keys(0 to 0)
+    keys(0).col = 1 : keys(0).bDescending = true
+    tkDataGrid_SetSortKeys( g, keys() )
+    tkDataGrid_Sort( g )
+    dim as TK_REPORT ptr r = tkReport_Create( "grid" )
+    dim as boolean opened = tkReportGrid_Open( r, g )
+    tkRBand_AddText( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 200, 12 ), "{[Name]}={[Qty] * 2}" )
+    dim as ustring errs
+    dim as boolean ok = tkReport_Prepare( r, errs )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    dim as string s = AllRuns( doc )
+    tkTest_Check( "RD2 DataGrid: visible columns in display order, typed, rows in view order", opened andalso ok andalso _
+                  (r->src.FieldCount( r->src.pCtx ) = 2) andalso (r->src.FieldName( r->src.pCtx, 0 ) = "Qty") andalso _
+                  (s = "N3=10|N5=8|N1=6|N4=4|N2=2|"), s & " " & errs )
+    tkPrintDoc_Destroy( doc )
+    tkReportGrid_Close( r )
+    tkReport_Destroy( r )
+    tkHost_Destroy( h )
+end sub
+
+sub Rd2ErrorsParams( )
+    dim as TK_REPORT ptr r = MakeSales( 5 )
+    dim as TKREPORT_ITEM ptr it = tkRBand_AddExpr( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 100, 12 ), "[Nope] + 1" )
+    it->name_ = "bad"
+    dim as ustring errs
+    dim as boolean ok = tkReport_Prepare( r, errs )
+    tkTest_Check( "RD2 Prepare names the item, the error and its column", (ok = false) andalso (instr( errs, "detail item 'bad'" ) > 0) _
+                  andalso (instr( errs, "no field [Nope]" ) > 0) andalso (instr( errs, "column 1" ) > 0), errs )
+    tkReport_Destroy( r )
+
+    r = MakeSales( 30 )
+    dim as long p = tkReport_AddParam( r, "Min", TKV_INT )
+    dim as TK_VALUE v
+    v.SetInt( 25 )
+    tkReport_SetParam( r, p, v )
+    tkReport_SetFilter( r, "[Qty] >= @Min" )
+    tkRBand_AddExpr( tkReport_GetBand( r, TKRB_DETAIL ), RcF( 0, 0, 100, 12 ), "[Qty]" )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    tkTest_Check( "RD2 a parameter in the filter", tkReport_GetRowsRead( r ) = 6, str( tkReport_GetRowsRead( r ) ) )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+end sub
+
+sub RunRd2Pass( )
+    tkTest_Begin( "report RD2" )
+    Rd2Calc( )
+    Rd2Late( )
+    Rd2Rules( )
+    Rd2Master( )
+    Rd2NoDataBottom( )
+    Rd2Sort( )
+    Rd2Grid( )
+    Rd2ErrorsParams( )
+end sub

@@ -1,0 +1,1341 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkChipGroup -- many chips as items of one widget: a wrapping row, none / single / multi
+' selection, removal, one tab stop. New in tkControls; the design is
+' C:\dev\docs\tkControls\RATING-BADGE-AVATAR-CHIP.md §7.3. Phases C1 + C2.
+'
+' Items are DATA laid out and drawn with tkChip's spec (tkChip_LayoutSpec / PaintInto): hundreds of
+' tags are not hundreds of widgets.
+' SELECTION IS A KEY SET held apart from the items (D-C3): SetSelectedKeys keeps keys not (yet)
+' present, an item added later with one is selected, GetSelectedKeys answers the present ones in
+' item order -- so setting the items and the selection commute (a designed form's LoadFrom).
+' REMOVAL (D-C2): the remove button or Delete / Backspace -> ItemRemoving( idx ) (FALSE vetoes) -> the
+' group removes the item -> ItemRemoved( key ). Focus moves to the next item, else the previous.
+' KEYS (one tab stop, a roving focus item): Left / Right (no wrap), Up / Down to the item in the row
+' above / below nearest the focus item's centre, Home / End, Space / Enter, Delete / Backspace.
+' Wrap off: one row, the items that do not fit replaced by a "+N" chip (OverflowClick).
+#module "tkChipGroup"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkImage" public
+#import "../tkBadge" public
+#import "../tkAvatar" public
+#import "../tkChip" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkImage
+using tkBadge
+using tkAvatar
+using tkChip
+
+public enum
+    TKCHIPGRP_NONE = 0          ' action chips: ItemClick
+    TKCHIPGRP_SINGLE            ' one selected once chosen (a re-click keeps it)
+    TKCHIPGRP_SINGLE_OR_NONE    ' a re-click deselects
+    TKCHIPGRP_MULTI             ' filter chips, check marks
+end enum
+
+public const as long TKCHIPGRP_OVERFLOW = -1         ' the "+N" chip (HitTest, the focus item)
+public const as long TKCHIPGRP_HIT_NONE = -2
+public const as long TKCHIPGRP_FOCUSGAP = 2
+public const as long TKCHIPGRP_FOCUSTHICK = 1
+
+public type TKCHIPGRP_ITEM
+    wszText     as ustring
+    wszKey      as ustring
+    nLead       as long = TKCHIP_LEAD_NONE
+    wszAvatar   as ustring
+    wszGlyph    as ustring
+    pImg        as tkImageFile ptr
+    nStatus     as long = TKBADGE_NEUTRAL
+    bEnabled    as boolean = true
+    nRemovable  as long = -1           ' -1 = the group's
+    nCount      as long
+    nData       as integer
+    wszTip      as ustring
+    rc          as TKRECT              ' laid out
+    nRow        as long
+    bShown      as boolean
+end type
+
+public type TKCHIPGRP_MESSAGEINFO
+    hGroup as TK_WIDGET ptr
+    msg    as long
+    x      as single
+    y      as single
+    key    as long
+    idx    as long                     ' the item under (x, y), TKCHIPGRP_OVERFLOW or TKCHIPGRP_HIT_NONE
+    part   as long                     ' TKCHIP_HIT_*
+end type
+
+public type CHG_ItemClickCallbackSub as sub( byval hGroup as TK_WIDGET ptr, byval idx as long )
+public type CHG_SelChangeCallbackSub as sub( byval hGroup as TK_WIDGET ptr, byval idx as long, byval isSelected as boolean )
+public type CHG_ItemRemovingCallbackFunc as function( byval hGroup as TK_WIDGET ptr, byval idx as long ) as boolean
+public type CHG_ItemRemovedCallbackSub as sub( byval hGroup as TK_WIDGET ptr, byval Key as ustring )
+public type CHG_OverflowClickCallbackSub as sub( byval hGroup as TK_WIDGET ptr )
+public type CHG_ItemMovedCallbackSub as sub( byval hGroup as TK_WIDGET ptr, byval nFrom as long, byval nTo as long )
+public type CHG_MessageCallbackFunc as function( byval m as TKCHIPGRP_MESSAGEINFO ptr ) as boolean
+
+public type TKCHIPGRP_STATE
+    hWin             as TK_WIDGET ptr
+    id               as long
+    items(any)       as TKCHIPGRP_ITEM
+    nCount           as long
+    selKeys(any)     as ustring
+    nSel             as long
+    nMode            as long = TKCHIPGRP_NONE
+    wszSep           as ustring = ";"
+    bRemovable       as boolean
+    nShowCheck       as long = -1            ' -1 = MULTI only
+    bWrap            as boolean = true
+    nItemGapDu       as long = 8
+    nRowGapDu        as long = 8
+    proto            as TKCHIP_SPEC          ' Size, Shape, Appearance, MaxLabel, fonts for every item
+    colors           as TKCHIP_COLORS
+    bColorsPinned    as boolean
+    fAvatar          as TTF_Font ptr
+    nMaxLabelDu      as long = -1            ' -1 = tkChip's default; scaled at every layout
+    bLayoutDirty     as boolean = true
+    nShownCount      as long
+    rcOverflow       as TKRECT
+    isFocused        as boolean
+    nFocus           as long
+    nHot             as long = TKCHIPGRP_HIT_NONE
+    nHotPart         as long
+    nPress           as long = TKCHIPGRP_HIT_NONE
+    nPressPart       as long
+    bReorder         as boolean                 ' AllowReorder (C3)
+    isDragging       as boolean
+    nDropSlot        as long = -1               ' while dragging: 0 .. shown count
+    rcDrop           as TKRECT                  ' ...and its insertion mark
+    fPressX          as single
+    fPressY          as single
+    tip              as TKTIPHOST_STATE
+    ItemClickCallback as CHG_ItemClickCallbackSub
+    SelChangeCallback as CHG_SelChangeCallbackSub
+    RemovingCallback  as CHG_ItemRemovingCallbackFunc
+    RemovedCallback   as CHG_ItemRemovedCallbackSub
+    OverflowCallback  as CHG_OverflowClickCallbackSub
+    MovedCallback     as CHG_ItemMovedCallbackSub
+    MessageCallback   as CHG_MessageCallbackFunc
+end type
+
+private function CG( byval w as TK_WIDGET ptr ) as TKCHIPGRP_STATE ptr
+    if w = 0 then return 0
+    return cast( TKCHIPGRP_STATE ptr, w->pData )
+end function
+
+' ==========================================================================================
+' The selection key set
+' ==========================================================================================
+private function KeyIndex( byval p as TKCHIPGRP_STATE ptr, byref k as ustring ) as long
+    for i as long = 0 to p->nSel - 1
+        if p->selKeys(i) = k then return i
+    next
+    return -1
+end function
+
+private function IsSel( byval p as TKCHIPGRP_STATE ptr, byval idx as long ) as boolean
+    return KeyIndex( p, p->items(idx).wszKey ) >= 0
+end function
+
+private sub SelAdd( byval p as TKCHIPGRP_STATE ptr, byref k as ustring )
+    if KeyIndex( p, k ) >= 0 then exit sub
+    redim preserve p->selKeys( 0 to p->nSel )
+    p->selKeys(p->nSel) = k
+    p->nSel += 1
+end sub
+
+private sub SelRemove( byval p as TKCHIPGRP_STATE ptr, byref k as ustring )
+    dim as long j = KeyIndex( p, k )
+    if j < 0 then exit sub
+    for i as long = j to p->nSel - 2
+        p->selKeys(i) = p->selKeys(i + 1)
+    next
+    p->nSel -= 1
+    p->selKeys(p->nSel) = ""
+end sub
+
+' The SINGLE modes hold one key: the first selected item's, else the first key in the set.
+private sub KeepOne( byval p as TKCHIPGRP_STATE ptr )
+    if ((p->nMode <> TKCHIPGRP_SINGLE) andalso (p->nMode <> TKCHIPGRP_SINGLE_OR_NONE)) orelse (p->nSel < 2) then exit sub
+    dim as ustring k = p->selKeys(0)
+    for i as long = 0 to p->nCount - 1
+        if IsSel( p, i ) then k = p->items(i).wszKey : exit for
+    next
+    erase p->selKeys
+    p->nSel = 0
+    SelAdd( p, k )
+end sub
+
+' ==========================================================================================
+' Layout
+' ==========================================================================================
+private function RingPad( byval p as TKCHIPGRP_STATE ptr ) as long
+    return tkHost_Scale( p->hWin->pHost, TKCHIPGRP_FOCUSGAP ) + TKCHIPGRP_FOCUSTHICK
+end function
+
+private function ShowsCheck( byval p as TKCHIPGRP_STATE ptr ) as boolean
+    if p->nShowCheck >= 0 then return p->nShowCheck <> 0
+    return p->nMode = TKCHIPGRP_MULTI
+end function
+
+private function ItemRemovable( byval p as TKCHIPGRP_STATE ptr, byval idx as long ) as boolean
+    if p->items(idx).nRemovable >= 0 then return p->items(idx).nRemovable <> 0
+    return p->bRemovable
+end function
+
+' Item idx's spec: the prototype, the item's content and its live state.
+private function ItemSpec( byval p as TKCHIPGRP_STATE ptr, byval idx as long ) as TKCHIP_SPEC
+    dim as TKCHIP_SPEC s = p->proto
+    s.fScale = p->hWin->pHost->fScale
+    if s.fText = 0 then s.fText = p->hWin->pHost->pDefaultFont
+    s.fAvatar = p->fAvatar
+    s.pColors = @p->colors
+    if p->nMaxLabelDu >= 0 then s.nMaxLabel = iif( p->nMaxLabelDu = 0, 0, tkHost_Scale( p->hWin->pHost, p->nMaxLabelDu ) )
+    s.bEnabled = tkWidget_IsEnabled( p->hWin )
+    if idx < 0 then return s                ' the prototype alone (the +N chip, measuring)
+    with p->items(idx)
+        s.wszText = .wszText
+        s.nLead = .nLead
+        s.wszAvatarName = .wszAvatar
+        s.wszGlyph = .wszGlyph
+        s.pImage = .pImg
+        s.nStatus = .nStatus
+        s.nCount = .nCount
+        s.bEnabled = .bEnabled andalso tkWidget_IsEnabled( p->hWin )
+    end with
+    s.bSelected = IsSel( p, idx )
+    s.bShowCheck = ShowsCheck( p )
+    s.bRemovable = ItemRemovable( p, idx )
+    s.bHot = (p->nHot = idx)
+    s.bRemoveHot = s.bHot andalso (p->nHotPart = TKCHIP_HIT_REMOVE)
+    s.bPressed = (p->nPress = idx) andalso (p->nPressPart = TKCHIP_HIT_BODY) andalso s.bHot andalso (p->nHotPart = TKCHIP_HIT_BODY)
+    return s
+end function
+
+private function OverflowSpec( byval p as TKCHIPGRP_STATE ptr, byval n as long ) as TKCHIP_SPEC
+    dim as TKCHIP_SPEC s = ItemSpec( p, -1 )
+    s.wszText = "+" & n
+    s.bHot = (p->nHot = TKCHIPGRP_OVERFLOW)
+    return s
+end function
+
+' Lay the items out for a client nWidth wide; returns the bottom of the last row (no margin).
+private function LayoutFor( byval p as TKCHIPGRP_STATE ptr, byval nWidth as long ) as long
+    dim as long m = RingPad( p ), gap = tkHost_Scale( p->hWin->pHost, p->nItemGapDu )
+    dim as long rgap = tkHost_Scale( p->hWin->pHost, p->nRowGapDu )
+    dim as long x = m, y = m, row = 0, bottom = 0
+    dim as long right_ = nWidth - m
+    tkRect_SetEmpty( p->rcOverflow )
+    p->nShownCount = p->nCount
+    dim as long ovW = 0, h
+    if p->bWrap = false then
+        dim as long oh
+        tkChip_MeasureSpec( OverflowSpec( p, p->nCount ), ovW, oh )     ' room for the largest N there can be
+    end if
+    for i as long = 0 to p->nCount - 1
+        dim as long w
+        tkChip_MeasureSpec( ItemSpec( p, i ), w, h )
+        p->items(i).bShown = true
+        if p->bWrap then
+            if (x > m) andalso (x + w > right_) then
+                x = m : y += h + rgap : row += 1
+            end if
+        else
+            ' one row: the last item must leave room for "+N" unless it is the last of all
+            dim as long need = x + w + iif( i < p->nCount - 1, gap + ovW, 0 )
+            if (x > m) andalso (need > right_) then
+                p->nShownCount = i
+                for j as long = i to p->nCount - 1
+                    p->items(j).bShown = false : tkRect_SetEmpty( p->items(j).rc )
+                next
+                dim as long ow, oh
+                tkChip_MeasureSpec( OverflowSpec( p, p->nCount - i ), ow, oh )
+                tkRect_Set( p->rcOverflow, x, y, x + ow, y + oh )
+                if y + oh > bottom then bottom = y + oh
+                exit for
+            end if
+        end if
+        tkRect_Set( p->items(i).rc, x, y, x + w, y + h )
+        p->items(i).nRow = row
+        if y + h > bottom then bottom = y + h
+        x += w + gap
+    next
+    return bottom
+end function
+
+' The focus item made valid for the layout: an item hidden behind the +N moves to the +N, and a +N
+' that is gone (wrap on, a wider group, fewer items) to the last item.
+private sub FixFocus( byval p as TKCHIPGRP_STATE ptr )
+    if p->nCount = 0 then p->nFocus = 0 : exit sub
+    if p->nShownCount < p->nCount then
+        if p->nFocus >= p->nShownCount then p->nFocus = TKCHIPGRP_OVERFLOW
+    elseif (p->nFocus < 0) orelse (p->nFocus >= p->nCount) then
+        p->nFocus = p->nCount - 1
+    end if
+end sub
+
+private sub EnsureLayout( byval p as TKCHIPGRP_STATE ptr )
+    if p->bLayoutDirty = false then exit sub
+    p->bLayoutDirty = false
+    LayoutFor( p, p->hWin->cw )
+    FixFocus( p )
+end sub
+
+private sub Refresh( byval p as TKCHIPGRP_STATE ptr )
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' The item (or the overflow) under (x, y) and the part of it.
+private function ItemAt( byval p as TKCHIPGRP_STATE ptr, byval x as single, byval y as single, byref part as long ) as long
+    EnsureLayout( p )
+    part = TKCHIP_HIT_NONE
+    for i as long = 0 to p->nShownCount - 1
+        if tkRect_Contains( p->items(i).rc, x, y ) then
+            dim as TKCHIP_PARTS pt
+            tkChip_LayoutSpec( ItemSpec( p, i ), p->items(i).rc.left, p->items(i).rc.top, pt )
+            part = iif( ItemRemovable( p, i ) andalso tkRect_Contains( pt.rcRemoveTarget, x, y ), TKCHIP_HIT_REMOVE, TKCHIP_HIT_BODY )
+            return i
+        end if
+    next
+    if tkRect_Contains( p->rcOverflow, x, y ) then part = TKCHIP_HIT_BODY : return TKCHIPGRP_OVERFLOW
+    return TKCHIPGRP_HIT_NONE
+end function
+
+' ==========================================================================================
+' Painting
+' ==========================================================================================
+private sub OnPaint( byval p as TKCHIPGRP_STATE ptr, byval b as TK_PAINT ptr )
+    EnsureLayout( p )
+    dim as TKRECT rcAll
+    tkRect_Set( rcAll, 0, 0, p->hWin->cw, p->hWin->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @rcAll )
+    for i as long = 0 to p->nShownCount - 1
+        dim as TKRECT r = p->items(i).rc
+        tkChip_PaintInto( b, r, ItemSpec( p, i ) )
+    next
+    if tkRect_IsEmpty( p->rcOverflow ) = false then
+        dim as TKRECT r = p->rcOverflow
+        tkChip_PaintInto( b, r, OverflowSpec( p, p->nCount - p->nShownCount ) )
+    end if
+    if p->isDragging andalso (tkRect_IsEmpty( p->rcDrop ) = false) then
+        b->SetBackColor( p->colors.FocusRingColor )
+        b->PaintRect( @p->rcDrop )
+    end if
+    if p->isFocused then
+        dim as TKRECT r
+        dim as long g = RingPad( p )
+        if p->nCount = 0 then
+            r = rcAll                                     ' nothing left: the ring round the empty group
+        elseif (p->nFocus = TKCHIPGRP_OVERFLOW) andalso (tkRect_IsEmpty( p->rcOverflow ) = false) then
+            r = p->rcOverflow
+            tkRect_Inflate( r, g, g )
+        elseif (p->nFocus >= 0) andalso (p->nFocus < p->nShownCount) then
+            r = p->items(p->nFocus).rc
+            tkRect_Inflate( r, g, g )
+        end if
+        if tkRect_IsEmpty( r ) = false then
+            b->SetPenColor( p->colors.FocusRingColor )
+            b->PaintRoundOutline( @r, iif( p->nCount = 0, 0, r.bottom - r.top ), TKCHIPGRP_FOCUSTHICK )
+        end if
+    end if
+end sub
+
+' ==========================================================================================
+' User actions: state first, callbacks last from snapshots
+' ==========================================================================================
+' Click / select item idx by the mode.
+private sub Activate( byval p as TKCHIPGRP_STATE ptr, byval idx as long )
+    dim as TK_WIDGET ptr w = p->hWin
+    if idx = TKCHIPGRP_OVERFLOW then
+        dim as CHG_OverflowClickCallbackSub cb = p->OverflowCallback
+        if cb then cb( w )
+        exit sub
+    end if
+    if (idx < 0) orelse (idx >= p->nCount) orelse (p->items(idx).bEnabled = false) then exit sub
+    dim as CHG_SelChangeCallbackSub cbSel = p->SelChangeCallback
+    select case p->nMode
+    case TKCHIPGRP_NONE
+        dim as CHG_ItemClickCallbackSub cb = p->ItemClickCallback
+        if cb then cb( w, idx )
+    case TKCHIPGRP_MULTI
+        dim as boolean v = not IsSel( p, idx )
+        if v then SelAdd( p, p->items(idx).wszKey ) else SelRemove( p, p->items(idx).wszKey )
+        Refresh( p )
+        if cbSel then cbSel( w, idx, v )
+    case else
+        if IsSel( p, idx ) then
+            if p->nMode = TKCHIPGRP_SINGLE then exit sub         ' required: a re-click keeps it
+            SelRemove( p, p->items(idx).wszKey )
+            Refresh( p )
+            if cbSel then cbSel( w, idx, false )
+            exit sub
+        end if
+        ' the old one out first, then the new one in: two SelChange, deselect then select
+        dim as long prev = -1
+        for i as long = 0 to p->nCount - 1
+            if IsSel( p, i ) then prev = i : exit for
+        next
+        for i as long = p->nSel - 1 to 0 step -1
+            SelRemove( p, p->selKeys(i) )
+        next
+        SelAdd( p, p->items(idx).wszKey )
+        Refresh( p )
+        if (prev >= 0) andalso (cbSel <> 0) then cbSel( w, prev, false )
+        if cbSel then cbSel( w, idx, true )
+    end select
+end sub
+
+' Item idx is gone: the focus stays on the item it was on (the next one when idx had it, the last
+' when idx was the last); hot and pressed are dropped.
+private sub AfterRemove( byval p as TKCHIPGRP_STATE ptr, byval idx as long )
+    if (p->nFocus > idx) andalso (p->nFocus <> TKCHIPGRP_OVERFLOW) then p->nFocus -= 1
+    if p->nFocus >= p->nCount then p->nFocus = p->nCount - 1
+    if (p->nCount = 0) orelse (p->nFocus < TKCHIPGRP_OVERFLOW) then p->nFocus = 0
+    p->nHot = TKCHIPGRP_HIT_NONE
+    p->nPress = TKCHIPGRP_HIT_NONE
+end sub
+
+' Remove item idx at the user's request (veto-able); focus to the next, else the previous.
+private sub UserRemove( byval p as TKCHIPGRP_STATE ptr, byval idx as long )
+    if (idx < 0) orelse (idx >= p->nCount) then exit sub
+    if (ItemRemovable( p, idx ) = false) orelse (p->items(idx).bEnabled = false) then exit sub
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as ustring k = p->items(idx).wszKey
+    dim as CHG_ItemRemovingCallbackFunc veto = p->RemovingCallback
+    if veto then
+        if veto( w, idx ) = false then exit sub
+        ' the handler may have changed the items (it must not destroy the group): find it again
+        idx = -1
+        for i as long = 0 to p->nCount - 1
+            if p->items(i).wszKey = k then idx = i : exit for
+        next
+        if idx < 0 then exit sub
+        if (ItemRemovable( p, idx ) = false) orelse (p->items(idx).bEnabled = false) then exit sub
+    end if
+    for i as long = idx to p->nCount - 2
+        p->items(i) = p->items(i + 1)
+    next
+    p->nCount -= 1
+    dim as TKCHIPGRP_ITEM blank
+    p->items(p->nCount) = blank
+    SelRemove( p, k )
+    AfterRemove( p, idx )
+    Refresh( p )
+    dim as CHG_ItemRemovedCallbackSub cb = p->RemovedCallback
+    if cb then cb( w, k )
+end sub
+
+' The next enabled item from idx in direction d (no wrap); idx itself when there is none.
+private function NextEnabled( byval p as TKCHIPGRP_STATE ptr, byval idx as long, byval d as long ) as long
+    dim as long i = idx + d
+    while (i >= 0) andalso (i < p->nShownCount)
+        if p->items(i).bEnabled then return i
+        i += d
+    wend
+    if (d > 0) andalso (p->nShownCount < p->nCount) andalso (idx < p->nShownCount) then return TKCHIPGRP_OVERFLOW
+    return idx
+end function
+
+' The enabled item in row (row of idx) + d nearest idx's centre x.
+private function RowNeighbour( byval p as TKCHIPGRP_STATE ptr, byval idx as long, byval d as long ) as long
+    if (idx < 0) orelse (idx >= p->nShownCount) then return idx
+    dim as long row = p->items(idx).nRow + d
+    dim as long cx = (p->items(idx).rc.left + p->items(idx).rc.right) \ 2
+    dim as long best = idx, bestD = &h7FFFFFFF
+    for i as long = 0 to p->nShownCount - 1
+        if (p->items(i).nRow = row) andalso p->items(i).bEnabled then
+            dim as long dx = abs( (p->items(i).rc.left + p->items(i).rc.right) \ 2 - cx )
+            if dx < bestD then bestD = dx : best = i
+        end if
+    next
+    return best
+end function
+
+private function CallMessage( byval p as TKCHIPGRP_STATE ptr, byval m as TK_MSG ptr, byval idx as long, byval part as long ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKCHIPGRP_MESSAGEINFO mi
+    mi.hGroup = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    mi.key = m->key
+    mi.idx = idx
+    mi.part = part
+    return p->MessageCallback( @mi )
+end function
+
+private sub SetHot( byval p as TKCHIPGRP_STATE ptr, byval idx as long, byval part as long )
+    if (idx = p->nHot) andalso (part = p->nHotPart) then exit sub
+    p->nHot = idx : p->nHotPart = part
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' ==========================================================================================
+' Reordering (C3)
+' ==========================================================================================
+' Item nFrom to place nTo, the others shifting; the focus stays on its item. Silent.
+private sub MoveCore( byval p as TKCHIPGRP_STATE ptr, byval nFrom as long, byval nTo as long )
+    dim as TKCHIPGRP_ITEM it = p->items(nFrom)
+    if nTo > nFrom then
+        for i as long = nFrom to nTo - 1 : p->items(i) = p->items(i + 1) : next
+    else
+        for i as long = nFrom to nTo + 1 step -1 : p->items(i) = p->items(i - 1) : next
+    end if
+    p->items(nTo) = it
+    dim as long f = p->nFocus
+    if f = nFrom then
+        f = nTo
+    elseif f <> TKCHIPGRP_OVERFLOW then
+        if (nFrom < f) andalso (f <= nTo) then
+            f -= 1
+        elseif (nTo <= f) andalso (f < nFrom) then
+            f += 1
+        end if
+    end if
+    p->nFocus = f
+    p->nHot = TKCHIPGRP_HIT_NONE
+    Refresh( p )
+end sub
+
+' The user moved item nFrom to nTo: the state, then ItemMoved, last.
+private sub UserMove( byval p as TKCHIPGRP_STATE ptr, byval nFrom as long, byval nTo as long )
+    if nFrom = nTo then exit sub
+    MoveCore( p, nFrom, nTo )
+    dim as CHG_ItemMovedCallbackSub cb = p->MovedCallback
+    if cb then cb( p->hWin, nFrom, nTo )
+end sub
+
+' Where a drop at (x, y) inserts: the shown row nearest y, then before its first item whose centre
+' is right of x, else after its last. Answers the slot (0 .. shown count; slot k = before item k)
+' and the insertion mark, a bar in the gap.
+private function DropSlot( byval p as TKCHIPGRP_STATE ptr, byval x as single, byval y as single, byref rcMark as TKRECT ) as long
+    EnsureLayout( p )
+    tkRect_SetEmpty( rcMark )
+    if p->nShownCount = 0 then return 0
+    dim as long row = 0, bestD = &h7FFFFFFF
+    for i as long = 0 to p->nShownCount - 1
+        with p->items(i).rc
+            dim as long d = iif( y < .top, .top - y, iif( y >= .bottom, y - .bottom + 1, 0 ) )
+            if d < bestD then bestD = d : row = p->items(i).nRow
+        end with
+    next
+    dim as long half = tkHost_Scale( p->hWin->pHost, p->nItemGapDu ) \ 2
+    dim as long bw = tkHost_Scale( p->hWin->pHost, 2 ), last = -1, xm, ref
+    dim as long slot = -1
+    for i as long = 0 to p->nShownCount - 1
+        if p->items(i).nRow = row then
+            if x < (p->items(i).rc.left + p->items(i).rc.right) / 2 then
+                slot = i : ref = i : xm = p->items(i).rc.left - half
+                exit for
+            end if
+            last = i
+        end if
+    next
+    if slot < 0 then slot = last + 1 : ref = last : xm = p->items(last).rc.right + half
+    tkRect_Set( rcMark, xm - bw \ 2, p->items(ref).rc.top, xm - bw \ 2 + bw, p->items(ref).rc.bottom )
+    return slot
+end function
+
+private sub EndDrag( byval p as TKCHIPGRP_STATE ptr )
+    if p->isDragging = false then exit sub
+    p->isDragging = false
+    p->nDropSlot = -1
+    tkRect_SetEmpty( p->rcDrop )
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' Shift+Left / Right: the focus item one place along (shown items only).
+private function KeyMove( byval p as TKCHIPGRP_STATE ptr, byval f as long, byval d as long ) as boolean
+    if (f < 0) orelse (f >= p->nShownCount) then return true
+    if p->items(f).bEnabled = false then return true
+    dim as long nTo = f + d
+    if (nTo < 0) orelse (nTo >= p->nShownCount) then return true
+    UserMove( p, f, nTo )
+    return true
+end function
+
+public declare sub tkChipGroup_ApplyTheme( byval hGroup as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+private function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKCHIPGRP_STATE ptr p = CG( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE, TKM_SCALECHANGED
+        Refresh( p )
+        return true
+    case TKM_THEMECHANGED
+        tkChipGroup_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_MOUSEMOVE
+        if tkWidget_IsEnabled( w ) = false then return true
+        dim as long part, idx = ItemAt( p, m->x, m->y, part )
+        if (idx >= 0) andalso (p->items(idx).bEnabled = false) then idx = TKCHIPGRP_HIT_NONE
+        SetHot( p, idx, part )
+        if p->bReorder andalso (p->nPress >= 0) andalso (p->nPressPart = TKCHIP_HIT_BODY) then
+            dim as long th = tkHost_Scale( w->pHost, 4 )
+            if (p->isDragging = false) andalso ((abs( m->x - p->fPressX ) > th) orelse (abs( m->y - p->fPressY ) > th)) then
+                p->isDragging = true
+                tkTipHost_Pop( @p->tip )
+            end if
+            if p->isDragging then
+                dim as TKRECT rk
+                dim as long sl = DropSlot( p, m->x, m->y, rk )
+                if (sl <> p->nDropSlot) orelse (rk.left <> p->rcDrop.left) orelse (rk.top <> p->rcDrop.top) then
+                    p->nDropSlot = sl : p->rcDrop = rk
+                    tkWidget_Invalidate( w )
+                end if
+                CallMessage( p, m, idx, part )
+                return true
+            end if
+        end if
+        tkTipHost_SetToolIndex( @p->tip, iif( idx = TKCHIPGRP_HIT_NONE, -1, iif( idx = TKCHIPGRP_OVERFLOW, 1000000, idx ) ) )
+        CallMessage( p, m, idx, part )
+        return true
+    case TKM_MOUSELEAVE
+        if p->nPress = TKCHIPGRP_HIT_NONE then SetHot( p, TKCHIPGRP_HIT_NONE, TKCHIP_HIT_NONE )
+        CallMessage( p, m, TKCHIPGRP_HIT_NONE, TKCHIP_HIT_NONE )
+        return true
+    case TKM_LBUTTONDOWN
+        if tkWidget_IsEnabled( w ) = false then return true
+        dim as long part, idx = ItemAt( p, m->x, m->y, part )
+        tkTipHost_Pop( @p->tip )
+        tkHost_SetFocus( w->pHost, w )
+        if CallMessage( p, m, idx, part ) then return true
+        if (idx = TKCHIPGRP_HIT_NONE) orelse ((idx >= 0) andalso (p->items(idx).bEnabled = false)) then return true
+        p->nPress = idx : p->nPressPart = part
+        p->fPressX = m->x : p->fPressY = m->y
+        p->nFocus = idx
+        SetHot( p, idx, part )
+        tkHost_SetCapture( w )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONUP
+        dim as long began = p->nPress, beganPart = p->nPressPart
+        dim as boolean wasDrag = p->isDragging
+        EndDrag( p )
+        p->nPress = TKCHIPGRP_HIT_NONE
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        dim as long part, idx = ItemAt( p, m->x, m->y, part )
+        SetHot( p, iif( w->pHost->pHot = w, idx, TKCHIPGRP_HIT_NONE ), part )
+        tkWidget_Invalidate( w )
+        if CallMessage( p, m, idx, part ) then return true          ' claimed: no click
+        if wasDrag then
+            ' a drop inside the group moves the item; outside it, nothing (no click either)
+            if (m->x >= 0) andalso (m->y >= 0) andalso (m->x < w->cw) andalso (m->y < w->ch) _
+               andalso (began >= 0) andalso (began < p->nCount) then
+                dim as TKRECT rk
+                dim as long sl = DropSlot( p, m->x, m->y, rk )
+                UserMove( p, began, iif( sl > began, sl - 1, sl ) )
+            end if
+            return true
+        end if
+        if (began <> TKCHIPGRP_HIT_NONE) andalso (idx = began) andalso (part = beganPart) then
+            if part = TKCHIP_HIT_REMOVE then UserRemove( p, idx ) else Activate( p, idx )
+        end if
+        return true
+    case TKM_CAPTURECHANGED
+        p->nPress = TKCHIPGRP_HIT_NONE
+        EndDrag( p )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        dim as long part, idx = ItemAt( p, m->x, m->y, part )
+        CallMessage( p, m, idx, part )
+        return true
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        p->isFocused = (m->msg = TKM_SETFOCUS)
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_KEYDOWN
+        if tkWidget_IsEnabled( w ) = false then return false
+        EnsureLayout( p )
+        if CallMessage( p, m, p->nFocus, TKCHIP_HIT_NONE ) then return true
+        if (m->mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI)) <> 0 then return false   ' a chord is not ours
+        if p->nPress <> TKCHIPGRP_HIT_NONE then
+            if m->key <> SDLK_ESCAPE then return false
+            ' Esc cancels a press (a drag included): nothing moves, nothing is clicked
+            p->nPress = TKCHIPGRP_HIT_NONE
+            EndDrag( p )
+            if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+            tkWidget_Invalidate( w )
+            return true
+        end if
+        if p->nCount = 0 then return false
+        dim as long f = p->nFocus
+        if p->bReorder andalso ((m->mods and SDL_KMOD_SHIFT) <> 0) then
+            if m->key = SDLK_LEFT then return KeyMove( p, f, -1 )
+            if m->key = SDLK_RIGHT then return KeyMove( p, f, 1 )
+        end if
+        select case m->key
+        case SDLK_LEFT
+            if f = TKCHIPGRP_OVERFLOW then f = p->nShownCount else f = NextEnabled( p, f, -1 )
+            if f = p->nShownCount then f = NextEnabled( p, f, -1 )
+        case SDLK_RIGHT : if f <> TKCHIPGRP_OVERFLOW then f = NextEnabled( p, f, 1 )
+        case SDLK_UP    : f = RowNeighbour( p, f, -1 )
+        case SDLK_DOWN  : f = RowNeighbour( p, f, 1 )
+        case SDLK_HOME
+            f = NextEnabled( p, -1, 1 )
+            if (f = TKCHIPGRP_OVERFLOW) andalso (p->nShownCount = p->nCount) then f = p->nFocus   ' nothing enabled
+        case SDLK_END
+            f = iif( p->nShownCount < p->nCount, TKCHIPGRP_OVERFLOW, NextEnabled( p, p->nShownCount, -1 ) )
+            if f >= p->nShownCount then f = p->nFocus                                            ' nothing enabled
+        case SDLK_SPACE, SDLK_RETURN, SDLK_KP_ENTER
+            if m->bFlag = false then Activate( p, f )
+            return true
+        case SDLK_DELETE, SDLK_BACKSPACE
+            if (f < 0) orelse (ItemRemovable( p, f ) = false) then return false
+            if m->bFlag = false then UserRemove( p, f )
+            return true
+        case else : return false
+        end select
+        if f <> p->nFocus then p->nFocus = f : tkWidget_Invalidate( w )
+        return true
+    case TKM_ENABLE
+        if m->bFlag = false then p->nPress = TKCHIPGRP_HIT_NONE : p->nHot = TKCHIPGRP_HIT_NONE : EndDrag( p ) : tkTipHost_Pop( @p->tip )
+        Refresh( p )
+        return true
+    case TKM_DESTROY
+        if p->fAvatar then TTF_CloseFont( p->fAvatar )
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' The tip: the item's own, else its full label when cut; the overflow's lists the hidden items.
+private function TipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKCHIPGRP_STATE ptr p = CG( a )
+    if p = 0 then return ""
+    EnsureLayout( p )
+    if (idx >= 0) andalso (idx < p->nCount) then
+        if len( p->items(idx).wszTip ) then return p->items(idx).wszTip
+        dim as TKCHIP_PARTS pt
+        tkChip_LayoutSpec( ItemSpec( p, idx ), 0, 0, pt )
+        if pt.bLabelCut then return p->items(idx).wszText
+        return ""
+    end if
+    if idx = 1000000 then
+        dim as ustring s
+        for i as long = p->nShownCount to p->nCount - 1
+            if i - p->nShownCount = 10 then s &= chr( 10 ) & "..." : exit for
+            s &= iif( i > p->nShownCount, chr( 10 ), "" ) & p->items(i).wszText
+        next
+        return s
+    end if
+    return ""
+end function
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' A child of hParent, created 0x0: size it from GetIdealHeight( width ). One tab stop.
+public function tkChipGroup_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKCHIPGRP_STATE ptr p = new TKCHIPGRP_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @Proc, p )
+    w->isFocusable = true
+    p->hWin = w
+    tkChipGroup_ApplyTheme( w, tkTheme_Of( w ) )
+    tkTipHost_Ensure( @p->tip, w, @TipText )
+    return w
+end function
+
+public function tkChipGroup_GetID( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return 0
+    return p->id
+end function
+
+public sub tkChipGroup_SetEnabled( byval hGroup as TK_WIDGET ptr, byval isEnabled as boolean )
+    if hGroup then tkWidget_Enable( hGroup, isEnabled )
+end sub
+
+' ---- items (every setter SILENT) -----------------------------------------------------------------
+' Before nBefore (-1 = at the end). Key "" = the text. -1 when the key holds the separator or is
+' already an item's.
+public function tkChipGroup_InsertItem( byval hGroup as TK_WIDGET ptr, byval nBefore as long, byval Text as ustring, _
+                                        byval Key as ustring = "" ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return -1
+    if len( Key ) = 0 then Key = Text
+    if instr( Key, p->wszSep ) > 0 then return -1
+    for i as long = 0 to p->nCount - 1
+        if p->items(i).wszKey = Key then return -1                 ' keys are unique
+    next
+    if (nBefore < 0) orelse (nBefore > p->nCount) then nBefore = p->nCount
+    redim preserve p->items( 0 to p->nCount )
+    for i as long = p->nCount to nBefore + 1 step -1
+        p->items(i) = p->items(i - 1)
+    next
+    dim as TKCHIPGRP_ITEM it
+    it.wszText = Text
+    it.wszKey = Key
+    p->items(nBefore) = it
+    p->nCount += 1
+    if (p->nFocus >= nBefore) andalso (p->nCount > 1) then p->nFocus += 1
+    Refresh( p )
+    return nBefore
+end function
+
+public function tkChipGroup_AddItem( byval hGroup as TK_WIDGET ptr, byval Text as ustring, byval Key as ustring = "" ) as long
+    return tkChipGroup_InsertItem( hGroup, -1, Text, Key )
+end function
+
+' Silent (no ItemRemoving / ItemRemoved: those are for the user's removals). The selection keeps the key.
+public sub tkChipGroup_RemoveItem( byval hGroup as TK_WIDGET ptr, byval idx as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    for i as long = idx to p->nCount - 2
+        p->items(i) = p->items(i + 1)
+    next
+    p->nCount -= 1
+    dim as TKCHIPGRP_ITEM blank
+    p->items(p->nCount) = blank
+    AfterRemove( p, idx )
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_Clear( byval hGroup as TK_WIDGET ptr )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    erase p->items
+    p->nCount = 0
+    p->nFocus = 0
+    p->nHot = TKCHIPGRP_HIT_NONE
+    p->nPress = TKCHIPGRP_HIT_NONE
+    Refresh( p )
+end sub
+
+public function tkChipGroup_GetCount( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return 0
+    return p->nCount
+end function
+
+public function tkChipGroup_FindItemByKey( byval hGroup as TK_WIDGET ptr, byval Key as ustring ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return -1
+    for i as long = 0 to p->nCount - 1
+        if p->items(i).wszKey = Key then return i
+    next
+    return -1
+end function
+
+' Item nFrom to place nTo (both 0 .. count - 1), the others shifting. Silent; the selection (keys)
+' and the focus item stay with their items.
+public sub tkChipGroup_MoveItem( byval hGroup as TK_WIDGET ptr, byval nFrom as long, byval nTo as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    if (nFrom < 0) orelse (nFrom >= p->nCount) orelse (nTo < 0) orelse (nTo >= p->nCount) orelse (nFrom = nTo) then exit sub
+    MoveCore( p, nFrom, nTo )
+end sub
+
+' The user may reorder: Shift+Left / Right on the focus item, or a drag (ItemMoved). Default off.
+public sub tkChipGroup_SetAllowReorder( byval hGroup as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    p->bReorder = bOn
+    if bOn = false then EndDrag( p )
+end sub
+
+public function tkChipGroup_GetAllowReorder( byval hGroup as TK_WIDGET ptr ) as boolean
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return false
+    return p->bReorder
+end function
+
+' While a drag is on: TRUE, and the insertion mark (control-local).
+public function tkChipGroup_GetDropMark( byval hGroup as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    tkRect_SetEmpty( rc )
+    if (p = 0) orelse (p->isDragging = false) then return false
+    rc = p->rcDrop
+    return true
+end function
+
+public function tkChipGroup_GetItemText( byval hGroup as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return ""
+    return p->items(idx).wszText
+end function
+
+public sub tkChipGroup_SetItemText( byval hGroup as TK_WIDGET ptr, byval idx as long, byval Text as ustring )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).wszText = Text
+    Refresh( p )
+end sub
+
+public function tkChipGroup_GetItemKey( byval hGroup as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return ""
+    return p->items(idx).wszKey
+end function
+
+public sub tkChipGroup_SetItemLeadingAvatar( byval hGroup as TK_WIDGET ptr, byval idx as long, byval Name_ as ustring = "", _
+                                             byval pImage as tkImageFile ptr = 0 )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).nLead = TKCHIP_LEAD_AVATAR
+    p->items(idx).wszAvatar = Name_
+    p->items(idx).pImg = pImage
+    if p->fAvatar = 0 then
+        dim as string fontPath = tkHost_FontDir() & TK_FONT_UI_BOLD
+        p->fAvatar = tkHost_OpenFontFace( fontPath, 10, 0 )
+    end if
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetItemLeadingGlyph( byval hGroup as TK_WIDGET ptr, byval idx as long, byval Glyph as ustring )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).nLead = TKCHIP_LEAD_GLYPH
+    p->items(idx).wszGlyph = Glyph
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetItemEnabled( byval hGroup as TK_WIDGET ptr, byval idx as long, byval bOn as boolean )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).bEnabled = bOn
+    Refresh( p )
+end sub
+
+public function tkChipGroup_GetItemEnabled( byval hGroup as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return false
+    return p->items(idx).bEnabled
+end function
+
+' One item's own removability (the group's Removable otherwise).
+public sub tkChipGroup_SetItemRemovable( byval hGroup as TK_WIDGET ptr, byval idx as long, byval bOn as boolean )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).nRemovable = iif( bOn, 1, 0 )
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetItemStatus( byval hGroup as TK_WIDGET ptr, byval idx as long, byval nStatus as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    if (nStatus < TKBADGE_ACCENT) orelse (nStatus > TKBADGE_NEUTRAL) then exit sub
+    p->items(idx).nStatus = nStatus
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetItemCountBadge( byval hGroup as TK_WIDGET ptr, byval idx as long, byval nCount as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).nCount = iif( nCount < 0, 0, nCount )
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetItemData( byval hGroup as TK_WIDGET ptr, byval idx as long, byval nData as integer )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).nData = nData
+end sub
+
+public function tkChipGroup_GetItemData( byval hGroup as TK_WIDGET ptr, byval idx as long ) as integer
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return 0
+    return p->items(idx).nData
+end function
+
+public sub tkChipGroup_SetItemTooltip( byval hGroup as TK_WIDGET ptr, byval idx as long, byval Text as ustring )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    p->items(idx).wszTip = Text
+end sub
+
+' The tip for item idx or TKCHIPGRP_OVERFLOW.
+public function tkChipGroup_GetTipText( byval hGroup as TK_WIDGET ptr, byval idx as long ) as ustring
+    return TipText( 0, hGroup, iif( idx = TKCHIPGRP_OVERFLOW, 1000000, idx ) )
+end function
+
+' ---- selection (silent) ---------------------------------------------------------------------------
+public function tkChipGroup_GetSelectionMode( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return TKCHIPGRP_NONE
+    return p->nMode
+end function
+
+' In the SINGLE modes a selection of several keys keeps one: the first selected item's, else the
+' first key.
+public sub tkChipGroup_SetSelectionMode( byval hGroup as TK_WIDGET ptr, byval nMode as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (nMode < TKCHIPGRP_NONE) orelse (nMode > TKCHIPGRP_MULTI) then exit sub
+    p->nMode = nMode
+    KeepOne( p )
+    Refresh( p )
+end sub
+
+public function tkChipGroup_GetItemSelected( byval hGroup as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return false
+    return IsSel( p, idx )
+end function
+
+' Silent; in the SINGLE modes selecting one deselects the others.
+public sub tkChipGroup_SetItemSelected( byval hGroup as TK_WIDGET ptr, byval idx as long, byval bOn as boolean )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then exit sub
+    if bOn then
+        if (p->nMode = TKCHIPGRP_SINGLE) orelse (p->nMode = TKCHIPGRP_SINGLE_OR_NONE) then
+            erase p->selKeys
+            p->nSel = 0
+        end if
+        SelAdd( p, p->items(idx).wszKey )
+    else
+        SelRemove( p, p->items(idx).wszKey )
+    end if
+    Refresh( p )
+end sub
+
+' The selected keys of the items present, in item order, joined by KeySeparator.
+public function tkChipGroup_GetSelectedKeys( byval hGroup as TK_WIDGET ptr ) as ustring
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return ""
+    dim as ustring s
+    dim as boolean first = true
+    for i as long = 0 to p->nCount - 1
+        if IsSel( p, i ) then
+            if first = false then s &= p->wszSep
+            s &= p->items(i).wszKey
+            first = false
+        end if
+    next
+    return s
+end function
+
+' The selection as keys joined by KeySeparator. Kept as a set: keys not (yet) present stay, and an
+' item added later with one is selected. A SINGLE mode keeps one key (KeepOne). Silent.
+public sub tkChipGroup_SetSelectedKeys( byval hGroup as TK_WIDGET ptr, byval Keys as ustring )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    erase p->selKeys
+    p->nSel = 0
+    dim as long st = 1, sl = len( p->wszSep )
+    while st <= len( Keys )
+        dim as long k = instr( st, Keys, p->wszSep )
+        if k = 0 then k = len( Keys ) + 1
+        dim as ustring one = mid( Keys, st, k - st )
+        if len( one ) then SelAdd( p, one )
+        st = k + sl
+    wend
+    KeepOne( p )
+    Refresh( p )
+end sub
+
+' The first selected item; -1 = none.
+public function tkChipGroup_GetCurSel( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return -1
+    for i as long = 0 to p->nCount - 1
+        if IsSel( p, i ) then return i
+    next
+    return -1
+end function
+
+' The items as their keys joined by KeySeparator (a tag list column).
+public function tkChipGroup_GetItemsText( byval hGroup as TK_WIDGET ptr ) as ustring
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return ""
+    dim as ustring s
+    for i as long = 0 to p->nCount - 1
+        if i > 0 then s &= p->wszSep
+        s &= p->items(i).wszKey
+    next
+    return s
+end function
+
+' Replace the items with these keys (text = key). The selection's key set is kept. Silent.
+public sub tkChipGroup_SetItemsText( byval hGroup as TK_WIDGET ptr, byval Items as ustring )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    tkChipGroup_Clear( hGroup )
+    dim as long st = 1, sl = len( p->wszSep )
+    while st <= len( Items )
+        dim as long k = instr( st, Items, p->wszSep )
+        if k = 0 then k = len( Items ) + 1
+        dim as ustring one = mid( Items, st, k - st )
+        if len( one ) then tkChipGroup_AddItem( hGroup, one )
+        st = k + sl
+    wend
+end sub
+
+public function tkChipGroup_GetKeySeparator( byval hGroup as TK_WIDGET ptr ) as ustring
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return ";"
+    return p->wszSep
+end function
+
+public sub tkChipGroup_SetKeySeparator( byval hGroup as TK_WIDGET ptr, byval Sep as ustring )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (len( Sep ) = 0) then exit sub
+    for i as long = 0 to p->nCount - 1
+        if instr( p->items(i).wszKey, Sep ) > 0 then exit sub      ' it would split a key: refused
+    next
+    p->wszSep = Sep
+end sub
+
+' ---- behaviour and look -----------------------------------------------------------------------------
+' Every item's default removability.
+public sub tkChipGroup_SetRemovable( byval hGroup as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    p->bRemovable = bOn
+    Refresh( p )
+end sub
+
+' Check marks on selected items: default MULTI only.
+public sub tkChipGroup_SetShowCheck( byval hGroup as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    p->nShowCheck = iif( bOn, 1, 0 )
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetWrap( byval hGroup as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    p->bWrap = bOn
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetGaps( byval hGroup as TK_WIDGET ptr, byval nItemGapDu as long, byval nRowGapDu as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    p->nItemGapDu = iif( nItemGapDu < 0, 0, nItemGapDu )
+    p->nRowGapDu = iif( nRowGapDu < 0, 0, nRowGapDu )
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetSize( byval hGroup as TK_WIDGET ptr, byval nSize as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (nSize < TKCHIP_SMALL) orelse (nSize > TKCHIP_MEDIUM) then exit sub
+    p->proto.nSize = nSize
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetShape( byval hGroup as TK_WIDGET ptr, byval nShape as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (nShape < TKCHIP_PILL) orelse (nShape > TKCHIP_ROUNDED) then exit sub
+    p->proto.nShape = nShape
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_SetAppearance( byval hGroup as TK_WIDGET ptr, byval nAppearance as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (nAppearance < TKCHIP_FILLED) orelse (nAppearance > TKCHIP_OUTLINED) then exit sub
+    p->proto.nAppearance = nAppearance
+    Refresh( p )
+end sub
+
+' The label's widest, design units; 0 = no limit.
+public sub tkChipGroup_SetMaxLabelWidth( byval hGroup as TK_WIDGET ptr, byval nDu as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    p->nMaxLabelDu = iif( nDu <= 0, 0, nDu )
+    Refresh( p )
+end sub
+
+public sub tkChipGroup_ApplyFonts( byval hGroup as TK_WIDGET ptr, byval fText as TTF_Font ptr, byval fGlyph as TTF_Font ptr )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    if fText then p->proto.fText = fText
+    if fGlyph then p->proto.fGlyph = fGlyph
+    Refresh( p )
+end sub
+
+' ---- geometry -----------------------------------------------------------------------------------------
+' The height the items take wrapped at nWidth (plus the margins); valid before sizing.
+public function tkChipGroup_GetIdealHeight( byval hGroup as TK_WIDGET ptr, byval nWidth as long ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return 0
+    dim as long b = LayoutFor( p, nWidth )
+    p->bLayoutDirty = true                    ' the real layout follows the real width
+    dim as long m = RingPad( p )
+    if b = 0 then
+        dim as long w, h
+        tkChip_MeasureSpec( ItemSpec( p, -1 ), w, h )
+        return h + 2 * m
+    end if
+    return b + m
+end function
+
+' One row of every item (no wrap) plus the margins.
+public sub tkChipGroup_GetIdealSize( byval hGroup as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    nWidth = 0 : nHeight = 0
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    dim as long m = RingPad( p ), gap = tkHost_Scale( hGroup->pHost, p->nItemGapDu ), h
+    nWidth = 2 * m
+    for i as long = 0 to p->nCount - 1
+        dim as long w
+        tkChip_MeasureSpec( ItemSpec( p, i ), w, h )
+        nWidth += w + iif( i > 0, gap, 0 )
+    next
+    tkChip_MeasureSpec( ItemSpec( p, -1 ), nHeight, h )
+    nHeight = h + 2 * m
+end sub
+
+public function tkChipGroup_GetItemRect( byval hGroup as TK_WIDGET ptr, byval idx as long, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return false
+    EnsureLayout( p )
+    if p->items(idx).bShown = false then return false
+    rc = p->items(idx).rc
+    return true
+end function
+
+public function tkChipGroup_GetItemRow( byval hGroup as TK_WIDGET ptr, byval idx as long ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nCount) then return -1
+    EnsureLayout( p )
+    return p->items(idx).nRow
+end function
+
+' The remove button's hit target of item idx (control-local); FALSE when it has none.
+public function tkChipGroup_GetRemoveRect( byval hGroup as TK_WIDGET ptr, byval idx as long, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKRECT r
+    if tkChipGroup_GetItemRect( hGroup, idx, r ) = false then return false
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if ItemRemovable( p, idx ) = false then return false
+    dim as TKCHIP_PARTS pt
+    tkChip_LayoutSpec( ItemSpec( p, idx ), r.left, r.top, pt )
+    rc = pt.rcRemoveTarget
+    return true
+end function
+
+public function tkChipGroup_GetOverflowRect( byval hGroup as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    tkRect_SetEmpty( rc )
+    if p = 0 then return false
+    EnsureLayout( p )
+    rc = p->rcOverflow
+    return tkRect_IsEmpty( rc ) = false
+end function
+
+' Items hidden behind "+N" (Wrap off); 0 = none.
+public function tkChipGroup_GetOverflowCount( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return 0
+    EnsureLayout( p )
+    return p->nCount - p->nShownCount
+end function
+
+' An item index, TKCHIPGRP_OVERFLOW or TKCHIPGRP_HIT_NONE; part = TKCHIP_HIT_BODY / REMOVE.
+public function tkChipGroup_HitTest( byval hGroup as TK_WIDGET ptr, byval x as long, byval y as long, byref part as long ) as long
+    part = TKCHIP_HIT_NONE
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return TKCHIPGRP_HIT_NONE
+    return ItemAt( p, x, y, part )
+end function
+
+public function tkChipGroup_GetFocusItem( byval hGroup as TK_WIDGET ptr ) as long
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then return 0
+    EnsureLayout( p )
+    return p->nFocus
+end function
+
+public sub tkChipGroup_SetFocusItem( byval hGroup as TK_WIDGET ptr, byval idx as long )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (idx < TKCHIPGRP_OVERFLOW) orelse (idx >= p->nCount) then exit sub
+    p->nFocus = idx
+    Refresh( p )                                 ' made valid by the next layout (FixFocus)
+end sub
+
+' ---- appearance ----------------------------------------------------------------------------------------
+public sub tkChipGroup_GetColors( byval hGroup as TK_WIDGET ptr, byval pColors as TKCHIP_COLORS ptr )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+public sub tkChipGroup_SetColors( byval hGroup as TK_WIDGET ptr, byval pColors as TKCHIP_COLORS ptr )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hGroup )
+end sub
+
+' The chips' colours from the theme: tkChip's roles.
+public function tkChipGroup_ThemeColors( byref t as TKTHEME_COLORS ) as TKCHIP_COLORS
+    return tkChip_ThemeColors( t )
+end function
+
+' The chips' colours (tkChip's roles), resolved under "ChipGroup".
+public sub tkChipGroup_ApplyTheme( byval hGroup as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hGroup, t )
+    p->colors = tkChip_ThemeColors( tr )
+    tkTheme_ResolveInto( hGroup, tr, cast( ulong ptr, @p->colors ), sizeof( TKCHIP_COLORS ) \ 4, "ChipGroup" )
+    tkWidget_Invalidate( hGroup )
+end sub
+
+public sub tkChipGroup_UnpinColors( byval hGroup as TK_WIDGET ptr )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkChipGroup_ApplyTheme( hGroup, tkTheme_Of( hGroup ) )
+end sub
+
+' ---- callbacks ----------------------------------------------------------------------------------------
+public sub tkChipGroup_SetItemClickCallback( byval hGroup as TK_WIDGET ptr, byval usersub as CHG_ItemClickCallbackSub )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p then p->ItemClickCallback = usersub
+end sub
+
+public sub tkChipGroup_SetSelChangeCallback( byval hGroup as TK_WIDGET ptr, byval usersub as CHG_SelChangeCallbackSub )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p then p->SelChangeCallback = usersub
+end sub
+
+' Return FALSE to veto a user removal.
+public sub tkChipGroup_SetItemRemovingCallback( byval hGroup as TK_WIDGET ptr, byval userfunc as CHG_ItemRemovingCallbackFunc )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p then p->RemovingCallback = userfunc
+end sub
+
+public sub tkChipGroup_SetItemRemovedCallback( byval hGroup as TK_WIDGET ptr, byval usersub as CHG_ItemRemovedCallbackSub )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p then p->RemovedCallback = usersub
+end sub
+
+public sub tkChipGroup_SetOverflowClickCallback( byval hGroup as TK_WIDGET ptr, byval usersub as CHG_OverflowClickCallbackSub )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p then p->OverflowCallback = usersub
+end sub
+
+public sub tkChipGroup_SetItemMovedCallback( byval hGroup as TK_WIDGET ptr, byval usersub as CHG_ItemMovedCallbackSub )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p then p->MovedCallback = usersub
+end sub
+
+public sub tkChipGroup_SetMessageCallback( byval hGroup as TK_WIDGET ptr, byval userfunc as CHG_MessageCallbackFunc )
+    dim as TKCHIPGRP_STATE ptr p = CG( hGroup )
+    if p then p->MessageCallback = userfunc
+end sub

@@ -1,0 +1,244 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPrinter -- Linux and macOS: CUPS. libcups is loaded at run time (libcups.so.2 /
+' /usr/lib/libcups.2.dylib), so a program without it still runs: it falls back to the lpstat / lp
+' commands, and without those printing fails with a message. A job is the document written as a
+' PDF (tkPdf) to a temporary file and submitted with the job's options (tkPrinter_CupsOptions).
+#module "tkPrinter"
+
+#ifndef __FB_WIN32__
+#import "../tkPdf"
+using tkPdf
+using tkPrint
+using tkHost
+using tkPaint
+
+type CUPS_OPTION                      ' cups_option_t
+    name_  as zstring ptr
+    value  as zstring ptr
+end type
+
+type CUPS_DEST                        ' cups_dest_t
+    name_      as zstring ptr
+    instance   as zstring ptr
+    isDefault  as long
+    numOptions as long
+    options    as CUPS_OPTION ptr
+end type
+
+type CupsGetDestsFn as function cdecl ( byval dests as CUPS_DEST ptr ptr ) as long
+type CupsFreeDestsFn as sub cdecl ( byval n as long, byval dests as CUPS_DEST ptr )
+type CupsGetOptionFn as function cdecl ( byval name_ as const zstring ptr, byval n as long, byval opts as CUPS_OPTION ptr ) as const zstring ptr
+type CupsAddOptionFn as function cdecl ( byval name_ as const zstring ptr, byval value as const zstring ptr, byval n as long, _
+                                         byval opts as CUPS_OPTION ptr ptr ) as long
+type CupsFreeOptionsFn as sub cdecl ( byval n as long, byval opts as CUPS_OPTION ptr )
+type CupsPrintFileFn as function cdecl ( byval printer as const zstring ptr, byval file as const zstring ptr, byval title as const zstring ptr, _
+                                         byval n as long, byval opts as CUPS_OPTION ptr ) as long
+type CupsLastErrorFn as function cdecl ( ) as const zstring ptr
+
+dim shared as CupsGetDestsFn cGetDests
+dim shared as CupsFreeDestsFn cFreeDests
+dim shared as CupsGetOptionFn cGetOption
+dim shared as CupsAddOptionFn cAddOption
+dim shared as CupsFreeOptionsFn cFreeOptions
+dim shared as CupsPrintFileFn cPrintFile
+dim shared as CupsLastErrorFn cLastError
+
+' TRUE when libcups was found (else the lp commands are used).
+private function CupsLoad( ) as boolean
+    static as long state = 0
+    if state then return state = 1
+    state = 2
+#ifdef __FB_DARWIN__
+    dim as SDL_SharedObject ptr so = SDL_LoadObject( "/usr/lib/libcups.2.dylib" )
+    if so = 0 then so = SDL_LoadObject( "libcups.2.dylib" )
+#else
+    dim as SDL_SharedObject ptr so = SDL_LoadObject( "libcups.so.2" )
+#endif
+    if so = 0 then return false
+    cGetDests = cast( CupsGetDestsFn, SDL_LoadFunction( so, "cupsGetDests" ) )
+    cFreeDests = cast( CupsFreeDestsFn, SDL_LoadFunction( so, "cupsFreeDests" ) )
+    cGetOption = cast( CupsGetOptionFn, SDL_LoadFunction( so, "cupsGetOption" ) )
+    cAddOption = cast( CupsAddOptionFn, SDL_LoadFunction( so, "cupsAddOption" ) )
+    cFreeOptions = cast( CupsFreeOptionsFn, SDL_LoadFunction( so, "cupsFreeOptions" ) )
+    cPrintFile = cast( CupsPrintFileFn, SDL_LoadFunction( so, "cupsPrintFile" ) )
+    cLastError = cast( CupsLastErrorFn, SDL_LoadFunction( so, "cupsLastErrorString" ) )
+    if (cGetDests = 0) orelse (cFreeDests = 0) orelse (cAddOption = 0) orelse (cFreeOptions = 0) orelse (cPrintFile = 0) then return false
+    state = 1
+    return true
+end function
+
+' Run a command, its standard output and exit code. FALSE when it cannot be started.
+private function RunCmd( args() as string, byref outText as string, byref code as long ) as boolean
+    dim as long n = ubound( args ) + 1
+    dim as zstring ptr argv( 0 to n )
+    for i as long = 0 to n - 1 : argv(i) = strptr( args(i) ) : next
+    argv(n) = 0
+    dim as SDL_Process ptr pr = SDL_CreateProcess( @argv(0), true )
+    if pr = 0 then return false
+    dim as uinteger sz
+    dim as any ptr p = SDL_ReadProcess( pr, @sz, @code )
+    outText = ""
+    if p then
+        outText = space( sz )
+        for i as integer = 0 to sz - 1 : outText[i] = cast( ubyte ptr, p )[i] : next
+        SDL_free( p )
+    end if
+    SDL_DestroyProcess( pr )
+    return true
+end function
+
+private function OptOf( byval d as CUPS_DEST ptr, byref nm as string ) as ustring
+    if cGetOption = 0 then return ""
+    dim as const zstring ptr v = cGetOption( strptr( nm ), d->numOptions, d->options )
+    if v = 0 then return ""
+    dim as string s = *v
+    return s
+end function
+
+function PrnEnumerate( list() as TKPRINTERINFO ) as long
+    if CupsLoad( ) then
+        dim as CUPS_DEST ptr dests
+        dim as long n = cGetDests( @dests ), k = 0
+        for i as long = 0 to n - 1
+            if dests[i].instance then continue for
+            redim preserve list( 0 to k )
+            dim as string nm = *dests[i].name_
+            list(k).name = nm
+            list(k).isDefault = dests[i].isDefault <> 0
+            list(k).location = OptOf( @dests[i], "printer-location" )
+            list(k).comment = OptOf( @dests[i], "printer-info" )
+            k += 1
+        next
+        if n > 0 then cFreeDests( n, dests )
+        return k
+    end if
+    dim as string args(0 to 1) = { "lpstat", "-e" }, txt
+    dim as long code
+    if RunCmd( args(), txt, code ) = false then PrnFail( "neither libcups nor lpstat is available" ) : return 0
+    dim as ustring def = PrnDefault( )
+    dim as long k = 0, p = 1
+    txt &= chr( 10 )
+    while p <= len( txt )
+        dim as long e = instr( p, txt, chr( 10 ) )
+        dim as string ln = trim( mid( txt, p, e - p ) )
+        p = e + 1
+        if len( ln ) = 0 then continue while
+        redim preserve list( 0 to k )
+        list(k).name = ln
+        list(k).isDefault = (ln = def)
+        k += 1
+    wend
+    return k
+end function
+
+function PrnDefault( ) as ustring
+    if CupsLoad( ) then
+        dim as CUPS_DEST ptr dests
+        dim as long n = cGetDests( @dests )
+        dim as string nm
+        for i as long = 0 to n - 1
+            if dests[i].isDefault andalso (dests[i].instance = 0) then nm = *dests[i].name_ : exit for
+        next
+        if n > 0 then cFreeDests( n, dests )
+        return nm
+    end if
+    dim as string args(0 to 1) = { "lpstat", "-d" }, txt
+    dim as long code
+    if RunCmd( args(), txt, code ) = false then return ""
+    dim as long c = instr( txt, ":" )
+    if (c = 0) orelse (instr( txt, "no system default" ) > 0) then return ""
+    return trim( mid( txt, c + 1 ), any " " & chr( 10 ) & chr( 13 ) )
+end function
+
+' CUPS does not tell paper sizes through the calls used here: the papers tkPrint knows, duplex and
+' colour assumed.
+function PrnCaps( byref printer as ustring, byref caps as TKPRINTERCAPS ) as boolean
+    dim as string names(0 to 7) = { "A4", "Letter", "Legal", "A3", "A5", "B5", "Tabloid", "Executive" }
+    dim as long ids(0 to 7) = { TK_PAPER_A4, TK_PAPER_LETTER, TK_PAPER_LEGAL, TK_PAPER_A3, TK_PAPER_A5, TK_PAPER_B5, TK_PAPER_TABLOID, TK_PAPER_EXECUTIVE }
+    caps.nPapers = 8
+    redim caps.paperName( 0 to 7 )
+    redim caps.paperW( 0 to 7 )
+    redim caps.paperH( 0 to 7 )
+    for i as long = 0 to 7
+        caps.paperName(i) = names(i)
+        tkPrint_PaperSize( ids(i), caps.paperW(i), caps.paperH(i) )
+    next
+    caps.bDuplex = true
+    caps.bColor = true
+    return true
+end function
+
+function PrnProperties( byval owner as TK_HOST ptr, byref job as TKPRINTJOB ) as boolean
+    PrnFail( "printer properties are a Windows dialog" )
+    return false
+end function
+
+function PrnPrint( byval doc as TK_PRINTDOC ptr, byref printer as ustring, byref job as TKPRINTJOB, pages() as long ) as boolean
+    dim as string tmp
+    dim as const zstring ptr td = SDL_getenv( "TMPDIR" )
+    tmp = iif( td, *td, "/tmp" )
+    if right( tmp, 1 ) <> "/" then tmp &= "/"
+    tmp &= "tkprint-" & SDL_GetTicks( ) & ".pdf"
+    if tkPrintDoc_ExportPdf( doc, tmp ) = false then PrnFail( "could not write " & tmp ) : return false
+    dim as string pr8 = printer, title = iif( len( job.title ), job.title, tkPrintDoc_GetTitle( doc ) )
+    if len( title ) = 0 then title = "Document"
+    dim as string opts = tkPrinter_CupsOptions( doc, job )
+    dim as boolean ok
+    if CupsLoad( ) then
+        dim as CUPS_OPTION ptr o = 0
+        dim as long n = 0, p = 1
+        opts &= " "
+        while p <= len( opts )
+            dim as long sp = instr( p, opts, " " )
+            dim as string kv = mid( opts, p, sp - p )
+            p = sp + 1
+            dim as long eq = instr( kv, "=" )
+            if eq = 0 then continue while
+            dim as string k = left( kv, eq - 1 ), v = mid( kv, eq + 1 )
+            n = cAddOption( strptr( k ), strptr( v ), n, @o )
+        wend
+        dim as long id = cPrintFile( strptr( pr8 ), strptr( tmp ), strptr( title ), n, o )
+        cFreeOptions( n, o )
+        ok = id > 0
+        if ok = false then
+            dim as string why = "the job was refused"
+            if cLastError then
+                dim as const zstring ptr z = cLastError( )
+                if z then why = *z
+            end if
+            PrnFail( why )
+        end if
+    else
+        ' lp -d printer -t title -o k=v ... file
+        dim as string args()
+        redim args( 0 to 4 )
+        args(0) = "lp" : args(1) = "-d" : args(2) = pr8 : args(3) = "-t" : args(4) = title
+        dim as long p = 1
+        opts &= " "
+        while p <= len( opts )
+            dim as long sp = instr( p, opts, " " )
+            dim as string kv = mid( opts, p, sp - p )
+            p = sp + 1
+            if len( kv ) = 0 then continue while
+            dim as long u = ubound( args )
+            redim preserve args( 0 to u + 2 )
+            args(u + 1) = "-o" : args(u + 2) = kv
+        wend
+        dim as long u = ubound( args )
+        redim preserve args( 0 to u + 1 )
+        args(u + 1) = tmp
+        dim as string txt
+        dim as long code
+        ok = RunCmd( args(), txt, code ) andalso (code = 0)
+        if ok = false then PrnFail( "lp failed: " & trim( txt ) )
+    end if
+    SDL_RemovePath( strptr( tmp ) )
+    if ok then PrnProgress( doc, job, ubound( pages ) + 1, ubound( pages ) + 1 )
+    return ok
+end function
+#endif

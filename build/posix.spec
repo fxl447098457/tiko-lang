@@ -557,8 +557,11 @@ STRUCT( struct_termios, struct termios )
     F_INT( c_cflag, c_cflag )
     F_INT( c_lflag, c_lflag )
     F_ARRAY( c_cc, c_cc )
+/* Bionic's termios is the kernel's: NCCS 19 and no speed fields (docs/tiko-android FACTS). */
+#ifndef __BIONIC__
     F_INT( c_ispeed, c_ispeed )
     F_INT( c_ospeed, c_ospeed )
+#endif
 END_STRUCT
 STRUCT( struct_winsize, struct winsize )
     F_INT( ws_row, ws_row )

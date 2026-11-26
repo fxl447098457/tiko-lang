@@ -1,0 +1,223 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportBarcode -- barcodes in tkReport bands (BARCODE.md §9.4, phase BC4). The bridge between
+' tkReport (which knows only the item kind TKRI_BARCODE and a painter slot) and tkBarcode (which
+' links libzint): a program that never prints a barcode imports neither this nor zint, as
+' tkReportSqlite keeps SQLite out of reports that don't query it.
+'
+'   tkReportBarcode_Install( )                                      once, before a report is run
+'   tkRBand_AddBarcode( band, rc, nField, spec [, look] )           a barcode of field nField
+'
+' THE ITEM'S SETTINGS travel in TKREPORT_ITEM.opts as "key=value;..." -- the same spelling a
+' .tkreport file can carry (the report designer's barcode item): sym, xdim (mm), barh (mm), text,
+' caption, qz, ecc, size, mask, square, check, gs1, esc, eci, bearer, align, dpi. Values escape
+' "%", ";" and "=" as %25 %3B %3D. tkReportBarcode_SpecToOpts / OptsToSpec convert.
+'
+' A symbol is drawn at its PHYSICAL size (tkBarcode_PaintPage) from the item rect's top, aligned
+' across it; it is not shrunk to fit. Data the symbology refuses draws the thin red frame of
+' tkBarcode's error state, and the report goes on.
+#module "tkReportBarcode"
+
+#import "../tkReport" public
+#import "../tkBarcode" public
+#import "../tkPrint" public
+using tkReport
+using tkBarcode
+using tkPrint
+using tkBind
+using tkHost
+using tkPaint
+
+' ---- symbology names: the designer's spelling (controls.toml create_arg_enum) ---------------------
+public function tkReportBarcode_SymbologyKey( byval nSym as int32 ) as string
+    select case nSym
+    case TKBC_EAN13:           return "EAN13"
+    case TKBC_EAN8:            return "EAN8"
+    case TKBC_UPCA:            return "UPCA"
+    case TKBC_UPCE:            return "UPCE"
+    case TKBC_ISBN:            return "ISBN"
+    case TKBC_CODE128:         return "Code128"
+    case TKBC_GS1_128:         return "GS1_128"
+    case TKBC_CODE39:          return "Code39"
+    case TKBC_CODE39_EXT:      return "Code39Ext"
+    case TKBC_CODE93:          return "Code93"
+    case TKBC_ITF:             return "ITF"
+    case TKBC_ITF14:           return "ITF14"
+    case TKBC_CODABAR:         return "Codabar"
+    case TKBC_QR:              return "QR"
+    case TKBC_MICRO_QR:        return "MicroQR"
+    case TKBC_DATAMATRIX:      return "DataMatrix"
+    case TKBC_GS1_DATAMATRIX:  return "GS1DataMatrix"
+    case TKBC_PDF417:          return "PDF417"
+    case TKBC_PDF417_COMPACT:  return "PDF417Compact"
+    case TKBC_AZTEC:           return "Aztec"
+    end select
+    return ""
+end function
+
+' -1 for a name no symbology has (case-insensitive).
+public function tkReportBarcode_SymbologyOf( byref key as const string ) as int32
+    for i as int32 = 0 to TKBC_SYMBOLOGY_COUNT - 1
+        if lcase( tkReportBarcode_SymbologyKey( i ) ) = lcase( key ) then return i
+    next
+    return -1
+end function
+
+' ---- opts ------------------------------------------------------------------------------------
+private function Esc_( byref s as const string ) as string
+    dim as string o = ""
+    for i as int32 = 1 to len( s )
+        dim as string ch = mid( s, i, 1 )
+        select case ch
+        case "%" : o &= "%25"
+        case ";" : o &= "%3B"
+        case "=" : o &= "%3D"
+        case else : o &= ch
+        end select
+    next
+    return o
+end function
+
+private function Unesc_( byref s as const string ) as string
+    dim as string o = ""
+    dim as int32 i = 1
+    while i <= len( s )
+        if (mid( s, i, 1 ) = "%") andalso (i + 2 <= len( s )) then
+            o &= chr( val( "&h" & mid( s, i + 1, 2 ) ) ) : i += 3
+        else
+            o &= mid( s, i, 1 ) : i += 1
+        end if
+    wend
+    return o
+end function
+
+private function Num_( byval v as float32 ) as string
+    dim as string s = str( int( v * 10000 + 0.5 ) / 10000 )
+    if left( s, 1 ) = "." then s = "0" & s
+    return s
+end function
+
+' The spec and paper look as an item's opts. Only what differs from the defaults is written.
+public function tkReportBarcode_SpecToOpts( byref spec as TKBARCODE_SPEC, byref pl as TKBARCODE_PAGELOOK ) as ustring
+    dim as string o = "sym=" & tkReportBarcode_SymbologyKey( spec.nSymbology )
+    if pl.fXdimMm > 0 then o &= ";xdim=" & Num_( pl.fXdimMm )
+    if pl.fBarHeightMm > 0 then o &= ";barh=" & Num_( pl.fBarHeightMm )
+    select case spec.nTextMode
+    case TKBC_TEXT_NONE  : o &= ";text=none"
+    case TKBC_TEXT_ABOVE : o &= ";text=above"
+    end select
+    if len( spec.wszCaption ) then
+        dim as string c8 = spec.wszCaption
+        o &= ";caption=" & Esc_( c8 )
+    end if
+    if spec.bQuietZone = false then o &= ";qz=0"
+    if spec.opts(TKBC_OPT_ECC) then o &= ";ecc=" & spec.opts(TKBC_OPT_ECC)
+    if spec.opts(TKBC_OPT_SIZE) then o &= ";size=" & spec.opts(TKBC_OPT_SIZE)
+    if spec.opts(TKBC_OPT_MASK) then o &= ";mask=" & spec.opts(TKBC_OPT_MASK)
+    if spec.opts(TKBC_OPT_DM_SQUARE) then o &= ";square=1"
+    if spec.opts(TKBC_OPT_CHECK_DIGIT) then o &= ";check=1"
+    if spec.opts(TKBC_OPT_GS1) then o &= ";gs1=1"
+    if spec.opts(TKBC_OPT_ESCAPES) then o &= ";esc=1"
+    if spec.opts(TKBC_OPT_ECI) then o &= ";eci=" & spec.opts(TKBC_OPT_ECI)
+    if spec.opts(TKBC_OPT_BEARER) then o &= ";bearer=" & spec.opts(TKBC_OPT_BEARER)
+    select case pl.nAlign
+    case TKBC_ALIGN_LEFT  : o &= ";align=left"
+    case TKBC_ALIGN_RIGHT : o &= ";align=right"
+    end select
+    if pl.fDpi > 0 then o &= ";dpi=" & Num_( pl.fDpi )
+    dim as ustring u = o
+    return u
+end function
+
+' Opts back into a spec and a look (defaults for what is absent). FALSE for an unknown symbology or
+' key, the spec then as far as it was read.
+public function tkReportBarcode_OptsToSpec( byref opts as const ustring, byref spec as TKBARCODE_SPEC, _
+                                            byref pl as TKBARCODE_PAGELOOK ) as boolean
+    dim as TKBARCODE_SPEC s0
+    dim as TKBARCODE_PAGELOOK p0
+    spec = s0 : pl = p0
+    dim as boolean ok = true
+    dim as string rest = opts
+    while len( rest )
+        dim as int32 sc = instr( rest, ";" )
+        dim as string kv = iif( sc > 0, left( rest, sc - 1 ), rest )
+        rest = iif( sc > 0, mid( rest, sc + 1 ), "" )
+        dim as int32 eq = instr( kv, "=" )
+        if eq = 0 then continue while
+        dim as string k = lcase( trim( left( kv, eq - 1 ) ) ), v = Unesc_( mid( kv, eq + 1 ) )
+        select case k
+        case "sym"
+            dim as int32 n = tkReportBarcode_SymbologyOf( v )
+            if n < 0 then ok = false else spec.nSymbology = n
+        case "xdim"    : pl.fXdimMm = val( v )
+        case "barh"    : pl.fBarHeightMm = val( v )
+        case "text"
+            select case lcase( v )
+            case "none"  : spec.nTextMode = TKBC_TEXT_NONE
+            case "above" : spec.nTextMode = TKBC_TEXT_ABOVE
+            case else    : spec.nTextMode = TKBC_TEXT_BELOW
+            end select
+        case "caption" : spec.wszCaption = v
+        case "qz"      : spec.bQuietZone = (val( v ) <> 0)
+        case "ecc"     : spec.opts(TKBC_OPT_ECC) = val( v )
+        case "size"    : spec.opts(TKBC_OPT_SIZE) = val( v )
+        case "mask"    : spec.opts(TKBC_OPT_MASK) = val( v )
+        case "square"  : spec.opts(TKBC_OPT_DM_SQUARE) = val( v )
+        case "check"   : spec.opts(TKBC_OPT_CHECK_DIGIT) = val( v )
+        case "gs1"     : spec.opts(TKBC_OPT_GS1) = val( v )
+        case "esc"     : spec.opts(TKBC_OPT_ESCAPES) = val( v )
+        case "eci"     : spec.opts(TKBC_OPT_ECI) = val( v )
+        case "bearer"  : spec.opts(TKBC_OPT_BEARER) = val( v )
+        case "align"
+            select case lcase( v )
+            case "left"  : pl.nAlign = TKBC_ALIGN_LEFT
+            case "right" : pl.nAlign = TKBC_ALIGN_RIGHT
+            case else    : pl.nAlign = TKBC_ALIGN_CENTER
+            end select
+        case "dpi"     : pl.fDpi = val( v )
+        case else      : ok = false
+        end select
+    wend
+    return ok
+end function
+
+' ---- the painter -------------------------------------------------------------------------------
+private sub PaintBarcode_( byval rpt as TK_REPORT ptr, byval item as TKREPORT_ITEM ptr, byval pg as TK_PAGE ptr, _
+                           byref rc as TKRECTF, byref value as ustring )
+    if (item = 0) orelse (pg = 0) then exit sub
+    dim as TKBARCODE_SPEC spec
+    dim as TKBARCODE_PAGELOOK pl
+    dim as TKBARCODE_SYMBOL sym
+    if tkReportBarcode_OptsToSpec( item->opts, spec, pl ) = false then
+        sym.nStatus = TKBC_ERR_INVALID_OPTION      ' a bad opts string: the error frame, not a guess
+    else
+        tkBarcode_Encode( spec, value, sym )
+    end if
+    tkBarcode_PaintPage( pg, rc, sym, spec, pl )
+end sub
+
+' Registers the barcode painter with tkReport. Once is enough; again is harmless.
+public sub tkReportBarcode_Install( )
+    tkReport_SetItemPainter( TKRI_BARCODE, @PaintBarcode_ )
+end sub
+
+' A barcode item: field nField's text (formatted by fmt) as spec's symbology, at the look's physical
+' size (X-dimension, bar height, alignment). nField -1: the fixed data sData.
+public function tkRBand_AddBarcode( byval band as TK_RBAND ptr, byref rc as TKRECTF, byval nField as long, _
+                                    byref spec as TKBARCODE_SPEC, byval pl as TKBARCODE_PAGELOOK ptr = 0, _
+                                    byref sData as ustring = "", byref fmt as ustring = "" ) as TKREPORT_ITEM ptr
+    dim as TKBARCODE_PAGELOOK p0
+    dim as TKREPORT_ITEM it
+    it.kind = TKRI_BARCODE
+    it.rc = rc
+    it.field = nField
+    it.text = sData
+    it.fmt = fmt
+    if pl then p0 = *pl
+    it.opts = tkReportBarcode_SpecToOpts( spec, p0 )
+    return tkRBand_AddItem( band, it )
+end function

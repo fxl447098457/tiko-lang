@@ -1,0 +1,1164 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkTokenBox -- an input whose values are CHIPS: typed text becomes a token on a separator or Enter,
+' or is completed from a suggestion list; each chip has a remove x and can be walked and deleted from
+' the keyboard. New in tkControls (no Win32 sibling); the design is C:\dev\docs\tkControls\
+' CHECKED-LISTS.md §8 (phase C4).
+'
+' THE PARTS. The handle is a container that paints the field, its border and the chips; inside it a
+' borderless single-line tkTextBox (the INPUT) takes the rest of the last line and has the keyboard
+' focus, so SDL text input and the IME work as in any text box. The suggestions are a tkItemPopup
+' without check boxes (§6): NOT_FOCUSABLE, so the input keeps the focus; tkHost routes keys to the
+' popup while it is up, and the popup sends every key it does not keep (all but Up / Down / PgUp /
+' PgDn / Enter / Tab / Escape) on to the input. A click on a chip's x closes the popup and still lands.
+'
+' TOKENS are kept in the order added. A token picked from the items carries the item's key, id and
+' data; a typed one is FREE (key = its text) unless it matches an item's text (case ignored), when it
+' becomes that item. EntryMode ITEMS_ONLY refuses free text. Duplicates (by key) are refused unless
+' AllowDuplicates; MaxTokens caps the count. TokenAdding (before) may veto or rewrite text and key.
+'
+' TYPING. A separator character (TokenSeparators, default ",;") typed or pasted into the input commits
+' every piece before it; the rest stays as input. Enter commits the input -- or, with the suggestions
+' up, the current suggestion; Tab does the same and moves on (D-13). Focus leaving the input commits
+' it (CommitOnBlur). Refused text stays in the input.
+'
+' KEYS. Input, caret at 0 and nothing selected: Backspace removes the last chip (D-11), Left walks
+' into the chips. Chip focus (a chip highlighted, the input still holding the keyboard focus): Left /
+' Right / Home / End move (Right past the last, or End, returns to the input); Backspace / Delete
+' remove the chip; Escape or any typing returns to the input. Down opens the suggestions.
+'
+' NOTIFICATION: setters are silent. User gestures fire TokenAdding / TokenRemoving BEFORE (vetoable)
+' and TokensChanged once AFTER each gesture (a paste of three tokens is one). InputChanged follows
+' the user's typing; Suggest lets a host fill the items for the text before they are matched.
+#module "tkTokenBox"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTextBox" public
+#import "../tkItemPopup" public
+#import "../tkMatch" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTextBox
+using tkItemPopup
+using tkMatch
+
+public enum
+    TKTB_ENTRY_FREE = 0        ' any text becomes a token (TokenAdding may refuse or rewrite it)
+    TKTB_ENTRY_ITEMS           ' only an item's text becomes a token
+end enum
+
+' unscaled design units
+public const TKTOKENBOX_DEFAULT_PAD = 4
+public const TKTOKENBOX_DEFAULT_CHIPPADX = 8
+public const TKTOKENBOX_DEFAULT_CHIPGAP = 4
+public const TKTOKENBOX_DEFAULT_CLOSEBOX = 16
+public const TKTOKENBOX_DEFAULT_MININPUT = 48
+public const TKTOKENBOX_DEFAULT_MAXCHIP = 200
+public const TKTOKENBOX_DEFAULT_SEPARATORS = ",;"
+public const TKTOKENBOX_DEFAULT_VALUESEP = ";"
+
+public type TKTOKENBOX_COLORS
+    BackColor          as ulong = &hFF2C313Aul
+    BorderColor        as ulong = &hFF444A56ul
+    BorderColorFocused as ulong = &hFF61AFEFul
+    ForeColor          as ulong = &hFFC8CDD6ul
+    PlaceholderColor   as ulong = &hFF969CA6ul
+    ChipBack           as ulong = &hFF373D48ul
+    ChipBackHot        as ulong = &hFF444A56ul
+    ChipBackFocused    as ulong = &hFF264F78ul
+    ChipText           as ulong = &hFFC8CDD6ul
+    ChipTextFocused    as ulong = &hFFFFFFFFul
+    ChipBorderInvalid  as ulong = &hFFE06C75ul
+    CloseGlyph         as ulong = &hFF969CA6ul
+    CloseGlyphHot      as ulong = &hFFE2E6EEul
+    CloseBackHot       as ulong = &hFF4B5263ul
+    BackColorDisabled  as ulong = &hFF282C33ul
+    ForeColorDisabled  as ulong = &hFF606670ul
+end type
+
+public type TKTOKENBOX_TOKEN
+    Text     as ustring
+    Key      as ustring          ' an item's key; a free token's is its text
+    id       as long
+    itemData as integer
+    bFree    as boolean          ' typed, not an item
+    bInvalid as boolean          ' painted with the invalid border (tkTokenBox_SetTokenInvalid)
+end type
+
+public type TKTOKENBOX_ITEM
+    Text     as ustring
+    Key      as ustring          ' "" = the text is the key
+    id       as long
+    itemData as integer
+end type
+
+public type TKTOKENBOX_CHIPINFO
+    hBox           as TK_WIDGET ptr
+    b              as TK_PAINT ptr
+    idx            as long
+    rcChip         as TKRECT
+    rcText         as TKRECT
+    rcClose        as TKRECT
+    wszText        as ustring
+    isHot          as boolean
+    isCloseHot     as boolean
+    isClosePressed as boolean
+    isFocused      as boolean       ' the chip-focus chip
+    isFree         as boolean
+    isInvalid      as boolean
+    isEnabled      as boolean
+end type
+
+public type TKB_ChipPaintCallbackSub as sub( byval ci as TKTOKENBOX_CHIPINFO ptr )
+' BEFORE a user's token is added: FALSE refuses; text and key may be rewritten.
+public type TKB_TokenAddingCallbackFunc as function( byval hBox as TK_WIDGET ptr, byref Text as ustring, byref Key as ustring ) as boolean
+' BEFORE a user removes token idx: FALSE keeps it.
+public type TKB_TokenRemovingCallbackFunc as function( byval hBox as TK_WIDGET ptr, byval idx as long ) as boolean
+public type TKB_NotifyCallbackSub as sub( byval hBox as TK_WIDGET ptr )
+public type TKB_ChipClickCallbackSub as sub( byval hBox as TK_WIDGET ptr, byval idx as long )
+' The input changed: a host may Clear/AddItem here to supply the suggestions for text.
+public type TKB_SuggestCallbackSub as sub( byval hBox as TK_WIDGET ptr, byval Text as ustring )
+
+public type TKTOKENBOX_STATE
+    hWin          as TK_WIDGET ptr
+    wEdit         as TK_WIDGET ptr
+    tokens(any)   as TKTOKENBOX_TOKEN
+    nTokens       as long
+    items(any)    as TKTOKENBOX_ITEM
+    nItems        as long
+    sug(any)      as long                 ' the shown suggestions: item indices
+    nSug          as long
+    pop           as TKITEMPOPUP_STATE
+    colors        as TKTOKENBOX_COLORS
+    bColorsPinned as boolean
+    pFont         as TTF_Font ptr
+    isEnabled     as boolean = true
+    isFocused     as boolean
+    nEntryMode    as long = TKTB_ENTRY_FREE
+    wszSeps       as ustring = TKTOKENBOX_DEFAULT_SEPARATORS
+    wszValueSep   as ustring = TKTOKENBOX_DEFAULT_VALUESEP
+    wszPlaceholder as ustring
+    bAllowDup     as boolean
+    nMaxTokens    as long
+    nMaxChipW     as long = TKTOKENBOX_DEFAULT_MAXCHIP      ' unscaled
+    bAutoHeight   as boolean
+    nMaxLines     as long = 4
+    bCommitOnBlur as boolean = true
+    nMatchMode    as long = TKMATCH_CONTAINS
+    nMaxSuggest   as long = 8
+    ' layout (client-local, before the scroll)
+    rcChips(any)  as TKRECT
+    rcInput       as TKRECT
+    nContentH     as long
+    nScrollY      as long
+    bLayoutDirty  as boolean = true
+    bSizing       as boolean
+    ' interaction
+    nHot          as long = -1
+    bCloseHot     as boolean
+    nPress        as long = -1            ' the chip whose x is pressed
+    bPressInside  as boolean
+    nFocusChip    as long = -1            ' chip focus, -1 = the input
+    bSettingText  as boolean              ' our own SetText: not a user edit
+    PaintCallback          as TKB_ChipPaintCallbackSub
+    TokenAddingCallback    as TKB_TokenAddingCallbackFunc
+    TokenRemovingCallback  as TKB_TokenRemovingCallbackFunc
+    TokensChangedCallback  as TKB_NotifyCallbackSub
+    InputChangedCallback   as TKB_NotifyCallbackSub
+    ChipClickCallback      as TKB_ChipClickCallbackSub
+    SuggestCallback        as TKB_SuggestCallbackSub
+end type
+
+public declare sub tkTokenBox_ApplyTheme( byval hBox as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+
+' ---- plumbing ---------------------------------------------------------------------------------
+private function TBX( byval h as TK_WIDGET ptr ) as TKTOKENBOX_STATE ptr
+    if h = 0 then return 0
+    return cast( TKTOKENBOX_STATE ptr, h->pData )
+end function
+
+private function TkS( byval p as TKTOKENBOX_STATE ptr, byval v as long ) as long
+    return tkHost_Scale( p->hWin->pHost, v )
+end function
+
+private function TkFont( byval p as TKTOKENBOX_STATE ptr ) as TTF_Font ptr
+    if p->pFont then return p->pFont
+    return p->hWin->pHost->pDefaultFont
+end function
+
+private function TkItemKey( byval p as TKTOKENBOX_STATE ptr, byval i as long ) as ustring
+    if len( p->items(i).Key ) then return p->items(i).Key
+    return p->items(i).Text
+end function
+
+private function TkHasKey( byval p as TKTOKENBOX_STATE ptr, byref k as const ustring ) as boolean
+    for i as long = 0 to p->nTokens - 1
+        if p->tokens(i).Key = k then return true
+    next
+    return false
+end function
+
+' The item whose text is t (case ignored), or -1.
+private function TkItemByText( byval p as TKTOKENBOX_STATE ptr, byref t as const ustring ) as long
+    dim as ustring lt = lcase( t )
+    for i as long = 0 to p->nItems - 1
+        if lcase( p->items(i).Text ) = lt then return i
+    next
+    return -1
+end function
+
+private function TkChipH( byval p as TKTOKENBOX_STATE ptr ) as long
+    dim as long hh = tkText_Height( TkFont( p ) ) + TkS( p, 6 )
+    if hh < TkS( p, 22 ) then hh = TkS( p, 22 )
+    return hh
+end function
+
+' ---- layout: chips flow and wrap; the input takes the rest of the last line ----------------------
+private sub TkLayout( byval p as TKTOKENBOX_STATE ptr )
+    p->bLayoutDirty = false
+    dim as long cw = p->hWin->cw, chh = p->hWin->ch
+    dim as long pad = TkS( p, TKTOKENBOX_DEFAULT_PAD ), gap = TkS( p, TKTOKENBOX_DEFAULT_CHIPGAP )
+    dim as long lineH = TkChipH( p ), minIn = TkS( p, TKTOKENBOX_DEFAULT_MININPUT )
+    dim as long maxW = TkS( p, p->nMaxChipW )
+    dim as long right_ = cw - pad
+    dim as TTF_Font ptr f = TkFont( p )
+    if p->nTokens > 0 then redim p->rcChips( 0 to p->nTokens - 1 ) else erase p->rcChips
+    dim as long x = pad, y = pad, nLines = 1
+    for i as long = 0 to p->nTokens - 1
+        dim as long w = tkText_Width( f, p->tokens(i).Text ) + 2 * TkS( p, TKTOKENBOX_DEFAULT_CHIPPADX ) + TkS( p, TKTOKENBOX_DEFAULT_CLOSEBOX )
+        if w > maxW then w = maxW
+        if w > right_ - pad then w = right_ - pad
+        if (x + w > right_) andalso (x > pad) then x = pad : y += lineH + gap : nLines += 1
+        tkRect_Set( p->rcChips(i), x, y, x + w, y + lineH )
+        x += w + gap
+    next
+    if (right_ - x < minIn) andalso (x > pad) then x = pad : y += lineH + gap : nLines += 1
+    tkRect_Set( p->rcInput, x, y, iif( right_ > x + 1, right_, x + 1 ), y + lineH )
+    p->nContentH = y + lineH + pad
+    ' AutoHeight: grow (or shrink) to the content, up to MaxLines; then scroll
+    if p->bAutoHeight andalso (p->bSizing = false) then
+        dim as long nShow = iif( nLines > p->nMaxLines, p->nMaxLines, nLines )
+        dim as long want = 2 * pad + nShow * lineH + (nShow - 1) * gap
+        if want <> chh then
+            p->bSizing = true
+            tkWidget_SetSize( p->hWin, cw, want )
+            p->bSizing = false
+            chh = p->hWin->ch
+        end if
+    end if
+    ' keep the input's line in view
+    p->nScrollY = 0
+    if p->nContentH > chh then p->nScrollY = p->nContentH - chh
+    if p->wEdit then
+        tkWidget_SetPos( p->wEdit, p->rcInput.left, p->rcInput.top - p->nScrollY, _
+                         p->rcInput.right - p->rcInput.left, p->rcInput.bottom - p->rcInput.top )
+    end if
+end sub
+
+private sub TkRelayout( byval p as TKTOKENBOX_STATE ptr )
+    p->bLayoutDirty = true
+    TkLayout( p )
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' A chip's rects on screen (after the scroll): the chip and its x box.
+private sub TkChipRects( byval p as TKTOKENBOX_STATE ptr, byval i as long, byref rc as TKRECT, byref rcX as TKRECT )
+    rc = p->rcChips(i)
+    tkRect_Offset( rc, 0, -p->nScrollY )
+    dim as long cb = TkS( p, TKTOKENBOX_DEFAULT_CLOSEBOX )
+    dim as long xr = rc.right - TkS( p, 4 )
+    dim as long yc = (rc.top + rc.bottom) \ 2
+    tkRect_Set( rcX, xr - cb, yc - cb \ 2, xr, yc - cb \ 2 + cb )
+end sub
+
+' The chip under (x, y), -1; bOnX: on its x box.
+private function TkHit( byval p as TKTOKENBOX_STATE ptr, byval x as long, byval y as long, byref bOnX as boolean ) as long
+    bOnX = false
+    if p->bLayoutDirty then TkLayout( p )
+    for i as long = 0 to p->nTokens - 1
+        dim as TKRECT rc, rcX
+        TkChipRects( p, i, rc, rcX )
+        if (x >= rc.left) andalso (x < rc.right) andalso (y >= rc.top) andalso (y < rc.bottom) then
+            bOnX = (x >= rcX.left) andalso (x < rcX.right) andalso (y >= rcX.top) andalso (y < rcX.bottom)
+            return i
+        end if
+    next
+    return -1
+end function
+
+
+' ---- painting ---------------------------------------------------------------------------------
+private sub TkRenderChip( byval p as TKTOKENBOX_STATE ptr, byval ci as TKTOKENBOX_CHIPINFO ptr )
+    dim as TK_PAINT ptr b = ci->b
+    dim as ulong back_ = p->colors.ChipBack, fore = p->colors.ChipText
+    if ci->isEnabled = false then
+        fore = p->colors.ForeColorDisabled
+    elseif ci->isFocused then
+        back_ = p->colors.ChipBackFocused : fore = p->colors.ChipTextFocused
+    elseif ci->isHot then
+        back_ = p->colors.ChipBackHot
+    end if
+    dim as long curv = ci->rcChip.bottom - ci->rcChip.top
+    b->SetBackColor( back_ )
+    b->PaintRoundRect( @ci->rcChip, curv )
+    if ci->isInvalid then
+        b->SetPenColor( p->colors.ChipBorderInvalid )
+        b->PaintRoundOutline( @ci->rcChip, curv, TkS( p, 1 ) )
+    end if
+    b->SetFont( TkFont( p ) )
+    b->SetColors( fore, back_ )
+    b->PaintText( ci->wszText, @ci->rcText, TK_DT_LEFT or TK_DT_ELLIPSIS )
+    ' the x: two strokes, on a round hot back
+    if ci->isEnabled andalso (ci->isCloseHot orelse ci->isClosePressed) then
+        b->SetBackColor( p->colors.CloseBackHot )
+        b->PaintRoundRect( @ci->rcClose, ci->rcClose.right - ci->rcClose.left )
+    end if
+    dim as long ins = (ci->rcClose.right - ci->rcClose.left) \ 4
+    dim as long thick = TkS( p, 1 )
+    if thick < 1 then thick = 1
+    b->SetPenColor( iif( ci->isCloseHot andalso ci->isEnabled, p->colors.CloseGlyphHot, iif( ci->isEnabled, p->colors.CloseGlyph, p->colors.ForeColorDisabled ) ) )
+    b->PaintLine( thick, ci->rcClose.left + ins, ci->rcClose.top + ins, ci->rcClose.right - ins, ci->rcClose.bottom - ins )
+    b->PaintLine( thick, ci->rcClose.right - ins, ci->rcClose.top + ins, ci->rcClose.left + ins, ci->rcClose.bottom - ins )
+end sub
+
+private sub TkOnPaint( byval p as TKTOKENBOX_STATE ptr, byval b as TK_PAINT ptr )
+    if p->bLayoutDirty then TkLayout( p )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, w->cw, w->ch )
+    b->SetBackColor( iif( p->isEnabled, p->colors.BackColor, p->colors.BackColorDisabled ) )
+    b->PaintRect( @rc )
+    for i as long = 0 to p->nTokens - 1
+        dim as TKTOKENBOX_CHIPINFO ci
+        ci.hBox = w : ci.b = b : ci.idx = i
+        TkChipRects( p, i, ci.rcChip, ci.rcClose )
+        ci.rcText = ci.rcChip
+        ci.rcText.left += TkS( p, TKTOKENBOX_DEFAULT_CHIPPADX )
+        ci.rcText.right = ci.rcClose.left - TkS( p, 2 )
+        ci.wszText = p->tokens(i).Text
+        ci.isHot = (i = p->nHot)
+        ci.isCloseHot = ci.isHot andalso p->bCloseHot
+        ci.isClosePressed = (i = p->nPress) andalso p->bPressInside
+        ci.isFocused = (i = p->nFocusChip)
+        ci.isFree = p->tokens(i).bFree
+        ci.isInvalid = p->tokens(i).bInvalid
+        ci.isEnabled = p->isEnabled
+        if p->PaintCallback then p->PaintCallback( @ci ) else TkRenderChip( p, @ci )
+    next
+    ' the border last, as an outline (PaintBorderRect fills -- Learnings)
+    b->SetPenColor( iif( p->isFocused, p->colors.BorderColorFocused, p->colors.BorderColor ) )
+    b->PaintRoundOutline( @rc, 0, TkS( p, 1 ) )
+end sub
+
+
+' ---- the model, by the user -------------------------------------------------------------------
+private sub TkNotifyChanged( byval p as TKTOKENBOX_STATE ptr )
+    if p->TokensChangedCallback then p->TokensChangedCallback( p->hWin )
+end sub
+
+private sub TkSetInput( byval p as TKTOKENBOX_STATE ptr, byref s as const ustring )
+    p->bSettingText = true
+    tkTextBox_SetText( p->wEdit, s )
+    dim as integer n = tkTextBox_GetTextLength( p->wEdit )
+    tkTextBox_SetSel( p->wEdit, n, n )
+    p->bSettingText = false
+end sub
+
+private sub TkUpdateCue( byval p as TKTOKENBOX_STATE ptr )
+    dim as ustring cue                      ' (not iif: ustring vs a narrow literal)
+    if p->nTokens = 0 then cue = p->wszPlaceholder
+    tkTextBox_SetCueBannerText( p->wEdit, cue )
+end sub
+
+' Adds one token as the user's (TokenAdding asked); FALSE refused. fromItem >= 0: a picked item.
+private function TkUserAdd( byval p as TKTOKENBOX_STATE ptr, byval piece as ustring, byval fromItem as long = -1 ) as boolean
+    dim as ustring t = trim( piece )
+    if len( t ) = 0 then return false
+    if fromItem < 0 then fromItem = TkItemByText( p, t )
+    dim as ustring k
+    if fromItem >= 0 then
+        t = p->items(fromItem).Text : k = TkItemKey( p, fromItem )
+    elseif p->nEntryMode = TKTB_ENTRY_ITEMS then
+        return false
+    else
+        k = t
+    end if
+    if (p->nMaxTokens > 0) andalso (p->nTokens >= p->nMaxTokens) then return false
+    if (p->bAllowDup = false) andalso TkHasKey( p, k ) then return false
+    if p->TokenAddingCallback then
+        if p->TokenAddingCallback( p->hWin, t, k ) = false then return false
+        if len( t ) = 0 then return false
+        if (p->bAllowDup = false) andalso TkHasKey( p, k ) then return false
+    end if
+    redim preserve p->tokens( 0 to p->nTokens )
+    with p->tokens(p->nTokens)
+        .Text = t : .Key = k : .bFree = (fromItem < 0) : .bInvalid = false
+        .id = iif( fromItem >= 0, p->items(fromItem).id, 0 )
+        .itemData = iif( fromItem >= 0, p->items(fromItem).itemData, 0 )
+    end with
+    p->nTokens += 1
+    return true
+end function
+
+private function TkUserRemove( byval p as TKTOKENBOX_STATE ptr, byval idx as long ) as boolean
+    if (idx < 0) orelse (idx >= p->nTokens) orelse (p->isEnabled = false) then return false
+    if p->TokenRemovingCallback then
+        if p->TokenRemovingCallback( p->hWin, idx ) = false then return false
+    end if
+    for i as long = idx to p->nTokens - 2
+        p->tokens(i) = p->tokens(i + 1)
+    next
+    p->nTokens -= 1
+    if p->nTokens = 0 then erase p->tokens else redim preserve p->tokens( 0 to p->nTokens - 1 )
+    return true
+end function
+
+declare sub TkRefreshSuggest( byval p as TKTOKENBOX_STATE ptr, byval bForce as boolean )
+
+' The input's text committed as tokens, piece by piece up to the first refusal; what was refused (and
+' what follows it) stays in the input. TRUE when anything was added.
+private function TkCommitText( byval p as TKTOKENBOX_STATE ptr, byref s as const ustring, byval bKeepTail as boolean ) as boolean
+    ' split on any separator character; with bKeepTail the piece after the last separator stays
+    dim as ustring pieces()
+    dim as long n = 0, start = 1
+    for i as long = 1 to len( s ) + 1
+        dim as boolean bSep = (i <= len( s )) andalso (instr( p->wszSeps, mid( s, i, 1 ) ) > 0)
+        if bSep orelse (i = len( s ) + 1) then
+            redim preserve pieces( 0 to n )
+            pieces(n) = mid( s, start, i - start ) : n += 1
+            start = i + 1
+        end if
+    next
+    dim as long nLast = iif( bKeepTail, n - 1, n )
+    dim as boolean bAdded = false
+    dim as ustring rest
+    for j as long = 0 to nLast - 1
+        if len( trim( pieces(j) ) ) = 0 then continue for
+        if TkUserAdd( p, pieces(j) ) then
+            bAdded = true
+        else
+            ' refused: it and the non-empty pieces after it go back to the input (an empty one --
+            ' the separator just typed -- does not, or the next keystroke would try them again)
+            rest = trim( pieces(j) )
+            for q as long = j + 1 to n - 1
+                if len( trim( pieces(q) ) ) then rest &= mid( p->wszSeps, 1, 1 ) & pieces(q)
+            next
+            TkSetInput( p, trim( rest ) )
+            return bAdded
+        end if
+    next
+    dim as ustring tail
+    if bKeepTail andalso (n > 0) then tail = ltrim( pieces(n - 1) )
+    TkSetInput( p, tail )
+    return bAdded
+end function
+
+
+' ---- suggestions ------------------------------------------------------------------------------
+private sub TkPopPick( byval pCtx as any ptr, byval idx as long )
+    dim as TKTOKENBOX_STATE ptr p = pCtx
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nSug) then exit sub
+    dim as long item = p->sug(idx)
+    dim as boolean bAdded = TkUserAdd( p, p->items(item).Text, item )
+    if bAdded then TkSetInput( p, "" )
+    tkItemPopup_Close( p->pop, false )
+    TkUpdateCue( p )
+    TkRelayout( p )
+    if bAdded then TkNotifyChanged( p )
+end sub
+
+private function TkPopKey( byval pCtx as any ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKTOKENBOX_STATE ptr p = pCtx
+    if (p = 0) orelse (p->wEdit = 0) then return true
+    tkWidget_Send( p->wEdit, m )          ' everything the popup does not keep is the input's
+    return true
+end function
+
+private sub TkPopClosed( byval pCtx as any ptr, byval bCommit as boolean )
+end sub
+
+' The suggestions for the input text: the items tkMatch accepts, minus those already tokens (unless
+' AllowDuplicates), at most MaxSuggest. Opens, refills or closes the popup; bForce opens it for an
+' empty input (Down).
+sub TkRefreshSuggest( byval p as TKTOKENBOX_STATE ptr, byval bForce as boolean )
+    dim as ustring q = tkTextBox_GetText( p->wEdit )
+    if (len( trim( q ) ) = 0) andalso (bForce = false) then tkItemPopup_Close( p->pop, false ) : exit sub
+    if p->SuggestCallback then p->SuggestCallback( p->hWin, q )
+    erase p->sug : p->nSug = 0
+    if p->nItems > 0 then redim p->sug( 0 to p->nItems - 1 )
+    dim as TKMATCH_QUERY mq
+    dim as boolean bAll = (len( trim( q ) ) = 0)
+    if bAll = false then tkMatch_Prepare( mq, p->nMatchMode, trim( q ) )
+    for i as long = 0 to p->nItems - 1
+        if p->nSug >= p->nMaxSuggest then exit for
+        if (p->bAllowDup = false) andalso TkHasKey( p, TkItemKey( p, i ) ) then continue for
+        if bAll orelse tkMatch_Test( mq, p->items(i).Text, tkMatch_KeyOf( mq, p->items(i).Text ) ) then
+            p->sug(p->nSug) = i : p->nSug += 1
+        end if
+    next
+    if p->nSug = 0 then tkItemPopup_Close( p->pop, false ) : exit sub
+    ' a popup cannot be resized everywhere (Wayland): another count is another popup
+    dim as boolean bSame = tkItemPopup_IsOpen( p->pop ) andalso (p->pop.nItems = p->nSug)
+    erase p->pop.items
+    redim p->pop.items( 0 to p->nSug - 1 )
+    for k as long = 0 to p->nSug - 1
+        p->pop.items(k).Text = p->items(p->sug(k)).Text
+    next
+    p->pop.nItems = p->nSug
+    if bSame then tkItemPopup_Refresh( p->pop ) : exit sub
+    tkItemPopup_Close( p->pop, false )
+    with p->pop
+        .bChecks = false : .bSelectAll = false : .bFilter = false : .bButtons = false
+        .nMaxRows = p->nMaxSuggest
+        .pFont = p->pFont
+        .bPassDismissClick = true            ' a click on a chip's x closes the list and still lands
+        .pCtx = p
+        .OnPick = @TkPopPick
+        .OnKey = @TkPopKey
+        .OnClosed = @TkPopClosed
+        .sFilter = ""
+    end with
+    tkItemPopup_Open( p->pop, p->hWin )
+end sub
+
+
+' ---- the input's callbacks -------------------------------------------------------------------------
+private function TkOfEdit( byval hEdit as TK_WIDGET ptr ) as TKTOKENBOX_STATE ptr
+    return TBX( tkWidget_Parent( hEdit ) )
+end function
+
+private sub TkEditChanged( byval hEdit as TK_WIDGET ptr )
+    dim as TKTOKENBOX_STATE ptr p = TkOfEdit( hEdit )
+    if (p = 0) orelse p->bSettingText then exit sub
+    p->nFocusChip = -1
+    dim as ustring s = tkTextBox_GetText( hEdit )
+    dim as boolean bAdded = false
+    ' a separator typed or pasted commits every piece before it
+    for i as long = 1 to len( p->wszSeps )
+        if instr( s, mid( p->wszSeps, i, 1 ) ) > 0 then bAdded = TkCommitText( p, s, true ) : exit for
+    next
+    if bAdded then TkUpdateCue( p ) : TkRelayout( p )
+    TkRefreshSuggest( p, false )
+    if bAdded then TkNotifyChanged( p )
+    if p->InputChangedCallback then p->InputChangedCallback( p->hWin )
+end sub
+
+private sub TkEditEnter( byval hEdit as TK_WIDGET ptr )
+    dim as TKTOKENBOX_STATE ptr p = TkOfEdit( hEdit )
+    if p = 0 then exit sub
+    ' (with the suggestions up, Enter is the popup's and picks the current one)
+    if TkCommitText( p, tkTextBox_GetText( hEdit ), false ) then
+        tkItemPopup_Close( p->pop, false )
+        TkUpdateCue( p ) : TkRelayout( p )
+        TkNotifyChanged( p )
+    end if
+end sub
+
+private sub TkEditFocus( byval hEdit as TK_WIDGET ptr, byval bGot as boolean )
+    dim as TKTOKENBOX_STATE ptr p = TkOfEdit( hEdit )
+    if p = 0 then exit sub
+    p->isFocused = bGot
+    if bGot = false then
+        p->nFocusChip = -1
+        tkItemPopup_Close( p->pop, false )
+        if p->bCommitOnBlur andalso (len( trim( tkTextBox_GetText( hEdit ) ) ) > 0) then
+            if TkCommitText( p, tkTextBox_GetText( hEdit ), false ) then
+                TkUpdateCue( p ) : TkRelayout( p )
+                TkNotifyChanged( p )
+            end if
+        end if
+    end if
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' The chip keys and the input's edge keys. TRUE = handled here (the input never sees it).
+private function TkEditMessage( byval m as TKTEXTBOX_MESSAGEINFO ptr ) as boolean
+    dim as TKTOKENBOX_STATE ptr p = TkOfEdit( m->hTextBox )
+    if (p = 0) orelse (p->isEnabled = false) then return false
+    if m->msg = TKM_CHAR then
+        if p->nFocusChip >= 0 then p->nFocusChip = -1 : tkWidget_Invalidate( p->hWin )
+        return false
+    end if
+    if m->msg <> TKM_KEYDOWN then return false
+    dim as boolean plain = ((m->mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI or SDL_KMOD_SHIFT)) = 0)
+    if p->nFocusChip >= 0 then
+        dim as long fc = p->nFocusChip
+        select case m->key
+        case SDLK_LEFT
+            if fc > 0 then p->nFocusChip = fc - 1
+        case SDLK_RIGHT
+            p->nFocusChip = iif( fc < p->nTokens - 1, fc + 1, -1 )
+        case SDLK_HOME
+            p->nFocusChip = 0
+        case SDLK_END, SDLK_ESCAPE
+            p->nFocusChip = -1
+        case SDLK_BACKSPACE, SDLK_DELETE
+            if TkUserRemove( p, fc ) then
+                if m->key = SDLK_BACKSPACE then
+                    p->nFocusChip = iif( fc > 0, fc - 1, iif( p->nTokens > 0, 0, -1 ) )
+                else
+                    p->nFocusChip = iif( fc < p->nTokens, fc, -1 )
+                end if
+                TkUpdateCue( p ) : TkRelayout( p )
+                TkNotifyChanged( p )
+            end if
+        case else
+            p->nFocusChip = -1               ' anything else goes back to the input, and on to it
+            tkWidget_Invalidate( p->hWin )
+            return false
+        end select
+        tkWidget_Invalidate( p->hWin )
+        return true
+    end if
+    if plain = false then return false
+    dim as integer s0, s1
+    tkTextBox_GetSel( m->hTextBox, s0, s1 )
+    dim as boolean atStart = (s0 = 0) andalso (s1 = 0)
+    select case m->key
+    case SDLK_BACKSPACE
+        if atStart andalso (p->nTokens > 0) then
+            if TkUserRemove( p, p->nTokens - 1 ) then
+                TkUpdateCue( p ) : TkRelayout( p )
+                TkNotifyChanged( p )
+            end if
+            return true
+        end if
+    case SDLK_LEFT
+        if atStart andalso (p->nTokens > 0) then
+            p->nFocusChip = p->nTokens - 1
+            tkWidget_Invalidate( p->hWin )
+            return true
+        end if
+    case SDLK_DOWN
+        if tkItemPopup_IsOpen( p->pop ) = false then TkRefreshSuggest( p, true )
+        return true
+    end select
+    return false
+end function
+
+
+' ---- the container ------------------------------------------------------------------------------
+private sub TkEditColors( byval p as TKTOKENBOX_STATE ptr )
+    if p->wEdit = 0 then exit sub
+    dim as TKTEXTBOX_COLORS c = tkTextBox_ThemeColors( tkTheme_Of( p->hWin ) )
+    ' the input fills the rest of the field, so it wears the field's colour, disabled too
+    dim as ulong back = iif( p->isEnabled, p->colors.BackColor, p->colors.BackColorDisabled )
+    c.BackColor = back : c.OuterBackColor = back
+    c.ForeColor = p->colors.ForeColor : c.CueColor = p->colors.PlaceholderColor
+    c.ForeColorDisabled = p->colors.ForeColorDisabled
+    tkTextBox_SetColors( p->wEdit, @c )
+end sub
+
+private function TkProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKTOKENBOX_STATE ptr p = TBX( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        TkOnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE
+        if p->bSizing = false then TkRelayout( p )
+        return true
+    case TKM_SCALECHANGED
+        tkItemPopup_Close( p->pop, false )
+        TkRelayout( p )
+        return true
+    case TKM_THEMECHANGED
+        tkTokenBox_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_SETFOCUS
+        if p->wEdit then tkHost_SetFocus( w->pHost, p->wEdit )
+        return true
+    case TKM_MOUSEMOVE
+        dim as boolean bOnX
+        dim as long hit = TkHit( p, cint( m->x ), cint( m->y ), bOnX )
+        if p->nPress >= 0 then
+            dim as boolean bIn = (hit = p->nPress) andalso bOnX
+            if bIn <> p->bPressInside then p->bPressInside = bIn : tkWidget_Invalidate( w )
+        end if
+        if (hit <> p->nHot) orelse (bOnX <> p->bCloseHot) then
+            p->nHot = hit : p->bCloseHot = bOnX andalso (hit >= 0)
+            tkWidget_Invalidate( w )
+        end if
+        return true
+    case TKM_MOUSELEAVE
+        if p->nHot >= 0 then p->nHot = -1 : p->bCloseHot = false : tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONDOWN
+        if p->isEnabled = false then return true
+        if p->wEdit then tkHost_SetFocus( w->pHost, p->wEdit )
+        dim as boolean bOnX
+        dim as long hit = TkHit( p, cint( m->x ), cint( m->y ), bOnX )
+        if (hit >= 0) andalso bOnX then
+            p->nPress = hit : p->bPressInside = true
+            tkHost_SetCapture( w )
+        elseif hit >= 0 then
+            p->nFocusChip = hit
+            if p->ChipClickCallback then p->ChipClickCallback( w, hit )
+        else
+            p->nFocusChip = -1
+        end if
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONUP
+        if p->nPress >= 0 then
+            dim as long r = p->nPress
+            dim as boolean bIn = p->bPressInside
+            p->nPress = -1 : p->bPressInside = false
+            if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+            if bIn andalso TkUserRemove( p, r ) then
+                p->nFocusChip = -1 : p->nHot = -1
+                TkUpdateCue( p ) : TkRelayout( p )
+                TkNotifyChanged( p )
+            end if
+            tkWidget_Invalidate( w )
+        end if
+        return true
+    case TKM_CAPTURECHANGED
+        if p->nPress >= 0 then p->nPress = -1 : p->bPressInside = false : tkWidget_Invalidate( w )
+        return true
+    case TKM_MOUSEWHEEL
+        if p->nContentH <= w->ch then return false
+        return true                   ' the content follows the input; nothing to scroll by hand
+    case TKM_ENABLE
+        p->isEnabled = m->bFlag
+        if p->wEdit then tkWidget_Enable( p->wEdit, m->bFlag )
+        TkEditColors( p )
+        if p->isEnabled = false then tkItemPopup_Close( p->pop, false ) : p->nFocusChip = -1
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_DESTROY
+        tkItemPopup_Detach( p->pop )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+
+
+' ---- create -----------------------------------------------------------------------------------
+public function tkTokenBox_ThemeColors( byref t as TKTHEME_COLORS ) as TKTOKENBOX_COLORS
+    dim as TKTOKENBOX_COLORS c
+    c.BackColor = t.Surface : c.BorderColor = t.Border : c.BorderColorFocused = t.FocusRing
+    c.ForeColor = t.Text : c.PlaceholderColor = t.TextDim
+    c.ChipBack = t.SurfaceHot : c.ChipBackHot = t.Border
+    c.ChipBackFocused = t.Selected : c.ChipText = t.Text : c.ChipTextFocused = t.SelectedText
+    c.ChipBorderInvalid = t.Error
+    c.CloseGlyph = t.TextDim : c.CloseGlyphHot = t.TextHot : c.CloseBackHot = t.Divider
+    c.BackColorDisabled = t.SurfaceDisabled : c.ForeColorDisabled = t.TextDisabled
+    return c
+end function
+
+public function tkTokenBox_Create( byval hParent as TK_WIDGET ptr, byval CtrlID as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKTOKENBOX_STATE ptr p = new TKTOKENBOX_STATE
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, CtrlID, @TkProc, p )
+    if w = 0 then delete p : return 0
+    p->hWin = w
+    p->colors = tkTokenBox_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKTOKENBOX_COLORS ) \ 4, "TokenBox" )
+    p->wEdit = tkTextBox_Create( w, CtrlID, false )
+    tkTextBox_SetBorderWidth( p->wEdit, 0 )
+    tkTextBox_SetChangeCallback( p->wEdit, @TkEditChanged )
+    tkTextBox_SetEnterPressedCallback( p->wEdit, @TkEditEnter )
+    tkTextBox_SetFocusCallback( p->wEdit, @TkEditFocus )
+    tkTextBox_SetMessageCallback( p->wEdit, @TkEditMessage )
+    TkEditColors( p )
+    return w
+end function
+
+public function tkTokenBox_GetID( byval h as TK_WIDGET ptr ) as long
+    return iif( h <> 0, h->ctrlId, 0 )
+end function
+
+' The input: a tkTextBox. Its callbacks are this control's: use the token box's events.
+public function tkTokenBox_GetInput( byval h as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    return iif( p <> 0, p->wEdit, 0 )
+end function
+
+
+' ---- items (the suggestions; silent) -------------------------------------------------------------
+public function tkTokenBox_AddItem( byval h as TK_WIDGET ptr, byval Text as ustring, byval Key as ustring = "", _
+                                    byval id as long = 0, byval itemData as integer = 0 ) as long
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then return -1
+    redim preserve p->items( 0 to p->nItems )
+    with p->items(p->nItems)
+        .Text = Text : .Key = Key : .id = id : .itemData = itemData
+    end with
+    p->nItems += 1
+    return p->nItems - 1
+end function
+
+public sub tkTokenBox_ClearItems( byval h as TK_WIDGET ptr )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then exit sub
+    erase p->items : p->nItems = 0
+end sub
+
+public function tkTokenBox_GetItemCount( byval h as TK_WIDGET ptr ) as long
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    return iif( p <> 0, p->nItems, 0 )
+end function
+
+
+' ---- tokens (silent) --------------------------------------------------------------------------
+' Adds a token without asking anyone: an item's when text (or key) names one, else a free one.
+public function tkTokenBox_AddToken( byval h as TK_WIDGET ptr, byval Text as ustring, byval Key as ustring = "" ) as long
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (len( trim( Text ) ) = 0) then return -1
+    dim as long it = -1
+    for i as long = 0 to p->nItems - 1
+        if (len( Key ) > 0) andalso (TkItemKey( p, i ) = Key) then it = i : exit for
+    next
+    if (it < 0) andalso (len( Key ) = 0) then it = TkItemByText( p, Text )
+    redim preserve p->tokens( 0 to p->nTokens )
+    with p->tokens(p->nTokens)
+        if it >= 0 then
+            .Text = p->items(it).Text : .Key = TkItemKey( p, it ) : .id = p->items(it).id : .itemData = p->items(it).itemData : .bFree = false
+        else
+            .Text = trim( Text ) : .Key = iif( len( Key ) > 0, Key, trim( Text ) ) : .id = 0 : .itemData = 0 : .bFree = true
+        end if
+        .bInvalid = false
+    end with
+    p->nTokens += 1
+    TkUpdateCue( p ) : TkRelayout( p )
+    return p->nTokens - 1
+end function
+
+public function tkTokenBox_RemoveToken( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nTokens) then return false
+    for i as long = idx to p->nTokens - 2
+        p->tokens(i) = p->tokens(i + 1)
+    next
+    p->nTokens -= 1
+    if p->nTokens = 0 then erase p->tokens else redim preserve p->tokens( 0 to p->nTokens - 1 )
+    if p->nFocusChip >= p->nTokens then p->nFocusChip = -1
+    TkUpdateCue( p ) : TkRelayout( p )
+    return true
+end function
+
+public sub tkTokenBox_ClearTokens( byval h as TK_WIDGET ptr )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then exit sub
+    erase p->tokens : p->nTokens = 0 : p->nFocusChip = -1
+    TkUpdateCue( p ) : TkRelayout( p )
+end sub
+
+public function tkTokenBox_GetTokenCount( byval h as TK_WIDGET ptr ) as long
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    return iif( p <> 0, p->nTokens, 0 )
+end function
+
+public function tkTokenBox_GetTokenText( byval h as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nTokens) then return ""
+    return p->tokens(idx).Text
+end function
+
+public function tkTokenBox_GetTokenKey( byval h as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nTokens) then return ""
+    return p->tokens(idx).Key
+end function
+
+public function tkTokenBox_GetTokenID( byval h as TK_WIDGET ptr, byval idx as long ) as long
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nTokens) then return 0
+    return p->tokens(idx).id
+end function
+
+public function tkTokenBox_IsTokenFree( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nTokens) then return false
+    return p->tokens(idx).bFree
+end function
+
+' Paints the chip with the invalid border (a host's validation result); silent.
+public sub tkTokenBox_SetTokenInvalid( byval h as TK_WIDGET ptr, byval idx as long, byval bInvalid as boolean )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nTokens) then exit sub
+    p->tokens(idx).bInvalid = bInvalid
+    tkWidget_Invalidate( h )
+end sub
+
+public function tkTokenBox_FindToken( byval h as TK_WIDGET ptr, byval Key as ustring ) as long
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then return -1
+    for i as long = 0 to p->nTokens - 1
+        if p->tokens(i).Key = Key then return i
+    next
+    return -1
+end function
+
+public function tkTokenBox_GetTokenKeys( byval h as TK_WIDGET ptr, keys() as ustring ) as long
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (p->nTokens = 0) then erase keys : return 0
+    redim keys( 0 to p->nTokens - 1 )
+    for i as long = 0 to p->nTokens - 1
+        keys(i) = p->tokens(i).Key
+    next
+    return p->nTokens
+end function
+
+public sub tkTokenBox_SetTokenKeys( byval h as TK_WIDGET ptr, keys() as ustring )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then exit sub
+    erase p->tokens : p->nTokens = 0 : p->nFocusChip = -1
+    for j as long = lbound( keys ) to ubound( keys )
+        if len( trim( keys(j) ) ) then tkTokenBox_AddToken( h, keys(j), trim( keys(j) ) )
+    next
+    TkUpdateCue( p ) : TkRelayout( p )
+end sub
+
+public sub tkTokenBox_SetValueSeparator( byval h as TK_WIDGET ptr, byval Sep as ustring )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p <> 0) andalso (len( Sep ) > 0) then p->wszValueSep = Sep
+end sub
+
+' The bind pair (CHECKED-LISTS.md §9.2): the tokens' keys joined by the ValueSeparator, in order.
+public function tkTokenBox_GetTokensText( byval h as TK_WIDGET ptr ) as ustring
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then return ""
+    dim as ustring s
+    for i as long = 0 to p->nTokens - 1
+        if i > 0 then s &= p->wszValueSep
+        s &= p->tokens(i).Key
+    next
+    return s
+end function
+
+' Splits on the ValueSeparator: each piece an item's key (that item's token) or a free token. Silent.
+public sub tkTokenBox_SetTokensText( byval h as TK_WIDGET ptr, byval s as ustring )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then exit sub
+    dim as ustring keys()
+    dim as long n = 0, nPos = 1, sepLen = len( p->wszValueSep )
+    do
+        dim as long nAt = instr( nPos, s, p->wszValueSep )
+        dim as ustring piece = trim( iif( nAt > 0, mid( s, nPos, nAt - nPos ), mid( s, nPos ) ) )
+        if len( piece ) then
+            redim preserve keys( 0 to n )
+            keys(n) = piece : n += 1
+        end if
+        if nAt = 0 then exit do
+        nPos = nAt + sepLen
+    loop
+    if n = 0 then tkTokenBox_ClearTokens( h ) else tkTokenBox_SetTokenKeys( h, keys() )
+end sub
+
+public function tkTokenBox_GetInputText( byval h as TK_WIDGET ptr ) as ustring
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then return ""
+    return tkTextBox_GetText( p->wEdit )
+end function
+
+public sub tkTokenBox_SetInputText( byval h as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then TkSetInput( p, Text )
+end sub
+
+
+' ---- options ----------------------------------------------------------------------------------
+public sub tkTokenBox_SetEntryMode( byval h as TK_WIDGET ptr, byval nMode as long )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p <> 0) andalso ((nMode = TKTB_ENTRY_FREE) orelse (nMode = TKTB_ENTRY_ITEMS)) then p->nEntryMode = nMode
+end sub
+
+' The characters that commit typed text (default ",;"); Enter always does.
+public sub tkTokenBox_SetTokenSeparators( byval h as TK_WIDGET ptr, byval Seps as ustring )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->wszSeps = Seps
+end sub
+
+public sub tkTokenBox_SetAllowDuplicates( byval h as TK_WIDGET ptr, byval bAllow as boolean )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->bAllowDup = bAllow
+end sub
+
+public sub tkTokenBox_SetMaxTokens( byval h as TK_WIDGET ptr, byval nMax as long )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->nMaxTokens = iif( nMax < 0, 0, nMax )
+end sub
+
+public sub tkTokenBox_SetMaxChipWidth( byval h as TK_WIDGET ptr, byval nWidth as long )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p <> 0) andalso (nWidth > 0) then p->nMaxChipW = nWidth : TkRelayout( p )
+end sub
+
+' The control's height follows its lines of chips, up to MaxLines (then the input's line is kept
+' in view and the first lines scroll off).
+public sub tkTokenBox_SetAutoHeight( byval h as TK_WIDGET ptr, byval bAuto as boolean, byval nMaxLines as long = 4 )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then exit sub
+    p->bAutoHeight = bAuto
+    if nMaxLines > 0 then p->nMaxLines = nMaxLines
+    TkRelayout( p )
+end sub
+
+public sub tkTokenBox_SetPlaceholderText( byval h as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->wszPlaceholder = Text : TkUpdateCue( p )
+end sub
+
+public sub tkTokenBox_SetCommitOnBlur( byval h as TK_WIDGET ptr, byval bCommit as boolean )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->bCommitOnBlur = bCommit
+end sub
+
+' TKMATCH_PREFIX / WORDPREFIX / CONTAINS (default) / FUZZY.
+public sub tkTokenBox_SetMatchMode( byval h as TK_WIDGET ptr, byval nMode as long )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->nMatchMode = nMode
+end sub
+
+public sub tkTokenBox_SetMaxSuggestions( byval h as TK_WIDGET ptr, byval n as long )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p <> 0) andalso (n > 0) then p->nMaxSuggest = n
+end sub
+
+public sub tkTokenBox_SetFont( byval h as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then exit sub
+    p->pFont = f
+    tkTextBox_SetFont( p->wEdit, f )
+    TkRelayout( p )
+end sub
+
+public sub tkTokenBox_SetEnabled( byval h as TK_WIDGET ptr, byval bEnabled as boolean )
+    tkWidget_Enable( h, bEnabled )
+end sub
+
+
+' ---- queries (hosts and tests) ----------------------------------------------------------------
+' A chip's rect, client-local (after the scroll).
+public function tkTokenBox_GetChipRect( byval h as TK_WIDGET ptr, byval idx as long, byref rc as TKRECT ) as boolean
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    tkRect_SetEmpty( rc )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nTokens) then return false
+    if p->bLayoutDirty then TkLayout( p )
+    dim as TKRECT rcX
+    TkChipRects( p, idx, rc, rcX )
+    return true
+end function
+
+public function tkTokenBox_GetChipCloseRect( byval h as TK_WIDGET ptr, byval idx as long, byref rc as TKRECT ) as boolean
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    tkRect_SetEmpty( rc )
+    if (p = 0) orelse (idx < 0) orelse (idx >= p->nTokens) then return false
+    if p->bLayoutDirty then TkLayout( p )
+    dim as TKRECT rcChip
+    TkChipRects( p, idx, rcChip, rc )
+    return true
+end function
+
+public function tkTokenBox_GetFocusedChip( byval h as TK_WIDGET ptr ) as long
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    return iif( p <> 0, p->nFocusChip, -1 )
+end function
+
+public function tkTokenBox_IsSuggesting( byval h as TK_WIDGET ptr ) as boolean
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    return (p <> 0) andalso tkItemPopup_IsOpen( p->pop )
+end function
+
+' The suggestion list (a tkListTree; 0 while closed) and its popup.
+public function tkTokenBox_GetSuggestList( byval h as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then return 0
+    return tkItemPopup_GetList( p->pop )
+end function
+
+public function tkTokenBox_GetSuggestHost( byval h as TK_WIDGET ptr ) as TK_HOST ptr
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then return 0
+    return tkItemPopup_GetHost( p->pop )
+end function
+
+
+' ---- colours ----------------------------------------------------------------------------------
+public sub tkTokenBox_GetColors( byval h as TK_WIDGET ptr, byval pColors as TKTOKENBOX_COLORS ptr )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p <> 0) andalso (pColors <> 0) then *pColors = p->colors
+end sub
+
+public sub tkTokenBox_SetColors( byval h as TK_WIDGET ptr, byval pColors as TKTOKENBOX_COLORS ptr )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    TkEditColors( p )
+    tkWidget_Invalidate( h )
+end sub
+
+public sub tkTokenBox_ApplyTheme( byval hBox as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKTOKENBOX_STATE ptr p = TBX( hBox )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hBox, t )
+    p->colors = tkTokenBox_ThemeColors( tr )
+    tkTheme_ResolveInto( hBox, tr, cast( ulong ptr, @p->colors ), sizeof( TKTOKENBOX_COLORS ) \ 4, "TokenBox" )
+    TkEditColors( p )
+    tkWidget_Invalidate( hBox )
+end sub
+
+public sub tkTokenBox_UnpinColors( byval h as TK_WIDGET ptr )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkTokenBox_ApplyTheme( h, tkTheme_Of( h ) )
+end sub
+
+
+' ---- callbacks (0 removes) --------------------------------------------------------------------
+' A paint callback's way to draw a chip as it would have been drawn, then add to it.
+public sub tkTokenBox_PaintChipDefault( byval ci as TKTOKENBOX_CHIPINFO ptr )
+    if ci = 0 then exit sub
+    dim as TKTOKENBOX_STATE ptr p = TBX( ci->hBox )
+    if p then TkRenderChip( p, ci )
+end sub
+
+public sub tkTokenBox_SetPaintCallback( byval h as TK_WIDGET ptr, byval usersub as TKB_ChipPaintCallbackSub )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->PaintCallback = usersub : tkWidget_Invalidate( h )
+end sub
+
+public sub tkTokenBox_SetTokenAddingCallback( byval h as TK_WIDGET ptr, byval userfunc as TKB_TokenAddingCallbackFunc )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->TokenAddingCallback = userfunc
+end sub
+
+public sub tkTokenBox_SetTokenRemovingCallback( byval h as TK_WIDGET ptr, byval userfunc as TKB_TokenRemovingCallbackFunc )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->TokenRemovingCallback = userfunc
+end sub
+
+public sub tkTokenBox_SetTokensChangedCallback( byval h as TK_WIDGET ptr, byval usersub as TKB_NotifyCallbackSub )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->TokensChangedCallback = usersub
+end sub
+
+public sub tkTokenBox_SetInputChangedCallback( byval h as TK_WIDGET ptr, byval usersub as TKB_NotifyCallbackSub )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->InputChangedCallback = usersub
+end sub
+
+public sub tkTokenBox_SetChipClickCallback( byval h as TK_WIDGET ptr, byval usersub as TKB_ChipClickCallbackSub )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->ChipClickCallback = usersub
+end sub
+
+public sub tkTokenBox_SetSuggestCallback( byval h as TK_WIDGET ptr, byval usersub as TKB_SuggestCallbackSub )
+    dim as TKTOKENBOX_STATE ptr p = TBX( h )
+    if p then p->SuggestCallback = usersub
+end sub

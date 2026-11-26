@@ -1,0 +1,389 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rcodegen -- a .tkreport to the plain tiko of its .design.tiko (Report Designer RD4; claude-docs
+' docs/tkReportDesigner/SPEC.md "Generated code"). The layout stays the file -- #embed'ded and read
+' at run time by tkReportDef -- so the generated code is only what must be TYPED:
+'   - the report's parameters as fields of their tiko types, starting at their defaults;
+'   - per array source, a row count and a value-by-field procedure over Array( of <item_type> )
+'     (tkBind_ToValue picks each field's kind from its type), bound by Set<Source>( rows ) -- or
+'     filled from items_source when the program does not call it; a child source over its master's
+'     <relation> field;
+'   - SetDatabase (sqlite sources), Set<Source>Grid (grid), Set<Source>Source (host);
+'   - CreateDoc, ShowIn (a tkReportViewer, with the parameter strip), ExportPdf;
+'   - [report.events] as members the program writes in its own half of `partial type Report`.
+' The same file always gives the same text: stable order, no timestamps, LF line ends.
+#module "rcodegen"
+
+#import "std/containers"
+#import "vendor/tkControls/tkReportDef"
+#import "../codegen"
+#import "../validate"
+using containers
+using tkReportDef
+using tkReport
+using tkBind
+
+const as string NL = chr( 10 )
+
+private function IsIdent_( byref s as const ustring ) as boolean
+    if len( s ) = 0 then return false
+    for i as long = 1 to len( s )
+        dim as ustring c = lcase( mid( s, i, 1 ) )
+        if (c >= "a") andalso (c <= "z") then continue for
+        if c = "_" then continue for
+        if (i > 1) andalso (c >= "0") andalso (c <= "9") then continue for
+        return false
+    next
+    return true
+end function
+
+' ident(.ident)* -- a field path of a record
+private function IsPath_( byref s as const ustring ) as boolean
+    dim as ustring rest = s & "."
+    do
+        dim as long d = instr( rest, "." )
+        if d = 0 then exit do
+        if IsIdent_( left( rest, d - 1 ) ) = false then return false
+        rest = mid( rest, d + 1 )
+    loop while len( rest )
+    return true
+end function
+
+' A tiko string literal.
+private function Lit_( byref s as const ustring ) as ustring
+    dim as ustring o = """"
+    for i as long = 1 to len( s )
+        dim as ustring c = mid( s, i, 1 )
+        if c = """" then
+            o &= """"""
+        elseif asc( c ) < 32 then
+            o &= """ & chr( " & asc( c ) & " ) & """
+        else
+            o &= c
+        end if
+    next
+    return o & """"
+end function
+
+private function TikoType_( byval k as int32 ) as ustring
+    select case k
+    case TKV_INT : return "int64"
+    case TKV_FLOAT : return "float64"
+    case TKV_BOOL : return "boolean"
+    case TKV_DATE : return "TKDATE"
+    case TKV_TIME : return "TKTIME"
+    end select
+    return "ustring"
+end function
+
+private function Setter_( byval k as int32 ) as ustring
+    select case k
+    case TKV_INT : return "SetInt"
+    case TKV_FLOAT : return "SetFloat"
+    case TKV_BOOL : return "SetBool"
+    case TKV_DATE : return "SetDate"
+    case TKV_TIME : return "SetTime"
+    end select
+    return "SetText"
+end function
+
+private function Member_( byval k as int32 ) as ustring
+    select case k
+    case TKV_INT : return "i"
+    case TKV_FLOAT : return "f"
+    case TKV_BOOL : return "b"
+    case TKV_DATE : return "d"
+    case TKV_TIME : return "t"
+    end select
+    return "s"
+end function
+
+' The members every generated report has; a parameter or event handler can't take one of them.
+private function Reserved_( byref n as const ustring ) as boolean
+    select case lcase( n )
+    case "definition", "createdoc", "showin", "exportpdf", "setdatabase", "prepare_", "def_", "loaderrors", "report"
+        return true
+    end select
+    return false
+end function
+
+' A Set... member the report has for one of its sources.
+private function SetterName_( byval def as TK_REPORTDEF ptr, byref n as const ustring ) as boolean
+    dim as ustring l = lcase( n )
+    for i as int32 = 0 to def->nSources - 1
+        dim as ustring s = "set" & lcase( def->sources(i).name_ )
+        if (l = s) orelse (l = s & "grid") orelse (l = s & "source") then return true
+    next
+    return false
+end function
+
+' Problems that stop the definition from being generated; none when it can be.
+public sub Check( byval def as TK_REPORTDEF ptr, byref moduleName as const ustring, byref problems as Array( of ustring ) )
+    if IsIdent_( moduleName ) = false then problems.Push( "the report's module name '" & moduleName & "' is not a name" )
+    for i as int32 = 0 to def->nParams - 1
+        dim as ustring n = def->params(i).name_
+        if IsIdent_( n ) = false then
+            problems.Push( "parameter '" & n & "': not a name a field can have" )
+        elseif validate.IsReserved( n ) then
+            ' its field would not compile ("To = v_.d": TKO0408)
+            problems.Push( "parameter '" & n & "': a reserved word of tiko can't name the report's field" )
+        elseif Reserved_( n ) orelse SetterName_( def, n ) then
+            problems.Push( "parameter '" & n & "': the name is a member the report already has" )
+        end if
+    next
+    for i as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(i)
+        if (s.kind = "array") orelse (s.kind = "grid") orelse (s.kind = "host") then
+            if IsIdent_( s.name_ ) = false then problems.Push( "source '" & s.name_ & "': a " & s.kind & " source's name must be a name (it names Set" & s.name_ & ")" )
+        end if
+        if s.kind = "array" then
+            if len( s.itemType ) = 0 then problems.Push( "source '" & s.name_ & "': an array source needs its item_type" )
+            if s.nFields = 0 then problems.Push( "source '" & s.name_ & "': an array source lists its fields ([[source.field]])" )
+            for f as int32 = 0 to s.nFields - 1
+                if IsPath_( s.fields(f).name_ ) = false then problems.Push( "source '" & s.name_ & "': field '" & s.fields(f).name_ & "' is not a field of a record" )
+            next
+            if len( s.parent ) then
+                dim as int32 m = tkReportDef_FindSource( def, s.parent )
+                if (m >= 0) andalso (def->sources(m).kind <> "array") then problems.Push( "source '" & s.name_ & "': an array child needs an array master" )
+                if IsPath_( s.relation ) = false then problems.Push( "source '" & s.name_ & "': an array child needs its relation (the master's Array field)" )
+                if len( s.itemsSource ) then problems.Push( "source '" & s.name_ & "': a child comes from its relation, not items_source" )
+            end if
+        elseif s.kind = "listtree" then
+            problems.Push( "source '" & s.name_ & "': a listtree source is not generated yet" )
+        end if
+    next
+    for i as int32 = 0 to def->nEvents - 1
+        dim as ustring h = def->evHandlers(i)
+        if IsIdent_( h ) = false then problems.Push( "event " & def->evNames(i) & ": handler '" & h & "' is not a name" )
+        if Reserved_( h ) then problems.Push( "event " & def->evNames(i) & ": handler '" & h & "' is a member of every report" )
+    next
+end sub
+
+private function HasKind_( byval def as TK_REPORTDEF ptr, byref k as const string ) as boolean
+    for i as int32 = 0 to def->nSources - 1
+        if def->sources(i).kind = k then return true
+    next
+    return false
+end function
+
+private function Handler_( byval def as TK_REPORTDEF ptr, byref ev as const string ) as ustring
+    for i as int32 = 0 to def->nEvents - 1
+        if def->evNames(i) = ev then return def->evHandlers(i)
+    next
+    return ""
+end function
+
+private function ArrType_( byref t as const ustring ) as ustring
+    return "Array( of " & t & " )"
+end function
+
+' The value procedure's body: one case per field, in the file's order.
+private sub ValueCases_( byref o as ustring, byref s as TKRD_SOURCE )
+    o &= "    select case f" & NL
+    for f as int32 = 0 to s.nFields - 1
+        o &= "    case " & f & " : tkBind_ToValue( r_." & s.fields(f).name_ & ", @v )" & NL
+    next
+    o &= "    end select" & NL
+end sub
+
+' The text of <moduleName>.design.tiko for a definition that passed Check.
+public function Generate( byval def as TK_REPORTDEF ptr, byref moduleName as const ustring, byref sourceName as const ustring, _
+                          byref sourceText as const ustring ) as ustring
+    dim as ustring o
+    dim as boolean hasArray = HasKind_( def, "array" ), hasSql = HasKind_( def, "sqlite" ), hasGrid = HasKind_( def, "grid" )
+    dim as ustring hBefore = Handler_( def, "BeforePrint" ), hPaint = Handler_( def, "PaintItem" )
+    dim as boolean hasEvents = (len( hBefore ) > 0) orelse (len( hPaint ) > 0)
+    o = "' GENERATED by the tkEdit Report Designer from " & sourceName & ". Do not edit." & NL
+    o &= "' source-hash: " & codegen.SourceHash( sourceText ) & NL
+    o &= "#module """ & moduleName & """" & NL & NL
+    o &= "#import ""vendor/tkControls/tkReportDef""" & NL
+    o &= "#import ""vendor/tkControls/tkReportViewer""" & NL
+    o &= "#import ""vendor/tkControls/tkPdf""" & NL
+    if hasSql then o &= "#import ""vendor/tkControls/tkReportSqlite""" & NL & "#import ""vendor/sqlite3""" & NL
+    if hasGrid then o &= "#import ""vendor/tkControls/tkReportGrid""" & NL
+    if hasArray then
+        o &= "#import ""std/containers""" & NL
+        if len( def->dataModule ) then o &= "#import """ & def->dataModule & """" & NL
+    end if
+    o &= NL & "using tkReportDef" & NL & "using tkReport" & NL & "using tkReportViewer" & NL & "using tkBind" & NL
+    o &= "using tkPrint" & NL & "using tkPdf" & NL & "using tkHost" & NL & "using tkPaint" & NL & "using tkCalendar" & NL & "using tkTimePanel" & NL
+    if hasSql then o &= "using tkReportSqlite" & NL
+    if hasGrid then o &= "using tkReportGrid" & NL
+    if hasArray then o &= "using containers" & NL
+    o &= NL & "#embed " & moduleName & "_Layout_ """ & sourceName & """" & NL & NL
+
+    ' ---- the type ----
+    o &= "public partial type Report" & NL
+    for i as int32 = 0 to def->nParams - 1
+        o &= "    " & def->params(i).name_ & " as " & TikoType_( def->params(i).kind ) & NL
+    next
+    o &= "    declare constructor( )" & NL
+    o &= "    declare destructor( )" & NL
+    for i as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(i)
+        select case s.kind
+        case "array"
+            if len( s.parent ) = 0 then o &= "    declare sub Set" & s.name_ & "( byref rows as " & ArrType_( s.itemType ) & " )" & NL
+        case "grid"
+            o &= "    declare sub Set" & s.name_ & "Grid( byval hGrid as TK_WIDGET ptr )" & NL
+        case "host"
+            o &= "    declare sub Set" & s.name_ & "Source( byref src as TKREPORT_SOURCE )" & NL
+        end select
+    next
+    if hasSql then o &= "    declare sub SetDatabase( byval db as sqlite3 ptr )" & NL
+    o &= "    declare function Definition( ) as TK_REPORTDEF ptr" & NL
+    o &= "    declare function CreateDoc( byref errs as ustring ) as TK_PRINTDOC ptr" & NL
+    o &= "    declare function ShowIn( byval hViewer as TK_WIDGET ptr ) as boolean" & NL
+    o &= "    declare function ExportPdf( byref path as ustring, byref errs as ustring ) as boolean" & NL
+    if len( hBefore ) then o &= "    declare function " & hBefore & "( byval band as TK_RBAND ptr, byval row as TK_VALUE ptr ) as boolean" & NL
+    if len( hPaint ) then o &= "    declare sub " & hPaint & "( byval item as TKREPORT_ITEM ptr, byval pg as TK_PAGE ptr, byref rc as TKRECTF, byval row as TK_VALUE ptr )" & NL
+    o &= "    declare sub Prepare_( )" & NL
+    o &= "    def_ as TK_REPORTDEF ptr" & NL
+    o &= "    loadErrors as ustring" & NL
+    for i as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(i)
+        if (s.kind = "array") andalso (len( s.parent ) = 0) andalso (len( s.itemsSource ) > 0) then
+            o &= "    " & s.name_ & "_Rows_ as " & ArrType_( s.itemType ) & NL
+            o &= "    " & s.name_ & "_Host_ as boolean" & NL
+        end if
+    next
+    o &= "end type" & NL
+
+    ' ---- array adapters ----
+    for i as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(i)
+        if s.kind <> "array" then continue for
+        if len( s.parent ) = 0 then
+            dim as ustring at = ArrType_( s.itemType )
+            o &= NL & "private function " & s.name_ & "_Count_( byval p as any ptr ) as int32" & NL
+            o &= "    return cast( " & at & " ptr, p )->Count( )" & NL & "end function" & NL
+            o &= NL & "private sub " & s.name_ & "_Value_( byval p as any ptr, byval row as int32, byval f as int32, byref v as TK_VALUE )" & NL
+            o &= "    dim byref as " & at & " a_ = *cast( " & at & " ptr, p )" & NL
+            o &= "    dim byref as " & s.itemType & " r_ = a_[row]" & NL
+            ValueCases_( o, s )
+            o &= "end sub" & NL
+        else
+            dim as int32 m = tkReportDef_FindSource( def, s.parent )
+            dim as ustring at = ArrType_( def->sources(m).itemType )
+            o &= NL & "private function " & s.name_ & "_Count_( byval p as any ptr, byval m as int32 ) as int32" & NL
+            o &= "    dim byref as " & at & " a_ = *cast( " & at & " ptr, p )" & NL
+            o &= "    return a_[m]." & s.relation & ".Count( )" & NL & "end function" & NL
+            o &= NL & "private sub " & s.name_ & "_Value_( byval p as any ptr, byval m as int32, byval row as int32, byval f as int32, byref v as TK_VALUE )" & NL
+            o &= "    dim byref as " & at & " a_ = *cast( " & at & " ptr, p )" & NL
+            o &= "    dim byref as " & s.itemType & " r_ = a_[m]." & s.relation & "[row]" & NL
+            ValueCases_( o, s )
+            o &= "end sub" & NL
+        end if
+    next
+
+    ' ---- events ----
+    if hasEvents then
+        if len( hBefore ) then
+            o &= NL & "private function " & moduleName & "_BeforePrint_( byval rpt as TK_REPORT ptr, byval band as TK_RBAND ptr, byval row as TK_VALUE ptr ) as boolean" & NL
+            o &= "    dim as Report ptr me_ = tkReport_GetUserData( rpt )" & NL
+            o &= "    if me_ = 0 then return true" & NL
+            o &= "    return me_->" & hBefore & "( band, row )" & NL & "end function" & NL
+        end if
+        if len( hPaint ) then
+            o &= NL & "private sub " & moduleName & "_PaintItem_( byval rpt as TK_REPORT ptr, byval item as TKREPORT_ITEM ptr, byval pg as TK_PAGE ptr, _" & NL
+            o &= "                    byref rc as TKRECTF, byval row as TK_VALUE ptr )" & NL
+            o &= "    dim as Report ptr me_ = tkReport_GetUserData( rpt )" & NL
+            o &= "    if me_ then me_->" & hPaint & "( item, pg, rc, row )" & NL & "end sub" & NL
+        end if
+        o &= NL & "private sub " & moduleName & "_Made_( byval def as TK_REPORTDEF ptr, byval rpt as TK_REPORT ptr, byval pUser as any ptr )" & NL
+        o &= "    tkReport_SetUserData( rpt, pUser )" & NL
+        if len( hBefore ) then o &= "    tkReport_SetBeforePrintCallback( rpt, @" & moduleName & "_BeforePrint_ )" & NL
+        if len( hPaint ) then o &= "    tkReport_SetPaintItemCallback( rpt, @" & moduleName & "_PaintItem_ )" & NL
+        o &= "end sub" & NL
+    end if
+
+    ' ---- the members ----
+    o &= NL & "constructor Report( )" & NL
+    o &= "    dim as ustring errs" & NL
+    o &= "    def_ = tkReportDef_LoadBytes( @" & moduleName & "_Layout_(0), ubound( " & moduleName & "_Layout_ ) + 1, errs )" & NL
+    o &= "    loadErrors = errs" & NL
+    o &= "    if def_ = 0 then exit constructor" & NL
+    if def->nParams > 0 then
+        o &= "    dim as TK_VALUE v_" & NL
+        for i as int32 = 0 to def->nParams - 1
+            o &= "    tkReportDef_GetParam( def_, " & i & ", v_ )" & NL
+            o &= "    " & def->params(i).name_ & " = v_." & Member_( def->params(i).kind ) & NL
+        next
+    end if
+    o &= "end constructor" & NL
+    o &= NL & "destructor Report( )" & NL & "    tkReportDef_Destroy( def_ )" & NL & "end destructor" & NL
+    for i as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(i)
+        select case s.kind
+        case "array"
+            if len( s.parent ) then continue for
+            o &= NL & "sub Report.Set" & s.name_ & "( byref rows as " & ArrType_( s.itemType ) & " )" & NL
+            if len( s.itemsSource ) then o &= "    " & s.name_ & "_Host_ = true" & NL
+            o &= "    tkReportDef_BindArray( def_, " & Lit_( s.name_ ) & ", @rows, @" & s.name_ & "_Count_, @" & s.name_ & "_Value_ )" & NL
+            for c as int32 = 0 to def->nSources - 1
+                dim byref as TKRD_SOURCE k = def->sources(c)
+                if (k.kind = "array") andalso (lcase( k.parent ) = lcase( s.name_ )) then
+                    o &= "    tkReportDef_BindArrayChild( def_, " & Lit_( k.name_ ) & ", @rows, @" & k.name_ & "_Count_, @" & k.name_ & "_Value_ )" & NL
+                end if
+            next
+            o &= "end sub" & NL
+        case "grid"
+            o &= NL & "sub Report.Set" & s.name_ & "Grid( byval hGrid as TK_WIDGET ptr )" & NL
+            o &= "    tkReportGrid_BindDef( def_, " & Lit_( s.name_ ) & ", hGrid )" & NL & "end sub" & NL
+        case "host"
+            o &= NL & "sub Report.Set" & s.name_ & "Source( byref src as TKREPORT_SOURCE )" & NL
+            o &= "    tkReportDef_BindSource( def_, " & Lit_( s.name_ ) & ", src )" & NL & "end sub" & NL
+        end select
+    next
+    if hasSql then
+        o &= NL & "sub Report.SetDatabase( byval db as sqlite3 ptr )" & NL
+        for i as int32 = 0 to def->nSources - 1
+            if def->sources(i).kind = "sqlite" then o &= "    tkReportSqlite_BindDef( def_, " & Lit_( def->sources(i).name_ ) & ", db )" & NL
+        next
+        o &= "end sub" & NL
+    end if
+    o &= NL & "function Report.Definition( ) as TK_REPORTDEF ptr" & NL & "    return def_" & NL & "end function" & NL
+    ' Prepare_: the parameters into the definition, items_source rows, the event handlers
+    o &= NL & "sub Report.Prepare_( )" & NL
+    o &= "    if def_ = 0 then exit sub" & NL
+    if def->nParams > 0 then o &= "    dim as TK_VALUE v_" & NL
+    for i as int32 = 0 to def->nParams - 1
+        dim byref as TKRD_PARAM pr = def->params(i)
+        o &= "    v_." & Setter_( pr.kind ) & "( " & pr.name_ & " )" & NL
+        o &= "    tkReportDef_SetParam( def_, " & Lit_( pr.name_ ) & ", v_ )" & NL
+    next
+    for i as int32 = 0 to def->nSources - 1
+        dim byref as TKRD_SOURCE s = def->sources(i)
+        if (s.kind <> "array") orelse (len( s.parent ) > 0) orelse (len( s.itemsSource ) = 0) then continue for
+        o &= "    if " & s.name_ & "_Host_ = false then" & NL
+        o &= "        " & s.name_ & "_Rows_ = " & s.itemsSource & NL
+        o &= "        Set" & s.name_ & "( " & s.name_ & "_Rows_ )" & NL
+        o &= "        " & s.name_ & "_Host_ = false" & NL
+        o &= "    end if" & NL
+    next
+    if hasEvents then o &= "    tkReportDef_SetReportMadeCallback( def_, @" & moduleName & "_Made_, @this )" & NL
+    o &= "end sub" & NL
+    o &= NL & "function Report.CreateDoc( byref errs as ustring ) as TK_PRINTDOC ptr" & NL
+    o &= "    if def_ = 0 then" & NL & "        errs = loadErrors" & NL & "        return 0" & NL & "    end if" & NL
+    o &= "    Prepare_( )" & NL
+    o &= "    return tkReportDef_CreateDoc( def_, errs )" & NL & "end function" & NL
+    o &= NL & "' Shown in a tkReportViewer, with the parameter strip. The report must outlive the viewer's use." & NL
+    o &= "function Report.ShowIn( byval hViewer as TK_WIDGET ptr ) as boolean" & NL
+    o &= "    if def_ = 0 then return false" & NL
+    o &= "    Prepare_( )" & NL
+    o &= "    tkReportViewer_SetReportDef( hViewer, def_ )" & NL
+    o &= "    return tkReportDef_GetReport( def_ ) <> 0" & NL & "end function" & NL
+    o &= NL & "function Report.ExportPdf( byref path as ustring, byref errs as ustring ) as boolean" & NL
+    o &= "    dim as TK_PRINTDOC ptr doc = CreateDoc( errs )" & NL
+    o &= "    if doc = 0 then return false" & NL
+    o &= "    tkPrintDoc_Generate( doc )" & NL
+    o &= "    dim as boolean ok = tkPrintDoc_ExportPdf( doc, path )" & NL
+    o &= "    tkPrintDoc_Destroy( doc )" & NL
+    o &= "    return ok" & NL & "end function" & NL
+    return o
+end function

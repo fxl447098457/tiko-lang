@@ -135,6 +135,58 @@ end sub
 
 #endif
 
+#ifdef __FB_ANDROID__
+'' AN APP'S OWN FILES ARE ITS APK'S ASSETS (docs/tiko-android A6 step 2, D-A6-2), which fopen
+'' cannot open: only Android's asset manager can, through SDL. src/c/fbrtapp.c, linked only into
+'' an app, sets this to its asset opener. A READ-ONLY open of a RELATIVE path that fopen did not
+'' find falls back to it, so 'open "data.txt" for input' reads the asset when the working
+'' directory (the app's storage) has no such file; a file there wins. Writes, read/write opens
+'' and absolute paths never fall back. NULL in a program that is not an app.
+type TkortAssetOpen as function cdecl( byval p as const zstring ptr ) as FILE ptr
+dim shared as TkortAssetOpen tkort_appAssetOpen
+
+extern "c"   '' NON-FBCALL: internal to tiko-rt, for src/c/fbrtapp.c; fbc has no such entry.
+sub tkort_SetAppAssetOpen alias "tkort_SetAppAssetOpen" ( byval fn as TkortAssetOpen )
+	tkort_appAssetOpen = fn
+end sub
+end extern
+
+'' THE SAME FALLBACK AS A FILE DESCRIPTOR, for what opens with open(2) rather than fopen: fs/ops
+'' (ReadAllText, ReadAllBytes, CopyFile's source) and std/fs's File.Open, each after a read-only
+'' open of a relative path failed. fbrtapp copies the asset once into an unlinked file in the
+'' app's cache, so the descriptor is a regular, seekable file. -1, errno as it was, when there is
+'' no such asset or the program is not an app.
+type TkortAssetFd as function cdecl( byval p as const zstring ptr ) as int32
+dim shared as TkortAssetFd tkort_appAssetFdFn
+
+extern "c"   '' NON-FBCALL: internal to tiko-rt and std/fs, for src/c/fbrtapp.c; fbc has no such entry.
+sub tkort_SetAppAssetFd alias "tkort_SetAppAssetFd" ( byval fn as TkortAssetFd )
+	tkort_appAssetFdFn = fn
+end sub
+
+function tkort_AppAssetFd alias "tkort_AppAssetFd" ( byval p as const zstring ptr ) as int32
+	if( (tkort_appAssetFdFn = nullptr) orelse (p = nullptr) ) then return -1
+	dim as const uint8 ptr pb = cptr( const uint8 ptr, p )
+	if( (pb[0] = 0) orelse (pb[0] = asc( "/" )) ) then return -1
+	return tkort_appAssetFdFn( p )
+end function
+end extern
+
+'' "r", "rb", "rt": read only. "r+b" and every "w"/"a" mode write.
+private function hAssetMode( byval p as const zstring ptr, byval m as const zstring ptr ) as boolean
+	if( (tkort_appAssetOpen = nullptr) orelse (p = nullptr) orelse (m = nullptr) ) then return false
+	dim as const uint8 ptr pb = cptr( const uint8 ptr, p ), mb = cptr( const uint8 ptr, m )
+	if( (pb[0] = 0) orelse (pb[0] = asc( "/" )) ) then return false
+	if( mb[0] <> asc( "r" ) ) then return false
+	dim as integer i = 1
+	while( mb[i] <> 0 )
+		if( mb[i] = asc( "+" ) ) then return false
+		i += 1
+	wend
+	return true
+end function
+#endif
+
 function tkort_PathFopen alias "fb_hPathFopen" _
 	( byval p as const zstring ptr, byval m as const zstring ptr ) as FILE ptr
 	#ifdef __FB_WIN32__
@@ -144,6 +196,10 @@ function tkort_PathFopen alias "fb_hPathFopen" _
 		hWideMode( m, @wm, 16 )
 		dim as FILE ptr f = crt_wfopen( w, @wm )
 		free( w )
+		return f
+	#elseif defined( __FB_ANDROID__ )
+		dim as FILE ptr f = fopen( p, m )
+		if( (f = nullptr) andalso hAssetMode( p, m ) ) then f = tkort_appAssetOpen( p )
 		return f
 	#else
 		return fopen( p, m )
@@ -163,6 +219,12 @@ function tkort_PathFreopen alias "fb_hPathFreopen" _
 		hWideMode( m, @wm, 16 )
 		dim as FILE ptr r = crt_wfreopen( w, @wm, f )
 		free( w )
+		return r
+	#elseif defined( __FB_ANDROID__ )
+		'' OPEN FOR INPUT measures with "rb" and reopens with "rt": an asset stream is reopened
+		'' by opening the asset again (freopen has closed it, as it always does).
+		dim as FILE ptr r = freopen( p, m, f )
+		if( (r = nullptr) andalso hAssetMode( p, m ) ) then r = tkort_appAssetOpen( p )
 		return r
 	#else
 		return freopen( p, m, f )

@@ -25,7 +25,7 @@ dim as ustring dir_ = CreateTempDir( "tkdoc" ).Value( )
 dim as ustring p = PathJoin( dir_, "f.txt" )
 WriteAllText( p, "x" )
 dim as FsResultBool r = LChown( p, -1, -1 )
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
 print r.Failure( ).Message( )    '' unsupported
 #else
 print r.IsOk( )                  '' true

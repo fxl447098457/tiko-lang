@@ -1,0 +1,523 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkBarcode -- a 1D or 2D barcode (EAN, UPC, Code 128, Code 39, QR, Data Matrix, PDF417, Aztec ...),
+' encoded by libzint (vendor/zint) and painted here: whole-pixel modules on screen, quiet zones,
+' human-readable text (HRT) in the control's font, an explicit error state for data the symbology
+' refuses. The design is C:\dev\docs\tkControls\BARCODE.md; this is phase BC1.
+'
+' FOUR FILES, ONE MODULE (they sort in this order, and each needs the ones before):
+'   tkBarcode.tiko         the types, the symbologies, and the zint adapter (spec + data -> symbol)
+'   tkBarcodeLayout.tiko   screen: layout (FitMode, rotation, bar height, HRT) and painting, widgetless
+'   tkBarcodePage.tiko     paper: physical size, dot-snap, and the PDF / PNG / SVG / clipboard exports
+'   tkBarcodeWidget.tiko   the control and its public API
+'
+' ONLY THIS FILE SEES ZINT. Everything else works on TKBARCODE_SYMBOL: the symbol in MODULE UNITS
+' (one unit = one module; zint's vector at scale 0.5, measured in BC0), rects merged by zint into
+' runs, HRT runs where zint places them, and the module matrix for tests.
+#module "tkBarcode"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkPrint" public
+#import "../tkPdf" public
+#import "vendor/zint"
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkPrint
+using tkPdf
+
+' ==========================================================================================
+' Symbologies: tkBarcode's own numbering (BARCODE.md §3.1, D-2). zint's ids never leak out.
+' ==========================================================================================
+public enum
+    TKBC_EAN13 = 0
+    TKBC_EAN8
+    TKBC_UPCA
+    TKBC_UPCE
+    TKBC_ISBN
+    TKBC_CODE128
+    TKBC_GS1_128
+    TKBC_CODE39
+    TKBC_CODE39_EXT
+    TKBC_CODE93
+    TKBC_ITF
+    TKBC_ITF14
+    TKBC_CODABAR
+    TKBC_QR
+    TKBC_MICRO_QR
+    TKBC_DATAMATRIX
+    TKBC_GS1_DATAMATRIX
+    TKBC_PDF417
+    TKBC_PDF417_COMPACT
+    TKBC_AZTEC
+    TKBC_SYMBOLOGY_COUNT
+end enum
+
+' Per-symbology options (§3.2): tkBarcode_SetOption( h, TKBC_OPT_*, value ). 0 is always "zint's
+' default". An option a symbology does not use is ignored.
+public enum
+    TKBC_OPT_ECC = 0        ' QR / Micro QR 1-4 = L M Q H; PDF417 1-9 = level 0-8; Aztec 1-4
+    TKBC_OPT_SIZE           ' QR / Micro QR version; Data Matrix / Aztec size; PDF417 columns
+    TKBC_OPT_MASK           ' QR / Micro QR: 1-8 = mask 0-7
+    TKBC_OPT_DM_SQUARE      ' Data Matrix: <> 0 = square sizes only
+    TKBC_OPT_CHECK_DIGIT    ' Code 39 (+ext), ITF, Codabar: <> 0 adds the optional check character
+    TKBC_OPT_GS1            ' Code 128, Data Matrix, QR: <> 0 = GS1 data ("[01]..." or "(01)...")
+    TKBC_OPT_ESCAPES        ' <> 0: backslash escapes in the data (\d029, \n, \\ ...)
+    TKBC_OPT_ECI            ' 2D: an ECI number (0 = none / automatic)
+    TKBC_OPT_BEARER         ' ITF, ITF-14: TKBC_BEARER_*
+    TKBC_OPT_COUNT
+end enum
+
+public enum
+    TKBC_BEARER_DEFAULT = 0 ' ITF-14: a box (zint's default, 5 modules); ITF: none
+    TKBC_BEARER_BOX
+    TKBC_BEARER_TOPBOTTOM
+    TKBC_BEARER_NONE
+end enum
+
+public enum
+    TKBC_TEXT_NONE = 0
+    TKBC_TEXT_BELOW
+    TKBC_TEXT_ABOVE         ' 1D codes with one text run (not EAN / UPC, which are BELOW)
+end enum
+
+' Status: what the last encode gave. Warnings (< TKBC_ERR_FIRST) still draw a symbol.
+public enum
+    TKBC_OK = 0
+    TKBC_EMPTY              ' no data: nothing is drawn, and nothing is wrong
+    TKBC_WARN_ECI           ' zint chose an ECI for the data (UTF-8 into QR)
+    TKBC_WARN_OPTION        ' an option was out of range and zint replaced it
+    TKBC_WARN_NONCOMPLIANT  ' a symbol outside its standard (not GS1: GS1 is TKBC_ERR_NONCOMPLIANT)
+    TKBC_ERR_FIRST = 16
+    TKBC_ERR_TOO_LONG = 16
+    TKBC_ERR_INVALID_DATA
+    TKBC_ERR_INVALID_CHECK
+    TKBC_ERR_INVALID_OPTION
+    TKBC_ERR_NONCOMPLIANT   ' GS1 data zint only warns about (a bad GTIN check digit), D-14
+    TKBC_ERR_OTHER
+end enum
+
+' Pinned black on white by default (D-7): scanners need dark bars on a light ground, so a dark theme
+' does not invert the symbol. Border and Error follow the theme.
+public type TKBARCODE_COLORS
+    BackColor       as ulong = &hFFFFFFFFul
+    BarColor        as ulong = &hFF000000ul
+    TextColor       as ulong = &hFF000000ul
+    BorderColor     as ulong = &hFF969CA6ul
+    ErrorColor      as ulong = &hFFE06C75ul
+    ErrorBackColor  as ulong = &hFFFFFFFFul
+end type
+
+' Everything that decides WHAT is encoded. Look (fit, module size, rotation, colours) is separate.
+public type TKBARCODE_SPEC
+    nSymbology  as int32 = TKBC_CODE128
+    nZintRaw    as int32                     ' <> 0: this zint id instead of nSymbology (§3.3)
+    opts(0 to TKBC_OPT_COUNT - 1) as int32
+    bQuietZone  as boolean = true
+    nTextMode   as int32 = TKBC_TEXT_BELOW
+    wszCaption  as ustring                   ' "" = zint's HRT; else this text, one centred run
+    fBarHeight  as float32                   ' 1D bar height in modules; 0 = fill the height
+end type
+
+public type TKBC_RECT                         ' module units, origin = the symbol's top-left
+    x as float32
+    y as float32
+    w as float32
+    h as float32
+end type
+
+public type TKBC_HEX                          ' MaxiCode: centre, inscribed diameter, rotation
+    x as float32
+    y as float32
+    d as float32
+    rot as int32
+end type
+
+public type TKBC_RING                         ' MaxiCode's bullseye: centre, diameter, line width
+    x as float32
+    y as float32
+    d as float32
+    w as float32
+end type
+
+public type TKBC_TEXT                         ' an HRT run: x by halign, baseline y, zint's size
+    x as float32
+    y as float32
+    size as float32
+    halign as int32                           ' 0 centre, 1 left, 2 right (zint's)
+    s as ustring
+end type
+
+' The encoded symbol, in module units. bars span [fBarTop, fBarTop + fBarH] (1D: what a fill
+' stretches); rects below that (EAN guards, a bearer box) keep their module size.
+public type TKBARCODE_SYMBOL
+    nStatus    as int32 = TKBC_EMPTY
+    wszError   as ustring                     ' zint's message, verbatim (untranslated)
+    nZintId    as int32                       ' the zint symbology used
+    fDefaultXdimMm as float32                 ' zint's default X-dimension for it, mm (paper)
+    fTextBottom as float32                    ' the lowest HRT descent, module units (0 = no HRT)
+    nW         as float32                     ' size in modules, quiet zones included, HRT not
+    nH         as float32
+    b2D        as boolean
+    bEanUpc    as boolean
+    fBarTop    as float32
+    fBarH      as float32
+    nCols      as int32                       ' the module matrix (zint's rows x width)
+    nRows      as int32
+    fQzLeft    as float32                     ' where matrix column 0 / row 0 lies, in modules
+    fQzTop     as float32
+    bits(any)  as ubyte                       ' nRows * nCols, row-major, 1 = dark
+    rects(any) as TKBC_RECT
+    hexes(any) as TKBC_HEX
+    rings(any) as TKBC_RING
+    texts(any) as TKBC_TEXT
+    nRects     as int32
+    nHexes     as int32
+    nRings     as int32
+    nTexts     as int32
+end type
+
+' ==========================================================================================
+' The symbology table
+' ==========================================================================================
+public function tkBarcode_ZintId( byval nSym as int32 ) as int32
+    select case nSym
+    case TKBC_EAN13:           return BARCODE_EAN13
+    case TKBC_EAN8:            return BARCODE_EAN8
+    case TKBC_UPCA:            return BARCODE_UPCA
+    case TKBC_UPCE:            return BARCODE_UPCE
+    case TKBC_ISBN:            return BARCODE_ISBNX
+    case TKBC_CODE128:         return BARCODE_CODE128
+    case TKBC_GS1_128:         return BARCODE_GS1_128
+    case TKBC_CODE39:          return BARCODE_CODE39
+    case TKBC_CODE39_EXT:      return BARCODE_EXCODE39
+    case TKBC_CODE93:          return BARCODE_CODE93
+    case TKBC_ITF:             return BARCODE_C25INTER
+    case TKBC_ITF14:           return BARCODE_ITF14
+    case TKBC_CODABAR:         return BARCODE_CODABAR
+    case TKBC_QR:              return BARCODE_QRCODE
+    case TKBC_MICRO_QR:        return BARCODE_MICROQR
+    case TKBC_DATAMATRIX:      return BARCODE_DATAMATRIX
+    case TKBC_GS1_DATAMATRIX:  return BARCODE_DATAMATRIX
+    case TKBC_PDF417:          return BARCODE_PDF417
+    case TKBC_PDF417_COMPACT:  return BARCODE_PDF417COMP
+    case TKBC_AZTEC:           return BARCODE_AZTEC
+    end select
+    return 0
+end function
+
+public function tkBarcode_SymbologyName( byval nSym as int32 ) as ustring
+    select case nSym
+    case TKBC_EAN13:           return "EAN-13"
+    case TKBC_EAN8:            return "EAN-8"
+    case TKBC_UPCA:            return "UPC-A"
+    case TKBC_UPCE:            return "UPC-E"
+    case TKBC_ISBN:            return "ISBN"
+    case TKBC_CODE128:         return "Code 128"
+    case TKBC_GS1_128:         return "GS1-128"
+    case TKBC_CODE39:          return "Code 39"
+    case TKBC_CODE39_EXT:      return "Code 39 Extended"
+    case TKBC_CODE93:          return "Code 93"
+    case TKBC_ITF:             return "ITF"
+    case TKBC_ITF14:           return "ITF-14"
+    case TKBC_CODABAR:         return "Codabar"
+    case TKBC_QR:              return "QR Code"
+    case TKBC_MICRO_QR:        return "Micro QR"
+    case TKBC_DATAMATRIX:      return "Data Matrix"
+    case TKBC_GS1_DATAMATRIX:  return "GS1 DataMatrix"
+    case TKBC_PDF417:          return "PDF417"
+    case TKBC_PDF417_COMPACT:  return "Compact PDF417"
+    case TKBC_AZTEC:           return "Aztec"
+    end select
+    return ""
+end function
+
+' A sample the symbology accepts: the design canvas's placeholder (§10.3) and the demo's.
+public function tkBarcode_SampleData( byval nSym as int32 ) as ustring
+    select case nSym
+    case TKBC_EAN13:           return "5901234123457"
+    case TKBC_EAN8:            return "96385074"
+    case TKBC_UPCA:            return "725272730706"
+    case TKBC_UPCE:            return "01234565"
+    case TKBC_ISBN:            return "9789295055124"
+    case TKBC_CODE128:         return "tiko-lang.net"
+    case TKBC_GS1_128:         return "[01]09501101530003[17]140704[10]AB-123"
+    case TKBC_CODE39:          return "TIKO-39"
+    case TKBC_CODE39_EXT:      return "tiko-39"
+    case TKBC_CODE93:          return "TIKO93"
+    case TKBC_ITF:             return "12345678"
+    case TKBC_ITF14:           return "15400141288763"
+    case TKBC_CODABAR:         return "A40156B"
+    case TKBC_QR:              return "https://tiko-lang.net"
+    case TKBC_MICRO_QR:        return "01234567"
+    case TKBC_DATAMATRIX:      return "tiko Data Matrix"
+    case TKBC_GS1_DATAMATRIX:  return "[01]09501101530003[17]140704[10]AB-123"
+    case TKBC_PDF417:          return "tiko PDF417"
+    case TKBC_PDF417_COMPACT:  return "tiko PDF417"
+    case TKBC_AZTEC:           return "tiko Aztec"
+    end select
+    return ""
+end function
+
+public function tkBarcode_Is2D( byval nSym as int32 ) as boolean
+    select case nSym
+    case TKBC_QR, TKBC_MICRO_QR, TKBC_DATAMATRIX, TKBC_GS1_DATAMATRIX, TKBC_PDF417, TKBC_PDF417_COMPACT, TKBC_AZTEC
+        return true
+    end select
+    return false
+end function
+
+private function IsEanUpc( byval nSym as int32 ) as boolean
+    select case nSym
+    case TKBC_EAN13, TKBC_EAN8, TKBC_UPCA, TKBC_UPCE, TKBC_ISBN
+        return true
+    end select
+    return false
+end function
+
+' zint's default X-dimension in mm (BC0: EAN 0.33, Code 128 0.495, QR 0.625 ...); 0 if unknown.
+public function tkBarcode_DefaultXdimMm( byval nSym as int32 ) as float32
+    dim as int32 id = tkBarcode_ZintId( nSym )
+    if id = 0 then return 0
+    return ZBarcode_Default_Xdim( id )
+end function
+
+' ==========================================================================================
+' The adapter
+' ==========================================================================================
+private function StatusOf( byval rc as int32, byval bGs1 as boolean ) as int32
+    select case rc
+    case 0:                           return TKBC_OK
+    case ZINT_WARN_USES_ECI:          return TKBC_WARN_ECI
+    case ZINT_WARN_INVALID_OPTION:    return TKBC_WARN_OPTION
+    case ZINT_WARN_HRT_TRUNCATED:     return TKBC_WARN_NONCOMPLIANT
+    case ZINT_WARN_NONCOMPLIANT:      return iif( bGs1, TKBC_ERR_NONCOMPLIANT, TKBC_WARN_NONCOMPLIANT )
+    case ZINT_ERROR_TOO_LONG:         return TKBC_ERR_TOO_LONG
+    case ZINT_ERROR_INVALID_DATA:     return TKBC_ERR_INVALID_DATA
+    case ZINT_ERROR_INVALID_CHECK:    return TKBC_ERR_INVALID_CHECK
+    case ZINT_ERROR_INVALID_OPTION:   return TKBC_ERR_INVALID_OPTION
+    case ZINT_ERROR_NONCOMPLIANT:     return TKBC_ERR_NONCOMPLIANT
+    end select
+    return TKBC_ERR_OTHER
+end function
+
+private sub ClearSymbol( byref sym as TKBARCODE_SYMBOL )
+    sym.wszError = ""
+    sym.nW = 0 : sym.nH = 0 : sym.fBarTop = 0 : sym.fBarH = 0
+    sym.nCols = 0 : sym.nRows = 0 : sym.fQzLeft = 0 : sym.fQzTop = 0 : sym.nZintId = 0 : sym.fTextBottom = 0
+    erase sym.bits, sym.rects, sym.hexes, sym.rings, sym.texts
+    sym.nRects = 0 : sym.nHexes = 0 : sym.nRings = 0 : sym.nTexts = 0
+end sub
+
+private function U8ToUstring( byval p as const uint8 ptr ) as ustring
+    if p = 0 then return ""
+    dim as string s = *cast( zstring ptr, p )
+    dim as ustring u = s
+    return u
+end function
+
+' Encode data under spec into sym. TRUE when a symbol was made (OK or a warning). Empty data is
+' TKBC_EMPTY, never encoded (zint calls it an error).
+public function tkBarcode_Encode( byref spec as TKBARCODE_SPEC, byref sData as ustring, _
+                                  byref sym as TKBARCODE_SYMBOL ) as boolean
+    ClearSymbol( sym )
+    sym.b2D = tkBarcode_Is2D( spec.nSymbology )
+    sym.bEanUpc = IsEanUpc( spec.nSymbology )
+    if len( sData ) = 0 then sym.nStatus = TKBC_EMPTY : return false
+    dim as int32 nSym = spec.nSymbology
+    dim as int32 id = iif( spec.nZintRaw <> 0, spec.nZintRaw, tkBarcode_ZintId( nSym ) )
+    if (id = 0) orelse (ZBarcode_ValidID( id ) = 0) then
+        sym.nStatus = TKBC_ERR_INVALID_OPTION : sym.wszError = "Unknown symbology" : return false
+    end if
+    if spec.nZintRaw <> 0 then sym.b2D = false : sym.bEanUpc = false
+
+    sym.nZintId = id
+    sym.fDefaultXdimMm = ZBarcode_Default_Xdim( id )
+    dim as string s8 = sData                ' UTF-16 -> UTF-8
+    dim as zint_symbol ptr z = ZBarcode_Create( )
+    if z = 0 then sym.nStatus = TKBC_ERR_OTHER : return false
+    z->symbology = id
+    z->scale = 0.5                          ' one vector unit = one module (BC0)
+    z->show_hrt = iif( spec.nTextMode = TKBC_TEXT_NONE, 0, 1 )
+    dim as boolean bGs1 = (nSym = TKBC_GS1_128) orelse (nSym = TKBC_GS1_DATAMATRIX) orelse (spec.opts(TKBC_OPT_GS1) <> 0)
+    dim as int32 mode = iif( bGs1, GS1_MODE, UNICODE_MODE )
+    if bGs1 andalso (left( s8, 1 ) = "(") then mode or= GS1PARENS_MODE
+    if spec.opts(TKBC_OPT_ESCAPES) <> 0 then mode or= ESCAPE_MODE
+    z->input_mode = mode
+    dim as int32 oo = iif( spec.bQuietZone, BARCODE_QUIET_ZONES, BARCODE_NO_QUIET_ZONES )
+    if spec.nZintRaw = 0 then
+        ' the options, each only where it means something
+        dim as int32 ecc = spec.opts(TKBC_OPT_ECC), size = spec.opts(TKBC_OPT_SIZE)
+        select case nSym
+        case TKBC_QR, TKBC_MICRO_QR
+            if ecc > 0 then z->option_1 = ecc
+            if size > 0 then z->option_2 = size
+            if spec.opts(TKBC_OPT_MASK) > 0 then z->option_3 = ( spec.opts(TKBC_OPT_MASK) ) shl 8
+        case TKBC_PDF417, TKBC_PDF417_COMPACT
+            if ecc > 0 then z->option_1 = ecc - 1
+            if size > 0 then z->option_2 = size
+        case TKBC_AZTEC
+            if ecc > 0 then z->option_1 = ecc
+            if size > 0 then z->option_2 = size
+        case TKBC_DATAMATRIX, TKBC_GS1_DATAMATRIX
+            if size > 0 then z->option_2 = size
+            if spec.opts(TKBC_OPT_DM_SQUARE) <> 0 then z->option_3 = DM_SQUARE
+        case TKBC_CODE39, TKBC_CODE39_EXT, TKBC_ITF, TKBC_CODABAR
+            if spec.opts(TKBC_OPT_CHECK_DIGIT) <> 0 then z->option_2 = 1
+        end select
+        if sym.b2D andalso (spec.opts(TKBC_OPT_ECI) > 0) then z->eci = spec.opts(TKBC_OPT_ECI)
+        if (nSym = TKBC_ITF) orelse (nSym = TKBC_ITF14) then
+            select case spec.opts(TKBC_OPT_BEARER)
+            case TKBC_BEARER_BOX:       oo or= BARCODE_BOX : z->border_width = 5
+            case TKBC_BEARER_TOPBOTTOM: oo or= BARCODE_BIND : z->border_width = 5
+            case TKBC_BEARER_NONE:      oo or= BARCODE_BIND : z->border_width = 0
+            end select
+        end if
+    end if
+    z->output_options = oo
+
+    dim as int32 rc = ZBarcode_Encode_and_Buffer_Vector( z, strptr( s8 ), len( s8 ), 0 )
+    sym.nStatus = StatusOf( rc, bGs1 )
+    if rc <> 0 then sym.wszError = U8ToUstring( cast( const uint8 ptr, @z->errtxt ) )
+    if (rc >= ZINT_ERROR) orelse (sym.nStatus >= TKBC_ERR_FIRST) orelse (z->vector = 0) then
+        ZBarcode_Delete( z )
+        return false
+    end if
+
+    ' ---- copy the vector, in module units ------------------------------------------------------
+    dim as zint_vector ptr v = z->vector
+    sym.nW = v->width : sym.nH = v->height
+    sym.nCols = z->width : sym.nRows = z->rows
+    sym.fBarH = z->height
+    dim as int32 n = 0
+    dim as zint_vector_rect ptr r = v->rectangles
+    while r : n += 1 : r = r->next : wend
+    if n > 0 then redim sym.rects( 0 to n - 1 )
+    sym.nRects = n
+    n = 0
+    r = v->rectangles
+    dim as float32 x0 = 1e30, y0 = 1e30, yBot = 0
+    while r
+        sym.rects(n).x = r->x : sym.rects(n).y = r->y : sym.rects(n).w = r->width : sym.rects(n).h = r->height
+        if r->x < x0 then x0 = r->x
+        if r->y < y0 then y0 = r->y
+        if r->y + r->height > yBot then yBot = r->y + r->height
+        n += 1
+        r = r->next
+    wend
+    n = 0
+    dim as zint_vector_hexagon ptr hx = v->hexagons
+    while hx : n += 1 : hx = hx->next : wend
+    if n > 0 then redim sym.hexes( 0 to n - 1 )
+    sym.nHexes = n
+    n = 0 : hx = v->hexagons
+    while hx
+        sym.hexes(n).x = hx->x : sym.hexes(n).y = hx->y : sym.hexes(n).d = hx->diameter : sym.hexes(n).rot = hx->rotation
+        n += 1 : hx = hx->next
+    wend
+    n = 0
+    dim as zint_vector_circle ptr ci = v->circles
+    while ci : n += 1 : ci = ci->next : wend
+    if n > 0 then redim sym.rings( 0 to n - 1 )
+    sym.nRings = n
+    n = 0 : ci = v->circles
+    while ci
+        sym.rings(n).x = ci->x : sym.rings(n).y = ci->y : sym.rings(n).d = ci->diameter : sym.rings(n).w = ci->width
+        n += 1 : ci = ci->next
+    wend
+    n = 0
+    dim as zint_vector_string ptr st = v->strings
+    while st : n += 1 : st = st->next : wend
+    if n > 0 then redim sym.texts( 0 to n - 1 )
+    sym.nTexts = n
+    n = 0 : st = v->strings
+    while st
+        sym.texts(n).x = st->x : sym.texts(n).y = st->y : sym.texts(n).size = st->fsize
+        sym.texts(n).halign = st->halign : sym.texts(n).s = U8ToUstring( st->text )
+        if st->y + st->fsize * 0.25 > sym.fTextBottom then sym.fTextBottom = st->y + st->fsize * 0.25
+        n += 1 : st = st->next
+    wend
+
+    ' what zint actually used: ITF-14 turns its bearer box on itself
+    dim as boolean bBox = (z->output_options and BARCODE_BOX) <> 0
+    dim as boolean bBind = (z->output_options and (BARCODE_BIND or BARCODE_BIND_TOP)) <> 0
+    dim as int32 nBorder = iif( bBox orelse bBind, z->border_width, 0 )
+
+    ' ---- the module matrix, and where it sits ---------------------------------------------------
+    if (sym.nCols > 0) andalso (sym.nRows > 0) then
+        redim sym.bits( 0 to sym.nCols * sym.nRows - 1 )
+        dim as int32 c0 = -1, r0 = -1
+        for row as int32 = 0 to sym.nRows - 1
+            for col as int32 = 0 to sym.nCols - 1
+                if ( ( z->encoded_data(row, col shr 3) shr ( col and 7 ) ) and 1 ) <> 0 then
+                    sym.bits(row * sym.nCols + col) = 1
+                    if (c0 < 0) orelse (col < c0) then c0 = col
+                    if r0 < 0 then r0 = row
+                end if
+            next
+        next
+        ' The leftmost / topmost rect is a dark module -- unless a bearer box frames the symbol
+        ' (ITF-14: zint adds BARCODE_BOX itself, so read the options back), whose quiet zones are
+        ' symmetric inside it.
+        if (bBox = false) andalso (bBind = false) then
+            if c0 >= 0 then sym.fQzLeft = x0 - c0
+            if (r0 >= 0) andalso sym.b2D then sym.fQzTop = y0 - r0
+        else
+            sym.fQzLeft = ( sym.nW - sym.nCols ) / 2
+        end if
+    end if
+    ' The bars: from the top of the matrix for fBarH modules (1D); a 2D symbol has no "bars"
+    if sym.b2D orelse (sym.nRects = 0) then
+        sym.fBarTop = 0 : sym.fBarH = 0
+    else
+        sym.fBarTop = nBorder
+        if sym.fBarH <= 0 then sym.fBarH = yBot - sym.fBarTop
+    end if
+    if sym.b2D then
+        sym.nH = v->height                  ' no HRT in 2D: the vector's height, quiet zones in
+    else
+        ' without HRT: the lowest rect (guards, a bearer) is the bottom
+        sym.nH = yBot
+    end if
+    ZBarcode_Delete( z )
+    return true
+end function
+
+' Whether data is valid for a symbology (a TextBox's B2 rule, a SaveTo check). sErr = zint's text.
+public function tkBarcode_Validate( byval nSym as int32, byref sData as ustring, byref sErr as ustring ) as boolean
+    dim as TKBARCODE_SPEC spec
+    spec.nSymbology = nSym
+    spec.nTextMode = TKBC_TEXT_NONE
+    dim as TKBARCODE_SYMBOL sym
+    dim as boolean ok = tkBarcode_Encode( spec, sData, sym )
+    sErr = sym.wszError
+    if sym.nStatus = TKBC_EMPTY then sErr = "No data" : return false
+    return ok
+end function
+
+' A dark module of the matrix (row, col): tests and exports read it.
+public function tkBarcode_SymbolModule( byref sym as TKBARCODE_SYMBOL, byval row as int32, byval col as int32 ) as boolean
+    if (row < 0) orelse (col < 0) orelse (row >= sym.nRows) orelse (col >= sym.nCols) then return false
+    return sym.bits(row * sym.nCols + col) <> 0
+end function
+
+' The short, user-facing class of a status (the error state's line); English, as tkControls' other
+' built-in strings. zint's full text is tkBarcode_GetErrorText / the tooltip.
+public function tkBarcode_StatusText( byval nStatus as int32 ) as ustring
+    select case nStatus
+    case TKBC_ERR_TOO_LONG:         return "Too much data"
+    case TKBC_ERR_INVALID_DATA:     return "Invalid data"
+    case TKBC_ERR_INVALID_CHECK:    return "Wrong check digit"
+    case TKBC_ERR_INVALID_OPTION:   return "Invalid option"
+    case TKBC_ERR_NONCOMPLIANT:     return "Invalid GS1 data"
+    case TKBC_ERR_OTHER:            return "Cannot encode"
+    end select
+    return ""
+end function

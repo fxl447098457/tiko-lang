@@ -66,6 +66,7 @@ constructor DriverOptions( )
     this.guiSubsystem = false
     this.stackSize = 2097152
     this.optLevel = 0
+    this.optSize = false
     this.showHelp = false
     this.helpCategory = ""
     this.showVersion = false
@@ -557,6 +558,73 @@ private function SourceOptionOk_ _
     return false
 end function
 
+'' -app's options as the APK needs them (docs/tiko-android A6): -appversion "name[,code]" with a
+'' code from 1 to 2100000000 (Play's ceiling); -appicon a .png that exists; -appkey a keystore that
+'' exists, whose password is in TIKO_ANDROID_KS_PASS -- the signing tools read it from there.
+private sub AppOptionsOk_( byref opts as Tko.DriverOptions, byref opt as string, byref why as string )
+    if len( opts.appVersion ) > 0 then
+        dim as string v = opts.appVersion
+        dim as int32 c = instrrev( v, "," )
+        dim as string vname = iif( c > 0, left( v, c - 1 ), v ), vcode = iif( c > 0, mid( v, c + 1 ), "1" )
+        dim as boolean good = (len( vname ) > 0) andalso (len( vcode ) > 0) andalso (len( vcode ) <= 10)
+        for i as int32 = 0 to len( vcode ) - 1
+            if (vcode[i] < asc( "0" )) orelse (vcode[i] > asc( "9" )) then good = false
+        next
+        if good then good = (vallng( vcode ) >= 1) andalso (vallng( vcode ) <= 2100000000)
+        if good = false then
+            opt = "-appversion " & v : why = "it is name[,code], the code a whole number from 1 to 2100000000"
+            return
+        end if
+    end if
+    '' -apppermission: a Java name, letters, digits, '_' and '.', starting with a letter -- it goes
+    '' into the manifest's XML as it is.
+    dim as int32 st = 1
+    do while st <= len( opts.appPermissions )
+        dim as int32 nl = instr( st, opts.appPermissions, chr( 10 ) )
+        dim as string pn = mid( opts.appPermissions, st, nl - st )
+        st = nl + 1
+        dim as boolean good = len( pn ) > 0
+        for i as int32 = 0 to len( pn ) - 1
+            dim as ubyte ch = pn[i]
+            dim as boolean alpha = ((ch or 32) >= asc( "a" )) andalso ((ch or 32) <= asc( "z" ))
+            if i = 0 then
+                if alpha = false then good = false
+            elseif (alpha orelse (ch >= asc( "0" ) andalso ch <= asc( "9" )) orelse ch = asc( "_" ) orelse ch = asc( "." )) = false then
+                good = false
+            end if
+        next
+        if good = false then
+            opt = "-apppermission " & pn : why = "a permission is a name such as INTERNET or android.permission.INTERNET"
+            return
+        end if
+    loop
+    if len( opts.appIcon ) > 0 then
+        if (fs.IsFile( opts.appIcon ) = false) orelse (lcase( right( opts.appIcon, 4 ) ) <> ".png") then
+            opt = "-appicon " & opts.appIcon : why = "not a .png file"
+            return
+        end if
+    end if
+    if len( opts.appKey ) > 0 then
+        dim as int32 c = instrrev( opts.appKey, "," )
+        dim as string ks = iif( c > 0, left( opts.appKey, c - 1 ), opts.appKey )
+        if fs.IsFile( ks ) = false then
+            opt = "-appkey " & opts.appKey : why = "no keystore '" & ks & "'"
+            return
+        end if
+        '' A BUNDLE IS SIGNED BY jarsigner, which takes the key by its alias; apksigner finds a
+        '' keystore's only key by itself.
+        if opts.appBundle andalso (c = 0) then
+            opt = "-appkey " & opts.appKey : why = "-appbundle signs with jarsigner, which needs the key's alias: -appkey keystore,alias"
+            return
+        end if
+        if len( environ( "TIKO_ANDROID_KS_PASS" ) ) = 0 then
+            opt = "-appkey " & opts.appKey
+            why = "set TIKO_ANDROID_KS_PASS to the keystore's password (and TIKO_ANDROID_KEY_PASS to the key's, when it differs)"
+            return
+        end if
+    end if
+end sub
+
 function Parse _
     ( byref args as Tko.StrVec, byref opts as Tko.DriverOptions, _
       byref diags as Tko.DiagnosticEngine ) as boolean
@@ -699,6 +767,15 @@ function Parse _
         '' artefact is a .so rather than a .dll.
         case Tko.OPT_DLL, Tko.OPT_DYLIB : opts.outKind = Tko.OUT_DLL
         case Tko.OPT_STATICLIB          : opts.outKind = Tko.OUT_STATICLIB
+        case Tko.OPT_APP                : opts.outKind = Tko.OUT_DLL : opts.app = true
+        case Tko.OPT_APPID              : opts.appId = value
+        case Tko.OPT_APPLABEL           : opts.appLabel = value
+        case Tko.OPT_APPASSETS          : opts.appAssets = value
+        case Tko.OPT_APPVERSION         : opts.appVersion = value
+        case Tko.OPT_APPICON            : opts.appIcon = value
+        case Tko.OPT_APPKEY             : opts.appKey = value
+        case Tko.OPT_APPBUNDLE          : opts.appBundle = true
+        case Tko.OPT_APPPERMISSION      : opts.appPermissions &= value & chr( 10 )
         '' BITS, ORED, whatever the order: '-exx -e' is still -exx, because each level's
         '' bits contain the one below's. The values are fbc's, measured with __FB_ERR__
         '' on fbc-modern 1.20 (T63, T64): -g sets 32, 64 and 128 as well as emitting
@@ -718,18 +795,23 @@ function Parse _
         case Tko.OPT_MT       : opts.threadSafe = true
 
         case Tko.OPT_OPTLEVEL
-            '' '-O 2' AS fbc TAKES IT, the level a separate argument; and only a DIGIT: '-Os'
-            '' read as valint( "s" ) = 0 and built at -O0 in silence -- fbc's 81 (F-64).
+            '' '-O 2' AS fbc TAKES IT, the level a separate argument; a DIGIT, or 's'.
+            '' fbc read '-Os' as valint( "s" ) = 0 and built at -O0 in silence (F-64); tiko
+            '' refused it, and since 2026-11-25 it means what it says: clang's -Os, at level 2
+            '' for __FB_OPTIMIZE__. A tiko extension -- input fbc mishandled, not one it built.
             if (len( value ) = 0) andalso (i + 1 < n) then
-                if (len( args[i + 1] ) = 1) andalso (instr( "0123", args[i + 1] ) > 0) then value = args[i + 1] : i += 1
+                if (len( args[i + 1] ) = 1) andalso (instr( "0123s", args[i + 1] ) > 0) then value = args[i + 1] : i += 1
             end if
-            dim as int32 lvl = valint( value )
-            dim as boolean bad = (len( value ) <> 1) orelse (instr( "0123", value ) = 0)
+            dim as boolean bad = (len( value ) <> 1) orelse (instr( "0123s", value ) = 0)
             if bad then
                 diags.ReportGlobal( Tko.TKO0106, value, "-O" )
                 ok = false
+            elseif value = "s" then
+                opts.optLevel = 2
+                opts.optSize = true
             else
-                opts.optLevel = lvl
+                opts.optLevel = valint( value )
+                opts.optSize = false
             end if
 
         case Tko.OPT_TARGET
@@ -979,6 +1061,23 @@ function Parse _
 
     if opts.pic andalso Tko.TargetIsWindows( opts.target ) then
         diags.ReportGlobal( Tko.TKO0123, opts.targetName )
+        ok = false
+    end if
+    if opts.app andalso (Tko.TargetOs( opts.target ) <> Tko.OS_ANDROID) then
+        diags.ReportGlobal( Tko.TKO0195, opts.targetName )
+        ok = false
+    end if
+    '' THE -app* OPTIONS, checked here rather than after the link (docs/tiko-android A6): each needs
+    '' -app, and a version, an icon or a keystore that is wrong fails before anything compiles.
+    dim as string appOpt, appWhy
+    if (opts.app = false) andalso (len( opts.appId & opts.appLabel & opts.appAssets & opts.appVersion & _
+                                        opts.appIcon & opts.appKey & opts.appPermissions ) > 0 orelse opts.appBundle) then
+        appOpt = "-app*" : appWhy = "-appid, -applabel, -appassets, -appversion, -appicon, -appkey, -apppermission and -appbundle need -app"
+    elseif opts.app then
+        AppOptionsOk_( opts, appOpt, appWhy )
+    end if
+    if len( appWhy ) > 0 then
+        diags.ReportGlobal( Tko.TKO0197, appOpt, appWhy )
         ok = false
     end if
     if opts.sanitizeAddress andalso Tko.TargetIsWindows( opts.target ) andalso (Tko.TargetLayoutFor( opts.target ).isMsvc = false) then

@@ -1,0 +1,137 @@
+' tkPrinter self-test (printing phase R3). One check per behaviour: page sets, the CUPS options a job
+' becomes, the printer list and its default, and a real job:
+'   Windows        pages 1 and 3 of a three-page document to "Microsoft Print to PDF", written to a
+'                  file (no prompt): the file has two pages, progress was told twice.
+'   Linux, macOS   a job to a printer that does not exist fails with a reason, and nothing crashes.
+' NEVER the default printer: on this machine it is paper.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkPrinter"
+using tkTest
+using tkPrinter
+using tkPdf
+using tkPrint
+using tkHost
+using tkPaint
+
+dim shared as long gProgress
+
+function OnProgress( byval doc as TK_PRINTDOC ptr, byval nDone as long, byval nTotal as long, byval pCtx as any ptr ) as boolean
+    gProgress += 1
+    return true
+end function
+
+function ThreePages( byval doc as TK_PRINTDOC ptr, byval pg as TK_PAGE ptr, byval i as long ) as boolean
+    dim as TKRECTF r
+    tkRectF_Set( r, 72, 72, 400, 120 )
+    dim as TKFONTSPEC fs
+    fs.pt = 24
+    tkPage_SetFont( pg, fs )
+    tkPage_Text( pg, "tkPrinter page " & (i + 1), r, TK_DT_LEFT )
+    tkPage_SetFillColor( pg, tkRGB( 30, 90, 200 ) )
+    tkRectF_Set( r, 72, 140, 272, 240 )
+    tkPage_FillRect( pg, r )
+    return i < 2
+end function
+
+function Joined( pages() as long ) as string
+    dim as string s
+    for i as long = 0 to ubound( pages ) : s &= pages(i) & " " : next
+    return rtrim( s )
+end function
+
+sub RunPass( )
+    tkTest_Begin( "printer" )
+    dim as long pages()
+    dim as long n1 = tkPrinter_ParsePageSet( "1-3,7,10-", 12, pages() )
+    dim as string j1 = Joined( pages() )
+    dim as long n2 = tkPrinter_ParsePageSet( "5-3", 12, pages() ), n3 = tkPrinter_ParsePageSet( "", 4, pages() )
+    tkTest_Check( "page sets: ranges, single pages, open end, invalid, all", (n1 = 7) andalso (j1 = "0 1 2 6 9 10 11") _
+                  andalso (n2 = 0) andalso (n3 = 4), n1 & ": " & j1 & " / " & n2 & " / " & n3 )
+
+    dim as TK_PRINTDOC ptr doc = tkPrintDoc_Create( "tkPrinter selftest" )
+    dim as TKPAGESETUP ps
+    ps.paper = TK_PAPER_A4
+    tkPrintDoc_SetPageSetup( doc, ps )
+    tkPrintDoc_SetPrintPageCallback( doc, @ThreePages )
+    tkPrintDoc_Generate( doc )
+    dim as TKPRINTJOB job
+    job.copies = 2 : job.pageSet = "1-3" : job.duplex = TK_DUPLEX_LONGEDGE : job.color = false
+    dim as string o = tkPrinter_CupsOptions( doc, job )
+    tkTest_Check( "CUPS options", o = "copies=2 multiple-document-handling=separate-documents-collated-copies page-ranges=1-3 " _
+                  & "sides=two-sided-long-edge print-color-mode=monochrome media=A4", o )
+
+    dim as TKPRINTERINFO list()
+    dim as long n = tkPrinter_Enumerate( list() )
+    dim as ustring def = tkPrinter_GetDefault( )
+    dim as boolean defListed = (len( def ) = 0)
+    for i as long = 0 to n - 1
+        if (list(i).name = def) andalso list(i).isDefault then defListed = true
+    next
+    tkTest_Check( "printers listed; the default among them, marked", (n >= 0) andalso defListed, n & " printers, default '" & def & "' " & tkPrinter_LastError( ) )
+
+#ifdef __FB_WIN32__
+    dim as ustring pdfPrinter = "Microsoft Print to PDF"
+    dim as boolean have = false
+    for i as long = 0 to n - 1
+        if list(i).name = pdfPrinter then have = true
+    next
+    if have then
+        dim as TKPRINTERCAPS caps
+        dim as boolean a4 = false
+        if tkPrinter_GetCaps( pdfPrinter, caps ) then
+            for i as long = 0 to caps.nPapers - 1
+                if (abs( caps.paperW(i) - 595.3 ) < 1.5) andalso (abs( caps.paperH(i) - 841.9 ) < 1.5) then a4 = true
+            next
+        end if
+        tkTest_Check( "caps: Microsoft Print to PDF offers A4", a4, caps.nPapers & " papers" )
+        SDL_CreateDirectory( "../out" )
+        dim as string outFile = *SDL_GetBasePath( )
+        outFile &= "..\out\tkprinter-job.pdf"
+        SDL_RemovePath( strptr( outFile ) )
+        dim as TKPRINTJOB pj
+        pj.printer = pdfPrinter : pj.pageSet = "1,3" : pj.outputFile = outFile : pj.pfnProgress = @OnProgress
+        gProgress = 0
+        dim as boolean printed = tkPrintDoc_Print( doc, pj )
+        dim as uinteger sz
+        dim as any ptr data_ = SDL_LoadFile( strptr( outFile ), @sz )
+        dim as long nPage = 0
+        if data_ then
+            dim as string s = space( sz )
+            for i as integer = 0 to sz - 1 : s[i] = cast( ubyte ptr, data_ )[i] : next
+            SDL_free( data_ )
+            dim as long p = instr( s, "/Type /Page" )
+            while p
+                if mid( s, p + 11, 1 ) <> "s" then nPage += 1
+                p = instr( p + 1, s, "/Type /Page" )
+            wend
+            if nPage = 0 then
+                p = instr( s, "/Type/Page" )
+                while p
+                    if mid( s, p + 10, 1 ) <> "s" then nPage += 1
+                    p = instr( p + 1, s, "/Type/Page" )
+                wend
+            end if
+        end if
+        tkTest_Check( "a job: pages 1 and 3 to Microsoft Print to PDF, a 2-page file, progress twice", _
+                      printed andalso (sz > 0) andalso (nPage = 2) andalso (gProgress = 2), _
+                      "printed " & printed & " size " & sz & " pages " & nPage & " progress " & gProgress & " " & tkPrinter_LastError( ) )
+    else
+        print "SKIP  Microsoft Print to PDF is not installed: no real job"
+    end if
+#else
+    dim as TKPRINTJOB bad
+    bad.printer = "tkprint-no-such-printer"
+    dim as boolean printed = tkPrintDoc_Print( doc, bad )
+    tkTest_Check( "a job to a printer that does not exist fails with a reason", (printed = false) andalso (len( tkPrinter_LastError( ) ) > 0), _
+                  tkPrinter_LastError( ) )
+#endif
+    tkPrintDoc_Destroy( doc )
+end sub
+
+if tkTest_Init() = false then end 1
+RunPass( )
+dim as long nFail = tkTest_Report( "tkPrinter" )
+tkTest_Quit()
+end nFail

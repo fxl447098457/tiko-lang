@@ -25,7 +25,7 @@ dim as ustring dir_ = CreateTempDir( "tkdoc" ).Value( )
 dim as ustring p = PathJoin( dir_, "f.txt" )
 WriteAllText( p, "x" )
 dim as FileInfo fi = Stat( p ).Value( )
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
 print fi.HasOwner( )    '' false
 #else
 print fi.HasOwner( )    '' true

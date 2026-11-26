@@ -104,6 +104,7 @@ The proc gets `TK_MSG` messages shaped like the Win32 ones they replace. Return 
 | `TKM_SCALECHANGED`, `TKM_THEMECHANGED`, `TKM_DESTROY` | `fOld`, `fNew` for the scale |
 | `TKM_DROPFILES`, `TKM_DROPTEXT` | `text` (paths LF-separated, `nStart` = how many), `x`, `y`; **bubble** if refused |
 | `TKM_CONTEXTMENU` | to a context-menu component: `pOther` = the widget it opens for, `x`, `y` = where, in window pixels; `bFlag` = from the keyboard |
+| `TKM_ADORNLAYOUT` | to an adornment just before it paints: place yourself against your parent (the target) with `tkWidget_SetPos`; invalidations made while handling it are dropped, this frame already uses the new rect |
 
 Rules a widget author relies on:
 
@@ -112,8 +113,10 @@ Rules a widget author relies on:
 - **Timers** with `tkWidget_SetTimer( w, id, ms )`, delivered as `TKM_TIMER` on the UI thread. Ids below `TK_TIMER_APP` are reserved.
 - **Context menus** with `tkWidget_SetContextMenu( w, hMenu )`: the right button's release over `w` or anything inside it, and the Menu key or Shift+F10 when the focus is there, go to `hMenu` as `TKM_CONTEXTMENU` instead of to the control. [tkContextMenu](tkContextMenu) is the component that answers it; it calls `tkWidget_ClearContextMenuRefs` as it goes.
 - **Watching the mouse from outside** with `tkWidget_SetMouseMoveCallback( w, cb )`: `cb` (a `TK_MouseMoveSub`) is told of every move over `w`, and over anything inside it that has no watcher of its own, with `x, y` in pixels from `w`'s top-left, SDL's button mask and the modifier keys. It runs after the widget's own `TKM_MOUSEMOVE`, needs no subclassing, and works on any control; 0 clears it. The Form Designer's MouseMove event is built on it.
+- **Adornments** with `tkWidget_SetAdorner( w, true )`: `w` becomes a decoration of its parent (an attached badge, a validation mark). It is painted right after the parent's own subtree, with the clip the *parent* was given, so it may overhang the parent and sits above it and its other children; before each paint it gets `TKM_ADORNLAYOUT` to place itself against the parent's current size. It is never hit-tested (a click on it reaches what is below), never in the Tab order, and gives up focus, capture and hot when it becomes one; otherwise it is an ordinary child, hidden, moved, rescaled, rethemed and destroyed with its parent. A sibling above the parent in z-order covers it as it covers the parent, and the parent's parent clips it. Code that walks a widget's children for layout skips `w->bAdorner` ones (tkScrollPanel's `AutoSizeContent` does). `tkWidget_IsAdorner( w )` reads the flag.
 - **Theme.** On `TKM_THEMECHANGED`, re-read [tkTheme](tkTheme)'s `tkTheme_Get()` unless your widget's colours are pinned.
 - **Notify like the controls do**: callbacks for user actions only; setters are silent.
+- `tkWidget_SetTextKind( w, kind )` says which screen keyboard a text widget asks for: `TK_TEXT_DEFAULT` (SDL's own; every widget's default), `TK_TEXT_LINE`, `TK_TEXT_MULTILINE`, `TK_TEXT_DECIMAL`, `TK_TEXT_INTEGER` or `TK_TEXT_PASSWORD`. A focused widget's text input restarts with the new kind, and focus moving to a widget of another kind restarts it too -- on a phone 120 ms later, because Android loses a start that comes straight after a stop. `tkHost_TextKindOn( h )` is the kind the live text input was started with, -1 when none is on.
 - `tkHost_SetTextInputArea` tells the IME where to put its candidate window; `tkHost_SetClipboardText`, `GetClipboardText` and `HasClipboardText` reach the clipboard.
 
 ## Fonts and icons
@@ -127,6 +130,8 @@ tkControls ships its own fonts, copied beside every program that imports tkHost,
 | `TK_FONT_ICONS` | Fluent UI System Icons, for glyphs |
 
 `tkHost_FontDir()` is the folder they are in (the program's own, ending in a separator), so `tkHost_FontDir() & TK_FONT_UI` is always a file that is there. `tkHost_OpenFont( h, path, pt )` opens a font in points at the surface's scale; the surface owns it, re-sizes it when the scale changes and closes it when the surface goes. `h->pDefaultFont` is the font every control falls back to.
+
+`tkHost_FontSource( f, path, face )` says where a font `tkHost_OpenFontFace` opened came from (the name or path it was given, and the face); [tkPrint](tkPrint) re-opens recorded fonts at a page's size this way. Close a font you opened with `tkHost_OpenFontFace` through `tkHost_CloseFont`, which also forgets its source. `tkHost_FontBytes( path, pData, nBytes, bOwned )` gives a font's bytes by the same name or path: a registered resource's own (bOwned FALSE), or the file read whole (bOwned TRUE: `SDL_free` them). [tkPdf](tkPdf) embeds fonts this way.
 
 ### Fonts and images by name
 
@@ -230,6 +235,9 @@ enum
     TKM_CONTEXTMENU          ' to a CONTEXT-MENU COMPONENT (tkWidget_SetContextMenu): m->pOther = the widget
                              ' it opens for, m->x / y = where, in the surface's window pixels; m->bFlag =
                              ' from the keyboard (the Menu key, Shift+F10)
+    TKM_ADORNLAYOUT          ' to an ADORNMENT just before it paints: place yourself against your parent
+                             ' (the target) as it is now. Invalidations made while handling it are
+                             ' dropped: this frame already paints the new rect.
 end enum
 
 enum
@@ -338,6 +346,9 @@ sub tkHost_AddFontData( byref name_ as string, byval pData as const any ptr, byv
 function tkHost_HasFontData( byref name_ as string ) as boolean
 function tkHost_LoadSurface( byref path as ustring ) as SDL_Surface ptr
 function tkHost_OpenFontFace( byref path as string, byval pt as single, byval face as long ) as TTF_Font ptr
+function tkHost_FontSource( byval f as TTF_Font ptr, byref path as string, byref face as long ) as boolean
+sub tkHost_CloseFont( byval f as TTF_Font ptr )
+function tkHost_FontBytes( byref path as string, byref pData as const any ptr, byref nBytes as integer, byref bOwned as boolean ) as boolean
 function tkHost_OpenFont( byval h as TK_HOST ptr, byref path as ustring, byval pt as single ) as TTF_Font ptr
 function tkHost_Create( byref title as ustring, byval w as long, byval hgt as long, byref defaultFont as ustring, byval forcedScale as single = 0 ) as TK_HOST ptr
 function tkHost_CreatePopup( byval owner as TK_HOST ptr, byval x as long, byval y as long, byval w as long, byval hgt as long, byval kind as long = TK_SURF_POPUP, byval extraFlags as Uint64 = 0 ) as TK_HOST ptr
@@ -355,6 +366,8 @@ function tkWidget_CreateChild( byval parent as TK_WIDGET ptr, byval ctrlId as lo
 function tkWidget_Create( byval h as TK_HOST ptr, byval ctrlId as long, byval proc as tkWidgetProc, byval pData as any ptr ) as TK_WIDGET ptr
 function tkWidget_Parent( byval w as TK_WIDGET ptr ) as TK_WIDGET ptr
 sub tkWidget_BringToTop( byval w as TK_WIDGET ptr )
+sub tkWidget_SetAdorner( byval w as TK_WIDGET ptr, byval bOn as boolean )
+function tkWidget_IsAdorner( byval w as TK_WIDGET ptr ) as boolean
 sub tkWidget_Invalidate( byval w as TK_WIDGET ptr )
 sub tkWidget_SetPos( byval w as TK_WIDGET ptr, byval x as long, byval y as long, byval cw as long, byval ch as long )
 sub tkWidget_SetSize( byval w as TK_WIDGET ptr, byval cw as long, byval ch as long )

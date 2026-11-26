@@ -16,6 +16,8 @@ Define without a value, created when compiling for Linux: the `linux-x86_64` and
 
 ## Remarks
 
+[`TIKO_OS_LINUX`](Category-Tiko-Compiler-Define) is tiko's own name for the same test; tiko code uses it.
+
 ### Differences from QB
 
 - New to FreeBASIC
@@ -26,6 +28,7 @@ Define without a value, created when compiling for Linux: the `linux-x86_64` and
 - [`__FB_WIN32__`](Fb-Win32)
 - [`__FB_UNIX__`](Fb-Unix)
 - [`__FB_DARWIN__`](Fb-Darwin)
+- [`TIKO_OS_LINUX`](Category-Tiko-Compiler-Define)
 - [Compiler Option: -target](Compiler-Option-Target)
 
 ## Examples

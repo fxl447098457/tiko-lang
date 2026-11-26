@@ -1,0 +1,225 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rwizard -- the New Report wizard's model (RD8), without a window: what the wizard asks (source,
+' fields, parameters, grouping, layout, page) to a whole .tkreport, as DevExpress's and FastReport's
+' wizards make one.
+'
+'   tabular   a page header of bold captions over the detail's columns, one a field
+'   columnar  the detail a label and a value a line, a field each
+' Either way: the title (and each parameter's value) in the report header; with a group, the
+' group's field in its header and its row count in its footer; "Page n of N" in the page footer;
+' the row count in the report footer. The text is the writer's (canonical) and reads back.
+#module "rwizard"
+
+#import "std/containers"
+#import "vendor/tkControls/tkReportDef"
+#import "../redits"
+#import "../rrecords"
+using containers
+using tkReportDef
+using tkReport
+using tkBind
+
+public type RWizardSpec
+    Title     as ustring = "Report"
+    Source    as ustring = "Rows"
+    Kind      as ustring = "host"       ' host array sqlite grid
+    ItemType  as ustring                ' array: the element type (codegen)
+    Sql       as ustring
+    DesignDb  as ustring
+    Fields    as ustring                ' "Customer, Amount:float"
+    Params    as ustring                ' "MinAmount:float, Region"
+    GroupBy   as ustring                ' a field's name, or ""
+    Layout    as ustring = "tabular"    ' tabular columnar
+    Paper     as ustring                ' "" A4 Letter ...
+    Landscape as boolean
+end type
+
+private function IsName_( byref s as const ustring ) as boolean
+    if len( s ) = 0 then return false
+    for i as long = 1 to len( s )
+        dim as long ch = asc( mid( s, i, 1 ) )
+        dim as boolean ok = ((ch >= 65) andalso (ch <= 90)) orelse ((ch >= 97) andalso (ch <= 122)) orelse (ch = 95) orelse _
+                            ((i > 1) andalso (ch >= 48) andalso (ch <= 57))
+        if ok = false then return false
+    next
+    return true
+end function
+
+' "A, B:int" into names and kinds; "" or what is wrong.
+private function Names_( byref line_ as const ustring, byref names as Array( of ustring ), byref kinds as Array( of int32 ) ) as ustring
+    names.Clear( )
+    kinds.Clear( )
+    dim as Array( of ustring ) parts
+    rrecords.SplitSort( line_, parts )
+    for each part as ustring in parts
+        dim as long c = instr( part, ":" )
+        dim as ustring nm = trim( part ), kn = "text"
+        if c > 0 then
+            nm = trim( left( part, c - 1 ) )
+            kn = lcase( trim( mid( part, c + 1 ) ) )
+        end if
+        if IsName_( nm ) = false then return nm & ": not a name"
+        select case kn
+        case "text", "int", "float", "bool", "date", "time"
+        case else : return kn & ": not a kind (text int float bool date time)"
+        end select
+        for each x as ustring in names
+            if lcase( x ) = lcase( nm ) then return nm & ": named twice"
+        next
+        names.Push( nm )
+        kinds.Push( tkReportDef_KindOf( kn ) )
+    next
+    return ""
+end function
+
+private sub Band_( byval def as TK_REPORTDEF ptr, byref id as const ustring, byref kind as const ustring, byval h as float32, _
+                  byref source as const ustring = "", byref group_ as const ustring = "" )
+    dim as TKRD_BAND b
+    b.id = id
+    b.kind = kind
+    b.height = h
+    b.source = source
+    b.group_ = group_
+    tkReportDef_AddBand( def, b )
+end sub
+
+private function Item_( byval def as TK_REPORTDEF ptr, byref kind as const ustring, byref band as const ustring, _
+                        byval x as float32, byval y as float32, byval w as float32, byval h as float32 ) as int32
+    dim as ustring id = redits.AddItem( def, kind, band, x, y )
+    dim as int32 i = tkReportDef_FindItem( def, id )
+    def->items(i).w = redits.Round2( w )
+    def->items(i).h = h
+    return i
+end function
+
+' The report spec describes, as .tkreport text; "" or why not (text then "").
+public function MakeReport( byref spec as RWizardSpec, byref text as ustring ) as ustring
+    text = ""
+    if IsName_( spec.Source ) = false then return spec.Source & ": the source's name must be a name"
+    dim as Array( of ustring ) fn, pn
+    dim as Array( of int32 ) fk, pk
+    dim as ustring e = Names_( spec.Fields, fn, fk )
+    if len( e ) then return e
+    if fn.Count( ) = 0 then return "the source needs a field"
+    e = Names_( spec.Params, pn, pk )
+    if len( e ) then return e
+    dim as int32 gi = -1
+    if len( trim( spec.GroupBy ) ) then
+        for k as int32 = 0 to fn.Count( ) - 1
+            if lcase( fn[k] ) = lcase( trim( spec.GroupBy ) ) then gi = k
+        next
+        if gi < 0 then return spec.GroupBy & ": not one of the fields"
+    end if
+    if (spec.Kind = "array") andalso (len( spec.ItemType ) = 0) then return "an array source needs its item_type"
+
+    dim as TK_REPORTDEF ptr def = tkReportDef_Create( )
+    def->title = spec.Title
+    def->paper = spec.Paper
+    def->landscape = spec.Landscape
+    ' the parameters, with a default of their kind
+    for k as int32 = 0 to pn.Count( ) - 1
+        dim as TKRD_PARAM p
+        p.name_ = pn[k]
+        p.kind = pk[k]
+        select case pk[k]
+        case TKV_INT, TKV_FLOAT : p.default_ = "0"
+        case TKV_BOOL : p.default_ = "false"
+        case TKV_TEXT : p.default_ = """"""
+        end select
+        tkReportDef_AddParam( def, p )
+    next
+    ' the source and its fields
+    dim as TKRD_SOURCE s
+    s.name_ = spec.Source
+    s.kind = spec.Kind
+    s.itemType = spec.ItemType
+    s.sql = spec.Sql
+    s.designDb = spec.DesignDb
+    if gi >= 0 then s.sort = "[" & fn[gi] & "]"
+    tkReportDef_AddSource( def, s )
+    for k as int32 = 0 to fn.Count( ) - 1
+        tkReportDef_AddField( def, 0, fn[k], fk[k] )
+    next
+
+    dim as float32 cw = tkReportDef_ContentWidth( def )
+    ' the report header: the title, each parameter's value after it
+    Band_( def, "reportHeader", "report_header", 30 )
+    dim as ustring title = spec.Title
+    for k as int32 = 0 to pn.Count( ) - 1
+        title &= "  " & pn[k] & ": {@" & pn[k] & "}"
+    next
+    dim as int32 ti = Item_( def, "text", "reportHeader", 0, 4, cw, 20 )
+    def->items(ti).text = title
+    def->items(ti).fontSize = 14
+    def->items(ti).bold = true
+    ' the columns: every field but the group's
+    dim as Array( of int32 ) cols
+    for k as int32 = 0 to fn.Count( ) - 1
+        if k <> gi then cols.Push( k )
+    next
+    dim as boolean tabular = (spec.Layout <> "columnar")
+    dim as float32 colW = cw
+    if cols.Count( ) > 0 then colW = redits.Round2( cw / cols.Count( ) )
+    if tabular then
+        Band_( def, "pageHeader", "page_header", 18 )
+        for c as int32 = 0 to cols.Count( ) - 1
+            dim as int32 i = Item_( def, "text", "pageHeader", c * colW, 2, colW, 14 )
+            def->items(i).text = fn[cols[c]]
+            def->items(i).bold = true
+            def->items(i).border = "bottom"
+        next
+    end if
+    if gi >= 0 then
+        Band_( def, "groupHeader1", "group_header", 20, "", "[" & fn[gi] & "]" )
+        dim as int32 i = Item_( def, "field", "groupHeader1", 0, 3, cw, 14 )
+        def->items(i).expr = "[" & fn[gi] & "]"
+        def->items(i).bold = true
+    end if
+    dim as float32 rowH = 16
+    if tabular = false then rowH = 16 * cols.Count( ) + 4
+    Band_( def, "detail", "detail", rowH, spec.Source )
+    for c as int32 = 0 to cols.Count( ) - 1
+        dim as int32 k = cols[c]
+        if tabular then
+            dim as int32 i = Item_( def, "field", "detail", c * colW, 1, colW, 14 )
+            def->items(i).expr = "[" & fn[k] & "]"
+            if (fk[k] = TKV_INT) orelse (fk[k] = TKV_FLOAT) then def->items(i).align = "right"
+        else
+            dim as int32 l = Item_( def, "text", "detail", 0, 2 + c * 16, 120, 14 )
+            def->items(l).text = fn[k]
+            def->items(l).bold = true
+            dim as int32 i = Item_( def, "field", "detail", 130, 2 + c * 16, cw - 130, 14 )
+            def->items(i).expr = "[" & fn[k] & "]"
+        end if
+    next
+    if gi >= 0 then
+        Band_( def, "groupFooter1", "group_footer", 18 )
+        dim as int32 i = Item_( def, "text", "groupFooter1", 0, 2, cw, 14 )
+        def->items(i).text = "{Count( )} rows"
+        def->items(i).align = "right"
+    end if
+    Band_( def, "reportFooter", "report_footer", 20 )
+    dim as int32 rf = Item_( def, "text", "reportFooter", 0, 4, cw, 14 )
+    def->items(rf).text = "{Count( )} rows in all"
+    def->items(rf).bold = true
+    Band_( def, "pageFooter", "page_footer", 18 )
+    dim as int32 pf = Item_( def, "text", "pageFooter", 0, 2, cw, 14 )
+    def->items(pf).text = "Page {PageNumber} of {PageCount}"
+    def->items(pf).align = "right"
+
+    text = tkReportDef_SaveText( def )
+    tkReportDef_Destroy( def )
+    dim as TK_REPORTDEF ptr t = tkReportDef_LoadText( text, e )
+    if t = 0 then
+        text = ""
+        return e
+    end if
+    tkReportDef_Destroy( t )
+    return ""
+end function

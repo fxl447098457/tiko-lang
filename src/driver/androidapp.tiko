@@ -1,0 +1,515 @@
+'' androidapp.tiko -- 'tiko -app': the APK. See androidapp.ti for the pipeline; every step and
+'' every choice in it was measured first by hand (docs/tiko-android A4, probes/a4/apkprobe.sh).
+
+#import "std/containers"
+#import "std/fs"
+#include once "driver/androidapp.ti"
+#include once "driver/modresolve.ti"
+#include once "codegen/toolchain.ti"
+#include once "support/spawn.ti"
+#include once "types/type.ti"
+
+namespace Tko.AndroidApp
+
+#ifdef __FB_WIN32__
+    const EXE_ = ".exe"
+#else
+    const EXE_ = ""
+#endif
+
+'' THE APP'S FIXED FACTS (D-A4-3): Android 10 and up, as the NDK link's triple says
+'' (aarch64/x86_64-linux-android29); built against Android 16's API.
+const MIN_SDK_ = "29"
+const TARGET_SDK_ = "36"
+
+private function Q_( byref s as string ) as string
+    return Tko.Spawn.QuoteArg( s )
+end function
+
+private function Slash_( byval p as string ) as string
+    for i as int32 = 0 to len( p ) - 1
+        if p[i] = asc( "\" ) then p[i] = asc( "/" )
+    next
+    return p
+end function
+
+private function Abi_( byval t as Tko.TargetId ) as string
+    select case t
+    case Tko.TARGET_ANDROID_X86_64 : return "x86_64"
+    case Tko.TARGET_ANDROID_ARM64  : return "arm64-v8a"
+    end select
+    return ""
+end function
+
+private function Stage_( byref ctx as Tko.CompilerContext ) as string
+    return Slash_( ctx.options.outputPath ) & ".stage"
+end function
+
+function LinkPath( byref ctx as Tko.CompilerContext ) as string
+    if ctx.options.app = false then return ""
+    return Slash_( ctx.options.outputPath ) & ".libmain.so"
+end function
+
+'' The subdirectory of 'root' with the highest version that holds 'need': build-tools/<ver>,
+'' platforms/android-<api>.
+private function Newest_( byref root as string, byref need as string ) as string
+    dim as string best, bestKey
+    dim as string d = dir( root & "/*", &h10 )
+    while len( d ) > 0
+        if (d <> ".") andalso (d <> "..") andalso fs.IsFile( root & "/" & d & "/" & need ) then
+            dim as string v = d
+            if left( v, 8 ) = "android-" then v = mid( v, 9 )
+            dim as string k = Tko.Codegen.AndroidVersionKey( v )
+            if k > bestKey then
+                bestKey = k
+                best = root & "/" & d
+            end if
+        end if
+        d = dir( )
+    wend
+    return best
+end function
+
+private function Sdk_( byref why as string ) as string
+    dim as string sdks( 0 to 2 )
+    Tko.Codegen.AndroidSdkCandidates( sdks() )
+    for i as int32 = 0 to 2
+        if (len( sdks( i ) ) > 0) andalso fs.IsDir( sdks( i ) & "/build-tools" ) then return sdks( i )
+    next
+    why = "no Android SDK with build-tools -- set ANDROID_HOME to one; it needs " & _
+          """build-tools;<version>"" and ""platforms;android-" & TARGET_SDK_ & """ (sdkmanager)"
+    return ""
+end function
+
+'' A JDK: jar, keytool and the java that runs apksigner.jar. JAVA_HOME, else Android Studio's own.
+private function Jdk_( byref why as string ) as string
+    dim as string cands( 0 to 1 )
+    cands( 0 ) = Slash_( environ( "JAVA_HOME" ) )
+    #if defined( __FB_WIN32__ )
+        if len( environ( "ProgramFiles" ) ) > 0 then cands( 1 ) = Slash_( environ( "ProgramFiles" ) ) & "/Android/Android Studio/jbr"
+    #elseif defined( __FB_DARWIN__ )
+        cands( 1 ) = "/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    #else
+        cands( 1 ) = "/opt/android-studio/jbr"
+    #endif
+    for i as int32 = 0 to 1
+        dim as string j = cands( i )
+        while (len( j ) > 1) andalso (right( j, 1 ) = "/")
+            j = left( j, len( j ) - 1 )
+        wend
+        if (len( j ) > 0) andalso fs.IsFile( j & "/bin/jar" & EXE_ ) andalso fs.IsFile( j & "/bin/keytool" & EXE_ ) then return j
+    next
+    why = "no JDK -- set JAVA_HOME to one (17 or later): jar, keytool and apksigner are Java"
+    return ""
+end function
+
+'' THE DEBUG KEY, where Android Studio keeps it: ANDROID_USER_HOME, else ~/.android.
+private function Keystore_( ) as string
+    dim as string h = Slash_( environ( "ANDROID_USER_HOME" ) )
+    if len( h ) = 0 then
+        #ifdef __FB_WIN32__
+            h = Slash_( environ( "USERPROFILE" ) ) & "/.android"
+        #else
+            h = environ( "HOME" ) & "/.android"
+        #endif
+    end if
+    return h & "/debug.keystore"
+end function
+
+'' The output's name without its directory or extension: 'demo' for 'out/demo.apk'.
+private function Stem_( byref p as string ) as string
+    dim as string s = mid( Slash_( p ), instrrev( Slash_( p ), "/" ) + 1 )
+    dim as int32 dot = instrrev( s, "." )
+    if dot > 1 then s = left( s, dot - 1 )
+    return s
+end function
+
+'' A Java package segment from a name: lower case, [a-z0-9_], starting with a letter.
+private function Segment_( byref s as string ) as string
+    dim as string r = lcase( s )
+    for i as int32 = 0 to len( r ) - 1
+        dim as uint8 ch = r[i]
+        if ((ch < asc( "a" )) orelse (ch > asc( "z" ))) andalso _
+           ((ch < asc( "0" )) orelse (ch > asc( "9" ))) then r[i] = asc( "_" )
+    next
+    if (len( r ) = 0) orelse (r[0] < asc( "a" )) orelse (r[0] > asc( "z" )) then r = "app" & r
+    return r
+end function
+
+'' An application id as Android takes it: two or more dot-separated segments, each a letter
+'' followed by letters, digits or '_'.
+private function IdOk_( byref id as string ) as boolean
+    dim as int32 segs = 1
+    dim as boolean atStart = true
+    for i as int32 = 0 to len( id ) - 1
+        dim as uint8 ch = id[i]
+        dim as boolean letter = ((ch >= asc( "a" )) andalso (ch <= asc( "z" ))) orelse _
+                                ((ch >= asc( "A" )) andalso (ch <= asc( "Z" )))
+        if ch = asc( "." ) then
+            if atStart then return false
+            segs += 1
+            atStart = true
+        elseif atStart then
+            if letter = false then return false
+            atStart = false
+        elseif (letter = false) andalso (ch <> asc( "_" )) andalso _
+               ((ch < asc( "0" )) orelse (ch > asc( "9" ))) then
+            return false
+        end if
+    next
+    return (segs >= 2) andalso (atStart = false)
+end function
+
+private function Xml_( byref s as string ) as string
+    dim as string r
+    for i as int32 = 0 to len( s ) - 1
+        select case s[i]
+        case asc( "&" ) : r &= "&amp;"
+        case asc( "<" ) : r &= "&lt;"
+        case asc( ">" ) : r &= "&gt;"
+        case asc( """" ) : r &= "&quot;"
+        case asc( "'" ) : r &= "&apos;"
+        case else : r &= chr( s[i] )
+        end select
+    next
+    return r
+end function
+
+'' SDL's own manifest (android-project), less what an app built here cannot use: TikoActivity
+'' (SDL static in libmain.so, D-A4-2), the system's fullscreen theme rather than a resource (SDL's
+'' AppTheme is that theme), the system's default icon unless -appicon gave one, and extractNativeLibs=false -- the .so is stored
+'' and 16 KB-aligned in the APK and mapped from it. enableOnBackInvokedCallback=false is SDL's own:
+'' with targetSdk 33+ BACK otherwise goes to Android's predictive-back dispatcher, which finished
+'' the Activity on the same press tkHost had already used to close a page (measured, A5 step 8).
+private function Manifest_( byref id as string, byref label as string, byref vname as string, _
+                            byref vcode as string, byref icon as string, byref perms as string ) as string
+    dim as string nl = chr( 10 )
+    '' -apppermission: one <uses-permission> each, in the order given; a name with no dot is
+    '' android.permission.<name>, and a name given twice is written once.
+    dim as string uses, seen = nl
+    dim as int32 st = 1
+    do while st <= len( perms )
+        dim as int32 e = instr( st, perms, nl )
+        dim as string pn = mid( perms, st, e - st )
+        st = e + 1
+        if instr( pn, "." ) = 0 then pn = "android.permission." & pn
+        if instr( seen, nl & pn & nl ) > 0 then continue do
+        seen &= pn & nl
+        uses &= "    <uses-permission android:name=""" & pn & """ />" & nl
+    loop
+    return "<?xml version=""1.0"" encoding=""utf-8""?>" & nl & _
+        "<manifest xmlns:android=""http://schemas.android.com/apk/res/android""" & nl & _
+        "    package=""" & id & """ android:versionCode=""" & vcode & """ android:versionName=""" & Xml_( vname ) & """>" & nl & _
+        uses & _
+        "    <uses-feature android:glEsVersion=""0x00020000"" />" & nl & _
+        "    <uses-feature android:name=""android.hardware.touchscreen"" android:required=""false"" />" & nl & _
+        "    <application android:label=""" & Xml_( label ) & """ android:icon=""" & icon & """" & nl & _
+        "        android:theme=""@android:style/Theme.NoTitleBar.Fullscreen"" android:hardwareAccelerated=""true""" & nl & _
+        "        android:extractNativeLibs=""false"" android:enableOnBackInvokedCallback=""false"">" & nl & _
+        "        <activity android:name=""org.tiko.app.TikoActivity""" & nl & _
+        "            android:label=""" & Xml_( label ) & """ android:alwaysRetainTaskState=""true"" android:launchMode=""singleInstance""" & nl & _
+        "            android:configChanges=""layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation""" & nl & _
+        "            android:preferMinimalPostProcessing=""true"" android:exported=""true"">" & nl & _
+        "            <intent-filter>" & nl & _
+        "                <action android:name=""android.intent.action.MAIN"" />" & nl & _
+        "                <category android:name=""android.intent.category.LAUNCHER"" />" & nl & _
+        "            </intent-filter>" & nl & _
+        "        </activity>" & nl & _
+        "    </application>" & nl & _
+        "</manifest>" & nl
+end function
+
+'' One tool, waited for; its output goes where tiko's does. 0 when it succeeded.
+private function Run_( byref ctx as Tko.CompilerContext, byref exe as string, byref args as string ) as int32
+    if ctx.options.verbose then print Q_( exe ) & " " & args
+    return Tko.Spawn.Wait( Tko.Spawn.Start( exe, args ) )
+end function
+
+private function Copy_( byref src as string, byref dst as string, byref why as string ) as boolean
+    dim as fs.FsResultBool r = fs.CopyFile( src, dst, true )
+    if r.IsOk( ) then return true
+    why = "cannot copy '" & src & "' to '" & dst & "'"
+    return false
+end function
+
+'' -appversion "name[,code]", checked by the command line (AppOptionsOk_, cmdline.tiko): "1.0" and
+'' "1" when absent, code "1" when only a name is given.
+private sub Version_( byref v as string, byref vname as string, byref vcode as string )
+    vname = "1.0" : vcode = "1"
+    if len( v ) = 0 then return
+    dim as int32 c = instrrev( v, "," )
+    vname = iif( c > 0, left( v, c - 1 ), v )
+    if c > 0 then vcode = mid( v, c + 1 )
+end sub
+
+'' THE SIGNING KEY: -appkey "keystore[,alias]", its passwords in TIKO_ANDROID_KS_PASS (and
+'' TIKO_ANDROID_KEY_PASS when the key's differs), which apksigner and jarsigner read from the
+'' environment themselves -- never on a command line, where any process could see them. Without
+'' -appkey, the debug key (made by keytool when absent, Android Studio's own parameters).
+type SignKey_
+    as string ks, alias_
+    as string storePass, keyPass    '' the variables' names (env_), or the debug key's passwords
+    as boolean env_
+end type
+
+private function Key_( byref ctx as Tko.CompilerContext, byref jdk as string, byref k as SignKey_, byref why as string ) as boolean
+    if len( ctx.options.appKey ) > 0 then
+        dim as string v = Slash_( ctx.options.appKey )
+        dim as int32 c = instrrev( v, "," )
+        k.ks = iif( c > 0, left( v, c - 1 ), v )
+        k.alias_ = iif( c > 0, mid( v, c + 1 ), "" )
+        if fs.IsFile( k.ks ) = false then why = "-appkey: no keystore '" & k.ks & "'" : return false
+        if len( environ( "TIKO_ANDROID_KS_PASS" ) ) = 0 then
+            why = "-appkey: set TIKO_ANDROID_KS_PASS to the keystore's password (and TIKO_ANDROID_KEY_PASS " & _
+                  "to the key's, when it differs)"
+            return false
+        end if
+        k.env_ = true
+        k.storePass = "TIKO_ANDROID_KS_PASS"
+        k.keyPass = iif( len( environ( "TIKO_ANDROID_KEY_PASS" ) ) > 0, "TIKO_ANDROID_KEY_PASS", "TIKO_ANDROID_KS_PASS" )
+        return true
+    end if
+    k.ks = Keystore_( ) : k.alias_ = "androiddebugkey" : k.storePass = "android" : k.keyPass = "android" : k.env_ = false
+    if fs.IsFile( k.ks ) then return true
+    fs.CreateDirAll( Tko.Modules.DirOfFile( k.ks ) )
+    dim as int32 rc = Run_( ctx, jdk & "/bin/keytool" & EXE_, "-genkeypair -keystore " & Q_( k.ks ) & _
+        " -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048" & _
+        " -validity 10000 -dname " & Q_( "CN=Android Debug,O=Android,C=US" ) )
+    if rc <> 0 then why = "keytool could not make the debug key '" & k.ks & "' (exit " & rc & ")" : return false
+    return true
+end function
+
+'' BUNDLETOOL (-appbundle), which no SDK package carries: TIKO_ANDROID_BUNDLETOOL (the jar), else
+'' the newest bundletool*.jar in <sdk>/../bundletool or <sdk>/bundletool -- beside the SDK is where
+'' docs/tiko-android keeps it.
+private function Bundletool_( byref sdk as string, byref why as string ) as string
+    dim as string e = Slash_( environ( "TIKO_ANDROID_BUNDLETOOL" ) )
+    if len( e ) > 0 then
+        if fs.IsFile( e ) then return e
+        why = "TIKO_ANDROID_BUNDLETOOL names no file: '" & e & "'"
+        return ""
+    end if
+    dim as string dirs( 0 to 1 ) = { Tko.Modules.DirOfFile( sdk ) & "/bundletool", sdk & "/bundletool" }
+    dim as string best
+    for i as int32 = 0 to 1
+        dim as string f = dir( dirs( i ) & "/bundletool*.jar" )
+        while len( f ) > 0
+            if (len( best ) = 0) orelse (f > mid( best, instrrev( best, "/" ) + 1 )) then best = dirs( i ) & "/" & f
+            f = dir( )
+        wend
+        if len( best ) > 0 then return best
+    next
+    why = "-appbundle needs bundletool: put bundletool-all-<version>.jar (github.com/google/bundletool/releases) " & _
+          "in '" & dirs( 0 ) & "', or set TIKO_ANDROID_BUNDLETOOL to it"
+    return ""
+end function
+
+'' AN APP BUNDLE (-appbundle, docs/tiko-android A6 step 4): what Play takes. aapt2 links the
+'' manifest and the icon in protobuf form into a directory; the base module is laid out as
+'' bundletool wants it (manifest/, dex/, lib/<abi>/, assets/, res/, resources.pb) and zipped by jar
+'' ('/' in every name); bundletool build-bundle makes the .aab; jarsigner signs it -- Play re-signs
+'' what it delivers with the app's signing key, this key is the upload key.
+private function Bundle_( byref ctx as Tko.CompilerContext, byref stage as string, byref abi as string, _
+                         byref bt as string, byref plat as string, byref jdk as string, byref flat as string, _
+                         byval haveAssets as boolean, byref key as SignKey_, byref outAab as string, _
+                         byref why as string ) as boolean
+    dim as string sdk = Tko.Modules.DirOfFile( Tko.Modules.DirOfFile( bt ) )
+    dim as string tool = Bundletool_( sdk, why )
+    if len( tool ) = 0 then return false
+    if fs.IsFile( jdk & "/bin/jarsigner" & EXE_ ) = false then
+        why = "the JDK at '" & jdk & "' has no jarsigner"
+        return false
+    end if
+
+    dim as string proto = stage & "/proto", b = stage & "/bundle"
+    '' aapt2's --output-to-dir writes into directories that exist, and makes none (measured, A6 step 4):
+    '' the icon is res/mipmap/ic_launcher.png there, as in the APK.
+    fs.CreateDirAll( proto & iif( len( flat ) > 0, "/res/mipmap", "" ) )
+    dim as string args = "link --proto-format --output-to-dir -o " & Q_( proto ) & " -I " & Q_( plat & "/android.jar" ) & _
+        " --manifest " & Q_( stage & "/AndroidManifest.xml" ) & _
+        " --min-sdk-version " & MIN_SDK_ & " --target-sdk-version " & TARGET_SDK_
+    if len( flat ) > 0 then args &= " " & Q_( flat )
+    dim as int32 rc = Run_( ctx, bt & "/aapt2" & EXE_, args )
+    if rc <> 0 then why = "aapt2 failed (exit " & rc & ")" : return false
+
+    fs.CreateDirAll( b & "/manifest" ) : fs.CreateDirAll( b & "/dex" ) : fs.CreateDirAll( b & "/lib/" & abi )
+    if Copy_( proto & "/AndroidManifest.xml", b & "/manifest/AndroidManifest.xml", why ) = false then return false
+    if fs.IsFile( proto & "/resources.pb" ) then
+        if Copy_( proto & "/resources.pb", b & "/resources.pb", why ) = false then return false
+    end if
+    if fs.IsDir( proto & "/res" ) then
+        if fs.CopyDir( proto & "/res", b & "/res" ).IsOk( ) = false then why = "cannot stage the resources" : return false
+    end if
+    if Copy_( stage & "/classes.dex", b & "/dex/classes.dex", why ) = false then return false
+    if Copy_( stage & "/lib/" & abi & "/libmain.so", b & "/lib/" & abi & "/libmain.so", why ) = false then return false
+    if haveAssets then
+        if fs.CopyDir( stage & "/assets", b & "/assets" ).IsOk( ) = false then why = "cannot stage the assets" : return false
+    end if
+    rc = Run_( ctx, jdk & "/bin/jar" & EXE_, "-cMf " & Q_( stage & "/base.zip" ) & " -C " & Q_( b ) & " ." )
+    if rc <> 0 then why = "jar failed on the base module (exit " & rc & ")" : return false
+
+    fs.RemoveFile( outAab )
+    rc = Run_( ctx, jdk & "/bin/java" & EXE_, "-jar " & Q_( tool ) & " build-bundle --modules=" & Q_( stage & "/base.zip" ) & _
+        " --output=" & Q_( outAab ) )
+    if rc <> 0 then why = "bundletool build-bundle failed (exit " & rc & ")" : return false
+
+    '' jarsigner takes ':env' after the option to read a password from the environment.
+    if key.env_ then
+        args = "-storepass:env " & key.storePass & " -keypass:env " & key.keyPass
+    else
+        args = "-storepass " & key.storePass & " -keypass " & key.keyPass
+    end if
+    rc = Run_( ctx, jdk & "/bin/jarsigner" & EXE_, "-keystore " & Q_( key.ks ) & " " & args & _
+        " -sigalg SHA256withRSA -digestalg SHA-256 " & Q_( outAab ) & " " & Q_( key.alias_ ) )
+    if rc <> 0 then why = "jarsigner failed (exit " & rc & ")" : fs.RemoveFile( outAab ) : return false
+    return true
+end function
+
+private function Package_( byref ctx as Tko.CompilerContext, byref why as string ) as boolean
+    dim as string stage = Stage_( ctx )
+    dim as string abi = Abi_( ctx.options.target )
+    dim as string outApk = Slash_( ctx.options.outputPath )
+    fs.RemoveDirAll( stage )
+    fs.CreateDirAll( stage & "/lib/" & abi )
+    if Copy_( LinkPath( ctx ), stage & "/lib/" & abi & "/libmain.so", why ) = false then return false
+
+    '' WHO THE APP IS: -appid, else org.tiko.<name>; -applabel, else the name.
+    dim as string stem = Stem_( outApk )
+    dim as string id = ctx.options.appId
+    if len( id ) = 0 then id = "org.tiko." & Segment_( stem )
+    if IdOk_( id ) = false then
+        why = "'" & id & "' is not an application id: two or more segments like 'com.example.game', " & _
+              "each a letter then letters, digits or '_'"
+        return false
+    end if
+    dim as string label = ctx.options.appLabel
+    if len( label ) = 0 then label = stem
+    if (len( ctx.options.appAssets ) > 0) andalso (fs.IsDir( ctx.options.appAssets ) = false) then
+        why = "-appassets: '" & ctx.options.appAssets & "' is not a directory"
+        return false
+    end if
+
+    '' SDL'S JAVA, which only vendor/SDL3 carries: an app is an SDL3 program. Found beside the
+    '' SDL3 archive the link took (lib/SDL3_android_<arch>.a -> lib/android/classes.dex).
+    dim as string dex
+    for each lf as string in ctx.link.pragmaLibFiles
+        dim as string cand = Tko.Modules.DirOfFile( Tko.Modules.NormPath( Tko.Modules.AbsPath( lf ) ) ) & "/android/classes.dex"
+        if fs.IsFile( cand ) then
+            dex = cand
+            exit for
+        end if
+    next
+    if len( dex ) = 0 then
+        why = "an app is an SDL3 program, and this one does not '#import ""vendor/SDL3""' " & _
+              "(or vendor/SDL3 has no lib/android/classes.dex: build/vendorfetch.sh --target " & _
+              Tko.TargetName( ctx.options.target ) & ")"
+        return false
+    end if
+
+    dim as string sdk = Sdk_( why )
+    if len( sdk ) = 0 then return false
+    dim as string bt = Newest_( sdk & "/build-tools", "lib/apksigner.jar" )
+    if (len( bt ) = 0) orelse (fs.IsFile( bt & "/aapt2" & EXE_ ) = false) orelse (fs.IsFile( bt & "/zipalign" & EXE_ ) = false) then
+        why = "the SDK at '" & sdk & "' has no build-tools with aapt2, zipalign and apksigner (sdkmanager ""build-tools;<version>"")"
+        return false
+    end if
+    dim as string plat = Newest_( sdk & "/platforms", "android.jar" )
+    if len( plat ) = 0 then
+        why = "the SDK at '" & sdk & "' has no platform (sdkmanager ""platforms;android-" & TARGET_SDK_ & """)"
+        return false
+    end if
+    dim as string jdk = Jdk_( why )
+    if len( jdk ) = 0 then return false
+
+    '' THE STAGE: classes.dex and the manifest beside lib/<abi>/libmain.so; the modules' run-time
+    '' files (tkHost's fonts) flat in assets/, where SDL_IOFromFile finds them by name, with the
+    '' -appassets tree, subdirectories kept, over them.
+    if Copy_( dex, stage & "/classes.dex", why ) = false then return false
+    dim as boolean haveAssets = (ctx.runtimeFiles.Count > 0) orelse (len( ctx.options.appAssets ) > 0)
+    if haveAssets then fs.CreateDirAll( stage & "/assets" )
+    if len( ctx.options.appAssets ) > 0 then
+        dim as fs.FsResultI64 cr = fs.CopyDir( Slash_( ctx.options.appAssets ), stage & "/assets" )
+        if cr.IsOk( ) = false then why = "cannot copy -appassets '" & ctx.options.appAssets & "'" : return false
+    end if
+    for each rf as string in ctx.runtimeFiles
+        dim as string src = Tko.Modules.NormPath( Tko.Modules.AbsPath( rf ) )
+        if Copy_( src, stage & "/assets/" & mid( src, instrrev( src, "/" ) + 1 ), why ) = false then return false
+    next
+    dim as string vname, vcode
+    Version_( ctx.options.appVersion, vname, vcode )
+    dim as SignKey_ key
+    if Key_( ctx, jdk, key, why ) = false then return false
+
+    '' THE ICON (-appicon): one PNG compiled as the resource mipmap/ic_launcher, used at every
+    '' density. It is staged as res/mipmap/ic_launcher.png and compiled with --dir: aapt2 on Windows
+    '' refuses a single file's path written with '/' ("bad resource path", measured, A6 step 3).
+    dim as int32 rc
+    dim as string icon = "@android:drawable/sym_def_app_icon", flat
+    if len( ctx.options.appIcon ) > 0 then
+        if (fs.IsFile( ctx.options.appIcon ) = false) orelse (lcase( right( ctx.options.appIcon, 4 ) ) <> ".png") then
+            why = "-appicon: '" & ctx.options.appIcon & "' is not a .png file"
+            return false
+        end if
+        fs.CreateDirAll( stage & "/res/mipmap" )
+        if Copy_( Slash_( ctx.options.appIcon ), stage & "/res/mipmap/ic_launcher.png", why ) = false then return false
+        flat = stage & "/res.zip"
+        rc = Run_( ctx, bt & "/aapt2" & EXE_, "compile --dir " & Q_( stage & "/res" ) & " -o " & Q_( flat ) )
+        if rc <> 0 then why = "aapt2 could not compile the icon (exit " & rc & ")" : return false
+        icon = "@mipmap/ic_launcher"
+    end if
+
+    dim as int32 fh = freefile
+    if open( stage & "/AndroidManifest.xml" for output as #fh ) <> 0 then
+        why = "cannot write '" & stage & "/AndroidManifest.xml'"
+        return false
+    end if
+    print #fh, Manifest_( id, label, vname, vcode, icon, ctx.options.appPermissions );
+    close #fh
+
+    if ctx.options.appBundle then return Bundle_( ctx, stage, abi, bt, plat, jdk, flat, haveAssets, key, outApk, why )
+
+    dim as string args = "link -o " & Q_( stage & "/base.apk" ) & " -I " & Q_( plat & "/android.jar" ) & _
+        " --manifest " & Q_( stage & "/AndroidManifest.xml" ) & _
+        " --min-sdk-version " & MIN_SDK_ & " --target-sdk-version " & TARGET_SDK_
+    if len( flat ) > 0 then args &= " " & Q_( flat )
+    rc = Run_( ctx, bt & "/aapt2" & EXE_, args )
+    if rc <> 0 then why = "aapt2 failed (exit " & rc & ")" : return false
+
+    '' THE ASSETS BY jar, NOT aapt2 -A: aapt2 on Windows names a nested asset with a backslash
+    '' ("assets/sub\n.txt" for sub/n.txt), which Android's asset manager never finds (measured,
+    '' A6 step 2).
+    '' jar names every entry with '/', and compresses them as aapt2 would.
+    if haveAssets then
+        rc = Run_( ctx, jdk & "/bin/jar" & EXE_, "-uMf " & Q_( stage & "/base.apk" ) & " -C " & Q_( stage ) & " assets" )
+        if rc <> 0 then why = "jar failed on the assets (exit " & rc & ")" : return false
+    end if
+
+    '' STORED (-0): a native library mapped from the APK must not be compressed, and jar's
+    '' -C keeps the entry names relative to the stage.
+    rc = Run_( ctx, jdk & "/bin/jar" & EXE_, "-u0Mf " & Q_( stage & "/base.apk" ) & _
+        " -C " & Q_( stage ) & " classes.dex -C " & Q_( stage ) & " lib/" & abi & "/libmain.so" )
+    if rc <> 0 then why = "jar failed (exit " & rc & ")" : return false
+
+    rc = Run_( ctx, bt & "/zipalign" & EXE_, "-P 16 -f 4 " & Q_( stage & "/base.apk" ) & " " & Q_( stage & "/aligned.apk" ) )
+    if rc <> 0 then why = "zipalign failed (exit " & rc & ")" : return false
+
+    '' NO v4 SIGNATURE: it is a second file (<apk>.idsig) for incremental installs only.
+    dim as string pre = iif( key.env_, "env:", "pass:" )
+    args = "-jar " & Q_( bt & "/lib/apksigner.jar" ) & " sign --ks " & Q_( key.ks ) & _
+        " --ks-pass " & pre & key.storePass & " --key-pass " & pre & key.keyPass
+    if len( key.alias_ ) > 0 then args &= " --ks-key-alias " & Q_( key.alias_ )
+    rc = Run_( ctx, jdk & "/bin/java" & EXE_, args & " --v4-signing-enabled false --out " & Q_( outApk ) & " " & Q_( stage & "/aligned.apk" ) )
+    if rc <> 0 then why = "apksigner failed (exit " & rc & ")" : return false
+    return true
+end function
+
+function Package( byref ctx as Tko.CompilerContext, byref why as string ) as boolean
+    dim as boolean ok = Package_( ctx, why )
+    if ctx.options.keepTemps = false then
+        fs.RemoveDirAll( Stage_( ctx ) )
+        fs.RemoveFile( LinkPath( ctx ) )
+    end if
+    return ok
+end function
+
+end namespace

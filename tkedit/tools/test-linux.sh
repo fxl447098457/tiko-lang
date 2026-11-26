@@ -23,6 +23,13 @@ copy() {     # copy <from> <to>
 }
 copy "$SRC" "$E"
 mkdir -p "$E/bin"
+# designall's ThemeLoadFixtures (TH8) reads examples/tkControls/tkThemeFile/fixtures/ and
+# tkDesigned/appTheme/ beside tkedit (../../../examples from src/design), and its DataGrid suite
+# tkGridForm/: copy those folders.
+for x in tkThemeFile/fixtures tkDesigned/appTheme tkGridForm; do
+    mkdir -p "$W/examples/tkControls/$x"
+    copy "$SRC/../examples/tkControls/$x" "$W/examples/tkControls/$x"
+done
 export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir EGL_LOG_LEVEL=fatal LD_LIBRARY_PATH=$LIB
 export TIKO_MODCACHE=$W/modcache
 bad=0

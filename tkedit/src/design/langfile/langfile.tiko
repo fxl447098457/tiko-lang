@@ -1,0 +1,531 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' langfile -- the project's languages (Form > Languages...): appLanguages/appLanguages.tklang, one
+' catalog per language in appLanguages/lang/<code>.toml, and the generated module that registers them
+' with tkLanguage in a program.
+'
+'   appLanguages.tklang
+'   format = 1
+'   base = "en"                   the language the forms are written in: no catalog
+'   base_name = "English"
+'   [[language]]
+'   code = "fr"                   lang/fr.toml
+'   name = "Français"             as the language calls itself
+'   embed = false                 written only when off: a file beside the program, in lang/
+'
+'   lang/fr.toml -- one table per form, the rest of each key quoted (its dots are the key's own)
+'   format = 1
+'   name = "Français"
+'   [frmMain]
+'   Caption = "Fenêtre"
+'   "btnOK.Text" = "OK"
+'   [_source.frmMain]             what each entry was translated from: a different text now = stale.
+'   Caption = "Main"              A program skips tables whose name starts with _.
+#module "langfile"
+
+#import "std/config"
+#import "std/fs"
+#import "std/containers"
+#import "../codegen"
+using containers
+
+public const as long LANG_FORMAT = 1
+public const as string LANG_MODULE = "appLanguages"
+public const as string LANG_DIR = "lang"                ' beside the .tklang, and beside the program
+public const as string SOURCE_TABLE = "_source"
+const as string NL = chr( 10 )
+
+public type LangInfo
+    Code as ustring
+    Name as ustring
+    Embed as boolean = true
+end type
+
+public type LangProject
+    BaseCode as ustring             ' "" until read: ParseProject makes it "en" when the file has none
+    BaseName as ustring
+    Languages as Array( of LangInfo )
+    Problems as Array( of ustring )
+end type
+
+public type CatEntry
+    Key as ustring          ' "frmMain.btnOK.Text"
+    Text as ustring         ' the translation
+    Source as ustring       ' the form's text it was made from
+end type
+
+public type Catalog
+    Name as ustring
+    Entries as Array( of CatEntry )     ' kept sorted by Key
+    Problems as Array( of ustring )
+end type
+
+' ---- names ---------------------------------------------------------------------------------------
+
+' A language code: a letter, then letters, digits, _ and - ("fr", "pt_BR", "zh-Hans"); at most 20.
+public function IsCode( byref s as const ustring ) as boolean
+    if (len( s ) = 0) orelse (len( s ) > 20) then return false
+    for i as long = 1 to len( s )
+        dim as long a = asc( mid( s, i, 1 ) )
+        dim as boolean letter = ((a >= 65) andalso (a <= 90)) orelse ((a >= 97) andalso (a <= 122))
+        if (i = 1) andalso (letter = false) then return false
+        if (letter = false) andalso (a <> 95) andalso (a <> 45) andalso ((a < 48) orelse (a > 57)) then return false
+    next
+    return true
+end function
+
+' The index of a language by code (case-insensitive), -1 when there is none.
+public function Find( byref proj as LangProject, byref code as const ustring ) as long
+    for i as long = 0 to proj.Languages.Count( ) - 1
+        if lcase( proj.Languages[i].Code ) = lcase( code ) then return i
+    next
+    return -1
+end function
+
+' A catalog's file, relative to the .tklang's folder.
+public function CatalogFile( byref code as const ustring ) as ustring
+    return LANG_DIR & "/" & code & ".toml"
+end function
+
+' ---- TOML helpers ----------------------------------------------------------------------------------
+
+private function StrOf_( byref t as config.TomlValue, byref k as const ustring ) as ustring
+    dim as config.TomlValue ptr p = t.Find( k )
+    if p = 0 then return ""
+    dim as ustring none = ""
+    return p->AsString( ).ValueOr( none )
+end function
+
+private function FormatOf_( byref root as config.TomlValue ) as longint
+    dim as longint fmt = 0
+    dim as config.TomlValue ptr f = root.Find( "format" )
+    if f then fmt = f->AsInt( ).ValueOr( fmt )
+    return fmt
+end function
+
+' Always the basic string form.
+private function Quote_( byref s as const ustring ) as ustring
+    dim as ustring o = """"
+    for i as long = 1 to len( s )
+        dim as ustring ch = mid( s, i, 1 )
+        select case asc( ch )
+        case 34 : o &= "\"""
+        case 92 : o &= "\\"
+        case 9  : o &= "\t"
+        case 10 : o &= "\n"
+        case 13 : o &= "\r"
+        case 0 to 31, 127 : o &= "\u" & hex( asc( ch ), 4 )
+        case else : o &= ch
+        end select
+    next
+    return o & """"
+end function
+
+private function IsBareKey_( byref k as const ustring ) as boolean
+    if len( k ) = 0 then return false
+    for i as long = 1 to len( k )
+        select case asc( mid( k, i, 1 ) )
+        case 48 to 57, 65 to 90, 97 to 122, 45, 95
+        case else
+            return false
+        end select
+    next
+    return true
+end function
+
+private function KeyText_( byref k as const ustring ) as ustring
+    if IsBareKey_( k ) then return k
+    return Quote_( k )
+end function
+
+' ---- the project file ------------------------------------------------------------------------------
+
+' False when the text isn't TOML or is a newer format; errText says why. Content faults go to Problems.
+public function ParseProject( byref text as const ustring, byref proj as LangProject, byref errText as ustring ) as boolean
+    dim as config.ConfigResultToml r = config.ParseToml( text )
+    if r.IsOk( ) = false then
+        errText = r.Failure( ).Message( )
+        return false
+    end if
+    dim as config.TomlValue root = r.Value( )
+    dim as longint fmt = FormatOf_( root )
+    if fmt <> LANG_FORMAT then
+        errText = "format " & fmt & " is not one this version reads (expected " & LANG_FORMAT & ")"
+        return false
+    end if
+    for i as long = 0 to root.Count( ) - 1
+        dim as ustring k = root.KeyAt( i )
+        if instr( " format base base_name language ", " " & k & " " ) = 0 then proj.Problems.Push( "file: unknown key '" & k & "'" )
+    next
+    proj.BaseCode = "en"
+    proj.BaseName = "English"
+    if root.Find( "base" ) then proj.BaseCode = StrOf_( root, "base" )
+    if root.Find( "base_name" ) then proj.BaseName = StrOf_( root, "base_name" )
+    dim as config.TomlValue ptr list = root.Find( "language" )
+    if list then
+        for i as long = 0 to list->Count( ) - 1
+            dim byref as config.TomlValue t = list->Item( i )
+            for j as long = 0 to t.Count( ) - 1
+                if instr( " code name embed ", " " & t.KeyAt( j ) & " " ) = 0 then
+                    proj.Problems.Push( "language " & (i + 1) & ": unknown key '" & t.KeyAt( j ) & "'" )
+                end if
+            next
+            dim as LangInfo x
+            x.Code = StrOf_( t, "code" )
+            x.Name = StrOf_( t, "name" )
+            dim as boolean yes = true
+            dim as config.TomlValue ptr e = t.Find( "embed" )
+            if e then x.Embed = e->AsBool( ).ValueOr( yes )
+            proj.Languages.Push( x )
+        next
+    end if
+    return true
+end function
+
+' The canonical text: the languages in their order, embed written only when it is off.
+public function ProjectText( byref proj as LangProject ) as ustring
+    dim as ustring o = "format = " & LANG_FORMAT & NL
+    o &= "base = " & Quote_( proj.BaseCode ) & NL
+    o &= "base_name = " & Quote_( proj.BaseName ) & NL
+    for each x as LangInfo in proj.Languages
+        o &= NL & "[[language]]" & NL
+        o &= "code = " & Quote_( x.Code ) & NL
+        o &= "name = " & Quote_( x.Name ) & NL
+        if x.Embed = false then o &= "embed = false" & NL
+    next
+    return o
+end function
+
+' The languages a new project starts with: none, the forms in English.
+public function DefaultProjectText( ) as ustring
+    dim as LangProject p
+    p.BaseCode = "en"
+    p.BaseName = "English"
+    return ProjectText( p )
+end function
+
+' What is wrong with it. dir_: the folder of the .tklang, whose lang/ must hold every catalog; ""
+' skips the files.
+public sub CheckProject( byref proj as LangProject, byref dir_ as const ustring, byref problems as Array( of ustring ) )
+    for each p as ustring in proj.Problems
+        problems.Push( p )
+    next
+    if IsCode( proj.BaseCode ) = false then problems.Push( "base '" & proj.BaseCode & "': a code is a letter, then letters, digits, _ and -" )
+    for i as long = 0 to proj.Languages.Count( ) - 1
+        dim byref as LangInfo x = proj.Languages[i]
+        if IsCode( x.Code ) = false then
+            problems.Push( "language '" & x.Code & "': a code is a letter, then letters, digits, _ and -" )
+        elseif Find( proj, x.Code ) <> i then
+            problems.Push( "language '" & x.Code & "': listed twice" )
+        elseif lcase( x.Code ) = lcase( proj.BaseCode ) then
+            problems.Push( "language '" & x.Code & "': is the forms' own language" )
+        elseif len( dir_ ) then
+            dim as ustring p = fs.PathJoin( dir_, LANG_DIR, x.Code & ".toml" )
+            if fs.IsFile( p ) = false then problems.Push( "language '" & x.Code & "': " & CatalogFile( x.Code ) & " is not there" )
+        end if
+    next
+end sub
+
+' ---- catalogs ----------------------------------------------------------------------------------------
+
+' The entry for key, -1 when there is none.
+public function FindEntry( byref cat as Catalog, byref key_ as const ustring ) as long
+    dim as long lo = 0, hi = cat.Entries.Count( ) - 1
+    while lo <= hi
+        dim as long m = (lo + hi) \ 2
+        if cat.Entries[m].Key = key_ then return m
+        if cat.Entries[m].Key < key_ then lo = m + 1 else hi = m - 1
+    wend
+    return -1
+end function
+
+' A translation set (made, or replaced); an empty text takes the entry out.
+public sub PutEntry( byref cat as Catalog, byref key_ as const ustring, byref text as const ustring, byref source as const ustring )
+    dim as long i = FindEntry( cat, key_ )
+    if len( text ) = 0 then
+        if i >= 0 then cat.Entries.Remove( i )
+        exit sub
+    end if
+    if i >= 0 then
+        cat.Entries[i].Text = text
+        cat.Entries[i].Source = source
+        exit sub
+    end if
+    dim as CatEntry e
+    e.Key = key_
+    e.Text = text
+    e.Source = source
+    dim as long at_ = 0
+    while (at_ < cat.Entries.Count( )) andalso (cat.Entries[at_].Key < key_)
+        at_ += 1
+    wend
+    cat.Entries.Insert( at_, e )
+end sub
+
+private sub Sort_( byref cat as Catalog )
+    for a as long = 1 to cat.Entries.Count( ) - 1
+        dim as CatEntry k = cat.Entries[a]
+        dim as long b = a - 1
+        while (b >= 0) andalso (cat.Entries[b].Key > k.Key)
+            cat.Entries[b + 1] = cat.Entries[b]
+            b -= 1
+        wend
+        cat.Entries[b + 1] = k
+    next
+end sub
+
+' Every string in a table, its key the table's path and its own key: "frmMain" + "btnOK.Text".
+private sub Flatten_( byref t as config.TomlValue, byref prefix as const ustring, byref keys as Array( of ustring ), _
+                      byref texts as Array( of ustring ), byref cat as Catalog )
+    for i as long = 0 to t.Count( ) - 1
+        dim as ustring k = prefix & "." & t.KeyAt( i )
+        dim byref as config.TomlValue v = t.Item( i )
+        if v.Kind( ) = config.TOML_TABLE then
+            Flatten_( v, k, keys, texts, cat )
+        elseif v.Kind( ) = config.TOML_STRING then
+            dim as ustring none = ""
+            keys.Push( k )
+            texts.Push( v.AsString( ).ValueOr( none ) )
+        else
+            cat.Problems.Push( "'" & k & "' is not text" )
+        end if
+    next
+end sub
+
+' False when the text isn't TOML or is a newer format; errText says why. Content faults go to
+' Problems: a catalog with a fault still reads.
+public function ParseCatalog( byref text as const ustring, byref cat as Catalog, byref errText as ustring ) as boolean
+    dim as config.ConfigResultToml r = config.ParseToml( text )
+    if r.IsOk( ) = false then
+        errText = r.Failure( ).Message( )
+        return false
+    end if
+    dim as config.TomlValue root = r.Value( )
+    dim as longint fmt = FormatOf_( root )
+    if fmt <> LANG_FORMAT then
+        errText = "format " & fmt & " is not one this version reads (expected " & LANG_FORMAT & ")"
+        return false
+    end if
+    cat.Name = StrOf_( root, "name" )
+    dim as Array( of ustring ) keys, texts, srcKeys, srcTexts
+    for i as long = 0 to root.Count( ) - 1
+        dim as ustring k = root.KeyAt( i )
+        if (k = "format") orelse (k = "name") then continue for
+        dim byref as config.TomlValue v = root.Item( i )
+        if v.Kind( ) <> config.TOML_TABLE then
+            cat.Problems.Push( "'" & k & "' is not a form's table" )
+        elseif k = SOURCE_TABLE then
+            for j as long = 0 to v.Count( ) - 1
+                dim byref as config.TomlValue f = v.Item( j )
+                if f.Kind( ) = config.TOML_TABLE then Flatten_( f, v.KeyAt( j ), srcKeys, srcTexts, cat )
+            next
+        elseif left( k, 1 ) <> "_" then
+            Flatten_( v, k, keys, texts, cat )
+        end if
+    next
+    for i as long = 0 to keys.Count( ) - 1
+        dim as CatEntry e
+        e.Key = keys[i]
+        e.Text = texts[i]
+        cat.Entries.Push( e )
+    next
+    Sort_( cat )
+    for i as long = 0 to srcKeys.Count( ) - 1
+        dim as long at_ = FindEntry( cat, srcKeys[i] )
+        if at_ >= 0 then cat.Entries[at_].Source = srcTexts[i]
+    next
+    return true
+end function
+
+' "frmMain" of "frmMain.btnOK.Text"; the rest is the key in its table.
+private function FormOf_( byref key_ as const ustring ) as ustring
+    dim as long d = instr( key_, "." )
+    if d = 0 then return key_
+    return left( key_, d - 1 )
+end function
+
+private function RestOf_( byref key_ as const ustring ) as ustring
+    return mid( key_, instr( key_, "." ) + 1 )
+end function
+
+' The canonical text: one table per form, keys sorted; then what each was translated from.
+public function CatalogText( byref cat as Catalog ) as ustring
+    dim as ustring o = "format = " & LANG_FORMAT & NL
+    o &= "name = " & Quote_( cat.Name ) & NL
+    dim as ustring form_ = chr( 1 )
+    for each e as CatEntry in cat.Entries
+        if FormOf_( e.Key ) <> form_ then
+            form_ = FormOf_( e.Key )
+            o &= NL & "[" & KeyText_( form_ ) & "]" & NL
+        end if
+        o &= KeyText_( RestOf_( e.Key ) ) & " = " & Quote_( e.Text ) & NL
+    next
+    form_ = chr( 1 )
+    for each e as CatEntry in cat.Entries
+        if len( e.Source ) = 0 then continue for
+        if FormOf_( e.Key ) <> form_ then
+            form_ = FormOf_( e.Key )
+            o &= NL & "[" & SOURCE_TABLE & "." & KeyText_( form_ ) & "]" & NL
+        end if
+        o &= KeyText_( RestOf_( e.Key ) ) & " = " & Quote_( e.Source ) & NL
+    next
+    return o
+end function
+
+' A new language's empty catalog.
+public function NewCatalogText( byref name_ as const ustring ) as ustring
+    dim as Catalog c
+    c.Name = name_
+    return CatalogText( c )
+end function
+
+' Every key starting with oldPrefix ("frmMain.btnOld.") made to start with newPrefix. A key that is
+' already there under the new name keeps its own. How many moved.
+public function RenameKeys( byref cat as Catalog, byref oldPrefix as const ustring, byref newPrefix as const ustring ) as long
+    dim as long n = 0
+    dim as Array( of CatEntry ) moved
+    dim as long i = 0
+    while i < cat.Entries.Count( )
+        if left( cat.Entries[i].Key, len( oldPrefix ) ) = oldPrefix then
+            dim as CatEntry e = cat.Entries[i]
+            e.Key = newPrefix & mid( e.Key, len( oldPrefix ) + 1 )
+            moved.Push( e )
+            cat.Entries.Remove( i )
+        else
+            i += 1
+        end if
+    wend
+    for each e as CatEntry in moved
+        if FindEntry( cat, e.Key ) < 0 then
+            PutEntry( cat, e.Key, e.Text, e.Source )
+            n += 1
+        end if
+    next
+    return n
+end function
+
+' ---- where an entry stands ---------------------------------------------------------------------------
+
+public enum EntryState
+    StateDone = 0           ' translated from the text the form has now
+    StateMissing            ' no translation
+    StateStale              ' translated from a text the form no longer has
+    StateUnused             ' in the catalog, in no form
+end enum
+
+public function StateOf( byref cat as Catalog, byref key_ as const ustring, byref baseText as const ustring ) as long
+    dim as long i = FindEntry( cat, key_ )
+    if i < 0 then return EntryState.StateMissing
+    if (len( cat.Entries[i].Source ) > 0) andalso (cat.Entries[i].Source <> baseText) then return EntryState.StateStale
+    return EntryState.StateDone
+end function
+
+' ---- the generated module ------------------------------------------------------------------------
+
+' The whole generated module for a project that passed CheckProject. Register() names the base
+' language and every catalog to tkLanguage: a built-in one from inside the program, then -- so it
+' wins -- a copy beside the program when there is one; any other from beside the program, else
+' where the project keeps it.
+public function Generate( byref proj as LangProject, byref moduleName as const ustring, byref sourceName as const ustring, _
+                          byref sourceText as const ustring ) as ustring
+    dim as ustring o = "' GENERATED by the tkEdit Form Designer from " & sourceName & ". Do not edit." & NL
+    o &= "' source-hash: " & codegen.SourceHash( sourceText ) & NL
+    o &= "#module """ & moduleName & """" & NL & NL
+    o &= "#import ""vendor/tkControls/tkApp""" & NL
+    o &= "#import ""vendor/tkControls/tkLanguage""" & NL & NL
+    o &= "using tkApp" & NL & "using tkHost" & NL & "using tkLanguage" & NL & NL
+    dim as boolean anyEmbed = false
+    for i as long = 0 to proj.Languages.Count( ) - 1
+        if proj.Languages[i].Embed then anyEmbed = true
+    next
+    if anyEmbed then
+        o &= "' Inside the program." & NL
+        for i as long = 0 to proj.Languages.Count( ) - 1
+            if proj.Languages[i].Embed then o &= "#embed gLang" & i & "_ " & Quote_( CatalogFile( proj.Languages[i].Code ) ) & NL
+        next
+        o &= NL
+    end if
+    o &= "' A catalog beside the program in " & LANG_DIR & "/ (tkEdit copies the ones not built in there after a" & NL
+    o &= "' build); """" when there is none." & NL
+    o &= "private function Beside_( byref f as const ustring ) as ustring" & NL
+    o &= "    dim as ustring beside = tkHost_FontDir( ) & """ & LANG_DIR & "/"" & f" & NL
+    o &= "    dim as string p8 = beside" & NL
+    o &= "    if SDL_GetPathInfo( strptr( p8 ), 0 ) then return beside" & NL
+    o &= "    return """"" & NL
+    o &= "end function" & NL & NL
+    o &= "' The forms' own language and every catalog, before a form is built." & NL
+    o &= "public sub Register( )" & NL
+    o &= "    tkLanguage_SetBase( " & Quote_( proj.BaseCode ) & ", " & Quote_( proj.BaseName ) & " )" & NL
+    for i as long = 0 to proj.Languages.Count( ) - 1
+        dim byref as LangInfo x = proj.Languages[i]
+        dim as ustring args = Quote_( x.Code ) & ", " & Quote_( x.Name )
+        dim as ustring f = Quote_( x.Code & ".toml" )
+        if x.Embed then
+            o &= "    tkLanguage_AddData( " & args & ", @gLang" & i & "_( 0 ), ubound( gLang" & i & "_ ) + 1 )" & NL
+            o &= "    if len( Beside_( " & f & " ) ) then tkLanguage_AddFile( " & args & ", Beside_( " & f & " ) )" & NL
+        else
+            o &= "    if len( Beside_( " & f & " ) ) then" & NL
+            o &= "        tkLanguage_AddFile( " & args & ", Beside_( " & f & " ) )" & NL
+            o &= "    else" & NL
+            o &= "        tkLanguage_AddFile( " & args & ", " & Quote_( moduleName & "/" & CatalogFile( x.Code ) ) & " )" & NL
+            o &= "    end if" & NL
+        end if
+    next
+    o &= "end sub" & NL & NL
+    o &= "' The language the system prefers, when the program has it; else the forms' own. True when one" & NL
+    o &= "' of the program's languages was chosen." & NL
+    o &= "public function UseSystem( ) as boolean" & NL
+    o &= "    return tkLanguage_UseSystem( )" & NL
+    o &= "end function" & NL & NL
+    o &= "' One language by its code (" & Quote_( proj.BaseCode ) & ": the forms' own). False when the program hasn't it." & NL
+    o &= "public function Use( byref code as const ustring ) as boolean" & NL
+    o &= "    return tkLanguage_Use( code )" & NL
+    o &= "end function" & NL
+    return o
+end function
+
+' main.tiko made to use the project's languages: the import beside tkApp's, Register( ) and
+' UseSystem( ) right after "if tkApp_Init( x ) = false then", before any form is built. 1 = done
+' (outText has it), 0 = it already does, -1 = no such line to hang it on.
+public function InstallIntoMain( byref text as const ustring, byref outText as ustring ) as long
+    if instr( text, LANG_MODULE & ".Register" ) then return 0
+    dim as Array( of ustring ) lines
+    dim as long at = 1
+    do
+        dim as long e = instr( at, text, chr( 10 ) )
+        if e = 0 then
+            lines.Push( mid( text, at ) )
+            exit do
+        end if
+        lines.Push( mid( text, at, e - at ) )
+        at = e + 1
+    loop
+    dim as long initLine = -1, importLine = -1
+    for i as long = 0 to lines.Count( ) - 1
+        dim as ustring l = trim( lines[i], any !" \t\r" )
+        if (importLine < 0) andalso (left( l, 7 ) = "#import") then importLine = i
+        if (lcase( left( l, 3 ) ) = "#im") andalso (instr( l, """vendor/tkControls/tkApp""" ) > 0) then importLine = i
+        if (initLine < 0) andalso (instr( lcase( l ), "if tkapp_init(" ) = 1) andalso (instr( lcase( l ), ") = false then" ) > 0) then initLine = i
+    next
+    if initLine < 0 then return -1
+    dim as ustring indent = left( lines[initLine], len( lines[initLine] ) - len( ltrim( lines[initLine], any !" \t" ) ) )
+    dim as ustring o
+    for i as long = 0 to lines.Count( ) - 1
+        o &= lines[i]
+        if i < lines.Count( ) - 1 then o &= NL
+        if i = importLine then o &= "#import ""./" & LANG_MODULE & """" & NL
+        if i = initLine then
+            if i = lines.Count( ) - 1 then o &= NL
+            o &= indent & LANG_MODULE & ".Register( )" & NL
+            o &= indent & LANG_MODULE & ".UseSystem( )      ' or " & LANG_MODULE & ".Use( ""fr"" ): one of the project's languages" & NL
+        end if
+    next
+    if importLine < 0 then o = "#import ""./" & LANG_MODULE & """" & NL & o
+    outText = o
+    return 1
+end function

@@ -1,0 +1,926 @@
+' tkAutoComplete self-test (phases A1 to A4): silent setters and the item store; typing opens and narrows
+' the list while the EDIT keeps the focus and the popup is not focusable; keys and characters sent
+' to the open list reach the edit; the popup is reused while its row count holds and replaced when
+' it changes; the arrows, paging, preview and Escape; commit (order of events), submit, Tab; the
+' closed-list keys; the mouse (hover never previews, click commits, a click in the edit closes);
+' geometry (popup size and place, row rects, matched characters painted in the match colour where
+' the run is and not after it); the status rows; the debounce; theme and pinned colours; an owner
+' accelerator; focus loss. A2: the search face -- glyph and clear cells and the text's margins,
+' the clear button's showing, hover and click, Search's debounce, Enter, Escape, commit, the glyph
+' font. A3: APPEND and SUGGESTAPPEND (completion, overtyping, Backspace, Escape, case, caret), the
+' LimitToList value (NotInList's three answers, full matches, emptying, ids), the drop button. A4:
+' the callback and async feeds (stale answers, the status row, cancel), a source, SetSelectedItem. One
+' check per distinct behaviour, one run at 1.75; every input is a pushed SDL event.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkAutoComplete"
+#import "vendor/tkControls/tkTest"
+using tkAutoComplete
+using tkTextBox
+using tkVScrollBar
+using tkMatch
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as string gLog
+dim shared as long gChanged, gChangedList, gSelected, gSelIdx, gSubmits, gSubIdx, gHighlights, gHiIdx
+dim shared as long gDrops, gAccels
+dim shared as longint gSelId
+dim shared as ustring gSubText
+declare sub KeepUp( )
+
+sub OnChanged( byval h as TK_WIDGET ptr, byval bFromList as boolean )
+    gChanged += 1
+    if bFromList then gChangedList += 1
+    gLog &= iif( bFromList, "T1;", "T0;" )
+end sub
+sub OnSelected( byval h as TK_WIDGET ptr, byval idx as long, byval id as longint )
+    gSelected += 1 : gSelIdx = idx : gSelId = id
+    gLog &= "I" & idx & ";"
+end sub
+sub OnSubmit( byval h as TK_WIDGET ptr, byref text as const ustring, byval idx as long )
+    gSubmits += 1 : gSubText = text : gSubIdx = idx
+    gLog &= "S" & idx & ";"
+end sub
+sub OnHighlight( byval h as TK_WIDGET ptr, byval idx as long )
+    gHighlights += 1 : gHiIdx = idx
+end sub
+sub OnDrop( byval h as TK_WIDGET ptr, byval isOpen as boolean )
+    if isOpen then KeepUp( )
+    gDrops += 1
+    gLog &= iif( isOpen, "O;", "C;" )
+end sub
+function OnPreKey( byval h as TK_HOST ptr, byval m as TK_MSG ptr ) as boolean
+    if (m->key = SDLK_S) andalso ((m->mods and SDL_KMOD_CTRL) <> 0) then gAccels += 1 : return true
+    return false
+end function
+
+sub ResetLog( )
+    gLog = "" : gChanged = 0 : gChangedList = 0 : gSelected = 0 : gSelIdx = -9 : gSubmits = 0
+    gSubIdx = -9 : gHighlights = 0 : gHiIdx = -9 : gDrops = 0 : gAccels = 0 : gSelId = 0 : gSubText = ""
+end sub
+
+' THE TEST WINDOW IS OFTEN NOT THE ACTIVE APPLICATION (the author works elsewhere while it runs). A
+' window focus loss then posts tkHost's focus check, which -- correctly, for an app -- closes every
+' popup 150 ms later, at a random point of a sequence (measured: 2 runs in 8 lost a list). So every
+' list this control opens is marked bKeepOnFocusLoss here, after each input. That flag affects ONLY
+' the app-level focus check: focus moving to another control, and a press outside the list, still
+' close it through their own paths, and those are tested.
+dim shared as TK_WIDGET ptr gKeepAc
+
+sub KeepUp( )
+    if gKeepAc = 0 then exit sub
+    dim as TK_HOST ptr l = tkAutoComplete_GetListHandle( gKeepAc )
+    if l then l->bKeepOnFocusLoss = true
+end sub
+
+sub Key( byval h as TK_HOST ptr, byval k as long, byval mods as long = 0 )
+    tkTest_PushKey( h, k, mods )
+    KeepUp( )
+end sub
+
+' Let a queued "did focus leave the application?" check run while no popup is up (tkComboBox's
+' selftest has the same reason: a test window that is not the active one closes popups 150 ms on).
+sub Settle( byval h as TK_HOST ptr )
+    tkTest_PumpFor( h, 200 )
+end sub
+
+' The edit's text, empty, focused.
+sub Fresh( byval h as TK_HOST ptr, byval ac as TK_WIDGET ptr )
+    tkAutoComplete_SetText( ac, "" )
+    tkHost_SetFocus( h, ac )
+    Settle( h )
+    ResetLog( )
+end sub
+
+sub TypeText( byval h as TK_HOST ptr, byref s as ustring )
+    for i as long = 1 to len( s )
+        tkTest_PushText( h, mid( s, i, 1 ) )
+        KeepUp( )
+    next
+end sub
+
+' Pixels of the popup's back buffer within dist (summed RGB) of colour c.
+function CountNear( byval h as TK_HOST ptr, byval x as long, byval y as long, byval w as long, byval hh as long, _
+                    byval c as ulong ) as long
+    dim as long n = 0
+    for yy as long = y to y + hh - 1
+        for xx as long = x to x + w - 1
+            dim as ulong px = tkTest_PixelAt( h, xx, yy )
+            dim as long d = abs( cast( long, (px shr 16) and 255 ) - cast( long, (c shr 16) and 255 ) ) + _
+                            abs( cast( long, (px shr 8) and 255 ) - cast( long, (c shr 8) and 255 ) ) + _
+                            abs( cast( long, px and 255 ) - cast( long, c and 255 ) )
+            if d < 120 then n += 1
+        next
+    next
+    return n
+end function
+
+' The items: source order matters (the rows are in it). Car 01..12 with a disabled "Carp" after
+' Car 02; Cab 01..04; Café Noir; Dog 01..05.
+sub Fill( byval ac as TK_WIDGET ptr )
+    tkAutoComplete_BeginUpdate( ac )
+    for i as long = 1 to 12
+        tkAutoComplete_AddItem( ac, "Car " & right( "0" & i, 2 ), 100 + i )
+        if i = 2 then
+            dim as TKAUTOCOMPLETE_ITEM it
+            it.text = "Carp" : it.id = 99 : it.enabled = false : it.detail = "fish"
+            tkAutoComplete_AddItemEx( ac, it )
+        end if
+    next
+    for i as long = 1 to 4
+        tkAutoComplete_AddItem( ac, "Cab " & right( "0" & i, 2 ), 200 + i )
+    next
+    dim as ustring cafe = "Café Noir"
+    tkAutoComplete_AddItem( ac, cafe, 300 )
+    for i as long = 1 to 5
+        tkAutoComplete_AddItem( ac, "Dog " & right( "0" & i, 2 ), 400 + i )
+    next
+    tkAutoComplete_EndUpdate( ac )
+end sub
+
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkAutoComplete selftest", 640, 520, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host", false, *SDL_GetError() ) : exit sub
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 300 )
+    dim as TK_WIDGET ptr ac = tkAutoComplete_Create( tkHost_Root( h ), 10 )
+    tkWidget_SetPos( ac, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 260 ), tkHost_Scale( h, 30 ) )
+    dim as TK_WIDGET ptr other = tkTextBox_Create( tkHost_Root( h ), 11, false )
+    tkWidget_SetPos( other, tkHost_Scale( h, 320 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 200 ), tkHost_Scale( h, 30 ) )
+    dim as TK_WIDGET ptr ed = tkAutoComplete_GetEditHandle( ac )
+    gKeepAc = ac
+    tkAutoComplete_SetTextChangedCallback( ac, @OnChanged )
+    tkAutoComplete_SetItemSelectedCallback( ac, @OnSelected )
+    tkAutoComplete_SetHighlightCallback( ac, @OnHighlight )
+    tkAutoComplete_SetDropDownCallback( ac, @OnDrop )
+    h->OnPreKey = @OnPreKey
+    ResetLog( )
+
+    ' ---- the store, silently ----
+    Fill( ac )
+    tkTest_Check( "find by id / by text (case-blind)", (tkAutoComplete_FindItemById( ac, 300 ) = 17) andalso _
+        (tkAutoComplete_FindItemByText( ac, "cab 02" ) = 14) andalso (tkAutoComplete_FindItemById( ac, 7777 ) = -1) )
+    dim as TKAUTOCOMPLETE_ITEM it
+    tkTest_Check( "GetItem round trip", tkAutoComplete_GetItem( ac, 2, it ) andalso (it.text = "Carp") andalso _
+        (it.enabled = false) andalso (it.detail = "fish") andalso (it.id = 99) )
+    tkAutoComplete_SetSelectedIndex( ac, 5 )
+    tkTest_Check( "SetSelectedIndex: the text and the id", (tkAutoComplete_GetText( ac ) = "Car 05") andalso _
+        (tkAutoComplete_GetSelectedId( ac ) = 105) )
+    tkAutoComplete_InsertItem( ac, 0, it )
+    tkTest_Check( "insert before the selection moves it", tkAutoComplete_GetSelectedIndex( ac ) = 6 )
+    tkAutoComplete_DeleteItem( ac, 0 )
+    tkAutoComplete_SetText( ac, "free" )
+    tkTest_Check( "no setter notifies, none opens the list", (gChanged + gSelected + gDrops + gHighlights = 0) andalso _
+        (tkAutoComplete_IsDroppedDown( ac ) = false), gLog )
+
+    ' ---- typing opens; the edit keeps the focus ----
+    Fresh( h, ac )
+    tkTest_Check( "focus to the control lands in its edit", tkHost_GetFocus( h ) = ed )
+    TypeText( h, "c" )
+    dim as TK_HOST ptr lst = tkAutoComplete_GetListHandle( ac )
+    tkTest_Check( "typing opens the list", tkAutoComplete_IsDroppedDown( ac ) andalso (lst <> 0), gLog )
+    tkTest_Check( "the list is up for what follows (#1)", lst <> 0 )
+    if lst then
+        tkTest_Check( "the popup is not focusable", (SDL_GetWindowFlags( lst->win ) and SDL_WINDOW_NOT_FOCUSABLE) <> 0 )
+    end if
+    tkTest_Check( "the edit still has the focus", tkHost_GetFocus( h ) = ed )
+    tkTest_Check( "TextChanged (typed), DropDown(open)", (gChanged = 1) andalso (gChangedList = 0) andalso (gLog = "T0;O;"), gLog )
+    dim as long gen0 = tkAutoComplete_GetListGeneration( ac )
+    TypeText( h, "a" )
+    tkTest_Check( "a character to the open list reaches the edit", tkAutoComplete_GetText( ac ) = "ca", tkAutoComplete_GetText( ac ) )
+    tkTest_Check( "'ca' keeps 18 rows and the same popup", (tkAutoComplete_GetResultCount( ac ) = 18) andalso _
+        (tkAutoComplete_GetListGeneration( ac ) = gen0) )
+    TypeText( h, "r" )
+    Key( h, SDLK_LEFT )
+    tkTest_Check( "Left goes to the edit (caret moves), the list stays", (tkTextBox_GetCaret( ed ) = 2) andalso tkAutoComplete_IsDroppedDown( ac ) )
+    Key( h, SDLK_END )
+    Key( h, SDLK_BACKSPACE )
+    Key( h, SDLK_BACKSPACE )
+    TypeText( h, "b" )
+    tkAutoComplete_SetText( ac, "" )
+    Fresh( h, ac )
+    TypeText( h, "cab" )
+    dim as long gen1 = tkAutoComplete_GetListGeneration( ac )
+    TypeText( h, " 0" )
+    Key( h, SDLK_BACKSPACE )
+    Key( h, SDLK_BACKSPACE )
+    Key( h, SDLK_BACKSPACE )
+    tkTest_Check( "Backspace back to 'ca': 18 rows, a NEW popup (the row count changed)", _
+        (tkAutoComplete_GetText( ac ) = "ca") andalso (tkAutoComplete_GetResultCount( ac ) = 18) andalso _
+        (tkAutoComplete_GetListGeneration( ac ) = gen1 + 1), tkAutoComplete_GetText( ac ) & " gen " & tkAutoComplete_GetListGeneration( ac ) - gen1 & " " & gLog )
+
+    ' ---- geometry ----
+    lst = tkAutoComplete_GetListHandle( ac )
+    tkTest_Check( "the list is up for what follows (#2)", lst <> 0 )
+    if lst then
+        dim as long pw, ph
+        tkHost_PixelSize( lst, pw, ph )
+        dim as long bw = tkHost_Scale( h, 1 ), rh = tkHost_Scale( h, TKAUTOCOMPLETE_DEFAULT_LISTITEMHEIGHT )
+        tkTest_Check( "popup width = the control's", pw = ac->cw, pw & " vs " & ac->cw )
+        tkTest_Check( "popup height = 8 rows + borders", ph = 2 * bw + 8 * rh, ph & " vs " & (2 * bw + 8 * rh) )
+        dim as TKRECT r0, r1
+        tkAutoComplete_GetListItemRect( ac, 0, r0 )
+        tkAutoComplete_GetListItemRect( ac, 1, r1 )
+        dim as long sbw = tkHost_Scale( h, TKVSCROLL_DEFAULT_WIDTH )
+        tkTest_Check( "row rects: height, stacking, scroll bar room", (r0.bottom - r0.top = rh) andalso (r1.top = r0.bottom) andalso _
+            (r0.top = bw) andalso (r0.left = bw) andalso (r0.right = pw - bw - sbw), r0.left & "," & r0.top & "," & r0.right & "," & r0.bottom )
+        dim as TKRECT r8
+        ' the popup's place: under the control, left edges aligned. SDL3 gives a popup's position
+        ' RELATIVE TO ITS PARENT, in OS window units.
+        dim as long ox = 0, oy = 0, px, py
+        SDL_GetWindowPosition( lst->win, @px, @py )
+        dim as TKRECT a
+        tkWidget_AbsRect( ac, a )
+        dim as single d = h->fDensity
+        dim as long ex = cint( a.left / d ), ey = cint( a.bottom / d )
+        tkTest_Check( "popup under the control, left aligned (+-1)", (abs( (px - ox) - ex ) <= 1) andalso (abs( (py - oy) - ey ) <= 1), _
+            "at " & (px - ox) & "," & (py - oy) & " want " & ex & "," & ey )
+    end if
+
+    ' ---- arrows, preview, Escape ----
+    Fresh( h, ac )
+    TypeText( h, "car" )
+    ResetLog( )
+    Key( h, SDLK_DOWN )
+    tkTest_Check( "Down: row 0, previewed, query kept", (tkAutoComplete_GetHighlight( ac ) = 0) andalso _
+        (tkAutoComplete_GetText( ac ) = "Car 01") andalso (tkAutoComplete_GetQueryText( ac ) = "car") andalso (gHiIdx = 0) )
+    Key( h, SDLK_DOWN )
+    Key( h, SDLK_DOWN )
+    tkTest_Check( "Down skips the disabled row (Carp)", (tkAutoComplete_GetHighlight( ac ) = 3) andalso _
+        (tkAutoComplete_GetText( ac ) = "Car 03"), str( tkAutoComplete_GetHighlight( ac ) ) )
+    tkTest_Check( "a preview is no change: nothing re-filtered", (gChanged = 0) andalso (tkAutoComplete_GetResultCount( ac ) = 13) )
+    Key( h, SDLK_UP ) : Key( h, SDLK_UP ) : Key( h, SDLK_UP )
+    tkTest_Check( "Up past row 0: no row, the typed text back", (tkAutoComplete_GetHighlight( ac ) = -1) andalso _
+        (tkAutoComplete_GetText( ac ) = "car") )
+    Key( h, SDLK_UP )
+    tkTest_Check( "Up from no row: the last row", tkAutoComplete_GetHighlight( ac ) = 12 )
+    Key( h, SDLK_HOME, SDL_KMOD_LCTRL )
+    Key( h, SDLK_PAGEDOWN )
+    tkTest_Check( "PgDn: a page on (8 rows: row 7)", tkAutoComplete_GetHighlight( ac ) = 7, str( tkAutoComplete_GetHighlight( ac ) ) )
+    Key( h, SDLK_END, SDL_KMOD_LCTRL )
+    tkTest_Check( "Ctrl+End: the last row, scrolled into view", (tkAutoComplete_GetHighlight( ac ) = 12) andalso _
+        (tkAutoComplete_GetListTopIndex( ac ) = 5), str( tkAutoComplete_GetListTopIndex( ac ) ) )
+    ResetLog( )
+    Key( h, SDLK_ESCAPE )
+    tkTest_Check( "Escape: closed, the typed text back, nothing selected", (tkAutoComplete_IsDroppedDown( ac ) = false) andalso _
+        (tkAutoComplete_GetText( ac ) = "car") andalso (gSelected = 0) andalso (gLog = "C;"), gLog )
+
+    ' ---- commit: order, text, value ----
+    Key( h, SDLK_DOWN )
+    tkTest_Check( "Down on a closed list opens it at row 0", tkAutoComplete_IsDroppedDown( ac ) andalso (tkAutoComplete_GetHighlight( ac ) = 0) )
+    Key( h, SDLK_DOWN )
+    ResetLog( )
+    Key( h, SDLK_RETURN )
+    tkTest_Check( "Enter commits: closed FIRST, then TextChanged(list), then ItemSelected", gLog = "C;T1;I1;", gLog )
+    tkTest_Check( "the item's text, index and id", (tkAutoComplete_GetText( ac ) = "Car 02") andalso _
+        (tkAutoComplete_GetSelectedIndex( ac ) = 1) andalso (gSelId = 102) andalso (tkAutoComplete_GetSelectedId( ac ) = 102) )
+    TypeText( h, "x" )
+    tkTest_Check( "typing again unselects", tkAutoComplete_GetSelectedIndex( ac ) = -1 )
+
+    ' ---- submit ----
+    tkAutoComplete_SetSubmitCallback( ac, @OnSubmit )
+    Fresh( h, ac )
+    TypeText( h, "ca" )
+    Key( h, SDLK_RETURN )
+    tkTest_Check( "Enter with no row: Submit( text, -1 ), the list closed", (gSubmits = 1) andalso (gSubIdx = -1) andalso _
+        (gSubText = "ca") andalso (tkAutoComplete_IsDroppedDown( ac ) = false) andalso (gSelected = 0), gLog )
+    tkAutoComplete_SetSelectedIndex( ac, 17 )
+    ResetLog( )
+    Key( h, SDLK_RETURN )
+    tkTest_Check( "Enter on a closed list: Submit with the selected item", (gSubmits = 1) andalso (gSubIdx = 17), gLog )
+    tkAutoComplete_SetSubmitCallback( ac, 0 )
+
+    ' ---- Up / Alt+Down on a closed list, Alt+Up ----
+    Fresh( h, ac )
+    tkAutoComplete_SetText( ac, "do" )
+    Key( h, SDLK_UP )
+    tkTest_Check( "Up on a closed list opens it at the last row", tkAutoComplete_IsDroppedDown( ac ) andalso _
+        (tkAutoComplete_GetHighlight( ac ) = 4) andalso (tkAutoComplete_GetText( ac ) = "Dog 05"), _
+        "open " & tkAutoComplete_IsDroppedDown( ac ) & " hot " & tkAutoComplete_GetHighlight( ac ) & " text " & tkAutoComplete_GetText( ac ) & " log " & gLog )
+    Key( h, SDLK_UP, SDL_KMOD_LALT )
+    tkTest_Check( "Alt+Up closes and keeps the text shown", (tkAutoComplete_IsDroppedDown( ac ) = false) andalso _
+        (tkAutoComplete_GetText( ac ) = "Dog 05") andalso (tkAutoComplete_GetQueryText( ac ) = "Dog 05") )
+    tkAutoComplete_SetText( ac, "do" )
+    Key( h, SDLK_DOWN, SDL_KMOD_LALT )
+    tkTest_Check( "Alt+Down opens with no row", tkAutoComplete_IsDroppedDown( ac ) andalso (tkAutoComplete_GetHighlight( ac ) = -1) )
+    Key( h, SDLK_ESCAPE )
+
+    ' ---- Tab commits and moves on ----
+    Fresh( h, ac )
+    TypeText( h, "dog" )
+    Key( h, SDLK_DOWN )
+    Key( h, SDLK_DOWN )
+    Key( h, SDLK_TAB )
+    tkTest_Check( "Tab commits the row and the focus moves on", (tkAutoComplete_GetSelectedIndex( ac ) = 19) andalso _
+        (tkHost_GetFocus( h ) = other) andalso (tkAutoComplete_IsDroppedDown( ac ) = false), str( tkAutoComplete_GetSelectedIndex( ac ) ) )
+
+    ' ---- the mouse ----
+    Fresh( h, ac )
+    TypeText( h, "car" )
+    lst = tkAutoComplete_GetListHandle( ac )
+    tkTest_Check( "the list is up for what follows (#3)", lst <> 0 )
+    if lst then
+        dim as TKRECT r
+        tkAutoComplete_GetListItemRect( ac, 3, r )
+        tkTest_PushMotion( lst, (r.left + r.right) / 2, (r.top + r.bottom) / 2 )
+        tkTest_Check( "hover highlights, never previews", (tkAutoComplete_GetHighlight( ac ) = 3) andalso (tkAutoComplete_GetText( ac ) = "car") )
+        tkAutoComplete_GetListItemRect( ac, 2, r )
+        tkTest_PushMotion( lst, (r.left + r.right) / 2, (r.top + r.bottom) / 2 )
+        tkTest_Click( lst, (r.left + r.right) / 2, (r.top + r.bottom) / 2 )
+        tkTest_Check( "a click on the disabled row does nothing", tkAutoComplete_IsDroppedDown( ac ) andalso (gSelected = 0) )
+        tkAutoComplete_GetListItemRect( ac, 4, r )
+        tkTest_Click( lst, (r.left + r.right) / 2, (r.top + r.bottom) / 2 )
+        tkTest_Check( "a click commits its row", (tkAutoComplete_GetText( ac ) = "Car 04") andalso (gSelected = 1) andalso _
+            (tkAutoComplete_IsDroppedDown( ac ) = false) )
+    end if
+    Fresh( h, ac )
+    TypeText( h, "car" )
+    tkTest_Click( h, tkTest_CX( ed ), tkTest_CY( ed ) )
+    tkTest_Check( "a click in the edit closes the list, the edit keeps the focus", (tkAutoComplete_IsDroppedDown( ac ) = false) andalso _
+        (tkHost_GetFocus( h ) = ed) )
+
+    ' ---- the matched characters are painted in the match colour, where the run is ----
+    dim as TKAUTOCOMPLETE_COLORS cc
+    tkAutoComplete_GetColors( ac, @cc )
+    cc.ListBackColor = &hFF000000ul : cc.ListForeColor = &hFF00FF00ul : cc.MatchForeColor = &hFFFF0000ul
+    cc.ListBackColorHot = &hFF000080ul
+    tkAutoComplete_SetColors( ac, @cc )
+    Fresh( h, ac )
+    TypeText( h, "dog" )
+    lst = tkAutoComplete_GetListHandle( ac )
+    tkTest_Check( "the list is up for what follows (#4)", lst <> 0 )
+    if lst then
+        tkHost_RenderTo( lst, false )
+        dim as TKRECT r
+        tkAutoComplete_GetListItemRect( ac, 0, r )
+        dim as long pad = tkHost_Scale( h, TKAUTOCOMPLETE_ROWPAD )
+        dim as TTF_Font ptr f = h->pDefaultFont
+        dim as long xRun = r.left + pad, wRun = tkText_Width( f, "Dog" ), wRest = tkText_Width( f, " 01" )
+        dim as long redIn = CountNear( lst, xRun, r.top, wRun, r.bottom - r.top, cc.MatchForeColor )
+        dim as long redOut = CountNear( lst, xRun + wRun + 1, r.top, wRest, r.bottom - r.top, cc.MatchForeColor )
+        dim as long greenOut = CountNear( lst, xRun + wRun + 1, r.top, wRest, r.bottom - r.top, cc.ListForeColor )
+        tkTest_Check( "the run 'Dog' is in the match colour, ' 01' is not", (redIn > 10) andalso (redOut = 0) andalso (greenOut > 5), _
+            "red in " & redIn & ", red after " & redOut & ", green after " & greenOut )
+    end if
+    Key( h, SDLK_ESCAPE )
+
+    ' ---- status rows ----
+    tkAutoComplete_SetEmptyText( ac, "No matches" )
+    Fresh( h, ac )
+    TypeText( h, "zz" )
+    tkTest_Check( "nothing matches: the empty-text row is up", tkAutoComplete_IsDroppedDown( ac ) andalso (tkAutoComplete_GetResultCount( ac ) = 0) )
+    Key( h, SDLK_DOWN )
+    Key( h, SDLK_ESCAPE )
+    tkAutoComplete_SetEmptyText( ac, "" )
+    Fresh( h, ac )
+    TypeText( h, "zz" )
+    tkAutoComplete_SetMaxResults( ac, 5 )
+    Fresh( h, ac )
+    TypeText( h, "c" )
+    tkTest_Check( "capped at 5: 5 rows, 18 matches, a 6th (status) row", (tkAutoComplete_GetResultCount( ac ) = 5) andalso _
+        (tkAutoComplete_GetMatchCount( ac ) = 18) )
+    lst = tkAutoComplete_GetListHandle( ac )
+    tkTest_Check( "the list is up for what follows (#5)", lst <> 0 )
+    if lst then
+        dim as long pw, ph
+        tkHost_PixelSize( lst, pw, ph )
+    end if
+    Key( h, SDLK_ESCAPE )
+    tkAutoComplete_SetMaxResults( ac, TKAUTOCOMPLETE_DEFAULT_MAXRESULTS )
+
+    ' ---- modes: contains, fuzzy ranks ----
+    tkAutoComplete_SetFilterMode( ac, TKMATCH_CONTAINS )
+    Fresh( h, ac )
+    TypeText( h, "noir" )
+    tkTest_Check( "contains: 'noir' finds Café Noir", (tkAutoComplete_GetResultCount( ac ) = 1) andalso (tkAutoComplete_GetResultItem( ac, 0 ) = 17) )
+    Key( h, SDLK_ESCAPE )
+    tkAutoComplete_SetFilterMode( ac, TKMATCH_FUZZY )
+    Fresh( h, ac )
+    TypeText( h, "cf" )
+    tkTest_Check( "fuzzy: 'cf' ranks Café Noir first", (tkAutoComplete_GetResultCount( ac ) >= 1) andalso (tkAutoComplete_GetResultItem( ac, 0 ) = 17) )
+    Key( h, SDLK_ESCAPE )
+    tkAutoComplete_SetFilterMode( ac, TKMATCH_PREFIX )
+
+    ' ---- the debounce ----
+    tkAutoComplete_SetDelay( ac, 150 )
+    Fresh( h, ac )
+    dim as long genD = tkAutoComplete_GetListGeneration( ac )
+    TypeText( h, "car" )
+    tkTest_PumpFor( h, 300 )
+    ' (not "still open": 300 ms is past tkHost's 150 ms focus check, which closes popups when the
+    ' test window is not the active application)
+    tkTest_Check( "Delay: one filter after the pause, one popup", _
+        (tkAutoComplete_GetListGeneration( ac ) = genD + 1) andalso (tkAutoComplete_GetResultCount( ac ) = 13), _
+        "gen +" & (tkAutoComplete_GetListGeneration( ac ) - genD) & " rows " & tkAutoComplete_GetResultCount( ac ) )
+    Key( h, SDLK_ESCAPE )
+    tkAutoComplete_SetDelay( ac, 0 )
+
+    ' ---- an owner accelerator, focus loss ----
+    Fresh( h, ac )
+    TypeText( h, "car" )
+    Key( h, SDLK_S, SDL_KMOD_LCTRL )
+    tkTest_Check( "Ctrl+S reaches the owner's accelerators; the list closes; the edit is untouched", (gAccels = 1) andalso _
+        (tkAutoComplete_IsDroppedDown( ac ) = false) andalso (tkAutoComplete_GetText( ac ) = "car") )
+    Fresh( h, ac )
+    TypeText( h, "car" )
+    tkHost_SetFocus( h, other )
+    tkTest_Check( "focus leaving closes the list", tkAutoComplete_IsDroppedDown( ac ) = false )
+
+    ' ---- theme and pinned colours ----
+    tkAutoComplete_UnpinColors( ac )
+    dim as TKAUTOCOMPLETE_COLORS want = tkAutoComplete_ThemeColors( tkTheme_Of( ac ) ), got
+    tkAutoComplete_GetColors( ac, @got )
+    dim as TKTEXTBOX_COLORS ec
+    tkTextBox_GetColors( ed, @ec )
+    tkTest_Check( "unpinned: the theme's colours, the edit's follow", (got.ListBackColor = want.ListBackColor) andalso _
+        (got.MatchForeColor = want.MatchForeColor) andalso (ec.BackColor = got.BackColor) andalso (ec.BorderColor = got.BorderColor) )
+    got.BackColor = &hFF123456ul
+    tkAutoComplete_SetColors( ac, @got )
+    tkAutoComplete_ApplyTheme( ac, tkTheme_Of( ac ) )
+    tkAutoComplete_GetColors( ac, @got )
+    tkTextBox_GetColors( ed, @ec )
+    tkTest_Check( "pinned: a theme change leaves them; the edit has them", (got.BackColor = &hFF123456ul) andalso (ec.BackColor = &hFF123456ul) )
+
+    gKeepAc = 0
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+' A2: the search face
+' ==========================================================================================
+dim shared as long gSearches
+dim shared as ustring gSearchText
+
+sub OnSearch( byval h as TK_WIDGET ptr, byref text as const ustring )
+    gSearches += 1 : gSearchText = text
+    gLog &= "Q[" & text & "];"
+end sub
+
+' Pixels of the main window's back buffer near colour c, in the control-local rect rc of w.
+function InkIn( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byref rc as TKRECT, byval c as ulong ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return CountNear( h, a.left + rc.left, a.top + rc.top, rc.right - rc.left, rc.bottom - rc.top, c )
+end function
+
+sub SearchPass( byval fScale as single )
+    tkTest_Begin( "search " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkAutoComplete search", 640, 360, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host", false, *SDL_GetError() ) : exit sub
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 300 )
+    dim as TK_WIDGET ptr ac = tkAutoComplete_Create( tkHost_Root( h ), 20 )
+    tkWidget_SetPos( ac, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 300 ), tkHost_Scale( h, 32 ) )
+    dim as TK_WIDGET ptr other = tkTextBox_Create( tkHost_Root( h ), 21, false )
+    tkWidget_SetPos( other, tkHost_Scale( h, 360 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 200 ), tkHost_Scale( h, 32 ) )
+    dim as TK_WIDGET ptr ed = tkAutoComplete_GetEditHandle( ac )
+    gKeepAc = ac
+    tkAutoComplete_SetTextChangedCallback( ac, @OnChanged )
+    tkAutoComplete_SetSearchCallback( ac, @OnSearch )
+    dim as long cell = tkHost_Scale( h, TKAUTOCOMPLETE_GLYPHCELL )
+    dim as TKRECT rg, rcl, rt
+
+    ' ---- the input style has no face ----
+    tkTest_Check( "input style: no glyph, no clear button, no Escape-clears", (tkAutoComplete_GetGlyphRect( ac, rg ) = false) andalso _
+        (tkAutoComplete_GetClearButton( ac ) = false) andalso (tkAutoComplete_GetClearOnEscape( ac ) = false) )
+    ' ---- the search style ----
+    tkAutoComplete_SetStyle( ac, TKAC_STYLE_SEARCH )
+    tkAutoComplete_GetGlyphRect( ac, rg )
+    tkTest_Check( "an empty box shows no clear button", tkAutoComplete_GetClearRect( ac, rcl ) = false )
+    tkTextBox_GetTextRect( ed, rt )
+    tkTest_Check( "the text keeps clear of both cells", (rt.left >= cell) andalso (rt.right <= ac->cw - cell), rt.left & ".." & rt.right & " cell " & cell )
+    gSearches = 0 : ResetLog( )
+    tkHost_SetFocus( h, ac )
+    Settle( h )
+    TypeText( h, "abc" )
+    tkTest_Check( "the clear button appears with text, at the right", tkAutoComplete_GetClearRect( ac, rcl ) andalso _
+        (rcl.right = ac->cw) andalso (rcl.left = ac->cw - cell) andalso (rcl.bottom = ac->ch) )
+    tkTest_PumpFor( h, 350 )
+    tkTest_Check( "one Search after the pause, with the text", (gSearches = 1) andalso (gSearchText = "abc"), gLog )
+    Key( h, SDLK_BACKSPACE ) : Key( h, SDLK_BACKSPACE ) : Key( h, SDLK_BACKSPACE )
+    tkTest_PumpFor( h, 350 )
+    tkTest_Check( "erased to empty: one Search(empty), the clear button gone", (gSearches = 2) andalso (gSearchText = "") andalso _
+        (tkAutoComplete_GetClearRect( ac, rcl ) = false), gLog )
+    TypeText( h, "q" )
+    Key( h, SDLK_RETURN )
+    tkTest_Check( "Enter searches at once", (gSearches = 3) andalso (gSearchText = "q") )
+    tkTest_PumpFor( h, 350 )
+
+    ' ---- the clear button: hover, click ----
+    dim as TKAUTOCOMPLETE_COLORS cc
+    tkAutoComplete_GetColors( ac, @cc )
+    cc.GlyphColor = &hFF00FF00ul : cc.GlyphColorHot = &hFFFF0000ul : cc.BackColor = &hFF000000ul
+    tkAutoComplete_SetColors( ac, @cc )
+    tkAutoComplete_GetClearRect( ac, rcl )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "the lens is drawn (glyph colour)", InkIn( h, ac, rg, cc.GlyphColor ) > 3 )
+    dim as TKRECT a
+    tkWidget_AbsRect( ac, a )
+    tkTest_PushMotion( h, a.left + (rcl.left + rcl.right) / 2, a.top + (rcl.top + rcl.bottom) / 2 )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "hovered, the cross takes the hot colour", (InkIn( h, ac, rcl, cc.GlyphColorHot ) > 3) andalso (InkIn( h, ac, rcl, cc.GlyphColor ) = 0) )
+    ResetLog( ) : gSearches = 0
+    tkHost_SetFocus( h, other )
+    tkTest_Click( h, a.left + (rcl.left + rcl.right) / 2, a.top + (rcl.top + rcl.bottom) / 2 )
+    tkTest_Check( "a click on clear: empty, TextChanged, Search(empty) at once, focus in the box", _
+        (tkAutoComplete_GetText( ac ) = "") andalso (gLog = "T0;Q[];") andalso (tkHost_GetFocus( h ) = ed) andalso _
+        (tkAutoComplete_GetClearRect( ac, rcl ) = false), gLog )
+    tkHost_SetFocus( h, other )
+    tkTest_Click( h, a.left + (rg.left + rg.right) / 2, a.top + (rg.top + rg.bottom) / 2 )
+    tkTest_Check( "a click on the glyph focuses the box", tkHost_GetFocus( h ) = ed )
+
+    ' ---- Escape ----
+    TypeText( h, "zz" )
+    ResetLog( ) : gSearches = 0
+    Key( h, SDLK_ESCAPE )
+    tkTest_Check( "Escape with text: cleared, Search(empty) at once", (tkAutoComplete_GetText( ac ) = "") andalso (gLog = "T0;Q[];"), gLog )
+    ResetLog( )
+    Key( h, SDLK_ESCAPE )
+    tkTest_Check( "Escape on an empty box is left alone", gLog = "", gLog )
+
+    ' ---- with suggestions: the first Escape closes the list, the second clears ----
+    tkAutoComplete_AddItem( ac, "alpha", 1 )
+    tkAutoComplete_AddItem( ac, "alpine", 2 )
+    tkAutoComplete_AddItem( ac, "beta", 3 )
+    Settle( h )
+    TypeText( h, "al" )
+    Key( h, SDLK_ESCAPE )
+    tkTest_Check( "Escape #1 closes the list, the text stays", (tkAutoComplete_IsDroppedDown( ac ) = false) andalso (tkAutoComplete_GetText( ac ) = "al") )
+    Key( h, SDLK_ESCAPE )
+    Settle( h )
+    TypeText( h, "al" )
+    Key( h, SDLK_DOWN )
+    Key( h, SDLK_DOWN )
+    ResetLog( ) : gSearches = 0
+    Key( h, SDLK_RETURN )
+    tkTest_Check( "a commit searches at once for the item", (gSearches = 1) andalso (gSearchText = "alpine"), gLog )
+
+    ' a closed list, then Enter on an item's text: it is selected AND submitted, one Search
+    tkAutoComplete_SetText( ac, "" )
+    Settle( h )
+    TypeText( h, "alp" )
+    Key( h, SDLK_DOWN )
+    Key( h, SDLK_UP, SDL_KMOD_LALT )
+    ResetLog( ) : gSearches = 0
+    Key( h, SDLK_RETURN )
+    tkTest_Check( "Alt+Up then Enter on 'alpha': selected, one Search", (gSearches = 1) andalso (gLog = "T1;Q[alpha];"), gLog )
+
+    ' ---- no delay: Search per change ----
+    tkAutoComplete_SetSearchDelay( ac, 0 )
+    tkAutoComplete_SetText( ac, "" )
+    gSearches = 0
+    TypeText( h, "xyz" )
+    tkTest_Check( "SearchDelay 0: one Search per change", (gSearches = 3) andalso (gSearchText = "xyz") )
+    Key( h, SDLK_ESCAPE )
+
+    ' ---- a glyph font draws the glyphs instead ----
+    dim as TTF_Font ptr fIcons = tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_ICONS, 12 )
+    tkAutoComplete_SetGlyphFont( ac, fIcons )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "glyph font: the search glyph has ink", (fIcons <> 0) andalso (InkIn( h, ac, rg, cc.GlyphColor ) > 3) )
+    tkAutoComplete_SetSearchGlyph( ac, 0 )
+    tkTextBox_GetTextRect( ed, rt )
+    tkAutoComplete_SetStyle( ac, TKAC_STYLE_INPUT )
+    tkTextBox_GetTextRect( ed, rt )
+    tkTest_Check( "back to input: no face, full-width text", (tkAutoComplete_GetClearButton( ac ) = false) andalso (rt.right > ac->cw - cell) )
+    gKeepAc = 0
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+' A3: modes, the value, the drop button
+' ==========================================================================================
+dim shared as long gNil, gNilAction
+dim shared as ustring gNilText
+dim shared as TK_WIDGET ptr gNilAc
+
+sub OnNotInList( byval h as TK_WIDGET ptr, byref text as const ustring, byref action as long )
+    gNil += 1 : gNilText = text
+    gLog &= "N[" & text & "];"
+    if gNilAction = AC_ACCEPT then tkAutoComplete_AddItem( h, text, 777 )
+    action = gNilAction
+end sub
+
+sub SelOf( byval ed as TK_WIDGET ptr, byref s0 as integer, byref s1 as integer )
+    tkTextBox_GetSel( ed, s0, s1 )
+end sub
+
+sub ValuePass( byval fScale as single )
+    tkTest_Begin( "value " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkAutoComplete value", 640, 480, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host", false, *SDL_GetError() ) : exit sub
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 300 )
+    dim as TK_WIDGET ptr ac = tkAutoComplete_Create( tkHost_Root( h ), 30 )
+    tkWidget_SetPos( ac, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 280 ), tkHost_Scale( h, 32 ) )
+    dim as TK_WIDGET ptr other = tkTextBox_Create( tkHost_Root( h ), 31, false )
+    tkWidget_SetPos( other, tkHost_Scale( h, 360 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 200 ), tkHost_Scale( h, 32 ) )
+    dim as TK_WIDGET ptr ed = tkAutoComplete_GetEditHandle( ac )
+    gKeepAc = ac
+    tkAutoComplete_SetTextChangedCallback( ac, @OnChanged )
+    tkAutoComplete_SetItemSelectedCallback( ac, @OnSelected )
+    tkAutoComplete_SetDropDownCallback( ac, @OnDrop )
+    tkAutoComplete_SetNotInListCallback( ac, @OnNotInList )
+    tkAutoComplete_AddItem( ac, "Canada", 124 )      ' 0
+    tkAutoComplete_AddItem( ac, "Cameroon", 120 )    ' 1
+    tkAutoComplete_AddItem( ac, "Chile", 152 )       ' 2
+    tkAutoComplete_AddItem( ac, "China", 156 )       ' 3
+    tkAutoComplete_AddItem( ac, "Colombia", 170 )    ' 4
+    dim as TKAUTOCOMPLETE_ITEM it
+    it.text = "Cuba" : it.id = 192 : it.enabled = false
+    tkAutoComplete_AddItemEx( ac, it )               ' 5, disabled
+    dim as integer s0, s1
+
+    ' ---- APPEND ----
+    tkAutoComplete_SetMode( ac, TKAC_MODE_APPEND )
+    Fresh( h, ac )
+    TypeText( h, "ca" )
+    SelOf( ed, s0, s1 )
+    tkTest_Check( "append: 'ca' completes to the first match, the rest selected, no list", (tkAutoComplete_GetText( ac ) = "canada") andalso _
+        (s0 = 2) andalso (s1 = 6) andalso (tkAutoComplete_IsDroppedDown( ac ) = false) andalso (tkAutoComplete_GetQueryText( ac ) = "ca"), _
+        tkAutoComplete_GetText( ac ) & " sel " & s0 & ".." & s1 )
+    TypeText( h, "m" )
+    SelOf( ed, s0, s1 )
+    tkTest_Check( "the next character overtypes the completion: 'cam' -> cameroon", (tkAutoComplete_GetText( ac ) = "cameroon") andalso (s0 = 3) andalso (s1 = 8), _
+        tkAutoComplete_GetText( ac ) )
+    Key( h, SDLK_BACKSPACE )
+    tkTest_Check( "Backspace removes the completion and adds none", tkAutoComplete_GetText( ac ) = "cam", tkAutoComplete_GetText( ac ) )
+    Key( h, SDLK_BACKSPACE )
+    TypeText( h, "x" )
+    Fresh( h, ac )
+    TypeText( h, "Ch" )
+    tkTest_Check( "the typed prefix keeps the user's case", tkAutoComplete_GetText( ac ) = "Chile", tkAutoComplete_GetText( ac ) )
+    Key( h, SDLK_ESCAPE )
+    tkTest_Check( "Escape takes the completion away", tkAutoComplete_GetText( ac ) = "Ch" )
+    Key( h, SDLK_ESCAPE )
+    Fresh( h, ac )
+    TypeText( h, "cu" )
+    tkTest_Check( "a disabled item is never the completion", tkAutoComplete_GetText( ac ) = "cu" )
+    Fresh( h, ac )
+    TypeText( h, "co" )
+    ResetLog( )
+    Key( h, SDLK_RETURN )
+    tkTest_Check( "Enter on a completion selects its item (free text)", (tkAutoComplete_GetText( ac ) = "Colombia") andalso _
+        (tkAutoComplete_GetSelectedIndex( ac ) = 4) andalso (gLog = "T1;I4;"), gLog )
+    tkAutoComplete_SetText( ac, "na" )
+    Key( h, SDLK_HOME )
+    TypeText( h, "Ca" )
+    tkTest_Check( "caret not at the end: no completion", tkAutoComplete_GetText( ac ) = "Cana", tkAutoComplete_GetText( ac ) )
+
+    ' ---- SUGGESTAPPEND ----
+    tkAutoComplete_SetMode( ac, TKAC_MODE_SUGGESTAPPEND )
+    Fresh( h, ac )
+    TypeText( h, "ch" )
+    tkTest_Check( "suggest+append: completion and the list of what was typed", (tkAutoComplete_GetText( ac ) = "chile") andalso _
+        tkAutoComplete_IsDroppedDown( ac ) andalso (tkAutoComplete_GetResultCount( ac ) = 2) )
+    Key( h, SDLK_ESCAPE )
+    tkTest_Check( "Escape: closed, the typed text back", (tkAutoComplete_IsDroppedDown( ac ) = false) andalso (tkAutoComplete_GetText( ac ) = "ch"), _
+        tkAutoComplete_GetText( ac ) )
+    tkAutoComplete_SetMode( ac, TKAC_MODE_SUGGEST )
+
+    ' ---- LIMITTOLIST ----
+    tkAutoComplete_SetValuePolicy( ac, TKAC_VALUE_LIMITTOLIST )
+    tkTest_Check( "LimitToList turns AutoHighlight and ShowAllOnEmpty on", tkAutoComplete_GetAutoHighlight( ac ) andalso tkAutoComplete_GetShowAllOnEmpty( ac ) )
+    Fresh( h, ac )
+    Key( h, SDLK_DOWN )
+    tkTest_Check( "Down on an empty box lists every item, row 0 previewed", tkAutoComplete_IsDroppedDown( ac ) andalso _
+        (tkAutoComplete_GetResultCount( ac ) = 6) andalso (tkAutoComplete_GetHighlight( ac ) = 0) andalso (tkAutoComplete_GetText( ac ) = "Canada") )
+    Key( h, SDLK_ESCAPE )
+    TypeText( h, "chi" )
+    tkTest_Check( "typing: the first row highlighted at once", tkAutoComplete_GetHighlight( ac ) = 0 )
+    ResetLog( )
+    Key( h, SDLK_RETURN )
+    Key( h, SDLK_DOWN )
+    tkTest_Check( "Down on a selected box highlights the selected item", tkAutoComplete_GetHighlight( ac ) >= 0 andalso _
+        (tkAutoComplete_GetResultItem( ac, tkAutoComplete_GetHighlight( ac ) ) = 2) )
+    Key( h, SDLK_ESCAPE )
+    ' not in the list: revert (the default)
+    tkTextBox_SelectAll( ed )
+    TypeText( h, "zz" )
+    ResetLog( ) : gNil = 0 : gNilAction = AC_REVERT
+    tkHost_SetFocus( h, other )
+    tkTest_Check( "leaving with 'zz': NotInList, reverted to the selected item", (gNil = 1) andalso (gNilText = "zz") andalso _
+        (tkAutoComplete_GetText( ac ) = "Chile") andalso (tkAutoComplete_GetSelectedIndex( ac ) = 2) andalso (gSelected = 0), gLog )
+    ' keep: the error tint
+    tkHost_SetFocus( h, ac )
+    tkTextBox_SelectAll( ed )
+    TypeText( h, "zz" )
+    gNilAction = AC_KEEP
+    tkHost_SetFocus( h, other )
+    dim as TKTEXTBOX_COLORS ec
+    dim as TKAUTOCOMPLETE_COLORS cc
+    tkTextBox_GetColors( ed, @ec )
+    tkAutoComplete_GetColors( ac, @cc )
+    tkTest_Check( "AC_KEEP: the text stays, nothing selected, the error tint on the border", (tkAutoComplete_GetText( ac ) = "zz") andalso _
+        (tkAutoComplete_GetSelectedIndex( ac ) = -1) andalso tkAutoComplete_GetError( ac ) andalso (ec.BorderColor = cc.ErrorColor) )
+    tkHost_SetFocus( h, ac )
+    TypeText( h, "a" )
+    tkTextBox_GetColors( ed, @ec )
+    tkTest_Check( "the next change takes the tint away", (tkAutoComplete_GetError( ac ) = false) andalso (ec.BorderColor = cc.BorderColor) )
+    Key( h, SDLK_ESCAPE )
+    ' accept: the host adds it
+    tkTextBox_SelectAll( ed )
+    TypeText( h, "Narnia" )
+    gNilAction = AC_ACCEPT
+    ResetLog( )
+    tkHost_SetFocus( h, other )
+    tkTest_Check( "AC_ACCEPT: the host's new item is selected", (tkAutoComplete_GetCount( ac ) = 7) andalso _
+        (tkAutoComplete_GetSelectedIndex( ac ) = 6) andalso (tkAutoComplete_GetSelectedId( ac ) = 777) andalso (gLog = "N[Narnia];T1;I6;"), gLog )
+    tkAutoComplete_DeleteItem( ac, 6 )
+    ' a full match typed in another case
+    tkHost_SetFocus( h, ac )
+    tkTextBox_SelectAll( ed )
+    TypeText( h, "china" )
+    Key( h, SDLK_ESCAPE )
+    ResetLog( ) : gNil = 0
+    tkHost_SetFocus( h, other )
+    tkTest_Check( "a full match selects its item, text in the item's case", (gNil = 0) andalso (tkAutoComplete_GetSelectedIndex( ac ) = 3) andalso _
+        (tkAutoComplete_GetText( ac ) = "China") andalso (gLog = "T1;I3;"), gLog )
+    ' emptied
+    tkAutoComplete_SetNoValueId( ac, -1 )
+    tkHost_SetFocus( h, ac )
+    tkTextBox_SelectAll( ed )
+    Key( h, SDLK_BACKSPACE )
+    Key( h, SDLK_ESCAPE )
+    ResetLog( )
+    tkHost_SetFocus( h, other )
+    tkTest_Check( "a lookup emptied: no value, ItemSelected(-1), NoValueId", (tkAutoComplete_GetSelectedIndex( ac ) = -1) andalso _
+        (tkAutoComplete_GetSelectedId( ac ) = -1) andalso (gLog = "I-1;"), gLog )
+    ' ids
+    ResetLog( )
+    tkTest_Check( "SetSelectedId: found", tkAutoComplete_SetSelectedId( ac, 170 ) andalso (tkAutoComplete_GetText( ac ) = "Colombia") andalso _
+        (tkAutoComplete_GetSelectedIndex( ac ) = 4) )
+    tkTest_Check( "SetSelectedId: not found clears", (tkAutoComplete_SetSelectedId( ac, 999 ) = false) andalso (tkAutoComplete_GetText( ac ) = "") andalso _
+        (tkAutoComplete_GetSelectedId( ac ) = -1) andalso (gLog = ""), gLog )
+    tkAutoComplete_SetShowAllOnEmpty( ac, false )
+    Fresh( h, ac )
+    Key( h, SDLK_DOWN )
+
+    ' ---- the drop button ----
+    dim as long cell = tkHost_Scale( h, TKAUTOCOMPLETE_GLYPHCELL )
+    tkAutoComplete_SetDropButton( ac, true )
+    dim as TKRECT rd, rcl, rt
+    tkTest_Check( "the drop cell at the far right", tkAutoComplete_GetDropRect( ac, rd ) andalso (rd.right = ac->cw) andalso (rd.left = ac->cw - cell) )
+    tkTextBox_GetTextRect( ed, rt )
+    tkAutoComplete_SetClearButton( ac, true )
+    tkAutoComplete_SetSelectedIndex( ac, 2 )
+    tkTest_Check( "with a clear button: clear left of drop", tkAutoComplete_GetClearRect( ac, rcl ) andalso (rcl.right = ac->cw - cell) andalso _
+        (rcl.left = ac->cw - 2 * cell) )
+    tkTextBox_GetTextRect( ed, rt )
+    tkTest_Check( "the text keeps clear of both", rt.right <= ac->cw - 2 * cell )
+    tkAutoComplete_SetClearButton( ac, false )
+    Settle( h )
+    dim as TKRECT a
+    tkWidget_AbsRect( ac, a )
+    tkAutoComplete_GetDropRect( ac, rd )
+    dim as single dx = a.left + (rd.left + rd.right) / 2, dy = a.top + (rd.top + rd.bottom) / 2
+    ResetLog( )
+    tkTest_Click( h, dx, dy )
+    tkTest_Check( "a click lists every item, the selected one highlighted, not previewed", tkAutoComplete_IsDroppedDown( ac ) andalso _
+        (tkAutoComplete_GetResultCount( ac ) = 6) andalso (tkAutoComplete_GetResultItem( ac, tkAutoComplete_GetHighlight( ac ) ) = 2) andalso _
+        (tkAutoComplete_GetText( ac ) = "Chile") andalso (tkHost_GetFocus( h ) = ed) )
+    tkTest_Click( h, dx, dy )
+    tkTest_Check( "a second click closes it (and does not reopen)", (tkAutoComplete_IsDroppedDown( ac ) = false) andalso (gLog = "O;C;"), gLog )
+    tkTest_Click( h, dx, dy )
+    Key( h, SDLK_ESCAPE )
+    ' hover colour
+    tkAutoComplete_GetColors( ac, @cc )
+    cc.GlyphColor = &hFF00FF00ul : cc.GlyphColorHot = &hFFFF0000ul : cc.BackColor = &hFF000000ul
+    tkAutoComplete_SetColors( ac, @cc )
+    tkHost_RenderTo( h, false )
+    tkTest_PushMotion( h, dx, dy )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "hovered, it takes the hot colour", (InkIn( h, ac, rd, cc.GlyphColorHot ) > 3) andalso (InkIn( h, ac, rd, cc.GlyphColor ) = 0) )
+    gKeepAc = 0
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+' A4: the feeds (callback, async), a source, SetSelectedItem
+' ==========================================================================================
+dim shared as long gNeeded, gPopulates, gLastReq
+dim shared as ustring gNeededQuery
+dim shared as ustring gCities( 0 to 7 )
+dim shared as long gCityCount
+
+sub OnItemsNeeded( byval h as TK_WIDGET ptr, byref query as const ustring )
+    gNeeded += 1 : gNeededQuery = query
+    ' the host's own filter: rows containing the query
+    dim as ustring names_( 0 to 4 )
+    names_(0) = "Rome" : names_(1) = "Romania" : names_(2) = "Roma Termini" : names_(3) = "Oslo" : names_(4) = "Rotterdam"
+    tkAutoComplete_ClearResults( h )
+    for i as long = 0 to 4
+        if instr( lcase( names_(i) ), lcase( query ) ) > 0 then tkAutoComplete_AddResult( h, names_(i), 1000 + i, "city" )
+    next
+end sub
+
+sub OnPopulate( byval h as TK_WIDGET ptr, byref query as const ustring, byval requestId as long )
+    gPopulates += 1 : gLastReq = requestId
+end sub
+
+function SrcCount( byval pCtx as any ptr ) as integer
+    return gCityCount
+end function
+function SrcText( byval pCtx as any ptr, byval i as integer ) as ustring
+    return gCities(i)
+end function
+function SrcId( byval pCtx as any ptr, byval i as integer ) as longint
+    return 500 + i
+end function
+
+sub FeedPass( byval fScale as single )
+    tkTest_Begin( "feeds " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkAutoComplete feeds", 640, 480, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host", false, *SDL_GetError() ) : exit sub
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 300 )
+    dim as TK_WIDGET ptr ac = tkAutoComplete_Create( tkHost_Root( h ), 40 )
+    tkWidget_SetPos( ac, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 280 ), tkHost_Scale( h, 32 ) )
+    dim as TK_WIDGET ptr other = tkTextBox_Create( tkHost_Root( h ), 41, false )
+    tkWidget_SetPos( other, tkHost_Scale( h, 360 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 200 ), tkHost_Scale( h, 32 ) )
+    dim as TK_WIDGET ptr ed = tkAutoComplete_GetEditHandle( ac )
+    gKeepAc = ac
+    tkAutoComplete_SetItemSelectedCallback( ac, @OnSelected )
+    tkAutoComplete_SetDropDownCallback( ac, @OnDrop )
+    tkAutoComplete_SetNotInListCallback( ac, @OnNotInList )
+
+    ' ---- the synchronous feed ----
+    tkAutoComplete_SetItemsNeededCallback( ac, @OnItemsNeeded )
+    Fresh( h, ac )
+    gNeeded = 0
+    TypeText( h, "ro" )
+    dim as boolean bWaited = (gNeeded = 0)
+    tkTest_PumpFor( h, 350 )
+    tkTest_Check( "a feed's default debounce: nothing while typing, one call after", bWaited andalso (gNeeded = 1) andalso (gNeededQuery = "ro"), str( gNeeded ) )
+    tkTest_Check( "the host's rows are the list, not items", tkAutoComplete_IsDroppedDown( ac ) andalso (tkAutoComplete_GetResultCount( ac ) = 4) andalso _
+        (tkAutoComplete_GetResultItem( ac, 0 ) = -1) andalso (tkAutoComplete_GetResultText( ac, 1 ) = "Romania") andalso (tkAutoComplete_GetResultId( ac, 1 ) = 1001) )
+    Key( h, SDLK_DOWN )
+    ResetLog( )
+    Key( h, SDLK_RETURN )
+    tkTest_Check( "a supplied row committed: its text, its id the value, no item index", (tkAutoComplete_GetText( ac ) = "Rome") andalso _
+        (tkAutoComplete_GetSelectedIndex( ac ) = -1) andalso (tkAutoComplete_GetSelectedId( ac ) = 1000) andalso (gLog = "C;I-1;"), gLog )
+    tkAutoComplete_SetDelay( ac, 0 )
+    tkAutoComplete_SetItemsNeededCallback( ac, 0 )
+
+    ' ---- the asynchronous feed ----
+    tkAutoComplete_SetPopulateCallback( ac, @OnPopulate )
+    Fresh( h, ac )
+    gPopulates = 0
+    TypeText( h, "os" )
+    dim as long req2 = gLastReq
+    tkTest_Check( "Populate per change; the list shows only the status row", (gPopulates = 2) andalso tkAutoComplete_IsDroppedDown( ac ) andalso _
+        (tkAutoComplete_GetResultCount( ac ) = 0) andalso (tkAutoComplete_GetPendingRequest( ac ) = req2) )
+    tkTest_Check( "a stale answer is refused", tkAutoComplete_BeginSupply( ac, req2 - 1 ) = false )
+    if tkAutoComplete_BeginSupply( ac, req2 ) then
+        tkAutoComplete_AddResult( ac, "Oslo", 7, "Norway" )
+        tkAutoComplete_EndSupply( ac )
+    end if
+    KeepUp( )
+    tkTest_Check( "the awaited answer shows, the status row goes", (tkAutoComplete_GetResultCount( ac ) = 1) andalso _
+        (tkAutoComplete_GetPendingRequest( ac ) = 0) andalso tkAutoComplete_IsDroppedDown( ac ) )
+    TypeText( h, "l" )
+    dim as long req3 = gLastReq
+    tkTest_Check( "a new request keeps the last rows up under the status row", (tkAutoComplete_GetResultCount( ac ) = 1) andalso _
+        (tkAutoComplete_GetPendingRequest( ac ) = req3) andalso (req3 <> req2) )
+    tkAutoComplete_CancelPending( ac )
+    tkTest_Check( "CancelPending makes the id stale", (tkAutoComplete_GetPendingRequest( ac ) = 0) andalso (tkAutoComplete_BeginSupply( ac, req3 ) = false) )
+    Key( h, SDLK_ESCAPE )
+    tkAutoComplete_SetPopulateCallback( ac, 0 )
+
+    ' ---- a source ----
+    gCities(0) = "Lima" : gCities(1) = "Lisbon" : gCities(2) = "London" : gCityCount = 3
+    dim as TKAUTOCOMPLETE_SOURCE src
+    src.Count = @SrcCount : src.GetText = @SrcText : src.GetId = @SrcId
+    tkAutoComplete_SetSource( ac, @src )
+    gCities(3) = "Luanda" : gCityCount = 4
+    tkAutoComplete_SourceChanged( ac )
+    tkTest_Check( "a source fills the items, SourceChanged re-reads it", (tkAutoComplete_GetCount( ac ) = 4) andalso _
+        (tkAutoComplete_FindItemById( ac, 503 ) = 3) andalso (tkAutoComplete_GetItemText( ac, 1 ) = "Lisbon") )
+
+    ' ---- SetSelectedItem: a value the items do not hold ----
+    tkAutoComplete_SetValuePolicy( ac, TKAC_VALUE_LIMITTOLIST )
+    ResetLog( ) : gNil = 0
+    tkAutoComplete_SetSelectedItem( ac, 55, "Zanzibar" )
+    tkHost_SetFocus( h, ac )
+    tkHost_SetFocus( h, other )
+    tkTest_Check( "SetSelectedItem: silent, and the value stands on leaving (no NotInList)", (tkAutoComplete_GetSelectedId( ac ) = 55) andalso _
+        (tkAutoComplete_GetText( ac ) = "Zanzibar") andalso (gNil = 0) andalso (gLog = ""), gLog )
+    gKeepAc = 0
+    tkHost_Destroy( h )
+end sub
+
+if tkTest_Init() = false then end 99
+' ONE run, at 1.75: scaled geometry is the stricter test (a missing tkHost_Scale shows there, not at
+' 1.0), and the behaviour checks do not depend on the scale (the author's "one check per distinct
+' behaviour", 2026-11-23).
+RunPass( 1.75 )
+SearchPass( 1.75 )
+ValuePass( 1.75 )
+FeedPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkAutoComplete" )
+tkTest_Quit()
+end nFail

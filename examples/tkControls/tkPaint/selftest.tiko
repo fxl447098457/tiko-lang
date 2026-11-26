@@ -15,6 +15,10 @@ const PEN = &hFF00FF00ul
 dim shared as long gScene
 dim shared as TTF_Font ptr gFont
 dim shared as TTF_Font ptr gIcons
+dim shared as SDL_Texture ptr gTex       ' 200 x 100: yellow | red | blue | yellow bands (MakeBands)
+const IMG_Y = &hFFFFFF00ul
+const IMG_R = &hFFFF0000ul
+const IMG_B = &hFF0000FFul
 
 ' What the canvas widget paints is chosen by gScene; coordinates are canvas-local.
 function CanvasProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
@@ -64,6 +68,22 @@ function CanvasProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolea
     case 14     ' word-wrapped text
         tkRect_Set( rc, 10, 10, 160, 300 )
         p->PaintTextEx( "the quick brown fox jumps over the lazy dog again and again", @rc, TK_DT_WORDBREAK )
+    case 16     ' a round photo: circle, cover (the avatar)
+        tkRect_Set( rc, 20, 20, 100, 100 ) : p->PaintImageShape( gTex, @rc, 80, TK_IMGFIT_COVER )
+    case 17     ' cover, square, through PaintImage
+        tkRect_Set( rc, 20, 20, 100, 100 ) : p->PaintImage( gTex, @rc, TK_IMGFIT_COVER )
+    case 18     ' aspect, square corners: the shape is the fitted image, not the box
+        tkRect_Set( rc, 20, 20, 100, 100 ) : p->PaintImageShape( gTex, @rc, 0, TK_IMGFIT_ASPECT )
+    case 19     ' half opacity
+        tkRect_Set( rc, 20, 20, 100, 100 ) : p->PaintImageShape( gTex, @rc, 80, TK_IMGFIT_COVER, 128 )
+    case 20     ' the clip in force is honoured
+        tkRect_Set( rc, 20, 20, 60, 100 ) : p->PushClip( @rc )
+        tkRect_Set( rc, 20, 20, 100, 100 ) : p->PaintImageShape( gTex, @rc, 80, TK_IMGFIT_COVER )
+        p->PopClip()
+    case 21     ' PaintImage ASPECT, unchanged by COVER's arrival
+        tkRect_Set( rc, 20, 20, 100, 100 ) : p->PaintImage( gTex, @rc, TK_IMGFIT_ASPECT )
+    case 22     ' a rounded rect (curvature 20) in a wide box, stretch
+        tkRect_Set( rc, 20, 20, 180, 60 ) : p->PaintImageShape( gTex, @rc, 20, TK_IMGFIT_STRETCH )
     case 15     ' an icon centred: its ink in the middle (its left bearing kept, which SDL_ttf drops)
         if gIcons then p->SetFont( gIcons )
         tkRect_Set( rc, 20, 10, 120, 50 ) : p->PaintText( wchr( TK_ICON_MORE ), @rc, TK_DT_CENTER )
@@ -73,6 +93,24 @@ end function
 
 function S( byval h as TK_HOST ptr, byval v as long ) as long
     return v      ' scenes are drawn in raw pixels; only pens scale
+end function
+
+' The test image: 200 x 100, four vertical bands -- x 0..49 yellow, 50..99 red, 100..149 blue,
+' 150..199 yellow. A COVER fit into a square shows the middle 100 x 100 only (red | blue, no
+' yellow); ASPECT shows it all inside a letterbox; NEAREST so a band edge is one column.
+function MakeBands( byval r as SDL_Renderer ptr ) as SDL_Texture ptr
+    dim as SDL_Surface ptr sf = SDL_CreateSurface( 200, 100, SDL_PIXELFORMAT_ARGB8888 )
+    if sf = 0 then return 0
+    dim as SDL_Rect b
+    b.y = 0 : b.h = 100 : b.w = 50
+    b.x = 0   : SDL_FillSurfaceRect( sf, @b, SDL_MapSurfaceRGBA( sf, 255, 255, 0, 255 ) )
+    b.x = 50  : SDL_FillSurfaceRect( sf, @b, SDL_MapSurfaceRGBA( sf, 255, 0, 0, 255 ) )
+    b.x = 100 : SDL_FillSurfaceRect( sf, @b, SDL_MapSurfaceRGBA( sf, 0, 0, 255, 255 ) )
+    b.x = 150 : SDL_FillSurfaceRect( sf, @b, SDL_MapSurfaceRGBA( sf, 255, 255, 0, 255 ) )
+    dim as SDL_Texture ptr t = SDL_CreateTextureFromSurface( r, sf )
+    SDL_DestroySurface( sf )
+    if t then SDL_SetTextureScaleMode( t, SDL_SCALEMODE_NEAREST )
+    return t
 end function
 
 ' Draw a scene and leave it in the back buffer.
@@ -164,6 +202,15 @@ sub RunPass( byval fScale as single )
     Scene( h, 6 )
     tkTest_Check( "ring: the hole is empty", Px( h, cv, 70, 70 ) = BG )
     tkTest_Check( "ring: the band is filled", Px( h, cv, 70, 30 ) = FG andalso Px( h, cv, 110, 70 ) = FG )
+    ' a whole ring has no seam where it closes (0 degrees, the +x axis): it was a 359.9 degree slit
+    ' whose AA fringes blended the rows there (the fasting app's timer ring, F5)
+    dim as long nSeam = 0
+    for y as long = 68 to 72
+        for x as long = 98 to 116
+            if Px( h, cv, x, y ) <> FG then nSeam += 1
+        next
+    next
+    tkTest_Check( "ring: no seam where a whole ring closes", nSeam = 0, nSeam & " band pixels not the fill" )
 
     ' ---- gradients --------------------------------------------------------------------------------
     Scene( h, 7 )
@@ -236,6 +283,56 @@ sub RunPass( byval fScale as single )
     tkTest_Check( "tkText_Wrap: every line fits", bWidthOk )
     dim as string hard = "one" & chr( 10 ) & chr( 10 ) & "three"
     tkTest_Check( "tkText_Wrap: hard newlines, blank line kept", tkText_Wrap( gFont, hard, 1000, st(), en() ) = 3 )
+
+    ' ---- images: COVER, and PaintImageShape (the round photo) --------------------------------------
+    gTex = MakeBands( h->renderer )
+    tkTest_Check( "image: the test texture", gTex <> 0, *SDL_GetError() )
+    Scene( h, 16 )
+    tkTest_Check( "shape: centre-left is the image's red band", Px( h, cv, 45, 60 ) = IMG_R, hex( Px( h, cv, 45, 60 ) ) )
+    tkTest_Check( "shape: centre-right is the blue band", Px( h, cv, 75, 60 ) = IMG_B, hex( Px( h, cv, 75, 60 ) ) )
+    tkTest_Check( "shape: cover crops the yellow sides (left rim, inside the circle)", Px( h, cv, 23, 60 ) = IMG_R, hex( Px( h, cv, 23, 60 ) ) )
+    tkTest_Check( "shape: cover crops the yellow sides (right rim)", Px( h, cv, 96, 60 ) = IMG_B, hex( Px( h, cv, 96, 60 ) ) )
+    tkTest_Check( "shape: the box's corners are outside the circle", (Px( h, cv, 21, 21 ) = BG) andalso (Px( h, cv, 98, 98 ) = BG) andalso (Px( h, cv, 98, 21 ) = BG) andalso (Px( h, cv, 21, 98 ) = BG) )
+    tkTest_Check( "shape: nothing outside the box", (Px( h, cv, 19, 60 ) = BG) andalso (Px( h, cv, 100, 60 ) = BG) andalso (Px( h, cv, 60, 19 ) = BG) andalso (Px( h, cv, 60, 100 ) = BG) )
+    ' the rim is anti-aliased: along the 45 degree diagonal (top-left) one pixel is between BG and red
+    dim as boolean bRim = false
+    for k as long = 26 to 36
+        if IsMid( Px( h, cv, k, k ), BG, IMG_R ) then bRim = true
+    next
+    tkTest_Check( "shape: an anti-aliased rim", bRim, Tones( h, cv, 26, 26, 11, 11 ) & " tones" )
+    ' the circle is round: the top-left inside/outside boundary on the diagonal sits at r(1 - 1/sqrt 2)
+    dim as long kIn = -1
+    for k as long = 22 to 40
+        if Px( h, cv, k, k ) = IMG_R then kIn = k : exit for
+    next
+    tkTest_Check( "shape: the rim on the diagonal at 40(1 - 0.707) = 11.7 px in", (kIn >= 20 + 11) andalso (kIn <= 20 + 13), "" & kIn )
+
+    Scene( h, 17 )
+    tkTest_Check( "cover: square corners filled", (Px( h, cv, 21, 21 ) = IMG_R) andalso (Px( h, cv, 98, 98 ) = IMG_B), hex( Px( h, cv, 21, 21 ) ) & " " & hex( Px( h, cv, 98, 98 ) ) )
+    tkTest_Check( "cover: no yellow (the sides are cropped)", (Px( h, cv, 20, 60 ) = IMG_R) andalso (Px( h, cv, 99, 60 ) = IMG_B) )
+    tkTest_Check( "cover: the band split at the box's centre", (Px( h, cv, 58, 60 ) = IMG_R) andalso (Px( h, cv, 61, 60 ) = IMG_B), hex( Px( h, cv, 58, 60 ) ) & " " & hex( Px( h, cv, 61, 60 ) ) )
+    tkTest_Check( "cover: nothing outside the box", (Px( h, cv, 19, 60 ) = BG) andalso (Px( h, cv, 100, 60 ) = BG) )
+
+    Scene( h, 18 )
+    ' 200 x 100 into 80 x 80: drawn 80 x 40 at y 40..79; yellow 20..39, red 40..59, blue 60..79, yellow 80..99
+    tkTest_Check( "shape aspect: letterbox above and below stays background", (Px( h, cv, 60, 30 ) = BG) andalso (Px( h, cv, 60, 90 ) = BG) )
+    tkTest_Check( "shape aspect: the whole image, yellow sides included", (Px( h, cv, 25, 60 ) = IMG_Y) andalso (Px( h, cv, 50, 60 ) = IMG_R) andalso (Px( h, cv, 70, 60 ) = IMG_B) andalso (Px( h, cv, 95, 60 ) = IMG_Y), _
+                  hex( Px( h, cv, 25, 60 ) ) & " " & hex( Px( h, cv, 50, 60 ) ) & " " & hex( Px( h, cv, 70, 60 ) ) & " " & hex( Px( h, cv, 95, 60 ) ) )
+    tkTest_Check( "shape aspect: square corners (curvature 0) are crisp", (Px( h, cv, 20, 40 ) = IMG_Y) andalso (Px( h, cv, 20, 39 ) = BG), hex( Px( h, cv, 20, 40 ) ) & " " & hex( Px( h, cv, 20, 39 ) ) )
+
+    Scene( h, 19 )
+    tkTest_Check( "shape alpha 128: the centre is half image, half background", IsMid( Px( h, cv, 45, 60 ), BG, IMG_R ), hex( Px( h, cv, 45, 60 ) ) )
+
+    Scene( h, 20 )
+    tkTest_Check( "shape: honours the clip in force", (Px( h, cv, 45, 60 ) = IMG_R) andalso (Px( h, cv, 75, 60 ) = BG), hex( Px( h, cv, 75, 60 ) ) )
+
+    Scene( h, 21 )
+    tkTest_Check( "PaintImage aspect unchanged: letterbox, yellow sides", (Px( h, cv, 60, 30 ) = BG) andalso (Px( h, cv, 25, 60 ) = IMG_Y) andalso (Px( h, cv, 70, 60 ) = IMG_B) )
+
+    Scene( h, 22 )
+    tkTest_Check( "shape rounded: corner cut, edge middle filled", (Px( h, cv, 20, 20 ) = BG) andalso (Px( h, cv, 100, 21 ) <> BG) andalso (Px( h, cv, 21, 40 ) = IMG_Y), _
+                  hex( Px( h, cv, 20, 20 ) ) & " " & hex( Px( h, cv, 100, 21 ) ) & " " & hex( Px( h, cv, 21, 40 ) ) )
+    SDL_DestroyTexture( gTex ) : gTex = 0
 
     ' ---- the caret helpers ------------------------------------------------------------------------
     dim as string w8 = "Caf" & chr( &hC3, &hA9 ) & " " & chr( &hE2, &h82, &hAC ) & "42"     ' "Café €42"

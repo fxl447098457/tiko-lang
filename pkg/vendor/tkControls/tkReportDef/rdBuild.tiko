@@ -1,0 +1,742 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportDef -- making the TK_REPORT.
+'
+' THE DATA is one TKREPORT_SOURCE, a JOIN over the bound sources (RD0 spike S4):
+'   fields   "<Master>.<f>" for the master's, "<Child>.<f>" for the child's, then __master (the
+'            master row's number, from 1) and __has_<Child> (FALSE on the one row of a master with
+'            no children); with no child source only the master's.
+'   rows     each master row's children, buffered when it is read -- so the child's own filter
+'            and sort apply -- or one row with the child's fields empty.
+' A detail_report therefore lays out as two group levels on __master after the file's own groups:
+' level U is the master row (the master's detail band as its header), level U+1 the children
+' (the detail_report's report_header / report_footer as its header / footer), and the child's detail
+' band is tkReport's Detail; the three print only when __has_<Child> (an empty detail report is left
+' out, as DevExpress leaves it). Totals with incr = "master" count once per
+' master row (incrLevel U).
+#module "tkReportDef"
+
+#import "../tkReport"
+#import "../tkRExpr"
+#import "../tkPaint"
+using tkReport
+using tkRExpr
+using tkBind
+using tkPrint
+using tkPaint
+
+type RD_JOIN_
+    master   as TKREPORT_SOURCE
+    mName    as ustring
+    nM       as int32
+    mcur(any) as TK_VALUE
+    masterNo as int64
+    hasChild as boolean
+    child    as TKRD_CHILD
+    cName    as ustring
+    nC       as int32
+    buf(any) as TK_VALUE                ' this master's children, nC values each
+    nBuf     as int32
+    order(any) as int32                 ' the children in their sort order
+    ci       as int32 = -1              ' the current child (-1: the master has none)
+    cFilter  as TK_REXPR ptr            ' the child's filter, over master + child fields
+    cSch     as TKREXPR_SCHEMA
+    cKeys(any) as TKREPORT_SORTKEY      ' the child's sort, by child field
+    nCKeys   as int32
+    comb(any) as TK_VALUE               ' master + child values, for the filter
+    ctx      as TKREXPR_CTX
+    params   as TK_VALUE ptr
+    started  as boolean
+end type
+
+private sub AddErr( byref errs as ustring, byref msg as const ustring )
+    if len( errs ) then errs &= chr( 10 )
+    errs &= msg
+end sub
+
+' ---- the join's TKREPORT_SOURCE ---------------------------------------------------------------
+private function JFieldCount( byval p as any ptr ) as long
+    dim as RD_JOIN_ ptr j = p
+    return j->nM + j->nC + iif( j->hasChild, 2, 0 )
+end function
+private function JFieldName( byval p as any ptr, byval f as long ) as ustring
+    dim as RD_JOIN_ ptr j = p
+    if f < j->nM then return j->mName & "." & j->master.FieldName( j->master.pCtx, f )
+    if f < j->nM + j->nC then return j->cName & "." & j->child.rows.FieldName( j->child.rows.pCtx, f - j->nM )
+    if f = j->nM + j->nC then return "__master"
+    return "__has_" & j->cName
+end function
+private function JFieldKind( byval p as any ptr, byval f as long ) as long
+    dim as RD_JOIN_ ptr j = p
+    if f < j->nM then return j->master.FieldKind( j->master.pCtx, f )
+    if f < j->nM + j->nC then return j->child.rows.FieldKind( j->child.rows.pCtx, f - j->nM )
+    if f = j->nM + j->nC then return TKV_INT
+    return TKV_BOOL
+end function
+private function JRowCount( byval p as any ptr ) as integer
+    return -1
+end function
+private function JRewind( byval p as any ptr ) as boolean
+    dim as RD_JOIN_ ptr j = p
+    j->masterNo = 0
+    j->ci = -1 : j->nBuf = 0 : j->started = false
+    return j->master.Rewind( j->master.pCtx )
+end function
+private function JSort( byval p as any ptr, byval keys as TKREPORT_SORTKEY ptr, byval nKeys as long ) as boolean
+    dim as RD_JOIN_ ptr j = p
+    if j->master.Sort = 0 then return false
+    for k as long = 0 to nKeys - 1
+        if keys[k].field >= j->nM then return false      ' a master sorts by its own fields only
+    next
+    return j->master.Sort( j->master.pCtx, keys, nKeys )
+end function
+
+' The children of the master row in mcur, filtered and sorted, into buf.
+private sub LoadChildren( byval j as RD_JOIN_ ptr )
+    j->nBuf = 0
+    if j->child.Open( j->child.pCtx, @j->mcur(0), j->nM ) = false then exit sub
+    while j->child.rows.MoveNext( j->child.rows.pCtx )
+        dim as int32 b = j->nBuf * j->nC
+        if b + j->nC - 1 > ubound( j->buf ) then redim preserve j->buf( 0 to (b + j->nC) * 2 + 15 )
+        for f as int32 = 0 to j->nC - 1
+            j->child.rows.GetValue( j->child.rows.pCtx, f, j->buf(b + f) )
+        next
+        if j->cFilter then
+            for f as int32 = 0 to j->nM - 1 : j->comb(f) = j->mcur(f) : next
+            for f as int32 = 0 to j->nC - 1 : j->comb(j->nM + f) = j->buf(b + f) : next
+            j->ctx.row = @j->comb(0)
+            j->ctx.params = j->params
+            if tkRExpr_EvalBool( j->cFilter, j->ctx ) = false then continue while
+        end if
+        j->nBuf += 1
+    wend
+    redim j->order( 0 to iif( j->nBuf > 0, j->nBuf - 1, 0 ) )
+    for i as int32 = 0 to j->nBuf - 1 : j->order(i) = i : next
+    if (j->nCKeys > 0) andalso (j->nBuf > 1) then
+        ' insertion sort: a master's children are few, and it is stable
+        for i as int32 = 1 to j->nBuf - 1
+            dim as int32 v = j->order(i), k = i - 1
+            while k >= 0
+                dim as long c = 0
+                for q as int32 = 0 to j->nCKeys - 1
+                    c = tkReport_CompareValues( j->buf(j->order(k) * j->nC + j->cKeys(q).field), j->buf(v * j->nC + j->cKeys(q).field) )
+                    if j->cKeys(q).desc then c = -c
+                    if c <> 0 then exit for
+                next
+                if c <= 0 then exit while
+                j->order(k + 1) = j->order(k)
+                k -= 1
+            wend
+            j->order(k + 1) = v
+        next
+    end if
+end sub
+
+private function JNext( byval p as any ptr ) as boolean
+    dim as RD_JOIN_ ptr j = p
+    if j->hasChild andalso j->started andalso (j->ci >= 0) andalso (j->ci + 1 < j->nBuf) then
+        j->ci += 1
+        return true
+    end if
+    if j->master.MoveNext( j->master.pCtx ) = false then return false
+    j->started = true
+    for f as int32 = 0 to j->nM - 1
+        j->master.GetValue( j->master.pCtx, f, j->mcur(f) )
+    next
+    j->masterNo += 1
+    if j->hasChild then
+        LoadChildren( j )
+        j->ci = iif( j->nBuf > 0, 0, -1 )
+    end if
+    return true
+end function
+
+private sub JGet( byval p as any ptr, byval f as long, byref v as TK_VALUE )
+    dim as RD_JOIN_ ptr j = p
+    v.Clear( )
+    if f < j->nM then
+        v = j->mcur(f)
+    elseif f < j->nM + j->nC then
+        if j->ci >= 0 then v = j->buf(j->order(j->ci) * j->nC + (f - j->nM))
+    elseif f = j->nM + j->nC then
+        v.SetInt( j->masterNo )
+    else
+        v.SetBool( j->ci >= 0 )
+    end if
+end sub
+
+' ---- freeing ---------------------------------------------------------------------------------
+sub RdFreeBuilt( byval def as TK_REPORTDEF ptr, byval bFinal as boolean )
+    if def->rpt then
+        tkReport_Destroy( def->rpt )
+        def->rpt = 0
+    end if
+    if def->join_ then
+        dim as RD_JOIN_ ptr jj = def->join_
+        tkRExpr_Destroy( jj->cFilter )
+        delete jj
+        def->join_ = 0
+    end if
+    for k as int32 = 0 to ubound( def->childPar )
+        tkRExpr_Destroy( def->childPar(k) )
+    next
+    erase def->childPar
+    def->childParSi = -1
+    for i as int32 = 0 to ubound( def->binds )
+        if def->binds(i).CloseAll then def->binds(i).CloseAll( def->binds(i).pCtx, bFinal )
+        if bFinal then def->binds(i).CloseAll = 0
+    next
+end sub
+
+' ---- parameters ------------------------------------------------------------------------------
+private sub ParamSchema( byval def as TK_REPORTDEF ptr, byref sch as TKREXPR_SCHEMA )
+    for i as int32 = 0 to def->nParams - 1
+        sch.AddParam( def->params(i).name_, def->params(i).kind )
+    next
+end sub
+
+' The parameter values in order (set, else default) for an evaluation context.
+private sub ParamValues( byval def as TK_REPORTDEF ptr, vals() as TK_VALUE )
+    if def->nParams = 0 then exit sub
+    redim vals( 0 to def->nParams - 1 )
+    for i as int32 = 0 to def->nParams - 1
+        tkReportDef_GetParam( def, i, vals(i) )
+    next
+end sub
+
+' v converted to kind k, as tkRExpr converts (an int default for a float parameter ...).
+private sub ToKind( byref v as TK_VALUE, byval k as int32 )
+    if (v.kind = k) orelse (v.kind = TKV_EMPTY) then exit sub
+    dim as TKREXPR_SCHEMA s
+    s.AddField( "v", v.kind )
+    dim as string fn
+    select case k
+    case TKV_TEXT : fn = "Str"
+    case TKV_INT : fn = "CInt"
+    case TKV_FLOAT : fn = "CFloat"
+    case TKV_BOOL : fn = "CBool"
+    case TKV_DATE : fn = "CDate"
+    case else : exit sub
+    end select
+    dim as TKREXPR_ERROR e
+    dim as TK_REXPR ptr x = tkRExpr_Compile( fn & "([v])", s, e )
+    if x = 0 then
+        v.Clear( )
+        exit sub
+    end if
+    dim as TKREXPR_CTX c
+    dim as TK_VALUE row(0 to 0)
+    row(0) = v
+    c.row = @row(0)
+    tkRExpr_Eval( x, c, v )
+    tkRExpr_Destroy( x )
+end sub
+
+' Parameter i's default (its expression, evaluated now). FALSE when it has none or it is empty.
+function RdParamDefault( byval def as TK_REPORTDEF ptr, byval i as int32, byref v as TK_VALUE ) as boolean
+    v.Clear( )
+    if len( trim( def->params(i).default_ ) ) = 0 then return false
+    dim as TKREXPR_SCHEMA s
+    s.noAggregates = true
+    dim as TKREXPR_ERROR e
+    dim as TK_REXPR ptr x = tkRExpr_Compile( def->params(i).default_, s, e )
+    if x = 0 then return false
+    tkRExpr_Eval( x, def->ctx, v )
+    tkRExpr_Destroy( x )
+    ToKind( v, def->params(i).kind )
+    return v.kind <> TKV_EMPTY
+end function
+
+' For a binder: source si's parameters (the file's params = { Name = "expression" }), evaluated
+' against the report's parameters. Their count; FALSE-ish (-1) with errs when one does not compile.
+public function tkReportDef_EvalParams( byval def as TK_REPORTDEF ptr, byval si as int32, names() as ustring, _
+                                        vals() as TK_VALUE, byref errs as ustring ) as int32
+    if (def = 0) orelse (si < 0) orelse (si >= def->nSources) then return -1
+    dim byref as TKRD_SOURCE s = def->sources(si)
+    if s.nPar = 0 then return 0
+    redim names( 0 to s.nPar - 1 )
+    redim vals( 0 to s.nPar - 1 )
+    dim as TKREXPR_SCHEMA sch
+    sch.noAggregates = true
+    ParamSchema( def, sch )
+    dim as TK_VALUE pv(any)
+    ParamValues( def, pv() )
+    dim as TKREXPR_CTX c
+    if def->nParams > 0 then c.params = @pv(0)
+    c.printDate = def->ctx.printDate
+    c.printTime = def->ctx.printTime
+    for k as int32 = 0 to s.nPar - 1
+        names(k) = s.pNames(k)
+        dim as TKREXPR_ERROR e
+        dim as TK_REXPR ptr x = tkRExpr_Compile( s.pExprs(k), sch, e )
+        if x = 0 then
+            AddErr( errs, "source '" & s.name_ & "': params." & s.pNames(k) & ": " & e.msg )
+            return -1
+        end if
+        tkRExpr_Eval( x, c, vals(k) )
+        tkRExpr_Destroy( x )
+    next
+    return s.nPar
+end function
+
+' For a child's binder: its parameters for this master row (master: the master's values, in the
+' bound master's field order), from expressions compiled when the report was made.
+public function tkReportDef_EvalChildParams( byval def as TK_REPORTDEF ptr, byval si as int32, byval master as TK_VALUE ptr, _
+                                             names() as ustring, vals() as TK_VALUE ) as int32
+    if (def = 0) orelse (si <> def->childParSi) then return -1
+    dim byref as TKRD_SOURCE s = def->sources(si)
+    if s.nPar = 0 then return 0
+    redim names( 0 to s.nPar - 1 )
+    redim vals( 0 to s.nPar - 1 )
+    dim as TK_VALUE pv(any)
+    ParamValues( def, pv() )
+    dim as TKREXPR_CTX c
+    c.row = master
+    if def->nParams > 0 then c.params = @pv(0)
+    for k as int32 = 0 to s.nPar - 1
+        names(k) = s.pNames(k)
+        if def->childPar(k) then tkRExpr_Eval( def->childPar(k), c, vals(k) ) else vals(k).Clear( )
+    next
+    return s.nPar
+end function
+
+' ---- checks ----------------------------------------------------------------------------------
+' The bound source's fields against the file's snapshot: every field the report expects is there,
+' of the kind it expects.
+private sub CheckSchema( byval def as TK_REPORTDEF ptr, byval si as int32, byref src as TKREPORT_SOURCE, byref errs as ustring )
+    dim byref as TKRD_SOURCE s = def->sources(si)
+    dim as long n = src.FieldCount( src.pCtx )
+    for k as int32 = 0 to s.nFields - 1
+        dim as long found = -1
+        for f as long = 0 to n - 1
+            if lcase( src.FieldName( src.pCtx, f ) ) = lcase( s.fields(k).name_ ) then found = f : exit for
+        next
+        if found < 0 then
+            AddErr( errs, "source '" & s.name_ & "': the data has no field '" & s.fields(k).name_ & "'" )
+        else
+            dim as long got = src.FieldKind( src.pCtx, found )
+            if got <> s.fields(k).kind then
+                AddErr( errs, "source '" & s.name_ & "': field '" & s.fields(k).name_ & "' is " & RdKindName( got ) & _
+                          " in the data and " & RdKindName( s.fields(k).kind ) & " in the report" )
+            end if
+        end if
+    next
+end sub
+
+' "[A], [B] desc" -> keys over src's fields (offset added). FALSE with errs on a name it doesn't have.
+private function ParseSort( byref text as const ustring, byref src as TKREPORT_SOURCE, byref srcName as const ustring, _
+                            byval offset as int32, keys() as TKREPORT_SORTKEY, byref n as int32, byref errs as ustring ) as boolean
+    n = 0
+    dim as ustring rest = text
+    dim as boolean ok = true
+    while len( trim( rest ) )
+        dim as long cm = instr( rest, "," )
+        dim as ustring part
+        if cm then
+            part = trim( left( rest, cm - 1 ) )
+            rest = mid( rest, cm + 1 )
+        else
+            part = trim( rest )
+            rest = ""
+        end if
+        dim as boolean desc_
+        if lcase( right( part, 5 ) ) = " desc" then
+            desc_ = true
+            part = trim( left( part, len( part ) - 5 ) )
+        elseif lcase( right( part, 4 ) ) = " asc" then
+            part = trim( left( part, len( part ) - 4 ) )
+        end if
+        if (left( part, 1 ) = "[") andalso (right( part, 1 ) = "]") then part = trim( mid( part, 2, len( part ) - 2 ) )
+        if lcase( left( part, len( srcName ) + 1 ) ) = lcase( srcName ) & "." then part = mid( part, len( srcName ) + 2 )
+        dim as long found = -1
+        for f as long = 0 to src.FieldCount( src.pCtx ) - 1
+            if lcase( src.FieldName( src.pCtx, f ) ) = lcase( part ) then found = f : exit for
+        next
+        if found < 0 then
+            AddErr( errs, "source '" & srcName & "': sort names no field '" & part & "'" )
+            ok = false
+            continue while
+        end if
+        redim preserve keys( 0 to n )
+        keys(n).field = found + offset
+        keys(n).desc = desc_
+        n += 1
+    wend
+    return ok
+end function
+
+' ---- making the report -----------------------------------------------------------------------
+
+private function BandIndex( byval def as TK_REPORTDEF ptr, byref id as const ustring ) as int32
+    for i as int32 = 0 to def->nBands - 1
+        if lcase( def->bands(i).id ) = lcase( id ) then return i
+    next
+    return -1
+end function
+
+private function LevelOf( byref s as const ustring, byval dflt as long ) as long
+    if left( s, 6 ) = "group:" then return valint( mid( s, 7 ) )
+    return dflt
+end function
+
+private function PaperOf( byref s as const ustring ) as long
+    select case lcase( s )
+    case "a4" : return TK_PAPER_A4
+    case "letter" : return TK_PAPER_LETTER
+    case "legal" : return TK_PAPER_LEGAL
+    case "a3" : return TK_PAPER_A3
+    case "a5" : return TK_PAPER_A5
+    case "b5" : return TK_PAPER_B5
+    case "tabloid" : return TK_PAPER_TABLOID
+    case "executive" : return TK_PAPER_EXECUTIVE
+    case "custom" : return TK_PAPER_CUSTOM
+    end select
+    return TK_PAPER_DEFAULT
+end function
+
+' The report's page: paper, orientation, margins.
+public sub tkReportDef_PageSetup( byval def as TK_REPORTDEF ptr, byref ps as TKPAGESETUP )
+    ps.paper = PaperOf( def->paper )
+    if ps.paper = TK_PAPER_CUSTOM then ps.widthPt = def->paperW : ps.heightPt = def->paperH
+    ps.landscape = def->landscape
+    ps.marginL = def->mL : ps.marginT = def->mT : ps.marginR = def->mR : ps.marginB = def->mB
+end sub
+
+' The engine's item for a definition's item: geometry, kind, style, totals. masterLevel is the
+' group level a "master" increment means. Its rules are the caller's (tkRItem_AddRule).
+public sub tkReportDef_MakeItem( byref it as TKRD_ITEM, byref e as TKREPORT_ITEM, byval masterLevel as long )
+    e.name_ = it.id
+    tkRectF_Set( e.rc, it.x, it.y, it.x + it.w, it.y + it.h )
+    select case it.kind
+    case "text" : e.kind = TKRI_TEXT : e.expr = it.text
+    case "field" : e.kind = TKRI_EXPR : e.expr = it.expr : e.fmt = it.format
+    case "line" : e.kind = TKRI_LINE
+    case "box" : e.kind = TKRI_BOX
+    case "image" : e.kind = TKRI_IMAGE : e.text = it.text : e.expr = it.expr
+    case "check" : e.kind = TKRI_CHECK : e.expr = it.expr
+    case "custom" : e.kind = TKRI_CUSTOM : e.tag = it.tag
+    end select
+    select case it.align
+    case "center" : e.flags = TK_DT_CENTER
+    case "right" : e.flags = TK_DT_RIGHT
+    case else : e.flags = TK_DT_LEFT
+    end select
+    if it.valign = "top" then e.flags or= TK_DT_TOP
+    if it.valign = "bottom" then e.flags or= TK_DT_BOTTOM
+    if it.wrap then e.flags or= TK_DT_WORDBREAK
+    e.canGrow = it.canGrow
+    e.font.src = it.fontSrc
+    e.font.pt = it.fontSize
+    e.font.bold = it.bold
+    e.font.italic = it.italic
+    e.fore = RdColor( it.fore, &hFF000000ul )
+    e.back = RdColor( it.back, 0 )
+    e.lineColor = RdColor( it.lineColor, &hFF000000ul )
+    e.penPt = it.pen
+    dim as ustring bw = " " & it.border & " "
+    if instr( bw, " all " ) then e.borders = TKRI_BORDER_ALL
+    if instr( bw, " left " ) then e.borders or= TKRI_BORDER_LEFT
+    if instr( bw, " top " ) then e.borders or= TKRI_BORDER_TOP
+    if instr( bw, " right " ) then e.borders or= TKRI_BORDER_RIGHT
+    if instr( bw, " bottom " ) then e.borders or= TKRI_BORDER_BOTTOM
+    e.visibleExpr = it.visible
+    select case it.reset
+    case "page" : e.reset = TKRS_SCOPE_PAGE
+    case "report" : e.reset = TKRS_SCOPE_REPORT
+    case "auto" : e.reset = TKRS_RESET_AUTO
+    case else : e.reset = LevelOf( it.reset, TKRS_RESET_AUTO )
+    end select
+    e.running = it.running
+    select case it.incr
+    case "row" : e.incrLevel = -1
+    case "master" : e.incrLevel = masterLevel
+    case else : e.incrLevel = LevelOf( it.incr, -1 )
+    end select
+end sub
+
+private sub AddItems( byval def as TK_REPORTDEF ptr, byval bi as int32, byval band as TK_RBAND ptr, byval masterLevel as long )
+    dim as ustring id = lcase( def->bands(bi).id )
+    for i as int32 = 0 to def->nItems - 1
+        dim byref as TKRD_ITEM it = def->items(i)
+        if lcase( it.band ) <> id then continue for
+        dim as TKREPORT_ITEM e
+        tkReportDef_MakeItem( it, e, masterLevel )
+        dim as TKREPORT_ITEM ptr p = tkRBand_AddItem( band, e )
+        for k as int32 = 0 to it.nRules - 1
+            dim byref as TKRD_RULE r = it.rules(k)
+            dim as TKREPORT_RULE ru
+            ru.when_ = r.when_
+            if len( r.fore ) then ru.setFore = true : ru.fore = RdColor( r.fore, &hFF000000ul )
+            if len( r.back ) then ru.setBack = true : ru.back = RdColor( r.back, 0 )
+            if r.bold >= 0 then ru.setBold = true : ru.bold = (r.bold = 1)
+            if r.italic >= 0 then ru.setItalic = true : ru.italic = (r.italic = 1)
+            ru.hide = r.hide
+            tkRItem_AddRule( p, ru )
+        next
+    next
+end sub
+
+private sub SetBand( byval def as TK_REPORTDEF ptr, byval bi as int32, byval band as TK_RBAND ptr, byref defaultSource as const ustring, _
+                     byref extraVisible as const ustring, byval masterLevel as long )
+    dim byref as TKRD_BAND b = def->bands(bi)
+    band->height = b.height
+    band->canGrow = b.canGrow
+    band->pageBreakBefore = b.breakBefore
+    band->pageBreakAfter = b.breakAfter
+    band->repeatOnEveryPage = b.repeat_
+    band->printOnFirstPage = b.printOnFirstPage
+    band->printAtBottom = b.printAtBottom
+    band->backColor = RdColor( b.back, 0 )
+    band->defaultSource = defaultSource
+    if len( extraVisible ) andalso len( b.visible ) then
+        band->visibleExpr = "(" & extraVisible & ") and (" & b.visible & ")"
+    elseif len( extraVisible ) then
+        band->visibleExpr = extraVisible
+    else
+        band->visibleExpr = b.visible
+    end if
+    AddItems( def, bi, band, masterLevel )
+end sub
+
+' The report from the definition and its bindings, owned by the definition (made again on each
+' call). 0 with errs: a source not bound, a schema that does not match, an expression that does not
+' compile, a group with no header, a required parameter with no value.
+public function tkReportDef_CreateReport( byval def as TK_REPORTDEF ptr, byref errs as ustring ) as TK_REPORT ptr
+    errs = ""
+    if def = 0 then return 0
+    RdFreeBuilt( def, false )
+    if ubound( def->binds ) < def->nSources - 1 then redim preserve def->binds( 0 to def->nSources - 1 )
+    if ubound( def->pv ) < def->nParams - 1 then
+        redim preserve def->pv( 0 to def->nParams - 1 )
+        redim preserve def->pvSet( 0 to def->nParams - 1 )
+    end if
+    ' one print moment for the whole report
+    def->ctx.printDate.wYear = 0
+    def->ctx.printTime.wHour = -1
+    ' the bands: top level, the detail, a detail_report and its children
+    dim as int32 iDetail = -1, iDR = -1, iDRHead = -1, iDRDet = -1, iDRFoot = -1
+    dim as long U = 0
+    for i as int32 = 0 to def->nBands - 1
+        dim byref as TKRD_BAND b = def->bands(i)
+        if len( b.parent ) then
+            dim as int32 pb = BandIndex( def, b.parent )
+            if (pb >= 0) andalso (def->bands(pb).kind = "detail_report") then
+                select case b.kind
+                case "report_header" : iDRHead = i
+                case "detail" : iDRDet = i
+                case "report_footer" : iDRFoot = i
+                end select
+            end if
+            if b.kind = "detail_report" then
+                if iDR >= 0 then AddErr( errs, "band '" & b.id & "': one detail_report only" )
+                iDR = i
+            end if
+            continue for
+        end if
+        select case b.kind
+        case "detail"
+            if iDetail >= 0 then AddErr( errs, "band '" & b.id & "': one top-level detail band only" )
+            iDetail = i
+        case "group_header", "group_footer"
+            if b.level + 1 > U then U = b.level + 1
+        end select
+    next
+    ' the sources: the master (the detail's, else the one source that is not a child), the child
+    dim as int32 mi = -1, ci = -1
+    if (iDetail >= 0) andalso (len( def->bands(iDetail).source ) > 0) then mi = tkReportDef_FindSource( def, def->bands(iDetail).source )
+    if mi < 0 then
+        for i as int32 = 0 to def->nSources - 1
+            if len( def->sources(i).parent ) = 0 then
+                if mi >= 0 then
+                    AddErr( errs, "the report: more than one source and the detail band names none" )
+                    exit for
+                end if
+                mi = i
+            end if
+        next
+    end if
+    if mi < 0 then AddErr( errs, "the report: no source for its rows" )
+    if iDR >= 0 then
+        ci = tkReportDef_FindSource( def, def->bands(iDR).source )
+        if (ci >= 0) andalso (mi >= 0) andalso (lcase( def->sources(ci).parent ) <> lcase( def->sources(mi).name_ )) then
+            AddErr( errs, "band '" & def->bands(iDR).id & "': source '" & def->sources(ci).name_ & "' is not a child of '" & def->sources(mi).name_ & "'" )
+        end if
+        if iDRDet < 0 then AddErr( errs, "band '" & def->bands(iDR).id & "': a detail_report needs its detail band" )
+    end if
+    if len( errs ) then return 0
+    ' open the master, then the child
+    dim as RD_JOIN_ ptr j = new RD_JOIN_
+    def->join_ = j
+    dim byref as TKRD_BINDING bm = def->binds(mi)
+    if bm.bSrc then
+        j->master = bm.src
+    elseif bm.OpenRows then
+        if bm.OpenRows( def, mi, bm.pCtx, j->master ) = false then AddErr( errs, "source '" & def->sources(mi).name_ & "': its data did not open" )
+    else
+        AddErr( errs, "source '" & def->sources(mi).name_ & "' is not bound to any data" )
+    end if
+    if len( errs ) then return 0
+    j->mName = def->sources(mi).name_
+    j->nM = j->master.FieldCount( j->master.pCtx )
+    redim j->mcur( 0 to iif( j->nM > 0, j->nM - 1, 0 ) )
+    CheckSchema( def, mi, j->master, errs )
+    if ci >= 0 then
+        ' the child's parameters, compiled against the master's fields (and the report's parameters)
+        dim as TKREXPR_SCHEMA ms
+        ms.noAggregates = true
+        for f as int32 = 0 to j->nM - 1
+            ms.AddField( j->mName & "." & j->master.FieldName( j->master.pCtx, f ), j->master.FieldKind( j->master.pCtx, f ) )
+        next
+        ms.defaultSource = j->mName
+        ParamSchema( def, ms )
+        dim byref as TKRD_SOURCE cs = def->sources(ci)
+        if cs.nPar > 0 then redim def->childPar( 0 to cs.nPar - 1 )
+        for k as int32 = 0 to cs.nPar - 1
+            dim as TKREXPR_ERROR e
+            def->childPar(k) = tkRExpr_Compile( cs.pExprs(k), ms, e )
+            if def->childPar(k) = 0 then AddErr( errs, "source '" & cs.name_ & "': params." & cs.pNames(k) & ": " & e.msg & " (column " & e.col & ")" )
+        next
+        def->childParSi = ci
+        dim byref as TKRD_BINDING bc = def->binds(ci)
+        if bc.bChild then
+            j->child = bc.child
+        elseif bc.OpenChild then
+            if bc.OpenChild( def, ci, bc.pCtx, j->child ) = false then AddErr( errs, "source '" & cs.name_ & "': its data did not open" )
+        else
+            AddErr( errs, "source '" & cs.name_ & "' is not bound to any data" )
+        end if
+        if len( errs ) then return 0
+        j->hasChild = true
+        j->cName = cs.name_
+        j->nC = j->child.rows.FieldCount( j->child.rows.pCtx )
+        CheckSchema( def, ci, j->child.rows, errs )
+        redim j->comb( 0 to j->nM + j->nC )
+        ' the child's filter (over master + child fields) and sort
+        if len( trim( cs.filter ) ) then
+            for f as int32 = 0 to j->nM - 1
+                j->cSch.AddField( j->mName & "." & j->master.FieldName( j->master.pCtx, f ), j->master.FieldKind( j->master.pCtx, f ) )
+            next
+            for f as int32 = 0 to j->nC - 1
+                j->cSch.AddField( j->cName & "." & j->child.rows.FieldName( j->child.rows.pCtx, f ), j->child.rows.FieldKind( j->child.rows.pCtx, f ) )
+            next
+            ParamSchema( def, j->cSch )
+            j->cSch.defaultSource = j->cName
+            j->cSch.noAggregates = true
+            dim as TKREXPR_ERROR e
+            j->cFilter = tkRExpr_Compile( cs.filter, j->cSch, e )
+            if j->cFilter = 0 then AddErr( errs, "source '" & cs.name_ & "': filter: " & e.msg & " (column " & e.col & ")" )
+        end if
+        if len( trim( cs.sort ) ) then ParseSort( cs.sort, j->child.rows, cs.name_, 0, j->cKeys(), j->nCKeys, errs )
+    end if
+    if len( errs ) then return 0
+
+    ' the report
+    dim as TK_REPORT ptr r = tkReport_Create( def->title )
+    def->rpt = r
+    dim as TKPAGESETUP ps
+    tkReportDef_PageSetup( def, ps )
+    tkReport_SetPageSetup( r, ps )
+    tkReport_SetBoolText( r, def->boolText )
+    dim as TKREPORT_SOURCE js
+    js.pCtx = j
+    js.FieldCount = @JFieldCount : js.FieldName = @JFieldName : js.FieldKind = @JFieldKind
+    js.RowCount = @JRowCount : js.MoveNext = @JNext : js.GetValue = @JGet : js.Rewind = @JRewind : js.Sort = @JSort
+    tkReport_SetSource( r, js )
+    ' parameters
+    for i as int32 = 0 to def->nParams - 1
+        dim as long k = tkReport_AddParam( r, def->params(i).name_, def->params(i).kind )
+        dim as TK_VALUE v
+        tkReportDef_GetParam( def, i, v )
+        ToKind( v, def->params(i).kind )
+        if def->params(i).required andalso (v.kind = TKV_EMPTY) then AddErr( errs, "parameter '" & def->params(i).name_ & "' needs a value" )
+        tkReport_SetParam( r, k, v )
+    next
+    j->params = 0
+    if def->nParams > 0 then j->params = @r->pVal(0)
+    ' calculated fields, the master's filter and sort
+    for i as int32 = 0 to def->nCalcs - 1
+        dim byref as TKRD_CALC c = def->calcs(i)
+        dim as ustring src = c.source
+        if len( src ) = 0 then src = j->mName
+        tkReport_AddCalcField( r, src & "." & c.name_, c.expr, src )
+    next
+    if len( trim( def->sources(mi).filter ) ) then tkReport_SetFilter( r, def->sources(mi).filter, j->mName )
+    if len( trim( def->sources(mi).sort ) ) then
+        dim as TKREPORT_SORTKEY keys(any)
+        dim as int32 nk
+        ParseSort( def->sources(mi).sort, j->master, j->mName, 0, keys(), nk, errs )
+        for k as int32 = 0 to nk - 1
+            tkReport_AddSortKey( r, keys(k).field, keys(k).desc )
+        next
+    end if
+    ' groups: the file's, outer first, then the master row and its children
+    for L as long = 0 to U - 1
+        dim as int32 hb = -1
+        for i as int32 = 0 to def->nBands - 1
+            if (len( def->bands(i).parent ) = 0) andalso (def->bands(i).kind = "group_header") andalso (def->bands(i).level = L) then
+                if hb >= 0 then AddErr( errs, "band '" & def->bands(i).id & "': two group_header bands at level " & L )
+                hb = i
+            end if
+        next
+        if hb < 0 then
+            AddErr( errs, "group " & L & " has no group_header to say what it groups on" )
+        elseif len( trim( def->bands(hb).group_ ) ) = 0 then
+            AddErr( errs, "band '" & def->bands(hb).id & "': a group_header needs its group expression" )
+        else
+            tkReport_AddGroupExpr( r, def->bands(hb).group_, j->mName )
+        end if
+    next
+    dim as long masterLevel = -1
+    if j->hasChild then
+        masterLevel = U
+        tkReport_AddGroup( r, j->nM + j->nC )          ' U: the master row
+        tkReport_AddGroup( r, j->nM + j->nC )          ' U + 1: its children
+    end if
+    ' bands
+    for i as int32 = 0 to def->nBands - 1
+        dim byref as TKRD_BAND b = def->bands(i)
+        if len( b.parent ) orelse (b.kind = "detail_report") then continue for
+        dim as TK_RBAND ptr eb
+        select case b.kind
+        case "report_header" : eb = tkReport_GetBand( r, TKRB_REPORT_HEADER )
+        case "page_header" : eb = tkReport_GetBand( r, TKRB_PAGE_HEADER )
+        case "group_header" : eb = tkReport_GetBand( r, TKRB_GROUP_HEADER, b.level )
+        case "group_footer" : eb = tkReport_GetBand( r, TKRB_GROUP_FOOTER, b.level )
+        case "report_footer" : eb = tkReport_GetBand( r, TKRB_REPORT_FOOTER )
+        case "page_footer" : eb = tkReport_GetBand( r, TKRB_PAGE_FOOTER )
+        case "no_data" : eb = tkReport_GetBand( r, TKRB_NO_DATA )
+        case "detail"
+            if j->hasChild then eb = tkReport_GetBand( r, TKRB_GROUP_HEADER, U ) else eb = tkReport_GetBand( r, TKRB_DETAIL )
+        end select
+        if eb then SetBand( def, i, eb, j->mName, "", masterLevel )
+    next
+    if j->hasChild then
+        if iDRHead >= 0 then SetBand( def, iDRHead, tkReport_GetBand( r, TKRB_GROUP_HEADER, U + 1 ), j->cName, "[__has_" & j->cName & "]", masterLevel )
+        if iDRDet >= 0 then SetBand( def, iDRDet, tkReport_GetBand( r, TKRB_DETAIL ), j->cName, "[__has_" & j->cName & "]", masterLevel )
+        if iDRFoot >= 0 then SetBand( def, iDRFoot, tkReport_GetBand( r, TKRB_GROUP_FOOTER, U + 1 ), j->cName, "[__has_" & j->cName & "]", masterLevel )
+    end if
+    if len( errs ) then
+        RdFreeBuilt( def, false )
+        return 0
+    end if
+    dim as ustring perr
+    if tkReport_Prepare( r, perr ) = false then
+        errs = perr
+        RdFreeBuilt( def, false )
+        return 0
+    end if
+    if def->onMade then def->onMade( def, r, def->onMadeUser )
+    return r
+end function
+
+' A document of the report (CreateReport, then tkReport_CreateDoc): the caller destroys it, before
+' the definition makes its report again or is destroyed.
+public function tkReportDef_CreateDoc( byval def as TK_REPORTDEF ptr, byref errs as ustring ) as TK_PRINTDOC ptr
+    dim as TK_REPORT ptr r = tkReportDef_CreateReport( def, errs )
+    if r = 0 then return 0
+    return tkReport_CreateDoc( r )
+end function

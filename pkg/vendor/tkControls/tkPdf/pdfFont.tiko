@@ -1,0 +1,371 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPdf -- the TrueType / OpenType reader: what a PDF needs from a font file.
+'
+'   head  unitsPerEm, the box        hhea  ascender, descender, numberOfHMetrics
+'   cmap  character -> glyph (format 12 preferred, else 4)
+'   hmtx  advances                   OS/2  fsType (may it be embedded?)
+'   name  the PostScript name        loca / glyf  outlines (simple and composite)
+'
+' A .ttc picks its face from the collection header. CFF fonts ('OTTO') are read for metrics but
+' not embedded in R2 (their text is drawn as an image; PRINTING-R2-RESULTS.md).
+#module "tkPdf"
+
+#import "../tkHost"
+using tkHost
+using tkPaint
+
+public type PDF_TTF
+    path      as string
+    face      as long
+    style     as long                 ' TTF_STYLE_* (synthetic bold / italic)
+    pData     as const ubyte ptr
+    nData     as integer
+    bOwned    as boolean
+    bOk       as boolean
+    bCff      as boolean
+    bNoEmbed  as boolean              ' OS/2 fsType: restricted
+    dirOff    as long                 ' this face's table directory
+    upem      as long = 1000
+    ascender  as long
+    descender as long
+    xMin      as long
+    yMin      as long
+    xMax      as long
+    yMax      as long
+    numGlyphs as long
+    numHM     as long
+    oHmtx     as long
+    oLoca     as long
+    oGlyf     as long
+    locaLong  as boolean
+    oCmap4    as long = -1
+    oCmap12   as long = -1
+    psName    as string
+    used(any) as ubyte                ' per glyph: drawn as text
+    uni(any)  as ulong                ' per glyph: the first character drawn with it
+    objId     as long                 ' the Type0 font object
+    resName   as string               ' /F1 ...
+end type
+
+private function U8_( byval f as PDF_TTF ptr, byval o as long ) as ulong
+    if (o < 0) orelse (o >= f->nData) then return 0
+    return f->pData[o]
+end function
+
+private function U16_( byval f as PDF_TTF ptr, byval o as long ) as ulong
+    return (U8_( f, o ) shl 8) or U8_( f, o + 1 )
+end function
+
+private function I16_( byval f as PDF_TTF ptr, byval o as long ) as long
+    dim as long v = U16_( f, o )
+    if v >= 32768 then v -= 65536
+    return v
+end function
+
+private function U32_( byval f as PDF_TTF ptr, byval o as long ) as ulong
+    return (U16_( f, o ) shl 16) or U16_( f, o + 2 )
+end function
+
+' A table's offset (and length), -1 when the face has none.
+private function TableAt( byval f as PDF_TTF ptr, byref tag as string, byref length as long ) as long
+    dim as long n = U16_( f, f->dirOff + 4 )
+    for i as long = 0 to n - 1
+        dim as long r = f->dirOff + 12 + i * 16
+        if (chr( U8_( f, r ) ) & chr( U8_( f, r + 1 ) ) & chr( U8_( f, r + 2 ) ) & chr( U8_( f, r + 3 ) )) = tag then
+            length = U32_( f, r + 12 )
+            return U32_( f, r + 8 )
+        end if
+    next
+    length = 0
+    return -1
+end function
+
+' Read the face's tables. FALSE when the bytes are no TrueType / OpenType font.
+function PdfTtf_Parse( byval f as PDF_TTF ptr ) as boolean
+    f->bOk = false
+    if (f->pData = 0) orelse (f->nData < 12) then return false
+    f->dirOff = 0
+    if U32_( f, 0 ) = &h74746366ul then                    ' 'ttcf'
+        dim as long nf = U32_( f, 8 )
+        if (f->face < 0) orelse (f->face >= nf) then return false
+        f->dirOff = U32_( f, 12 + f->face * 4 )
+    end if
+    dim as ulong ver = U32_( f, f->dirOff )
+    f->bCff = (ver = &h4F54544Ful)                          ' 'OTTO'
+    if (ver <> &h00010000ul) andalso (ver <> &h74727565ul) andalso (f->bCff = false) then return false
+    dim as long ln
+    dim as long oHead = TableAt( f, "head", ln ), oHhea = TableAt( f, "hhea", ln ), oMaxp = TableAt( f, "maxp", ln )
+    f->oHmtx = TableAt( f, "hmtx", ln )
+    if (oHead < 0) orelse (oHhea < 0) orelse (oMaxp < 0) orelse (f->oHmtx < 0) then return false
+    f->upem = U16_( f, oHead + 18 )
+    if f->upem <= 0 then f->upem = 1000
+    f->xMin = I16_( f, oHead + 36 ) : f->yMin = I16_( f, oHead + 38 )
+    f->xMax = I16_( f, oHead + 40 ) : f->yMax = I16_( f, oHead + 42 )
+    f->locaLong = (I16_( f, oHead + 50 ) <> 0)
+    f->ascender = I16_( f, oHhea + 4 ) : f->descender = I16_( f, oHhea + 6 )
+    f->numHM = U16_( f, oHhea + 34 )
+    f->numGlyphs = U16_( f, oMaxp + 4 )
+    f->oLoca = TableAt( f, "loca", ln ) : f->oGlyf = TableAt( f, "glyf", ln )
+    dim as long oOs2 = TableAt( f, "OS/2", ln )
+    if oOs2 >= 0 then f->bNoEmbed = (U16_( f, oOs2 + 8 ) and &h000F) = &h0002
+    ' cmap: (3,10) format 12, else (3,1) / (0,x) format 4
+    dim as long oCmap = TableAt( f, "cmap", ln )
+    if oCmap >= 0 then
+        dim as long nt = U16_( f, oCmap + 2 )
+        for i as long = 0 to nt - 1
+            dim as long r = oCmap + 4 + i * 8
+            dim as long plat = U16_( f, r ), enc = U16_( f, r + 2 ), sub_ = oCmap + U32_( f, r + 4 )
+            dim as long fmt = U16_( f, sub_ )
+            if (fmt = 12) andalso (f->oCmap12 < 0) andalso ((plat = 3) orelse (plat = 0)) then f->oCmap12 = sub_
+            if (fmt = 4) andalso (f->oCmap4 < 0) andalso (((plat = 3) andalso (enc = 1)) orelse (plat = 0)) then f->oCmap4 = sub_
+        next
+    end if
+    ' name: the PostScript name (nameID 6), letters and digits and '-' only
+    dim as long oName = TableAt( f, "name", ln )
+    if oName >= 0 then
+        dim as long cnt = U16_( f, oName + 2 ), strOff = oName + U16_( f, oName + 4 )
+        for i as long = 0 to cnt - 1
+            dim as long r = oName + 6 + i * 12
+            if U16_( f, r + 6 ) <> 6 then continue for
+            dim as long plat = U16_( f, r ), length = U16_( f, r + 8 ), so = strOff + U16_( f, r + 10 )
+            dim as string s
+            dim as long stp = iif( plat = 3 orelse plat = 0, 2, 1 )
+            for k as long = 0 to length - 1 step stp
+                dim as long ch = iif( stp = 2, U16_( f, so + k ), U8_( f, so + k ) )
+                if ((ch >= 48) andalso (ch <= 57)) orelse ((ch >= 65) andalso (ch <= 90)) orelse ((ch >= 97) andalso (ch <= 122)) orelse (ch = 45) then s &= chr( ch )
+            next
+            if len( s ) then f->psName = s : exit for
+        next
+    end if
+    redim f->used( 0 to f->numGlyphs )
+    redim f->uni( 0 to f->numGlyphs )
+    f->bOk = true
+    return true
+end function
+
+' The glyph for a character, 0 (.notdef) when the font has none.
+function PdfTtf_Glyph( byval f as PDF_TTF ptr, byval cp as ulong ) as long
+    if f->oCmap12 >= 0 then
+        dim as long ng = U32_( f, f->oCmap12 + 12 ), lo = 0, hi = ng - 1
+        while lo <= hi
+            dim as long m = (lo + hi) \ 2
+            dim as long r = f->oCmap12 + 16 + m * 12
+            dim as ulong s0 = U32_( f, r ), e0 = U32_( f, r + 4 )
+            if cp < s0 then
+                hi = m - 1
+            elseif cp > e0 then
+                lo = m + 1
+            else
+                return U32_( f, r + 8 ) + (cp - s0)
+            end if
+        wend
+        return 0
+    end if
+    if (f->oCmap4 < 0) orelse (cp > &hFFFF) then return 0
+    dim as long t = f->oCmap4, segs = U16_( f, t + 6 ) \ 2
+    dim as long oEnd = t + 14, oStart = oEnd + segs * 2 + 2, oDelta = oStart + segs * 2, oRange = oDelta + segs * 2
+    for i as long = 0 to segs - 1
+        if cp <= U16_( f, oEnd + i * 2 ) then
+            dim as ulong st = U16_( f, oStart + i * 2 )
+            if cp < st then return 0
+            dim as long ro = U16_( f, oRange + i * 2 )
+            if ro = 0 then return (cp + U16_( f, oDelta + i * 2 )) and &hFFFF
+            dim as long gi = U16_( f, oRange + i * 2 + ro + (cp - st) * 2 )
+            if gi = 0 then return 0
+            return (gi + U16_( f, oDelta + i * 2 )) and &hFFFF
+        end if
+    next
+    return 0
+end function
+
+' A glyph's advance in font units.
+function PdfTtf_Advance( byval f as PDF_TTF ptr, byval g as long ) as long
+    if f->numHM <= 0 then return 0
+    if g >= f->numHM then g = f->numHM - 1
+    return U16_( f, f->oHmtx + g * 4 )
+end function
+
+' ---- outlines as PDF path operators ---------------------------------------------------------
+' Numbers for a content stream: up to 3 decimals, no exponent, "." always.
+function PdfNum( byval v as double ) as string
+    dim as longint n = clngint( v * 1000 )               ' CLNGINT rounds to nearest
+    dim as string s = iif( n < 0, "-", "" )
+    n = abs( n )
+    s &= str( n \ 1000 )
+    dim as long fr = n mod 1000
+    if fr then
+        dim as string d = right( "00" & fr, 3 )
+        while right( d, 1 ) = "0" : d = left( d, len( d ) - 1 ) : wend
+        s &= "." & d
+    end if
+    if s = "-0" then s = "0"
+    return s
+end function
+
+type TTF_XF                            ' a composite's transform: font units -> page points
+    a as double
+    b as double
+    c as double
+    d as double
+    e as double
+    f as double
+end type
+
+private sub XfPt( byref t as TTF_XF, byval x as double, byval y as double, byref ox as double, byref oy as double )
+    ox = t.a * x + t.c * y + t.e
+    oy = t.b * x + t.d * y + t.f
+end sub
+
+private sub Emit2( byref s as string, byval x as double, byval y as double, byref op as string )
+    s &= PdfNum( x ) & " " & PdfNum( y ) & " " & op & chr( 10 )
+end sub
+
+' A quadratic segment p0 -> p1 (control) -> p2 as the cubic PDF draws.
+private sub Quad( byref s as string, byref t as TTF_XF, byval x0 as double, byval y0 as double, byval x1 as double, _
+                  byval y1 as double, byval x2 as double, byval y2 as double )
+    dim as double c1x = x0 + (x1 - x0) * 2 / 3, c1y = y0 + (y1 - y0) * 2 / 3
+    dim as double c2x = x2 + (x1 - x2) * 2 / 3, c2y = y2 + (y1 - y2) * 2 / 3
+    dim as double ax, ay, bx, by, cx, cy
+    XfPt( t, c1x, c1y, ax, ay ) : XfPt( t, c2x, c2y, bx, by ) : XfPt( t, x2, y2, cx, cy )
+    s &= PdfNum( ax ) & " " & PdfNum( ay ) & " " & PdfNum( bx ) & " " & PdfNum( by ) & " " & PdfNum( cx ) & " " & PdfNum( cy ) & " c" & chr( 10 )
+end sub
+
+' Glyph g's outline as path operators (m / l / c / h), through transform t. Composites recurse
+' (depth 8).
+sub PdfTtf_Outline( byval f as PDF_TTF ptr, byval g as long, byref t as TTF_XF, byref s as string, byval depth as long = 0 )
+    if (f->oLoca < 0) orelse (f->oGlyf < 0) orelse (g < 0) orelse (g >= f->numGlyphs) orelse (depth > 8) then exit sub
+    dim as long g0, g1
+    if f->locaLong then
+        g0 = U32_( f, f->oLoca + g * 4 ) : g1 = U32_( f, f->oLoca + g * 4 + 4 )
+    else
+        g0 = U16_( f, f->oLoca + g * 2 ) * 2 : g1 = U16_( f, f->oLoca + g * 2 + 2 ) * 2
+    end if
+    if g1 <= g0 then exit sub                               ' an empty glyph (a space)
+    dim as long o = f->oGlyf + g0
+    dim as long nc = I16_( f, o )
+    if nc < 0 then
+        ' composite: components with an offset and an optional scale
+        dim as long q = o + 10, flags
+        do
+            flags = U16_( f, q ) : dim as long gi = U16_( f, q + 2 ) : q += 4
+            dim as double dx, dy
+            if flags and 1 then
+                dx = I16_( f, q ) : dy = I16_( f, q + 2 ) : q += 4
+            else
+                dx = U8_( f, q ) : dy = U8_( f, q + 1 ) : q += 2
+                if dx >= 128 then dx -= 256
+                if dy >= 128 then dy -= 256
+            end if
+            dim as double sa = 1, sb = 0, sc = 0, sd = 1
+            if flags and 8 then
+                sa = I16_( f, q ) / 16384 : sd = sa : q += 2
+            elseif flags and &h40 then
+                sa = I16_( f, q ) / 16384 : sd = I16_( f, q + 2 ) / 16384 : q += 4
+            elseif flags and &h80 then
+                sa = I16_( f, q ) / 16384 : sb = I16_( f, q + 2 ) / 16384
+                sc = I16_( f, q + 4 ) / 16384 : sd = I16_( f, q + 6 ) / 16384 : q += 8
+            end if
+            if (flags and 2) = 0 then dx = 0 : dy = 0     ' point matching: not supported, placed at 0
+            dim as TTF_XF ct
+            ct.a = t.a * sa + t.c * sb : ct.b = t.b * sa + t.d * sb
+            ct.c = t.a * sc + t.c * sd : ct.d = t.b * sc + t.d * sd
+            XfPt( t, dx, dy, ct.e, ct.f )
+            PdfTtf_Outline( f, gi, ct, s, depth + 1 )
+        loop while flags and &h20
+        exit sub
+    end if
+    ' simple: contours of on / off-curve points
+    dim as long endPts( 0 to nc - 1 )
+    for i as long = 0 to nc - 1 : endPts(i) = U16_( f, o + 10 + i * 2 ) : next
+    dim as long np = iif( nc > 0, endPts(nc - 1) + 1, 0 )
+    if np <= 0 then exit sub
+    dim as long p = o + 10 + nc * 2
+    p += 2 + U16_( f, p )                                   ' skip the instructions
+    dim as ubyte fl( 0 to np - 1 )
+    dim as long i = 0
+    while i < np
+        dim as ubyte v = U8_( f, p ) : p += 1
+        fl(i) = v : i += 1
+        if v and 8 then
+            dim as long rep = U8_( f, p ) : p += 1
+            for k as long = 1 to rep
+                if i < np then fl(i) = v : i += 1
+            next
+        end if
+    wend
+    dim as double px( 0 to np - 1 ), py( 0 to np - 1 )
+    dim as long acc = 0
+    for k as long = 0 to np - 1
+        if fl(k) and 2 then
+            dim as long dv = U8_( f, p ) : p += 1
+            acc += iif( fl(k) and 16, dv, -dv )
+        elseif (fl(k) and 16) = 0 then
+            acc += I16_( f, p ) : p += 2
+        end if
+        px(k) = acc
+    next
+    acc = 0
+    for k as long = 0 to np - 1
+        if fl(k) and 4 then
+            dim as long dv = U8_( f, p ) : p += 1
+            acc += iif( fl(k) and 32, dv, -dv )
+        elseif (fl(k) and 32) = 0 then
+            acc += I16_( f, p ) : p += 2
+        end if
+        py(k) = acc
+    next
+    dim as long first = 0
+    for c as long = 0 to nc - 1
+        dim as long last = endPts(c), cnt = last - first + 1
+        if cnt >= 2 then
+            ' start at an on-curve point, or at the midpoint of the first two off-curve points
+            dim as long st = -1
+            for k as long = first to last
+                if fl(k) and 1 then st = k : exit for
+            next
+            dim as double sx, sy
+            if st >= 0 then
+                sx = px(st) : sy = py(st)
+            else
+                st = first
+                sx = (px(first) + px(last)) / 2 : sy = (py(first) + py(last)) / 2
+                st = last                                   ' so the walk begins at 'first'
+            end if
+            dim as double ox, oy
+            XfPt( t, sx, sy, ox, oy )
+            Emit2( s, ox, oy, "m" )
+            dim as double curX = sx, curY = sy
+            dim as boolean haveCtl = false
+            dim as double ctlX, ctlY
+            for n as long = 1 to cnt
+                dim as long k = first + ((st - first + n) mod cnt)
+                dim as double x = px(k), y = py(k)
+                if fl(k) and 1 then
+                    if haveCtl then
+                        Quad( s, t, curX, curY, ctlX, ctlY, x, y )
+                        haveCtl = false
+                    else
+                        XfPt( t, x, y, ox, oy )
+                        Emit2( s, ox, oy, "l" )
+                    end if
+                    curX = x : curY = y
+                else
+                    if haveCtl then
+                        dim as double mx = (ctlX + x) / 2, my = (ctlY + y) / 2
+                        Quad( s, t, curX, curY, ctlX, ctlY, mx, my )
+                        curX = mx : curY = my
+                    end if
+                    ctlX = x : ctlY = y : haveCtl = true
+                end if
+            next
+            if haveCtl then Quad( s, t, curX, curY, ctlX, ctlY, sx, sy )
+            s &= "h" & chr( 10 )
+        end if
+        first = last + 1
+    next
+end sub

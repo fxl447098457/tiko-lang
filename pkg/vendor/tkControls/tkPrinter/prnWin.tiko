@@ -1,0 +1,333 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPrinter -- Windows: winspool.drv and gdi32.dll through GetProcAddress (kernel32 is the one
+' library every link has, as tkApp does it).
+'
+' A job is RASTER: each page is replayed by tkPrint into bands (at most 16 MB each) at the printer's
+' resolution capped at 600 dpi, and StretchDIBits sends each band to the printer's DC, offset by the
+' printable area's physical offset so the page lines up with the paper's edge as in the preview.
+' Copies and collation are done here (the DEVMODE asks the driver for one copy).
+#module "tkPrinter"
+
+#ifdef __FB_WIN32__
+#import "../tkPdf"
+using tkPdf
+using tkPrint
+using tkHost
+using tkPaint
+
+extern "C"
+    declare function prn_LoadLibraryW stdcall alias "LoadLibraryW" ( byval name_ as const any ptr ) as any ptr
+    declare function prn_GetProcAddress stdcall alias "GetProcAddress" ( byval m as any ptr, byval name_ as const zstring ptr ) as any ptr
+end extern
+
+type PrnEnumPrintersFn as function stdcall ( byval flags as ulong, byval name_ as any ptr, byval level as ulong, byval buf as any ptr, _
+                                              byval cb as ulong, byval needed as ulong ptr, byval returned as ulong ptr ) as long
+type PrnGetDefaultFn as function stdcall ( byval buf as any ptr, byval cch as ulong ptr ) as long
+type PrnOpenPrinterFn as function stdcall ( byval name_ as any ptr, byval ph as any ptr ptr, byval def as any ptr ) as long
+type PrnClosePrinterFn as function stdcall ( byval h as any ptr ) as long
+type PrnDocPropsFn as function stdcall ( byval hwnd as any ptr, byval hPrinter as any ptr, byval dev as any ptr, byval outDm as any ptr, _
+                                         byval inDm as any ptr, byval mode as ulong ) as long
+type PrnDevCapsFn as function stdcall ( byval dev as any ptr, byval port as any ptr, byval cap as ushort, byval outp as any ptr, _
+                                        byval dm as any ptr ) as long
+type PrnCreateDCFn as function stdcall ( byval drv as any ptr, byval dev as any ptr, byval port as any ptr, byval dm as any ptr ) as any ptr
+type PrnStartDocFn as function stdcall ( byval hdc as any ptr, byval di as any ptr ) as long
+type PrnHdcFn as function stdcall ( byval hdc as any ptr ) as long
+type PrnGetDevCapsFn as function stdcall ( byval hdc as any ptr, byval idx as long ) as long
+type PrnStretchFn as function stdcall ( byval hdc as any ptr, byval xd as long, byval yd as long, byval wd as long, byval hd as long, _
+                                        byval xs as long, byval ys as long, byval ws as long, byval hs as long, byval bits as const any ptr, _
+                                        byval bmi as const any ptr, byval usage as ulong, byval rop as ulong ) as long
+type PrnSetModeFn as function stdcall ( byval hdc as any ptr, byval mode as long ) as long
+
+' PRINTER_INFO_2W, 64-bit layout
+type PRN_INFO2
+    pServerName   as any ptr
+    pPrinterName  as any ptr
+    pShareName    as any ptr
+    pPortName     as any ptr
+    pDriverName   as any ptr
+    pComment      as any ptr
+    pLocation     as any ptr
+    pDevMode      as any ptr
+    pSepFile      as any ptr
+    pPrintProc    as any ptr
+    pDatatype     as any ptr
+    pParameters   as any ptr
+    pSecurity     as any ptr
+    nums(0 to 7)  as ulong
+end type
+
+dim shared as PrnEnumPrintersFn pEnumPrinters
+dim shared as PrnGetDefaultFn pGetDefault
+dim shared as PrnOpenPrinterFn pOpenPrinter
+dim shared as PrnClosePrinterFn pClosePrinter
+dim shared as PrnDocPropsFn pDocProps
+dim shared as PrnDevCapsFn pDevCaps
+dim shared as PrnCreateDCFn pCreateDC
+dim shared as PrnStartDocFn pStartDoc
+dim shared as PrnHdcFn pStartPage, pEndPage, pEndDoc, pAbortDoc, pDeleteDC
+dim shared as PrnGetDevCapsFn pGetDevCaps
+dim shared as PrnStretchFn pStretch
+dim shared as PrnSetModeFn pSetStretchMode
+
+private function PrnLoad( ) as boolean
+    static as long state = 0                              ' 0 untried, 1 ok, 2 failed
+    if state then return state = 1
+    state = 2
+    dim as ustring ws = "winspool.drv", wg = "gdi32.dll"
+    dim as any ptr hs = prn_LoadLibraryW( strptr( ws ) ), hg = prn_LoadLibraryW( strptr( wg ) )
+    if (hs = 0) orelse (hg = 0) then PrnFail( "winspool.drv / gdi32.dll not found" ) : return false
+    pEnumPrinters = prn_GetProcAddress( hs, "EnumPrintersW" )
+    pGetDefault = prn_GetProcAddress( hs, "GetDefaultPrinterW" )
+    pOpenPrinter = prn_GetProcAddress( hs, "OpenPrinterW" )
+    pClosePrinter = prn_GetProcAddress( hs, "ClosePrinter" )
+    pDocProps = prn_GetProcAddress( hs, "DocumentPropertiesW" )
+    pDevCaps = prn_GetProcAddress( hs, "DeviceCapabilitiesW" )
+    pCreateDC = prn_GetProcAddress( hg, "CreateDCW" )
+    pStartDoc = prn_GetProcAddress( hg, "StartDocW" )
+    pStartPage = prn_GetProcAddress( hg, "StartPage" )
+    pEndPage = prn_GetProcAddress( hg, "EndPage" )
+    pEndDoc = prn_GetProcAddress( hg, "EndDoc" )
+    pAbortDoc = prn_GetProcAddress( hg, "AbortDoc" )
+    pDeleteDC = prn_GetProcAddress( hg, "DeleteDC" )
+    pGetDevCaps = prn_GetProcAddress( hg, "GetDeviceCaps" )
+    pStretch = prn_GetProcAddress( hg, "StretchDIBits" )
+    pSetStretchMode = prn_GetProcAddress( hg, "SetStretchBltMode" )
+    if (pEnumPrinters = 0) orelse (pGetDefault = 0) orelse (pOpenPrinter = 0) orelse (pDocProps = 0) orelse (pDevCaps = 0) _
+       orelse (pCreateDC = 0) orelse (pStartDoc = 0) orelse (pStretch = 0) orelse (pGetDevCaps = 0) then
+        PrnFail( "a printing entry point is missing" )
+        return false
+    end if
+    state = 1
+    return true
+end function
+
+private function WideStr( byval p as any ptr ) as ustring
+    if p = 0 then return ""
+    return *cast( wstring ptr, p )
+end function
+
+function PrnEnumerate( list() as TKPRINTERINFO ) as long
+    if PrnLoad( ) = false then return 0
+    dim as ulong need, cnt
+    pEnumPrinters( 2 or 4, 0, 2, 0, 0, @need, @cnt )             ' PRINTER_ENUM_LOCAL | CONNECTIONS, level 2
+    if need = 0 then return 0
+    dim as ubyte buf( 0 to need - 1 )
+    if pEnumPrinters( 2 or 4, 0, 2, @buf(0), need, @need, @cnt ) = 0 then PrnFail( "EnumPrinters failed" ) : return 0
+    dim as ustring def = PrnDefault( )
+    dim as PRN_INFO2 ptr pi = cast( PRN_INFO2 ptr, @buf(0) )
+    if cnt = 0 then return 0
+    redim list( 0 to cnt - 1 )
+    for i as long = 0 to cnt - 1
+        list(i).name = WideStr( pi[i].pPrinterName )
+        list(i).location = WideStr( pi[i].pLocation )
+        list(i).comment = WideStr( pi[i].pComment )
+        list(i).isDefault = (list(i).name = def)
+    next
+    return cnt
+end function
+
+function PrnDefault( ) as ustring
+    if PrnLoad( ) = false then return ""
+    dim as ulong cch = 0
+    pGetDefault( 0, @cch )
+    if cch = 0 then return ""
+    dim as ushort buf( 0 to cch )
+    if pGetDefault( @buf(0), @cch ) = 0 then return ""
+    return WideStr( @buf(0) )
+end function
+
+function PrnCaps( byref printer as ustring, byref caps as TKPRINTERCAPS ) as boolean
+    if PrnLoad( ) = false then return false
+    dim as ustring wn = printer
+    dim as long n = pDevCaps( strptr( wn ), 0, 2, 0, 0 )             ' DC_PAPERS
+    if n < 0 then PrnFail( "no such printer: " & printer ) : return false
+    if n > 0 then
+        dim as ushort names( 0 to n * 64 )
+        dim as long sizes( 0 to n * 2 )
+        pDevCaps( strptr( wn ), 0, 16, @names(0), 0 )                ' DC_PAPERNAMES, 64 wchars each
+        pDevCaps( strptr( wn ), 0, 3, @sizes(0), 0 )                 ' DC_PAPERSIZE, tenths of mm
+        caps.nPapers = n
+        redim caps.paperName( 0 to n - 1 )
+        redim caps.paperW( 0 to n - 1 )
+        redim caps.paperH( 0 to n - 1 )
+        for i as long = 0 to n - 1
+            dim as ushort one( 0 to 64 )
+            for k as long = 0 to 63 : one(k) = names(i * 64 + k) : next
+            caps.paperName(i) = WideStr( @one(0) )
+            caps.paperW(i) = sizes(i * 2) / 10 * TK_PT_PER_MM
+            caps.paperH(i) = sizes(i * 2 + 1) / 10 * TK_PT_PER_MM
+        next
+    end if
+    caps.bDuplex = pDevCaps( strptr( wn ), 0, 7, 0, 0 ) = 1         ' DC_DUPLEX
+    caps.bColor = pDevCaps( strptr( wn ), 0, 32, 0, 0 ) = 1         ' DC_COLORDEVICE
+    return true
+end function
+
+' The printer's DEVMODE: its defaults, merged with the job's (from Properties) when there is one,
+' then with mode (DM_IN_PROMPT shows the driver's dialog). "" on failure. hwnd for the prompt.
+private function DevModeOf( byref printer as ustring, byref inDm as string, byval prompt as boolean, byval hwnd as any ptr, _
+                            byref bCancelled as boolean ) as string
+    bCancelled = false
+    dim as ustring wn = printer
+    dim as any ptr hp
+    if pOpenPrinter( strptr( wn ), @hp, 0 ) = 0 then PrnFail( "cannot open the printer: " & printer ) : return ""
+    dim as long sz = pDocProps( hwnd, hp, strptr( wn ), 0, 0, 0 )
+    if sz <= 0 then pClosePrinter( hp ) : PrnFail( "the driver gave no settings" ) : return ""
+    dim as string dm = string( sz, 0 )
+    dim as ulong mode = 2                                          ' DM_OUT_BUFFER
+    dim as any ptr pin = 0
+    if len( inDm ) = sz then pin = strptr( inDm ) : mode or= 8     ' DM_IN_BUFFER
+    if prompt then mode or= 4                                      ' DM_IN_PROMPT
+    dim as long r = pDocProps( hwnd, hp, strptr( wn ), strptr( dm ), pin, mode )
+    pClosePrinter( hp )
+    if prompt andalso (r <> 1) then bCancelled = true : return ""  ' IDOK = 1
+    if r < 0 then PrnFail( "DocumentProperties failed" ) : return ""
+    return dm
+end function
+
+private sub PutShort( byref dm as string, byval off as long, byval v as long )
+    dm[off] = v and 255 : dm[off + 1] = (v shr 8) and 255
+end sub
+
+private sub OrFields( byref dm as string, byval f as ulong )
+    dim as ulong ptr p = cast( ulong ptr, strptr( dm ) + 72 )
+    *p or= f
+end sub
+
+function PrnProperties( byval owner as TK_HOST ptr, byref job as TKPRINTJOB ) as boolean
+    if PrnLoad( ) = false then return false
+    dim as ustring printer = iif( len( job.printer ), job.printer, PrnDefault( ) )
+    dim as any ptr hwnd = 0
+    if owner andalso owner->win then hwnd = SDL_GetPointerProperty( SDL_GetWindowProperties( owner->win ), SDL_PROP_WINDOW_WIN32_HWND_POINTER, 0 )
+    dim as boolean cancelled
+    dim as string dm = DevModeOf( printer, job.devMode, true, hwnd, cancelled )
+    if len( dm ) = 0 then return false
+    job.devMode = dm
+    return true
+end function
+
+' The DEVMODE paper code of a tkPrint paper; 0 = none (a custom size).
+private function DmPaper( byval paper as long ) as long
+    select case paper
+    case TK_PAPER_LETTER : return 1
+    case TK_PAPER_TABLOID : return 3
+    case TK_PAPER_LEGAL : return 5
+    case TK_PAPER_EXECUTIVE : return 7
+    case TK_PAPER_A3 : return 8
+    case TK_PAPER_A4 : return 9
+    case TK_PAPER_A5 : return 11
+    end select
+    return 0
+end function
+
+function PrnPrint( byval doc as TK_PRINTDOC ptr, byref printer as ustring, byref job as TKPRINTJOB, pages() as long ) as boolean
+    if PrnLoad( ) = false then return false
+    dim as boolean cancelled
+    dim as string dm = DevModeOf( printer, job.devMode, false, 0, cancelled )
+    if len( dm ) = 0 then return false
+    ' one copy from the driver (copies and collation are ours), orientation, paper, duplex, colour
+    dim as TKPAGESETUP st = tkPrintDoc_GetPageSetup( doc )
+    dim as single w0, h0
+    tkPrintDoc_GetPageSize( doc, 0, w0, h0 )
+    if len( dm ) >= 104 then
+        PutShort( dm, 86, 1 ) : OrFields( dm, &h100 )                                   ' dmCopies
+        PutShort( dm, 76, iif( w0 > h0, 2, 1 ) ) : OrFields( dm, &h1 )                   ' dmOrientation
+        dim as long dp = DmPaper( st.paper )
+        if dp then
+            PutShort( dm, 78, dp ) : OrFields( dm, &h2 )
+        else
+            PutShort( dm, 78, 256 )                                                     ' DMPAPER_USER
+            PutShort( dm, 80, clng( st.heightPt / TK_PT_PER_MM * 10 ) )
+            PutShort( dm, 82, clng( st.widthPt / TK_PT_PER_MM * 10 ) )
+            OrFields( dm, &h2 or &h4 or &h8 )
+        end if
+        PutShort( dm, 94, iif( job.duplex = TK_DUPLEX_LONGEDGE, 2, iif( job.duplex = TK_DUPLEX_SHORTEDGE, 3, 1 ) ) ) : OrFields( dm, &h1000 )
+        PutShort( dm, 92, iif( job.color, 2, 1 ) ) : OrFields( dm, &h800 )
+    end if
+    dim as ustring wDrv = "WINSPOOL", wn = printer
+    dim as any ptr hdc = pCreateDC( strptr( wDrv ), strptr( wn ), 0, strptr( dm ) )
+    if hdc = 0 then PrnFail( "cannot open the printer's device: " & printer ) : return false
+    dim as ustring docName = iif( len( job.title ), job.title, tkPrintDoc_GetTitle( doc ) )
+    if len( docName ) = 0 then docName = "Document"
+    dim as ustring outFile = job.outputFile
+    dim as ubyte di( 0 to 39 )                                       ' DOCINFOW, 64-bit
+    *cast( long ptr, @di(0) ) = 40
+    *cast( any ptr ptr, @di(8) ) = strptr( docName )
+    if len( outFile ) then *cast( any ptr ptr, @di(16) ) = strptr( outFile )
+    if pStartDoc( hdc, @di(0) ) <= 0 then
+        pDeleteDC( hdc )
+        PrnFail( "the printer refused the job: " & printer )
+        return false
+    end if
+    if pSetStretchMode then pSetStretchMode( hdc, 4 )               ' HALFTONE
+    dim as long dpiX = pGetDevCaps( hdc, 88 ), dpiY = pGetDevCaps( hdc, 90 )   ' LOGPIXELSX / Y
+    dim as long offX = pGetDevCaps( hdc, 112 ), offY = pGetDevCaps( hdc, 113 ) ' PHYSICALOFFSETX / Y
+    if dpiX <= 0 then dpiX = 300
+    if dpiY <= 0 then dpiY = dpiX
+    dim as single rdpi = iif( dpiX < dpiY, dpiX, dpiY )
+    if rdpi > 600 then rdpi = 600
+    dim as single s = rdpi / TK_PT_PER_INCH
+    dim as boolean ok = true
+    dim as long nPages = ubound( pages ) + 1, total = nPages * job.copies, done_ = 0
+    dim as SDL_Surface ptr surf = 0
+    dim as SDL_Renderer ptr r = 0
+    dim as TK_PRINTREPLAY ptr rp = 0
+    dim as long surfW = 0, bandRows = 0
+    for pass as long = 0 to iif( job.collate, job.copies - 1, 0 )
+        for pi as long = 0 to nPages - 1
+            for cp as long = 1 to iif( job.collate, 1, job.copies )
+                dim as long page = pages(pi)
+                dim as single wPt, hPt
+                tkPrintDoc_GetPageSize( doc, page, wPt, hPt )
+                dim as long wPx = clng( int( wPt * s + 0.5 ) ), hPx = clng( int( hPt * s + 0.5 ) )
+                if (surf = 0) orelse (wPx <> surfW) then
+                    if rp then tkPrintReplay_Destroy( rp )
+                    if r then SDL_DestroyRenderer( r )
+                    if surf then SDL_DestroySurface( surf )
+                    bandRows = (16 * 1024 * 1024) \ (wPx * 4)
+                    if bandRows < 16 then bandRows = 16
+                    surf = SDL_CreateSurface( wPx, bandRows, SDL_PIXELFORMAT_ARGB8888 )
+                    r = iif( surf, SDL_CreateSoftwareRenderer( surf ), 0 )
+                    if r = 0 then ok = false : PrnFail( "no memory for a band" ) : exit for, for, for
+                    SDL_SetRenderDrawBlendMode( r, SDL_BLENDMODE_BLEND )
+                    rp = tkPrintReplay_Create( r )
+                    surfW = wPx
+                end if
+                if pStartPage( hdc ) <= 0 then ok = false : PrnFail( "StartPage failed" ) : exit for, for, for
+                ' BITMAPINFOHEADER: 32 bpp, top-down (negative height); a row is the surface's pitch
+                dim as long bmi( 0 to 9 )
+                bmi(0) = 40 : bmi(1) = surf->pitch \ 4
+                *cast( ushort ptr, @bmi(3) ) = 1 : *(cast( ushort ptr, @bmi(3) ) + 1) = 32
+                dim as single kx = dpiX / rdpi, ky = dpiY / rdpi
+                dim as long y0 = 0
+                while y0 < hPx
+                    dim as long rows = iif( hPx - y0 < bandRows, hPx - y0, bandRows )
+                    SDL_SetRenderClipRect( r, 0 )
+                    SDL_SetRenderDrawColor( r, 255, 255, 255, 255 )
+                    SDL_RenderClear( r )
+                    tkPrintReplay_Page( rp, doc, page, 0, -y0, s )
+                    SDL_FlushRenderer( r )
+                    bmi(2) = -rows
+                    dim as long yd = clng( y0 * ky ) - offY, yd2 = clng( (y0 + rows) * ky ) - offY
+                    pStretch( hdc, -offX, yd, clng( wPx * kx ), yd2 - yd, 0, 0, wPx, rows, surf->pixels, @bmi(0), 0, &h00CC0020 )
+                    y0 += rows
+                wend
+                if pEndPage( hdc ) <= 0 then ok = false : PrnFail( "EndPage failed" ) : exit for, for, for
+                done_ += 1
+                if PrnProgress( doc, job, done_, total ) = false then ok = false : PrnFail( "cancelled" ) : exit for, for, for
+            next
+        next
+    next
+    if ok then pEndDoc( hdc ) else pAbortDoc( hdc )
+    pDeleteDC( hdc )
+    if rp then tkPrintReplay_Destroy( rp )
+    if r then SDL_DestroyRenderer( r )
+    if surf then SDL_DestroySurface( surf )
+    return ok
+end function
+#endif

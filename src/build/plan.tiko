@@ -168,18 +168,19 @@ function ProfileFlags _
     loop
 
     '' ...APPLIED ANCESTOR FIRST: a built-in's own values, then the manifest's keys for it.
-    dim as int32 dbg = -1, opt = -1, asan = 0
+    dim as int32 dbg = -1, asan = 0
+    dim as string opt = ""   '' the -O value: "0".."3", "s" (size), or "" for none
     dim as string errs = chr( 1 ), opts = chr( 1 )
     for i as int32 = chain.Count - 1 to 0 step -1
         dim as string pn = chain[i]
-        if pn = "debug" then dbg = 1 : errs = "exx" : opt = 0
-        if pn = "release" then dbg = 0 : errs = "" : opt = 2
-        if pn = "asan" then dbg = 1 : errs = "exx" : opt = 1 : asan = 1
+        if pn = "debug" then dbg = 1 : errs = "exx" : opt = "0"
+        if pn = "release" then dbg = 0 : errs = "" : opt = "2"
+        if pn = "asan" then dbg = 1 : errs = "exx" : opt = "1" : asan = 1
         for k as int32 = 0 to m.prfName.Count - 1
             if m.prfName[k] <> pn then continue for
             select case m.prfKey[k]
             case "debug"   : dbg = iif( m.prfVal[k] = "true", 1, 0 )
-            case "opt"     : opt = valint( m.prfVal[k] )
+            case "opt"     : opt = m.prfVal[k]
             case "errors"  : errs = m.prfVal[k]
             case "options" : opts = m.prfVal[k]
             end select
@@ -187,7 +188,7 @@ function ProfileFlags _
     next
     if dbg = 1 then flags.Push( "-g" )
     if (errs <> chr( 1 )) andalso (len( errs ) > 0) then flags.Push( "-" & errs )
-    if opt >= 0 then flags.Push( "-O" & opt )
+    if len( opt ) > 0 then flags.Push( "-O" & opt )
     if asan = 1 then flags.Push( "-fsanitize=address" )
     if opts <> chr( 1 ) then
         dim as Tko.StrVec mo
@@ -210,6 +211,8 @@ private function DefaultName_ _
     d.Push( tname & ".bas" )
     if kind = "dll" then d.Push( "-dll" )
     if kind = "lib" then d.Push( "-lib" )
+    if (kind = "app") orelse (kind = "aab") then d.Push( "-app" )
+    if kind = "aab" then d.Push( "-appbundle" )
     if len( tgt ) > 0 then d.Push( "-target" ) : d.Push( tgt )
     dim as Tko.DriverOptions o
     if Tko.Cmdline.Parse( d, o, diags ) = false then return ""
@@ -233,6 +236,7 @@ function TargetOutput _
     if len( out_ ) > 0 then return Rel( mdir, out_ )
     dim as string kind = TargetKey_( m, tname, "kind" )
     if len( kind ) = 0 then kind = "exe"
+    if (kind = "app") andalso (TargetKey_( m, tname, "app.bundle" ) = "true") then kind = "aab"
     dim as string nm = DefaultName_( tname, kind, a.target, diags )
     if len( nm ) = 0 then return ""
     return Rel( mdir, "out/" & profile & "/" & nm )
@@ -270,7 +274,7 @@ private function ExeOutFlag_( byref flags as Tko.StrVec ) as string
     return r
 end function
 
-'' The OS table ([target.x.<os>]) a build for a.target reads: "windows", "linux" or "macos".
+'' The OS table ([target.x.<os>]) a build for a.target reads: "windows", "linux", "macos" or "android".
 private function OsTableName_( byref a as BuildArgs ) as string
     dim as Tko.TargetId t = Tko.HostTarget( )
     if len( a.target ) > 0 then
@@ -280,6 +284,7 @@ private function OsTableName_( byref a as BuildArgs ) as string
     select case Tko.TargetOs( t )
     case Tko.OS_LINUX  : return "linux"
     case Tko.OS_DARWIN : return "macos"
+    case Tko.OS_ANDROID : return "android"
     end select
     return "windows"
 end function
@@ -294,6 +299,8 @@ function PlanTarget _
     p.kind = "exe"
     dim as string main_, subsys
     dim as Tko.StrVec sources, libs, libpaths, topts, copies
+    dim as Tko.StrVec appArgs     '' [target.x.app], as -app* options (docs/tiko-android A6)
+    dim as boolean appBundle
     dim as string os_ = OsTableName_( a )
     for k as int32 = 0 to m.tgtName.Count - 1
         if m.tgtName[k] <> tname then continue for
@@ -315,6 +322,23 @@ function PlanTarget _
         case "options"   : SplitLf_( v, topts )
         case "copy_to"   : SplitLf_( v, copies )
         case "define"    : p.defines.Push( v )
+        case "app.id"      : appArgs.Push( "-appid" ) : appArgs.Push( v )
+        case "app.label"   : appArgs.Push( "-applabel" ) : appArgs.Push( v )
+        case "app.version" : appArgs.Push( "-appversion" ) : appArgs.Push( v )
+        case "app.assets"  : appArgs.Push( "-appassets" ) : appArgs.Push( Rel( mdir, v ) )
+        case "app.icon"    : appArgs.Push( "-appicon" ) : appArgs.Push( Rel( mdir, v ) )
+        case "app.key"
+            '' keystore[,alias]: the keystore is a path, the alias is not
+            dim as int32 c = instrrev( v, "," )
+            appArgs.Push( "-appkey" )
+            appArgs.Push( iif( c > 0, Rel( mdir, left( v, c - 1 ) ) & mid( v, c ), Rel( mdir, v ) ) )
+        case "app.bundle"  : appBundle = (v = "true")
+        case "app.permissions"
+            dim as Tko.StrVec perms
+            SplitLf_( v, perms )
+            for j as int32 = 0 to perms.Count - 1
+                appArgs.Push( "-apppermission" ) : appArgs.Push( perms[j] )
+            next
         end select
     next
     if len( main_ ) = 0 then
@@ -348,7 +372,12 @@ function PlanTarget _
     for each x as string in p.flags
         if (x = "-dll") orelse (x = "-dylib") then p.kind = "dll"
         if x = "-lib" then p.kind = "lib"
+        if x = "-app" then p.kind = "app"
+        if x = "-appbundle" then appBundle = true
     next
+    '' AN APP'S [target.x.app] KEYS are its -app* options; outside kind = "app" they mean nothing,
+    '' and the driver refuses them (TKO0197).
+    if (p.kind = "app") andalso appBundle then p.kind = "aab"
     dim as string out_ = TargetKey_( m, tname, "output" )
     if len( out_ ) > 0 then
         p.artifact = Rel( mdir, out_ )
@@ -376,6 +405,11 @@ function PlanTarget _
     next
     if p.kind = "dll" then p.dargs.Push( "-dll" )
     if p.kind = "lib" then p.dargs.Push( "-lib" )
+    if (p.kind = "app") orelse (p.kind = "aab") then p.dargs.Push( "-app" )
+    if p.kind = "aab" then p.dargs.Push( "-appbundle" )
+    for each x as string in appArgs
+        p.dargs.Push( x )
+    next
     if len( subsys ) > 0 then p.dargs.Push( "-s" ) : p.dargs.Push( subsys )
     for each x as string in libs
         p.dargs.Push( "-l" ) : p.dargs.Push( x )

@@ -3,11 +3,6 @@
 The checks in `std/testing` all report where they are written: the file, the
 line, and the expressions as you wrote them.
 
-````admonish warning title="Status in this version"
-`tiko test` and `std/testing` arrive after tiko 0.1.6, the toolchain this site is pinned to.
-This example was compiled and run on Windows with the development toolchain.
-````
-
 ```tiko
 {{#include ../../examples/testing/checks/checks_test.tiko}}
 ```

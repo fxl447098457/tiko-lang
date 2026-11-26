@@ -1,0 +1,370 @@
+' tkReportDef self-test (Report Designer phase RD3). One check per behaviour: a canonical .tkreport
+' reads and writes back byte for byte, and a hand-written one in another order writes back canonical;
+' strict reading names the place of each error; a report runs from the file over SQLite (a master
+' with a named parameter, a child re-bound per master row, a calculated field, groups, a rule,
+' totals once per master, late values), over a DataGrid and over a host source; the schema check
+' refuses a kind that differs; parameters (defaults, required, set); an unbound source.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkReportDef"
+#import "vendor/tkControls/tkReportSqlite"
+#import "vendor/tkControls/tkReportGrid"
+#import "vendor/tkControls/tkDataGrid"
+#import "vendor/tkControls/tkReportViewer"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkCheckBox"
+#import "vendor/tkControls/tkStatusBar"
+#import "vendor/sqlite3"
+#import "std/fs"
+using tkTest
+using tkReportDef
+using tkReportSqlite
+using tkReportGrid
+using tkDataGrid
+using tkReportViewer
+using tkTextBox
+using tkCheckBox
+using tkStatusBar
+using tkReport
+using tkRExpr
+using tkBind
+using tkCalendar
+using tkPrint
+using tkHost
+using tkPaint
+
+function FileText( byref path as const ustring ) as ustring
+    return fs.ReadAllText( path ).ValueOr( "" )
+end function
+
+' Every text run of every page (late runs resolved), "|"-joined; the runs drawn in 'colour' into coloured.
+function Runs( byval doc as TK_PRINTDOC ptr, byval colour as ulong = 0, byref coloured as string = "" ) as string
+    dim as string s
+    dim as long np = tkPrintDoc_GetPageCount( doc )
+    for pg as long = 0 to np - 1
+        for i as long = 0 to tkPrintDoc_GetOpCount( doc, pg ) - 1
+            dim as TKPRINT_OPINFO oi
+            tkPrintDoc_GetOp( doc, pg, i, oi )
+            if (oi.op <> TKREC_TEXT) andalso (oi.op <> TKPRINT_OP_LATE) then continue for
+            dim as string t = oi.text
+            if oi.op = TKPRINT_OP_LATE then t = PrLateText( oi.text, pg, np, doc )
+            s &= t & "|"
+            if (colour <> 0) andalso (oi.c = colour) then coloured &= t & "|"
+        next
+    next
+    return s
+end function
+
+function MakeDb( ) as sqlite3 ptr
+    dim as sqlite3 ptr db
+    sqlite3_open( ":memory:", @db )
+    sqlite3_exec( db, "create table orders( Id integer, Customer text, OrderDate date );" & _
+                      "create table lines( OrderId integer, Product text, Qty integer, Price real );" & _
+                      "insert into orders values( 1001, 'Avery', '2025-12-30' ), ( 1002, 'Avery', '2026-01-05' )," & _
+                      " ( 1003, 'Blake', '2026-02-01' ), ( 1004, 'Avery', '2026-03-01' ), ( 1005, 'Casey', '2026-03-02' );" & _
+                      "insert into lines values( 1001, 'Old', 1, 99 ), ( 1002, 'Nut', 10, 0.25 ), ( 1002, 'Bolt', 2, 3.5 )," & _
+                      " ( 1004, 'Washer', 100, 0.1 ), ( 1005, 'Gear', 3, 12 );", 0, 0, 0 )
+    return db
+end function
+
+' ---- a host source: two fields over fixed rows ----
+dim shared as long gHostRow = -1
+function HCount( byval p as any ptr ) as long : return 2 : end function
+function HName( byval p as any ptr, byval f as long ) as ustring
+    if f = 0 then return "Name"
+    return "Qty"
+end function
+function HKind( byval p as any ptr, byval f as long ) as long
+    if f = 0 then return TKV_TEXT
+    return TKV_INT
+end function
+function HRows( byval p as any ptr ) as integer : return 3 : end function
+function HNext( byval p as any ptr ) as boolean
+    gHostRow += 1
+    return gHostRow < 3
+end function
+sub HGet( byval p as any ptr, byval f as long, byref v as TK_VALUE )
+    if f = 0 then v.SetText( "H" & (gHostRow + 1) ) else v.SetInt( (gHostRow + 1) * 7 )
+end sub
+function HRewind( byval p as any ptr ) as boolean
+    gHostRow = -1
+    return true
+end function
+
+sub RoundTrip( )
+    tkTest_Begin( "reading and writing" )
+    dim as ustring errs, canon = FileText( "orders.tkreport" )
+    dim as TK_REPORTDEF ptr def = tkReportDef_LoadFile( "orders.tkreport", errs )
+    tkTest_Check( "a .tkreport reads", (def <> 0) andalso (len( errs ) = 0), errs )
+    if def = 0 then exit sub
+    tkTest_Check( "the model: 1 parameter, 2 sources, 1 calc, 11 bands, 16 items, a nested rule", _
+                  (def->nParams = 1) andalso (def->nSources = 2) andalso (def->nCalcs = 1) andalso (def->nBands = 11) _
+                  andalso (def->nItems = 16) andalso (def->items(7).nRules = 1) andalso (def->sources(1).nPar = 1), _
+                  def->nParams & " " & def->nSources & " " & def->nCalcs & " " & def->nBands & " " & def->nItems )
+    dim as ustring w1 = tkReportDef_SaveText( def )
+    dim as long at = 0
+    for i as long = 1 to len( canon )
+        if mid( canon, i, 1 ) <> mid( w1, i, 1 ) then at = i : exit for
+    next
+    tkTest_Check( "written back byte for byte", w1 = canon, "first difference at " & at & ": " & mid( w1, iif( at > 20, at - 20, 1 ), 60 ) )
+    dim as TK_REPORTDEF ptr d2 = tkReportDef_LoadText( w1, errs )
+    tkTest_Check( "read again, written again: the same", (d2 <> 0) andalso (tkReportDef_SaveText( d2 ) = w1) )
+    tkReportDef_Destroy( d2 )
+    tkReportDef_Destroy( def )
+    ' the same definition, hand-written: keys out of order, defaults written, inline arrays spaced
+    dim as ustring hand = _
+        "[report]" & !"\n" & "margins = [ 56.69,56.69, 56.69 , 56.69 ]" & !"\n" & "title = 'T'" & !"\n" & "units = ""mm""" & !"\n" & _
+        "format = 1" & !"\n"
+    ' TOML: 'format' after [report] would belong to the table: write it first
+    hand = "format = 1" & !"\n" & "[report]" & !"\n" & "units = ""mm""" & !"\n" & "title = 'T'" & !"\n" & _
+           "margins = [ 56.69,56.69, 56.69 , 56.69 ]" & !"\n" & _
+           "[[band]]" & !"\n" & "height = 20.0" & !"\n" & "kind = ""detail""" & !"\n" & "id = ""d""" & !"\n" & "can_grow = true" & !"\n" & _
+           "[[item]]" & !"\n" & "rect = [ 0, 0, 100.004, 14 ]" & !"\n" & "kind = ""text""" & !"\n" & "band = ""d""" & !"\n" & "id = ""a""" & !"\n" & _
+           "align = ""left""" & !"\n" & "text = ""x""" & !"\n"
+    def = tkReportDef_LoadText( hand, errs )
+    dim as ustring want = "format = 1" & !"\n" & !"\n" & "[report]" & !"\n" & "title = ""T""" & !"\n" & !"\n" & _
+                          "[[band]]" & !"\n" & "id = ""d""" & !"\n" & "kind = ""detail""" & !"\n" & !"\n" & _
+                          "[[item]]" & !"\n" & "id = ""a""" & !"\n" & "band = ""d""" & !"\n" & "rect = [0, 0, 100, 14]" & !"\n" & "text = ""x""" & !"\n"
+    dim as ustring got
+    if def then got = tkReportDef_SaveText( def )
+    tkTest_Check( "a hand-written file writes back canonical (order, defaults, numbers)", got = want, got & " / " & errs )
+    tkReportDef_Destroy( def )
+end sub
+
+sub Strict( )
+    tkTest_Begin( "strict reading" )
+    dim as ustring errs
+    dim as TK_REPORTDEF ptr def
+    def = tkReportDef_LoadText( "format = 2" & !"\n", errs )
+    tkTest_Check( "format 2 is refused", (def = 0) andalso (instr( errs, "format must be 1" ) > 0), errs )
+    def = tkReportDef_LoadText( "format = 1" & !"\n" & "[[band]]" & !"\n" & "id = ""b""" & !"\n" & "kind = ""detail""" & !"\n" & "hieght = 3" & !"\n", errs )
+    tkTest_Check( "an unknown key names its band", (def = 0) andalso (instr( errs, "band 'b': unknown key 'hieght'" ) > 0), errs )
+    def = tkReportDef_LoadText( "format = 1" & !"\n" & "[[band]]" & !"\n" & "id = ""b""" & !"\n" & "kind = ""detial""" & !"\n", errs )
+    tkTest_Check( "an unknown band kind", (def = 0) andalso (instr( errs, "is not a band kind" ) > 0), errs )
+    def = tkReportDef_LoadText( "format = 1" & !"\n" & "[[item]]" & !"\n" & "id = ""i""" & !"\n" & "band = ""nope""" & !"\n", errs )
+    tkTest_Check( "an item on a band that is not there", (def = 0) andalso (instr( errs, "item 'i': no band 'nope'" ) > 0), errs )
+    def = tkReportDef_LoadText( "format = 1" & !"\n" & "[[band]]" & !"\n" & "id = ""b""" & !"\n" & "kind = ""detail""" & !"\n" & _
+                                "[[item]]" & !"\n" & "id = ""i""" & !"\n" & "band = ""b""" & !"\n" & "fore = ""red""" & !"\n" & "height = 3" & !"\n", errs )
+    tkTest_Check( "a colour that is not one, and every error at once", (def = 0) andalso (instr( errs, "fore ""red"" is not a colour" ) > 0) _
+                  andalso (instr( errs, "unknown key 'height'" ) > 0), errs )
+    def = tkReportDef_LoadText( "format = 1" & !"\n" & "[[source]]" & !"\n" & "name = ""a""" & !"\n" & "parent = ""b""" & !"\n", errs )
+    tkTest_Check( "a child of a source that is not there", (def = 0) andalso (instr( errs, "no source 'b' (its parent)" ) > 0), errs )
+    def = tkReportDef_LoadText( "format = 1" & !"\n" & "title = [" & !"\n", errs )
+    tkTest_Check( "TOML that does not parse: its line", (def = 0) andalso (instr( errs, "line" ) > 0), errs )
+end sub
+
+sub FromSqlite( )
+    tkTest_Begin( "a report from the file over SQLite" )
+    dim as sqlite3 ptr db = MakeDb( )
+    dim as ustring errs
+    dim as TK_REPORTDEF ptr def = tkReportDef_LoadFile( "orders.tkreport", errs )
+    tkTest_Check( "unbound: the report is refused, naming the source", (tkReportDef_CreateReport( def, errs ) = 0) _
+                  andalso (instr( errs, "source 'Orders' is not bound" ) > 0), errs )
+    tkReportSqlite_BindDef( def, "Orders", db )
+    tkReportSqlite_BindDef( def, "Lines", db )
+    dim as TK_PRINTDOC ptr doc = tkReportDef_CreateDoc( def, errs )
+    tkTest_Check( "bound: the report is made", doc <> 0, errs )
+    if doc = 0 then exit sub
+    tkPrintDoc_Generate( doc )
+    dim as string reds
+    dim as string s = Runs( doc, &hFFC00000ul, reds )
+    tkTest_Check( "the parameter's default filters the master query (no order 1001)", (instr( s, "Order 1001" ) = 0) andalso (instr( s, "Orders from 01/01/2026|" ) > 0), left( s, 80 ) )
+    tkTest_Check( "masters sorted by customer, children by product, re-bound per master", _
+                  instr( s, "|Avery|19.50|Order 1002 of 05/01/2026|Lines|Bolt|2|7.00|Nut|10|2.50|9.50|Order 1004 of 01/03/2026|Lines|Washer|100|10.00|10.00|Customer total|19.50|2 orders|" ) > 0, s )
+    tkTest_Check( "a master with no children: its line, no child rows, no empty detail report", instr( s, "|Blake|0.00|Order 1003 of 01/02/2026|Customer total|0.00|1 orders|" ) > 0, s )
+    tkTest_Check( "a rule colours exactly the line over 20; totals once per master", (reds = "36.00|") andalso (instr( s, "|All 4 orders|55.50|" ) > 0) _
+                  andalso (instr( s, "Page 1 of 1" ) > 0), reds )
+    tkPrintDoc_Destroy( doc )
+    ' a parameter set by the host; then a required one with no value
+    dim as TK_VALUE v
+    dim as TKDATE d
+    d.wYear = 2026 : d.wMonth = 3 : d.wDay = 1
+    v.SetDate( d )
+    tkReportDef_SetParam( def, "From", v )
+    doc = tkReportDef_CreateDoc( def, errs )
+    if doc then
+        tkPrintDoc_Generate( doc )
+        s = Runs( doc )
+        tkTest_Check( "a parameter the host set reaches the SQL", (instr( s, "Order 1002" ) = 0) andalso (instr( s, "|All 2 orders|46.00|" ) > 0), s )
+        tkPrintDoc_Destroy( doc )
+    end if
+    tkReportDef_Destroy( def )
+    ' the snapshot says Qty is text: the data says int -- refused
+    dim as ustring t = FileText( "orders.tkreport" )
+    dim as long k = instr( t, "name = ""Qty""" & !"\n" & "  kind = ""int""" )
+    t = left( t, k - 1 ) & "name = ""Qty""" & mid( t, k + len( "name = ""Qty""" & !"\n" & "  kind = ""int""" ) )
+    def = tkReportDef_LoadText( t, errs )
+    tkReportSqlite_BindDef( def, "Orders", db )
+    tkReportSqlite_BindDef( def, "Lines", db )
+    tkTest_Check( "a field of another kind than the file says is refused", (k > 0) andalso (tkReportDef_CreateReport( def, errs ) = 0) _
+                  andalso (instr( errs, "field 'Qty' is int in the data and text in the report" ) > 0), errs )
+    tkReportDef_Destroy( def )
+    ' an expression error names the item
+    t = FileText( "orders.tkreport" )
+    k = instr( t, "expr = ""[Qty]""" )
+    t = left( t, k - 1 ) & "expr = ""[Qtty]""" & mid( t, k + len( "expr = ""[Qty]""" ) )
+    def = tkReportDef_LoadText( t, errs )
+    tkReportSqlite_BindDef( def, "Orders", db )
+    tkReportSqlite_BindDef( def, "Lines", db )
+    tkTest_Check( "an expression that does not compile names its item", (tkReportDef_CreateReport( def, errs ) = 0) _
+                  andalso (instr( errs, "item 'qty'" ) > 0) andalso (instr( errs, "no field [Qtty]" ) > 0), errs )
+    tkReportDef_Destroy( def )
+    sqlite3_close( db )
+end sub
+
+sub FromGridAndHost( )
+    tkTest_Begin( "a report from the file over a DataGrid and a host source" )
+    dim as ustring rpt = "format = 1" & !"\n" & !"\n" & "[report]" & !"\n" & "title = ""G""" & !"\n" & !"\n" & _
+        "[[parameter]]" & !"\n" & "name = ""Min""" & !"\n" & "type = ""int""" & !"\n" & "required = true" & !"\n" & !"\n" & _
+        "[[source]]" & !"\n" & "name = ""S""" & !"\n" & "kind = ""grid""" & !"\n" & "filter = ""[Qty] >= @Min""" & !"\n" & !"\n" & _
+        "  [[source.field]]" & !"\n" & "  name = ""Name""" & !"\n" & !"\n" & _
+        "  [[source.field]]" & !"\n" & "  name = ""Qty""" & !"\n" & "  kind = ""int""" & !"\n" & !"\n" & _
+        "[[band]]" & !"\n" & "id = ""d""" & !"\n" & "kind = ""detail""" & !"\n" & !"\n" & _
+        "[[item]]" & !"\n" & "id = ""t""" & !"\n" & "band = ""d""" & !"\n" & "rect = [0, 0, 200, 14]" & !"\n" & "text = ""{[Name]}={[S.Qty]}""" & !"\n"
+    dim as ustring errs
+    dim as TK_REPORTDEF ptr def = tkReportDef_LoadText( rpt, errs )
+    tkTest_Check( "a grid report reads", def <> 0, errs )
+    if def = 0 then exit sub
+    dim as TK_HOST ptr h = tkHost_Create( "RD3 grid", 400, 300, tkHost_FontDir() & TK_FONT_UI, 1.0 )
+    dim as TK_WIDGET ptr g = tkDataGrid_Create( tkHost_Root( h ), 1 )
+    tkDataGrid_AddColumnEx( g, "Name" )
+    tkDataGrid_AddColumnEx( g, "Qty", TKDG_COL_TEXT, 80, TKDG_INT )
+    dim as long qs(0 to 3) = { 3, 9, 5, 1 }
+    for k as long = 0 to 3
+        dim as integer row = tkDataGrid_AddRow( g )
+        tkDataGrid_SetCellText( g, row, 0, "N" & (k + 1) )
+        tkDataGrid_SetCellInt( g, row, 1, qs(k) )
+    next
+    dim as TKDG_SORTKEY keys(0 to 0)
+    keys(0).col = 1 : keys(0).bDescending = true
+    tkDataGrid_SetSortKeys( g, keys() )
+    tkDataGrid_Sort( g )
+    tkReportGrid_BindDef( def, "S", g )
+    tkTest_Check( "a required parameter with no value refuses the report", (tkReportDef_CreateReport( def, errs ) = 0) _
+                  andalso (instr( errs, "parameter 'Min' needs a value" ) > 0), errs )
+    dim as TK_VALUE v
+    v.SetInt( 3 )
+    tkReportDef_SetParam( def, "Min", v )
+    dim as TK_PRINTDOC ptr doc = tkReportDef_CreateDoc( def, errs )
+    dim as string s
+    if doc then
+        tkPrintDoc_Generate( doc )
+        s = Runs( doc )
+        tkPrintDoc_Destroy( doc )
+    end if
+    tkTest_Check( "the grid's rows in view order, filtered by a parameter", s = "N2=9|N3=5|N1=3|", s & " " & errs )
+    tkReportDef_Destroy( def )
+    tkHost_Destroy( h )
+
+    ' the same file over a host's own source (the parameter now has a default)
+    rpt = left( rpt, instr( rpt, "required = true" ) - 1 ) & "default = ""10""" & mid( rpt, instr( rpt, "required = true" ) + len( "required = true" ) )
+    def = tkReportDef_LoadText( rpt, errs )
+    dim as TKREPORT_SOURCE src
+    src.FieldCount = @HCount : src.FieldName = @HName : src.FieldKind = @HKind
+    src.RowCount = @HRows : src.MoveNext = @HNext : src.GetValue = @HGet : src.Rewind = @HRewind
+    tkReportDef_BindSource( def, "S", src )
+    doc = tkReportDef_CreateDoc( def, errs )
+    s = ""
+    if doc then
+        tkPrintDoc_Generate( doc )
+        s = Runs( doc )
+        tkPrintDoc_Destroy( doc )
+    end if
+    tkTest_Check( "a host source, the parameter's default in the filter", s = "H2=14|H3=21|", s & " " & errs )
+    tkReportDef_Destroy( def )
+end sub
+
+' The viewer's parameter strip: a control per parameter, laid out under the toolbar and above the
+' preview, wrapping when narrow; Run (a real click) reads them, a bad number stops it with why.
+sub ViewerStrip( byval fScale as single )
+    tkTest_Begin( "the viewer's parameter strip at " & fScale )
+    dim as ustring rpt = "format = 1" & !"\n" & !"\n" & "[report]" & !"\n" & "title = ""V""" & !"\n" & !"\n" & _
+        "[[parameter]]" & !"\n" & "name = ""Min""" & !"\n" & "type = ""int""" & !"\n" & "default = ""0""" & !"\n" & "prompt = ""At least""" & !"\n" & !"\n" & _
+        "[[parameter]]" & !"\n" & "name = ""Heading""" & !"\n" & "default = ""\""Stock\""""" & !"\n" & !"\n" & _
+        "[[parameter]]" & !"\n" & "name = ""Since""" & !"\n" & "type = ""date""" & !"\n" & "default = ""#2026-01-01#""" & !"\n" & !"\n" & _
+        "[[parameter]]" & !"\n" & "name = ""Loud""" & !"\n" & "type = ""bool""" & !"\n" & "default = ""true""" & !"\n" & !"\n" & _
+        "[[source]]" & !"\n" & "name = ""S""" & !"\n" & "filter = ""[Qty] >= @Min""" & !"\n" & !"\n" & _
+        "[[band]]" & !"\n" & "id = ""h""" & !"\n" & "kind = ""report_header""" & !"\n" & !"\n" & _
+        "[[band]]" & !"\n" & "id = ""d""" & !"\n" & "kind = ""detail""" & !"\n" & !"\n" & _
+        "[[item]]" & !"\n" & "id = ""head""" & !"\n" & "band = ""h""" & !"\n" & "rect = [0, 0, 300, 14]" & !"\n" & _
+        "text = ""{iif(@Loud, UCase(@Heading), @Heading)} since {Format(@Since, \""dd/mm/yyyy\"")}""" & !"\n" & !"\n" & _
+        "[[item]]" & !"\n" & "id = ""t""" & !"\n" & "band = ""d""" & !"\n" & "rect = [0, 0, 200, 14]" & !"\n" & "text = ""{[Name]}={[Qty]}""" & !"\n"
+    dim as ustring errs
+    dim as TK_REPORTDEF ptr def = tkReportDef_LoadText( rpt, errs )
+    tkTest_Check( "a report with four parameters reads", def <> 0, errs )
+    if def = 0 then exit sub
+    dim as TKREPORT_SOURCE src
+    src.FieldCount = @HCount : src.FieldName = @HName : src.FieldKind = @HKind
+    src.RowCount = @HRows : src.MoveNext = @HNext : src.GetValue = @HGet : src.Rewind = @HRewind
+    tkReportDef_BindSource( def, "S", src )
+    dim as TK_HOST ptr h = tkHost_Create( "RD3 viewer", 900, 600, tkHost_FontDir() & TK_FONT_UI, fScale )
+    dim as TK_WIDGET ptr v = tkReportViewer_Create( tkHost_Root( h ), 1 )
+    tkWidget_SetPos( v, 0, 0, tkHost_Scale( h, 900 ), tkHost_Scale( h, 600 ) )
+    tkReportViewer_SetReportDef( v, def )
+    tkTest_PumpFor( h, 50 )
+    dim as TK_WIDGET ptr c0 = tkReportViewer_GetParamControl( v, 0 ), c3 = tkReportViewer_GetParamControl( v, 3 )
+    dim as TK_WIDGET ptr bar = tkReportViewer_GetToolbar( v ), pv = tkReportViewer_GetPreview( v ), run_ = tkReportViewer_GetRunButton( v )
+    dim as boolean placed = (c0 <> 0) andalso (c3 <> 0) andalso (run_ <> 0)
+    dim as long stripBottom
+    if placed then
+        for i as long = 0 to 3
+            dim as TK_WIDGET ptr c = tkReportViewer_GetParamControl( v, i )
+            if (c->y < bar->y + bar->ch) orelse (c->x + c->cw > v->cw) then placed = false
+            if c->y + c->ch > stripBottom then stripBottom = c->y + c->ch
+            if i > 0 then
+                dim as TK_WIDGET ptr q = tkReportViewer_GetParamControl( v, i - 1 )
+                if (c->y = q->y) andalso (c->x < q->x + q->cw) then placed = false     ' overlaps the one before
+            end if
+        next
+        placed = placed andalso (pv->y >= stripBottom) andalso (pv->y + pv->ch <= v->ch) andalso (c0->y = c3->y)
+    end if
+    tkTest_Check( "a control per parameter, one row under the toolbar, the preview below", placed, _
+                  "pv.y " & pv->y & " strip bottom " & stripBottom )
+    dim as TK_PRINTDOC ptr doc = tkReportViewer_GetDocument( v )
+    dim as string s
+    if doc then
+        tkPrintDoc_Generate( doc )
+        s = Runs( doc )
+    end if
+    tkTest_Check( "the defaults run at once (text, date, bool, int)", s = "STOCK since 01/01/2026|H1=7|H2=14|H3=21|", s )
+    ' a bad number: Run (clicked) stops with why, the document stays
+    tkTextBox_SetText( c0, "abc" )
+    tkTest_Click( h, run_->x + run_->cw / 2, run_->y + run_->ch / 2 )
+    tkTest_PumpFor( h, 50 )
+    dim as ustring st = tkStatusBar_GetText( tkReportViewer_GetStatusBar( v ), 2 )
+    tkTest_Check( "Run with a bad number: why in the status bar, the document kept", (instr( st, "At least is not a whole number" ) > 0) _
+                  andalso (tkReportViewer_GetDocument( v ) = doc), st )
+    tkTextBox_SetText( c0, "14" )
+    tkCheckBox_SetChecked( c3, false )
+    tkTest_Click( h, run_->x + run_->cw / 2, run_->y + run_->ch / 2 )
+    tkTest_PumpFor( h, 50 )
+    doc = tkReportViewer_GetDocument( v )
+    s = ""
+    if doc then
+        tkPrintDoc_Generate( doc )
+        s = Runs( doc )
+    end if
+    tkTest_Check( "Run (clicked) reads the strip into the report", s = "Stock since 01/01/2026|H2=14|H3=21|", s )
+    ' narrow: the strip wraps onto more rows
+    tkWidget_SetPos( v, 0, 0, tkHost_Scale( h, 300 ), tkHost_Scale( h, 600 ) )
+    tkTest_PumpFor( h, 20 )
+    tkTest_Check( "narrow, the strip wraps; the preview stays below it", (c3->y > c0->y) andalso (pv->y >= c3->y + c3->ch) _
+                  andalso (c3->x + c3->cw <= v->cw), "c0.y " & c0->y & " c3.y " & c3->y & " pv.y " & pv->y )
+    tkReportViewer_SetReportDef( v, 0 )
+    tkTest_Check( "the definition taken off: no strip, no document", (tkReportViewer_GetParamControl( v, 0 ) = 0) _
+                  andalso (tkReportViewer_GetDocument( v ) = 0) andalso (pv->y = bar->y + bar->ch) )
+    tkHost_Destroy( h )
+    tkReportDef_Destroy( def )
+end sub
+
+if tkTest_Init() = false then end 1
+RoundTrip( )
+Strict( )
+FromSqlite( )
+FromGridAndHost( )
+ViewerStrip( 1.0 )
+ViewerStrip( 1.75 )
+dim as long nFail = tkTest_Report( "tkReportDef" )
+tkTest_Quit()
+end nFail

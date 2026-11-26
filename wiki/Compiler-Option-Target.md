@@ -12,7 +12,7 @@ Parameters
 
 `platform`
 
-The target platform. tiko recognizes four:
+The target platform. tiko recognizes six. The two Android ones are in the Windows toolchain only, and are **experimental** (see [Android](Android)):
 
 | Target | |
 | --- | --- |
@@ -20,6 +20,8 @@ The target platform. tiko recognizes four:
 | `linux-x86_64` | Linux on x86-64; the default on x86-64 Linux |
 | `linux-arm64` | Linux on arm64 (aarch64); the default on arm64 Linux |
 | `macos-arm64` | macOS on Apple Silicon; the default on macOS. A program for it links on a Mac, with Apple's linker and SDK |
+| `android-x86_64` | Android on x86-64 (the emulator); links with the Android NDK. [`-app`](Compiler-Option-App) makes an app of an SDL3 program |
+| `android-arm64` | Android on arm64 (phones and tablets); links with the Android NDK. [`-app`](Compiler-Option-App) makes an app of an SDL3 program |
 
 Any other name is refused with `TKO0103`.
 

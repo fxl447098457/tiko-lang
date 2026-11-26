@@ -212,6 +212,11 @@ gives none. The border thickness likewise follows the theme's `BorderWidth` unti
 `tkButton_SetBorderWidth`. Either setter pins that button's shape, so later theme changes leave
 it alone.
 
+The whole client takes the mood colour first, as PsButton's did, so a rounded button on a parent
+of another colour shows **square corners**. `tkButton_SetTransparentCorners( h, TRUE )` leaves the
+client outside the rounded body unpainted: the corners show what the parent painted under the
+button (a card, a tinted strip). A paint callback then draws on the parent's colours too.
+
 ### Who sizes the control
 
 By default, nobody but you: measure with `tkButton_GetIdealSize` and call `tkWidget_SetPos`.
@@ -342,6 +347,7 @@ re-applies auto-size.
 | `tkButton_GetFocusRing` / `tkButton_SetFocusRing` | The gap from the chrome to the ring, and the ring's thickness (0 hides it), each clamped to 0. Both change the ideal size. |
 | `tkButton_GetBorderWidth` / `tkButton_SetBorderWidth` | The border thickness, clamped to 0, where 0 means no border. Repaints only. Setting it stops the theme's `BorderWidth` applying to this button. |
 | `tkButton_SetCornerCurvature` | The corner ellipse **diameter**, clamped to 0 (square corners). Repaints only. Setting it stops the theme's `CornerRadius` applying to this button. |
+| `tkButton_GetTransparentCorners` / `tkButton_SetTransparentCorners` | TRUE: the client outside the rounded body is not filled, so the corners show the parent. Default FALSE (the whole client in the mood colour). Repaints only. |
 | `tkButton_SetAutoSize` | When TRUE the button sizes itself to its ideal size whenever something size-affecting changes. Default FALSE. Turning it on applies immediately. |
 | `tkButton_GetIdealSize` | Forces any pending layout and returns the ideal size. **Valid before the button has been sized**: the measuring pass runs before the zero-size bail. |
 | `tkButton_GetTextWidth` | The measured caption width and the caption font's line height. |

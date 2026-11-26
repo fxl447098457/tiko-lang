@@ -1,0 +1,412 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkBarcode, part two: layout and painting (BARCODE.md §6), shared by the control, its PaintDefault
+' and the widgetless tkBarcode_PaintInto. Types and the encoder are in tkBarcode.tiko.
+'
+' THE EDGE RULE: every edge is ox + RoundPx( x * k ), from the symbol's own (cumulative) coordinates,
+' never a rounded width added up -- bars differ by at most a pixel and the total never drifts.
+' At an integer k every module is exactly k pixels.
+#module "tkBarcode"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkPrint" public
+#import "../tkPdf" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkPrint
+using tkPdf
+
+public enum
+    TKBC_FIT_NORMAL = 0     ' ModuleWidth pixels per module, centred, clipped when too big
+    TKBC_FIT_FIT            ' NORMAL, reduced by whole pixels until it fits (fractional below 1)
+    TKBC_FIT_PROPORTIONAL   ' the largest scale that fits: fractional for 2D; whole pixels for 1D (scans)
+    TKBC_FIT_STRETCH        ' fills the rect: 1D across, 2D on both axes; fractional (a small 1D code won't scan)
+end enum
+
+public enum
+    TKBC_ROT_0 = 0
+    TKBC_ROT_90             ' clockwise; no HRT at 90 / 180 / 270 (BC1)
+    TKBC_ROT_180
+    TKBC_ROT_270
+end enum
+
+' How a symbol is drawn: everything that is not WHAT is encoded.
+public type TKBARCODE_LOOK
+    nFit        as int32 = TKBC_FIT_NORMAL
+    nModulePx   as int32 = 2                 ' pixels per module at NORMAL / FIT (already scaled)
+    nRotation   as int32 = TKBC_ROT_0
+    bShowErrors as boolean = true
+    bBorder     as boolean                   ' a 1-pixel BorderColor frame round the rect
+    pColors     as TKBARCODE_COLORS ptr      ' 0 = the defaults (black on white)
+    pFont       as TTF_Font ptr              ' 0 = no HRT, no error line
+end type
+
+' Where a layout put the symbol. Logical coordinates are before rotation (at 90 / 270 the logical
+' box is the rect turned on its side); rcSymbol is the symbol's box on the surface, after it.
+public type TKBC_LAYOUT
+    bOk         as boolean                   ' a symbol is drawn
+    kx          as float32                   ' pixels per module across (logical)
+    ky          as float32                   ' pixels per module down, outside the bars
+    fBarPx      as float32                   ' 1D: the bars' height in pixels
+    ox          as float32                   ' logical position of module coordinate (0, 0)
+    oy          as float32
+    lw          as int32                     ' the logical box
+    lh          as int32
+    rcBox       as TKRECT                    ' the rect laid out in (border excluded)
+    rcSymbol    as TKRECT                    ' the symbol (quiet zones in, HRT out), on the surface
+    bText       as boolean
+    bTextAbove  as boolean
+    fTextTop    as float32                   ' logical top of the HRT band (below / above the bars)
+    nTextH      as int32
+    bUnderscaled as boolean                  ' FIT could not keep a whole pixel per module
+    nRotation   as int32
+end type
+
+private function RoundPx( byval v as float32 ) as int32
+    return int( v + 0.5 )
+end function
+
+' Module y -> logical pixel y. 1D: the bars [fBarTop, fBarTop + fBarH] stretch to fBarPx; above
+' and below them a module is ky pixels.
+private function MapY( byref sym as TKBARCODE_SYMBOL, byref L as TKBC_LAYOUT, byval ym as float32 ) as float32
+    if sym.b2D orelse (sym.fBarH <= 0) then return L.oy + ym * L.ky
+    if ym <= sym.fBarTop then return L.oy + ym * L.ky
+    dim as float32 yb = L.oy + sym.fBarTop * L.ky
+    if ym <= sym.fBarTop + sym.fBarH then return yb + ( ym - sym.fBarTop ) * L.fBarPx / sym.fBarH
+    return yb + L.fBarPx + ( ym - sym.fBarTop - sym.fBarH ) * L.ky
+end function
+
+' The text the symbol shows: none, zint's runs, or the caption as one run.
+private function TextRuns( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC ) as int32
+    if spec.nTextMode = TKBC_TEXT_NONE then return 0
+    if len( spec.wszCaption ) > 0 then return 1
+    if sym.b2D then return 0
+    return sym.nTexts
+end function
+
+' Lay out sym in rc. FALSE (L.bOk false) when nothing is drawn: no symbol, or no room.
+public function tkBarcode_Layout( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                  byref look as TKBARCODE_LOOK, byref rc as TKRECT, byref L as TKBC_LAYOUT ) as boolean
+    dim as TKBC_LAYOUT z
+    L = z
+    L.nRotation = look.nRotation
+    L.rcBox = rc
+    if look.bBorder then tkRect_Inflate( L.rcBox, -1, -1 )
+    if (sym.nStatus = TKBC_EMPTY) orelse (sym.nStatus >= TKBC_ERR_FIRST) orelse (sym.nW <= 0) orelse (sym.nH <= 0) then return false
+    dim as int32 bw = L.rcBox.right - L.rcBox.left, bh = L.rcBox.bottom - L.rcBox.top
+    if (bw <= 0) orelse (bh <= 0) then return false
+    dim as boolean bSide = (look.nRotation = TKBC_ROT_90) orelse (look.nRotation = TKBC_ROT_270)
+    L.lw = iif( bSide, bh, bw ) : L.lh = iif( bSide, bw, bh )
+
+    ' ---- HRT band --------------------------------------------------------------------------------
+    L.bText = (TextRuns( sym, spec ) > 0) andalso (look.pFont <> 0) andalso (look.nRotation = TKBC_ROT_0)
+    L.bTextAbove = L.bText andalso (spec.nTextMode = TKBC_TEXT_ABOVE) andalso (sym.b2D = false) andalso (sym.bEanUpc = false)
+    L.nTextH = iif( L.bText, tkText_Height( look.pFont ), 0 )
+
+    ' ---- across ---------------------------------------------------------------------------------
+    dim as float32 W = sym.nW, H = sym.nH
+    dim as int32 kN = iif( look.nModulePx < 1, 1, look.nModulePx )
+    dim as int32 gap = 0
+    dim as float32 k
+    ' the height a 2D symbol may use (the HRT band comes off it: gap ~ one module, min 1 px)
+    select case look.nFit
+    case TKBC_FIT_NORMAL
+        k = kN
+    case TKBC_FIT_FIT
+        dim as int32 kf = int( L.lw / W )
+        if sym.b2D then
+            dim as int32 band = iif( L.bText, L.nTextH + kN, 0 )
+            dim as int32 kh = int( ( L.lh - band ) / H )
+            if kh < kf then kf = kh
+        end if
+        if kf > kN then kf = kN
+        if kf >= 1 then
+            k = kf
+        else
+            L.bUnderscaled = true
+            k = L.lw / W
+            if sym.b2D then
+                dim as float32 kh2 = ( L.lh - iif( L.bText, L.nTextH + 1, 0 ) ) / H
+                if kh2 < k then k = kh2
+            end if
+        end if
+    case else       ' PROPORTIONAL, STRETCH
+        k = L.lw / W
+        if sym.b2D andalso (look.nFit = TKBC_FIT_PROPORTIONAL) then
+            dim as float32 kh3 = ( L.lh - iif( L.bText, L.nTextH + 1, 0 ) ) / H
+            if kh3 < k then k = kh3
+        end if
+        ' A 1D code with fractional modules does not scan on screen (BC1's zxing oracle: every 1D
+        ' symbology failed at ~1.5 px per module, every 2D one read): PROPORTIONAL keeps whole
+        ' pixels for 1D while at least one fits. STRETCH stays fractional, by its definition.
+        if (sym.b2D = false) andalso (look.nFit = TKBC_FIT_PROPORTIONAL) andalso (k >= 1) then k = int( k )
+    end select
+    if k <= 0 then return false
+    L.kx = k : L.ky = k
+    gap = iif( L.bText, iif( RoundPx( k ) < 1, 1, RoundPx( k ) ), 0 )
+    dim as float32 symW = W * k
+
+    ' ---- down -----------------------------------------------------------------------------------
+    dim as float32 total
+    if sym.b2D then
+        if look.nFit = TKBC_FIT_STRETCH then
+            L.ky = ( L.lh - iif( L.bText, L.nTextH + gap, 0 ) ) / H
+            if L.ky <= 0 then return false
+        end if
+        total = H * L.ky + iif( L.bText, gap + L.nTextH, 0 )
+    else
+        dim as float32 above = sym.fBarTop * k
+        dim as float32 below = ( H - sym.fBarTop - sym.fBarH ) * k
+        if below < 0 then below = 0
+        dim as float32 band = iif( L.bText, gap + L.nTextH, 0 )
+        dim as float32 bandAbove = 0
+        if L.bTextAbove then
+            bandAbove = band
+        elseif sym.bEanUpc then
+            if band > below then below = band            ' the digits sit between the guards
+        else
+            below += band
+        end if
+        if spec.fBarHeight > 0 then
+            L.fBarPx = spec.fBarHeight * k
+        else
+            L.fBarPx = L.lh - bandAbove - above - below
+        end if
+        if L.fBarPx < 1 then L.fBarPx = 1
+        total = bandAbove + above + L.fBarPx + below
+        L.oy = bandAbove                                  ' adjusted for centring below
+        if L.bTextAbove then L.fTextTop = 0
+    end if
+    dim as float32 sx = ( L.lw - iif( look.nFit = TKBC_FIT_STRETCH, L.lw, symW ) ) / 2
+    dim as float32 sy = ( L.lh - total ) / 2
+    if look.nFit = TKBC_FIT_STRETCH then sx = 0
+    L.ox = int( sx )
+    dim as float32 oyTop = int( sy )
+    if sym.b2D then
+        L.oy = oyTop
+        L.fTextTop = L.oy + RoundPx( H * L.ky ) + gap
+    else
+        L.oy += oyTop
+        if L.bTextAbove then
+            L.fTextTop = oyTop
+        else
+            ' EAN / UPC: right under the normal bars, between the guards; any other code: under its
+            ' lowest rect (ITF-14's bottom bearer)
+            dim as float32 yUnder = iif( sym.bEanUpc, sym.fBarTop + sym.fBarH, sym.nH )
+            L.fTextTop = RoundPx( MapY( sym, L, yUnder ) ) + gap
+        end if
+    end if
+
+    ' ---- the symbol's box on the surface ------------------------------------------------------------
+    dim as int32 x1 = L.ox, y1 = RoundPx( MapY( sym, L, 0 ) )
+    dim as int32 x2 = L.ox + RoundPx( W * L.kx ), y2 = RoundPx( MapY( sym, L, H ) )
+    tkBarcode_LogicalToSurface( L, x1, y1, x2, y2, L.rcSymbol )
+    L.bOk = true
+    return true
+end function
+
+' A logical rect (x1, y1)-(x2, y2) -> the surface, after rotation.
+public sub tkBarcode_LogicalToSurface( byref L as TKBC_LAYOUT, byval x1 as int32, byval y1 as int32, _
+                                       byval x2 as int32, byval y2 as int32, byref r as TKRECT )
+    dim as int32 l0 = L.rcBox.left, t0 = L.rcBox.top
+    select case L.nRotation
+    case TKBC_ROT_90  : tkRect_Set( r, l0 + L.lh - y2, t0 + x1, l0 + L.lh - y1, t0 + x2 )
+    case TKBC_ROT_180 : tkRect_Set( r, l0 + L.lw - x2, t0 + L.lh - y2, l0 + L.lw - x1, t0 + L.lh - y1 )
+    case TKBC_ROT_270 : tkRect_Set( r, l0 + y1, t0 + L.lw - x2, l0 + y2, t0 + L.lw - x1 )
+    case else         : tkRect_Set( r, l0 + x1, t0 + y1, l0 + x2, t0 + y2 )
+    end select
+end sub
+
+private sub LogicalPt( byref L as TKBC_LAYOUT, byval x as float32, byval y as float32, byref p as SDL_FPoint )
+    dim as float32 l0 = L.rcBox.left, t0 = L.rcBox.top
+    select case L.nRotation
+    case TKBC_ROT_90  : p.x = l0 + L.lh - y : p.y = t0 + x
+    case TKBC_ROT_180 : p.x = l0 + L.lw - x : p.y = t0 + L.lh - y
+    case TKBC_ROT_270 : p.x = l0 + y : p.y = t0 + L.lw - x
+    case else         : p.x = l0 + x : p.y = t0 + y
+    end select
+end sub
+
+' The surface rect of one module of the matrix (row, col), for tests: where it is drawn.
+public sub tkBarcode_ModuleRect( byref sym as TKBARCODE_SYMBOL, byref L as TKBC_LAYOUT, byval row as int32, _
+                                 byval col as int32, byref r as TKRECT )
+    dim as float32 xm = sym.fQzLeft + col
+    dim as int32 x1 = L.ox + RoundPx( xm * L.kx ), x2 = L.ox + RoundPx( ( xm + 1 ) * L.kx )
+    dim as int32 y1, y2
+    if sym.b2D then
+        dim as float32 ym = sym.fQzTop + row
+        y1 = RoundPx( MapY( sym, L, ym ) ) : y2 = RoundPx( MapY( sym, L, ym + 1 ) )
+    else
+        y1 = RoundPx( MapY( sym, L, sym.fBarTop ) ) : y2 = RoundPx( MapY( sym, L, sym.fBarTop + sym.fBarH ) )
+    end if
+    tkBarcode_LogicalToSurface( L, x1, y1, x2, y2, r )
+end sub
+
+private sub Fill( byval b as TK_PAINT ptr, byref r as TKRECT )
+    if (r.right > r.left) andalso (r.bottom > r.top) then b->PaintRect( @r )
+end sub
+
+private sub Frame( byval b as TK_PAINT ptr, byref rc as TKRECT, byval clr as ulong )
+    dim as TKRECT r
+    b->SetBackColor( clr )
+    tkRect_Set( r, rc.left, rc.top, rc.right, rc.top + 1 ) : Fill( b, r )
+    tkRect_Set( r, rc.left, rc.bottom - 1, rc.right, rc.bottom ) : Fill( b, r )
+    tkRect_Set( r, rc.left, rc.top, rc.left + 1, rc.bottom ) : Fill( b, r )
+    tkRect_Set( r, rc.right - 1, rc.top, rc.right, rc.bottom ) : Fill( b, r )
+end sub
+
+private sub DrawRun( byval b as TK_PAINT ptr, byref L as TKBC_LAYOUT, byref s as ustring, byval xc as float32, _
+                     byval halign as int32, byval top as float32 )
+    if len( s ) = 0 then exit sub
+    dim as int32 tw = tkText_Width( b->pFont, s )
+    dim as int32 x1
+    select case halign
+    case 1    : x1 = RoundPx( xc )
+    case 2    : x1 = RoundPx( xc ) - tw
+    case else : x1 = RoundPx( xc - tw / 2 )
+    end select
+    dim as TKRECT r
+    tkRect_Set( r, L.rcBox.left + x1, L.rcBox.top + RoundPx( top ), L.rcBox.left + x1 + tw + 1, L.rcBox.top + RoundPx( top ) + L.nTextH )
+    b->PaintText( s, @r, TK_DT_LEFT or TK_DT_TOP or TK_DT_NOCLIP )
+end sub
+
+' Paint a symbol into rc: background, border, symbol, HRT; or the error state; or (empty) the
+' background alone. sym is what tkBarcode_Encode made of spec.
+public sub tkBarcode_PaintInto( byval b as TK_PAINT ptr, byref rc as TKRECT, byref sym as TKBARCODE_SYMBOL, _
+                                byref spec as TKBARCODE_SPEC, byref look as TKBARCODE_LOOK )
+    if b = 0 then exit sub
+    dim as TKBARCODE_COLORS cDef
+    dim as TKBARCODE_COLORS ptr c = iif( look.pColors <> 0, look.pColors, @cDef )
+    dim as boolean bErr = (sym.nStatus >= TKBC_ERR_FIRST)
+
+    ' ---- the error state --------------------------------------------------------------------------
+    if bErr then
+        b->SetBackColor( iif( look.bShowErrors, c->ErrorBackColor, c->BackColor ) )
+        Fill( b, rc )
+        if look.bShowErrors then
+            Frame( b, rc, c->ErrorColor )
+            ' two diagonal ticks in the corners: "hatched", so it never reads as a symbol
+            dim as TKRECT r
+            dim as int32 t = iif( rc.right - rc.left < 12, 2, 6 )
+            for i as int32 = 0 to t - 1
+                tkRect_Set( r, rc.left + 2 + i, rc.top + 2 + t - 1 - i, rc.left + 3 + i, rc.top + 3 + t - 1 - i ) : Fill( b, r )
+                tkRect_Set( r, rc.right - 3 - i, rc.bottom - 3 - t + 1 + i, rc.right - 2 - i, rc.bottom - 2 - t + 1 + i ) : Fill( b, r )
+            next
+            if look.pFont then
+                dim as TTF_Font ptr fWas = b->pFont
+                b->SetFont( look.pFont )
+                b->SetForeColor( c->ErrorColor )
+                dim as TKRECT rt = rc
+                tkRect_Inflate( rt, -4, -2 )
+                b->PaintText( tkBarcode_StatusText( sym.nStatus ), @rt, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_ELLIPSIS )
+                b->SetFont( fWas )
+            end if
+        end if
+        exit sub
+    end if
+
+    b->SetBackColor( c->BackColor )
+    Fill( b, rc )
+    if look.bBorder then Frame( b, rc, c->BorderColor )
+    dim as TKBC_LAYOUT L
+    if tkBarcode_Layout( sym, spec, look, rc, L ) = false then exit sub
+
+    b->PushClip( @L.rcBox )
+    ' ---- bars and modules --------------------------------------------------------------------------
+    b->SetBackColor( c->BarColor )
+    dim as TKRECT r
+    for i as int32 = 0 to sym.nRects - 1
+        dim as int32 x1 = L.ox + RoundPx( sym.rects(i).x * L.kx ), x2 = L.ox + RoundPx( ( sym.rects(i).x + sym.rects(i).w ) * L.kx )
+        dim as int32 y1 = RoundPx( MapY( sym, L, sym.rects(i).y ) ), y2 = RoundPx( MapY( sym, L, sym.rects(i).y + sym.rects(i).h ) )
+        if x2 = x1 then x2 = x1 + 1          ' never lose a bar to rounding (k < 1)
+        if y2 = y1 then y2 = y1 + 1
+        tkBarcode_LogicalToSurface( L, x1, y1, x2, y2, r )
+        Fill( b, r )
+    next
+    ' MaxiCode's hexagons and bullseye (reached through a raw zint id only)
+    for i as int32 = 0 to sym.nHexes - 1
+        dim as SDL_FPoint pts(0 to 5)
+        dim as float32 cx = L.ox + sym.hexes(i).x * L.kx, cy = MapY( sym, L, sym.hexes(i).y )
+        dim as float32 rr = sym.hexes(i).d * L.kx / 2 / 0.8660254
+        for j as int32 = 0 to 5
+            dim as float32 a = ( 90 + 60 * j + sym.hexes(i).rot ) * 3.14159265 / 180
+            LogicalPt( L, cx + rr * cos( a ), cy - rr * sin( a ), pts(j) )
+        next
+        b->PaintPolygonF( @pts(0), 6 )
+    next
+    for i as int32 = 0 to sym.nRings - 1
+        dim as float32 cx = L.ox + sym.rings(i).x * L.kx, cy = MapY( sym, L, sym.rings(i).y )
+        dim as float32 ro = ( sym.rings(i).d + sym.rings(i).w ) * L.kx / 2, ri = ( sym.rings(i).d - sym.rings(i).w ) * L.kx / 2
+        dim as TKRECT re
+        b->SetBackColor( c->BarColor )
+        tkBarcode_LogicalToSurface( L, RoundPx( cx - ro ), RoundPx( cy - ro ), RoundPx( cx + ro ), RoundPx( cy + ro ), re )
+        b->PaintEllipse( @re )
+        if (sym.rings(i).w > 0) andalso (ri > 0) then
+            b->SetBackColor( c->BackColor )
+            tkBarcode_LogicalToSurface( L, RoundPx( cx - ri ), RoundPx( cy - ri ), RoundPx( cx + ri ), RoundPx( cy + ri ), re )
+            b->PaintEllipse( @re )
+        end if
+    next
+
+    ' ---- HRT ---------------------------------------------------------------------------------------
+    if L.bText then
+        dim as TTF_Font ptr fWas = b->pFont
+        b->SetFont( look.pFont )
+        b->SetForeColor( c->TextColor )
+        dim as float32 xMid = L.ox + sym.nW * L.kx / 2
+        if len( spec.wszCaption ) > 0 then
+            DrawRun( b, L, spec.wszCaption, xMid, 0, L.fTextTop )
+        elseif L.bTextAbove orelse (sym.bEanUpc = false) then
+            ' one run (zint centres it under the bars)
+            for i as int32 = 0 to sym.nTexts - 1
+                DrawRun( b, L, sym.texts(i).s, L.ox + sym.texts(i).x * L.kx, sym.texts(i).halign, L.fTextTop )
+            next
+        else
+            ' EAN / UPC: zint's runs where zint puts them; an add-on's digits ride above its bars
+            for i as int32 = 0 to sym.nTexts - 1
+                dim as float32 top = L.fTextTop
+                if sym.texts(i).y < sym.fBarTop + sym.fBarH then top = MapY( sym, L, sym.texts(i).y ) - L.nTextH
+                DrawRun( b, L, sym.texts(i).s, L.ox + sym.texts(i).x * L.kx, sym.texts(i).halign, top )
+            next
+        end if
+        b->SetFont( fWas )
+    end if
+    b->PopClip( )
+end sub
+
+' The size a symbol needs at FitMode NORMAL with this look (AutoSize): its modules at nModulePx,
+' bars at the spec's height (else 50 modules, zint's default), HRT, the border. 0 x 0 when none.
+public sub tkBarcode_PreferredSize( byref sym as TKBARCODE_SYMBOL, byref spec as TKBARCODE_SPEC, _
+                                    byref look as TKBARCODE_LOOK, byref nWidth as int32, byref nHeight as int32 )
+    nWidth = 0 : nHeight = 0
+    if (sym.nStatus = TKBC_EMPTY) orelse (sym.nStatus >= TKBC_ERR_FIRST) then exit sub
+    dim as int32 k = iif( look.nModulePx < 1, 1, look.nModulePx )
+    dim as boolean bText = (TextRuns( sym, spec ) > 0) andalso (look.pFont <> 0) andalso (look.nRotation = TKBC_ROT_0)
+    dim as int32 band = iif( bText, k + tkText_Height( look.pFont ), 0 )
+    nWidth = RoundPx( sym.nW * k )
+    if sym.b2D then
+        nHeight = RoundPx( sym.nH * k ) + band
+    else
+        dim as float32 barH = iif( spec.fBarHeight > 0, spec.fBarHeight, sym.fBarH )
+        dim as float32 below = ( sym.nH - sym.fBarTop - sym.fBarH ) * k
+        if below < 0 then below = 0
+        if bText then
+            if sym.bEanUpc then
+                if band > below then below = band
+            else
+                below += band
+            end if
+        end if
+        nHeight = RoundPx( ( sym.fBarTop + barH ) * k + below )
+    end if
+    if (look.nRotation = TKBC_ROT_90) orelse (look.nRotation = TKBC_ROT_270) then swap nWidth, nHeight
+    if look.bBorder then nWidth += 2 : nHeight += 2
+end sub

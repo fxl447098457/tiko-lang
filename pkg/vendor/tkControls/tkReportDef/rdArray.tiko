@@ -1,0 +1,288 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportDef -- an Array( of T ) of the program as a source (Report Designer RD4). The code tkEdit
+' generates for a report knows the element type; it gives two procedures per source, a row count and
+' a value by row and field (tkBind_ToValue picks the kind from each field's type), and binds them here:
+'
+'   tkReportDef_BindArray( def, "Orders", @rows, @Orders_Count_, @Orders_Value_ )
+'   tkReportDef_BindArrayChild( def, "Lines", @rows, @Lines_Count_, @Lines_Value_ )   ' rows: the MASTER array
+'
+' The fields are the file's [[source.field]] list, in its order (generated code reads them in that
+' order). The runtime here does the rest: the cursor, sorting (a stable merge sort of a row map --
+' the report never sorts, the source does), and a child's rows for the master row being read.
+' The arrays are read as the report lays out: they must outlive its layout.
+#module "tkReportDef"
+
+#import "../tkReport"
+using tkReport
+using tkBind
+
+public type RD_ArrayCountFunc as function( byval pArr as any ptr ) as int32
+public type RD_ArrayValueSub as sub( byval pArr as any ptr, byval row as int32, byval f as int32, byref v as TK_VALUE )
+public type RD_ChildCountFunc as function( byval pArr as any ptr, byval masterRow as int32 ) as int32
+public type RD_ChildValueSub as sub( byval pArr as any ptr, byval masterRow as int32, byval row as int32, byval f as int32, byref v as TK_VALUE )
+
+type RD_ARRSRC
+    names(any) as ustring
+    kinds(any) as long
+    nF       as long
+    pArr     as any ptr
+    Count    as RD_ArrayCountFunc
+    Value    as RD_ArrayValueSub
+    CCount   as RD_ChildCountFunc
+    CValue   as RD_ChildValueSub
+    master   as RD_ARRSRC ptr           ' a child: the master's cursor
+    n        as int32
+    map(any) as int32                   ' sorted: the row at each position
+    bMapped  as boolean
+    pos_     as int32 = -1
+    mrow     as int32 = -1              ' a child: the master row its rows belong to
+end type
+
+type RD_ARRBIND
+    pArr     as any ptr
+    Count    as RD_ArrayCountFunc
+    Value    as RD_ArrayValueSub
+    CCount   as RD_ChildCountFunc
+    CValue   as RD_ChildValueSub
+    def      as TK_REPORTDEF ptr
+    masterSi as int32 = -1
+    opened(any) as RD_ARRSRC ptr
+    nOpen    as long
+    cur      as RD_ARRSRC ptr           ' the master's cursor last opened
+end type
+
+private function AFieldCount( byval p as any ptr ) as long
+    return cast( RD_ARRSRC ptr, p )->nF
+end function
+private function AFieldName( byval p as any ptr, byval f as long ) as ustring
+    dim as RD_ARRSRC ptr a = p
+    if (f < 0) orelse (f >= a->nF) then return ""
+    return a->names(f)
+end function
+private function AFieldKind( byval p as any ptr, byval f as long ) as long
+    dim as RD_ARRSRC ptr a = p
+    if (f < 0) orelse (f >= a->nF) then return TKV_EMPTY
+    return a->kinds(f)
+end function
+private function ARowCount( byval p as any ptr ) as integer
+    return cast( RD_ARRSRC ptr, p )->n
+end function
+private function ARewind( byval p as any ptr ) as boolean
+    dim as RD_ARRSRC ptr a = p
+    a->pos_ = -1
+    if a->master = 0 then
+        dim as int32 n = a->Count( a->pArr )
+        if n <> a->n then a->bMapped = false          ' the rows changed: the old order is gone
+        a->n = n
+    end if
+    return true
+end function
+private function ANext( byval p as any ptr ) as boolean
+    dim as RD_ARRSRC ptr a = p
+    if a->pos_ + 1 >= a->n then
+        a->pos_ = a->n
+        return false
+    end if
+    a->pos_ += 1
+    return true
+end function
+
+' The master row at the cursor (through the sort map).
+private function ARow( byval a as RD_ARRSRC ptr ) as int32
+    if (a->pos_ < 0) orelse (a->pos_ >= a->n) then return -1
+    if a->bMapped then return a->map(a->pos_)
+    return a->pos_
+end function
+
+private sub AGet( byval p as any ptr, byval f as long, byref v as TK_VALUE )
+    dim as RD_ARRSRC ptr a = p
+    v.Clear( )
+    if (f < 0) orelse (f >= a->nF) then exit sub
+    if a->master then
+        if (a->mrow < 0) orelse (a->pos_ < 0) orelse (a->pos_ >= a->n) then exit sub
+        a->CValue( a->pArr, a->mrow, a->pos_, f, v )
+    else
+        dim as int32 row = ARow( a )
+        if row >= 0 then a->Value( a->pArr, row, f, v )
+    end if
+end sub
+
+' The master's rows ordered by the keys: a stable merge sort of a row map (the arrays are not moved).
+private function ASort( byval p as any ptr, byval keys as TKREPORT_SORTKEY ptr, byval nKeys as long ) as boolean
+    dim as RD_ARRSRC ptr a = p
+    if a->master then return false
+    dim as int32 n = a->Count( a->pArr )
+    a->n = n
+    a->bMapped = false
+    if (n < 2) orelse (nKeys < 1) then return true
+    for k as long = 0 to nKeys - 1
+        if (keys[k].field < 0) orelse (keys[k].field >= a->nF) then return false
+    next
+    dim as TK_VALUE kv(any)
+    redim kv( 0 to n * nKeys - 1 )
+    for row as int32 = 0 to n - 1
+        for k as long = 0 to nKeys - 1
+            a->Value( a->pArr, row, keys[k].field, kv(row * nKeys + k) )
+        next
+    next
+    dim as int32 m(any), t(any)
+    redim m( 0 to n - 1 )
+    redim t( 0 to n - 1 )
+    for i as int32 = 0 to n - 1 : m(i) = i : next
+    dim as int32 w = 1
+    while w < n
+        dim as int32 lo = 0
+        while lo < n
+            dim as int32 mid_ = lo + w, hi = lo + 2 * w
+            if mid_ > n then mid_ = n
+            if hi > n then hi = n
+            dim as int32 i = lo, j = mid_, o = lo
+            while (i < mid_) orelse (j < hi)
+                dim as boolean takeLeft = (j >= hi)
+                if (takeLeft = false) andalso (i < mid_) then
+                    dim as long c = 0
+                    for k as long = 0 to nKeys - 1
+                        c = tkReport_CompareValues( kv(m(i) * nKeys + k), kv(m(j) * nKeys + k) )
+                        if keys[k].desc then c = -c
+                        if c <> 0 then exit for
+                    next
+                    takeLeft = (c <= 0)
+                end if
+                if takeLeft then
+                    t(o) = m(i) : i += 1
+                else
+                    t(o) = m(j) : j += 1
+                end if
+                o += 1
+            wend
+            lo = hi
+        wend
+        for i as int32 = 0 to n - 1 : m(i) = t(i) : next
+        w *= 2
+    wend
+    redim a->map( 0 to n - 1 )
+    for i as int32 = 0 to n - 1 : a->map(i) = m(i) : next
+    a->bMapped = true
+    return true
+end function
+
+' A child's rows for the master row the master's cursor is on.
+private function AOpenChildRows( byval p as any ptr, byval master as TK_VALUE ptr, byval nMaster as int32 ) as boolean
+    dim as RD_ARRSRC ptr a = p
+    a->mrow = ARow( a->master )
+    a->n = 0
+    if a->mrow >= 0 then a->n = a->CCount( a->pArr, a->mrow )
+    a->pos_ = -1
+    return true
+end function
+
+private sub ASource( byval a as RD_ARRSRC ptr, byref src as TKREPORT_SOURCE )
+    src.pCtx = a
+    src.FieldCount = @AFieldCount : src.FieldName = @AFieldName : src.FieldKind = @AFieldKind
+    src.RowCount = @ARowCount : src.MoveNext = @ANext : src.GetValue = @AGet : src.Rewind = @ARewind
+    if a->master = 0 then src.Sort = @ASort
+end sub
+
+' A cursor with the source's fields from the file (an array source names them all).
+private function NewCursor( byval b as RD_ARRBIND ptr, byval def as TK_REPORTDEF ptr, byval si as int32 ) as RD_ARRSRC ptr
+    dim byref as TKRD_SOURCE s = def->sources(si)
+    if s.nFields = 0 then return 0
+    dim as RD_ARRSRC ptr a = new RD_ARRSRC
+    a->nF = s.nFields
+    redim a->names( 0 to a->nF - 1 )
+    redim a->kinds( 0 to a->nF - 1 )
+    for f as long = 0 to a->nF - 1
+        a->names(f) = s.fields(f).name_
+        a->kinds(f) = s.fields(f).kind
+    next
+    a->pArr = b->pArr
+    a->Count = b->Count : a->Value = b->Value
+    a->CCount = b->CCount : a->CValue = b->CValue
+    redim preserve b->opened( 0 to b->nOpen )
+    b->opened(b->nOpen) = a
+    b->nOpen += 1
+    return a
+end function
+
+private function AOpenRows( byval def as TK_REPORTDEF ptr, byval si as int32, byval p as any ptr, _
+                            byref src as TKREPORT_SOURCE ) as boolean
+    dim as RD_ARRBIND ptr b = p
+    dim as RD_ARRSRC ptr a = NewCursor( b, def, si )
+    if a = 0 then return false
+    a->n = b->Count( b->pArr )
+    b->cur = a
+    ASource( a, src )
+    return true
+end function
+
+private function AOpenChild( byval def as TK_REPORTDEF ptr, byval si as int32, byval p as any ptr, _
+                             byref child as TKRD_CHILD ) as boolean
+    dim as RD_ARRBIND ptr b = p
+    if (b->masterSi < 0) orelse (b->masterSi > ubound( def->binds )) then return false
+    dim byref as TKRD_BINDING mb = def->binds(b->masterSi)
+    if mb.OpenRows <> @AOpenRows then return false        ' the master is not an array of this kind
+    dim as RD_ARRBIND ptr m = mb.pCtx
+    if m->cur = 0 then return false
+    dim as RD_ARRSRC ptr a = NewCursor( b, def, si )
+    if a = 0 then return false
+    a->master = m->cur
+    child.pCtx = a
+    ASource( a, child.rows )
+    child.Open = @AOpenChildRows
+    return true
+end function
+
+private sub AClose( byval p as any ptr, byval bFinal as boolean )
+    dim as RD_ARRBIND ptr b = p
+    if b = 0 then exit sub
+    for i as long = 0 to b->nOpen - 1
+        delete b->opened(i)
+    next
+    b->nOpen = 0
+    b->cur = 0
+    if bFinal then delete b
+end sub
+
+' Source 'name' (a master or a single source) is the array at pArr: count gives its rows, value a
+' field of a row. FALSE when the definition has no such source.
+public function tkReportDef_BindArray( byval def as TK_REPORTDEF ptr, byref name_ as const ustring, byval pArr as any ptr, _
+                                       byval count as RD_ArrayCountFunc, byval value as RD_ArrayValueSub ) as boolean
+    if (def = 0) orelse (count = 0) orelse (value = 0) then return false
+    dim as RD_ARRBIND ptr b = new RD_ARRBIND
+    b->pArr = pArr : b->Count = count : b->Value = value : b->def = def
+    dim as TKRD_BINDING bd
+    bd.pCtx = b
+    bd.OpenRows = @AOpenRows
+    bd.CloseAll = @AClose
+    if tkReportDef_Bind( def, name_, bd ) = false then
+        delete b
+        return false
+    end if
+    return true
+end function
+
+' Child source 'name' is an array field of its master's rows: pArr is the MASTER array, count gives a
+' master row's children, value a field of one. The master must be bound with BindArray.
+public function tkReportDef_BindArrayChild( byval def as TK_REPORTDEF ptr, byref name_ as const ustring, byval pArr as any ptr, _
+                                            byval count as RD_ChildCountFunc, byval value as RD_ChildValueSub ) as boolean
+    if (def = 0) orelse (count = 0) orelse (value = 0) then return false
+    dim as int32 si = tkReportDef_FindSource( def, name_ )
+    if si < 0 then return false
+    dim as RD_ARRBIND ptr b = new RD_ARRBIND
+    b->pArr = pArr : b->CCount = count : b->CValue = value : b->def = def
+    b->masterSi = tkReportDef_FindSource( def, def->sources(si).parent )
+    dim as TKRD_BINDING bd
+    bd.pCtx = b
+    bd.OpenChild = @AOpenChild
+    bd.CloseAll = @AClose
+    if tkReportDef_Bind( def, name_, bd ) = false then
+        delete b
+        return false
+    end if
+    return true
+end function

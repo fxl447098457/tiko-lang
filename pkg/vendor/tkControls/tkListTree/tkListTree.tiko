@@ -35,6 +35,7 @@
 #import "../tkColumnHeader" public
 #import "../tkVScrollBar" public
 #import "../tkScrollBar" public
+#import "../tkCheckBox" public
 using tkHost
 using tkPaint
 using tkTheme
@@ -43,6 +44,7 @@ using tkTextBox
 using tkColumnHeader
 using tkVScrollBar
 using tkScrollBar
+using tkCheckBox
 
 ' ---- constants --------------------------------------------------------------------------
 public const CLISTTREE_DEFAULT_ROWHEIGHT = 22      ' unscaled
@@ -53,6 +55,19 @@ public const CLISTTREE_DEFAULT_TWISTY = 16         ' unscaled
 public const CLISTTREE_DRAG_THRESHOLD = 4          ' scaled: SDL has no SM_CXDRAG
 public const CLISTTREE_DRAGSCROLL_ZONE = 16        ' scaled
 public const CLISTTREE_DRAGSCROLL_MS = 60
+public const CLISTTREE_DEFAULT_CHECKBOX = 16       ' unscaled: the box's side
+public const CLISTTREE_DEFAULT_CHECKBAND = 20      ' unscaled: the column the box sits in
+
+' Check boxes (C1, docs/tkControls/CHECKED-LISTS.md in claude-docs): a row's check state is a
+' CHK_STATE_* of tkCheckBox; these are the same values under the list's names.
+public const LT_CHECK_UNCHECKED = CHK_STATE_UNCHECKED
+public const LT_CHECK_CHECKED = CHK_STATE_CHECKED
+public const LT_CHECK_MIXED = CHK_STATE_MIXED
+
+public enum
+    LT_CHECKMODE_TWOSTATE = 0      ' a user toggle goes unchecked <-> checked; MIXED -> checked
+    LT_CHECKMODE_THREESTATE        ' a user toggle cycles unchecked -> checked -> mixed -> unchecked
+end enum
 
 ' ---- types ------------------------------------------------------------------------------
 public type TKLISTTREE_CELLINFO
@@ -80,6 +95,11 @@ public type TKLISTTREE_PAINTINFO
     isExpanded   as boolean
     indent       as integer
     rcTwisty     as TKRECT
+    rcCheck      as TKRECT             ' the box cell (C1); empty when the row has no box
+    checkState   as long               ' LT_CHECK_*
+    isCheckable  as boolean            ' a box is drawn on this row
+    isCheckHot   as boolean
+    isCheckPressed as boolean
     columnCount  as integer
     cells        as TKLISTTREE_CELLINFO ptr
 end type
@@ -94,6 +114,7 @@ public type TKLISTTREE_MESSAGEINFO
     idx     as integer                 ' MODEL row under the mouse, or -1
     isCtrl  as boolean
     isShift as boolean
+    onCheck as boolean                 ' (C1) the point is over the row's check box
 end type
 
 public type TKLISTTREE_ROWINFO
@@ -107,6 +128,8 @@ public type TKLISTTREE_ROWINFO
     cells(any)    as ustring           ' columns 1..N, sparse
     itemData      as integer
     itemDataExtra as integer
+    check         as ubyte = 0         ' LT_CHECK_* (C1); travels with the row like `selected`
+    bCheckable    as boolean = true    ' false: no box, never toggled, left out of the cascade
     declare sub EnsureCells( byval n as integer )
     declare sub TrimCells( byval n as integer )
 end type
@@ -144,6 +167,12 @@ public type LT_DragDropCallbackSub as sub( byval hList as TK_WIDGET ptr, byval n
 public type LT_BeginLabelEditCallbackFunc as function( byval hList as TK_WIDGET ptr, byval row as integer ) as boolean
 public type LT_EndLabelEditCallbackFunc as function( byval hList as TK_WIDGET ptr, byval row as integer, byval newText as ustring ) as boolean
 public type LT_ExpandCollapseCallbackSub as sub( byval hList as TK_WIDGET ptr, byval row as integer, byval bExpanded as boolean )
+' BEFORE a user's check change, for the row the user touched only (not the cascaded ones): FALSE
+' vetoes; newState may be rewritten (WinForms ItemCheckEventArgs.NewValue).
+public type LT_ItemCheckCallbackFunc as function( byval hList as TK_WIDGET ptr, byval row as integer, _
+                                                  byval oldState as long, byref newState as long ) as boolean
+' AFTER the whole gesture (cascade and multi-row Space done); row = the row the user touched.
+public type LT_ItemCheckedCallbackSub as sub( byval hList as TK_WIDGET ptr, byval row as integer, byval newState as long )
 
 public type TKLISTTREE_STATE
     hWin            as TK_WIDGET ptr       ' the container (the handle)
@@ -221,6 +250,18 @@ public type TKLISTTREE_STATE
     bEditSelectAll  as boolean = true
     nEditTextInset  as integer = -1
     bEditTearingDown as boolean
+    ' --- check boxes (C1) ---
+    bCheckBoxes     as boolean
+    nCheckMode      as long = LT_CHECKMODE_TWOSTATE
+    bCheckCascade   as boolean
+    bCheckOnClick   as boolean
+    bCheckOwnerDraw as boolean
+    checkColors     as TKCHECKBOX_COLORS
+    bCheckColorsPinned as boolean
+    checkHotRow     as integer = -1        ' MODEL row whose box is under the mouse
+    checkPressRow   as integer = -1        ' MODEL row whose box is pressed, or -1
+    bCheckPressInside as boolean
+    nCheckChanges   as integer             ' bumped by every row whose state really changes
     ' --- children ---
     ScrollBarWidth  as integer = CLISTTREE_DEFAULT_SCROLLWIDTH
     scrollBarShown  as boolean
@@ -238,6 +279,8 @@ public type TKLISTTREE_STATE
     BeginLabelEditCallback as LT_BeginLabelEditCallbackFunc
     EndLabelEditCallback   as LT_EndLabelEditCallbackFunc
     ExpandCollapseCallback as LT_ExpandCollapseCallbackSub
+    ItemCheckCallback      as LT_ItemCheckCallbackFunc
+    ItemCheckedCallback    as LT_ItemCheckedCallbackSub
     paintCells(any) as TKLISTTREE_CELLINFO
     spanCell        as TKLISTTREE_CELLINFO
 
@@ -313,6 +356,7 @@ function TKLISTTREE_STATE.InsertRowAt( byval modelRow as integer ) as TKLISTTREE
     with this.rows(modelRow)
         .IsHeader = false : .bCollapsed = false : .bSpanColumns = false : .bSelectable = true
         .level = 0 : .selected = false : .Text = "" : .itemData = 0 : .itemDataExtra = 0
+        .check = LT_CHECK_UNCHECKED : .bCheckable = true
     end with
     this.rows(modelRow).TrimCells( 0 )
     this.rowCount += 1
@@ -328,6 +372,7 @@ function TKLISTTREE_STATE.DeleteRowAt( byval modelRow as integer ) as boolean
     this.rows(this.rowCount - 1).Text = ""
     this.rows(this.rowCount - 1).TrimCells( 0 )
     this.rowCount -= 1
+    this.checkHotRow = -1 : this.checkPressRow = -1
     ' a focus / anchor past the end would point at nothing
     if this.focusRow >= this.rowCount then this.focusRow = -1
     if this.anchorRow >= this.rowCount then this.anchorRow = -1
@@ -344,6 +389,7 @@ sub TKLISTTREE_STATE.ClearRows()
     this.focusRow = -1
     this.anchorRow = -1
     this.lastNotifiedRow = -1
+    this.checkHotRow = -1 : this.checkPressRow = -1
     this.NotifyChange()
 end sub
 
@@ -504,6 +550,7 @@ function TKLISTTREE_STATE.MoveRows( srcRows() as integer, byval insertBefore as 
     this.focusRow = newFirst
     this.anchorRow = newFirst
     this.lastNotifiedRow = newFirst
+    this.checkHotRow = -1 : this.checkPressRow = -1
     this.NotifyChange()
     return newFirst
 end function
@@ -574,6 +621,53 @@ private function LtPointOverTwisty( byval p as TKLISTTREE_STATE ptr, byval x as 
     if (p->bShowTwisty = false) orelse (p->HasChildrenAt( modelRow ) = false) then return false
     dim as integer tx = LtRowLevelIndentPx( p, modelRow )
     return (x >= tx) andalso (x < tx + LtTwistyPx( p ))
+end function
+
+' ---- check boxes (C1): the band sits after the twisty, before column 0's text -------------
+' Every non-header row reserves the band while check boxes are on, so text stays aligned when a
+' row is not checkable (it just paints no box).
+private function LtCheckBandPx( byval p as TKLISTTREE_STATE ptr, byval modelRow as integer ) as integer
+    if (p->bCheckBoxes = false) orelse (p->IsValidRow( modelRow ) = false) then return 0
+    if p->rows(modelRow).IsHeader then return 0
+    dim as integer v = LtScale( p, CLISTTREE_DEFAULT_CHECKBAND )
+    return iif( v < 1, 1, v )
+end function
+
+private function LtHasBox( byval p as TKLISTTREE_STATE ptr, byval modelRow as integer ) as boolean
+    if LtCheckBandPx( p, modelRow ) = 0 then return false
+    return p->rows(modelRow).bCheckable
+end function
+
+' The box's side: the scaled default, never more than the row height less a scaled 2 px each side.
+private function LtCheckBoxPx( byval p as TKLISTTREE_STATE ptr ) as integer
+    dim as integer v = LtScale( p, CLISTTREE_DEFAULT_CHECKBOX )
+    dim as integer cap = LtItemHeightPx( p ) - 2 * LtScale( p, 2 )
+    if v > cap then v = cap
+    return iif( v < 1, 1, v )
+end function
+
+' The band's left edge, surface-local (the same frame as the twisty's).
+private function LtCheckBandLeft( byval p as TKLISTTREE_STATE ptr, byval modelRow as integer ) as integer
+    return LtRowLevelIndentPx( p, modelRow ) + iif( p->bShowTwisty, LtTwistyPx( p ), 0 )
+end function
+
+' The box cell of a row whose top is y: a box-sized square centred in the band. FALSE (and empty)
+' when the row has no box.
+private function LtCheckCellRect( byval p as TKLISTTREE_STATE ptr, byval modelRow as integer, byval y as integer, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    if LtHasBox( p, modelRow ) = false then return false
+    dim as integer band = LtCheckBandPx( p, modelRow ), bx = LtCheckBoxPx( p ), ih = LtItemHeightPx( p )
+    dim as integer x0 = LtCheckBandLeft( p, modelRow ) + (band - bx) \ 2
+    dim as integer y0 = y + (ih - bx) \ 2
+    tkRect_Set( rc, x0, y0, x0 + bx, y0 + bx )
+    return true
+end function
+
+' The hit area is the whole band across the row's height (easier to hit than the box itself).
+private function LtPointOverCheck( byval p as TKLISTTREE_STATE ptr, byval x as integer, byval modelRow as integer ) as boolean
+    if LtHasBox( p, modelRow ) = false then return false
+    dim as integer bl = LtCheckBandLeft( p, modelRow )
+    return (x >= bl) andalso (x < bl + LtCheckBandPx( p, modelRow ))
 end function
 
 private function LtVisPerPage( byval p as TKLISTTREE_STATE ptr ) as integer
@@ -906,6 +1000,140 @@ private sub LtKeySpace( byval p as TKLISTTREE_STATE ptr )
     LtNotifySelChange( p )
 end sub
 
+' ---- check boxes (C1): the model -------------------------------------------------------
+private sub LtSetCheckRaw( byval p as TKLISTTREE_STATE ptr, byval row as integer, byval st as long )
+    if (p->IsValidRow( row ) = false) orelse (p->rows(row).bCheckable = false) orelse p->rows(row).IsHeader then exit sub
+    if (st < LT_CHECK_UNCHECKED) orelse (st > LT_CHECK_MIXED) then exit sub
+    if p->rows(row).check = st then exit sub
+    p->rows(row).check = st
+    p->nCheckChanges += 1
+end sub
+
+' A row's state from its DIRECT children that take part (checkable, not headers): all checked ->
+' checked, all unchecked -> unchecked, else mixed. FALSE when none take part.
+private function LtDeriveCheck( byval p as TKLISTTREE_STATE ptr, byval row as integer, byref st as long ) as boolean
+    dim as integer lvl = p->rows(row).level, nOn = 0, nOff = 0, n = 0
+    for i as integer = row + 1 to p->rowCount - 1
+        if p->rows(i).level <= lvl then exit for
+        if p->rows(i).level <> lvl + 1 then continue for
+        if p->rows(i).IsHeader orelse (p->rows(i).bCheckable = false) then continue for
+        n += 1
+        select case p->rows(i).check
+        case LT_CHECK_CHECKED : nOn += 1
+        case LT_CHECK_UNCHECKED : nOff += 1
+        end select
+    next
+    if n = 0 then return false
+    st = iif( nOn = n, LT_CHECK_CHECKED, iif( nOff = n, LT_CHECK_UNCHECKED, LT_CHECK_MIXED ) )
+    return true
+end function
+
+' Up from row: each ancestor re-derived; stops at the first that does not change, or that does
+' not take part (its own parent cannot have changed through it).
+private sub LtCascadeUp( byval p as TKLISTTREE_STATE ptr, byval row as integer )
+    dim as integer r = p->ParentOf( row )
+    while r >= 0
+        if p->rows(r).IsHeader orelse (p->rows(r).bCheckable = false) then exit while
+        dim as long st
+        if LtDeriveCheck( p, r, st ) = false then exit while
+        if p->rows(r).check = st then exit while
+        LtSetCheckRaw( p, r, st )
+        r = p->ParentOf( r )
+    wend
+end sub
+
+' Sets one row; with the cascade, a CHECKED / UNCHECKED row takes its whole subtree with it, and
+' the ancestors are re-derived.
+private sub LtApplyCheck( byval p as TKLISTTREE_STATE ptr, byval row as integer, byval st as long )
+    LtSetCheckRaw( p, row, st )
+    if p->bCheckCascade = false then exit sub
+    if st <> LT_CHECK_MIXED then
+        for i as integer = row + 1 to p->LastDescendantOf( row )
+            LtSetCheckRaw( p, i, st )
+        next
+    end if
+    LtCascadeUp( p, row )
+end sub
+
+' Every parent derived from its children in one reverse pass: in reverse pre-order a row's direct
+' children have all been seen, and tallied at level + 1, just before it.
+private sub LtRecomputeChecks( byval p as TKLISTTREE_STATE ptr )
+    if p->rowCount <= 0 then exit sub
+    dim as integer maxLvl = 0
+    for i as integer = 0 to p->rowCount - 1
+        if p->rows(i).level > maxLvl then maxLvl = p->rows(i).level
+    next
+    dim as integer nOn(0 to maxLvl + 1), nOff(0 to maxLvl + 1), nAll(0 to maxLvl + 1)
+    for i as integer = p->rowCount - 1 to 0 step -1
+        dim as integer L = p->rows(i).level
+        dim as boolean takesPart = (p->rows(i).IsHeader = false) andalso p->rows(i).bCheckable
+        if p->HasChildrenAt( i ) andalso takesPart andalso (nAll(L + 1) > 0) then
+            LtSetCheckRaw( p, i, iif( nOn(L + 1) = nAll(L + 1), LT_CHECK_CHECKED, _
+                                 iif( nOff(L + 1) = nAll(L + 1), LT_CHECK_UNCHECKED, LT_CHECK_MIXED ) ) )
+        end if
+        for k as integer = L + 1 to maxLvl + 1
+            nOn(k) = 0 : nOff(k) = 0 : nAll(k) = 0
+        next
+        if takesPart then
+            nAll(L) += 1
+            if p->rows(i).check = LT_CHECK_CHECKED then nOn(L) += 1
+            if p->rows(i).check = LT_CHECK_UNCHECKED then nOff(L) += 1
+        end if
+    next
+end sub
+
+' ---- check boxes (C1): the user's gestures ---------------------------------------------
+private function LtCanUserCheck( byval p as TKLISTTREE_STATE ptr, byval row as integer ) as boolean
+    if LtHasBox( p, row ) = false then return false
+    return p->rows(row).bSelectable andalso tkWidget_IsEnabled( p->hWin )
+end function
+
+' Two-state (or with the cascade): checked -> unchecked, anything else -> checked. Three-state
+' without the cascade: unchecked -> checked -> mixed -> unchecked.
+private function LtNextUserState( byval p as TKLISTTREE_STATE ptr, byval cur as long ) as long
+    if (p->nCheckMode = LT_CHECKMODE_THREESTATE) andalso (p->bCheckCascade = false) then
+        select case cur
+        case LT_CHECK_UNCHECKED : return LT_CHECK_CHECKED
+        case LT_CHECK_CHECKED : return LT_CHECK_MIXED
+        end select
+        return LT_CHECK_UNCHECKED
+    end if
+    return iif( cur = LT_CHECK_CHECKED, LT_CHECK_UNCHECKED, LT_CHECK_CHECKED )
+end function
+
+' One user gesture on row: forced = -1 toggles, else sets that state. bSelection: when row is
+' selected among others, every selected row that can be checked follows it (Space, +, -).
+' ONE ItemCheck (vetoable, may rewrite) for row, ONE ItemChecked after, only if anything changed.
+private function LtUserCheck( byval p as TKLISTTREE_STATE ptr, byval row as integer, byval bSelection as boolean, _
+                              byval forced as long = -1 ) as boolean
+    if LtCanUserCheck( p, row ) = false then return false
+    dim as long oldSt = p->rows(row).check
+    dim as long newSt = iif( forced >= 0, forced, LtNextUserState( p, oldSt ) )
+    dim as boolean bMulti = bSelection andalso p->rows(row).selected andalso (p->GetSelCount() > 1)
+    if (newSt = oldSt) andalso (bMulti = false) then return false
+    if p->ItemCheckCallback then
+        if p->ItemCheckCallback( p->hWin, row, oldSt, newSt ) = false then return false
+        if (newSt < LT_CHECK_UNCHECKED) orelse (newSt > LT_CHECK_MIXED) then return false
+    end if
+    dim as integer before = p->nCheckChanges
+    LtApplyCheck( p, row, newSt )
+    if bMulti then
+        for i as integer = 0 to p->rowCount - 1
+            if (i <> row) andalso p->rows(i).selected andalso LtCanUserCheck( p, i ) then LtApplyCheck( p, i, newSt )
+        next
+    end if
+    if p->nCheckChanges = before then return false
+    tkWidget_Invalidate( p->wSurf )
+    if p->ItemCheckedCallback then p->ItemCheckedCallback( p->hWin, row, p->rows(row).check )
+    return true
+end function
+
+private sub LtSetCheckHot( byval p as TKLISTTREE_STATE ptr, byval row as integer )
+    if row = p->checkHotRow then exit sub
+    p->checkHotRow = row
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
 ' ---- drag reorder ----------------------------------------------------------------------
 private function LtBuildDragSource( byval p as TKLISTTREE_STATE ptr, byval pressedRow as integer, srcRows() as integer ) as integer
     dim as integer n = 0
@@ -1012,14 +1240,18 @@ private function LtBeginEdit( byval p as TKLISTTREE_STATE ptr, byval row as inte
     if p->bEditing then LtEndEdit( p, true )
     dim as integer vis = p->ModelToVisible( row )
     if vis < 0 then return false
+    ' set BEFORE the callback: GetEditRow / GetEditCol are how BeginLabelEdit learns the cell
+    ' (its signature has no column); every failure below puts editRow back to -1
+    p->editRow = row
+    p->editCol = col
     if p->BeginLabelEditCallback then
-        if p->BeginLabelEditCallback( p->hWin, row ) = false then return false
+        if p->BeginLabelEditCallback( p->hWin, row ) = false then p->editRow = -1 : return false
     end if
     dim as TKRECT rcRow
-    if LtVisIndexRect( p, vis, rcRow ) = false then return false
+    if LtVisIndexRect( p, vis, rcRow ) = false then p->editRow = -1 : return false
     if p->wEdit = 0 then
         p->wEdit = tkTextBox_Create( p->wSurf, p->hWin->ctrlId + 3, false )
-        if p->wEdit = 0 then return false
+        if p->wEdit = 0 then p->editRow = -1 : return false
         tkTextBox_SetEnterPressedCallback( p->wEdit, @LtEditEnterPressed )
         tkTextBox_SetFocusCallback( p->wEdit, @LtEditFocusChanged )
         tkTextBox_SetMessageCallback( p->wEdit, @LtEditMessage )
@@ -1027,8 +1259,6 @@ private function LtBeginEdit( byval p as TKLISTTREE_STATE ptr, byval row as inte
         LtApplyEditColors( p )
     end if
     if p->pRowFont then tkTextBox_SetFont( p->wEdit, p->pRowFont )
-    p->editRow = row
-    p->editCol = col
     dim as integer nCols = LtColCount( p ), xLeft, xRight
     if (col > 0) andalso (col < nCols) then
         dim as TKRECT rcCol
@@ -1037,6 +1267,7 @@ private function LtBeginEdit( byval p as TKLISTTREE_STATE ptr, byval row as inte
     else
         xLeft = rcRow.left + LtRowLevelIndentPx( p, row )
         if p->bShowTwisty then xLeft += LtTwistyPx( p )
+        xLeft += LtCheckBandPx( p, row )          ' C1: column 0 starts after the check box
         xRight = rcRow.right
         if nCols > 0 then
             dim as TKRECT rcCol0
@@ -1163,8 +1394,14 @@ private sub LtPaintSurface( byval p as TKLISTTREE_STATE ptr, byval b as TK_PAINT
             pi.hasChildren = p->HasChildrenAt( modelRow )
             pi.isExpanded = (pRow->bCollapsed = false)
             dim as integer lvlIndent = LtRowLevelIndentPx( p, modelRow )
-            dim as integer indentPx = lvlIndent + iif( p->bShowTwisty, LtTwistyPx( p ), 0 )
+            dim as integer indentPx = lvlIndent + iif( p->bShowTwisty, LtTwistyPx( p ), 0 ) + LtCheckBandPx( p, modelRow )
             pi.indent = indentPx
+            if LtCheckCellRect( p, modelRow, y, pi.rcCheck ) then
+                pi.isCheckable = true
+                pi.checkState = pRow->check
+                pi.isCheckHot = (modelRow = p->checkHotRow)
+                pi.isCheckPressed = (modelRow = p->checkPressRow) andalso p->bCheckPressInside
+            end if
             if p->bShowTwisty andalso pi.hasChildren then
                 tkRect_Set( pi.rcTwisty, lvlIndent, y, lvlIndent + LtTwistyPx( p ), y + ih )
             end if
@@ -1203,6 +1440,12 @@ private sub LtPaintSurface( byval p as TKLISTTREE_STATE ptr, byval b as TK_PAINT
                 else
                     LtPaintChevron( b, pi.rcTwisty, pi.isExpanded, p->TwistyColor )
                 end if
+            end if
+            ' the box, after the row as the twisty is -- unless the host's painter draws it
+            if pi.isCheckable andalso (p->bCheckOwnerDraw = false) then
+                dim as boolean bOn = tkWidget_IsEnabled( p->hWin ) andalso pi.isSelectable
+                dim as long nMood = tkCheckBox_ResolveMood( bOn, pi.isCheckPressed, pi.isCheckHot )
+                tkCheckBox_PaintMark( b, pi.rcCheck, pi.checkState, @p->checkColors, nMood )
             end if
         next
     end if
@@ -1245,6 +1488,10 @@ private function LtMakeMsg( byval p as TKLISTTREE_STATE ptr, byval m as TK_MSG p
     mi.clicks = m->clicks : mi.wheelY = m->wheelY : mi.idx = idx
     mi.isCtrl = ((km and TK_KMOD_PRIMARY) <> 0)             ' Cmd on macOS
     mi.isShift = ((km and SDL_KMOD_SHIFT) <> 0)
+    select case m->msg
+    case TKM_LBUTTONDOWN, TKM_LBUTTONUP, TKM_RBUTTONDOWN, TKM_MOUSEMOVE
+        mi.onCheck = (idx >= 0) andalso LtPointOverCheck( p, cint( m->x ), idx )
+    end select
     return mi
 end function
 
@@ -1274,6 +1521,21 @@ private sub LtButtonDown( byval p as TKLISTTREE_STATE ptr, byval m as TK_MSG ptr
     dim as integer modelRow = p->VisibleToModel( vis )
     dim as TKLISTTREE_ROWINFO ptr pRow = p->GetRow( modelRow )
     dim as TKLISTTREE_MESSAGEINFO mi = LtMakeMsg( p, m, modelRow )
+    if mi.onCheck then
+        ' C1: a press on the box -- checked on release over it (tkCheckBox's press model); the
+        ' row becomes the focus row, the selection is left alone, no drag, no edit. A double
+        ' click is two presses here, so two toggles, and never Activate.
+        if p->bEditing then LtEndEdit( p, true )
+        if p->rows(modelRow).bSelectable then p->focusRow = modelRow
+        if LtCanUserCheck( p, modelRow ) then
+            p->checkPressRow = modelRow
+            p->bCheckPressInside = true
+            tkHost_SetCapture( w )
+        end if
+        tkWidget_Invalidate( w )
+        LtCallMsg( p, mi )
+        exit sub
+    end if
     if m->clicks >= 2 then
         ' vendor's WM_LBUTTONDBLCLK: it stands in for the pair's second press
         if p->PreventDblClick then
@@ -1315,6 +1577,7 @@ private sub LtButtonDown( byval p as TKLISTTREE_STATE ptr, byval m as TK_MSG ptr
             p->dragAnchorRow = modelRow
             p->dragStartX = x : p->dragStartY = y
         end if
+        if p->bCheckOnClick then LtUserCheck( p, modelRow, false )     ' C1: one click selects and checks
         dim as boolean bWantEdit = false
         if p->bClickToEdit andalso p->bLabelEdit andalso bWasCurrent then bWantEdit = (deferSel = false)
         if bWantEdit then LtBeginEdit( p, modelRow, p->editGestureCol )
@@ -1324,6 +1587,19 @@ end sub
 
 private sub LtButtonUp( byval p as TKLISTTREE_STATE ptr, byval m as TK_MSG ptr )
     dim as integer x = cint( m->x ), y = cint( m->y )
+    if p->checkPressRow >= 0 then
+        ' C1: the box's release. Cleared BEFORE the capture goes, so CAPTURECHANGED sees no press.
+        dim as integer r = p->checkPressRow
+        dim as integer visUp = LtVisIndexFromPoint( p, x, y )
+        dim as boolean bInside = (visUp >= 0) andalso (p->VisibleToModel( visUp ) = r) andalso LtPointOverCheck( p, x, r )
+        p->checkPressRow = -1 : p->bCheckPressInside = false
+        if tkHost_GetCapture( p->wSurf->pHost ) = p->wSurf then tkHost_ReleaseCapture( p->wSurf->pHost )
+        tkWidget_Invalidate( p->wSurf )
+        if bInside then LtUserCheck( p, r, false )
+        dim as TKLISTTREE_MESSAGEINFO miUp = LtMakeMsg( p, m, iif( visUp >= 0, p->VisibleToModel( visUp ), -1 ) )
+        LtCallMsg( p, miUp )
+        exit sub
+    end if
     if p->bDragActive then
         LtUpdateDragTarget( p, x, y )
         LtCommitDrop( p )
@@ -1366,6 +1642,17 @@ private sub LtMouseMove( byval p as TKLISTTREE_STATE ptr, byval m as TK_MSG ptr 
         end if
     end if
     dim as integer vis = LtVisIndexFromPoint( p, x, y )
+    if p->checkPressRow >= 0 then
+        ' C1: a held box press shows pressed only while the cursor is still over that box
+        dim as boolean bIn = (vis >= 0) andalso (p->VisibleToModel( vis ) = p->checkPressRow) _
+                             andalso LtPointOverCheck( p, x, p->checkPressRow )
+        if bIn <> p->bCheckPressInside then p->bCheckPressInside = bIn : tkWidget_Invalidate( p->wSurf )
+    end if
+    if (vis >= 0) andalso LtPointOverCheck( p, x, p->VisibleToModel( vis ) ) then
+        LtSetCheckHot( p, p->VisibleToModel( vis ) )
+    else
+        LtSetCheckHot( p, -1 )
+    end if
     p->nLastHotCol = LtColFromX( p, x )
     if vis >= 0 then LtSetHot( p, vis )
     dim as TKLISTTREE_MESSAGEINFO mi = LtMakeMsg( p, m, iif( vis >= 0, p->VisibleToModel( vis ), -1 ) )
@@ -1413,7 +1700,23 @@ private function LtKeyDown( byval p as TKLISTTREE_STATE ptr, byval m as TK_MSG p
     case SDLK_END : LtMoveFocusVis( p, p->visibleCount - 1, isShift, isCtrl, -1, true ) : return true
     case SDLK_LEFT : LtKeyLeft( p ) : return true
     case SDLK_RIGHT : LtKeyRight( p ) : return true
-    case SDLK_SPACE : LtKeySpace( p ) : return true
+    case SDLK_SPACE
+        ' C1: with check boxes, Space checks (the selection follows the focus row) and
+        ' Ctrl+Space is the old Space; without them, Space is unchanged
+        if p->bCheckBoxes andalso (isCtrl = false) then
+            LtUserCheck( p, p->focusRow, true )
+        else
+            LtKeySpace( p )
+        end if
+        return true
+    case SDLK_KP_PLUS, SDLK_PLUS, SDLK_EQUALS       ' the =+ key is the Plus key (tkKeys)
+        if p->bCheckBoxes = false then return false
+        LtUserCheck( p, p->focusRow, true, LT_CHECK_CHECKED )
+        return true
+    case SDLK_KP_MINUS, SDLK_MINUS
+        if p->bCheckBoxes = false then return false
+        LtUserCheck( p, p->focusRow, true, LT_CHECK_UNCHECKED )
+        return true
     case SDLK_F2
         if p->bLabelEdit then LtBeginEdit( p, p->focusRow, p->editGestureCol )
         return true
@@ -1449,6 +1752,7 @@ function LtSurfaceProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boo
     case TKM_MOUSELEAVE
         p->nLastHotCol = -1
         LtSetHot( p, -1 )
+        LtSetCheckHot( p, -1 )
         dim as TKLISTTREE_MESSAGEINFO mi = LtMakeMsg( p, m, -1 )
         LtCallMsg( p, mi )
         return true
@@ -1484,6 +1788,7 @@ function LtSurfaceProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boo
         return true
     case TKM_CAPTURECHANGED
         if p->bDragActive orelse p->bDragArmed then LtCancelDrag( p )
+        if p->checkPressRow >= 0 then p->checkPressRow = -1 : p->bCheckPressInside = false : tkWidget_Invalidate( w )
         return true
     end select
     return false
@@ -2595,7 +2900,190 @@ public function tkListTree_GetSurface( byval hList as TK_WIDGET ptr ) as TK_WIDG
     return p->wSurf
 end function
 
+' ---- check boxes (C1, docs/tkControls/CHECKED-LISTS.md §4 in claude-docs) -----------------
+' A box per non-header row, after the twisty. Setters are silent; only the user's gestures (a
+' click on the box, Space, + / -, a row click with CheckOnClick) fire ItemCheck / ItemChecked.
+public function tkListTree_SetCheckBoxes( byval hList as TK_WIDGET ptr, byval enable as boolean = true ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p = 0 then return false
+    if p->bEditing then LtEndEdit( p, true )      ' column 0 moves under an open editor
+    p->bCheckBoxes = enable
+    p->checkHotRow = -1 : p->checkPressRow = -1
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
+public function tkListTree_GetCheckBoxes( byval hList as TK_WIDGET ptr ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    return (p <> 0) andalso p->bCheckBoxes
+end function
+
+public function tkListTree_SetCheckMode( byval hList as TK_WIDGET ptr, byval nMode as long ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if (p = 0) orelse (nMode < LT_CHECKMODE_TWOSTATE) orelse (nMode > LT_CHECKMODE_THREESTATE) then return false
+    p->nCheckMode = nMode
+    return true
+end function
+
+public function tkListTree_GetCheckMode( byval hList as TK_WIDGET ptr ) as long
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    return iif( p <> 0, p->nCheckMode, LT_CHECKMODE_TWOSTATE )
+end function
+
+' The tree cascade: a user's check takes the row's subtree with it and re-derives its ancestors
+' (all checked / all unchecked / mixed). Turning it on does not re-derive: call RecomputeChecks.
+public function tkListTree_SetCheckCascade( byval hList as TK_WIDGET ptr, byval enable as boolean = true ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p = 0 then return false
+    p->bCheckCascade = enable
+    return true
+end function
+
+public function tkListTree_GetCheckCascade( byval hList as TK_WIDGET ptr ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    return (p <> 0) andalso p->bCheckCascade
+end function
+
+public function tkListTree_SetCheckOnClick( byval hList as TK_WIDGET ptr, byval enable as boolean = true ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p = 0 then return false
+    p->bCheckOnClick = enable
+    return true
+end function
+
+public function tkListTree_GetCheckOnClick( byval hList as TK_WIDGET ptr ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    return (p <> 0) andalso p->bCheckOnClick
+end function
+
+' Silent. bCascade applies the tree cascade as a user's check would (subtree + ancestors).
+public function tkListTree_SetCheck( byval hList as TK_WIDGET ptr, byval row as integer, byval state as long, _
+                                    byval bCascade as boolean = false ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if (p = 0) orelse (p->IsValidRow( row ) = false) then return false
+    if (state < LT_CHECK_UNCHECKED) orelse (state > LT_CHECK_MIXED) then return false
+    if p->rows(row).IsHeader orelse (p->rows(row).bCheckable = false) then return false
+    if bCascade then
+        dim as boolean bWas = p->bCheckCascade
+        p->bCheckCascade = true
+        LtApplyCheck( p, row, state )
+        p->bCheckCascade = bWas
+    else
+        LtSetCheckRaw( p, row, state )
+    end if
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
+public function tkListTree_GetCheck( byval hList as TK_WIDGET ptr, byval row as integer ) as long
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if (p = 0) orelse (p->IsValidRow( row ) = false) then return LT_CHECK_UNCHECKED
+    return p->rows(row).check
+end function
+
+' Not checkable: no box (the band stays, so text keeps its column), never toggled, left out of
+' the cascade. Its state is kept.
+public function tkListTree_SetRowCheckable( byval hList as TK_WIDGET ptr, byval row as integer, byval bCheckable as boolean = true ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if (p = 0) orelse (p->IsValidRow( row ) = false) then return false
+    p->rows(row).bCheckable = bCheckable
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
+public function tkListTree_GetRowCheckable( byval hList as TK_WIDGET ptr, byval row as integer ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if (p = 0) orelse (p->IsValidRow( row ) = false) then return false
+    return p->rows(row).bCheckable andalso (p->rows(row).IsHeader = false)
+end function
+
+' Every checkable row to state; silent.
+public sub tkListTree_CheckAll( byval hList as TK_WIDGET ptr, byval state as long )
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if (p = 0) orelse (state < LT_CHECK_UNCHECKED) orelse (state > LT_CHECK_MIXED) then exit sub
+    for i as integer = 0 to p->rowCount - 1
+        LtSetCheckRaw( p, i, state )
+    next
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' Every parent derived from its children, bottom up, in one O(n) pass; silent. For after a bulk
+' load into a cascading tree.
+public sub tkListTree_RecomputeChecks( byval hList as TK_WIDGET ptr )
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p = 0 then exit sub
+    LtRecomputeChecks( p )
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' Rows whose state is LT_CHECK_CHECKED (mixed ones are not counted).
+public function tkListTree_GetCheckedCount( byval hList as TK_WIDGET ptr ) as integer
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p = 0 then return 0
+    dim as integer n = 0
+    for i as integer = 0 to p->rowCount - 1
+        if (p->rows(i).check = LT_CHECK_CHECKED) andalso p->rows(i).bCheckable andalso (p->rows(i).IsHeader = false) then n += 1
+    next
+    return n
+end function
+
+public function tkListTree_GetCheckedItems( byval hList as TK_WIDGET ptr, checkedRows() as integer ) as integer
+    dim as integer n = tkListTree_GetCheckedCount( hList )
+    if n = 0 then erase checkedRows : return 0
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    redim checkedRows( 0 to n - 1 )
+    dim as integer k = 0
+    for i as integer = 0 to p->rowCount - 1
+        if (p->rows(i).check = LT_CHECK_CHECKED) andalso p->rows(i).bCheckable andalso (p->rows(i).IsHeader = false) then checkedRows(k) = i : k += 1
+    next
+    return n
+end function
+
+' The box's cell, surface-local; FALSE when the row has no box or is not on screen.
+public function tkListTree_GetCheckRect( byval hList as TK_WIDGET ptr, byval row as integer, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p = 0 then return false
+    dim as TKRECT rcRow
+    if LtVisIndexRect( p, p->ModelToVisible( row ), rcRow ) = false then return false
+    return LtCheckCellRect( p, row, rcRow.top, rc )
+end function
+
+' Pins the boxes' colours (apart from the rows' own pin); UnpinColors gives both back to the theme.
+public sub tkListTree_SetCheckColors( byval hList as TK_WIDGET ptr, byval pColors as TKCHECKBOX_COLORS ptr )
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->checkColors = *pColors
+    p->bCheckColorsPinned = true
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+public sub tkListTree_GetCheckColors( byval hList as TK_WIDGET ptr, byval pColors as TKCHECKBOX_COLORS ptr )
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if (p <> 0) andalso (pColors <> 0) then *pColors = p->checkColors
+end sub
+
+' The host's row painter draws the box itself, from pi->rcCheck / checkState / isCheckHot /
+' isCheckPressed (tkCheckBox_PaintMark is the stock look). The hit test is unchanged.
+public function tkListTree_SetCheckOwnerDraw( byval hList as TK_WIDGET ptr, byval enable as boolean = true ) as boolean
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p = 0 then return false
+    p->bCheckOwnerDraw = enable
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
 ' ---- callback registration ----------------------------------------------------------------
+public sub tkListTree_SetItemCheckCallback( byval hList as TK_WIDGET ptr, byval userfunc as LT_ItemCheckCallbackFunc )
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p then p->ItemCheckCallback = userfunc
+end sub
+
+public sub tkListTree_SetItemCheckedCallback( byval hList as TK_WIDGET ptr, byval usersub as LT_ItemCheckedCallbackSub )
+    dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
+    if p then p->ItemCheckedCallback = usersub
+end sub
+
 public sub tkListTree_SetPaintCallback( byval hList as TK_WIDGET ptr, byval usersub as LT_PaintCallbackSub )
     dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
     if p = 0 then exit sub
@@ -2689,6 +3177,8 @@ public sub tkListTree_ApplyTheme( byval hList as TK_WIDGET ptr, byref t as TKTHE
     dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
     if p = 0 then exit sub
     ApplyThemeShape( hList )
+    ' C1: the boxes are tkCheckBox's colours for the theme; their own pin, kept apart
+    if p->bCheckColorsPinned = false then p->checkColors = tkCheckBox_ThemeColors( tkTheme_Styled( hList, t ) )
     if p->bColorsPinned then exit sub
     dim as TKTHEME_COLORS s = tkTheme_Styled( hList, t )     ' no colour struct: a style, no recipe
     p->BackColor = s.Window
@@ -2708,6 +3198,7 @@ public sub tkListTree_UnpinColors( byval hList as TK_WIDGET ptr )
     dim as TKLISTTREE_STATE ptr p = GetListTreePointer( hList )
     if p = 0 then exit sub
     p->bColorsPinned = false
+    p->bCheckColorsPinned = false
     tkListTree_ApplyTheme( hList, tkTheme_Of( hList ) )
 end sub
 

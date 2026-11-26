@@ -277,6 +277,8 @@ All silent unless marked otherwise.
 | `tkCalendar_SetNavStep( hCtrl, nStep as long )` | 0 (the default) = a chevron advances by the whole page, so a one-panel calendar steps a month and a twelve-panel grid steps a year. A positive value steps that many months regardless of panel count: `SetNavStep(1)` on a two-panel calendar gives the sliding range-picker idiom. Negatives are clamped to 0. In the drill-down views a step is a year (months) or a decade (years). |
 | `tkCalendar_GetShowTodayRing( hCtrl ) as boolean` | Whether today's cell gets an outline. |
 | `tkCalendar_SetShowTodayRing( hCtrl, bShow as boolean )` | Default TRUE. |
+| `tkCalendar_SetActivateOnClick( hCtrl, bOn as boolean )` / `Get...` | Default FALSE (a double-click activates, as MonthCal). TRUE is a phone's rule: one tap on a day activates it -- `SelChange` when the day changed, then `DateActivated` -- and a tap on the day already selected activates it again. |
+| `tkCalendar_SetTitleZoom( hCtrl, bOn as boolean )` / `Get...` | Default TRUE: a click on the title drills out to months and years. FALSE makes the title a label (a phone's month grid, changed by the chevrons or a swipe). |
 | `tkCalendar_IsPrevDisabled( hCtrl ) as boolean` | TRUE when the previous chevron would reveal nothing selectable. |
 | `tkCalendar_IsNextDisabled( hCtrl ) as boolean` | Likewise for next. Both account for the panel count: with two panels stepping one month, "next" only dies when the genuinely *new* month falls outside the range, one month later than a single-panel calendar would. |
 

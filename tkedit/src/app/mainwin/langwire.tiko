@@ -1,0 +1,294 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' langwire -- the project's languages (Form > Languages..., Translatable's "..."): the dialog opened
+' on every translatable form's texts, its catalogs written, the generated appLanguages module kept
+' current for a build, the catalogs not built in copied beside the program, and a renamed control's
+' translations carried to its new name.
+#module "mainwin"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
+#import "tkc/i18n"
+#import "tka/documents"
+#import "tkd/canvas"
+#import "tkd/model"
+#import "tkd/validate"
+#import "tkd/formfile"
+#import "tkd/codegen"
+#import "tkd/langfile"
+#import "tkd/langdlg"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkMessageBox"
+using containers
+using tkApp
+using tkHost
+using tkMessageBox
+using model
+
+' The open project's appLanguages/appLanguages.tklang ("" with no project open).
+function Window.LanguagesPath( ) as ustring
+    if ProjOpen = false then return ""
+    return fs.PathJoin( fs.PathParent( Proj.Path ), langfile.LANG_MODULE, langfile.LANG_MODULE & ".tklang" )
+end function
+
+' The project's languages: appLanguages/appLanguages.tklang, none but the forms' own, and its module.
+' One already there is kept.
+private function CreateLanguageFiles_( byref path as const ustring ) as boolean
+    if fs.IsFile( path ) then return true
+    dim as ustring folder = fs.PathParent( path )
+    fs.CreateDirAll( fs.PathJoin( folder, langfile.LANG_DIR ) )
+    dim as ustring text = langfile.DefaultProjectText( )
+    dim as langfile.LangProject proj
+    dim as ustring e
+    if langfile.ParseProject( text, proj, e ) = false then return false
+    if fs.WriteAtomic( path, text ).IsOk( ) = false then return false
+    return fs.WriteAtomic( fs.PathJoin( folder, langfile.LANG_MODULE & ".design.tiko" ), _
+                           langfile.Generate( proj, langfile.LANG_MODULE, langfile.LANG_MODULE & ".tklang", text ) ).IsOk( )
+end function
+
+' A file's text: its open buffer's, else the disk's ("" when neither).
+function Window.TextOf( byref path as const ustring ) as ustring
+    dim as DocRef d = OpenDocAt_( Docs, path )
+    if d then return codegen.WithoutCr( d->Text( ) )
+    dim as ustring none
+    return codegen.WithoutCr( fs.ReadAllText( path ).ValueOr( none ) )
+end function
+
+' A file written through its open buffer (saved), else atomically. False when it couldn't be.
+function Window.PutText( byref path as const ustring, byref text as const ustring ) as boolean
+    dim as DocRef d = OpenDocAt_( Docs, path )
+    if d then
+        if codegen.WithoutCr( d->Text( ) ) = text then return true
+        d->Main.ReplaceAllText( text )
+        return this.SaveDoc( d, false )
+    end if
+    if fs.IsFile( path ) andalso (this.TextOf( path ) = text) then return true
+    fs.CreateDirAll( fs.PathParent( path ) )
+    if fs.WriteAtomic( path, text ).IsOk( ) then return true
+    this.SetMessage( fs.PathFileName( path ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+    return false
+end function
+
+' appLanguages.design.tiko from a .tklang's text. False, with a message, when it has a problem.
+function Window.WriteLanguagesGenerated( byref path as const ustring, byref text as const ustring ) as boolean
+    dim as langfile.LangProject proj
+    dim as ustring e
+    dim as Array( of ustring ) problems
+    if langfile.ParseProject( text, proj, e ) = false then
+        problems.Push( e )
+    else
+        langfile.CheckProject( proj, fs.PathParent( path ), problems )
+    end if
+    if problems.Count( ) then
+        this.SetMessage( fs.PathFileName( path ) & ": " & problems[0] )
+        return false
+    end if
+    dim as ustring generated = langfile.Generate( proj, fs.PathStem( path ), fs.PathFileName( path ), text )
+    dim as ustring target = left( path, instrrev( path, "." ) - 1 ) & ".design.tiko", none
+    if fs.IsFile( target ) then
+        if codegen.WithoutCr( fs.ReadAllText( target ).ValueOr( none ) ) = generated then return true
+    end if
+    if fs.WriteAtomic( target, generated ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( target ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    return true
+end function
+
+' Before a build: the project's appLanguages module from its .tklang (open or not). True when there
+' is none.
+function Window.PrepareLanguages( ) as boolean
+    dim as ustring path = this.LanguagesPath( )
+    if (len( path ) = 0) orelse (fs.IsFile( path ) = false) then return true
+    return this.WriteLanguagesGenerated( path, this.TextOf( path ) )
+end function
+
+' After a build: the catalogs not built in, copied beside the program (lang/), where Register looks
+' first. A copy already there and as new is kept.
+sub Window.CopyLanguageFiles( byref exePath as const ustring )
+    dim as ustring path = this.LanguagesPath( )
+    if (len( path ) = 0) orelse (len( exePath ) = 0) orelse (fs.IsFile( path ) = false) then exit sub
+    dim as langfile.LangProject proj
+    dim as ustring e
+    if langfile.ParseProject( this.TextOf( path ), proj, e ) = false then exit sub
+    dim as ustring dst = fs.PathJoin( fs.PathParent( exePath ), langfile.LANG_DIR )
+    for each x as langfile.LangInfo in proj.Languages
+        if x.Embed then continue for
+        dim as ustring src = fs.PathJoin( fs.PathParent( path ), langfile.LANG_DIR, x.Code & ".toml" )
+        if fs.IsFile( src ) = false then continue for
+        fs.CreateDirAll( dst )
+        fs.CopyFile( src, fs.PathJoin( dst, x.Code & ".toml" ), true )
+    next
+end sub
+
+' Every key the project's translatable forms ask for, form by form: an open form as it stands on its
+' canvas, any other as its file has it. A form with a problem is left out (its build says why).
+function Window.ProjectTexts( ) as Array( of codegen.TrEntry )
+    dim as Array( of codegen.TrEntry ) all_
+    if ProjOpen = false then return all_
+    dim as Array( of ustring ) files
+    ProjectRefFiles_( fs.PathParent( Proj.Path ), files, 0 )
+    for each p as ustring in files
+        if lcase( right( p, 7 ) ) <> ".tkform" then continue for
+        dim as FormDoc doc
+        dim as DocRef d = OpenDocAt_( Docs, p )
+        if (d <> 0) andalso (d->Designer <> 0) then
+            doc = d->Designer->Doc
+        else
+            dim as ustring e
+            if formfile.Parse( this.TextOf( p ), doc, e ) = false then continue for
+        end if
+        if doc.Translate = false then continue for
+        dim as Array( of ustring ) problems
+        validate.Check( doc, fs.PathStem( p ), problems )
+        if problems.Count( ) then continue for
+        dim as Array( of codegen.TrEntry ) one = codegen.TranslatableTexts( doc, fs.PathStem( p ) )
+        for each t as codegen.TrEntry in one
+            all_.Push( t )
+        next
+    next
+    return all_
+end function
+
+private function LangAsk_( byval owner as any ptr, byref text as const ustring ) as boolean
+    dim as Window ptr w = owner
+    return w->Ask( w->form, text, MBX_BTN_YESNO ) = MBX_IDYES
+end function
+
+' Languages. c: the form whose Translatable "..." opened it (its texts are shown first, and it is made
+' Translatable if it wasn't), or 0 from the Form menu. True on OK.
+function Window.EditLanguages( byval c as canvas.FormCanvas ptr ) as boolean
+    if (ProjOpen = false) orelse (LangDlg <> 0) then
+        if ProjOpen = false then this.SetMessage( i18n.Tr( "designer.lang_needs_project", "Languages belong to a project: open or make one first" ) )
+        return false
+    end if
+    dim as ustring path = this.LanguagesPath( )
+    if CreateLanguageFiles_( path ) = false then
+        this.SetMessage( langfile.LANG_MODULE & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    dim as ustring formName
+    if c then
+        dim as DocRef d = this.DocOfCanvas( c )
+        if (d <> 0) andalso (len( d->Path ) > 0) then formName = fs.PathStem( d->Path )
+        if c->Doc.Translate = false then
+            ' its "..." is how a form is translated: it is made Translatable first
+            dim as FormDoc trial = c->Doc
+            trial.Translate = true
+            dim as ustring fault = c->ApplyEdit( trial, false, "" )
+            if len( fault ) then
+                this.SetMessage( fault )
+                return false
+            end if
+        end if
+    end if
+
+    dim as langfile.LangProject proj
+    dim as ustring e
+    if langfile.ParseProject( this.TextOf( path ), proj, e ) = false then
+        this.SetMessage( fs.PathFileName( path ) & ": " & e )
+        return false
+    end if
+    dim as Array( of langfile.Catalog ) cats
+    for each x as langfile.LangInfo in proj.Languages
+        dim as langfile.Catalog cat
+        dim as ustring cp = fs.PathJoin( fs.PathParent( path ), langfile.LANG_DIR, x.Code & ".toml" )
+        if fs.IsFile( cp ) orelse (OpenDocAt_( Docs, cp ) <> 0) then
+            if langfile.ParseCatalog( this.TextOf( cp ), cat, e ) = false then
+                this.SetMessage( langfile.CatalogFile( x.Code ) & ": " & e )
+                return false                    ' rather than write over what couldn't be read
+            end if
+        end if
+        if len( cat.Name ) = 0 then cat.Name = x.Name
+        cats.Push( cat )
+    next
+    dim as Array( of codegen.TrEntry ) texts = this.ProjectTexts( )
+
+    LangDlg = new langdlg.LanguagesDialog
+    LangDlg->Owner = @this
+    LangDlg->Ask = @LangAsk_
+    LangDlg->Open( form, proj, cats, texts, formName )
+    if LangDlg->Win = 0 then
+        delete LangDlg
+        LangDlg = 0
+        return false
+    end if
+    dim as boolean ok = LangDlg->RunModal( )
+    dim as langdlg.LanguagesDialog ptr dlg = LangDlg
+    LangDlg = 0
+    if ok andalso dlg->Changed( ) then this.ApplyLanguages( *dlg )
+    dlg->Close( )
+    delete dlg
+    return ok
+end function
+
+' OK: the .tklang and every catalog written, the catalogs of removed and renamed languages deleted,
+' the module made again, and main made to use it.
+sub Window.ApplyLanguages( byref dlg as langdlg.LanguagesDialog )
+    dim as ustring path = this.LanguagesPath( )
+    dim as ustring dir_ = fs.PathParent( path )
+    dim as Array( of ustring ) keep
+    for i as long = 0 to dlg.Proj.Languages.Count( ) - 1
+        dim as ustring cp = fs.PathJoin( dir_, langfile.LANG_DIR, dlg.Proj.Languages[i].Code & ".toml" )
+        dlg.Cats[i].Name = dlg.Proj.Languages[i].Name
+        if this.PutText( cp, langfile.CatalogText( dlg.Cats[i] ) ) = false then exit sub
+        keep.Push( lcase( dlg.Proj.Languages[i].Code ) )
+    next
+    dim as Array( of ustring ) old = dlg.OldFiles( )
+    for each code as ustring in old
+        dim as boolean kept = false
+        for each k as ustring in keep
+            if k = lcase( code ) then kept = true
+        next
+        if kept = false then fs.RemoveFile( fs.PathJoin( dir_, langfile.LANG_DIR, code & ".toml" ) )
+    next
+    dim as ustring text = langfile.ProjectText( dlg.Proj )
+    if this.PutText( path, text ) = false then exit sub
+    this.WriteLanguagesGenerated( path, text )
+
+    ' the project's main uses them, before its first form is built
+    dim as ustring mainPath = fs.PathJoin( fs.PathParent( Proj.Path ), "main.tiko" ), outText
+    dim as ustring mainText = this.TextOf( mainPath )
+    dim as boolean byHand = false
+    if (len( mainText ) > 0) andalso (dlg.Proj.Languages.Count( ) > 0) then
+        select case langfile.InstallIntoMain( mainText, outText )
+        case 1
+            dim as DocRef mainDoc = OpenDocAt_( Docs, mainPath )
+            if mainDoc then mainDoc->Main.ReplaceAllText( outText ) else fs.WriteAtomic( mainPath, outText )
+        case -1
+            byHand = true
+        end select
+    end if
+    if byHand then
+        this.SetMessage( i18n.Tr( "designer.lang_main_by_hand", "main.tiko: add appLanguages.Register( ) and appLanguages.UseSystem( ) after tkApp_Init" ) )
+    else
+        this.SetMessage( i18n.Tr( "designer.lang_saved", "Languages saved" ) )
+    end if
+end sub
+
+' A translatable form's control renamed: its translations in every catalog go by the new name. Written
+' at once (the rename is undone in the form alone).
+sub Window.RenameLanguageKeys( byval c as canvas.FormCanvas ptr, byref oldName as const ustring, byref newName as const ustring )
+    if (c = 0) orelse (c->Doc.Translate = false) then exit sub
+    dim as DocRef d = this.DocOfCanvas( c )
+    dim as ustring path = this.LanguagesPath( )
+    if (d = 0) orelse (len( d->Path ) = 0) orelse (len( path ) = 0) orelse (fs.IsFile( path ) = false) then exit sub
+    dim as ustring moduleName = fs.PathStem( d->Path )
+    dim as langfile.LangProject proj
+    dim as ustring e
+    if langfile.ParseProject( this.TextOf( path ), proj, e ) = false then exit sub
+    for each x as langfile.LangInfo in proj.Languages
+        dim as ustring cp = fs.PathJoin( fs.PathParent( path ), langfile.LANG_DIR, x.Code & ".toml" )
+        dim as langfile.Catalog cat
+        if langfile.ParseCatalog( this.TextOf( cp ), cat, e ) = false then continue for
+        if langfile.RenameKeys( cat, moduleName & "." & oldName & ".", moduleName & "." & newName & "." ) then
+            this.PutText( cp, langfile.CatalogText( cat ) )
+        end if
+    next
+end sub

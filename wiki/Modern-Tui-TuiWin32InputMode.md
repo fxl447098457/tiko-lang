@@ -20,7 +20,7 @@ Windows only. The console input mode Enter will install, as a pure function of t
 #import "std/tui"
 using tui
 
-#ifdef __FB_WIN32__
+#ifdef TIKO_OS_WINDOWS
     dim as DWORD found = ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT or _
                          ENABLE_PROCESSED_INPUT or ENABLE_QUICK_EDIT_MODE
 

@@ -7,6 +7,7 @@
 #import "vendor/tkControls/tkTest"
 using tkListTree
 using tkTextBox
+using tkCheckBox
 using tkColumnHeader
 using tkTooltip
 using tkTheme
@@ -33,9 +34,45 @@ end sub
 function OnEndEdit( byval h as TK_WIDGET ptr, byval row as integer, byval newText as ustring ) as boolean
     return gRejectEdit = false
 end function
+dim shared as boolean gRejectBegin
+dim shared as integer gBeginRow = -2, gBeginEditRow = -2, gBeginEditCol = -2
+function OnBeginEdit( byval h as TK_WIDGET ptr, byval row as integer ) as boolean
+    gBeginRow = row
+    gBeginEditRow = tkListTree_GetEditRow( h )
+    gBeginEditCol = tkListTree_GetEditCol( h )
+    return gRejectBegin = false
+end function
 sub OnPaint( byval p as TKLISTTREE_PAINTINFO ptr )
     gPaints += 1 : gPaintList = p->hList
     tkListTree_PaintRowDefault( p )
+end sub
+
+' ---- C1: check boxes -------------------------------------------------------------------------
+dim shared as long gItemCheck, gItemChecked, gIcOld, gIcNew, gIcdRow, gIcdState, gRewrite = -1
+dim shared as boolean gVetoCheck, gDownOnCheck
+dim shared as long gIndent(0 to 63)
+sub OnPaintK( byval p as TKLISTTREE_PAINTINFO ptr )
+    if (p->itemID >= 0) andalso (p->itemID <= 63) then gIndent(p->itemID) = p->indent
+    tkListTree_PaintRowDefault( p )
+end sub
+function OnItemCheck( byval h as TK_WIDGET ptr, byval row as integer, byval oldState as long, byref newState as long ) as boolean
+    gItemCheck += 1 : gIcOld = oldState : gIcNew = newState
+    ' BEFORE the change: the getter still answers the old state
+    if tkListTree_GetCheck( h, row ) <> oldState then gIcOld = -99
+    if gRewrite >= 0 then newState = gRewrite
+    return gVetoCheck = false
+end function
+sub OnItemChecked( byval h as TK_WIDGET ptr, byval row as integer, byval newState as long )
+    gItemChecked += 1 : gIcdRow = row : gIcdState = newState
+    if tkListTree_GetCheck( h, row ) <> newState then gIcdState = -99     ' AFTER: the getter agrees
+end sub
+function OnMsgK( byval m as TKLISTTREE_MESSAGEINFO ptr ) as boolean
+    if m->msg = TKM_LBUTTONDOWN then gDownOnCheck = m->onCheck
+    return false
+end function
+sub ResetCheckCounts()
+    gItemCheck = 0 : gItemChecked = 0 : gIcOld = -1 : gIcNew = -1 : gIcdRow = -1 : gIcdState = -1
+    gVetoCheck = false : gRewrite = -1
 end sub
 
 ' Window-pixel centre of visible row v (column x optional, surface-local).
@@ -232,6 +269,16 @@ sub RunPass( byval fScale as single )
     ClickRow( h, c, 5 )
     tkTest_Check( "clicking away commits and selects", (tkListTree_IsEditing( c ) = false) andalso (tkListTree_GetCurSel( c ) = 5) andalso (tkListTree_GetText( c, 4 ) = "clicked"), tkListTree_GetText( c, 4 ) )
     tkListTree_SetClickToEdit( c, false )
+    ' every edit so far was column 0: BeginLabelEdit must see THIS edit's cell, not the last one's
+    tkListTree_SetBeginLabelEditCallback( c, @OnBeginEdit )
+    tkTest_Check( "BeginEdit on column 2 starts", tkListTree_BeginEdit( c, 4, 2 ) andalso tkListTree_IsEditing( c ) )
+    tkTest_Check( "BeginLabelEdit sees the row and column being edited", (gBeginRow = 4) andalso (gBeginEditRow = 4) andalso (gBeginEditCol = 2), "row " & gBeginEditRow & " col " & gBeginEditCol )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    gRejectBegin = true
+    tkTest_Check( "BeginLabelEdit can veto", (tkListTree_BeginEdit( c, 5, 1 ) = false) andalso (tkListTree_IsEditing( c ) = false) )
+    tkTest_Check( "a vetoed edit leaves no edit row", tkListTree_GetEditRow( c ) = -1 )
+    gRejectBegin = false
+    tkListTree_SetBeginLabelEditCallback( c, 0 )
     tkListTree_EnableLabelEdit( c, false )
 
     ' ---- I: drag reorder -------------------------------------------------------------------
@@ -271,6 +318,220 @@ sub RunPass( byval fScale as single )
     tkTest_Check( "a colour setter pins", tkListTree_GetBackColor( c ) = &hFF102030ul )
     tkListTree_UnpinColors( c )
     tkTest_Check( "UnpinColors returns to the current theme", tkListTree_GetBackColor( c ) = tkTheme_Get().Window )
+
+    ' ---- K: check boxes (C1) -----------------------------------------------------------------
+    tkWidget_Show( c, false )
+    dim as TK_WIDGET ptr k = tkListTree_Create( tkHost_Root( h ), 600 )
+    tkListTree_SetFont( k, f10 )
+    tkListTree_SetPaintCallback( k, @OnPaintK )
+    tkListTree_SetSelChangeCallback( k, @OnSel )
+    tkListTree_SetActivateCallback( k, @OnAct )
+    tkListTree_SetItemCheckCallback( k, @OnItemCheck )
+    tkListTree_SetItemCheckedCallback( k, @OnItemChecked )
+    tkListTree_SetMessageCallback( k, @OnMsgK )
+    tkListTree_SetTreeIndent( k, true )
+    tkListTree_ShowTwisty( k, true )
+    tkWidget_SetPos( k, tkHost_Scale( h, 10 ), tkHost_Scale( h, 10 ), tkHost_Scale( h, 300 ), 10 * ih )
+    tkListTree_AddNode( k, -1, "root" )          ' 0
+    tkListTree_AddNode( k, 0, "a" )              ' 1
+    tkListTree_AddNode( k, 1, "a1" )             ' 2
+    tkListTree_AddNode( k, 1, "a2" )             ' 3
+    tkListTree_AddNode( k, 0, "b" )              ' 4
+    tkListTree_AddNode( k, 4, "b1" )             ' 5
+    tkListTree_AddNode( k, -1, "other" )         ' 6
+    dim as TK_WIDGET ptr ks = tkListTree_GetSurface( k )
+    dim as TKRECT rk, ak
+    tkTest_Check( "check boxes start off: no box", (tkListTree_GetCheckBoxes( k ) = false) andalso (tkListTree_GetCheckRect( k, 2, rk ) = false) )
+    tkListTree_SetCheckBoxes( k, true )
+    tkTest_PumpFor( h, 30 )
+    ' geometry: band after indent + twisty, box = min( 16, ih - 2*2 ) scaled, centred in band and row
+    dim as long indentPx = tkHost_Scale( h, 16 ), twPx = tkHost_Scale( h, 16 ), bandPx = tkHost_Scale( h, 20 )
+    dim as long boxPx = tkHost_Scale( h, 16 )
+    if boxPx > ih - 2 * tkHost_Scale( h, 2 ) then boxPx = ih - 2 * tkHost_Scale( h, 2 )
+    ' (the query BEFORE the check: arguments are evaluated right to left, so a detail string built
+    ' from rk inside the same call would show the rect from before the query)
+    dim as boolean bRect2 = tkListTree_GetCheckRect( k, 2, rk )
+    tkTest_Check( "GetCheckRect, level 2: indent*2 + twisty + centred in the band", bRect2 _
+        andalso (rk.left = 2 * indentPx + twPx + (bandPx - boxPx) \ 2) andalso (rk.right - rk.left = boxPx) _
+        andalso (rk.top = 2 * ih + (ih - boxPx) \ 2) andalso (rk.bottom - rk.top = boxPx), _
+        rk.left & "," & rk.top & " " & (rk.right - rk.left) & "x" & (rk.bottom - rk.top) )
+    tkListTree_GetCheckRect( k, 6, rk )
+    tkTest_Check( "GetCheckRect, level 0", (rk.left = twPx + (bandPx - boxPx) \ 2) andalso (rk.top = 6 * ih + (ih - boxPx) \ 2), rk.left & "," & rk.top )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "the painter's indent includes the band", (gIndent(2) = 2 * indentPx + twPx + bandPx) andalso (gIndent(6) = twPx + bandPx), gIndent(2) & " " & gIndent(6) )
+
+    ' pixels, with pinned box colours that name the state that painted them
+    const as ulong K_BACK = &hFF203040ul, K_BOX = &hFF2050F0ul, K_HOT = &hFF20F050ul, K_PRESS = &hFFF02020ul
+    const as ulong K_CHK = &hFF30C0C0ul
+    dim as TKCHECKBOX_COLORS kc
+    kc.BackColor = K_BACK : kc.BackColorHot = K_BACK : kc.BackColorPressed = K_BACK : kc.BackColorDisabled = K_BACK
+    kc.BoxColor = K_BOX : kc.BoxColorHot = K_HOT : kc.BoxColorPressed = K_PRESS : kc.BoxColorDisabled = &hFF505050ul
+    kc.BoxColorChecked = K_CHK : kc.BoxColorCheckedHot = K_CHK : kc.BoxColorCheckedPressed = K_CHK : kc.BoxColorCheckedDisabled = &hFF404860ul
+    tkListTree_SetCheckColors( k, @kc )
+    tkWidget_AbsRect( ks, ak )
+    tkListTree_GetCheckRect( k, 6, rk )
+    dim as long ex = ak.left + rk.left, ey = ak.top + (rk.top + rk.bottom) \ 2
+    dim as long side = rk.right - rk.left
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "pixels: an unchecked box is its outline in BoxColor", tkTest_PixelAt( h, ex, ey ) = K_BOX, hex( tkTest_PixelAt( h, ex, ey ) ) )
+    tkListTree_SetCheck( k, 6, LT_CHECK_CHECKED )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "pixels: a checked box is filled in BoxColorChecked", tkTest_PixelAt( h, ex + side \ 2, ak.top + rk.top + side \ 4 ) = K_CHK )
+    tkListTree_SetCheck( k, 6, LT_CHECK_MIXED )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "pixels: a mixed box has the bar in the back colour", tkTest_PixelAt( h, ex + side \ 2, ey ) = K_BACK, hex( tkTest_PixelAt( h, ex + side \ 2, ey ) ) )
+    tkListTree_SetCheck( k, 6, LT_CHECK_UNCHECKED )
+    tkTest_PushMotion( h, ex + side \ 2, ey )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "pixels: the hot box", tkTest_PixelAt( h, ex, ey ) = K_HOT, hex( tkTest_PixelAt( h, ex, ey ) ) )
+    tkListTree_SetCheckOwnerDraw( k, true )
+    tkHost_RenderTo( h, false )
+    dim as ulong pOwner = tkTest_PixelAt( h, ex, ey )
+    tkTest_Check( "owner draw: the control paints no box", (pOwner <> K_HOT) andalso (pOwner <> K_BOX) andalso (pOwner <> K_PRESS), hex( pOwner ) )
+    tkListTree_SetCheckOwnerDraw( k, false )
+    tkListTree_ApplyTheme( k, tkTheme_Light() )
+    dim as TKCHECKBOX_COLORS kc2
+    tkListTree_GetCheckColors( k, @kc2 )
+    tkTest_Check( "SetCheckColors pins against ApplyTheme", kc2.BoxColor = K_BOX )
+
+    ' the mouse: press + release on the box checks; selection untouched; one event each
+    ResetCounts() : ResetCheckCounts()
+    tkListTree_SetCurSel( k, 2 )
+    dim as long bx6 = rk.left + side \ 2
+    ClickRow( h, k, 6, 1, bx6 )
+    tkTest_Check( "a click on the box checks the row", tkListTree_GetCheck( k, 6 ) = LT_CHECK_CHECKED )
+    tkTest_Check( "ItemCheck BEFORE (old 0 -> new 1), ItemChecked AFTER, once each", (gItemCheck = 1) andalso (gIcOld = 0) andalso (gIcNew = 1) _
+        andalso (gItemChecked = 1) andalso (gIcdRow = 6) andalso (gIcdState = LT_CHECK_CHECKED), gItemCheck & " " & gIcOld & " " & gItemChecked & " " & gIcdState )
+    tkTest_Check( "the box click leaves the selection alone", (gSel = 0) andalso tkListTree_GetSel( k, 2 ) andalso (tkListTree_GetSel( k, 6 ) = false) )
+    tkTest_Check( "the message callback is told the press was on the box", gDownOnCheck )
+    ' press, slide off, release: nothing; the press shows only while over the box
+    dim as single px, py
+    RowXY( k, 6, px, py, bx6 )
+    tkTest_PushMotion( h, px, py )
+    tkTest_PushButton( h, true, px, py )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "a held press paints the checked colour (state 1)", tkTest_PixelAt( h, ex + side \ 2, ak.top + rk.top + side \ 4 ) = K_CHK )
+    tkTest_Check( "the press captures", tkHost_GetCapture( h ) = ks )
+    tkTest_PushMotion( h, px + tkHost_Scale( h, 120 ), py )
+    tkTest_PushButton( h, false, px + tkHost_Scale( h, 120 ), py )
+    tkTest_Check( "released off the box: no change, no events, capture released", (tkListTree_GetCheck( k, 6 ) = LT_CHECK_CHECKED) _
+        andalso (gItemCheck = 1) andalso (gItemChecked = 1) andalso (tkHost_GetCapture( h ) = 0) )
+    ' double click on the box: two toggles, never Activate
+    ClickRow( h, k, 6, 1, bx6 )
+    ClickRow( h, k, 6, 2, bx6 )
+    tkTest_Check( "a double click on the box toggles twice and does not activate", (tkListTree_GetCheck( k, 6 ) = LT_CHECK_CHECKED) _
+        andalso (gItemChecked = 3) andalso (gAct = 0), gItemChecked & " act " & gAct )
+    ' veto and rewrite
+    gVetoCheck = true
+    ClickRow( h, k, 6, 1, bx6 )
+    tkTest_Check( "ItemCheck vetoes: no change, no ItemChecked", (tkListTree_GetCheck( k, 6 ) = LT_CHECK_CHECKED) andalso (gItemCheck = 4) andalso (gItemChecked = 3) )
+    gVetoCheck = false : gRewrite = LT_CHECK_MIXED
+    ClickRow( h, k, 6, 1, bx6 )
+    tkTest_Check( "ItemCheck rewrites the new state", (tkListTree_GetCheck( k, 6 ) = LT_CHECK_MIXED) andalso (gIcdState = LT_CHECK_MIXED) )
+    gRewrite = -1
+    ' a click on the row text: no check, unless CheckOnClick
+    ClickRow( h, k, 6, 1, rk.right + tkHost_Scale( h, 30 ) )
+    tkTest_Check( "a row click does not check (CheckOnClick off)", (tkListTree_GetCheck( k, 6 ) = LT_CHECK_MIXED) andalso tkListTree_GetSel( k, 6 ) )
+    tkListTree_SetCheckOnClick( k, true )
+    ClickRow( h, k, 2, 1, rk.right + tkHost_Scale( h, 60 ) )
+    tkTest_Check( "CheckOnClick: one click selects and checks", tkListTree_GetSel( k, 2 ) andalso (tkListTree_GetCheck( k, 2 ) = LT_CHECK_CHECKED) )
+    tkListTree_SetCheckOnClick( k, false )
+
+    ' the keyboard
+    tkListTree_CheckAll( k, LT_CHECK_UNCHECKED )
+    ResetCheckCounts()
+    tkTest_Check( "CheckAll is silent", (gItemCheck = 0) andalso (gItemChecked = 0) andalso (tkListTree_GetCheckedCount( k ) = 0) )
+    tkListTree_SetCurSel( k, 6 )
+    tkHost_SetFocus( h, ks )
+    tkTest_PushKey( h, SDLK_SPACE )
+    tkTest_Check( "Space checks the focus row", (tkListTree_GetCheck( k, 6 ) = LT_CHECK_CHECKED) andalso (gItemChecked = 1) )
+    tkTest_PushKey( h, SDLK_SPACE )
+    tkTest_Check( "Space again unchecks", tkListTree_GetCheck( k, 6 ) = LT_CHECK_UNCHECKED )
+    tkTest_PushKey( h, SDLK_SPACE, TK_KMOD_PRIMARY )
+    tkTest_Check( "Ctrl+Space does not check", (tkListTree_GetCheck( k, 6 ) = LT_CHECK_UNCHECKED) andalso (gItemChecked = 2) )
+    tkTest_PushKey( h, SDLK_KP_PLUS )
+    tkTest_Check( "keypad + checks", tkListTree_GetCheck( k, 6 ) = LT_CHECK_CHECKED )
+    tkTest_PushKey( h, SDLK_KP_PLUS )
+    tkTest_Check( "+ on a checked row: no event", gItemChecked = 3 )
+    tkTest_PushKey( h, SDLK_MINUS )
+    tkTest_Check( "- unchecks", tkListTree_GetCheck( k, 6 ) = LT_CHECK_UNCHECKED )
+    tkTest_PushKey( h, SDLK_EQUALS, SDL_KMOD_LSHIFT )
+    tkTest_Check( "the =+ key checks", tkListTree_GetCheck( k, 6 ) = LT_CHECK_CHECKED )
+    ' the selection follows the focus row (D-4)
+    tkListTree_CheckAll( k, LT_CHECK_UNCHECKED )
+    tkListTree_SetExtendedSelect( k, true )
+    tkListTree_SetCurSel( k, 6 )
+    tkListTree_SetSel( k, 2, true )
+    ResetCheckCounts()
+    tkTest_PushKey( h, SDLK_SPACE )
+    tkTest_Check( "Space on a selected row checks every selected row, one event pair", (tkListTree_GetCheck( k, 6 ) = LT_CHECK_CHECKED) _
+        andalso (tkListTree_GetCheck( k, 2 ) = LT_CHECK_CHECKED) andalso (tkListTree_GetCheckedCount( k ) = 2) andalso (gItemCheck = 1) andalso (gItemChecked = 1) )
+    dim as integer ck()
+    tkTest_Check( "GetCheckedItems in row order", (tkListTree_GetCheckedItems( k, ck() ) = 2) andalso (ck(0) = 2) andalso (ck(1) = 6) )
+    tkListTree_SetExtendedSelect( k, false )
+    ' three-state cycling (no cascade)
+    tkListTree_CheckAll( k, LT_CHECK_UNCHECKED )
+    tkListTree_SetCheckMode( k, LT_CHECKMODE_THREESTATE )
+    tkListTree_SetCurSel( k, 6 )
+    tkTest_PushKey( h, SDLK_SPACE ) : dim as long s1 = tkListTree_GetCheck( k, 6 )
+    tkTest_PushKey( h, SDLK_SPACE ) : dim as long s2 = tkListTree_GetCheck( k, 6 )
+    tkTest_PushKey( h, SDLK_SPACE ) : dim as long s3 = tkListTree_GetCheck( k, 6 )
+    tkTest_Check( "three-state: unchecked -> checked -> mixed -> unchecked", (s1 = 1) andalso (s2 = 2) andalso (s3 = 0), s1 & s2 & s3 )
+    tkListTree_SetCheckMode( k, LT_CHECKMODE_TWOSTATE )
+    ' a label editor keeps Space: it types, it does not check
+    tkListTree_CheckAll( k, LT_CHECK_UNCHECKED )
+    tkListTree_EnableLabelEdit( k, true )
+    tkListTree_BeginEdit( k, 6, 0 )
+    dim as TK_WIDGET ptr ked = tkListTree_GetEditor( k )
+    tkTest_Check( "the editor starts after the check band", ked->x = twPx + bandPx, ked->x & " vs " & (twPx + bandPx) )
+    ResetCheckCounts()
+    tkTest_PushKey( h, SDLK_END )
+    tkTest_PushKey( h, SDLK_SPACE )
+    tkTest_PushText( h, " " )
+    tkTest_Check( "Space in the label editor types and checks nothing", (gItemCheck = 0) andalso (tkListTree_GetCheck( k, 6 ) = LT_CHECK_UNCHECKED) _
+        andalso (tkTextBox_GetText( ked ) = "other "), "[" & tkTextBox_GetText( ked ) & "]" )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkListTree_EnableLabelEdit( k, false )
+
+    ' the cascade (D-5: a mixed box checks)
+    tkListTree_SetCheckCascade( k, true )
+    tkListTree_CheckAll( k, LT_CHECK_UNCHECKED )
+    ResetCheckCounts()
+    tkListTree_GetCheckRect( k, 1, rk )
+    ClickRow( h, k, 1, 1, rk.left + side \ 2 )
+    tkTest_Check( "cascade: checking a node checks its subtree", (tkListTree_GetCheck( k, 1 ) = 1) andalso (tkListTree_GetCheck( k, 2 ) = 1) andalso (tkListTree_GetCheck( k, 3 ) = 1) )
+    tkTest_Check( "cascade: the parent of mixed children is mixed; siblings untouched", (tkListTree_GetCheck( k, 0 ) = LT_CHECK_MIXED) _
+        andalso (tkListTree_GetCheck( k, 4 ) = 0) andalso (tkListTree_GetCheck( k, 6 ) = 0) )
+    tkTest_Check( "cascade: one ItemCheck and one ItemChecked for the gesture", (gItemCheck = 1) andalso (gItemChecked = 1) andalso (gIcdRow = 1) )
+    tkListTree_SetCurSel( k, 3 )
+    tkTest_PushKey( h, SDLK_SPACE )
+    tkTest_Check( "cascade: unchecking a leaf makes its parent mixed", (tkListTree_GetCheck( k, 3 ) = 0) andalso (tkListTree_GetCheck( k, 1 ) = LT_CHECK_MIXED) andalso (tkListTree_GetCheck( k, 0 ) = LT_CHECK_MIXED) )
+    tkListTree_GetCheckRect( k, 4, rk )
+    ClickRow( h, k, 4, 1, rk.left + side \ 2 )
+    tkListTree_GetCheckRect( k, 1, rk )
+    ClickRow( h, k, 1, 1, rk.left + side \ 2 )
+    tkTest_Check( "cascade: a click on a mixed node checks it, and the root follows", (tkListTree_GetCheck( k, 1 ) = 1) andalso (tkListTree_GetCheck( k, 3 ) = 1) _
+        andalso (tkListTree_GetCheck( k, 0 ) = LT_CHECK_CHECKED) )
+    ResetCheckCounts()
+    tkListTree_SetCheck( k, 0, LT_CHECK_UNCHECKED, true )
+    tkTest_Check( "SetCheck with bCascade: the whole tree, silently", (tkListTree_GetCheckedCount( k ) = 0) andalso (gItemCheck = 0) andalso (gItemChecked = 0) )
+    tkListTree_SetCheck( k, 2, LT_CHECK_CHECKED ) : tkListTree_SetCheck( k, 5, LT_CHECK_CHECKED )
+    tkTest_Check( "SetCheck without bCascade touches one row", (tkListTree_GetCheck( k, 1 ) = 0) andalso (tkListTree_GetCheck( k, 0 ) = 0) )
+    tkListTree_RecomputeChecks( k )
+    tkTest_Check( "RecomputeChecks derives every parent", (tkListTree_GetCheck( k, 1 ) = LT_CHECK_MIXED) andalso (tkListTree_GetCheck( k, 4 ) = LT_CHECK_CHECKED) _
+        andalso (tkListTree_GetCheck( k, 0 ) = LT_CHECK_MIXED) andalso (gItemChecked = 0) )
+    tkListTree_SetRowCheckable( k, 3, false )
+    tkListTree_RecomputeChecks( k )
+    tkTest_Check( "an uncheckable child is left out of its parent's state", tkListTree_GetCheck( k, 1 ) = LT_CHECK_CHECKED )
+    tkTest_Check( "an uncheckable row has no box", (tkListTree_GetRowCheckable( k, 3 ) = false) andalso (tkListTree_GetCheckRect( k, 3, rk ) = false) )
+    tkListTree_SetCheckCascade( k, false )
+    ' a legacy header row never has a box
+    tkListTree_AddHeader( k, "Group" )
+    tkTest_Check( "a header row has no box", (tkListTree_GetRowCheckable( k, 7 ) = false) andalso (tkListTree_GetCheckRect( k, 7, rk ) = false) )
+    ' the theme gives the boxes back
+    tkListTree_UnpinColors( k )
+    tkListTree_GetCheckColors( k, @kc2 )
+    tkTest_Check( "UnpinColors: the boxes take tkCheckBox's theme colours", kc2.BoxColorChecked = tkCheckBox_ThemeColors( tkTheme_Get() ).BoxColorChecked )
 
     tkHost_Destroy( h )
 end sub

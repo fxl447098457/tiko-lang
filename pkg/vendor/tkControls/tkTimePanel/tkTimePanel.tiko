@@ -1,0 +1,1507 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkTimePanel -- an embeddable time-of-day chooser, and the time core every time control shares.
+' New in tkControls (no Win32 sibling); the design is C:\dev\docs\tkControls\TIMEPICKER.md. This
+' is phases T0 (the core, in tkTimePanelCore.tiko) and T1 (the panel, here). tkTimePicker (T2/T3)
+' hosts this panel in its dropdown, as tkDatePicker hosts tkCalendar.
+'
+' THE VALUE is TKTIME, SYSTEMTIME's time half field for field (TKDATE is its date half). wHour = -1
+' is "no time" -- its default, so a fresh TKTIME is empty; 0 is midnight, a real time.
+'
+' A PATTERN decides what is shown: H HH (0-23), h hh (1-12), m mm, s ss, f ff fff (fraction),
+' t tt (designator: first character / whole), 'quoted' literal text ('' is a quote), anything
+' else literal. The value never depends on the display: hidden parts are kept until the USER
+' edits, which zeroes the parts finer than the finest one shown (TIMEPICKER.md D-4).
+'
+' TWO MODES. COLUMNS (default): one column per unit the pattern shows -- hours, minutes,
+' seconds, AM/PM -- each a list of items. LIST: one list from ListStart to ListEnd by
+' ListInterval. Items out of the range, or refused by the ItemDisabled callback, are dimmed and
+' inert. The STEP (seconds, default 60) decides the items: under a minute it is the seconds
+' column's step; from a minute up, step \ 60 is the minutes column's.
+'
+' NOTIFICATION: setters are silent. A user pick sets the value and fires SelChange; a pick in the
+' LAST column, a pick in the list, or Enter also fires Accept; Esc (and F4, Alt+Up/Down) fire
+' Dismiss. Enter / Esc are claimed only while their callback is set, so an embedded panel leaves
+' them to the form. Callbacks fire last, from snapshots: one may destroy the panel.
+#module "tkTimePanel"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+using tkHost
+using tkPaint
+using tkTheme
+
+' ---- constants -------------------------------------------------------------------------------
+' Segment kinds of a parsed pattern; also the column kinds (no LITERAL / FRACTION column).
+public enum
+    TKTP_SEG_LITERAL = 0
+    TKTP_SEG_HOUR24
+    TKTP_SEG_HOUR12
+    TKTP_SEG_MINUTE
+    TKTP_SEG_SECOND
+    TKTP_SEG_FRACTION
+    TKTP_SEG_AMPM
+    ' date segments: only tkTimePanel_ParsePattern( ..., bDateTokens = TRUE ) makes them (tkDateTimePicker)
+    TKTP_SEG_YEAR
+    TKTP_SEG_MONTH
+    TKTP_SEG_MONTHNAME
+    TKTP_SEG_DAY
+    TKTP_SEG_WEEKDAY
+end enum
+public const as long TKTP_ITEM_TIME = 100       ' a LIST item: its value is seconds since midnight
+
+public enum
+    TKTP_PANEL_COLUMNS = 0
+    TKTP_PANEL_LIST
+end enum
+
+public enum
+    TKTP_PART_NONE = 0
+    TKTP_PART_ITEM                              ' an item (col, index)
+    TKTP_PART_COLUMN                            ' inside a column, past its last item
+end enum
+
+public const as long TKTP_MS_PER_DAY = 86400000
+public const TKTP_DEFAULT_PATTERN = "HH:mm"
+public const as long TKTP_DEFAULT_STEP = 60               ' seconds
+public const as long TKTP_DEFAULT_ROWS = 7
+public const as long TKTP_DEFAULT_LIST_INTERVAL = 1800    ' seconds
+public const as long TKTP_TYPE_TIMEOUT = 1000             ' ms: type-ahead keeps its digits this long
+' Sizes in design units, scaled at use. The border is a hairline rule: never scaled.
+public const as long TKTP_DEFAULT_ITEMH = 28
+public const as long TKTP_DEFAULT_ITEMPADX = 10
+public const as long TKTP_DEFAULT_PAD = 4
+public const as long TKTP_DEFAULT_BORDER = 1
+public const as long TKTP_MIN_COLW = 40
+
+' ---- types -----------------------------------------------------------------------------------
+public type TKTIME
+    wHour         as long = -1     ' -1 = no time
+    wMinute       as long
+    wSecond       as long
+    wMilliseconds as long
+end type
+
+public type TKTIME_SEGMENT
+    kind as long                   ' TKTP_SEG_*
+    nLen as long                   ' token length: H/HH = 1/2, f..fff = 1..3, t/tt = 1/2
+    text as ustring                ' a literal's text
+end type
+
+public type TKTIMEPANEL_HIT
+    part  as long = TKTP_PART_NONE
+    col   as long = -1
+    index as long = -1
+end type
+
+public type TKTIMEPANEL_COLORS
+    BackColor             as ulong = &hFF21252Bul
+    BorderColor           as ulong = &hFF3C424Dul
+    FocusRingColor        as ulong = &hFF569CD6ul
+    ItemColor             as ulong = &hFFD7DAE0ul
+    ItemColorDisabled     as ulong = &hFF5A606Aul
+    ItemBackColorHot      as ulong = &hFF343A44ul
+    ItemForeColorHot      as ulong = &hFFFFFFFFul
+    ItemBackColorSelected as ulong = &hFF0078D7ul
+    ItemForeColorSelected as ulong = &hFFFFFFFFul
+    ColumnDividerColor    as ulong = &hFF3C424Dul
+end type
+
+public type TKTIMEPANEL_ITEMPAINTINFO
+    hPanel      as TK_WIDGET ptr
+    b           as TK_PAINT ptr
+    rcItem      as TKRECT              ' panel pixels, the whole row of the column
+    nColumn     as long
+    nKind       as long                ' TKTP_SEG_* of the column, TKTP_ITEM_TIME in the list
+    nValue      as long                ' the item's value (hour 0-23, minute, second, 0/1, seconds)
+    text        as ustring
+    isSelected  as boolean
+    isHot       as boolean
+    isDisabled  as boolean
+    isFocused   as boolean             ' the keyboard's item while the panel has focus
+    isEnabled   as boolean
+end type
+
+public type TKTIMEPANEL_MESSAGEINFO
+    hPanel as TK_WIDGET ptr
+    msg    as long
+    x      as single
+    y      as single
+    key    as long
+    mods   as long
+    wheelX as single
+    wheelY as single
+end type
+
+public type TP_SelChangeCallbackSub as sub( byval hPanel as TK_WIDGET ptr, byval pTime as TKTIME ptr )
+public type TP_AcceptCallbackSub as sub( byval hPanel as TK_WIDGET ptr, byval pTime as TKTIME ptr )
+public type TP_DismissCallbackSub as sub( byval hPanel as TK_WIDGET ptr )
+public type TP_ItemDisabledCallbackFunc as function( byval hPanel as TK_WIDGET ptr, byval nKind as long, byval nValue as long ) as boolean
+public type TP_ItemPaintCallbackSub as sub( byval p as TKTIMEPANEL_ITEMPAINTINFO ptr )
+public type TP_MessageCallbackFunc as function( byval m as TKTIMEPANEL_MESSAGEINFO ptr ) as boolean
+' An item's label: sText arrives as the default (the pattern's); the host may replace it.
+public type TP_ItemTextCallbackSub as sub( byval hPanel as TK_WIDGET ptr, byval nKind as long, byval nValue as long, byref sText as ustring )
+
+type TP_COLUMN
+    kind    as long
+    nItems  as long
+    v(any)  as long
+    x       as long
+    w       as long
+    nScroll as single              ' pixels
+end type
+
+type TKTIMEPANEL_STATE
+    hWin           as TK_WIDGET ptr
+    id             as long
+    isEnabled      as boolean = true
+    isFocused      as boolean
+    bColorsPinned  as boolean
+    bShapePinned   as boolean
+    colors         as TKTIMEPANEL_COLORS
+    pFont          as TTF_Font ptr              ' borrowed; 0 = the host's
+    ' value and rules
+    tm             as TKTIME
+    tMin           as TKTIME
+    tMax           as TKTIME
+    hasMin         as boolean
+    hasMax         as boolean
+    nStep          as long = TKTP_DEFAULT_STEP
+    sPattern       as ustring = TKTP_DEFAULT_PATTERN
+    sAm            as ustring = "AM"
+    sPm            as ustring = "PM"
+    nMode          as long = TKTP_PANEL_COLUMNS
+    nListStart     as long = 0
+    nListEnd       as long = 86340
+    nListInterval  as long = TKTP_DEFAULT_LIST_INTERVAL
+    nRows          as long = TKTP_DEFAULT_ROWS
+    nBorderThick   as long = TKTP_DEFAULT_BORDER
+    ' derived
+    segs(any)      as TKTIME_SEGMENT
+    nSegs          as long
+    cols(0 to 3)   as TP_COLUMN
+    nCols          as long
+    nZeroFrom      as long                      ' the first unit a user edit zeroes: 1 m, 2 s, 3 ms, 4 none
+    bItemsDirty    as boolean = true
+    bLayoutDirty   as boolean = true
+    nItemH         as long
+    nTop           as long                      ' the body's top
+    nViewH         as long                      ' the body's height
+    ' interaction
+    nFocusCol      as long
+    nListCursor    as long = -1                 ' LIST: the keyboard's item when none is selected
+    nHotCol        as long = -1
+    nHotIndex      as long = -1
+    sTypeBuf       as string
+    nTypeTick      as ulongint
+    nWheelAccum    as single
+    ' callbacks
+    SelChangeCallback    as TP_SelChangeCallbackSub
+    AcceptCallback       as TP_AcceptCallbackSub
+    DismissCallback      as TP_DismissCallbackSub
+    ItemDisabledCallback as TP_ItemDisabledCallbackFunc
+    ItemPaintCallback    as TP_ItemPaintCallbackSub
+    MessageCallback      as TP_MessageCallbackFunc
+    ItemTextCallback     as TP_ItemTextCallbackSub
+end type
+
+
+' ==========================================================================================
+' T1 -- the panel: state helpers
+' ==========================================================================================
+private function TP( byval w as TK_WIDGET ptr ) as TKTIMEPANEL_STATE ptr
+    if w = 0 then return 0
+    return cast( TKTIMEPANEL_STATE ptr, w->pData )
+end function
+
+private function TpFont( byval p as TKTIMEPANEL_STATE ptr ) as TTF_Font ptr
+    if p->pFont then return p->pFont
+    return p->hWin->pHost->pDefaultFont
+end function
+
+private function TpScale( byval p as TKTIMEPANEL_STATE ptr, byval v as long ) as long
+    return tkHost_Scale( p->hWin->pHost, v )
+end function
+
+private function StepOf_( byval p as TKTIMEPANEL_STATE ptr, byval kind as long ) as long
+    select case kind
+    case TKTP_SEG_SECOND : return iif( p->nStep < 60, p->nStep, 1 )
+    case TKTP_SEG_MINUTE
+        if p->nStep < 60 then return 1
+        dim as long k = p->nStep \ 60
+        return iif( k > 60, 60, k )
+    end select
+    return 1
+end function
+
+' Rebuild the segments, the columns and their items from pattern / step / mode / list range.
+private sub BuildItems( byval p as TKTIMEPANEL_STATE ptr )
+    p->bItemsDirty = false
+    p->nSegs = tkTimePanel_ParsePattern( p->sPattern, p->segs() )
+    if p->nSegs = 0 then p->nSegs = tkTimePanel_ParsePattern( TKTP_DEFAULT_PATTERN, p->segs() )
+    ' the finest unit shown decides what a user edit zeroes
+    dim as long finest = 0                               ' 0 h, 1 m, 2 s, 3 ms
+    for i as long = 0 to p->nSegs - 1
+        select case p->segs( i ).kind
+        case TKTP_SEG_MINUTE   : if finest < 1 then finest = 1
+        case TKTP_SEG_SECOND   : if finest < 2 then finest = 2
+        case TKTP_SEG_FRACTION : finest = 3
+        end select
+    next
+    p->nZeroFrom = finest + 1
+    p->nCols = 0
+    if p->nMode = TKTP_PANEL_LIST then
+        with p->cols( 0 )
+            .kind = TKTP_ITEM_TIME
+            dim as long iv = iif( p->nListInterval < 60, 60, p->nListInterval )
+            dim as long a = p->nListStart, z = p->nListEnd
+            if a < 0 then a = 0
+            if z > 86399 then z = 86399
+            .nItems = 0
+            if z >= a then
+                .nItems = (z - a) \ iv + 1
+                redim .v( 0 to .nItems - 1 )
+                for i as long = 0 to .nItems - 1
+                    .v( i ) = a + i * iv
+                next
+            end if
+        end with
+        p->nCols = 1
+    else
+        dim as boolean haveHour, haveMin, haveSec, haveAmPm
+        for i as long = 0 to p->nSegs - 1
+            dim as long kind = p->segs( i ).kind
+            dim as boolean bAdd = false
+            select case kind
+            case TKTP_SEG_HOUR24, TKTP_SEG_HOUR12 : bAdd = (haveHour = false) : haveHour = true
+            case TKTP_SEG_MINUTE : bAdd = (haveMin = false) : haveMin = true
+            case TKTP_SEG_SECOND : bAdd = (haveSec = false) : haveSec = true
+            case TKTP_SEG_AMPM   : bAdd = (haveAmPm = false) : haveAmPm = true
+            end select
+            if bAdd andalso (p->nCols <= 3) then
+                with p->cols( p->nCols )
+                    .kind = kind
+                    select case kind
+                    case TKTP_SEG_HOUR24
+                        .nItems = 24
+                        redim .v( 0 to 23 )
+                        for j as long = 0 to 23 : .v( j ) = j : next
+                    case TKTP_SEG_HOUR12
+                        ' 12, 1 .. 11: the value is the hour within the half day
+                        .nItems = 12
+                        redim .v( 0 to 11 )
+                        for j as long = 0 to 11 : .v( j ) = j : next
+                    case TKTP_SEG_MINUTE, TKTP_SEG_SECOND
+                        dim as long st = StepOf_( p, kind )
+                        .nItems = (59 \ st) + 1
+                        redim .v( 0 to .nItems - 1 )
+                        for j as long = 0 to .nItems - 1 : .v( j ) = j * st : next
+                    case TKTP_SEG_AMPM
+                        .nItems = 2
+                        redim .v( 0 to 1 )
+                        .v( 0 ) = 0 : .v( 1 ) = 1
+                    end select
+                end with
+                p->nCols += 1
+            end if
+        next
+    end if
+    for c as long = 0 to p->nCols - 1
+        p->cols( c ).nScroll = 0
+    next
+    if p->nFocusCol >= p->nCols then p->nFocusCol = iif( p->nCols > 0, p->nCols - 1, 0 )
+    p->nHotCol = -1 : p->nHotIndex = -1
+    p->bLayoutDirty = true
+end sub
+
+private function ItemTextDefault_( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long ) as ustring
+    dim as long v = p->cols( c ).v( i )
+    select case p->cols( c ).kind
+    case TKTP_SEG_HOUR24, TKTP_SEG_MINUTE, TKTP_SEG_SECOND : return Pad2_( v )
+    case TKTP_SEG_HOUR12 : return iif( v = 0, "12", Pad2_( v ) )
+    case TKTP_SEG_AMPM   : return iif( v = 0, p->sAm, p->sPm )
+    case TKTP_ITEM_TIME
+        dim as TKTIME t = tkTimePanel_MsToTime( v * 1000 )
+        return tkTimePanel_FormatPattern( t, p->sPattern, p->sAm, p->sPm )
+    end select
+    return ""
+end function
+
+' The label: the default, then the ItemText callback's say (hours as 0-23, as ItemDisabled).
+private function ItemText( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long ) as ustring
+    dim as ustring sText = ItemTextDefault_( p, c, i )
+    if p->ItemTextCallback then
+        dim as long kind = p->cols( c ).kind, v = p->cols( c ).v( i )
+        if kind = TKTP_SEG_HOUR12 then kind = TKTP_SEG_HOUR24 : v = ItemHour24( p, c, i )
+        p->ItemTextCallback( p->hWin, kind, v, sText )
+    end if
+    return sText
+end function
+
+' The time edits start from: the value, or midnight when there is none (TIMEPICKER.md D-7).
+private function BaseTime( byval p as TKTIMEPANEL_STATE ptr ) as TKTIME
+    if tkTimePanel_IsTime( p->tm ) then return p->tm
+    return tkTimePanel_MakeTime( 0, 0 )
+end function
+
+' The 0-23 hour an hour item stands for, given the base time's half of the day.
+private function ItemHour24( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long ) as long
+    dim as long v = p->cols( c ).v( i )
+    if p->cols( c ).kind = TKTP_SEG_HOUR12 then
+        dim as TKTIME b = BaseTime( p )
+        return v + iif( b.wHour >= 12, 12, 0 )
+    end if
+    return v
+end function
+
+' Milliseconds an item covers: [lo, hi], coarser units from the base time, finer ones free.
+private sub ItemSpan( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long, byref lo as long, byref hi as long )
+    dim as TKTIME b = BaseTime( p )
+    dim as long v = p->cols( c ).v( i )
+    select case p->cols( c ).kind
+    case TKTP_SEG_HOUR24, TKTP_SEG_HOUR12
+        lo = ItemHour24( p, c, i ) * 3600000 : hi = lo + 3599999
+    case TKTP_SEG_AMPM
+        lo = v * 43200000 : hi = lo + 43199999
+    case TKTP_SEG_MINUTE
+        lo = (b.wHour * 60 + v) * 60000 : hi = lo + 59999
+    case TKTP_SEG_SECOND
+        lo = ((b.wHour * 60 + b.wMinute) * 60 + v) * 1000 : hi = lo + 999
+    case TKTP_ITEM_TIME
+        lo = v * 1000 : hi = lo
+    end select
+end sub
+
+private function IsItemDisabled_( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long ) as boolean
+    if (c < 0) orelse (c >= p->nCols) orelse (i < 0) orelse (i >= p->cols( c ).nItems) then return true
+    dim as long lo, hi
+    ItemSpan( p, c, i, lo, hi )
+    if p->hasMin andalso (hi < tkTimePanel_TimeToMs( p->tMin )) then return true
+    if p->hasMax andalso (lo > tkTimePanel_TimeToMs( p->tMax )) then return true
+    if p->ItemDisabledCallback then
+        dim as long kind = p->cols( c ).kind, v = p->cols( c ).v( i )
+        if kind = TKTP_SEG_HOUR12 then kind = TKTP_SEG_HOUR24 : v = ItemHour24( p, c, i )
+        if p->ItemDisabledCallback( p->hWin, kind, v ) then return true
+    end if
+    return false
+end function
+
+' The item the value selects in column c, or -1.
+private function SelIndex( byval p as TKTIMEPANEL_STATE ptr, byval c as long ) as long
+    if tkTimePanel_IsTime( p->tm ) = false then return -1
+    dim as long want
+    with p->tm
+        select case p->cols( c ).kind
+        case TKTP_SEG_HOUR24 : want = .wHour
+        case TKTP_SEG_HOUR12 : want = .wHour mod 12
+        case TKTP_SEG_MINUTE : want = .wMinute
+        case TKTP_SEG_SECOND : want = .wSecond
+        case TKTP_SEG_AMPM   : want = iif( .wHour >= 12, 1, 0 )
+        case TKTP_ITEM_TIME
+            if .wMilliseconds <> 0 then return -1
+            want = (.wHour * 60 + .wMinute) * 60 + .wSecond
+        end select
+    end with
+    for i as long = 0 to p->cols( c ).nItems - 1
+        if p->cols( c ).v( i ) = want then return i
+    next
+    return -1
+end function
+
+' The keyboard's item in column c: the selected one, else (LIST) the cursor, else -1.
+private function CursorIndex( byval p as TKTIMEPANEL_STATE ptr, byval c as long ) as long
+    dim as long i = SelIndex( p, c )
+    if (i < 0) andalso (p->nMode = TKTP_PANEL_LIST) then i = p->nListCursor
+    return i
+end function
+
+private function ClampMs( byval p as TKTIMEPANEL_STATE ptr, byval ms as long ) as long
+    if p->hasMin andalso (ms < tkTimePanel_TimeToMs( p->tMin )) then ms = tkTimePanel_TimeToMs( p->tMin )
+    if p->hasMax andalso (ms > tkTimePanel_TimeToMs( p->tMax )) then ms = tkTimePanel_TimeToMs( p->tMax )
+    return ms
+end function
+
+' ---- layout -------------------------------------------------------------------------------------
+private sub Layout( byval p as TKTIMEPANEL_STATE ptr )
+    if p->bItemsDirty then BuildItems( p )
+    p->bLayoutDirty = false
+    dim as TTF_Font ptr f = TpFont( p )
+    dim as long textH = tkText_Height( f )
+    p->nItemH = TpScale( p, TKTP_DEFAULT_ITEMH )
+    if p->nItemH < textH + TpScale( p, 8 ) then p->nItemH = textH + TpScale( p, 8 )
+    dim as long inset = p->nBorderThick + TpScale( p, TKTP_DEFAULT_PAD )
+    dim as long padX = TpScale( p, TKTP_DEFAULT_ITEMPADX )
+    dim as long x = inset
+    for c as long = 0 to p->nCols - 1
+        with p->cols( c )
+            dim as long wMax = 0
+            for i as long = 0 to .nItems - 1
+                dim as long tw = tkText_Width( f, ItemText( p, c, i ) )
+                if tw > wMax then wMax = tw
+            next
+            .w = wMax + 2 * padX
+            if .w < TpScale( p, TKTP_MIN_COLW ) then .w = TpScale( p, TKTP_MIN_COLW )
+            .x = x
+            x += .w + 1                                  ' a hairline divider between columns
+        end with
+    next
+    p->nTop = inset
+    p->nViewH = p->hWin->ch - 2 * inset
+    if p->nViewH < 0 then p->nViewH = 0
+    ' a column stretches to fill a wider panel only in LIST mode (one column)
+    if (p->nMode = TKTP_PANEL_LIST) andalso (p->nCols = 1) then
+        dim as long full = p->hWin->cw - 2 * inset
+        if full > p->cols( 0 ).w then p->cols( 0 ).w = full
+    end if
+end sub
+
+private sub EnsureLayout( byval p as TKTIMEPANEL_STATE ptr )
+    if p->bItemsDirty orelse p->bLayoutDirty then Layout( p )
+end sub
+
+private function MaxScroll( byval p as TKTIMEPANEL_STATE ptr, byval c as long ) as single
+    dim as long m = p->cols( c ).nItems * p->nItemH - p->nViewH
+    return iif( m > 0, m, 0 )
+end function
+
+private sub ClampScroll( byval p as TKTIMEPANEL_STATE ptr, byval c as long )
+    with p->cols( c )
+        if .nScroll > MaxScroll( p, c ) then .nScroll = MaxScroll( p, c )
+        if .nScroll < 0 then .nScroll = 0
+    end with
+end sub
+
+' Item i of column c to the top of the column (as far as the column scrolls).
+private sub ScrollToTop( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long )
+    if i < 0 then exit sub
+    p->cols( c ).nScroll = i * p->nItemH
+    ClampScroll( p, c )
+end sub
+
+' Item i of column c into view, moving as little as possible.
+private sub ScrollIntoView( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long )
+    if i < 0 then exit sub
+    with p->cols( c )
+        dim as single y0 = i * p->nItemH, y1 = y0 + p->nItemH
+        if y0 < .nScroll then
+            .nScroll = y0
+        elseif y1 > .nScroll + p->nViewH then
+            .nScroll = y1 - p->nViewH
+        end if
+    end with
+    ClampScroll( p, c )
+end sub
+
+' Every column's selection to its top; the LIST's selection (or the item before the value) too.
+private sub AlignAll( byval p as TKTIMEPANEL_STATE ptr )
+    EnsureLayout( p )
+    for c as long = 0 to p->nCols - 1
+        dim as long i = SelIndex( p, c )
+        if (i < 0) andalso (p->cols( c ).kind = TKTP_ITEM_TIME) then
+            ' the last item at or before the value, so the value's neighbourhood shows
+            p->nListCursor = -1
+            if tkTimePanel_IsTime( p->tm ) then
+                dim as long ms = tkTimePanel_TimeToMs( p->tm )
+                for j as long = 0 to p->cols( c ).nItems - 1
+                    if p->cols( c ).v( j ) * 1000 <= ms then p->nListCursor = j
+                next
+            end if
+            i = p->nListCursor
+        end if
+        if i >= 0 then ScrollToTop( p, c, i ) else ClampScroll( p, c )
+    next
+end sub
+
+' ---- notification -----------------------------------------------------------------------------
+' From snapshots, last: a callback may destroy the panel.
+private sub Notify( byval p as TKTIMEPANEL_STATE ptr, byval bChanged as boolean, byval bAccept as boolean )
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as TKTIME t = p->tm
+    dim as TP_SelChangeCallbackSub cbSel = p->SelChangeCallback
+    dim as TP_AcceptCallbackSub cbAcc = p->AcceptCallback
+    if bChanged andalso (cbSel <> 0) then cbSel( w, @t )
+    if bAccept andalso (cbAcc <> 0) then cbAcc( w, @t )
+end sub
+
+' The user picks item i of column c. TRUE when the value changed.
+private function UserPick( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long ) as boolean
+    if IsItemDisabled_( p, c, i ) then return false
+    dim as long ms
+    if p->cols( c ).kind = TKTP_ITEM_TIME then
+        ms = p->cols( c ).v( i ) * 1000
+        p->nListCursor = i
+    else
+        dim as TKTIME b = BaseTime( p )
+        dim as long v = p->cols( c ).v( i )
+        select case p->cols( c ).kind
+        case TKTP_SEG_HOUR24, TKTP_SEG_HOUR12 : b.wHour = ItemHour24( p, c, i )
+        case TKTP_SEG_MINUTE : b.wMinute = v
+        case TKTP_SEG_SECOND : b.wSecond = v
+        case TKTP_SEG_AMPM   : b.wHour = (b.wHour mod 12) + v * 12
+        end select
+        ' a user edit zeroes what the pattern does not show (TIMEPICKER.md D-4)
+        if p->nZeroFrom <= 1 then b.wMinute = 0
+        if p->nZeroFrom <= 2 then b.wSecond = 0
+        if p->nZeroFrom <= 3 then b.wMilliseconds = 0
+        ms = tkTimePanel_TimeToMs( b )
+    end if
+    ms = ClampMs( p, ms )
+    dim as TKTIME nt = tkTimePanel_MsToTime( ms )
+    if tkTimePanel_IsTime( p->tm ) andalso tkTimePanel_SameTime( nt, p->tm ) then
+        tkWidget_Invalidate( p->hWin )
+        return false
+    end if
+    p->tm = nt
+    tkWidget_Invalidate( p->hWin )
+    return true
+end function
+
+private function CallMessage( byval p as TKTIMEPANEL_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKTIMEPANEL_MESSAGEINFO mi
+    mi.hPanel = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    mi.key = m->key : mi.mods = m->mods
+    mi.wheelX = m->wheelX : mi.wheelY = m->wheelY
+    return p->MessageCallback( @mi )
+end function
+
+' ---- hit testing --------------------------------------------------------------------------------
+private function HitAt( byval p as TKTIMEPANEL_STATE ptr, byval x as long, byval y as long ) as TKTIMEPANEL_HIT
+    dim as TKTIMEPANEL_HIT r
+    EnsureLayout( p )
+    if (y < p->nTop) orelse (y >= p->nTop + p->nViewH) then return r
+    for c as long = 0 to p->nCols - 1
+        with p->cols( c )
+            if (x >= .x) andalso (x < .x + .w) then
+                r.col = c
+                dim as long i = int( (y - p->nTop + .nScroll) / p->nItemH )
+                if (i >= 0) andalso (i < .nItems) then
+                    r.part = TKTP_PART_ITEM : r.index = i
+                else
+                    r.part = TKTP_PART_COLUMN
+                end if
+                return r
+            end if
+        end with
+    next
+    return r
+end function
+
+private sub SetHot( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval i as long )
+    if (c <> p->nHotCol) orelse (i <> p->nHotIndex) then
+        p->nHotCol = c : p->nHotIndex = i
+        tkWidget_Invalidate( p->hWin )
+    end if
+end sub
+
+' ---- painting -----------------------------------------------------------------------------------
+private sub RenderItem( byval p as TKTIMEPANEL_STATE ptr, byval pi as TKTIMEPANEL_ITEMPAINTINFO ptr )
+    dim as TK_PAINT ptr b = pi->b
+    dim as TKRECT r = pi->rcItem
+    dim as long gx = TpScale( p, 3 ), gy = TpScale( p, 1 )
+    tkRect_Inflate( r, -gx, -gy )
+    dim as ulong fore = p->colors.ItemColor
+    with p->colors
+        if (pi->isEnabled = false) orelse pi->isDisabled then
+            fore = .ItemColorDisabled
+            if pi->isSelected andalso pi->isEnabled then
+                b->SetBackColor( .ItemBackColorHot )
+                b->PaintRoundRect( @r, TpScale( p, 6 ) )
+            end if
+        elseif pi->isSelected then
+            b->SetBackColor( .ItemBackColorSelected )
+            b->PaintRoundRect( @r, TpScale( p, 6 ) )
+            fore = .ItemForeColorSelected
+        elseif pi->isHot then
+            b->SetBackColor( .ItemBackColorHot )
+            b->PaintRoundRect( @r, TpScale( p, 6 ) )
+            fore = .ItemForeColorHot
+        end if
+        if pi->isFocused then
+            b->SetPenColor( .FocusRingColor )
+            b->PaintRoundOutline( @r, TpScale( p, 6 ), 1 )
+        end if
+    end with
+    b->SetFont( TpFont( p ) )
+    b->SetForeColor( fore )
+    b->PaintText( pi->text, @pi->rcItem, TK_DT_CENTER )
+end sub
+
+private sub OnPaint( byval p as TKTIMEPANEL_STATE ptr, byval b as TK_PAINT ptr )
+    EnsureLayout( p )
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, p->hWin->cw, p->hWin->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @rc )
+    for c as long = 0 to p->nCols - 1
+        dim as long sel = SelIndex( p, c ), cur = CursorIndex( p, c )
+        with p->cols( c )
+            dim as TKRECT rcCol
+            tkRect_Set( rcCol, .x, p->nTop, .x + .w, p->nTop + p->nViewH )
+            b->PushClip( @rcCol )
+            dim as long first = int( .nScroll / p->nItemH )
+            for i as long = first to .nItems - 1
+                dim as long y = p->nTop + i * p->nItemH - cint( .nScroll )
+                if y >= p->nTop + p->nViewH then exit for
+                dim as TKTIMEPANEL_ITEMPAINTINFO pi
+                pi.hPanel = p->hWin
+                pi.b = b
+                tkRect_Set( pi.rcItem, .x, y, .x + .w, y + p->nItemH )
+                pi.nColumn = c
+                pi.nKind = .kind
+                pi.nValue = .v( i )
+                if .kind = TKTP_SEG_HOUR12 then pi.nKind = TKTP_SEG_HOUR24 : pi.nValue = ItemHour24( p, c, i )
+                pi.text = ItemText( p, c, i )
+                pi.isSelected = (i = sel)
+                pi.isHot = (c = p->nHotCol) andalso (i = p->nHotIndex)
+                pi.isDisabled = IsItemDisabled_( p, c, i )
+                pi.isFocused = p->isFocused andalso (c = p->nFocusCol) andalso (i = cur)
+                pi.isEnabled = p->isEnabled
+                if p->ItemPaintCallback then p->ItemPaintCallback( @pi ) else RenderItem( p, @pi )
+            next
+            b->PopClip()
+            ' a focused column with no keyboard item shows the ring round the column
+            if p->isFocused andalso (c = p->nFocusCol) andalso (cur < 0) then
+                b->SetPenColor( p->colors.FocusRingColor )
+                b->PaintRoundOutline( @rcCol, 0, 1 )
+            end if
+            if c < p->nCols - 1 then
+                dim as TKRECT rcDiv
+                tkRect_Set( rcDiv, .x + .w, p->nTop, .x + .w + 1, p->nTop + p->nViewH )
+                b->SetBackColor( p->colors.ColumnDividerColor )
+                b->PaintRect( @rcDiv )
+            end if
+        end with
+    next
+    if p->nBorderThick > 0 then
+        b->SetPenColor( p->colors.BorderColor )
+        b->PaintRoundOutline( @rc, 0, p->nBorderThick )
+    end if
+end sub
+
+' ---- input ------------------------------------------------------------------------------------
+private function Accepts( byval p as TKTIMEPANEL_STATE ptr ) as boolean
+    return (p->AcceptCallback <> 0) andalso tkTimePanel_IsTime( p->tm )
+end function
+
+' Move the keyboard's item in column c by delta (+1 down), skipping disabled items; no wrap.
+' bAbs: delta is -1 (first) or +1 (last). TRUE when claimed.
+private function MoveIn( byval p as TKTIMEPANEL_STATE ptr, byval c as long, byval delta as long, byval bAbs as boolean ) as boolean
+    if (c < 0) orelse (c >= p->nCols) then return false
+    dim as long n = p->cols( c ).nItems
+    if n = 0 then return true
+    dim as long cur = CursorIndex( p, c ), target = -1
+    if bAbs then
+        if delta < 0 then
+            for i as long = 0 to n - 1
+                if IsItemDisabled_( p, c, i ) = false then target = i : exit for
+            next
+        else
+            for i as long = n - 1 to 0 step -1
+                if IsItemDisabled_( p, c, i ) = false then target = i : exit for
+            next
+        end if
+    elseif cur < 0 then
+        ' nothing selected: Down starts at the first enabled item, Up at the last
+        return MoveIn( p, c, iif( delta > 0, -1, 1 ), true )
+    else
+        dim as long want = cur + delta
+        if want < 0 then want = 0
+        if want > n - 1 then want = n - 1
+        dim as long dirn = sgn( delta )
+        ' the nearest enabled item at or past want, in the direction of travel; else back toward cur
+        dim as long i = want
+        while (i >= 0) andalso (i < n)
+            if IsItemDisabled_( p, c, i ) = false then target = i : exit while
+            i += dirn
+        wend
+        if target < 0 then
+            i = want - dirn
+            while (i <> cur) andalso (i >= 0) andalso (i < n)
+                if IsItemDisabled_( p, c, i ) = false then target = i : exit while
+                i -= dirn
+            wend
+        end if
+    end if
+    if (target < 0) orelse (target = cur) then return true
+    dim as boolean bChanged = UserPick( p, c, target )
+    if p->cols( c ).kind = TKTP_ITEM_TIME then ScrollIntoView( p, c, target ) else AlignAll( p )
+    if bChanged then Notify( p, true, false )
+    return true
+end function
+
+' Type-ahead: digits pick by number in the focused column (LIST: by the label's digits); a / p
+' (or the designators' first letters) pick the half of the day where there is an AM/PM column.
+private function TypeAhead( byval p as TKTIMEPANEL_STATE ptr, byval key as long, byval scancode as long ) as boolean
+    dim as long dgt = tkTimePanel_KeyDigit( key, scancode )
+    if dgt < 0 then
+        ' a letter: the designators
+        if (key < SDLK_A) orelse (key > SDLK_A + 25) then return false
+        dim as string ch = chr( key )
+        dim as long want = -1
+        if lcase( left( p->sAm, 1 ) ) = ch then
+            want = 0
+        elseif lcase( left( p->sPm, 1 ) ) = ch then
+            want = 1
+        elseif ch = "a" then
+            want = 0
+        elseif ch = "p" then
+            want = 1
+        end if
+        if want < 0 then return false
+        for c as long = 0 to p->nCols - 1
+            if p->cols( c ).kind = TKTP_SEG_AMPM then
+                if UserPick( p, c, want ) then AlignAll( p ) : Notify( p, true, false )
+                return true
+            end if
+        next
+        return false
+    end if
+    dim as ulongint now_ = SDL_GetTicks()
+    if (len( p->sTypeBuf ) = 0) orelse (now_ - p->nTypeTick > TKTP_TYPE_TIMEOUT) then p->sTypeBuf = ""
+    p->nTypeTick = now_
+    p->sTypeBuf &= str( dgt )
+    dim as long c = p->nFocusCol
+    if (c < 0) orelse (c >= p->nCols) then return true
+    dim as long hit = -1
+    for attempt as long = 1 to 2
+        dim as string want = p->sTypeBuf
+        for i as long = 0 to p->cols( c ).nItems - 1
+            if IsItemDisabled_( p, c, i ) = false then
+                if p->cols( c ).kind = TKTP_ITEM_TIME then
+                    ' the label's digits, leading zeros dropped: "09:30" answers to 9, 93, 930
+                    dim as string lbl = ItemText( p, c, i ), dg
+                    for k as long = 1 to len( lbl )
+                        dim as long a = asc( lbl, k )
+                        if (a >= 48) andalso (a <= 57) then dg &= chr( a )
+                    next
+                    while (len( dg ) > 1) andalso (left( dg, 1 ) = "0")
+                        dg = mid( dg, 2 )
+                    wend
+                    if left( dg, len( want ) ) = want then hit = i : exit for
+                else
+                    dim as long num = p->cols( c ).v( i )
+                    if p->cols( c ).kind = TKTP_SEG_HOUR12 then num = iif( num = 0, 12, num )
+                    if p->cols( c ).kind = TKTP_SEG_AMPM then num = -1
+                    if (num >= 0) andalso (num = valint( want )) then hit = i : exit for
+                end if
+            end if
+        next
+        if hit >= 0 then exit for
+        ' no match for the buffer: start over with this digit alone
+        if len( p->sTypeBuf ) <= 1 then exit for
+        p->sTypeBuf = str( dgt )
+    next
+    if len( p->sTypeBuf ) >= 2 andalso (p->cols( c ).kind <> TKTP_ITEM_TIME) then p->sTypeBuf = ""
+    if hit < 0 then return true
+    dim as boolean bChanged = UserPick( p, c, hit )
+    if p->cols( c ).kind = TKTP_ITEM_TIME then ScrollToTop( p, c, hit ) else AlignAll( p )
+    if bChanged then Notify( p, true, false )
+    return true
+end function
+
+private function OnKey( byval p as TKTIMEPANEL_STATE ptr, byval key as long, byval mods as long, byval scancode as long ) as boolean
+    EnsureLayout( p )
+    dim as boolean bAlt = ((mods and SDL_KMOD_ALT) <> 0)
+    dim as boolean bShift = ((mods and SDL_KMOD_SHIFT) <> 0)
+    dim as long c = p->nFocusCol
+    select case key
+    case SDLK_RETURN, SDLK_KP_ENTER
+        if Accepts( p ) = false then return false
+        Notify( p, false, true )
+        return true
+    case SDLK_ESCAPE, SDLK_F4
+        if p->DismissCallback = 0 then return false
+        dim as TP_DismissCallbackSub cb = p->DismissCallback
+        cb( p->hWin )
+        return true
+    case SDLK_UP, SDLK_DOWN
+        if bAlt then
+            if p->DismissCallback = 0 then return false
+            dim as TP_DismissCallbackSub cbAlt = p->DismissCallback
+            cbAlt( p->hWin )
+            return true
+        end if
+        return MoveIn( p, c, iif( key = SDLK_DOWN, 1, -1 ), false )
+    case SDLK_PAGEUP, SDLK_PAGEDOWN
+        dim as long pg = p->nViewH \ iif( p->nItemH > 0, p->nItemH, 1 )
+        if pg < 1 then pg = 1
+        return MoveIn( p, c, iif( key = SDLK_PAGEDOWN, pg, -pg ), false )
+    case SDLK_HOME : return MoveIn( p, c, -1, true )
+    case SDLK_END  : return MoveIn( p, c, 1, true )
+    case SDLK_LEFT, SDLK_RIGHT
+        dim as long nc = c + iif( key = SDLK_RIGHT, 1, -1 )
+        if (nc >= 0) andalso (nc < p->nCols) then p->nFocusCol = nc : p->sTypeBuf = "" : tkWidget_Invalidate( p->hWin )
+        return true
+    case SDLK_TAB
+        ' column to column; past either end, the focus walk takes it
+        dim as long nt = c + iif( bShift, -1, 1 )
+        if (nt < 0) orelse (nt >= p->nCols) then return false
+        p->nFocusCol = nt : p->sTypeBuf = ""
+        tkWidget_Invalidate( p->hWin )
+        return true
+    end select
+    if (mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI)) <> 0 then return false
+    return TypeAhead( p, key, scancode )
+end function
+
+private function OnWheel( byval p as TKTIMEPANEL_STATE ptr, byval x as long, byval y as long, byval notches as single ) as boolean
+    dim as TKTIMEPANEL_HIT ht = HitAt( p, x, y )
+    if ht.col < 0 then return false
+    dim as long c = ht.col
+    if MaxScroll( p, c ) <= 0 then return false
+    dim as single before = p->cols( c ).nScroll
+    p->cols( c ).nScroll -= notches * p->nItemH * 2
+    ClampScroll( p, c )
+    if p->cols( c ).nScroll <> before then tkWidget_Invalidate( p->hWin )
+    return true
+end function
+
+private sub Rescale( byval p as TKTIMEPANEL_STATE ptr, byval fOld as single, byval fNew as single )
+    if (fOld <= 0) orelse (fNew <= 0) orelse (fOld = fNew) then exit sub
+    dim as single k = fNew / fOld
+    for c as long = 0 to p->nCols - 1
+        p->cols( c ).nScroll *= k
+    next
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+public declare sub tkTimePanel_ApplyTheme( byval hPanel as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+public declare function tkTimePanel_ThemeColors( byref t as TKTHEME_COLORS ) as TKTIMEPANEL_COLORS
+declare sub ApplyThemeShape( byval w as TK_WIDGET ptr )
+
+private function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKTIMEPANEL_STATE ptr p = TP( w )
+    if p = 0 then return false
+    dim as TK_HOST ptr h = w->pHost
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+
+    case TKM_SIZE
+        p->bLayoutDirty = true
+        EnsureLayout( p )
+        for c as long = 0 to p->nCols - 1
+            ClampScroll( p, c )
+        next
+        tkWidget_Invalidate( w )
+        return true
+
+    case TKM_SCALECHANGED
+        Rescale( p, m->fOld, m->fNew )
+        return true
+
+    case TKM_THEMECHANGED
+        tkTimePanel_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+
+    case TKM_LBUTTONDOWN
+        if p->isEnabled = false then return true
+        tkHost_SetFocus( h, w )
+        if CallMessage( p, m ) then return true
+        dim as TKTIMEPANEL_HIT ht = HitAt( p, cint( m->x ), cint( m->y ) )
+        if ht.col >= 0 then
+            if ht.col <> p->nFocusCol then p->nFocusCol = ht.col : p->sTypeBuf = "" : tkWidget_Invalidate( w )
+        end if
+        if ht.part <> TKTP_PART_ITEM then return true
+        if IsItemDisabled_( p, ht.col, ht.index ) then return true
+        dim as boolean bChanged = UserPick( p, ht.col, ht.index )
+        dim as boolean bLast = (ht.col = p->nCols - 1)
+        if p->cols( ht.col ).kind = TKTP_ITEM_TIME then ScrollIntoView( p, ht.col, ht.index ) else AlignAll( p )
+        Notify( p, bChanged, bLast andalso (p->AcceptCallback <> 0) )
+        return true
+
+    case TKM_MOUSEMOVE
+        if p->isEnabled = false then return true
+        dim as TKTIMEPANEL_HIT hm = HitAt( p, cint( m->x ), cint( m->y ) )
+        if hm.part = TKTP_PART_ITEM then SetHot( p, hm.col, hm.index ) else SetHot( p, -1, -1 )
+        CallMessage( p, m )
+        return true
+
+    case TKM_MOUSELEAVE
+        SetHot( p, -1, -1 )
+        CallMessage( p, m )
+        return true
+
+    case TKM_LBUTTONUP, TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        CallMessage( p, m )
+        return true
+
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        dim as boolean bFocused = (m->msg = TKM_SETFOCUS)
+        if bFocused <> p->isFocused then p->isFocused = bFocused : tkWidget_Invalidate( w )
+        p->sTypeBuf = ""
+        CallMessage( p, m )
+        return true
+
+    case TKM_KEYDOWN
+        if p->isEnabled = false then return false
+        if CallMessage( p, m ) then return true
+        return OnKey( p, m->key, m->mods, m->scancode )
+
+    case TKM_MOUSEWHEEL
+        if p->isEnabled = false then return false
+        if CallMessage( p, m ) then return true
+        return OnWheel( p, cint( m->x ), cint( m->y ), m->wheelY )
+
+    case TKM_ENABLE
+        p->isEnabled = m->bFlag
+        if p->isEnabled = false then p->nHotCol = -1 : p->nHotIndex = -1
+        tkWidget_Invalidate( w )
+        return true
+
+    case TKM_SHOW
+        if m->bFlag = false then p->nHotCol = -1 : p->nHotIndex = -1
+        return true
+
+    case TKM_DESTROY
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' A child of hParent, created 0x0: size it from GetIdealSize.
+public function tkTimePanel_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKTIMEPANEL_STATE ptr p = new TKTIMEPANEL_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @Proc, p )
+    w->isFocusable = true
+    p->hWin = w
+    p->colors = tkTimePanel_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKTIMEPANEL_COLORS ) \ 4, "TimePanel" )
+    ApplyThemeShape( w )
+    return w
+end function
+
+public function tkTimePanel_GetID( byval hPanel as TK_WIDGET ptr ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return 0
+    return p->id
+end function
+
+public function tkTimePanel_GetEnabled( byval hPanel as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return false
+    return p->isEnabled
+end function
+
+public sub tkTimePanel_SetEnabled( byval hPanel as TK_WIDGET ptr, byval isEnabled as boolean )
+    if hPanel then tkWidget_Enable( hPanel, isEnabled )
+end sub
+
+public function tkTimePanel_GetFocused( byval hPanel as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return false
+    return p->isFocused
+end function
+
+public sub tkTimePanel_Refresh( byval hPanel as TK_WIDGET ptr )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' ---- value ----------------------------------------------------------------------------------------
+' FALSE when there is no time (t is then the empty time).
+public function tkTimePanel_GetTime( byval hPanel as TK_WIDGET ptr, byref t as TKTIME ) as boolean
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    t = tkTimePanel_EmptyTime()
+    if p = 0 then return false
+    t = p->tm
+    return tkTimePanel_IsTime( t )
+end function
+
+' Silent. An empty (or invalid) t clears; a time is clamped to the range. Scrolls the selection
+' to the top of each column.
+public sub tkTimePanel_SetTime( byval hPanel as TK_WIDGET ptr, byref t as const TKTIME )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    if tkTimePanel_IsTime( t ) then
+        p->tm = tkTimePanel_MsToTime( ClampMs( p, tkTimePanel_TimeToMs( t ) ) )
+    else
+        p->tm = tkTimePanel_EmptyTime()
+    end if
+    AlignAll( p )
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' The bind pair: an empty TKTIME is no time.
+public function tkTimePanel_GetTimeValue( byval hPanel as TK_WIDGET ptr ) as TKTIME
+    dim as TKTIME t
+    tkTimePanel_GetTime( hPanel, t )
+    return t
+end function
+
+public sub tkTimePanel_SetTimeValue( byval hPanel as TK_WIDGET ptr, byval t as TKTIME )
+    tkTimePanel_SetTime( hPanel, t )
+end sub
+
+public function tkTimePanel_HasTime( byval hPanel as TK_WIDGET ptr ) as boolean
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return false
+    return tkTimePanel_IsTime( p->tm )
+end function
+
+public sub tkTimePanel_ClearTime( byval hPanel as TK_WIDGET ptr )
+    tkTimePanel_SetTime( hPanel, tkTimePanel_EmptyTime() )
+end sub
+
+public sub tkTimePanel_GetRange( byval hPanel as TK_WIDGET ptr, byref tMin as TKTIME, byref tMax as TKTIME, _
+                                 byref hasMin as boolean, byref hasMax as boolean )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    tMin = p->tMin : tMax = p->tMax : hasMin = p->hasMin : hasMax = p->hasMax
+end sub
+
+' Min <= max: an inverted pair is swapped. An invalid bound counts as absent. The value is clamped
+' (silently).
+public sub tkTimePanel_SetRange( byval hPanel as TK_WIDGET ptr, byref tMin as const TKTIME, byref tMax as const TKTIME, _
+                                 byval hasMin as boolean = true, byval hasMax as boolean = true )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->hasMin = hasMin andalso tkTimePanel_IsTime( tMin )
+    p->hasMax = hasMax andalso tkTimePanel_IsTime( tMax )
+    p->tMin = tkTimePanel_EmptyTime()
+    p->tMax = tkTimePanel_EmptyTime()
+    if p->hasMin then p->tMin = tMin
+    if p->hasMax then p->tMax = tMax
+    if p->hasMin andalso p->hasMax andalso (tkTimePanel_CompareTime( p->tMin, p->tMax ) > 0) then swap p->tMin, p->tMax
+    if tkTimePanel_IsTime( p->tm ) then p->tm = tkTimePanel_MsToTime( ClampMs( p, tkTimePanel_TimeToMs( p->tm ) ) )
+    AlignAll( p )
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' Seconds, 1 .. 3600 (clamped). Under 60 it steps the seconds column; from 60 up, step \ 60 steps
+' the minutes column.
+public function tkTimePanel_GetStep( byval hPanel as TK_WIDGET ptr ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return TKTP_DEFAULT_STEP
+    return p->nStep
+end function
+
+public sub tkTimePanel_SetStep( byval hPanel as TK_WIDGET ptr, byval nSeconds as long )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    if nSeconds < 1 then nSeconds = 1
+    if nSeconds > 3600 then nSeconds = 3600
+    p->nStep = nSeconds
+    p->bItemsDirty = true
+    AlignAll( p )
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' ---- display --------------------------------------------------------------------------------------
+public function tkTimePanel_GetFormat( byval hPanel as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return ""
+    return p->sPattern
+end function
+
+' The pattern decides the columns (and the list's labels). "" is the default, HH:mm.
+public sub tkTimePanel_SetFormat( byval hPanel as TK_WIDGET ptr, byval sPattern as ustring )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->sPattern = sPattern
+    if len( sPattern ) = 0 then p->sPattern = TKTP_DEFAULT_PATTERN
+    p->bItemsDirty = true
+    AlignAll( p )
+    tkWidget_Invalidate( hPanel )
+end sub
+
+public sub tkTimePanel_SetAmPmText( byval hPanel as TK_WIDGET ptr, byval sAm as ustring, byval sPm as ustring )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->sAm = sAm
+    p->sPm = sPm
+    if len( sAm ) = 0 then p->sAm = "AM"
+    if len( sPm ) = 0 then p->sPm = "PM"
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( hPanel )
+end sub
+
+public function tkTimePanel_GetAmText( byval hPanel as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return ""
+    return p->sAm
+end function
+
+public function tkTimePanel_GetPmText( byval hPanel as TK_WIDGET ptr ) as ustring
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return ""
+    return p->sPm
+end function
+
+public function tkTimePanel_GetMode( byval hPanel as TK_WIDGET ptr ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return TKTP_PANEL_COLUMNS
+    return p->nMode
+end function
+
+public sub tkTimePanel_SetMode( byval hPanel as TK_WIDGET ptr, byval nMode as long )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->nMode = iif( nMode = TKTP_PANEL_LIST, TKTP_PANEL_LIST, TKTP_PANEL_COLUMNS )
+    p->nFocusCol = 0
+    p->bItemsDirty = true
+    AlignAll( p )
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' LIST mode's items: tStart to tEnd (inclusive when it lands) by nIntervalSeconds (>= 60).
+public sub tkTimePanel_SetListRange( byval hPanel as TK_WIDGET ptr, byref tStart as const TKTIME, byref tEnd as const TKTIME, _
+                                     byval nIntervalSeconds as long )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->nListStart = iif( tkTimePanel_IsTime( tStart ), tkTimePanel_TimeToMs( tStart ) \ 1000, 0 )
+    p->nListEnd = iif( tkTimePanel_IsTime( tEnd ), tkTimePanel_TimeToMs( tEnd ) \ 1000, 86340 )
+    p->nListInterval = iif( nIntervalSeconds < 60, 60, nIntervalSeconds )
+    p->bItemsDirty = true
+    AlignAll( p )
+    tkWidget_Invalidate( hPanel )
+end sub
+
+public sub tkTimePanel_GetListRange( byval hPanel as TK_WIDGET ptr, byref tStart as TKTIME, byref tEnd as TKTIME, _
+                                     byref nIntervalSeconds as long )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    tStart = tkTimePanel_MsToTime( p->nListStart * 1000 )
+    tEnd = tkTimePanel_MsToTime( p->nListEnd * 1000 )
+    nIntervalSeconds = p->nListInterval
+end sub
+
+public function tkTimePanel_GetVisibleRows( byval hPanel as TK_WIDGET ptr ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return TKTP_DEFAULT_ROWS
+    return p->nRows
+end function
+
+' How many items GetIdealSize makes room for (1 .. 24).
+public sub tkTimePanel_SetVisibleRows( byval hPanel as TK_WIDGET ptr, byval nRows as long )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    if nRows < 1 then nRows = 1
+    if nRows > 24 then nRows = 24
+    p->nRows = nRows
+end sub
+
+public function tkTimePanel_GetFont( byval hPanel as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return 0
+    return p->pFont
+end function
+
+public sub tkTimePanel_SetFont( byval hPanel as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->pFont = f
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( hPanel )
+end sub
+
+public function tkTimePanel_GetBorderThickness( byval hPanel as TK_WIDGET ptr ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return 0
+    return p->nBorderThick
+end function
+
+' A hairline rule, never scaled; 0 draws none (tkTimePicker's popup draws its own frame). Pins the
+' shape: the theme's BorderWidth no longer applies.
+public sub tkTimePanel_SetBorderThickness( byval hPanel as TK_WIDGET ptr, byval nThickness as long )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->nBorderThick = iif( nThickness < 0, 0, nThickness )
+    p->bShapePinned = true
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' Room for every column and VisibleRows items. Valid before the panel is sized.
+public sub tkTimePanel_GetIdealSize( byval hPanel as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    nWidth = 0 : nHeight = 0
+    if p = 0 then exit sub
+    EnsureLayout( p )
+    dim as long inset = p->nBorderThick + TpScale( p, TKTP_DEFAULT_PAD )
+    dim as long wsum = 0
+    for c as long = 0 to p->nCols - 1
+        wsum += p->cols( c ).w
+    next
+    if (p->nMode = TKTP_PANEL_LIST) andalso (p->nCols = 1) then
+        ' measured, not stretched: the column's own width
+        dim as TTF_Font ptr f = TpFont( p )
+        dim as long wMax = 0
+        for i as long = 0 to p->cols( 0 ).nItems - 1
+            dim as long tw = tkText_Width( f, ItemText( p, 0, i ) )
+            if tw > wMax then wMax = tw
+        next
+        wsum = wMax + 2 * TpScale( p, TKTP_DEFAULT_ITEMPADX )
+        if wsum < TpScale( p, TKTP_MIN_COLW ) then wsum = TpScale( p, TKTP_MIN_COLW )
+    end if
+    nWidth = 2 * inset + wsum + iif( p->nCols > 1, p->nCols - 1, 0 )
+    nHeight = 2 * inset + p->nRows * p->nItemH
+end sub
+
+' ---- columns and items (test seams and host queries) ---------------------------------------------
+public function tkTimePanel_GetColumnCount( byval hPanel as TK_WIDGET ptr ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return 0
+    EnsureLayout( p )
+    return p->nCols
+end function
+
+' TKTP_SEG_* (TKTP_ITEM_TIME in LIST mode), or -1.
+public function tkTimePanel_GetColumnKind( byval hPanel as TK_WIDGET ptr, byval nCol as long ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return -1
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then return -1
+    return p->cols( nCol ).kind
+end function
+
+public function tkTimePanel_GetItemCount( byval hPanel as TK_WIDGET ptr, byval nCol as long ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return 0
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then return 0
+    return p->cols( nCol ).nItems
+end function
+
+' The item's value: hour 0-23 (for a 12-hour column: in the value's half of the day), minute,
+' second, 0 / 1 (AM / PM), or seconds since midnight (LIST). -1 when out of range.
+public function tkTimePanel_GetItemValue( byval hPanel as TK_WIDGET ptr, byval nCol as long, byval nIndex as long ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return -1
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then return -1
+    if (nIndex < 0) orelse (nIndex >= p->cols( nCol ).nItems) then return -1
+    if p->cols( nCol ).kind = TKTP_SEG_HOUR12 then return ItemHour24( p, nCol, nIndex )
+    return p->cols( nCol ).v( nIndex )
+end function
+
+public function tkTimePanel_GetItemText( byval hPanel as TK_WIDGET ptr, byval nCol as long, byval nIndex as long ) as ustring
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return ""
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then return ""
+    if (nIndex < 0) orelse (nIndex >= p->cols( nCol ).nItems) then return ""
+    return ItemText( p, nCol, nIndex )
+end function
+
+public function tkTimePanel_IsItemDisabled( byval hPanel as TK_WIDGET ptr, byval nCol as long, byval nIndex as long ) as boolean
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return true
+    EnsureLayout( p )
+    return IsItemDisabled_( p, nCol, nIndex )
+end function
+
+' The item the value selects in a column, or -1.
+public function tkTimePanel_GetSelectedIndex( byval hPanel as TK_WIDGET ptr, byval nCol as long ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return -1
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then return -1
+    return SelIndex( p, nCol )
+end function
+
+public function tkTimePanel_GetFocusedColumn( byval hPanel as TK_WIDGET ptr ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return 0
+    return p->nFocusCol
+end function
+
+public sub tkTimePanel_SetFocusedColumn( byval hPanel as TK_WIDGET ptr, byval nCol as long )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then exit sub
+    p->nFocusCol = nCol
+    tkWidget_Invalidate( hPanel )
+end sub
+
+public function tkTimePanel_GetScrollPos( byval hPanel as TK_WIDGET ptr, byval nCol as long ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return 0
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then return 0
+    return cint( p->cols( nCol ).nScroll )
+end function
+
+' Each column's selection scrolled to its top (as far as the column scrolls).
+public sub tkTimePanel_EnsureVisible( byval hPanel as TK_WIDGET ptr )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    AlignAll( p )
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' An item's rect in panel pixels (not clipped). FALSE when no part of it is in view.
+public function tkTimePanel_GetItemRect( byval hPanel as TK_WIDGET ptr, byval nCol as long, byval nIndex as long, _
+                                         byref rc as TKRECT ) as boolean
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    tkRect_Set( rc, 0, 0, 0, 0 )
+    if p = 0 then return false
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then return false
+    if (nIndex < 0) orelse (nIndex >= p->cols( nCol ).nItems) then return false
+    with p->cols( nCol )
+        dim as long y = p->nTop + nIndex * p->nItemH - cint( .nScroll )
+        tkRect_Set( rc, .x, y, .x + .w, y + p->nItemH )
+    end with
+    return (rc.bottom > p->nTop) andalso (rc.top < p->nTop + p->nViewH)
+end function
+
+' A column's rect: its body, panel pixels.
+public function tkTimePanel_GetColumnRect( byval hPanel as TK_WIDGET ptr, byval nCol as long, byref rc as TKRECT ) as boolean
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    tkRect_Set( rc, 0, 0, 0, 0 )
+    if p = 0 then return false
+    EnsureLayout( p )
+    if (nCol < 0) orelse (nCol >= p->nCols) then return false
+    tkRect_Set( rc, p->cols( nCol ).x, p->nTop, p->cols( nCol ).x + p->cols( nCol ).w, p->nTop + p->nViewH )
+    return true
+end function
+
+public function tkTimePanel_HitTest( byval hPanel as TK_WIDGET ptr, byval x as long, byval y as long ) as TKTIMEPANEL_HIT
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    dim as TKTIMEPANEL_HIT r
+    if p = 0 then return r
+    return HitAt( p, x, y )
+end function
+
+public function tkTimePanel_GetItemHeight( byval hPanel as TK_WIDGET ptr ) as long
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then return 0
+    EnsureLayout( p )
+    return p->nItemH
+end function
+
+' ---- appearance ------------------------------------------------------------------------------
+public sub tkTimePanel_GetColors( byval hPanel as TK_WIDGET ptr, byval pColors as TKTIMEPANEL_COLORS ptr )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Copies the struct and PINS it: a theme change leaves this panel alone until UnpinColors.
+public sub tkTimePanel_SetColors( byval hPanel as TK_WIDGET ptr, byval pColors as TKTIMEPANEL_COLORS ptr )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' The roles tkCalendar uses for the same parts, so a panel beside a calendar matches it.
+public function tkTimePanel_ThemeColors( byref t as TKTHEME_COLORS ) as TKTIMEPANEL_COLORS
+    dim as TKTIMEPANEL_COLORS c
+    c.BackColor             = t.Window
+    c.BorderColor           = t.Border
+    c.FocusRingColor        = t.FocusRing
+    c.ItemColor             = t.Text
+    c.ItemColorDisabled     = t.TextDisabled
+    c.ItemBackColorHot      = t.SurfaceHot
+    c.ItemForeColorHot      = t.TextHot
+    c.ItemBackColorSelected = t.Selected
+    c.ItemForeColorSelected = t.SelectedText
+    c.ColumnDividerColor    = t.Divider
+    return c
+end function
+
+public sub tkTimePanel_ApplyTheme( byval hPanel as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    ApplyThemeShape( hPanel )
+    if p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hPanel, t )
+    p->colors = tkTimePanel_ThemeColors( tr )
+    tkTheme_ResolveInto( hPanel, tr, cast( ulong ptr, @p->colors ), sizeof( TKTIMEPANEL_COLORS ) \ 4, "TimePanel" )
+    tkWidget_Invalidate( hPanel )
+end sub
+
+public sub tkTimePanel_UnpinColors( byval hPanel as TK_WIDGET ptr )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkTimePanel_ApplyTheme( hPanel, tkTheme_Of( hPanel ) )
+end sub
+
+public sub tkTimePanel_ApplyFonts( byval hPanel as TK_WIDGET ptr, byval fText as TTF_Font ptr, byval fGlyph as TTF_Font ptr )
+    if fText then tkTimePanel_SetFont( hPanel, fText )
+end sub
+
+' ---- callbacks ---------------------------------------------------------------------------------
+' An item paint callback's way to draw the item as it would have been drawn, then add to it.
+public sub tkTimePanel_PaintItemDefault( byval pi as TKTIMEPANEL_ITEMPAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKTIMEPANEL_STATE ptr p = TP( pi->hPanel )
+    if p then RenderItem( p, pi )
+end sub
+
+public sub tkTimePanel_SetSelChangeCallback( byval hPanel as TK_WIDGET ptr, byval usersub as TP_SelChangeCallbackSub )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p then p->SelChangeCallback = usersub
+end sub
+
+public sub tkTimePanel_SetAcceptCallback( byval hPanel as TK_WIDGET ptr, byval usersub as TP_AcceptCallbackSub )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p then p->AcceptCallback = usersub
+end sub
+
+public sub tkTimePanel_SetDismissCallback( byval hPanel as TK_WIDGET ptr, byval usersub as TP_DismissCallbackSub )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p then p->DismissCallback = usersub
+end sub
+
+public sub tkTimePanel_SetItemDisabledCallback( byval hPanel as TK_WIDGET ptr, byval userfunc as TP_ItemDisabledCallbackFunc )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->ItemDisabledCallback = userfunc
+    tkWidget_Invalidate( hPanel )
+end sub
+
+public sub tkTimePanel_SetItemPaintCallback( byval hPanel as TK_WIDGET ptr, byval usersub as TP_ItemPaintCallbackSub )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->ItemPaintCallback = usersub
+    tkWidget_Invalidate( hPanel )
+end sub
+
+public sub tkTimePanel_SetMessageCallback( byval hPanel as TK_WIDGET ptr, byval userfunc as TP_MessageCallbackFunc )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p then p->MessageCallback = userfunc
+end sub
+
+' Replaces item labels (tkTimePicker's FormatTime reaches its list this way). Re-measures.
+public sub tkTimePanel_SetItemTextCallback( byval hPanel as TK_WIDGET ptr, byval usersub as TP_ItemTextCallbackSub )
+    dim as TKTIMEPANEL_STATE ptr p = TP( hPanel )
+    if p = 0 then exit sub
+    p->ItemTextCallback = usersub
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( hPanel )
+end sub
+
+' The theme's shape until a shape setter ran: its BorderWidth is the panel's border.
+private sub ApplyThemeShape( byval w as TK_WIDGET ptr )
+    dim as TKTIMEPANEL_STATE ptr p = TP( w )
+    if (p = 0) orelse p->bShapePinned then exit sub
+    dim as TKTHEME_SHAPE sh = tkTheme_ShapeOf( w )
+    p->nBorderThick = iif( sh.BorderWidth >= 0, sh.BorderWidth, TKTP_DEFAULT_BORDER )
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( w )
+end sub

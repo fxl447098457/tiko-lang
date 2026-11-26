@@ -71,7 +71,7 @@ compiles it. clang is not bundled: tiko runs whatever `TIKO_CLANG` names, else
 clang on the `PATH`, and it needs clang 18 or newer. The link
 goes through clang with lld, or on Linux the system linker when there is no `ld.lld`; on macOS
 it goes through Apple's linker with the macOS SDK.
-`-O1` to `-O3` are clang's optimisations; tiko's own optimiser is deliberately thin.
+`-O1` to `-O3` and `-Os` are clang's optimisations; tiko's own optimiser is deliberately thin.
 
 **The driver** (`src/driver`). Reads the command line, decides what is being built, builds the
 modules a program imports in dependency order, and runs everything above. A module is compiled
@@ -135,7 +135,7 @@ LGPL-2.1-or-later with the static-linking exception: a program tiko compiles may
 same `fb_Gfx*` entry points, so it is a drop-in replacement. Its A/B tests (`lib/gfx/tools`) run
 drawing primitives through both libraries and compare what they drew. It is
 derived from FreeBASIC's `gfxlib2`, under the same LGPL licence and exception. It is built for
-windows-x86_64 only, which is why graphics programs build on Windows only (Appendix D).
+all four targets, drawing through GDI on Windows, X11 on Linux and Cocoa on macOS (Appendix D).
 
 ## Self-hosting
 

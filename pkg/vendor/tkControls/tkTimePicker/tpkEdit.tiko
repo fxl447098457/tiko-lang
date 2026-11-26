@@ -1,0 +1,393 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkTimePicker -- the field's editing (TIMEPICKER.md §6): stepping a segment, the digit-entry
+' state machine, the keys, the clipboard, the spin pair's auto-repeat and the wheel. Everything
+' here changes the value through TpkUserSet and notifies LAST, once per input, from a snapshot.
+'
+' DIGITS (Win32 / HTML): the first digit is held as a partial entry unless no second digit could
+' make a valid value (hour24 3-9, hour12 2-9, minute / second 6-9): then it completes at once and
+' the focus moves on. The second digit completes; an invalid pair keeps the new digit as a fresh
+' first digit. A partial entry also completes on : . or space (and moves on), on a 1000 ms pause,
+' on Enter, on Left / Right / Up / Down, and when the focus leaves. A fraction takes its pattern's
+' digit count. Typing into an empty value starts the other parts at 00 (D-7).
+#module "tkTimePicker"
+
+#import "../tkHost"
+#import "../tkTimePanel"
+using tkHost
+using tkTimePanel
+
+' The step of a minute / second segment when it is the finest shown (TIMEPICKER.md §5.2); 1 else.
+function TpkSegStep( byval p as TKTIMEPICKER_STATE ptr, byval kind as long ) as long
+    dim as boolean haveSec = false
+    for i as long = 0 to p->nSegs - 1
+        if p->segs( i ).kind = TKTP_SEG_SECOND then haveSec = true
+    next
+    select case kind
+    case TKTP_SEG_SECOND
+        return iif( p->nStep < 60, p->nStep, 1 )
+    case TKTP_SEG_MINUTE
+        if haveSec orelse (p->nStep < 60) then return 1
+        dim as long k = p->nStep \ 60
+        return iif( k > 59, 59, k )
+    end select
+    return 1
+end function
+
+' t with segment i moved one step (dirn +1 / -1), wrapping inside the segment with no carry.
+' bPage: PgUp / PgDn (10 minutes / seconds, an hour, the half day). Not clamped: TpkFinish does.
+function TpkStepped( byval p as TKTIMEPICKER_STATE ptr, byval t as TKTIME, byval i as long, _
+                     byval dirn as long, byval bPage as boolean ) as TKTIME
+    dim as long kind = p->segs( i ).kind
+    select case kind
+    case TKTP_SEG_HOUR24
+        t.wHour = (t.wHour + dirn + 24) mod 24
+    case TKTP_SEG_HOUR12
+        ' 1..12 inside the same half of the day (Win32)
+        dim as long half = iif( t.wHour >= 12, 12, 0 )
+        t.wHour = ((t.wHour mod 12) + dirn + 12) mod 12 + half
+    case TKTP_SEG_MINUTE, TKTP_SEG_SECOND
+        dim as long v = iif( kind = TKTP_SEG_MINUTE, t.wMinute, t.wSecond )
+        if bPage then
+            v = (v + dirn * 10 + 60) mod 60
+        else
+            dim as long st = TpkSegStep( p, kind )
+            ' to the next point of the step's grid in that direction, wrapping
+            if dirn > 0 then
+                v = ((v \ st) + 1) * st
+                if v > 59 then v = 0
+            else
+                if v = 0 then
+                    v = (59 \ st) * st
+                else
+                    v = ((v + st - 1) \ st - 1) * st
+                end if
+            end if
+        end if
+        if kind = TKTP_SEG_MINUTE then t.wMinute = v else t.wSecond = v
+    case TKTP_SEG_FRACTION
+        dim as long unit = iif( p->segs( i ).nLen = 1, 100, iif( p->segs( i ).nLen = 2, 10, 1 ) )
+        t.wMilliseconds = (t.wMilliseconds + dirn * unit + 1000) mod 1000
+    case TKTP_SEG_AMPM
+        t.wHour = (t.wHour + 12) mod 24
+    end select
+    return t
+end function
+
+' ---- digit entry ----------------------------------------------------------------------------------
+function TpkFirstMax( byval kind as long ) as long
+    select case kind
+    case TKTP_SEG_HOUR24 : return 2
+    case TKTP_SEG_HOUR12 : return 1
+    end select
+    return 5
+end function
+
+function TpkValidFor( byval kind as long, byval v as long ) as boolean
+    select case kind
+    case TKTP_SEG_HOUR24 : return (v >= 0) andalso (v <= 23)
+    case TKTP_SEG_HOUR12 : return (v >= 1) andalso (v <= 12)
+    end select
+    return (v >= 0) andalso (v <= 59)
+end function
+
+' Segment i set to v as the user typed it. TRUE when the value changed (the caller notifies).
+function TpkCompleteSeg( byval p as TKTIMEPICKER_STATE ptr, byval i as long, byval v as long, byval bAdvance as boolean ) as boolean
+    p->sEntry = ""
+    tkWidget_KillTimer( p->hWin, TPK_TIMER_ENTRY )
+    dim as TKTIME t = TpkBase( p )
+    select case p->segs( i ).kind
+    case TKTP_SEG_HOUR24   : t.wHour = v
+    case TKTP_SEG_HOUR12   : t.wHour = (v mod 12) + iif( t.wHour >= 12, 12, 0 )
+    case TKTP_SEG_MINUTE   : t.wMinute = v
+    case TKTP_SEG_SECOND   : t.wSecond = v
+    case TKTP_SEG_FRACTION : t.wMilliseconds = v
+    end select
+    dim as boolean bChanged = TpkUserSet( p, TpkFinish( p, t ) )
+    if bAdvance then
+        dim as long nx = TpkNextSeg( p, i, 1 )
+        if nx >= 0 then p->nFocusSeg = nx
+    end if
+    TpkRefresh( p )
+    return bChanged
+end function
+
+' A pending entry completed as it stands (no advance); an entry that is no value is dropped.
+' TRUE when the value changed.
+function TpkCommitEntry( byval p as TKTIMEPICKER_STATE ptr ) as boolean
+    if len( p->sEntry ) = 0 then return false
+    dim as long i = p->nFocusSeg
+    if TpkIsEditable( p, i ) = false then p->sEntry = "" : return false
+    dim as long v
+    if p->segs( i ).kind = TKTP_SEG_FRACTION then
+        v = valint( left( p->sEntry & "00", 3 ) )
+    else
+        v = valint( p->sEntry )
+        if TpkValidFor( p->segs( i ).kind, v ) = false then
+            p->sEntry = ""
+            tkWidget_KillTimer( p->hWin, TPK_TIMER_ENTRY )
+            TpkRefresh( p )
+            return false
+        end if
+    end if
+    return TpkCompleteSeg( p, i, v, false )
+end function
+
+' One digit typed. TRUE when the value changed.
+function TpkDigit( byval p as TKTIMEPICKER_STATE ptr, byval d as long ) as boolean
+    dim as long i = p->nFocusSeg
+    if TpkIsEditable( p, i ) = false then return false
+    dim as long kind = p->segs( i ).kind
+    if kind = TKTP_SEG_AMPM then return false
+    tkWidget_SetTimer( p->hWin, TPK_TIMER_ENTRY, TKTP_TYPE_TIMEOUT )
+    if kind = TKTP_SEG_FRACTION then
+        p->sEntry &= str( d )
+        if len( p->sEntry ) >= p->segs( i ).nLen then return TpkCompleteSeg( p, i, valint( left( p->sEntry & "00", 3 ) ), true )
+        TpkRefresh( p )
+        return false
+    end if
+    if len( p->sEntry ) = 0 then
+        if d > TpkFirstMax( kind ) then return TpkCompleteSeg( p, i, d, true )
+        p->sEntry = str( d )
+        TpkRefresh( p )
+        return false
+    end if
+    dim as long v = valint( p->sEntry ) * 10 + d
+    if TpkValidFor( kind, v ) then return TpkCompleteSeg( p, i, v, true )
+    ' no such value: this digit starts over (Win32)
+    p->sEntry = ""
+    return TpkDigit( p, d )
+end function
+
+' ---- keys ----------------------------------------------------------------------------------------------
+' The designator from a letter: 0 AM, 1 PM, -1 none.
+function TpkLetterHalf( byval p as TKTIMEPICKER_STATE ptr, byval key as long ) as long
+    if (key < SDLK_A) orelse (key > SDLK_A + 25) then return -1
+    dim as string ch = chr( key )
+    if lcase( left( p->sAm, 1 ) ) = ch then return 0
+    if lcase( left( p->sPm, 1 ) ) = ch then return 1
+    if ch = "a" then return 0
+    if ch = "p" then return 1
+    return -1
+end function
+
+function TpkHasAmPm( byval p as TKTIMEPICKER_STATE ptr ) as boolean
+    for i as long = 0 to p->nSegs - 1
+        if p->segs( i ).kind = TKTP_SEG_AMPM then return true
+    next
+    return false
+end function
+
+' Step the focused segment as the user (Up / Down / spin / wheel). TRUE when the value changed.
+function TpkUserStep( byval p as TKTIMEPICKER_STATE ptr, byval i as long, byval dirn as long, byval bPage as boolean ) as boolean
+    if TpkIsEditable( p, i ) = false then return false
+    if tkTimePanel_IsTime( p->tm ) = false then
+        ' the first step of an empty field lands on the start time, clamped (D-7)
+        return TpkUserSet( p, TpkFinish( p, TpkBase( p ) ) )
+    end if
+    return TpkUserSet( p, TpkFinish( p, TpkStepped( p, p->tm, i, dirn, bPage ) ) )
+end function
+
+function TpkCopy( byval p as TKTIMEPICKER_STATE ptr ) as boolean
+    if tkTimePanel_IsTime( p->tm ) = false then return false
+    tkHost_SetClipboardText( tkTimePanel_FormatPattern( p->tm, p->sPattern, p->sAm, p->sPm ) )
+    return true
+end function
+
+' The field's keys (§6.2). TRUE when claimed; notifies last, once.
+function TpkKey( byval p as TKTIMEPICKER_STATE ptr, byval key as long, byval mods as long, byval scancode as long ) as boolean
+    dim as boolean bAlt = ((mods and SDL_KMOD_ALT) <> 0)
+    dim as boolean bCtrl = ((mods and (SDL_KMOD_CTRL or SDL_KMOD_GUI)) <> 0)
+    dim as boolean bShift = ((mods and SDL_KMOD_SHIFT) <> 0)
+    dim as boolean bChanged = false, bClaimed = true
+    if TpkIsEditable( p, p->nFocusSeg ) = false then p->nFocusSeg = TpkFirstSeg( p )
+    dim as long i = p->nFocusSeg
+    if bCtrl then
+        select case key
+        case SDLK_C
+            TpkCopy( p )
+        case SDLK_X
+            if TpkCopy( p ) andalso p->bAllowEmpty then p->sEntry = "" : bChanged = TpkUserSet( p, tkTimePanel_EmptyTime() )
+        case SDLK_V
+            dim as TKTIME tPaste
+            p->sEntry = ""
+            tkWidget_KillTimer( p->hWin, TPK_TIMER_ENTRY )
+            if tkTimePanel_ParseLoose( tkHost_GetClipboardText(), tPaste, p->sAm, p->sPm ) then bChanged = TpkUserSet( p, TpkFinish( p, tPaste ) )
+            TpkRefresh( p )
+        case else
+            return false
+        end select
+        if bChanged then TpkNotify( p )
+        return true
+    end if
+    select case key
+    case SDLK_F4
+        if p->nButtonStyle <> TKTP_BUTTON_DROPDOWN then return false
+        bChanged = TpkCommitEntry( p )
+        tkTimePicker_DropDown( p->hWin )
+    case SDLK_UP, SDLK_DOWN
+        bChanged = TpkCommitEntry( p )
+        if bAlt then
+            if p->nButtonStyle <> TKTP_BUTTON_DROPDOWN then
+                bClaimed = bChanged
+            else
+                tkTimePicker_DropDown( p->hWin )
+            end if
+        else
+            if TpkUserStep( p, i, iif( key = SDLK_UP, 1, -1 ), false ) then bChanged = true
+        end if
+    case SDLK_PAGEUP, SDLK_PAGEDOWN
+        bChanged = TpkCommitEntry( p )
+        if TpkUserStep( p, i, iif( key = SDLK_PAGEUP, 1, -1 ), true ) then bChanged = true
+    case SDLK_LEFT, SDLK_RIGHT
+        bChanged = TpkCommitEntry( p )
+        dim as long nxLR = TpkNextSeg( p, i, iif( key = SDLK_RIGHT, 1, -1 ) )
+        if nxLR >= 0 then p->nFocusSeg = nxLR
+        tkWidget_Invalidate( p->hWin )
+    case SDLK_HOME, SDLK_END
+        bChanged = TpkCommitEntry( p )
+        p->nFocusSeg = iif( key = SDLK_HOME, TpkFirstSeg( p ), TpkLastSeg( p ) )
+        tkWidget_Invalidate( p->hWin )
+    case SDLK_TAB
+        if p->bTabMovesSegments = false then return false
+        dim as long nxTab = TpkNextSeg( p, i, iif( bShift, -1, 1 ) )
+        if nxTab < 0 then
+            ' past the last / first segment: the focus walk takes it (KILLFOCUS commits)
+            return false
+        end if
+        bChanged = TpkCommitEntry( p )
+        p->nFocusSeg = nxTab
+        tkWidget_Invalidate( p->hWin )
+    case SDLK_RETURN, SDLK_KP_ENTER
+        ' claimed only to finish an entry: otherwise the form's default button has it
+        if len( p->sEntry ) = 0 then return false
+        bChanged = TpkCommitEntry( p )
+    case SDLK_ESCAPE
+        if len( p->sEntry ) = 0 then return false
+        p->sEntry = ""
+        tkWidget_KillTimer( p->hWin, TPK_TIMER_ENTRY )
+        TpkRefresh( p )
+    case SDLK_BACKSPACE, SDLK_DELETE
+        if len( p->sEntry ) then
+            p->sEntry = ""
+            tkWidget_KillTimer( p->hWin, TPK_TIMER_ENTRY )
+            TpkRefresh( p )
+        elseif p->bAllowEmpty then
+            bChanged = TpkUserSet( p, tkTimePanel_EmptyTime() )
+        end if
+    case SDLK_COLON, SDLK_SEMICOLON, SDLK_PERIOD, SDLK_KP_PERIOD, SDLK_SPACE
+        ' a separator: finish the segment and move on
+        bChanged = TpkCommitEntry( p )
+        dim as long nxSep = TpkNextSeg( p, i, 1 )
+        if nxSep >= 0 then p->nFocusSeg = nxSep
+        tkWidget_Invalidate( p->hWin )
+    case else
+        dim as long d = tkTimePanel_KeyDigit( key, scancode )
+        if d >= 0 then
+            bChanged = TpkDigit( p, d )
+        else
+            dim as long half = TpkLetterHalf( p, key )
+            if (half < 0) orelse (TpkHasAmPm( p ) = false) then return false
+            bChanged = TpkCommitEntry( p )
+            dim as TKTIME tHalf = TpkBase( p )
+            tHalf.wHour = (tHalf.wHour mod 12) + half * 12
+            if TpkUserSet( p, TpkFinish( p, tHalf ) ) then bChanged = true
+        end if
+    end select
+    if bChanged then TpkNotify( p )
+    return bClaimed
+end function
+
+' ---- the timer: the entry pause, the spin's auto-repeat ------------------------------------------------
+sub TpkStartRepeat( byval p as TKTIMEPICKER_STATE ptr )
+    if (p->nRepeatDelay <= 0) orelse (p->nRepeatInterval <= 0) then exit sub
+    tkWidget_SetTimer( p->hWin, TK_TIMER_AUTOREPEAT, p->nRepeatDelay )
+    p->bRepeatOn = true
+end sub
+
+sub TpkStopRepeat( byval p as TKTIMEPICKER_STATE ptr )
+    if p->bRepeatOn then tkWidget_KillTimer( p->hWin, TK_TIMER_AUTOREPEAT )
+    p->bRepeatOn = false
+end sub
+
+function TpkTimer( byval p as TKTIMEPICKER_STATE ptr, byval id as long ) as boolean
+    select case id
+    case TPK_TIMER_ENTRY
+        tkWidget_KillTimer( p->hWin, TPK_TIMER_ENTRY )
+        if TpkCommitEntry( p ) then TpkNotify( p )
+        return true
+    case TK_TIMER_AUTOREPEAT
+        if p->bRepeatOn = false then return true
+        tkWidget_SetTimer( p->hWin, TK_TIMER_AUTOREPEAT, p->nRepeatInterval )
+        ' paused while the pointer is off the pressed half (NumericUpDown's rule)
+        if (p->nPressedPart = TKTPK_HIT_NONE) orelse (p->nHotPart <> p->nPressedPart) then return true
+        if TpkUserStep( p, p->nFocusSeg, iif( p->nPressedPart = TKTPK_HIT_SPINUP, 1, -1 ), false ) then TpkNotify( p )
+        return true
+    end select
+    return false
+end function
+
+' ---- mouse -------------------------------------------------------------------------------------------
+function TpkPress( byval p as TKTIMEPICKER_STATE ptr, byval x as single, byval y as single ) as boolean
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as long part = TpkHit( p, x, y )
+    dim as boolean bChanged = false
+    select case part
+    case TKTPK_HIT_BUTTON
+        ' the press that just closed our dropdown must not reopen it
+        if p->nClosedBySerial = tkHost_PressSerial() then return true
+        bChanged = TpkCommitEntry( p )
+        p->nPressedPart = TKTPK_HIT_BUTTON
+        tkWidget_Invalidate( w )
+        if p->isOpen then tkTimePicker_CloseUp( w ) else tkTimePicker_DropDown( w )
+        if bChanged then TpkNotify( p )
+    case TKTPK_HIT_SPINUP, TKTPK_HIT_SPINDOWN
+        tkHost_SetFocus( w->pHost, w )
+        bChanged = TpkCommitEntry( p )
+        p->nPressedPart = part
+        TpkSetHot( p, part )
+        tkHost_SetCapture( w )
+        TpkStartRepeat( p )
+        if TpkUserStep( p, p->nFocusSeg, iif( part = TKTPK_HIT_SPINUP, 1, -1 ), false ) then bChanged = true
+        if bChanged then TpkNotify( p )
+    case TKTPK_HIT_FIELD
+        tkHost_SetFocus( w->pHost, w )
+        dim as long seg = TpkSegAt( p, cint( x ) )
+        if seg <> p->nFocusSeg then bChanged = TpkCommitEntry( p )
+        if seg >= 0 then p->nFocusSeg = seg
+        tkWidget_Invalidate( w )
+        if bChanged then TpkNotify( p )
+    end select
+    return true
+end function
+
+sub TpkRelease( byval p as TKTIMEPICKER_STATE ptr )
+    TpkStopRepeat( p )
+    if tkHost_GetCapture( p->hWin->pHost ) = p->hWin then tkHost_ReleaseCapture( p->hWin->pHost )
+    if p->nPressedPart <> TKTPK_HIT_NONE then p->nPressedPart = TKTPK_HIT_NONE : tkWidget_Invalidate( p->hWin )
+end sub
+
+' The wheel over a focused field steps the segment under the pointer (a literal: the focused one).
+function TpkWheel( byval p as TKTIMEPICKER_STATE ptr, byval x as single, byval notches as single ) as boolean
+    if notches = 0 then return false
+    p->nWheelAccum += notches
+    dim as long n = fix( p->nWheelAccum )
+    if n = 0 then return true
+    p->nWheelAccum -= n
+    dim as boolean bChanged = TpkCommitEntry( p )
+    TpkEnsureLayout( p )
+    dim as long seg = p->nFocusSeg
+    for i as long = 0 to p->nSegs - 1
+        if TpkIsEditable( p, i ) andalso (x >= p->segX( i )) andalso (x < p->segX( i ) + p->segW( i )) then seg = i
+    next
+    if seg <> p->nFocusSeg then p->nFocusSeg = seg : tkWidget_Invalidate( p->hWin )
+    for k as long = 1 to abs( n )
+        if TpkUserStep( p, seg, sgn( n ), false ) then bChanged = true
+    next
+    if bChanged then TpkNotify( p )
+    return true
+end function

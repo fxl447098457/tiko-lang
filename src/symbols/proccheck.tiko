@@ -825,8 +825,8 @@ end function
 '' untyped, and so is not reported.
 '' WHAT AN OPERAND IS, for the two sweeps below: 0 nothing judged here (a UDT, a 'void'
 '' result, 'any', an untyped one), 1 a number, boolean, enum or pointer, 2 a string --
-'' a fixed-length one being an ARRAY of a string builtin. Two strings are never judged:
-'' 'wstring + ustring' is a concatenation BinaryResult does not type.
+'' a fixed-length one being an ARRAY of a string builtin. Two strings are judged only off
+'' '+' and '&': 'wstring + ustring' is a concatenation BinaryResult does not type.
 private function OperandClass_( byref c as Ctx, byval t as TypeId ) as int32
     dim as TypeId t0 = t
     select case c.types->Kind( t )
@@ -853,6 +853,16 @@ private sub Report0820_( byref c as Ctx, byval id as NodeId, byref opText as str
     c.diags->Report( TKO0820, PointRange( c.ast->Loc( id ) ), opText )
 end sub
 
+'' IN AN INSTANCE OF A GENERIC GLOBAL OPERATOR the string rules below stay silent: tiko makes
+'' one for every T its type is instantiated with, fbc only for a use (InstantiateGlobalOpsFor_,
+'' generic.tiko), so 'x.v * k' at T = string is a body fbc never builds (global-operators.bas).
+private function InGlobalOpInst_( byref c as Ctx ) as boolean
+    if c.curProc = NODE_NONE then return false
+    dim as StmtPayload ptr pp = c.ast->StmtOf( c.curProc )
+    if (pp->op <> cast( uint16, KW_OPERATOR )) orelse (pp->ownerName <> 0) then return false
+    return c.info->InstFrameOf( c.curProc ) <> 0    '' an instantiated body (instframe.tiko)
+end function
+
 private sub UdtArith_ ( byref c as Ctx, byval id as NodeId, byval bp as BinaryPayload ptr )
     if (bp->lhs = NODE_NONE) orelse (bp->rhs = NODE_NONE) then return
     if c.info->RefOf( id ) <> SYMBOL_NONE then return
@@ -868,10 +878,14 @@ private sub UdtArith_ ( byref c as Ctx, byval id as NodeId, byval bp as BinaryPa
     dim as boolean rUdt = (c.types->Kind( rt ) = TK_UDT)
     '' ...AND OVER TWO PLAIN OPERANDS that no builtin operator takes -- 's + 1', 'b + 1',
     '' 'p + 1.5', all error 20. BinaryResult left them untyped and a concatenation
-    '' fallback lowered them: 's + 1' printed "x1".
+    '' fallback lowered them: 's + 1' printed "x1". Two strings take only '+' and '&' here:
+    '' '"a" \ "b"', 's * s', 's and s' are error 20 (fbc 1.10.1, 2026-11-22), and were TKO0994.
     if (lUdt orelse rUdt) = false then
         dim as int32 lc = OperandClass_( c, lt ), rc = OperandClass_( c, rt )
-        if (lc <> 0) andalso (rc <> 0) andalso ((lc = 2) andalso (rc = 2)) = false then
+        dim as boolean strOk = (lc = 2) andalso (rc = 2) andalso _
+            ((cast( TokenKind, bp->op ) = TK_PLUS) orelse (cast( TokenKind, bp->op ) = TK_AMP) _
+             orelse InGlobalOpInst_( c ))
+        if (lc <> 0) andalso (rc <> 0) andalso (strOk = false) then
             Report0820_( c, id, _
                              lcase( TokenKindText( cast( TokenKind, bp->op ) ) ) )
         end if
@@ -941,6 +955,29 @@ sub CheckPtrCompound_ ( byref c as Ctx, byval id as NodeId )
     if (lk <> TK_POINTER) andalso (lk <> TK_BUILTIN) then return
     if (rk <> TK_POINTER) andalso (rk <> TK_BUILTIN) then return
     dim as string selfNm = CompoundSelfName_( cast( TokenKind, sp->op ) )
+    Report0820_( c, id, left( selfNm, len( selfNm ) - 1 ) )
+end sub
+
+'' ...AND A STRING ON EITHER SIDE of one. fbc 1.10.1, 2026-11-22: a string target takes '&='
+'' and '+=' a string, nothing else ('s -= "b"', 's += 1' error 20); a number target takes no
+'' string at all ('n *= "3"'; '&=' is TKO0635's). tiko compiled 'n += "3"' and stopped on
+'' TKO0994 for the rest.
+sub CheckStrCompound_ ( byref c as Ctx, byval id as NodeId )
+    if c.info->AmbiguousOf( id ) <> AMB_ASSIGN then return
+    dim as StmtPayload ptr sp = c.ast->StmtOf( id )
+    dim as TokenKind op = cast( TokenKind, sp->op )
+    dim as string selfNm = CompoundSelfName_( op )
+    if (len( selfNm ) = 0) orelse (op = TK_AMPEQ) then return
+    if (sp->a = NODE_NONE) orelse (sp->b = NODE_NONE) then return
+    dim as TypeId lt = c.types->Unqualify( c.info->TypeOf_( sp->a ) )
+    dim as TypeId rt = c.types->Unqualify( c.info->TypeOf_( sp->b ) )
+    if (lt = TYPE_NONE) orelse (rt = TYPE_NONE) then return
+    if c.types->Kind( lt ) = TK_REFERENCE then lt = c.types->Unqualify( c.types->Inner( lt ) )
+    if c.types->Kind( rt ) = TK_REFERENCE then rt = c.types->Unqualify( c.types->Inner( rt ) )
+    dim as int32 lc = OperandClass_( c, lt ), rc = OperandClass_( c, rt )
+    if (lc = 0) orelse (rc = 0) orelse ((lc <> 2) andalso (rc <> 2)) then return
+    if (op = TK_PLUSEQ) andalso (lc = 2) andalso (rc = 2) then return
+    if InGlobalOpInst_( c ) then return
     Report0820_( c, id, left( selfNm, len( selfNm ) - 1 ) )
 end sub
 

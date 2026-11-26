@@ -16,6 +16,8 @@ Define created at compile time if the OS is reasonably enough like UNIX that you
 
 ## Remarks
 
+In tiko this is `linux-x86_64`, `linux-arm64` and `macos-arm64`. tiko has no single name of its own for it: tiko code tests `defined( TIKO_OS_LINUX ) orelse defined( TIKO_OS_MACOS )` ([`TIKO_OS_`](Category-Tiko-Compiler-Define)).
+
 ### Differences from QB
 
 - New to FreeBASIC
@@ -29,6 +31,7 @@ Define created at compile time if the OS is reasonably enough like UNIX that you
 - [`__FB_CYGWIN__`](Fb-Cygwin)
 - [`__FB_DARWIN__`](Fb-Darwin)
 - [`__FB_PCOS__`](Fb-Pcos)
+- [`TIKO_OS_LINUX`](Category-Tiko-Compiler-Define)
 - [Compiler Option: -target](Compiler-Option-Target)
 
 ## Examples

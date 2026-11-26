@@ -1,0 +1,931 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- editing and the row transaction (phase G2).
+'
+' THE EDITORS are children of the surface, one per kind, created on first use and HIDDEN between
+' edits, never destroyed from here: an edit usually ends inside the editor's own callback
+' (ListTree's rule). TEXT and NUMBER cells edit in a tkTextBox, COMBO cells in a tkComboBox filled
+' from the column's items, DATE cells in a tkDatePicker. A CHECK cell has no editor: Space or a click
+' toggles it. BUTTON and LINK cells are not edited; they fire ButtonClick.
+'
+' THE KEYS. A single-line tkTextBox refuses Tab, Up/Down, PgUp/PgDn and Esc, so they bubble to the
+' surface, which commits and moves (dgInput.tiko); Enter is the TextBox's own, so its callback
+' commits and moves. The combo and the picker claim more keys, so their message callbacks take
+' Enter and Esc first.
+'
+' THE LIFECYCLE. BeginEdit: the grid's read-only checks, CellBeginEdit's veto, a placeholder
+' row made real (RowAdded), the editor filled and placed over the cell, the focus moved to it.
+' EndEdit( commit ): the editor's value is parsed by the column's value kind (dgStore's strict
+' rules), CellParse may change or refuse it; a refusal keeps the editor open, framed in ErrorColor,
+' with the reason in GetEditError. A changed value makes its row the dirty row (its values
+' snapshotted first), is written, and fires CellValueChanged; then CellEndEdit.
+'
+' THE ROW TRANSACTION. Leaving the dirty row (another current row, the focus leaving the grid)
+' asks RowValidating, then fires RowCommitted. Esc with no edit open cancels it: the snapshot is
+' written back -- or a row made from the placeholder in this transaction is removed -- and
+' CancelRowEdit fires.
+'
+' THE FOCUS WATCH. While an edit is open or a row is dirty, a timer on the surface checks where
+' the focus is: an editor that lost it (to anything but its own dropdown) commits; a dirty row
+' whose grid lost it commits. A refused commit takes the focus back to the editor.
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkTextBox"
+#import "../tkComboBox"
+#import "../tkDatePicker"
+#import "../tkCalendar"
+using tkHost
+using tkPaint
+using tkTextBox
+using tkComboBox
+using tkDatePicker
+using tkCalendar
+
+const DG_TIMER_EDITFOCUS = TK_TIMER_APP + 10
+const DG_EDITFOCUS_MS = 50
+
+' ==========================================================================================
+' Helpers
+' ==========================================================================================
+function DgHasNewRow( byval p as TKDATAGRID_STATE ptr ) as boolean
+    return p->bAllowAdd andalso (p->bReadOnly = false) andalso DgFeedWritable( p ) andalso DgFeedCanInsert( p )
+end function
+
+' The rows the view shows: the real ones (sorted and filtered) plus the placeholder.
+function DgViewRows( byval p as TKDATAGRID_STATE ptr ) as integer
+    return DgViewCount( p ) + iif( DgHasNewRow( p ), 1, 0 )
+end function
+
+' A model row, or the placeholder (row = rowCount with AllowAddRows).
+function DgValidViewRow( byval p as TKDATAGRID_STATE ptr, byval row as integer ) as boolean
+    return (row >= 0) andalso ((row < p->rowCount) orelse (DgHasNewRow( p ) andalso (row = p->rowCount)))
+end function
+
+private function DgValueEqual( byref a as const TKDG_VALUE, byref b as const TKDG_VALUE ) as boolean
+    if a.kind <> b.kind then return false
+    select case a.kind
+    case TKDG_TEXT  : return a.s = b.s
+    case TKDG_INT   : return a.i = b.i
+    case TKDG_FLOAT : return a.f = b.f
+    case TKDG_BOOL  : return a.b = b.b
+    case TKDG_DATE  : return (a.d.wYear = b.d.wYear) andalso (a.d.wMonth = b.d.wMonth) andalso (a.d.wDay = b.d.wDay)
+    end select
+    return true
+end function
+
+' Can the user change this cell at all (any way: an editor, a toggle, Delete, a paste)?
+function DgCellEditable( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer ) as boolean
+    if p->bReadOnly orelse (DgValidViewRow( p, row ) = false) orelse (DgValidCol( p, col ) = false) then return false
+    if (p->cols(col).c.readOnly) orelse (p->cols(col).c.visible = false) orelse (DgFeedWritable( p ) = false) then return false
+    select case p->cols(col).c.kind
+    case TKDG_COL_TEXT, TKDG_COL_NUMBER, TKDG_COL_COMBO, TKDG_COL_DATE, TKDG_COL_CHECK : return true
+    end select
+    return false
+end function
+
+' Does this cell open an editor (a check cell is changed in place)?
+function DgCellHasEditor( byval p as TKDATAGRID_STATE ptr, byval col as integer ) as boolean
+    select case p->cols(col).c.kind
+    case TKDG_COL_TEXT, TKDG_COL_NUMBER, TKDG_COL_COMBO, TKDG_COL_DATE : return true
+    end select
+    return false
+end function
+
+' A combo cell's shown text: the item an INT value indexes.
+function DgDisplayText( byval p as TKDATAGRID_STATE ptr, byval col as integer, byref v as const TKDG_VALUE ) as ustring
+    if (p->cols(col).c.kind = TKDG_COL_COMBO) andalso (v.kind = TKDG_INT) then
+        if (v.i >= 0) andalso (v.i < p->cols(col).nItems) then return p->cols(col).items( v.i )
+    end if
+    return DgDefaultText( v )
+end function
+
+' Text to the column's kind, by dgStore's strict rules; "" is EMPTY.
+private function DgParseCell( byval p as TKDATAGRID_STATE ptr, byval col as integer, byref text as const ustring, _
+                              byref v as TKDG_VALUE, byref errText as ustring ) as boolean
+    dim as TKDG_VALUE t
+    t.SetText( text )
+    if DgConvert( t, p->cols(col).c.valueKind ) then
+        v = t
+        errText = ""
+        return true
+    end if
+    select case p->cols(col).c.valueKind
+    case TKDG_INT   : errText = "Not a whole number"
+    case TKDG_FLOAT : errText = "Not a number"
+    case TKDG_BOOL  : errText = "Not true or false"
+    case TKDG_DATE  : errText = "Not a date (yyyy-mm-dd)"
+    case else       : errText = "Not a valid value"
+    end select
+    return false
+end function
+
+' ==========================================================================================
+' The row transaction
+' ==========================================================================================
+' row becomes the dirty row (its values snapshotted) unless it already is.
+private sub DgMarkDirty( byval p as TKDATAGRID_STATE ptr, byval row as integer )
+    if p->dirtyRow = row then exit sub
+    p->dirtyRow = row
+    if p->colCount > 0 then
+        redim p->dirtySnap( 0 to p->colCount - 1 )
+        for k as integer = 0 to p->colCount - 1
+            DgRead( p, row, k, p->dirtySnap(k) )
+        next
+    end if
+    DgStartFocusWatch( p )
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' Forget an edit and the dirty row without a word (programmatic changes to rows or columns).
+sub DgDropEdit( byval p as TKDATAGRID_STATE ptr )
+    if p->bEditing then
+        p->bEditing = false
+        p->editRow = -1 : p->editCol = -1
+        if p->wEditor then
+            if tkWidget_IsAncestorOf( p->wEditor, p->hWin->pHost->pFocus ) then tkHost_SetFocus( p->hWin->pHost, p->wSurf )
+            tkWidget_Show( p->wEditor, false )
+        end if
+        p->wEditor = 0
+        p->editError = ""
+    end if
+    p->dirtyRow = -1 : p->bDirtyIsNew = false
+    erase p->dirtySnap
+end sub
+
+' Leaving the dirty row: TRUE when it is committed (or there was none).
+function DgCommitRow( byval p as TKDATAGRID_STATE ptr ) as boolean
+    if p->bEditing then
+        if DgEndEdit( p, true ) = false then return false
+    end if
+    if p->dirtyRow < 0 then return true
+    dim as integer row = p->dirtyRow
+    if p->RowValidatingCallback then
+        if p->RowValidatingCallback( p->hWin, row ) = false then return false
+    end if
+    p->dirtyRow = -1 : p->bDirtyIsNew = false
+    erase p->dirtySnap
+    if p->RowCommittedCallback then p->RowCommittedCallback( p->hWin, row )
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
+' Esc on the dirty row: its old values back, or the new row gone.
+sub DgCancelRow( byval p as TKDATAGRID_STATE ptr )
+    if p->bEditing then DgEndEdit( p, false )
+    if p->dirtyRow < 0 then exit sub
+    dim as integer row = p->dirtyRow
+    if p->bDirtyIsNew then
+        p->dirtyRow = -1 : p->bDirtyIsNew = false
+        erase p->dirtySnap
+        ' virtual mode: the count drops and CancelRowEdit (below) tells the host to drop its row
+        if DgRowsRemoved( p, row, 1 ) then DgSelRowsMoved( p, row, -1 )
+        DgChanged( p )
+    else
+        dim as integer n = ubound( p->dirtySnap ) + 1
+        if n > p->colCount then n = p->colCount
+        for k as integer = 0 to n - 1
+            DgWrite( p, row, k, p->dirtySnap(k) )
+        next
+        p->dirtyRow = -1
+        erase p->dirtySnap
+    end if
+    if p->CancelRowEditCallback then p->CancelRowEditCallback( p->hWin, row )
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' A user's change of one cell outside an editor (a toggle, Delete, a paste): dirty, written, told.
+' FALSE when the value would not go in.
+function DgUserWrite( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, _
+                      byref v as const TKDG_VALUE, byval bTransaction as boolean ) as boolean
+    dim as TKDG_VALUE old
+    DgRead( p, row, col, old )
+    dim as TKDG_VALUE w = v
+    if DgConvert( w, p->cols(col).c.valueKind ) = false then return false
+    if DgValueEqual( old, w ) then return true
+    if bTransaction then DgMarkDirty( p, row )
+    if DgWrite( p, row, col, w ) = false then return false
+    if p->CellValueChangedCallback then p->CellValueChangedCallback( p->hWin, row, col )
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
+' ==========================================================================================
+' The editors
+' ==========================================================================================
+private function DgFromEditorChild( byval w as TK_WIDGET ptr ) as TKDATAGRID_STATE ptr
+    ' editor -> surface -> container; a picker's field is one level deeper
+    while w
+        if w->proc = @DgSurfaceProc then return DgState( tkWidget_Parent( w ) )
+        w = w->pParent
+    wend
+    return 0
+end function
+
+' Enter in an editor: commit, then move as Enter does (Shift: up).
+private sub DgEditorEnter( byval p as TKDATAGRID_STATE ptr )
+    if DgEndEdit( p, true ) = false then exit sub
+    dim as TK_MSG m
+    m.msg = TKM_KEYDOWN : m.key = SDLK_RETURN : m.mods = SDL_GetModState( )
+    DgKeyDown( p, @m )
+end sub
+
+sub DgEdTextEnter( byval hTextBox as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgFromEditorChild( hTextBox )
+    if p then DgEditorEnter( p )
+end sub
+
+function DgEdComboMessage( byval m as TKCOMBOBOX_MESSAGEINFO ptr ) as boolean
+    if m->msg <> TKM_KEYDOWN then return false
+    dim as TKDATAGRID_STATE ptr p = DgFromEditorChild( m->hCombo )
+    if p = 0 then return false
+    select case m->key
+    case SDLK_RETURN, SDLK_KP_ENTER
+        DgEditorEnter( p )
+        return true
+    case SDLK_ESCAPE
+        DgEndEdit( p, false )
+        return true
+    end select
+    return false
+end function
+
+function DgEdDateMessage( byval m as TKDATEPICKER_MESSAGEINFO ptr ) as boolean
+    if m->msg <> TKM_KEYDOWN then return false
+    dim as TKDATAGRID_STATE ptr p = DgFromEditorChild( m->hCtrl )
+    if p = 0 then return false
+    if tkDatePicker_IsDroppedDown( m->hCtrl ) then return false
+    select case m->key
+    case SDLK_RETURN, SDLK_KP_ENTER
+        DgEditorEnter( p )
+        return true
+    case SDLK_ESCAPE
+        DgEndEdit( p, false )
+        return true
+    end select
+    return false
+end function
+
+private function DgGridFont( byval p as TKDATAGRID_STATE ptr ) as TTF_Font ptr
+    return iif( p->pFont <> 0, p->pFont, p->hWin->pHost->pDefaultFont )
+end function
+
+' The editor for a column's kind, made on first use.
+private function DgEditorFor( byval p as TKDATAGRID_STATE ptr, byval col as integer ) as TK_WIDGET ptr
+    dim as long id = p->hWin->ctrlId
+    select case p->cols(col).c.kind
+    case TKDG_COL_COMBO
+        if p->wEdCombo = 0 then
+            p->wEdCombo = tkComboBox_Create( p->wSurf, id + 11 )
+            tkComboBox_SetMessageCallback( p->wEdCombo, @DgEdComboMessage )
+            tkWidget_Show( p->wEdCombo, false )
+        end if
+        tkComboBox_SetFont( p->wEdCombo, DgGridFont( p ) )
+        return p->wEdCombo
+    case TKDG_COL_DATE
+        if p->wEdDate = 0 then
+            p->wEdDate = tkDatePicker_Create( p->wSurf, id + 12 )
+            tkDatePicker_SetAllowEmpty( p->wEdDate, true )
+            tkDatePicker_SetMessageCallback( p->wEdDate, @DgEdDateMessage )
+            tkWidget_Show( p->wEdDate, false )
+        end if
+        tkDatePicker_SetFont( p->wEdDate, DgGridFont( p ) )
+        return p->wEdDate
+    case else
+        if p->wEdText = 0 then
+            p->wEdText = tkTextBox_Create( p->wSurf, id + 10, false )
+            tkTextBox_SetEnterPressedCallback( p->wEdText, @DgEdTextEnter )
+            tkTextBox_SetSelectOnFocus( p->wEdText, false )
+            tkTextBox_SetBorderWidth( p->wEdText, 1 )
+            tkWidget_Show( p->wEdText, false )
+        end if
+        tkTextBox_SetFont( p->wEdText, DgGridFont( p ) )
+        dim as integer m_ = DgScale( p, CDATAGRID_CELL_PAD ) - 1
+        tkTextBox_SetMargins( p->wEdText, iif( m_ < 0, 0, m_ ), iif( m_ < 0, 0, m_ ) )
+        select case DgAlignOf( p->cols(col).c )
+        case TKDG_ALIGN_RIGHT : tkTextBox_SetTextAlign( p->wEdText, TXT_ALIGN_RIGHT )
+        case TKDG_ALIGN_CENTER : tkTextBox_SetTextAlign( p->wEdText, TXT_ALIGN_CENTER )
+        case else : tkTextBox_SetTextAlign( p->wEdText, TXT_ALIGN_LEFT )
+        end select
+        return p->wEdText
+    end select
+end function
+
+' Where the focus goes inside an editor.
+private function DgEditorFocusTarget( byval p as TKDATAGRID_STATE ptr ) as TK_WIDGET ptr
+    if (p->wEditor <> 0) andalso (p->wEditor = p->wEdDate) then return tkDatePicker_GetTextBoxHandle( p->wEdDate )
+    return p->wEditor
+end function
+
+private function DgEditorDropped( byval p as TKDATAGRID_STATE ptr ) as boolean
+    if p->wEditor = 0 then return false
+    if p->wEditor = p->wEdCombo then return tkComboBox_IsDroppedDown( p->wEdCombo )
+    if p->wEditor = p->wEdDate then return tkDatePicker_IsDroppedDown( p->wEdDate )
+    return false
+end function
+
+private sub DgShowEditError( byval p as TKDATAGRID_STATE ptr, byval bOn as boolean )
+    if (p->wEditor = 0) orelse (p->wEditor <> p->wEdText) then exit sub
+    if bOn then
+        tkTextBox_SetBorderColor( p->wEdText, p->colors.ErrorColor )
+        tkTextBox_SetFocusBorderColor( p->wEdText, p->colors.ErrorColor )
+        p->bErrorShown = true
+    elseif p->bErrorShown then
+        tkTextBox_UnpinColors( p->wEdText )
+        p->bErrorShown = false
+    end if
+end sub
+
+' The open editor over its cell. A cell scrolled out of view commits; a refused commit scrolls it
+' back.
+sub DgPlaceEditor( byval p as TKDATAGRID_STATE ptr )
+    if (p->bEditing = false) orelse (p->wEditor = 0) orelse p->bEndingEdit then exit sub
+    dim as integer row = p->editRow, col = p->editCol
+    if p->cols(col).wPx <= 0 then
+        DgEndEdit( p, true )
+        exit sub
+    end if
+    dim as integer rowH = DgRowHPx( p )
+    dim as integer v = DgViewOf( p, row )
+    if v < 0 then
+        DgEndEdit( p, true )
+        exit sub
+    end if
+    dim as integer x = DgColLeft( p, col ), y = DgRowY( p, v )
+    dim as integer lim = iif( DgIsFrozen( p, col ), DgRhPx( p ), DgScrollLeft( p ) )
+    ' a scrolling row under the frozen rows or the footer is out of view; a frozen row never is
+    dim as integer top = iif( v < DgNFR( p ), DgBandTop( p ), DgBodyTop( p ) )
+    if (x + p->cols(col).wPx <= lim) orelse (x >= p->wSurf->cw) orelse (y + rowH <= top) orelse (y >= DgBodyBottom( p )) then
+        if DgEndEdit( p, true ) = false then DgEnsureVisible( p, row, col )
+        exit sub
+    end if
+    dim as integer w = p->cols(col).wPx
+    if p->wEditor = p->wEdDate then
+        ' the picker's icon takes room the cell's text did not need: at least the date and the
+        ' icon, spilling over the next cell when the column is narrower (as Excel's editor does)
+        dim as integer need = tkText_Width( DgGridFont( p ), "0000-00-00" ) + tkDatePicker_GetIconWidth( p->wEdDate ) + DgScale( p, 2 * CDATAGRID_CELL_PAD + 12 )
+        if need > w then w = need
+    end if
+    tkWidget_SetPos( p->wEditor, x, y, w, rowH )
+end sub
+
+' ==========================================================================================
+' Begin / end
+' ==========================================================================================
+' Opens the editor on (row, col). initText: replaces the content (a typed character); else the
+' cell's value, all selected when bSelectAll, the caret at the end otherwise. FALSE when the cell
+' cannot be edited, the veto said no, or the dirty row would not let go.
+function DgBeginEdit( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, _
+                      byref initText as const ustring, byval bReplace as boolean, byval bSelectAll as boolean ) as boolean
+    if p->bEditing then
+        if (p->editRow = row) andalso (p->editCol = col) then return true
+        if DgEndEdit( p, true ) = false then return false
+    end if
+    if (DgCellEditable( p, row, col ) = false) orelse (DgCellHasEditor( p, col ) = false) then return false
+    if (p->dirtyRow >= 0) andalso (p->dirtyRow <> row) then
+        if DgCommitRow( p ) = false then return false
+    end if
+    if p->CellBeginEditCallback then
+        if p->CellBeginEditCallback( p->hWin, row, col ) = false then return false
+    end if
+    ' the placeholder becomes a real row first
+    if row >= p->rowCount then
+        row = p->rowCount
+        if DgRowsInserted( p, row, 1 ) = false then return false
+        DgChanged( p )
+        if p->RowAddedCallback then p->RowAddedCallback( p->hWin, row )
+        DgMarkDirty( p, row )
+        p->bDirtyIsNew = true
+    end if
+    dim as TK_WIDGET ptr ed = DgEditorFor( p, col )
+    p->wEditor = ed
+    p->editRow = row : p->editCol = col
+    p->bEditing = true
+    p->editError = ""
+    dim as TKDG_VALUE v
+    DgRead( p, row, col, v )
+    select case p->cols(col).c.kind
+    case TKDG_COL_COMBO
+        tkComboBox_Clear( ed )
+        for k as integer = 0 to p->cols(col).nItems - 1
+            tkComboBox_AddItem( ed, p->cols(col).items(k) )
+        next
+        dim as long idx = -1
+        if v.kind = TKDG_INT then
+            idx = v.i
+        elseif v.kind = TKDG_TEXT then
+            idx = tkComboBox_FindItemByText( ed, v.s )
+        end if
+        tkComboBox_SetCurSel( ed, idx )
+    case TKDG_COL_DATE
+        dim as TKDG_VALUE dv = v
+        if DgConvert( dv, TKDG_DATE ) andalso (dv.kind = TKDG_DATE) then tkDatePicker_SetDate( ed, dv.d ) else tkDatePicker_ClearDate( ed )
+    case else
+        tkTextBox_SetText( ed, iif( bReplace, initText, DgDefaultText( v ) ) )
+    end select
+    p->curRow = row : p->curCol = col
+    DgEnsureVisible( p, row, col )
+    DgPlaceEditor( p )
+    tkWidget_BringToTop( ed )
+    tkWidget_Show( ed, true )
+    tkHost_SetFocus( p->hWin->pHost, DgEditorFocusTarget( p ) )
+    if ed = p->wEdText then
+        dim as integer n = tkTextBox_GetTextLength( ed )
+        if bSelectAll andalso (bReplace = false) then tkTextBox_SelectAll( ed ) else tkTextBox_SetSel( ed, n, n )
+    elseif (ed = p->wEdDate) andalso bReplace then
+        dim as TK_WIDGET ptr fld = tkDatePicker_GetTextBoxHandle( ed )
+        tkTextBox_SetText( fld, initText )
+        tkTextBox_SetSel( fld, tkTextBox_GetTextLength( fld ), tkTextBox_GetTextLength( fld ) )
+    end if
+    DgStartFocusWatch( p )
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
+' Ends the edit. bCommit: the editor's value goes in (parse, CellParse, write); FALSE when it was
+' refused, and the edit stays open. Cancelling always ends it.
+function DgEndEdit( byval p as TKDATAGRID_STATE ptr, byval bCommit as boolean ) as boolean
+    if (p->bEditing = false) orelse p->bEndingEdit then return true
+    p->bEndingEdit = true
+    dim as integer row = p->editRow, col = p->editCol
+    dim as TK_WIDGET ptr ed = p->wEditor
+    dim as boolean bCommitted = false
+    if bCommit andalso DgValidRow( p, row ) andalso DgValidCol( p, col ) then
+        dim as TKDG_VALUE v
+        dim as ustring text, errText
+        dim as boolean ok = true
+        if ed = p->wEdCombo then
+            dim as long idx = tkComboBox_GetCurSel( ed )
+            if idx >= 0 then text = tkComboBox_GetItemText( ed, idx )
+            if idx < 0 then
+                v.Clear( )
+            elseif p->cols(col).c.valueKind = TKDG_INT then
+                v.SetInt( idx )
+            else
+                v.SetText( text )
+            end if
+        elseif ed = p->wEdDate then
+            dim as TKDATE d
+            text = tkTextBox_GetText( tkDatePicker_GetTextBoxHandle( ed ) )
+            if tkDatePicker_HasDate( ed ) andalso tkDatePicker_GetDate( ed, d ) then v.SetDate( d ) else v.Clear( )
+            if DgConvert( v, p->cols(col).c.valueKind ) = false then ok = false : errText = "Not a valid value"
+        else
+            text = tkTextBox_GetText( ed )
+            ok = DgParseCell( p, col, text, v, errText )
+        end if
+        if p->CellParseCallback then ok = p->CellParseCallback( p->hWin, row, col, text, ok, v, errText )
+        if ok then
+            dim as TKDG_VALUE w = v, old
+            if DgConvert( w, p->cols(col).c.valueKind ) = false then ok = false : errText = "Not a valid value"
+            if ok then
+                DgRead( p, row, col, old )
+                if DgValueEqual( old, w ) = false then
+                    DgMarkDirty( p, row )
+                    if DgWrite( p, row, col, w ) = false then ok = false : errText = "Not a valid value"
+                    if ok andalso (p->CellValueChangedCallback <> 0) then p->CellValueChangedCallback( p->hWin, row, col )
+                end if
+            end if
+        end if
+        if ok = false then
+            if len( errText ) = 0 then errText = "Not a valid value"
+            p->editError = errText
+            DgShowEditError( p, true )
+            if tkWidget_IsAncestorOf( ed, p->hWin->pHost->pFocus ) = false then tkHost_SetFocus( p->hWin->pHost, DgEditorFocusTarget( p ) )
+            p->bEndingEdit = false
+            return false
+        end if
+        bCommitted = true
+    end if
+    DgShowEditError( p, false )
+    p->bEditing = false
+    p->editRow = -1 : p->editCol = -1
+    p->editError = ""
+    ' the focus back to the surface first: hiding the focused editor would drop it to nobody
+    if tkWidget_IsAncestorOf( ed, p->hWin->pHost->pFocus ) then tkHost_SetFocus( p->hWin->pHost, p->wSurf )
+    if ed = p->wEdCombo then tkComboBox_CloseUp( ed )
+    if ed = p->wEdDate then tkDatePicker_CloseUp( ed )
+    tkWidget_Show( ed, false )
+    p->wEditor = 0
+    p->bEndingEdit = false
+    if p->CellEndEditCallback then p->CellEndEditCallback( p->hWin, row, col, bCommitted )
+    tkWidget_Invalidate( p->wSurf )
+    return true
+end function
+
+' ==========================================================================================
+' The focus watch
+' ==========================================================================================
+sub DgStartFocusWatch( byval p as TKDATAGRID_STATE ptr )
+    if tkWidget_HasTimer( p->wSurf, DG_TIMER_EDITFOCUS ) = false then tkWidget_SetTimer( p->wSurf, DG_TIMER_EDITFOCUS, DG_EDITFOCUS_MS )
+end sub
+
+sub DgFocusWatchTick( byval p as TKDATAGRID_STATE ptr )
+    if (p->bEditing = false) andalso (p->dirtyRow < 0) then
+        tkWidget_KillTimer( p->wSurf, DG_TIMER_EDITFOCUS )
+        exit sub
+    end if
+    dim as TK_WIDGET ptr f = p->hWin->pHost->pFocus
+    if p->bEditing then
+        if tkWidget_IsAncestorOf( p->wEditor, f ) orelse DgEditorDropped( p ) then exit sub
+        if DgEndEdit( p, true ) = false then exit sub         ' refused: the focus is back in the editor
+    end if
+    if (p->dirtyRow >= 0) andalso (tkWidget_IsAncestorOf( p->wSurf, f ) = false) then DgCommitRow( p )
+end sub
+
+' ==========================================================================================
+' In-place changes: check toggles, buttons, Delete, paste
+' ==========================================================================================
+' Space or a click on a check cell. FALSE when it is not one, or not editable.
+function DgToggleCheck( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer ) as boolean
+    if (p->cols(col).c.kind <> TKDG_COL_CHECK) orelse (DgCellEditable( p, row, col ) = false) then return false
+    if row >= p->rowCount then return false                       ' the placeholder has no value to toggle
+    if (p->dirtyRow >= 0) andalso (p->dirtyRow <> row) then
+        if DgCommitRow( p ) = false then return false
+    end if
+    dim as TKDG_VALUE v
+    DgRead( p, row, col, v )
+    dim as boolean bOn = false
+    if DgConvert( v, TKDG_BOOL ) andalso (v.kind = TKDG_BOOL) then bOn = v.b
+    dim as TKDG_VALUE nv
+    nv.SetBool( bOn = false )
+    return DgUserWrite( p, row, col, nv, true )
+end function
+
+function DgClickButton( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer ) as boolean
+    select case p->cols(col).c.kind
+    case TKDG_COL_BUTTON, TKDG_COL_LINK
+        if row >= p->rowCount then return false
+        if p->ButtonClickCallback then p->ButtonClickCallback( p->hWin, row, col )
+        return true
+    end select
+    return false
+end function
+
+' Delete with whole rows selected (and AllowDeleteRows): those rows go, RowsDeleting asked once
+' per run, last run first. Otherwise the selected editable cells become EMPTY. TRUE when the key
+' did something.
+function DgDeleteKey( byval p as TKDATAGRID_STATE ptr ) as boolean
+    if p->bReadOnly then return false
+    if (p->sel.bAll orelse (p->sel.nSpans > 0)) andalso p->bAllowDelete then
+        if p->bEditing then DgEndEdit( p, false )
+        dim as TKDG_SPAN runs( any )
+        dim as integer n = 0
+        if p->sel.bAll then
+            if p->rowCount > 0 then redim runs( 0 to 0 ) : runs(0).a = 0 : runs(0).b = p->rowCount - 1 : n = 1
+        else
+            redim runs( 0 to p->sel.nSpans - 1 )
+            for k as integer = 0 to p->sel.nSpans - 1
+                runs(n) = p->sel.spans(k)
+                if runs(n).b > p->rowCount - 1 then runs(n).b = p->rowCount - 1
+                if runs(n).a <= runs(n).b then n += 1
+            next
+        end if
+        dim as boolean any_ = false
+        for k as integer = n - 1 to 0 step -1
+            dim as integer cnt = runs(k).b - runs(k).a + 1
+            if p->RowsDeletingCallback then
+                if p->RowsDeletingCallback( p->hWin, runs(k).a, cnt ) = false then continue for
+            end if
+            if (p->dirtyRow >= runs(k).a) andalso (p->dirtyRow <= runs(k).b) then p->dirtyRow = -1 : p->bDirtyIsNew = false : erase p->dirtySnap
+            if p->dirtyRow > runs(k).b then p->dirtyRow -= cnt
+            if DgRowsRemoved( p, runs(k).a, cnt ) = false then continue for
+            DgSelRowsMoved( p, runs(k).a, -cnt )
+            any_ = true
+        next
+        if any_ then DgChanged( p )
+        return any_
+    end if
+    ' cells
+    dim as boolean any_ = false
+    dim as TKDG_VALUE e
+    for k as integer = 0 to p->sel.nRects - 1
+        dim as TKDG_RANGE q = p->sel.rects(k)
+        for qv as integer = q.row1 to iif( q.row2 < DgViewCount( p ), q.row2, DgViewCount( p ) - 1 )
+            dim as integer r = DgModelOf( p, qv )
+            if (r < 0) orelse (r >= p->rowCount) then continue for
+            for d as integer = q.disp1 to q.disp2
+                if (d < 0) orelse (d >= p->colCount) then continue for
+                dim as integer c = p->order(d)
+                if DgCellEditable( p, r, c ) = false then continue for
+                if DgUserWrite( p, r, c, e, false ) then any_ = true
+            next
+        next
+    next
+    return any_
+end function
+
+' Tab-separated text into the grid from the current cell, rows down and display columns right,
+' clipped at the last row and column; a quoted field may hold tabs, line breaks and doubled
+' quotes. Each value is parsed by its column; one that will not go in is skipped. Returns how many
+' cells changed.
+private sub DgPasteOne( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval d0 as integer, byval ci as integer, _
+                        byref fld as const ustring, byref n as integer )
+    if (row < 0) orelse (row >= p->rowCount) then exit sub
+    dim as integer d = d0
+    for k as integer = 1 to ci
+        d = DgNextVisDisp( p, d, 1 )
+        if d < 0 then exit sub
+    next
+    dim as integer col = p->order(d)
+    if (DgCellEditable( p, row, col ) = false) orelse (p->cols(col).c.kind = TKDG_COL_CHECK andalso (len( fld ) = 0)) then exit sub
+    dim as TKDG_VALUE v
+    dim as ustring er
+    if DgParseCell( p, col, fld, v, er ) = false then exit sub
+    dim as TKDG_VALUE old
+    DgRead( p, row, col, old )
+    if DgValueEqual( old, v ) then exit sub
+    if DgUserWrite( p, row, col, v, false ) then n += 1
+end sub
+
+' Tab-separated text into the grid from the current cell, rows down and visible display columns
+' right, clipped at the last row and column; a quoted field may hold tabs, line breaks and doubled
+' quotes (Excel's rule). Each value is parsed by its column; one that will not go in is skipped.
+' Returns how many cells changed. Written at once, outside the row transaction.
+function DgPasteText( byval p as TKDATAGRID_STATE ptr, byref text as const ustring ) as integer
+    if p->bReadOnly orelse (DgValidRow( p, p->curRow ) = false) then return 0
+    dim as integer d0 = DgDispOf( p, p->curCol )
+    if d0 < 0 then return 0
+    if p->bEditing then DgEndEdit( p, true )
+    dim as ustring q = chr(34), fld
+    dim as integer n = 0, r = 0, ci = 0, k = 1, L = len( text )
+    dim as integer v0 = DgViewOf( p, p->curRow )         ' lines go down the rows as shown
+    dim as boolean inQ = false
+    while k <= L
+        dim as ustring c = mid( text, k, 1 )
+        if inQ then
+            if c = q then
+                if (k < L) andalso (mid( text, k + 1, 1 ) = q) then fld &= q : k += 1 else inQ = false
+            else
+                fld &= c
+            end if
+        elseif (c = q) andalso (len( fld ) = 0) then
+            inQ = true
+        elseif c = chr(9) then
+            DgPasteOne( p, DgModelOf( p, v0 + r ), d0, ci, fld, n )
+            ci += 1 : fld = ""
+        elseif (c = chr(13)) orelse (c = chr(10)) then
+            if (c = chr(13)) andalso (k < L) andalso (mid( text, k + 1, 1 ) = chr(10)) then k += 1
+            DgPasteOne( p, DgModelOf( p, v0 + r ), d0, ci, fld, n )
+            r += 1 : ci = 0 : fld = ""
+        else
+            fld &= c
+        end if
+        k += 1
+    wend
+    if (len( fld ) > 0) orelse (ci > 0) then DgPasteOne( p, DgModelOf( p, v0 + r ), d0, ci, fld, n )
+    return n
+end function
+
+' ==========================================================================================
+' Public API: editing
+' ==========================================================================================
+public sub tkDataGrid_SetEditMode( byval hGrid as TK_WIDGET ptr, byval nMode as long )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (nMode < TKDG_EDIT_ONENTER) orelse (nMode > TKDG_EDIT_PROGRAMMATIC) then exit sub
+    p->editMode = nMode
+end sub
+
+public function tkDataGrid_GetEditMode( byval hGrid as TK_WIDGET ptr ) as long
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->editMode, TKDG_EDIT_ONKEYSTROKEORF2 )
+end function
+
+' The whole grid: no editor, no toggle, no Delete, no paste, no placeholder row. An open edit is
+' cancelled. Enter on a cell then fires CellActivate.
+public sub tkDataGrid_SetReadOnly( byval hGrid as TK_WIDGET ptr, byval b as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    if b andalso p->bEditing then DgEndEdit( p, false )
+    p->bReadOnly = b
+    DgChanged( p )
+end sub
+
+public function tkDataGrid_GetReadOnly( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->bReadOnly, false )
+end function
+
+' A placeholder row after the last; editing it makes a real row (RowAdded).
+public sub tkDataGrid_SetAllowAddRows( byval hGrid as TK_WIDGET ptr, byval b as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->bAllowAdd = b
+    DgChanged( p )
+end sub
+
+public function tkDataGrid_GetAllowAddRows( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->bAllowAdd, false )
+end function
+
+public sub tkDataGrid_SetAllowDeleteRows( byval hGrid as TK_WIDGET ptr, byval b as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->bAllowDelete = b
+end sub
+
+public function tkDataGrid_GetAllowDeleteRows( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->bAllowDelete, false )
+end function
+
+' F2 and a double click select the cell's text (FALSE: the caret goes to its end).
+public sub tkDataGrid_SetEditSelectAll( byval hGrid as TK_WIDGET ptr, byval b as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then p->bEditSelectAll = b
+end sub
+
+' Is row the placeholder (the row after the last, with AllowAddRows)?
+public function tkDataGrid_IsNewRow( byval hGrid as TK_WIDGET ptr, byval row as integer ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return false
+    return DgHasNewRow( p ) andalso (row = p->rowCount)
+end function
+
+' A COMBO column's choices. An INT column stores the chosen index, a TEXT column its text.
+public sub tkDataGrid_SetColumnItems( byval hGrid as TK_WIDGET ptr, byval col as integer, items() as ustring )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then exit sub
+    dim as integer n = ubound( items ) - lbound( items ) + 1
+    with p->cols(col)
+        if n <= 0 then
+            erase .items : .nItems = 0
+        else
+            redim .items( 0 to n - 1 )
+            for k as integer = 0 to n - 1
+                .items(k) = items( lbound( items ) + k )
+            next
+            .nItems = n
+        end if
+    end with
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+public function tkDataGrid_GetColumnItemCount( byval hGrid as TK_WIDGET ptr, byval col as integer ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return 0
+    return p->cols(col).nItems
+end function
+
+' Opens the editor on a cell, as F2 does; FALSE when it cannot be edited (or was vetoed).
+public function tkDataGrid_BeginEdit( byval hGrid as TK_WIDGET ptr, byval row as integer, byval col as integer, _
+                                      byval bSelectAll as boolean = true ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return false
+    return DgBeginEdit( p, row, col, "", false, bSelectAll )
+end function
+
+' Ends the open edit; FALSE when a commit was refused (the editor stays open).
+public function tkDataGrid_EndEdit( byval hGrid as TK_WIDGET ptr, byval bCommit as boolean = true ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return true
+    return DgEndEdit( p, bCommit )
+end function
+
+public function tkDataGrid_IsEditing( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->bEditing, false )
+end function
+
+public function tkDataGrid_GetEditRow( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->editRow, -1 )
+end function
+
+public function tkDataGrid_GetEditCol( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->editCol, -1 )
+end function
+
+' The editor in use (a tkTextBox, tkComboBox or tkDatePicker), 0 when none.
+public function tkDataGrid_GetEditor( byval hGrid as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->wEditor, cast( TK_WIDGET ptr, 0 ) )
+end function
+
+' Why the last commit was refused ("" when it was not, or the edit ended).
+public function tkDataGrid_GetEditError( byval hGrid as TK_WIDGET ptr ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return ""
+    return p->editError
+end function
+
+' The dirty row, -1 when none.
+public function tkDataGrid_GetDirtyRow( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->dirtyRow, -1 )
+end function
+
+' Commits the dirty row as leaving it would (RowValidating, RowCommitted); FALSE when refused.
+public function tkDataGrid_CommitRow( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return true
+    return DgCommitRow( p )
+end function
+
+' Cancels the dirty row as Esc would (CancelRowEdit).
+public sub tkDataGrid_CancelRowEdit( byval hGrid as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p then DgCancelRow( p )
+end sub
+
+' Ctrl+V's: tab-separated text from the clipboard into the grid at the current cell; returns
+' how many cells changed.
+public function tkDataGrid_Paste( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (tkHost_HasClipboardText( ) = false) then return 0
+    return DgPasteText( p, tkHost_GetClipboardText( ) )
+end function
+
+' The same from a string.
+public function tkDataGrid_PasteText( byval hGrid as TK_WIDGET ptr, byval text as ustring ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return 0
+    return DgPasteText( p, text )
+end function
+
+' ==========================================================================================
+' Public API: virtual mode and change notification (G3)
+' ==========================================================================================
+' TRUE: the host answers every cell (CellValueNeeded / CellValuePushed) and sets the row count
+' with SetRowCount; the grid keeps nothing per row. Either way the grid's rows are dropped.
+public sub tkDataGrid_SetVirtual( byval hGrid as TK_WIDGET ptr, byval bVirtual as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    DgSwitchFeed( p, iif( bVirtual, DG_FEED_VIRTUAL, DG_FEED_STORE ) )
+    DgChanged( p )
+end sub
+
+public function tkDataGrid_IsVirtual( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->feed = DG_FEED_VIRTUAL, false )
+end function
+
+public function tkDataGrid_HasSource( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->feed = DG_FEED_SOURCE, false )
+end function
+
+' G5: the bound source's pCtx (what tkDataGrid_SetSource was given), 0 with no source. A generated
+' live binding compares it with a record's array to tell "this grid shows it" from "copy it".
+public function tkDataGrid_GetSourceContext( byval hGrid as TK_WIDGET ptr ) as any ptr
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (p->feed <> DG_FEED_SOURCE) then return 0
+    return p->src.pCtx
+end function
+
+' Values the host changed in rows row1 .. row2, columns col1 .. col2 (-1 for every one): repaint.
+' The grid caches no cell, so this owes a paint -- and the footer's totals (G7b) are worked out again.
+public sub tkDataGrid_InvalidateCells( byval hGrid as TK_WIDGET ptr, byval row1 as integer = -1, byval col1 as integer = -1, _
+                                       byval row2 as integer = -1, byval col2 as integer = -1 )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    DgSumInvalidate( p )
+    tkWidget_Invalidate( p->wSurf )
+end sub
+
+' The host inserted n rows at row (virtual or source): the count grows, the current row moves with
+' its row, the selection and an open edit are dropped (as for the grid's own inserts).
+public sub tkDataGrid_NotifyRowsInserted( byval hGrid as TK_WIDGET ptr, byval row as integer, byval n as integer )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (p->feed = DG_FEED_STORE) orelse (n <= 0) then exit sub
+    if (row < 0) orelse (row > p->rowCount) then row = p->rowCount
+    DgDropEdit( p )
+    p->rowCount += n
+    DgViewRowsMoved( p, row, n )
+    DgSelRowsMoved( p, row, n )
+    DgChanged( p )
+end sub
+
+public sub tkDataGrid_NotifyRowsRemoved( byval hGrid as TK_WIDGET ptr, byval row as integer, byval n as integer )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (p->feed = DG_FEED_STORE) orelse (DgValidRow( p, row ) = false) orelse (n <= 0) then exit sub
+    if row + n > p->rowCount then n = p->rowCount - row
+    DgDropEdit( p )
+    p->rowCount -= n
+    DgViewRowsMoved( p, row, -n )
+    DgSelRowsMoved( p, row, -n )
+    if p->hotRow >= p->rowCount then p->hotRow = -1
+    DgChanged( p )
+end sub
+
+' Everything may have changed (a re-query, a new sort order): the edit, the dirty row and the
+' selection go; a source's count is asked again; the current cell is kept in range.
+public sub tkDataGrid_Reset( byval hGrid as TK_WIDGET ptr )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    DgDropEdit( p )
+    DgSelReset( p )
+    DgCacheClear( p )
+    if (p->feed = DG_FEED_SOURCE) andalso (p->src.RowCount <> 0) then
+        p->rowCount = p->src.RowCount( p->src.pCtx )
+        if p->rowCount < 0 then p->rowCount = 0
+    end if
+    if p->curRow >= p->rowCount + iif( DgHasNewRow( p ), 1, 0 ) then p->curRow = p->rowCount - 1
+    if p->hotRow >= p->rowCount then p->hotRow = -1
+    ' the host re-queried: a filter (or the grid's own sort) is rebuilt over the new rows
+    if p->bViewMap then DgApplyView( p ) else DgChanged( p )
+end sub

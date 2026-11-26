@@ -5,157 +5,42 @@
 '    License, v. 2.0. If a copy of the MPL was not distributed with this
 '    file, You can obtain one at https://mozilla.org/MPL/2.0/.
 '
-' fuzzy -- the fuzzy matcher behind Search Symbol and the file pickers: a port of fzy
-' (https://github.com/jhawthorn/fzy), by way of tiko-editor-tiko's edc/fuzzy, whose scores and
-' positions it matched when ported (tests/fuzzysuite).
+' fuzzy -- the fuzzy matcher behind Search Symbol and the file pickers: fzy
+' (https://github.com/jhawthorn/fzy). The port lives in vendor/tkControls/tkMatch now (moved there
+' for tkAutoComplete, docs/tkControls/AUTOCOMPLETE.md D-3); this module keeps tkEdit's names over it,
+' so tests/fuzzysuite checks the moved code unchanged.
 '
 ' Score: the best alignment of needle's characters, in order and without case, inside haystack.
 ' A match right after a separator (/ - _ space .) or at a lower->upper camel step scores a bonus,
 ' consecutive matches score more, gaps cost a little. The bonus of a character is decided by
-' its low byte, as fzy's 256-entry tables were (a UTF-16 unit above 255 is taken mod 256 -- the
-' old port did the same, so the scores agree).
+' its low byte, as fzy's 256-entry tables were.
 #module "fuzzy"
 
 #import "std/containers"
+#import "vendor/tkControls/tkMatch"
 using containers
+using tkMatch
 
-public const SCORE_GAP_LEADING = -0.005
-public const SCORE_GAP_TRAILING = -0.005
-public const SCORE_GAP_INNER = -0.01
-public const SCORE_MATCH_CONSECUTIVE = 1.0
-public const SCORE_MATCH_SLASH = 0.9
-public const SCORE_MATCH_WORD = 0.8
-public const SCORE_MATCH_CAPITAL = 0.7
-public const SCORE_MATCH_DOT = 0.6
-public const SCORE_MAX = 9999999999
-public const SCORE_MIN = -9999999999
-
-' fzy's bonus_states[ bonus_index[ch] ][ last_ch ], as code instead of two shared tables.
-private function Bonus( byval lastCh as ulong, byval ch as ulong ) as double
-    lastCh and= 255
-    ch and= 255
-    dim as long row = 0
-    if ( ch >= 65 ) andalso ( ch <= 90 ) then
-        row = 2
-    elseif ( ( ch >= 97 ) andalso ( ch <= 122 ) ) orelse ( ( ch >= 48 ) andalso ( ch <= 57 ) ) then
-        row = 1
-    end if
-    if row = 0 then return 0
-    select case lastCh
-    case 47 : return SCORE_MATCH_SLASH                    ' /
-    case 45, 95, 32 : return SCORE_MATCH_WORD             ' - _ space
-    case 46 : return SCORE_MATCH_DOT                      ' .
-    case 97 to 122
-        if row = 2 then return SCORE_MATCH_CAPITAL        ' a lower letter before a capital
-    end select
-    return 0
-end function
+public const SCORE_GAP_LEADING = TKMATCH_GAP_LEADING
+public const SCORE_GAP_TRAILING = TKMATCH_GAP_TRAILING
+public const SCORE_GAP_INNER = TKMATCH_GAP_INNER
+public const SCORE_MATCH_CONSECUTIVE = TKMATCH_MATCH_CONSECUTIVE
+public const SCORE_MATCH_SLASH = TKMATCH_MATCH_SLASH
+public const SCORE_MATCH_WORD = TKMATCH_MATCH_WORD
+public const SCORE_MATCH_CAPITAL = TKMATCH_MATCH_CAPITAL
+public const SCORE_MATCH_DOT = TKMATCH_MATCH_DOT
+public const SCORE_MAX = TKMATCH_SCORE_MAX
+public const SCORE_MIN = TKMATCH_SCORE_MIN
 
 ' Every character of needle occurs in haystack, in order, ignoring case.
 public function HasMatch( byref needle as const ustring, byref haystack as const ustring ) as boolean
-    dim as ustring n = lcase( needle ), h = lcase( haystack )
-    dim as long at = 1
-    for i as long = 1 to len( n )
-        at = instr( at, h, mid( n, i, 1 ) )
-        if at = 0 then return false
-        at += 1
-    next
-    return true
-end function
-
-' The D (best ending in a match) and M (best so far) score matrices, n rows by hlen columns.
-type Matrices
-    declare constructor( byval rows as long, byval cols as long )
-    declare function D( byval i as long, byval j as long ) byref as double
-    declare function M( byval i as long, byval j as long ) byref as double
-    m_cols as long
-    m_d as Array( of double )
-    m_m as Array( of double )
-end type
-
-constructor Matrices( byval rows as long, byval cols as long )
-    m_cols = cols
-    m_d.Reserve( rows * cols )
-    m_m.Reserve( rows * cols )
-    for k as long = 1 to rows * cols
-        m_d.Push( 0 )
-        m_m.Push( 0 )
-    next
-end constructor
-
-function Matrices.D( byval i as long, byval j as long ) byref as double
-    return m_d[i * m_cols + j]
-end function
-
-function Matrices.M( byval i as long, byval j as long ) byref as double
-    return m_m[i * m_cols + j]
-end function
-
-private function Max2( byval a as double, byval b as double ) as double
-    if a > b then return a
-    return b
-end function
-
-' Fills both matrices; returns false when the lengths alone settle it (score in result).
-private function Compute( byref needle as const ustring, byref haystack as const ustring, _
-                          byref mx as Matrices, byref result as double ) as boolean
-    dim as long n = len( needle ), hlen = len( haystack )
-    if n = 0 orelse n > hlen then
-        result = SCORE_MIN
-        return false
-    end if
-    dim as ustring ln = lcase( needle ), lh = lcase( haystack )
-    if ( n = hlen ) andalso ( ln = lh ) then
-        result = SCORE_MAX
-        return false
-    end if
-    dim as Array( of double ) bonuses
-    dim as ulong lastCh = 47
-    for j as long = 0 to hlen - 1
-        bonuses.Push( Bonus( lastCh, haystack[j] ) )
-        lastCh = haystack[j]
-    next
-    for i as long = 0 to n - 1
-        dim as double prevScore = SCORE_MIN, prevM = SCORE_MIN, prevD = SCORE_MIN
-        dim as double gap = SCORE_GAP_INNER
-        if i = n - 1 then gap = SCORE_GAP_TRAILING
-        for j as long = 0 to hlen - 1
-            if ln[i] = lh[j] then
-                dim as double score = SCORE_MIN
-                if i = 0 then
-                    score = ( j * SCORE_GAP_LEADING ) + bonuses[j]
-                elseif j > 0 then
-                    score = Max2( prevM + bonuses[j], prevD + SCORE_MATCH_CONSECUTIVE )
-                end if
-                if i > 0 then
-                    prevD = mx.D( i - 1, j )
-                    prevM = mx.M( i - 1, j )
-                end if
-                mx.D( i, j ) = score
-                prevScore = Max2( score, prevScore + gap )
-                mx.M( i, j ) = prevScore
-            else
-                if i > 0 then
-                    prevD = mx.D( i - 1, j )
-                    prevM = mx.M( i - 1, j )
-                end if
-                mx.D( i, j ) = SCORE_MIN
-                prevScore = prevScore + gap
-                mx.M( i, j ) = prevScore
-            end if
-        next
-    next
-    result = mx.M( n - 1, hlen - 1 )
-    return true
+    return tkMatch_FuzzyHas( needle, haystack )
 end function
 
 ' The score of needle in haystack; SCORE_MIN for an empty needle or one longer than haystack,
 ' SCORE_MAX for the same text in another case. Call it only where HasMatch is true.
 public function Score( byref needle as const ustring, byref haystack as const ustring ) as double
-    dim as Matrices mx = Matrices( len( needle ), len( haystack ) )
-    dim as double result
-    Compute( needle, haystack, mx, result )
-    return result
+    return tkMatch_FuzzyScore( needle, haystack )
 end function
 
 ' Score, and where in haystack (0-based) each character of needle matched. positions is left
@@ -163,38 +48,10 @@ end function
 public function ScorePositions( byref needle as const ustring, byref haystack as const ustring, _
                                 byref positions as Array( of long ) ) as double
     positions.Clear( )
-    dim as long n = len( needle ), hlen = len( haystack )
-    dim as Matrices mx = Matrices( n, hlen )
-    dim as double result
-    if Compute( needle, haystack, mx, result ) = false then
-        if result = SCORE_MAX then
-            for i as long = 0 to n - 1
-                positions.Push( i )
-            next
-        end if
-        return result
-    end if
-    ' backtrace: of several optimal paths take the first met, the latest in haystack
-    for i as long = 1 to n
-        positions.Push( 0 )
-    next
-    dim as boolean matchRequired = false
-    dim as long j = hlen - 1
-    for i as long = n - 1 to 0 step -1
-        while j >= 0
-            if ( mx.D( i, j ) <> SCORE_MIN ) andalso ( matchRequired orelse ( mx.D( i, j ) = mx.M( i, j ) ) ) then
-                ' a score made by SCORE_MATCH_CONSECUTIVE needs the previous character matched
-                if ( i > 0 ) andalso ( j > 0 ) then
-                    matchRequired = ( mx.M( i, j ) = mx.D( i - 1, j - 1 ) + SCORE_MATCH_CONSECUTIVE )
-                else
-                    matchRequired = false
-                end if
-                positions[i] = j
-                j -= 1
-                exit while
-            end if
-            j -= 1
-        wend
+    dim as long p()
+    dim as double result = tkMatch_FuzzyPositions( needle, haystack, p() )
+    for i as long = lbound( p ) to ubound( p )
+        positions.Push( p(i) )
     next
     return result
 end function

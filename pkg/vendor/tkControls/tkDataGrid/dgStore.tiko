@@ -1,0 +1,417 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- the read path, the store and the value rules.
+'
+' DgRead / DgWrite are the ONE way to a cell: the painter, the getters and (later) sort, copy
+' and the editors all go through them. In G0 they reach the grid's own store; G3 adds the
+' virtual and source feeds behind the same two procedures.
+'
+' THE STORE is columnar: each column keeps one array of its value kind's type, plus an EMPTY
+' byte per row. Capacity (rowCap) is shared by every column and grows by doubling.
+'
+' THE VALUE RULES (DgConvert), the same both ways for every pair:
+'   EMPTY          stays EMPTY in every kind; "" (blank text) becomes EMPTY in a non-text kind
+'   text -> int    trimmed; an optional sign and digits only, else refused
+'   text -> float  trimmed; sign, digits, one '.', an exponent; else refused
+'   text -> bool   true 1 -1 yes on / false 0 no off (any case, trimmed); else refused
+'   text -> date   ISO yyyy-mm-dd, a real date; else refused
+'   float -> int   rounds as CLNGINT does (to even)
+'   bool -> number 1 / 0;  number -> bool  <> 0
+'   any -> text    the default text (DgDefaultText)
+'   date <-> number refused
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkCalendar"
+using tkHost
+using tkCalendar
+
+' ---- the store -----------------------------------------------------------------------------
+sub DgStoreRedim( byref st as TKDG_COLSTORE, byval kind as long, byval cap as integer )
+    if cap <= 0 then
+        erase st.s : erase st.i : erase st.f : erase st.b : erase st.d : erase st.e
+        exit sub
+    end if
+    select case kind
+    case TKDG_TEXT  : redim preserve st.s( 0 to cap - 1 )
+    case TKDG_INT   : redim preserve st.i( 0 to cap - 1 )
+    case TKDG_FLOAT : redim preserve st.f( 0 to cap - 1 )
+    case TKDG_BOOL  : redim preserve st.b( 0 to cap - 1 )
+    case TKDG_DATE  : redim preserve st.d( 0 to cap - 1 )
+    end select
+    redim preserve st.e( 0 to cap - 1 )
+end sub
+
+private sub DgStoreCopy( byref st as TKDG_COLSTORE, byval kind as long, byval src as integer, byval dst as integer )
+    select case kind
+    case TKDG_TEXT  : st.s(dst) = st.s(src)
+    case TKDG_INT   : st.i(dst) = st.i(src)
+    case TKDG_FLOAT : st.f(dst) = st.f(src)
+    case TKDG_BOOL  : st.b(dst) = st.b(src)
+    case TKDG_DATE  : st.d(dst) = st.d(src)
+    end select
+    st.e(dst) = st.e(src)
+end sub
+
+private sub DgStoreClearAt( byref st as TKDG_COLSTORE, byval kind as long, byval idx as integer )
+    dim as TKDATE none_
+    select case kind
+    case TKDG_TEXT  : st.s(idx) = ""
+    case TKDG_INT   : st.i(idx) = 0
+    case TKDG_FLOAT : st.f(idx) = 0
+    case TKDG_BOOL  : st.b(idx) = 0
+    case TKDG_DATE  : st.d(idx) = none_
+    end select
+    st.e(idx) = 1
+end sub
+
+private sub DgEnsureCap( byval p as TKDATAGRID_STATE ptr, byval need as integer )
+    if need <= p->rowCap then exit sub
+    dim as integer cap = iif( p->rowCap < 16, 16, p->rowCap )
+    while cap < need
+        cap *= 2
+    wend
+    for k as integer = 0 to p->colCount - 1
+        DgStoreRedim( p->cols(k).st, p->cols(k).c.valueKind, cap )
+    next
+    redim preserve p->rowData( 0 to cap - 1 )
+    p->rowCap = cap
+end sub
+
+' n EMPTY rows at row (0 <= row <= rowCount).
+sub DgStoreInsertRows( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval n as integer )
+    if n <= 0 then exit sub
+    DgEnsureCap( p, p->rowCount + n )
+    for k as integer = 0 to p->colCount - 1
+        dim as long kind = p->cols(k).c.valueKind
+        for r as integer = p->rowCount - 1 to row step -1
+            DgStoreCopy( p->cols(k).st, kind, r, r + n )
+        next
+        for r as integer = row to row + n - 1
+            DgStoreClearAt( p->cols(k).st, kind, r )
+        next
+    next
+    for r as integer = p->rowCount - 1 to row step -1
+        p->rowData(r + n) = p->rowData(r)
+    next
+    for r as integer = row to row + n - 1
+        p->rowData(r) = 0
+    next
+    p->rowCount += n
+end sub
+
+' Rows row .. row + n - 1 (all valid). The freed tail is cleared, so no string outlives its row.
+sub DgStoreDeleteRows( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval n as integer )
+    if n <= 0 then exit sub
+    for k as integer = 0 to p->colCount - 1
+        dim as long kind = p->cols(k).c.valueKind
+        for r as integer = row + n to p->rowCount - 1
+            DgStoreCopy( p->cols(k).st, kind, r, r - n )
+        next
+        for r as integer = p->rowCount - n to p->rowCount - 1
+            DgStoreClearAt( p->cols(k).st, kind, r )
+        next
+    next
+    for r as integer = row + n to p->rowCount - 1
+        p->rowData(r - n) = p->rowData(r)
+    next
+    p->rowCount -= n
+end sub
+
+private sub DgStoreGet( byref st as TKDG_COLSTORE, byval kind as long, byval row as integer, byref v as TKDG_VALUE )
+    v.Clear( )
+    if st.e(row) then exit sub
+    select case kind
+    case TKDG_TEXT  : v.SetText( st.s(row) )
+    case TKDG_INT   : v.SetInt( st.i(row) )
+    case TKDG_FLOAT : v.SetFloat( st.f(row) )
+    case TKDG_BOOL  : v.SetBool( st.b(row) <> 0 )
+    case TKDG_DATE  : v.SetDate( st.d(row) )
+    end select
+end sub
+
+' v is already of the column's kind, or EMPTY.
+private sub DgStorePut( byref st as TKDG_COLSTORE, byval kind as long, byval row as integer, byref v as const TKDG_VALUE )
+    if v.kind = TKDG_EMPTY then
+        DgStoreClearAt( st, kind, row )
+        exit sub
+    end if
+    select case kind
+    case TKDG_TEXT  : st.s(row) = v.s
+    case TKDG_INT   : st.i(row) = v.i
+    case TKDG_FLOAT : st.f(row) = v.f
+    case TKDG_BOOL  : st.b(row) = iif( v.b, 1, 0 )
+    case TKDG_DATE  : st.d(row) = v.d
+    end select
+    st.e(row) = 0
+end sub
+
+' Every stored value to the new kind; one that will not convert becomes EMPTY.
+sub DgStoreConvertColumn( byval p as TKDATAGRID_STATE ptr, byval col as integer, byval newKind as long )
+    dim as long oldKind = p->cols(col).c.valueKind
+    dim as TKDG_COLSTORE fresh
+    DgStoreRedim( fresh, newKind, p->rowCap )
+    for r as integer = 0 to p->rowCount - 1
+        dim as TKDG_VALUE v
+        DgStoreGet( p->cols(col).st, oldKind, r, v )
+        if DgConvert( v, newKind ) = false then v.Clear( )
+        DgStorePut( fresh, newKind, r, v )
+    next
+    for r as integer = p->rowCount to p->rowCap - 1
+        fresh.e(r) = 1
+    next
+    p->cols(col).st = fresh
+    p->cols(col).c.valueKind = newKind
+end sub
+
+' ---- the read path -------------------------------------------------------------------------
+' row / col valid. v gets the cell's value: from the store (the column's kind, or EMPTY), from
+' CellValueNeeded, or from the source's GetCell (whatever kind they give; none: EMPTY).
+sub DgRead( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE )
+    ' G6: a loaded block's value first (what the grid shows); else the feed, synchronously (D-5)
+    if (p->cacheRows > 0) andalso DgCacheGet( p, row, col, v ) then exit sub
+    DgReadFeed( p, row, col, v )
+end sub
+
+' The feed itself, past the block cache.
+sub DgReadFeed( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, byref v as TKDG_VALUE )
+    select case p->feed
+    case DG_FEED_STORE
+        DgStoreGet( p->cols(col).st, p->cols(col).c.valueKind, row, v )
+    case DG_FEED_VIRTUAL
+        v.Clear( )
+        if p->CellValueNeededCallback then p->CellValueNeededCallback( p->hWin, row, col, v )
+    case else
+        v.Clear( )
+        if p->src.GetCell then p->src.GetCell( p->src.pCtx, row, col, v )
+    end select
+end sub
+
+' row / col valid. v is converted to the column's kind first. FALSE: it would not convert, or the
+' host / source refused it (or cannot take values); nothing changed.
+function DgWrite( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, byref v as const TKDG_VALUE ) as boolean
+    DgSumInvalidate( p )                 ' G7b
+    dim as TKDG_VALUE w = v
+    if DgConvert( w, p->cols(col).c.valueKind ) = false then return false
+    select case p->feed
+    case DG_FEED_STORE
+        DgStorePut( p->cols(col).st, p->cols(col).c.valueKind, row, w )
+        return true
+    case DG_FEED_VIRTUAL
+        if p->CellValuePushedCallback = 0 then return false
+        if p->CellValuePushedCallback( p->hWin, row, col, w ) = false then return false
+    case else
+        if p->src.SetCell = 0 then return false
+        if p->src.SetCell( p->src.pCtx, row, col, w ) = false then return false
+    end select
+    DgCachePut( p, row, col, w )
+    return true
+end function
+
+' Can the feed take values at all? (Virtual without CellValuePushed, a source without SetCell: no.)
+function DgFeedWritable( byval p as TKDATAGRID_STATE ptr ) as boolean
+    select case p->feed
+    case DG_FEED_VIRTUAL : return p->CellValuePushedCallback <> 0
+    case DG_FEED_SOURCE  : return p->src.SetCell <> 0
+    end select
+    return true
+end function
+
+' Can the feed add / remove rows? (Virtual: the host does, told by the events; a source needs the
+' procedure.)
+function DgFeedCanInsert( byval p as TKDATAGRID_STATE ptr ) as boolean
+    return (p->feed <> DG_FEED_SOURCE) orelse (p->src.InsertRows <> 0)
+end function
+
+' n rows into the feed at row: the store makes them, virtual mode counts them (the host was told),
+' a source is asked. FALSE when the source refused (or cannot).
+function DgRowsInserted( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval n as integer ) as boolean
+    if n <= 0 then return true
+    select case p->feed
+    case DG_FEED_STORE
+        DgStoreInsertRows( p, row, n )
+        DgViewRowsMoved( p, row, n )
+        return true
+    case DG_FEED_SOURCE
+        if (p->src.InsertRows = 0) orelse (p->src.InsertRows( p->src.pCtx, row, n ) = false) then return false
+    end select
+    p->rowCount += n
+    DgViewRowsMoved( p, row, n )
+    return true
+end function
+
+function DgRowsRemoved( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval n as integer ) as boolean
+    if n <= 0 then return true
+    select case p->feed
+    case DG_FEED_STORE
+        DgStoreDeleteRows( p, row, n )
+        DgViewRowsMoved( p, row, -n )
+        return true
+    case DG_FEED_SOURCE
+        if (p->src.DeleteRows = 0) orelse (p->src.DeleteRows( p->src.pCtx, row, n ) = false) then return false
+    end select
+    p->rowCount -= n
+    if p->rowCount < 0 then p->rowCount = 0
+    DgViewRowsMoved( p, row, -n )
+    return true
+end function
+
+' A new feed: the store's rows freed, the selection, edit and scroll reset; empty until the host
+' sets a count (virtual) or the source gives one.
+sub DgSwitchFeed( byval p as TKDATAGRID_STATE ptr, byval feed as long )
+    DgDropEdit( p )
+    DgCacheClear( p )
+    p->bSrcSorted = false
+    for k as integer = 0 to p->colCount - 1
+        DgStoreRedim( p->cols(k).st, p->cols(k).c.valueKind, 0 )
+    next
+    erase p->rowData
+    p->rowCap = 0
+    p->rowCount = 0
+    dim as TKDATAGRID_SOURCE none_
+    p->src = none_
+    p->feed = feed
+    p->bSrcFiltered = false : p->srcFltSerial = -1     ' G7c: a new feed has not been told of the filters
+    p->bViewMap = false : p->viewCount = 0
+    erase p->viewToModel : erase p->modelToView
+    DgSelReset( p )
+    p->curRow = -1
+    p->hotRow = -1
+    p->scrollY = 0
+end sub
+
+' ---- the value rules -----------------------------------------------------------------------
+private function DgPad( byval n as long, byval w as long ) as ustring
+    dim as ustring s = str( n )
+    if len( s ) < w then s = string( w - len( s ), "0" ) & s
+    return s
+end function
+
+function DgIsoOf( byref d as const TKDATE ) as ustring
+    if d.wYear = 0 then return ""
+    return DgPad( d.wYear, 4 ) & "-" & DgPad( d.wMonth, 2 ) & "-" & DgPad( d.wDay, 2 )
+end function
+
+private function DgDaysIn( byval y as long, byval m as long ) as long
+    select case m
+    case 4, 6, 9, 11 : return 30
+    case 2
+        if ((y mod 4 = 0) andalso (y mod 100 <> 0)) orelse (y mod 400 = 0) then return 29
+        return 28
+    end select
+    return 31
+end function
+
+private function DgAllDigits( byref t as const ustring, byval a as long, byval n as long ) as boolean
+    if n <= 0 then return false
+    for k as long = a to a + n - 1
+        dim as long ch = asc( mid( t, k, 1 ) )
+        if (ch < 48) orelse (ch > 57) then return false
+    next
+    return true
+end function
+
+' ISO yyyy-mm-dd, a real calendar date (years 1..9999).
+function DgParseIso( byref s as const ustring, byref d as TKDATE ) as boolean
+    dim as ustring t = trim( s )
+    if len( t ) <> 10 then return false
+    if (mid( t, 5, 1 ) <> "-") orelse (mid( t, 8, 1 ) <> "-") then return false
+    if (DgAllDigits( t, 1, 4 ) = false) orelse (DgAllDigits( t, 6, 2 ) = false) orelse (DgAllDigits( t, 9, 2 ) = false) then return false
+    dim as long y = clng( vallng( mid( t, 1, 4 ) ) ), m = clng( vallng( mid( t, 6, 2 ) ) ), dd = clng( vallng( mid( t, 9, 2 ) ) )
+    if (y < 1) orelse (m < 1) orelse (m > 12) orelse (dd < 1) orelse (dd > DgDaysIn( y, m )) then return false
+    d = tkCalendar_MakeDate( y, m, dd )
+    return true
+end function
+
+' An optional sign then digits; with bFloat also one '.', and an exponent (e / E, sign, digits).
+private function DgIsNumber( byref t as const ustring, byval bFloat as boolean ) as boolean
+    dim as long n = len( t ), k = 1, digits = 0
+    if n = 0 then return false
+    dim as ustring c = mid( t, 1, 1 )
+    if (c = "+") orelse (c = "-") then k = 2
+    dim as boolean dot = false
+    while k <= n
+        c = mid( t, k, 1 )
+        if (c >= "0") andalso (c <= "9") then
+            digits += 1
+        elseif bFloat andalso (c = ".") andalso (dot = false) then
+            dot = true
+        elseif bFloat andalso ((c = "e") orelse (c = "E")) andalso (digits > 0) then
+            k += 1
+            if k <= n then
+                c = mid( t, k, 1 )
+                if (c = "+") orelse (c = "-") then k += 1
+            end if
+            return DgAllDigits( t, k, n - k + 1 )
+        else
+            return false
+        end if
+        k += 1
+    wend
+    return digits > 0
+end function
+
+' The text painted for a value before CellFormatting.
+function DgDefaultText( byref v as const TKDG_VALUE ) as ustring
+    select case v.kind
+    case TKDG_TEXT  : return v.s
+    case TKDG_INT   : return str( v.i )
+    case TKDG_FLOAT : return str( v.f )
+    case TKDG_BOOL  : return iif( v.b, "true", "false" )
+    case TKDG_DATE  : return DgIsoOf( v.d )
+    end select
+    return ""
+end function
+
+' v to toKind in place; FALSE (v unchanged) when it will not convert. EMPTY always converts.
+function DgConvert( byref v as TKDG_VALUE, byval toKind as long ) as boolean
+    if (v.kind = toKind) orelse (v.kind = TKDG_EMPTY) then return true
+    if toKind = TKDG_TEXT then
+        v.SetText( DgDefaultText( v ) )
+        return true
+    end if
+    if v.kind = TKDG_TEXT then
+        dim as ustring t = trim( v.s )
+        if len( t ) = 0 then v.Clear( ) : return true
+        select case toKind
+        case TKDG_INT
+            if DgIsNumber( t, false ) = false then return false
+            v.SetInt( vallng( t ) )
+        case TKDG_FLOAT
+            if DgIsNumber( t, true ) = false then return false
+            v.SetFloat( val( t ) )
+        case TKDG_BOOL
+            select case lcase( t )
+            case "true", "1", "-1", "yes", "on" : v.SetBool( true )
+            case "false", "0", "no", "off" : v.SetBool( false )
+            case else : return false
+            end select
+        case TKDG_DATE
+            dim as TKDATE d
+            if DgParseIso( t, d ) = false then return false
+            v.SetDate( d )
+        case else
+            return false
+        end select
+        return true
+    end if
+    if (v.kind = TKDG_DATE) orelse (toKind = TKDG_DATE) then return false
+    ' number / bool -> number / bool
+    dim as float64 x
+    select case v.kind
+    case TKDG_INT   : x = v.i
+    case TKDG_FLOAT : x = v.f
+    case TKDG_BOOL  : x = iif( v.b, 1, 0 )
+    end select
+    select case toKind
+    case TKDG_INT   : v.SetInt( clngint( x ) )
+    case TKDG_FLOAT : v.SetFloat( x )
+    case TKDG_BOOL  : v.SetBool( x <> 0 )
+    case else       : return false
+    end select
+    return true
+end function

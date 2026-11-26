@@ -1,0 +1,125 @@
+' tkPrintDialog self-test (printing phase R3). One check per behaviour: the Print dialog filled from
+' a job, a range naming no page refused in the dialog, the controls collected into a job, Enter =
+' Print and Esc = Cancel through the real modal loop; Page Setup collected, impossible margins refused.
+' On a machine with no printer the Print checks become: the dialog says so and Print is disabled.
+' Nothing is printed. One pass (the checks do not depend on the scale).
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkPrintDialog"
+#import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkNumericUpDown"
+#import "vendor/tkControls/tkCheckBox"
+#import "vendor/tkControls/tkOptionButton"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkLabel"
+using tkTest
+using tkPrintDialog
+using tkPrinter
+using tkComboBox
+using tkNumericUpDown
+using tkCheckBox
+using tkOptionButton
+using tkTextBox
+using tkLabel
+using tkPdf
+using tkPrint
+using tkHost
+using tkPaint
+
+function ThreePages( byval doc as TK_PRINTDOC ptr, byval pg as TK_PAGE ptr, byval i as long ) as boolean
+    return i < 2
+end function
+
+' A key for the dialog's window, queued (not pumped): the modal loop must be the one to see it.
+sub QueueKey( byval h as TK_HOST ptr, byval key as long )
+    dim as SDL_Event e
+    e.type = SDL_EVENT_KEY_DOWN
+    e.key.windowID = h->winId
+    e.key.key = key
+    e.key.down = true
+    SDL_PushEvent( @e )
+end sub
+
+sub RunPass( )
+    tkTest_Begin( "dialogs" )
+    dim as TK_HOST ptr h = tkHost_Create( "tkPrintDialog selftest", 640, 480, tkHost_FontDir() & TK_FONT_UI, 1.0 )
+    if h = 0 then tkTest_Check( "host", false, *SDL_GetError() ) : exit sub
+    tkHost_Show( h )
+    dim as TK_PRINTDOC ptr doc = tkPrintDoc_Create( "three" )
+    tkPrintDoc_SetPrintPageCallback( doc, @ThreePages )
+    tkPrintDoc_Generate( doc )
+    dim as TKPRINTERINFO list()
+    dim as long nPrn = tkPrinter_Enumerate( list() )
+
+    dim as TKPRINTJOB job
+    job.copies = 2 : job.collate = false : job.pageSet = "2-3"
+    if nPrn > 0 then job.printer = list(nPrn - 1).name
+    dim as TK_HOST ptr dlg = tkPrintDialog_Create( h, doc, job, 0 )
+    if nPrn > 0 then
+        tkTest_Check( "Print: filled from the job (printer, copies, collate, range)", _
+                      (tkComboBox_GetText( tkPrintDialog_GetControl( dlg, TKPD_ID_PRINTER ) ) = job.printer) _
+                      andalso (tkNumericUpDown_GetValue( tkPrintDialog_GetControl( dlg, TKPD_ID_COPIES ) ) = 2) _
+                      andalso (tkCheckBox_GetChecked( tkPrintDialog_GetControl( dlg, TKPD_ID_COLLATE ) ) = false) _
+                      andalso tkOptionButton_GetChecked( tkPrintDialog_GetControl( dlg, TKPD_ID_RANGE ) ) _
+                      andalso (tkTextBox_GetText( tkPrintDialog_GetControl( dlg, TKPD_ID_RANGETEXT ) ) = "2-3") )
+        tkTextBox_SetText( tkPrintDialog_GetControl( dlg, TKPD_ID_RANGETEXT ), "9" )
+        dim as TKPRINTJOB got
+        tkTest_Check( "Print: a range naming no page is refused, and the dialog says so", _
+                      (tkPrintDialog_Collect( dlg, got ) = false) andalso tkWidget_IsVisible( tkPrintDialog_GetControl( dlg, TKPD_ID_ERROR ) ) _
+                      andalso (tkLabel_GetText( tkPrintDialog_GetControl( dlg, TKPD_ID_ERROR ) ) = tkPrintDialog_GetStrings( ).BadRange) )
+        tkTextBox_SetText( tkPrintDialog_GetControl( dlg, TKPD_ID_RANGETEXT ), "1, 3" )
+        tkNumericUpDown_SetValue( tkPrintDialog_GetControl( dlg, TKPD_ID_COPIES ), 3 )
+        tkCheckBox_SetChecked( tkPrintDialog_GetControl( dlg, TKPD_ID_COLOUR ), false )
+        dim as boolean ok = tkPrintDialog_Collect( dlg, got )
+        tkTest_Check( "Print: the controls as a job", ok andalso (got.printer = job.printer) andalso (got.copies = 3) _
+                      andalso (got.pageSet = "1, 3") andalso (got.color = false) andalso (got.collate = false), _
+                      got.printer & " x" & got.copies & " [" & got.pageSet & "] colour " & got.color )
+        ' "Current" with page 0 current
+        tkOptionButton_SetChecked( tkPrintDialog_GetControl( dlg, TKPD_ID_CURRENT ), true )
+        QueueKey( dlg, SDLK_RETURN )
+        dim as TKPRINTJOB ran
+        dim as boolean pr = tkPrintDialog_Run( dlg, ran )
+        tkTest_Check( "Print: Enter prints (the modal loop returns TRUE) with the current page", pr andalso (ran.pageSet = "1"), _
+                      "run " & pr & " [" & ran.pageSet & "]" )
+        dlg = tkPrintDialog_Create( h, doc, job )
+        QueueKey( dlg, SDLK_ESCAPE )
+        tkTest_Check( "Print: Esc cancels", tkPrintDialog_Run( dlg, ran ) = false )
+    else
+        tkTest_Check( "Print: no printer -- the dialog says so, Print disabled", _
+                      tkWidget_IsVisible( tkPrintDialog_GetControl( dlg, TKPD_ID_ERROR ) ) _
+                      andalso (tkWidget_IsEnabled( tkPrintDialog_GetControl( dlg, TKPD_ID_OK ) ) = false) )
+        QueueKey( dlg, SDLK_ESCAPE )
+        dim as TKPRINTJOB ran
+        tkTest_Check( "Print: Esc cancels", tkPrintDialog_Run( dlg, ran ) = false )
+    end if
+
+    ' ---- page setup --------------------------------------------------------------------------
+    dim as TKPAGESETUP ps
+    ps.paper = TK_PAPER_A4
+    dim as TK_HOST ptr sd = tkPageSetupDialog_Create( h, ps )
+    tkComboBox_SetCurSel( tkPrintDialog_GetControl( sd, TKPD_ID_PAPER ), 1 )               ' Letter
+    tkOptionButton_SetChecked( tkPrintDialog_GetControl( sd, TKPD_ID_LANDSCAPE ), true )
+    dim as boolean inches = (tkPrint_DefaultPaper( ) = TK_PAPER_LETTER)
+    dim as double unit = iif( inches, TK_PT_PER_INCH, TK_PT_PER_MM )
+    tkNumericUpDown_SetValue( tkPrintDialog_GetControl( sd, TKPD_ID_MARGIN_L ), iif( inches, 0.5, 12.7 ) )
+    dim as TKPAGESETUP got
+    dim as boolean ok = tkPageSetupDialog_Collect( sd, got )
+    tkTest_Check( "Page Setup: paper, orientation and a margin collected (36 pt)", ok andalso (got.paper = TK_PAPER_LETTER) _
+                  andalso got.landscape andalso (abs( got.marginL - 36 ) < 0.2), got.paper & " " & got.landscape & " " & got.marginL )
+    tkNumericUpDown_SetValue( tkPrintDialog_GetControl( sd, TKPD_ID_MARGIN_L ), iif( inches, 6, 150 ) )
+    tkNumericUpDown_SetValue( tkPrintDialog_GetControl( sd, TKPD_ID_MARGIN_R ), iif( inches, 6, 150 ) )
+    tkTest_Check( "Page Setup: margins that leave under an inch are refused, with a reason", _
+                  (tkPageSetupDialog_Collect( sd, got ) = false) andalso tkWidget_IsVisible( tkPrintDialog_GetControl( sd, TKPD_ID_ERROR ) ) )
+    QueueKey( sd, SDLK_ESCAPE )
+    tkPageSetupDialog_Run( sd, got )
+
+    tkPrintDoc_Destroy( doc )
+    tkHost_Destroy( h )
+end sub
+
+if tkTest_Init() = false then end 1
+RunPass( )
+dim as long nFail = tkTest_Report( "tkPrintDialog" )
+tkTest_Quit()
+end nFail

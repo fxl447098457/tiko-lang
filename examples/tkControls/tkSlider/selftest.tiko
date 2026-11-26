@@ -1,0 +1,1051 @@
+' tkSlider self-test (phase S0). Real windows, real SDL event queue: every input claim is made by
+' PUSHING the SDL event a user would have produced and pumping the host. Two passes, scale pinned
+' at 1.0 and at 1.75. Geometry is asserted against SLIDER.md §4's formulas, events are counted.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkSlider"
+#import "vendor/tkControls/tkTest"
+using tkSlider
+using tkTooltip
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gChanged, gCommitted, gMismatch, gParentWheels
+dim shared as double gLastChanged, gLastCommitted
+dim shared as boolean gDestroyInChanged
+dim shared as long gIdealW(0 to 1)
+dim shared as string gLog                         ' "c0 m1 ...": Changed / Committed, thumb, in order
+
+sub OnChanged( byval hSlider as TK_WIDGET ptr, byval nThumb as long, byval nValue as double )
+    gChanged += 1
+    gLastChanged = nValue
+    gLog &= "c" & nThumb & " "
+    if gDestroyInChanged then tkWidget_Destroy( hSlider ) : exit sub
+    ' state first: the getter already answers the new value; thumb 1 only in range mode
+    if nThumb = 1 then
+        if (tkSlider_GetMode( hSlider ) <> TKSL_MODE_RANGE) orelse (tkSlider_GetUpperValue( hSlider ) <> nValue) then gMismatch += 1
+    elseif (nThumb <> 0) orelse (tkSlider_GetValue( hSlider ) <> nValue) then
+        gMismatch += 1
+    end if
+end sub
+
+' Never dereferences hSlider: it may have been destroyed by OnChanged.
+sub OnCommitted( byval hSlider as TK_WIDGET ptr, byval nThumb as long, byval nValue as double )
+    gCommitted += 1
+    gLastCommitted = nValue
+    gLog &= "m" & nThumb & " "
+end sub
+
+sub ResetCounts( )
+    gChanged = 0 : gCommitted = 0 : gLog = ""
+end sub
+
+' A plain parent that counts the wheel events its children refuse.
+function ParentProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg = TKM_MOUSEWHEEL then gParentWheels += 1 : return true
+    return false
+end function
+
+sub PaintStock( byval p as TKSLIDER_PAINTINFO ptr )
+    tkSlider_PaintDefault( p )
+end sub
+
+sub PaintNothing( byval p as TKSLIDER_PAINTINFO ptr )
+end sub
+
+' Window pixel of a widget-local point.
+function PixW( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byval x as long, byval y as long ) as ulong
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return tkTest_PixelAt( h, a.left + x, a.top + y )
+end function
+
+' Window coordinates of a widget-local point.
+function WX( byval w as TK_WIDGET ptr, byval x as long ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return a.left + x
+end function
+
+function WY( byval w as TK_WIDGET ptr, byval y as long ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return a.top + y
+end function
+
+sub RenderQuiet( byval h as TK_HOST ptr )
+    tkHost_SetFocus( h, 0 )
+    tkTest_PushMotion( h, 2, 2 )
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_MOUSE_LEAVE )
+    tkHost_RenderTo( h, false )
+end sub
+
+function CentreX( byref r as TKRECT ) as long
+    return (r.left + r.right) \ 2
+end function
+
+function CentreY( byref r as TKRECT ) as long
+    return (r.top + r.bottom) \ 2
+end function
+
+' ==========================================================================================
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as boolean bLogic = (fScale = 1.0)
+    dim as TK_HOST ptr h = tkHost_Create( "tkSlider selftest", 720, 480, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host created", false, *SDL_GetError() ) : exit sub
+    tkTest_Check( "scale pinned", h->fScale = fScale, "" & h->fScale )
+    dim as TK_WIDGET ptr root = tkHost_Root( h )
+
+    ' ---- A: defaults, ideal size, geometry formulas -----------------------------------------
+    dim as TK_WIDGET ptr s = tkSlider_Create( root, 900 )
+    dim as long tt = tkSlider_GetTrackSize( s ), thw, thh, fg, ft, iw, ih
+    tkSlider_GetThumbSize( s, thw, thh )
+    tkSlider_GetFocusRing( s, fg, ft )
+    tkTest_Check( "sizes scaled at create", tt = tkHost_Scale( h, 4 ) andalso thw = tkHost_Scale( h, 16 ) andalso thh = thw _
+                  andalso fg = tkHost_Scale( h, 3 ), tt & " " & thw & "x" & thh & " " & fg )
+    tkTest_Check( "thicknesses NOT scaled", ft = 1 andalso tkSlider_GetBorderThickness( s ) = 2, ft & " " & tkSlider_GetBorderThickness( s ) )
+    dim as double mn, mx
+    tkSlider_GetRange( s, mn, mx )
+    tkTest_Check( "defaults: 0..100, value 0, step 1, small 1, large 10, 0 places", mn = 0 andalso mx = 100 andalso tkSlider_GetValue( s ) = 0 _
+                  andalso tkSlider_GetStep( s ) = 1 andalso tkSlider_GetSmallChange( s ) = 1 andalso tkSlider_GetLargeChange( s ) = 10 _
+                  andalso tkSlider_GetDecimalPlaces( s ) = 0 )
+    tkTest_Check( "defaults: wheel FOCUSED, not read-only", tkSlider_GetWheelMode( s ) = TKSL_WHEEL_FOCUSED andalso tkSlider_GetReadOnly( s ) = false )
+    dim as long rp = fg + ft
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkTest_Check( "ideal size before sizing = formula", iw = thw + tkHost_Scale( h, 120 ) + 2 * rp andalso ih = thh + 2 * rp, iw & "x" & ih )
+    gIdealW(iif( fScale > 1.5, 1, 0 )) = iw
+    dim as TKRECT rt, rf, rth, rg
+    tkTest_Check( "rect queries FALSE before sizing", tkSlider_GetTrackRect( s, rt ) = false andalso tkRect_IsEmpty( rt ) _
+                  andalso tkSlider_GetThumbRect( s, 0, rth ) = false )
+    dim as TKSLIDER_COLORS cc
+    tkSlider_GetColors( s, @cc )
+    tkTest_Check( "created with the current theme (dark)", cc.FillColor = tkTheme_Dark().Accent andalso cc.BackColor = tkTheme_Dark().Window _
+                  andalso cc.TrackColor = tkTheme_Dark().Track )
+
+    ' a wide cell, taller than ideal: the thumb band is centred
+    dim as long cw = tkHost_Scale( h, 300 ), ch = ih + tkHost_Scale( h, 10 )
+    tkWidget_SetPos( s, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), cw, ch )
+    tkTest_Check( "rect queries TRUE once sized", tkSlider_GetTrackRect( s, rt ) )
+    dim as long half = thw \ 2
+    dim as long x0 = rp + half, x1 = (cw - rp) - (thw - half), sp = x1 - x0
+    dim as long bandTop = rp + ((ch - 2 * rp) - thh) \ 2
+    dim as long ty = bandTop + (thh - tt) \ 2
+    tkTest_Check( "track = x0 - T\2 .. x1 + (T - T\2), centred on the band", rt.left = x0 - tt \ 2 andalso rt.right = x1 + (tt - tt \ 2) _
+                  andalso rt.top = ty andalso rt.bottom = ty + tt, tkRect_Str( rt ) )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_Check( "thumb at Min: centre x0, band top", rth.left = x0 - half andalso rth.right = x0 - half + thw andalso rth.top = bandTop _
+                  andalso rth.bottom = bandTop + thh, tkRect_Str( rth ) )
+    tkSlider_GetFillRect( s, rf )
+    tkTest_Check( "fill at Min: track.left .. x0", rf.left = rt.left andalso rf.right = x0, tkRect_Str( rf ) )
+    tkSlider_SetValue( s, 100 )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_Check( "thumb at Max: centre x1, inside the content", rth.left = x1 - half andalso rth.right = cw - rp, tkRect_Str( rth ) )
+    dim as long badGeo = 0, badRound = 0
+    for v as long = 0 to 100
+        tkSlider_SetValue( s, v )
+        tkSlider_GetThumbRect( s, 0, rth )
+        dim as long cx = x0 + cint( int( (v / 100) * sp + 0.5 ) )
+        if (rth.left <> cx - half) orelse (tkSlider_ValueToPos( s, v ) <> cx) then badGeo += 1
+        if tkSlider_PosToValue( s, cx ) <> v then badRound += 1
+    next
+    tkTest_Check( "every grid value: thumb centre = x0 + round( frac * span )", badGeo = 0, badGeo & " off" )
+    tkTest_Check( "every grid value: PosToValue( ValueToPos( v ) ) = v", badRound = 0, badRound & " off" )
+    tkSlider_GetThumbTarget( s, 0, rg )
+    dim as long minT = tkHost_Scale( h, 24 )
+    tkTest_Check( "hit target >= 24 across, centred on the thumb", (rg.right - rg.left) >= minT andalso (rg.bottom - rg.top) >= minT _
+                  andalso rg.left <= rth.left andalso rg.top <= rth.top, tkRect_Str( rg ) )
+    tkTest_Check( "HitTest: thumb, track, outside", tkSlider_HitTest( s, CentreX( rth ), CentreY( rth ) ) = TKSL_PART_THUMB0 _
+                  andalso tkSlider_HitTest( s, x0, 1 ) = TKSL_PART_TRACK andalso tkSlider_HitTest( s, -1, 1 ) = TKSL_PART_NONE )
+    tkSlider_SetStep( s, 0 )
+    tkSlider_SetRange( s, 0, 1 )
+    dim as double worst = 0
+    for x as long = x0 to x1
+        dim as double v = tkSlider_PosToValue( s, x )
+        dim as double e = abs( v - (x - x0) / sp )
+        if e > worst then worst = e
+    next
+    tkTest_Check( "continuous: PosToValue within a pixel's worth", worst <= 1.0 / sp + 1e-9, str( worst ) )
+    tkWidget_Destroy( s )
+
+    ' ---- B: the value model -----------------------------------------------------------------
+    ResetCounts( )
+    s = tkSlider_Create( root, 901 )
+    tkSlider_SetValueChangedCallback( s, @OnChanged )
+    tkSlider_SetValueCommittedCallback( s, @OnCommitted )
+    if bLogic then          ' scale-independent: checked in the 1.0 pass only
+    tkSlider_SetRange( s, 10, 0 )
+    tkSlider_GetRange( s, mn, mx )
+    tkTest_Check( "inverted range swapped", mn = 0 andalso mx = 10 )
+    tkSlider_SetStep( s, 3 )
+    tkSlider_SetValue( s, 10 )
+    tkSlider_SetValue( s, 9.6 )
+    tkTest_Check( "nearest legal: 9.6 -> Max 10", tkSlider_GetValue( s ) = 10, str( tkSlider_GetValue( s ) ) )
+    tkSlider_SetValue( s, 8 )
+    tkTest_Check( "nearest legal: 8 -> 9", tkSlider_GetValue( s ) = 9, str( tkSlider_GetValue( s ) ) )
+    tkSlider_SetValue( s, 4.5 )
+    tkTest_Check( "half way rounds away from Min: 4.5 -> 6", tkSlider_GetValue( s ) = 6, str( tkSlider_GetValue( s ) ) )
+    tkSlider_SetValue( s, 10 )
+    tkSlider_StepBy( s, -1 )
+    tkTest_Check( "a step down from off-grid Max lands on the grid below (9)", tkSlider_GetValue( s ) = 9, str( tkSlider_GetValue( s ) ) )
+    tkSlider_StepBy( s, 1 )
+    tkTest_Check( "a step up from the last grid point reaches Max", tkSlider_GetValue( s ) = 10, str( tkSlider_GetValue( s ) ) )
+    tkSlider_SetValue( s, 0 )
+    tkSlider_StepBy( s, 1 )
+    tkTest_Check( "SmallChange 1 under Step 3 still moves one grid point", tkSlider_GetValue( s ) = 3, str( tkSlider_GetValue( s ) ) )
+    tkSlider_SetValue( s, -50 )
+    dim as double vLo = tkSlider_GetValue( s )
+    tkSlider_SetValue( s, 50 )
+    tkTest_Check( "clamped at Min and at Max", vLo = 0 andalso tkSlider_GetValue( s ) = 10 )
+    tkSlider_SetRange( s, 0, 5 )
+    tkTest_Check( "SetRange re-clamps the value", tkSlider_GetValue( s ) = 5, str( tkSlider_GetValue( s ) ) )
+    tkSlider_SetRange( s, 0, 1 )
+    tkSlider_SetStep( s, 0.1 )
+    tkSlider_SetValue( s, 0.3 )
+    tkTest_Check( "Step 0.1: 0.3 carries no residue", str( tkSlider_GetValue( s ) ) = "0.3", str( tkSlider_GetValue( s ) ) )
+    tkSlider_SetValue( s, 0 )
+    tkSlider_SetSmallChange( s, 0 )
+    tkSlider_StepBy( s, 7 )
+    tkTest_Check( "SmallChange 0 steps by Step: 7 steps = 0.7, no drift", str( tkSlider_GetValue( s ) ) = "0.7", str( tkSlider_GetValue( s ) ) )
+    tkSlider_SetRange( s, 0, 100 ) : tkSlider_SetStep( s, 1 ) : tkSlider_SetSmallChange( s, 1 ) : tkSlider_SetDecimalPlaces( s, 0 )
+    tkSlider_SetValue( s, 33 )
+    tkTest_Check( "every setter above was SILENT", gChanged = 0 andalso gCommitted = 0, gChanged & " / " & gCommitted )
+
+    end if
+
+    ' ---- C: the mouse, through the real dispatch ---------------------------------------------
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkWidget_SetPos( s, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), cw, ih )
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 100 )
+    tkSlider_SetValue( s, 50 )
+    tkSlider_GetThumbRect( s, 0, rth )
+    dim as long grab = 2                                    ' pressed 2 px right of the centre
+    dim as long px = CentreX( rth ) + grab, py = CentreY( rth )
+    ResetCounts( )
+    tkTest_PushButton( h, true, WX( s, px ), WY( s, py ) )
+    tkTest_Check( "press on the thumb: focus, drag, no move", tkSlider_GetFocused( s ) andalso tkSlider_IsDragging( s ) _
+                  andalso tkSlider_GetValue( s ) = 50 andalso gChanged = 0 andalso tkSlider_GetPressedThumb( s ) = 0 )
+    for v as long = 51 to 55
+        tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, v ) + grab ), WY( s, py ) )
+    next
+    tkTest_Check( "drag keeps the grab offset: five grid values, five Changed", tkSlider_GetValue( s ) = 55 andalso gChanged = 5 _
+                  andalso gLastChanged = 55 andalso gCommitted = 0, tkSlider_GetValue( s ) & " " & gChanged & "/" & gCommitted )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 55 ) + grab ), WY( s, py ) )
+    tkTest_Check( "release: one Committed with the final value, capture gone", gCommitted = 1 andalso gLastCommitted = 55 _
+                  andalso tkHost_GetCapture( h ) = 0 andalso tkSlider_IsDragging( s ) = false )
+    tkTest_Check( "inside the callbacks the getter already answered", gMismatch = 0, str( gMismatch ) )
+
+    ' a click on the thumb without moving: nothing
+    ResetCounts( )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_Click( h, WX( s, CentreX( rth ) ), WY( s, CentreY( rth ) ) )
+    tkTest_Check( "a click on the thumb changes nothing", gChanged = 0 andalso gCommitted = 0 andalso tkSlider_GetValue( s ) = 55 )
+
+    ' away and back: Changed twice, no Committed
+    ResetCounts( )
+    tkTest_PushButton( h, true, WX( s, CentreX( rth ) ), WY( s, py ) )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, 60 ) ), WY( s, py ) )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, 55 ) ), WY( s, py ) )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 55 ) ), WY( s, py ) )
+    tkTest_Check( "released on the start value: no Committed", gChanged = 2 andalso gCommitted = 0, gChanged & "/" & gCommitted )
+
+    ' JUMP: a press on the track brings the thumb, then drags on
+    ResetCounts( )
+    dim as long jx = tkSlider_ValueToPos( s, 80 )
+    tkTest_PushButton( h, true, WX( s, jx ), WY( s, py ) )
+    tkTest_Check( "track press jumps: value 80, one Changed, no Committed yet", tkSlider_GetValue( s ) = 80 andalso gChanged = 1 _
+                  andalso gCommitted = 0, tkSlider_GetValue( s ) & " " & gChanged )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, 85 ) ), WY( s, py ) )
+    tkTest_Check( "and drags on from there (grab 0)", tkSlider_GetValue( s ) = 85, str( tkSlider_GetValue( s ) ) )
+    tkTest_PushMotion( h, WX( s, cw + tkHost_Scale( h, 200 ) ), WY( s, py + tkHost_Scale( h, 300 ) ) )
+    tkTest_Check( "dragged far outside: clamped at Max, not snapped back", tkSlider_GetValue( s ) = 100 )
+    tkTest_PushButton( h, false, WX( s, cw + tkHost_Scale( h, 200 ) ), WY( s, py ) )
+    tkTest_Check( "release outside: Committed 100, capture gone, not hot", gCommitted = 1 andalso gLastCommitted = 100 _
+                  andalso tkHost_GetCapture( h ) = 0 andalso tkSlider_GetHotThumb( s ) = -1 )
+
+    ' Esc during a drag
+    ResetCounts( )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_PushButton( h, true, WX( s, CentreX( rth ) ), WY( s, py ) )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, 70 ) ), WY( s, py ) )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "Esc restores the start value, notifies it, commits nothing", tkSlider_GetValue( s ) = 100 andalso gChanged = 2 _
+                  andalso gLastChanged = 100 andalso gCommitted = 0, tkSlider_GetValue( s ) & " " & gChanged & "/" & gCommitted )
+    tkTest_Check( "Esc ends the drag and frees the capture", tkSlider_IsDragging( s ) = false andalso tkHost_GetCapture( h ) = 0 )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 70 ) ), WY( s, py ) )
+    tkTest_Check( "the button-up after Esc commits nothing", gCommitted = 0 andalso tkSlider_GetValue( s ) = 100 )
+
+    ' hot follows the thumb's target
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_PushMotion( h, WX( s, CentreX( rth ) ), WY( s, CentreY( rth ) ) )
+    tkTest_Check( "hover over the thumb: hot", tkSlider_GetHotThumb( s ) = 0 )
+    tkTest_PushMotion( h, WX( s, x0 ), WY( s, CentreY( rth ) ) )
+    tkTest_Check( "over the track: not hot", tkSlider_GetHotThumb( s ) = -1 )
+
+    if bLogic then          ' scale-independent: checked in the 1.0 pass only
+    ' ---- D: keys -------------------------------------------------------------------------------
+    tkHost_SetFocus( h, s )
+    tkSlider_SetValue( s, 50 )
+    dim as long keys(0 to 7) = { SDLK_RIGHT, SDLK_LEFT, SDLK_UP, SDLK_DOWN, SDLK_PAGEUP, SDLK_PAGEDOWN, SDLK_HOME, SDLK_END }
+    dim as double want(0 to 7) = { 51, 50, 51, 50, 60, 50, 0, 100 }
+    dim as string kname(0 to 7) = { "Right", "Left", "Up", "Down", "PgUp", "PgDn", "Home", "End" }
+    for i as long = 0 to 7
+        ResetCounts( )
+        tkTest_PushKey( h, keys(i) )
+        tkTest_PushKey( h, keys(i), 0, false )
+        tkTest_Check( "key " & kname(i) & ": value + one Changed + one Committed", tkSlider_GetValue( s ) = want(i) andalso gChanged = 1 _
+                      andalso gCommitted = 1 andalso gLastCommitted = want(i), tkSlider_GetValue( s ) & " " & gChanged & "/" & gCommitted )
+    next
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "Right at Max: no events", gChanged = 0 andalso gCommitted = 0 andalso tkSlider_GetValue( s ) = 100 )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "Esc with no drag changes nothing", tkSlider_GetValue( s ) = 100 andalso gChanged = 0 )
+    tkSlider_SetReadOnly( s, true )
+    tkTest_PushKey( h, SDLK_HOME )
+    tkTest_Check( "read-only: Home changes nothing", tkSlider_GetValue( s ) = 100 andalso gChanged = 0 )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_Click( h, WX( s, x0 ), WY( s, py ) )
+    tkTest_Check( "read-only: a track click changes nothing, still focuses", tkSlider_GetValue( s ) = 100 andalso gChanged = 0 _
+                  andalso tkSlider_GetFocused( s ) )
+    tkSlider_SetReadOnly( s, false )
+
+    end if
+
+    ' ---- E: the wheel ------------------------------------------------------------------------
+    dim as TK_WIDGET ptr pnl = tkWidget_CreateChild( root, 950, @ParentProc, 0 )
+    tkWidget_SetPos( pnl, 0, tkHost_Scale( h, 120 ), tkHost_Scale( h, 400 ), tkHost_Scale( h, 100 ) )
+    dim as TK_WIDGET ptr s2 = tkSlider_Create( pnl, 951 )
+    tkWidget_SetPos( s2, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), cw, ih )
+    tkSlider_SetValueChangedCallback( s2, @OnChanged )
+    tkSlider_SetValueCommittedCallback( s2, @OnCommitted )
+    tkSlider_SetValue( s2, 50 )
+    dim as TKRECT a2
+    tkWidget_AbsRect( s2, a2 )
+    dim as long wx2 = (a2.left + a2.right) \ 2, wy2 = (a2.top + a2.bottom) \ 2
+    if bLogic then          ' scale-independent: checked in the 1.0 pass only
+    tkHost_SetFocus( h, s )                                 ' s2 is NOT focused
+    ResetCounts( ) : gParentWheels = 0
+    tkTest_PushWheel( h, wx2, wy2, 0, 1 )
+    tkTest_Check( "FOCUSED mode, unfocused: value unchanged, the wheel bubbles to the parent", tkSlider_GetValue( s2 ) = 50 _
+                  andalso gChanged = 0 andalso gParentWheels = 1, tkSlider_GetValue( s2 ) & " parent " & gParentWheels )
+    tkHost_SetFocus( h, s2 )
+    ResetCounts( ) : gParentWheels = 0
+    tkTest_PushWheel( h, wx2, wy2, 0, 1 )
+    tkTest_PushWheel( h, wx2, wy2, 0, -3 )
+    tkTest_Check( "focused: up +1, down -3, Changed + Committed per event, not bubbled", tkSlider_GetValue( s2 ) = 48 _
+                  andalso gChanged = 2 andalso gCommitted = 2 andalso gParentWheels = 0, tkSlider_GetValue( s2 ) & " " & gChanged & "/" & gCommitted )
+    ResetCounts( )
+    tkTest_PushWheel( h, wx2, wy2, 0, 0.5 )
+    tkTest_Check( "half a notch: kept, no move", tkSlider_GetValue( s2 ) = 48 andalso gChanged = 0 )
+    tkTest_PushWheel( h, wx2, wy2, 0, 0.5 )
+    tkTest_Check( "the second half: one step", tkSlider_GetValue( s2 ) = 49 andalso gChanged = 1 )
+    tkTest_PushWheel( h, wx2, wy2, 1, 0 )
+    tkTest_Check( "horizontal wheel right: +1", tkSlider_GetValue( s2 ) = 50, str( tkSlider_GetValue( s2 ) ) )
+    tkHost_SetFocus( h, s )
+    tkSlider_SetWheelMode( s2, TKSL_WHEEL_HOVER )
+    tkTest_PushWheel( h, wx2, wy2, 0, 1 )
+    tkTest_Check( "HOVER mode: moves unfocused", tkSlider_GetValue( s2 ) = 51 )
+    tkSlider_SetWheelMode( s2, TKSL_WHEEL_NEVER )
+    gParentWheels = 0
+    tkHost_SetFocus( h, s2 )
+    tkTest_PushWheel( h, wx2, wy2, 0, 1 )
+    tkTest_Check( "NEVER mode: refused even focused", tkSlider_GetValue( s2 ) = 51 andalso gParentWheels = 1 )
+
+    end if
+
+    if bLogic then          ' scale-independent: checked in the 1.0 pass only
+    ' ---- F: disabled -------------------------------------------------------------------------
+    tkHost_SetFocus( h, 0 )
+    tkSlider_SetEnabled( s2, false )
+    ResetCounts( )
+    tkTest_Click( h, WX( s2, tkSlider_ValueToPos( s2, 90 ) ), wy2 )
+    tkTest_Check( "disabled: a click neither moves nor focuses", tkSlider_GetValue( s2 ) = 51 andalso gChanged = 0 _
+                  andalso tkSlider_GetFocused( s2 ) = false andalso tkSlider_GetEnabled( s2 ) = false )
+    tkSlider_SetEnabled( s2, true )
+    ' disabling mid-drag ends it where it stands
+    tkTest_PushButton( h, true, WX( s2, tkSlider_ValueToPos( s2, 90 ) ), wy2 )
+    tkSlider_SetEnabled( s2, false )
+    tkTest_Check( "disabled mid-drag: the drag ends, capture gone", tkSlider_IsDragging( s2 ) = false andalso tkHost_GetCapture( h ) = 0 )
+    tkTest_PushButton( h, false, WX( s2, tkSlider_ValueToPos( s2, 90 ) ), wy2 )
+    tkSlider_SetEnabled( s2, true )
+
+    end if
+
+    ' ---- G: theme, paint ---------------------------------------------------------------------
+    dim as TKSLIDER_COLORS cp
+    tkSlider_GetColors( s, @cp )
+    cp.FillColor = &hFF3E8C5Aul
+    tkSlider_SetColors( s, @cp )
+    tkTheme_Apply( tkTheme_Light() )
+    tkSlider_GetColors( s2, @cc )
+    tkTest_Check( "theme reaches an unpinned slider", cc.FillColor = tkTheme_Light().Accent andalso cc.BackColor = tkTheme_Light().Window _
+                  andalso cc.TrackColor = tkTheme_Light().Track andalso cc.ThumbColor = tkTheme_Light().Surface )
+    tkSlider_GetColors( s, @cc )
+    tkTest_Check( "SetColors pinned", cc.FillColor = &hFF3E8C5Aul )
+    tkSlider_SetValue( s, 50 )
+    RenderQuiet( h )
+    tkSlider_GetFillRect( s, rf )
+    tkSlider_GetTrackRect( s, rt )
+    tkSlider_GetThumbRect( s, 0, rth )
+    dim as long fx = (rf.left + rth.left) \ 2, fy = CentreY( rf ), tx = (rth.right + rt.right) \ 2
+    tkTest_Check( "px: the fill left of the thumb is the pinned colour", PixW( h, s, fx, fy ) = &hFF3E8C5Aul, hex( PixW( h, s, fx, fy ) ) )
+    tkTest_Check( "px: the track right of the thumb is the track colour", PixW( h, s, tx, fy ) = cc.TrackColor, hex( PixW( h, s, tx, fy ) ) )
+    tkTest_Check( "px: the thumb's centre is the thumb colour", PixW( h, s, CentreX( rth ), CentreY( rth ) ) = cc.ThumbColor, _
+                  hex( PixW( h, s, CentreX( rth ), CentreY( rth ) ) ) )
+    tkTest_Check( "px: outside the track band is the back colour", PixW( h, s, tx, 0 ) = cc.BackColor, hex( PixW( h, s, tx, 0 ) ) )
+    dim as ulong pxStock = PixW( h, s, CentreX( rth ), CentreY( rth ) )
+    tkSlider_SetPaintCallback( s, @PaintStock )
+    RenderQuiet( h )
+    dim as ulong pxVia = PixW( h, s, CentreX( rth ), CentreY( rth ) )
+    tkSlider_SetPaintCallback( s, @PaintNothing )
+    RenderQuiet( h )
+    dim as ulong pxBare = PixW( h, s, CentreX( rth ), CentreY( rth ) )
+    tkSlider_SetPaintCallback( s, 0 )
+    tkTest_Check( "PaintDefault inside a callback = the stock thumb", pxVia = pxStock, hex( pxStock ) & " / " & hex( pxVia ) )
+    tkTest_Check( "a callback that draws nothing leaves no thumb", pxBare <> pxStock, hex( pxBare ) )
+    tkSlider_UnpinColors( s )
+    tkSlider_GetColors( s, @cc )
+    tkTest_Check( "unpin hands it back to the current theme", cc.FillColor = tkTheme_Light().Accent )
+    tkTheme_Apply( tkTheme_Dark() )
+    dim as TKTHEME_SHAPE sh
+    sh.BorderWidth = 3
+    tkTheme_SetShape( sh )
+    tkTest_Check( "an unpinned thumb border takes the theme's BorderWidth", tkSlider_GetBorderThickness( s ) = 3 )
+    tkSlider_SetBorderThickness( s, 1 )
+    sh.BorderWidth = 4
+    tkTheme_SetShape( sh )
+    tkTest_Check( "SetBorderThickness pins it", tkSlider_GetBorderThickness( s ) = 1 )
+    dim as TKTHEME_SHAPE sh0
+    tkTheme_SetShape( sh0 )
+
+    ' ---- H: the per-monitor scale path -------------------------------------------------------
+    dim as long tt1, thw1, thh1, fg1, ft1
+    h->fScaleForced = fScale * 2
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
+    tkSlider_GetThumbSize( s2, thw1, thh1 )
+    tkSlider_GetFocusRing( s2, fg1, ft1 )
+    tkTest_Check( "rescale: track, thumb, gap x2; ring thickness not", tkSlider_GetTrackSize( s2 ) = tt * 2 andalso thw1 = thw * 2 _
+                  andalso thh1 = thh * 2 andalso fg1 = fg * 2 andalso ft1 = 1, tkSlider_GetTrackSize( s2 ) & " " & thw1 & " " & fg1 )
+    h->fScaleForced = fScale
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
+    tkSlider_GetThumbSize( s2, thw1, thh1 )
+    tkTest_Check( "rescale back", tkSlider_GetTrackSize( s2 ) = tt andalso thw1 = thw, tkSlider_GetTrackSize( s2 ) & " " & thw1 )
+
+    if bLogic then          ' scale-independent: checked in the 1.0 pass only
+    ' ---- I: a callback that destroys the slider ------------------------------------------------
+    tkHost_SetFocus( h, s2 )
+    tkSlider_SetValue( s2, 50 )
+    ResetCounts( )
+    gDestroyInChanged = true
+    tkTest_PushKey( h, SDLK_RIGHT )
+    gDestroyInChanged = false
+    tkTest_Check( "Changed destroyed the slider: Committed still came, nothing crashed", gChanged = 1 andalso gCommitted = 1 _
+                  andalso gLastCommitted = 51 andalso tkHost_GetFocus( h ) <> s2, gChanged & "/" & gCommitted )
+
+    end if
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+' S1: vertical, reversed, page clicks, ticks, labels, SnapToTicks, fill modes, rect thumb, tip
+' ==========================================================================================
+function PctFormat( byval hSlider as TK_WIDGET ptr, byval nValue as double, byval nWhere as long ) as ustring
+    if nWhere = TKSL_FMT_TICK then return str( cint( nValue ) ) & "%"
+    return ""                                               ' the tip: the default
+end function
+
+' The along-axis centre of a rect.
+function MidA( byval s as TK_WIDGET ptr, byref r as TKRECT ) as long
+    if tkSlider_GetOrientation( s ) = TKSL_VERTICAL then return (r.top + r.bottom) \ 2
+    return (r.left + r.right) \ 2
+end function
+
+' A slider sized to its ideal size at (x, y).
+function MakeAt( byval h as TK_HOST ptr, byval id as long, byval x as long, byval y as long, byval bVert as boolean = false ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr s = tkSlider_Create( tkHost_Root( h ), id )
+    if bVert then tkSlider_SetOrientation( s, TKSL_VERTICAL )
+    tkSlider_SetValueChangedCallback( s, @OnChanged )
+    tkSlider_SetValueCommittedCallback( s, @OnCommitted )
+    dim as long iw, ih
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkWidget_SetPos( s, x, y, iw, ih )
+    return s
+end function
+
+function TipText( byval s as TK_WIDGET ptr ) as ustring
+    dim as TK_TIP ptr t = tkSlider_GetValueTipHandle( s )
+    if t = 0 then return "(no tip)"
+    return tkTooltip_GetText( t )
+end function
+
+sub RunS1( byval fScale as single )
+    tkTest_Begin( "S1 scale " & fScale )
+    dim as boolean bLogic = (fScale = 1.0)
+    dim as TK_HOST ptr h = tkHost_Create( "tkSlider selftest S1", 760, 560, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host created", false, *SDL_GetError() ) : exit sub
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 100 )
+    dim as long rp, fg, ft, ta, tx, iw, ih
+    dim as TKRECT rth, rf, rt, rl, rl2
+
+    ' ---- J: vertical, Min at the bottom ------------------------------------------------------
+    dim as TK_WIDGET ptr v = MakeAt( h, 200, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), true )
+    tkSlider_GetFocusRing( v, fg, ft ) : rp = fg + ft
+    tkSlider_GetThumbSize( v, ta, tx )
+    tkSlider_GetIdealSize( v, iw, ih )
+    tkTest_Check( "vertical ideal: across x along", iw = tx + 2 * rp andalso ih = ta + tkHost_Scale( h, 120 ) + 2 * rp, iw & "x" & ih )
+    dim as long half = ta \ 2, a0 = rp + half, a1 = (ih - rp) - (ta - half), sp = a1 - a0
+    dim as long bad = 0
+    for k as long = 0 to 100
+        tkSlider_SetValue( v, k )
+        tkSlider_GetThumbRect( v, 0, rth )
+        dim as long cy = a1 - cint( int( (k / 100) * sp + 0.5 ) )
+        if (rth.top <> cy - half) orelse (tkSlider_ValueToPos( v, k ) <> cy) orelse (tkSlider_PosToValue( v, cy ) <> k) then bad += 1
+    next
+    tkTest_Check( "vertical: centre = a1 - round( fr * span ), Min at the bottom, round trip", bad = 0, bad & " off" )
+    tkSlider_SetValue( v, 30 )
+    tkSlider_GetFillRect( v, rf ) : tkSlider_GetTrackRect( v, rt ) : tkSlider_GetThumbRect( v, 0, rth )
+    tkTest_Check( "vertical fill: the thumb's centre down to the track's bottom", rf.bottom = rt.bottom andalso rf.top = MidA( v, rth ) _
+                  andalso rf.left = rt.left andalso rf.right = rt.right, tkRect_Str( rf ) )
+    ResetCounts( )
+    tkTest_PushButton( h, true, WX( v, (rth.left + rth.right) \ 2 ), WY( v, MidA( v, rth ) ) )
+    tkTest_PushMotion( h, WX( v, (rth.left + rth.right) \ 2 ), WY( v, tkSlider_ValueToPos( v, 60 ) ) )
+    tkTest_PushButton( h, false, WX( v, (rth.left + rth.right) \ 2 ), WY( v, tkSlider_ValueToPos( v, 60 ) ) )
+    tkTest_Check( "vertical drag up raises the value", tkSlider_GetValue( v ) = 60 andalso gCommitted = 1, str( tkSlider_GetValue( v ) ) )
+    tkHost_SetFocus( h, v )
+    dim as long vk(0 to 3) = { SDLK_UP, SDLK_DOWN, SDLK_RIGHT, SDLK_LEFT }
+    dim as double vw(0 to 3) = { 61, 60, 61, 60 }
+    bad = 0
+    for i as long = 0 to 3
+        tkTest_PushKey( h, vk(i) )
+        if tkSlider_GetValue( v ) <> vw(i) then bad += 1
+    next
+    tkTest_Check( "vertical keys: Up +, Down -, Right +, Left -", bad = 0, str( tkSlider_GetValue( v ) ) )
+    tkSlider_SetReversed( v, true )
+    tkSlider_SetValue( v, 0 )
+    tkSlider_GetThumbRect( v, 0, rth )
+    tkTest_Check( "vertical reversed: Min at the top", MidA( v, rth ) = a0, str( MidA( v, rth ) ) )
+    tkSlider_SetValue( v, 50 )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "vertical reversed: Up decreases (geometry), Right still increases", tkSlider_GetValue( v ) = 49, str( tkSlider_GetValue( v ) ) )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "  ... Right +1", tkSlider_GetValue( v ) = 50 )
+    tkWidget_Destroy( v )
+
+    ' ---- K: reversed horizontal --------------------------------------------------------------
+    dim as TK_WIDGET ptr s = MakeAt( h, 201, tkHost_Scale( h, 80 ), tkHost_Scale( h, 20 ) )
+    tkSlider_SetReversed( s, true )
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkSlider_SetValue( s, 0 )
+    tkSlider_GetThumbRect( s, 0, rth )
+    dim as long ha0 = rp + half, ha1 = (iw - rp) - (ta - half)
+    tkTest_Check( "reversed horizontal: Min at the right", MidA( s, rth ) = ha1, MidA( s, rth ) & " vs " & ha1 )
+    tkSlider_SetValue( s, 40 )
+    tkSlider_GetFillRect( s, rf ) : tkSlider_GetTrackRect( s, rt ) : tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_Check( "reversed fill: thumb centre to the track's right end", rf.left = MidA( s, rth ) andalso rf.right = rt.right, tkRect_Str( rf ) )
+    tkHost_SetFocus( h, s )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "reversed: Right decreases", tkSlider_GetValue( s ) = 39 )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "reversed: Up still increases", tkSlider_GetValue( s ) = 40 )
+    tkSlider_SetReversed( s, false )
+
+    dim as long py
+    if bLogic then          ' scale-independent: checked in the 1.0 pass only
+    ' ---- L: PAGE clicks with auto-repeat ------------------------------------------------------
+    tkSlider_SetAutoRepeat( s, 60, 20 )
+    tkSlider_SetTrackClick( s, TKSL_CLICK_PAGE )
+    tkSlider_SetValue( s, 50 )
+    tkSlider_GetThumbRect( s, 0, rth )
+    py = (rth.top + rth.bottom) \ 2
+    ResetCounts( )
+    tkTest_PushButton( h, true, WX( s, tkSlider_ValueToPos( s, 90 ) ), WY( s, py ) )
+    tkTest_Check( "page press: one LargeChange at once, Changed + Committed, repeating", tkSlider_GetValue( s ) = 60 andalso gChanged = 1 _
+                  andalso gCommitted = 1 andalso tkSlider_IsRepeating( s ) andalso tkHost_GetCapture( h ) = s, tkSlider_GetValue( s ) & " " & gChanged )
+    tkTest_Check( "  ... the value tip shows while paging", tkSlider_IsValueTipShown( s ) andalso TipText( s ) = "60", TipText( s ) )
+    tkTest_PumpFor( h, 600 )
+    tkTest_Check( "held: repeats to the pointer (90) and stops there", tkSlider_GetValue( s ) = 90 andalso tkSlider_IsRepeating( s ) = false _
+                  andalso gCommitted = 4, tkSlider_GetValue( s ) & " commits " & gCommitted )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 90 ) ), WY( s, py ) )
+    tkTest_Check( "release: no extra Committed, capture gone, tip hidden", gCommitted = 4 andalso tkHost_GetCapture( h ) = 0 _
+                  andalso tkSlider_IsValueTipShown( s ) = false )
+    ResetCounts( )
+    tkTest_PushButton( h, true, WX( s, tkSlider_ValueToPos( s, 5 ) ), WY( s, py ) )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 5 ) ), WY( s, py ) )
+    tkTest_Check( "page press below: one step down, released before the repeat", tkSlider_GetValue( s ) = 80 andalso gCommitted = 1 _
+                  andalso tkSlider_IsRepeating( s ) = false, str( tkSlider_GetValue( s ) ) )
+    tkSlider_GetThumbRect( s, 0, rth )
+    ResetCounts( )
+    tkTest_PushButton( h, true, WX( s, MidA( s, rth ) ), WY( s, py ) )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, 85 ) ), WY( s, py ) )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 85 ) ), WY( s, py ) )
+    tkTest_Check( "PAGE mode: the thumb itself still drags", tkSlider_GetValue( s ) = 85 andalso gCommitted = 1 )
+    tkSlider_SetTrackClick( s, TKSL_CLICK_JUMP )
+
+    end if
+
+    ' ---- M: ticks ---------------------------------------------------------------------------
+    tkSlider_SetTickFrequency( s, 10 )
+    tkTest_Check( "frequency 10 on 0..100: 11 ticks", tkSlider_GetTickCount( s ) = 11, str( tkSlider_GetTickCount( s ) ) )
+    bad = 0
+    for i as long = 0 to 10
+        if (tkSlider_GetTickValue( s, i ) <> i * 10) orelse (tkSlider_GetTickPos( s, i ) <> tkSlider_ValueToPos( s, i * 10 )) then bad += 1
+        if tkSlider_GetTickShown( s, i ) then bad += 1                 ' placement NONE: no marks
+    next
+    tkTest_Check( "tick i at value 10i, at ValueToPos; none shown with placement NONE", bad = 0, str( bad ) )
+    tkSlider_SetTickFrequency( s, 30 )
+    tkTest_Check( "frequency 30: 0 30 60 90 and Max", tkSlider_GetTickCount( s ) = 5 andalso tkSlider_GetTickValue( s, 3 ) = 90 _
+                  andalso tkSlider_GetTickValue( s, 4 ) = 100 )
+    dim as double tl(0 to 4) = { 50, -5, 20, 20, 120 }
+    tkSlider_SetTicks( s, tl() )
+    tkTest_Check( "explicit list: sorted, deduplicated, outside dropped", tkSlider_GetTickCount( s ) = 2 andalso tkSlider_GetTickValue( s, 0 ) = 20 _
+                  andalso tkSlider_GetTickValue( s, 1 ) = 50, str( tkSlider_GetTickCount( s ) ) )
+    dim as double none_(any)
+    tkSlider_SetTicks( s, none_() )
+    tkTest_Check( "an empty list returns to the frequency", tkSlider_GetTickCount( s ) = 5 )
+    tkSlider_SetTickPlacement( s, TKSL_TICKS_BOTTOMRIGHT )
+    tkSlider_GetIdealSize( s, iw, ih )
+    dim as long tl0, tg0, lg0
+    tkSlider_GetTickSize( s, tl0, tg0, lg0 )
+    tkTest_Check( "BOTTOMRIGHT ticks add TickGap + TickLength to the ideal height", ih = tx + tg0 + tl0 + 2 * rp, str( ih ) )
+    tkWidget_SetSize( s, tkHost_Scale( h, 300 ), ih )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_Check( "HitTest in the tick band = TICKS", tkSlider_HitTest( s, tkSlider_GetTickPos( s, 1 ), rth.bottom + tg0 + 1 ) = TKSL_PART_TICKS )
+    tkSlider_SetTickFrequency( s, 0.1 )                     ' 1000 ticks on ~300 px
+    dim as long minG = tkHost_Scale( h, 2 ), nShown = 0, lastP = -100000, worstGap = 100000
+    for i as long = 0 to tkSlider_GetTickCount( s ) - 1
+        if tkSlider_GetTickShown( s, i ) then
+            if nShown > 0 andalso abs( tkSlider_GetTickPos( s, i ) - lastP ) < worstGap then worstGap = abs( tkSlider_GetTickPos( s, i ) - lastP )
+            lastP = tkSlider_GetTickPos( s, i ) : nShown += 1
+        end if
+    next
+    dim as long nT = tkSlider_GetTickCount( s )
+    tkTest_Check( "dense ticks thinned: shown ones >= 2 px (scaled) apart", nT = 1001 andalso nShown > 10 andalso nShown < nT andalso worstGap >= minG, _
+                  nT & " ticks, " & nShown & " shown, worst gap " & worstGap )
+    tkTest_Check( "  ... the first and the last are shown", tkSlider_GetTickShown( s, 0 ) andalso tkSlider_GetTickShown( s, nT - 1 ) )
+    tkSlider_SetTickFrequency( s, 1e-9 )
+    tkTest_Check( "a frequency past MAX_TICKS: no ticks", tkSlider_GetTickCount( s ) = 0 )
+    tkSlider_SetTickFrequency( s, 25 )
+    tkSlider_SetTickPlacement( s, TKSL_TICKS_BOTH )
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkTest_Check( "BOTH: ticks on both sides of the thumb band", ih = tx + 2 * (tg0 + tl0) + 2 * rp, str( ih ) )
+    tkWidget_SetSize( s, tkHost_Scale( h, 300 ), ih )
+    dim as TKSLIDER_COLORS cc
+    tkSlider_GetColors( s, @cc )
+    cc.TickColor = &hFFFF00FFul
+    tkSlider_SetColors( s, @cc )
+    tkSlider_SetValue( s, 0 )
+    RenderQuiet( h )
+    tkSlider_GetThumbRect( s, 0, rth )
+    dim as long tpx = tkSlider_GetTickPos( s, 2 )
+    tkTest_Check( "px: a tick mark above and below the band at value 50", PixW( h, s, tpx, rth.top - tg0 - 1 ) = &hFFFF00FFul _
+                  andalso PixW( h, s, tpx, rth.bottom + tg0 ) = &hFFFF00FFul, hex( PixW( h, s, tpx, rth.top - tg0 - 1 ) ) )
+    tkSlider_UnpinColors( s )
+
+    ' ---- N: labels ---------------------------------------------------------------------------
+    tkSlider_SetTickPlacement( s, TKSL_TICKS_BOTTOMRIGHT )
+    tkSlider_SetShowTickLabels( s, true )
+    tkSlider_GetIdealSize( s, iw, ih )
+    dim as long lh = tkText_Height( h->pDefaultFont )
+    tkTest_Check( "labels add LabelGap + the line height", ih = tx + tg0 + tl0 + lg0 + lh + 2 * rp, ih & " lh " & lh )
+    tkWidget_SetSize( s, tkHost_Scale( h, 300 ), ih )
+    dim as string wantL(0 to 4) = { "0", "25", "50", "75", "100" }
+    bad = 0
+    for i as long = 0 to 4
+        if tkSlider_GetLabelText( s, i ) <> wantL(i) then bad += 1
+        if tkSlider_GetLabelRect( s, i, rl ) = false then bad += 1
+        if (rl.right - rl.left) <> tkText_Width( h->pDefaultFont, wantL(i) ) then bad += 1
+        if (rl.left < rp) orelse (rl.right > tkHost_Scale( h, 300 ) - rp) then bad += 1
+    next
+    tkTest_Check( "labels 0 25 50 75 100, measured, inside the content", bad = 0, str( bad ) )
+    tkSlider_GetLabelRect( s, 2, rl )
+    tkTest_Check( "a middle label is centred on its tick", abs( (rl.left + rl.right) \ 2 - tkSlider_GetTickPos( s, 2 ) ) <= 1, tkRect_Str( rl ) )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_Check( "labels sit LabelGap below the ticks", rl.top = rth.bottom + tg0 + tl0 + lg0, rl.top & " vs " & (rth.bottom + tg0 + tl0 + lg0) )
+    tkSlider_SetLabelEvery( s, 2 )
+    tkTest_Check( "LabelEvery 2: 0, 50, 100 (the last always)", tkSlider_GetLabelRect( s, 1, rl ) = false andalso tkSlider_GetLabelRect( s, 2, rl ) _
+                  andalso tkSlider_GetLabelRect( s, 4, rl ) )
+    tkSlider_SetTickFrequency( s, 1 )                         ' 101 labels on ~300 px: most must go
+    dim as long nL = 0, firstL = -1, lastL = -1
+    bad = 0
+    for i as long = 0 to tkSlider_GetTickCount( s ) - 1
+        if tkSlider_GetLabelRect( s, i, rl ) then
+            if lastL >= 0 then
+                tkSlider_GetLabelRect( s, lastL, rl2 )
+                if rl.left < rl2.right + tkHost_Scale( h, 6 ) then bad += 1
+            end if
+            if firstL < 0 then firstL = i
+            lastL = i : nL += 1
+        end if
+    next
+    tkTest_Check( "dense labels thinned: none within 6 px (scaled) of the next", bad = 0 andalso nL > 3 andalso nL < 101, nL & " shown, " & bad & " clash" )
+    tkTest_Check( "  ... 0 and 100 kept", firstL = 0 andalso lastL = 100, firstL & " .. " & lastL )
+    tkSlider_SetTickFrequency( s, 25 )
+    tkSlider_SetFormatValueCallback( s, @PctFormat )
+    tkTest_Check( "FormatValue: the labels' text", tkSlider_GetLabelText( s, 2 ) = "50%" andalso tkSlider_FormatValue( s, 50, TKSL_FMT_TICK ) = "50%" )
+    tkTest_Check( "  ... an empty answer is the default", tkSlider_FormatValue( s, 50, TKSL_FMT_TIP ) = "50" )
+    tkSlider_SetFormatValueCallback( s, 0 )
+    tkSlider_SetDecimalPlaces( s, 2 )
+    tkTest_Check( "default text has DecimalPlaces digits", tkSlider_FormatValue( s, 12.5 ) = "12.50" andalso tkSlider_FormatValue( s, -0.004 ) = "0.00", _
+                  tkSlider_FormatValue( s, 12.5 ) )
+    tkSlider_SetDecimalPlaces( s, 0 )
+    ' vertical labels: the band is the widest label, right of the ticks
+    v = MakeAt( h, 202, tkHost_Scale( h, 420 ), tkHost_Scale( h, 20 ), true )
+    tkSlider_SetTickFrequency( v, 50 )
+    tkSlider_SetTickPlacement( v, TKSL_TICKS_BOTTOMRIGHT )
+    tkSlider_SetShowTickLabels( v, true )
+    tkSlider_GetIdealSize( v, iw, ih )
+    dim as long w100 = tkText_Width( h->pDefaultFont, "100" )
+    tkTest_Check( "vertical labels: ideal width = thumb + ticks + gap + widest label", iw = tx + tg0 + tl0 + lg0 + w100 + 2 * rp, iw & " w100 " & w100 )
+    tkWidget_SetSize( v, iw, ih )
+    tkSlider_GetLabelRect( v, 0, rl )
+    tkSlider_GetThumbRect( v, 0, rth )
+    tkTest_Check( "vertical: label 0 left-aligned past the ticks, at the bottom", rl.left = rth.right + tg0 + tl0 + lg0 _
+                  andalso rl.bottom <= ih - rp andalso rl.top > ih \ 2, tkRect_Str( rl ) )
+    tkWidget_Destroy( v )
+
+    dim as double st(0 to 4) = { 0, 10, 25, 70, 100 }
+    if bLogic then          ' scale-independent: checked in the 1.0 pass only
+    ' ---- O: SnapToTicks ----------------------------------------------------------------------
+    tkSlider_SetShowTickLabels( s, false )
+    tkSlider_SetTickPlacement( s, TKSL_TICKS_NONE )
+    tkSlider_SetTicks( s, st() )
+    tkSlider_SetSnapToTicks( s, true )
+    tkSlider_SetValue( s, 20 )
+    tkTest_Check( "snap: 20 -> the nearest tick, 25", tkSlider_GetValue( s ) = 25, str( tkSlider_GetValue( s ) ) )
+    tkHost_SetFocus( h, s )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "snap: Right goes to the next tick, 70", tkSlider_GetValue( s ) = 70, str( tkSlider_GetValue( s ) ) )
+    tkTest_PushKey( h, SDLK_LEFT )
+    tkTest_PushKey( h, SDLK_PAGEUP )
+    tkTest_Check( "snap: PgUp (10) from 25 finds no tick by 35, so the next one, 70", tkSlider_GetValue( s ) = 70, str( tkSlider_GetValue( s ) ) )
+    tkTest_PushKey( h, SDLK_END )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "snap: at the last tick Right stays", tkSlider_GetValue( s ) = 100 )
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkWidget_SetSize( s, tkHost_Scale( h, 300 ), ih )
+    tkSlider_GetThumbRect( s, 0, rth )
+    py = (rth.top + rth.bottom) \ 2
+    tkTest_Click( h, WX( s, tkSlider_ValueToPos( s, 60 ) - 0 ), WY( s, py ) )
+    tkTest_Check( "snap: a jump to 60's place lands on 70", tkSlider_GetValue( s ) = 70, str( tkSlider_GetValue( s ) ) )
+    end if
+    tkSlider_SetShowTickLabels( s, false ) : tkSlider_SetTickPlacement( s, TKSL_TICKS_NONE )
+    tkSlider_SetSnapToTicks( s, false )
+    tkSlider_SetTicks( s, none_() )
+    tkSlider_SetTickFrequency( s, 0 )
+
+    ' ---- P: fill modes, rect thumb -------------------------------------------------------------
+    tkSlider_SetFillMode( s, TKSL_FILL_NONE )
+    tkSlider_GetFillRect( s, rf )
+    tkTest_Check( "FILL_NONE: no fill", tkRect_IsEmpty( rf ) )
+    tkSlider_SetFillMode( s, TKSL_FILL_ORIGIN )
+    tkSlider_SetRange( s, -10, 10 )
+    tkSlider_SetFillOrigin( s, 0 )
+    tkSlider_SetValue( s, 5 )
+    tkSlider_GetFillRect( s, rf )
+    tkTest_Check( "FILL_ORIGIN, value above: origin to thumb", rf.left = tkSlider_ValueToPos( s, 0 ) andalso rf.right = tkSlider_ValueToPos( s, 5 ), tkRect_Str( rf ) )
+    tkSlider_SetValue( s, -5 )
+    tkSlider_GetFillRect( s, rf )
+    tkTest_Check( "FILL_ORIGIN, value below: thumb to origin", rf.left = tkSlider_ValueToPos( s, -5 ) andalso rf.right = tkSlider_ValueToPos( s, 0 ), tkRect_Str( rf ) )
+    tkSlider_SetFillMode( s, TKSL_FILL_MIN )
+    tkSlider_SetRange( s, 0, 100 )
+    tkSlider_SetThumbShape( s, TKSL_THUMB_RECT )
+    tkSlider_SetThumbSize( s, tkHost_Scale( h, 10 ), tkHost_Scale( h, 20 ) )
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkWidget_SetSize( s, tkHost_Scale( h, 300 ), ih )
+    tkSlider_SetValue( s, 50 )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_Check( "rect thumb: ThumbSize is (along, across)", (rth.right - rth.left) = tkHost_Scale( h, 10 ) andalso (rth.bottom - rth.top) = tkHost_Scale( h, 20 ), tkRect_Str( rth ) )
+    tkSlider_GetColors( s, @cc )
+    RenderQuiet( h )
+    tkTest_Check( "px: the rect thumb's centre is the thumb colour", PixW( h, s, MidA( s, rth ), (rth.top + rth.bottom) \ 2 ) = cc.ThumbColor, _
+                  hex( PixW( h, s, MidA( s, rth ), (rth.top + rth.bottom) \ 2 ) ) )
+    tkTest_Check( "px: a round thumb would not reach the rect's corner; this one does", PixW( h, s, rth.left + tkHost_Scale( h, 3 ), rth.top + tkHost_Scale( h, 3 ) ) <> cc.BackColor, _
+                  hex( PixW( h, s, rth.left + tkHost_Scale( h, 3 ), rth.top + tkHost_Scale( h, 3 ) ) ) )
+    tkSlider_SetThumbShape( s, TKSL_THUMB_ROUND )
+    tkSlider_SetThumbSize( s, ta, tx )
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkWidget_SetSize( s, tkHost_Scale( h, 300 ), ih )
+
+    if bLogic then          ' scale-independent: checked in the 1.0 pass only
+    ' ---- R: the value tip --------------------------------------------------------------------
+    tkTest_Check( "default tip mode: DRAG", tkSlider_GetShowValueTip( s ) = TKSL_TIP_DRAG )
+    tkSlider_SetValue( s, 50 )
+    tkSlider_GetThumbRect( s, 0, rth )
+    py = (rth.top + rth.bottom) \ 2
+    tkTest_PushButton( h, true, WX( s, MidA( s, rth ) ), WY( s, py ) )
+    tkTest_Check( "DRAG: shown on the press, the value's text", tkSlider_IsValueTipShown( s ) andalso TipText( s ) = "50", TipText( s ) )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, 64 ) ), WY( s, py ) )
+    tkTest_Check( "  ... follows the drag", TipText( s ) = "64", TipText( s ) )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 64 ) ), WY( s, py ) )
+    tkTest_Check( "  ... hidden on release", tkSlider_IsValueTipShown( s ) = false )
+    tkHost_SetFocus( h, s )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "DRAG: keys show no tip", tkSlider_IsValueTipShown( s ) = false )
+    tkSlider_SetShowValueTip( s, TKSL_TIP_FOCUSED )
+    tkTest_Check( "FOCUSED: shown at once while focused", tkSlider_IsValueTipShown( s ) andalso TipText( s ) = "65", TipText( s ) )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "  ... follows the keys", TipText( s ) = "66", TipText( s ) )
+    tkHost_SetFocus( h, 0 )
+    tkTest_Check( "  ... hidden when focus goes", tkSlider_IsValueTipShown( s ) = false )
+    tkSlider_SetShowValueTip( s, TKSL_TIP_NONE )
+    tkSlider_GetThumbRect( s, 0, rth )
+    tkTest_PushButton( h, true, WX( s, MidA( s, rth ) ), WY( s, py ) )
+    tkTest_Check( "NONE: no tip while dragging", tkSlider_IsValueTipShown( s ) = false )
+    tkTest_PushButton( h, false, WX( s, MidA( s, rth ) ), WY( s, py ) )
+
+    ' S1's setters, every one silent
+    ResetCounts( )
+    tkSlider_SetOrientation( s, TKSL_VERTICAL ) : tkSlider_SetReversed( s, true ) : tkSlider_SetTrackClick( s, TKSL_CLICK_PAGE )
+    tkSlider_SetTickFrequency( s, 7 ) : tkSlider_SetSnapToTicks( s, true ) : tkSlider_SetTicks( s, st() )
+    tkSlider_SetTickPlacement( s, TKSL_TICKS_BOTH ) : tkSlider_SetShowTickLabels( s, true ) : tkSlider_SetLabelEvery( s, 3 )
+    tkSlider_SetFillMode( s, TKSL_FILL_ORIGIN ) : tkSlider_SetFillOrigin( s, 40 ) : tkSlider_SetThumbShape( s, TKSL_THUMB_RECT )
+    tkSlider_SetShowValueTip( s, TKSL_TIP_FOCUSED ) : tkSlider_SetRange( s, 5, 95 ) : tkSlider_SetValue( s, 33 )
+    tkTest_Check( "S1's setters (orientation, ticks, snap, labels, fill, shape, tip, range) fire nothing", gChanged = 0 andalso gCommitted = 0, _
+                  gChanged & "/" & gCommitted )
+    tkTest_Check( "  ... and SnapToTicks moved 33 to the nearest tick, 25", tkSlider_GetValue( s ) = 25, str( tkSlider_GetValue( s ) ) )
+    end if
+    tkHost_Destroy( h )
+end sub
+
+
+' ==========================================================================================
+' S2: range mode
+' ==========================================================================================
+function Pair( byval s as TK_WIDGET ptr ) as string
+    return tkSlider_GetValue( s ) & "," & tkSlider_GetUpperValue( s )
+end function
+
+function IsPair( byval s as TK_WIDGET ptr, byval lo as double, byval hi as double ) as boolean
+    return (tkSlider_GetValue( s ) = lo) andalso (tkSlider_GetUpperValue( s ) = hi)
+end function
+
+' Press at value a's place on the thumb band, move to value b's, release (window coordinates).
+sub DragVal( byval h as TK_HOST ptr, byval s as TK_WIDGET ptr, byval a as double, byval b as double, byval py as long, _
+             byval bRelease as boolean = true )
+    tkTest_PushButton( h, true, WX( s, tkSlider_ValueToPos( s, a ) ), WY( s, py ) )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, b ) ), WY( s, py ) )
+    if bRelease then tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, b ) ), WY( s, py ) )
+end sub
+
+sub RunS2( byval fScale as single )
+    tkTest_Begin( "S2 scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkSlider selftest S2", 760, 400, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host created", false, *SDL_GetError() ) : exit sub
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 100 )
+    dim as TKRECT r0, r1, rf, rb
+    dim as long iw, ih
+
+    ' ---- A: mode, defaults -------------------------------------------------------------------
+    dim as TK_WIDGET ptr s = MakeAt( h, 300, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ) )
+    tkSlider_GetIdealSize( s, iw, ih )
+    tkWidget_SetSize( s, tkHost_Scale( h, 300 ), ih )
+    tkTest_Check( "default: single mode, UpperValue = Max, no thumb 1", tkSlider_GetMode( s ) = TKSL_MODE_SINGLE _
+                  andalso tkSlider_GetUpperValue( s ) = 100 andalso tkSlider_GetThumbRect( s, 1, r1 ) = false )
+    ResetCounts( )
+    tkSlider_SetMode( s, TKSL_MODE_RANGE )
+    tkTest_Check( "range mode: (0, 100), two thumbs", IsPair( s, 0, 100 ) andalso tkSlider_GetThumbRect( s, 1, r1 ), Pair( s ) )
+
+    ' ---- B: setters push, never fail ----------------------------------------------------------
+    tkSlider_SetValues( s, 10, 20 ) : tkSlider_SetValue( s, 30 )
+    tkTest_Check( "SetValue past the upper pushes it: (30, 30)", IsPair( s, 30, 30 ), Pair( s ) )
+    tkSlider_SetUpperValue( s, 40 )
+    tkTest_Check( "  then SetUpperValue 40: (30, 40) -- LoadFrom's order, from below", IsPair( s, 30, 40 ), Pair( s ) )
+    tkSlider_SetValues( s, 50, 60 ) : tkSlider_SetValue( s, 5 ) : tkSlider_SetUpperValue( s, 8 )
+    tkTest_Check( "  from above: (5, 8)", IsPair( s, 5, 8 ), Pair( s ) )
+    tkSlider_SetValues( s, 10, 20 ) : tkSlider_SetUpperValue( s, 5 )
+    tkTest_Check( "SetUpperValue below the lower pushes it down: (5, 5)", IsPair( s, 5, 5 ), Pair( s ) )
+    tkSlider_SetValues( s, 70, 60 )
+    tkTest_Check( "SetValues swaps an inverted pair", IsPair( s, 60, 70 ), Pair( s ) )
+    tkSlider_SetMode( s, TKSL_MODE_SINGLE ) : tkSlider_SetValue( s, 80 )
+    tkTest_Check( "single mode: the upper value is kept, not pushed", IsPair( s, 80, 70 ), Pair( s ) )
+    tkSlider_SetMode( s, TKSL_MODE_RANGE )
+    tkTest_Check( "back to range: the pair put in order (80, 80)", IsPair( s, 80, 80 ), Pair( s ) )
+    tkSlider_SetMinDistance( s, 10 ) : tkSlider_SetValues( s, 50, 52 )
+    tkTest_Check( "setters may go closer than MinDistance", IsPair( s, 50, 52 ), Pair( s ) )
+    tkSlider_SetMinDistance( s, 0 )
+    tkSlider_SetStep( s, 10 )
+    tkTest_Check( "SetStep re-snaps both", IsPair( s, 50, 50 ), Pair( s ) )
+    tkSlider_SetStep( s, 1 )
+    tkTest_Check( "every setter above was SILENT", gChanged = 0 andalso gCommitted = 0, gLog )
+
+    ' ---- C: geometry -------------------------------------------------------------------------
+    tkSlider_SetValues( s, 30, 60 )
+    tkSlider_GetThumbRect( s, 0, r0 ) : tkSlider_GetThumbRect( s, 1, r1 ) : tkSlider_GetFillRect( s, rf )
+    tkTest_Check( "thumb 1 at ValueToPos( upper )", MidA( s, r1 ) = tkSlider_ValueToPos( s, 60 ) andalso MidA( s, r0 ) = tkSlider_ValueToPos( s, 30 ) )
+    tkTest_Check( "range fill: between the centres, whatever FillMode says", rf.left = MidA( s, r0 ) andalso rf.right = MidA( s, r1 ), tkRect_Str( rf ) )
+    dim as long py = (r0.top + r0.bottom) \ 2
+    tkTest_Check( "HitTest: THUMB0, THUMB1, RANGE between", tkSlider_HitTest( s, MidA( s, r0 ), py ) = TKSL_PART_THUMB0 _
+                  andalso tkSlider_HitTest( s, MidA( s, r1 ), py ) = TKSL_PART_THUMB1 _
+                  andalso tkSlider_HitTest( s, tkSlider_ValueToPos( s, 45 ), py ) = TKSL_PART_RANGE )
+
+    ' ---- D: a user's thumb stops at the other ------------------------------------------------
+    ResetCounts( )
+    DragVal( h, s, 60, 10, py )
+    tkTest_Check( "thumb 1 dragged below thumb 0 stops on it: (30, 30)", IsPair( s, 30, 30 ), Pair( s ) )
+    tkTest_Check( "  events carry thumb 1; getters already answered", instr( gLog, "c0" ) = 0 andalso right( gLog, 3 ) = "m1 " _
+                  andalso gMismatch = 0, gLog )
+    tkSlider_SetValues( s, 30, 60 ) : tkSlider_SetMinDistance( s, 5 )
+    DragVal( h, s, 30, 90, py )
+    tkTest_Check( "MinDistance 5: thumb 0 stops 5 short: (55, 60)", IsPair( s, 55, 60 ), Pair( s ) )
+    tkSlider_SetValues( s, 58, 60 )
+    DragVal( h, s, 58, 80, py )
+    tkTest_Check( "closer than MinDistance (a setter did it): no closer, no push back", IsPair( s, 58, 60 ), Pair( s ) )
+    DragVal( h, s, 58, 40, py )
+    tkTest_Check( "  but it moves away freely", IsPair( s, 40, 60 ), Pair( s ) )
+    tkSlider_SetMinDistance( s, 0 )
+
+    ' ---- E: two thumbs on one spot: the first move decides -------------------------------------
+    tkSlider_SetValues( s, 40, 40 )
+    ResetCounts( )
+    DragVal( h, s, 40, 40, py, false )
+    tkTest_Check( "coincident press: neither thumb pressed yet", tkSlider_GetPressedThumb( s ) = -1 andalso tkSlider_IsDragging( s ) )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, 50 ) ), WY( s, py ) )
+    tkTest_Check( "  a move up takes thumb 1: (40, 50)", IsPair( s, 40, 50 ) andalso tkSlider_GetPressedThumb( s ) = 1 andalso tkSlider_GetActiveThumb( s ) = 1, Pair( s ) )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 50 ) ), WY( s, py ) )
+    tkSlider_SetValues( s, 40, 40 )
+    DragVal( h, s, 40, 30, py )
+    tkTest_Check( "  a move down takes thumb 0: (30, 40)", IsPair( s, 30, 40 ) andalso tkSlider_GetActiveThumb( s ) = 0, Pair( s ) )
+    tkSlider_SetValues( s, 100, 100 )
+    DragVal( h, s, 100, 70, py )
+    tkTest_Check( "  both at Max: still separable (70, 100)", IsPair( s, 70, 100 ), Pair( s ) )
+
+    ' ---- F: track presses move the nearer thumb ------------------------------------------------
+    tkSlider_SetValues( s, 30, 60 )
+    tkTest_Click( h, WX( s, tkSlider_ValueToPos( s, 10 ) ), WY( s, py ) )
+    tkTest_Check( "JUMP below both: thumb 0 (10, 60)", IsPair( s, 10, 60 ), Pair( s ) )
+    tkTest_Click( h, WX( s, tkSlider_ValueToPos( s, 90 ) ), WY( s, py ) )
+    tkTest_Check( "JUMP above both: thumb 1 (10, 90)", IsPair( s, 10, 90 ), Pair( s ) )
+    tkSlider_SetValues( s, 30, 60 )
+    tkTest_Click( h, WX( s, tkSlider_ValueToPos( s, 52 ) ), WY( s, py ) )
+    tkTest_Check( "JUMP between, nearer thumb 1: (30, 52)", IsPair( s, 30, 52 ), Pair( s ) )
+    tkSlider_SetTrackClick( s, TKSL_CLICK_PAGE )
+    tkSlider_SetValues( s, 30, 60 )
+    tkTest_Click( h, WX( s, tkSlider_ValueToPos( s, 95 ) ), WY( s, py ) )
+    tkTest_Check( "PAGE above: thumb 1 pages +10 (30, 70)", IsPair( s, 30, 70 ), Pair( s ) )
+    tkSlider_SetTrackClick( s, TKSL_CLICK_JUMP )
+
+    ' ---- G: range drag ---------------------------------------------------------------------------
+    tkSlider_SetValues( s, 30, 60 )
+    tkTest_Click( h, WX( s, tkSlider_ValueToPos( s, 45 ) ), WY( s, py ) )
+    tkTest_Check( "AllowRangeDrag off: a press between jumps a thumb", IsPair( s, 45, 60 ) orelse IsPair( s, 30, 45 ), Pair( s ) )
+    tkSlider_SetAllowRangeDrag( s, true )
+    tkSlider_SetValues( s, 30, 60 )
+    ResetCounts( )
+    DragVal( h, s, 45, 65, py, false )
+    tkTest_Check( "range drag: both move, distance kept (50, 80)", IsPair( s, 50, 80 ) andalso tkSlider_GetPressedThumb( s ) = TKSL_THUMB_BOTH, Pair( s ) )
+    tkTest_Check( "  Changed thumb 0 then thumb 1", gLog = "c0 c1 ", gLog )
+    tkTest_Check( "  the tip shows both values", TipText( s ) = "50 - 80", TipText( s ) )
+    tkTest_PushMotion( h, WX( s, tkSlider_ValueToPos( s, 100 ) + tkHost_Scale( h, 40 ) ), WY( s, py ) )
+    tkTest_Check( "  clamped as a block at Max (70, 100)", IsPair( s, 70, 100 ), Pair( s ) )
+    ResetCounts( )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 100 ) ), WY( s, py ) )
+    tkTest_Check( "  release: Committed thumb 0 then thumb 1", gLog = "m0 m1 ", gLog )
+    tkSlider_SetValues( s, 30, 60 )
+    DragVal( h, s, 45, 55, py, false )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "Esc during a range drag restores both", IsPair( s, 30, 60 ) andalso gLog = "c0 c1 " andalso tkHost_GetCapture( h ) = 0, Pair( s ) & " " & gLog )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 55 ) ), WY( s, py ) )
+    tkSlider_SetAllowRangeDrag( s, false )
+
+    ' ---- H: keys, the active thumb, Tab -----------------------------------------------------------
+    dim as TK_WIDGET ptr other = MakeAt( h, 301, tkHost_Scale( h, 20 ), tkHost_Scale( h, 120 ) )
+    tkSlider_SetValues( s, 30, 60 )
+    tkHost_SetFocus( h, s )
+    tkTest_Check( "keyboard focus arrives on thumb 0", tkSlider_GetActiveThumb( s ) = 0 )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "Right moves thumb 0", IsPair( s, 31, 60 ), Pair( s ) )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab: thumb 1, focus stays", tkSlider_GetActiveThumb( s ) = 1 andalso tkHost_GetFocus( h ) = s )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "Right now moves thumb 1, events say so", IsPair( s, 31, 61 ) andalso gLog = "c1 m1 ", Pair( s ) & " " & gLog )
+    tkTest_PushKey( h, SDLK_HOME )
+    tkTest_Check( "Home on thumb 1 stops at thumb 0", IsPair( s, 31, 31 ), Pair( s ) )
+    tkTest_PushKey( h, SDLK_END )
+    tkTest_PushKey( h, SDLK_TAB, SDL_KMOD_SHIFT )
+    tkTest_Check( "Shift+Tab: back to thumb 0", tkSlider_GetActiveThumb( s ) = 0 andalso tkHost_GetFocus( h ) = s )
+    tkSlider_SetMinDistance( s, 4 )
+    tkTest_PushKey( h, SDLK_END )
+    tkTest_Check( "End on thumb 0 stops MinDistance short of thumb 1", IsPair( s, 96, 100 ), Pair( s ) )
+    tkTest_PushKey( h, SDLK_TAB, SDL_KMOD_SHIFT )
+    tkTest_Check( "Shift+Tab from thumb 0 leaves the slider", tkHost_GetFocus( h ) <> s )
+    tkHost_SetFocus( h, s )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab from thumb 1 leaves the slider", tkHost_GetFocus( h ) <> s )
+    tkSlider_SetMinDistance( s, 0 )
+    tkHost_SetFocus( h, s )
+    tkSlider_SetActiveThumb( s, 1 )
+    tkSlider_SetValues( s, 30, 60 )
+    tkTest_PushWheel( h, WX( s, tkSlider_ValueToPos( s, 80 ) ), WY( s, py ), 0, 2 )
+    tkTest_Check( "the wheel moves the active thumb", IsPair( s, 30, 62 ), Pair( s ) )
+    tkSlider_StepBy( s, -100, 1 )
+    tkTest_Check( "StepBy thumb 1, silently stopped at thumb 0", IsPair( s, 30, 30 ), Pair( s ) )
+    tkSlider_SetMode( s, TKSL_MODE_SINGLE )
+    tkSlider_StepBy( s, 5, 1 )
+    tkTest_Check( "single mode: StepBy thumb 1 is ignored, SetActiveThumb 1 too", tkSlider_GetUpperValue( s ) = 30 _
+                  andalso tkSlider_GetActiveThumb( s ) = 0 )
+    tkSlider_SetMode( s, TKSL_MODE_RANGE )
+    tkSlider_SetReadOnly( s, true )
+    tkHost_SetFocus( h, s )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "read-only still walks Tab to thumb 1", tkSlider_GetActiveThumb( s ) = 1 andalso tkHost_GetFocus( h ) = s )
+    tkSlider_SetReadOnly( s, false )
+
+    ' ---- I: paint ------------------------------------------------------------------------------
+    tkSlider_SetValues( s, 20, 70 )
+    dim as TKSLIDER_COLORS cc
+    tkSlider_GetColors( s, @cc )
+    RenderQuiet( h )
+    tkSlider_GetThumbRect( s, 0, r0 ) : tkSlider_GetThumbRect( s, 1, r1 ) : tkSlider_GetFillRect( s, rf ) : tkSlider_GetTrackRect( s, rb )
+    dim as long fy = (rf.top + rf.bottom) \ 2
+    tkTest_Check( "px: thumb 1's centre is the thumb colour", PixW( h, s, MidA( s, r1 ), (r1.top + r1.bottom) \ 2 ) = cc.ThumbColor )
+    tkTest_Check( "px: between the thumbs is the fill", PixW( h, s, tkSlider_ValueToPos( s, 45 ), fy ) = cc.FillColor, hex( PixW( h, s, tkSlider_ValueToPos( s, 45 ), fy ) ) )
+    tkTest_Check( "px: below thumb 0 is track, not fill", PixW( h, s, tkSlider_ValueToPos( s, 8 ), fy ) = cc.TrackColor, hex( PixW( h, s, tkSlider_ValueToPos( s, 8 ), fy ) ) )
+    tkTest_Check( "px: above thumb 1 is track", PixW( h, s, tkSlider_ValueToPos( s, 90 ), fy ) = cc.TrackColor )
+
+    ' ---- J: the tip follows the dragged thumb ---------------------------------------------------
+    tkSlider_SetValues( s, 20, 70 )
+    DragVal( h, s, 70, 75, py, false )
+    tkTest_Check( "tip: thumb 1's value while it drags", TipText( s ) = "75", TipText( s ) )
+    tkTest_PushButton( h, false, WX( s, tkSlider_ValueToPos( s, 75 ) ), WY( s, py ) )
+
+    ' ---- K: vertical range ------------------------------------------------------------------------
+    dim as TK_WIDGET ptr v = MakeAt( h, 302, tkHost_Scale( h, 400 ), tkHost_Scale( h, 20 ), true )
+    tkSlider_SetMode( v, TKSL_MODE_RANGE )
+    tkSlider_SetValues( v, 25, 75 )
+    tkSlider_GetThumbRect( v, 0, r0 ) : tkSlider_GetThumbRect( v, 1, r1 ) : tkSlider_GetFillRect( v, rf )
+    tkTest_Check( "vertical range: thumb 1 above thumb 0, fill between", MidA( v, r1 ) < MidA( v, r0 ) andalso rf.top = MidA( v, r1 ) _
+                  andalso rf.bottom = MidA( v, r0 ), tkRect_Str( rf ) )
+    dim as long vx = (r0.left + r0.right) \ 2
+    tkTest_PushButton( h, true, WX( v, vx ), WY( v, MidA( v, r1 ) ) )
+    tkTest_PushMotion( h, WX( v, vx ), WY( v, tkSlider_ValueToPos( v, 10 ) ) )
+    tkTest_PushButton( h, false, WX( v, vx ), WY( v, tkSlider_ValueToPos( v, 10 ) ) )
+    tkTest_Check( "vertical: thumb 1 dragged down stops on thumb 0", IsPair( v, 25, 25 ), Pair( v ) )
+
+    tkTest_Check( "no callback ever saw a value its getter disagreed with", gMismatch = 0, str( gMismatch ) )
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+if tkTest_Init() = false then end 99
+
+RunPass( 1.0 )
+RunPass( 1.75 )
+RunS1( 1.0 )
+RunS1( 1.75 )
+RunS2( 1.0 )                ' range mode is logic: one pass
+
+tkTest_Begin( "cross-pass" )
+tkTest_Check( "ideal width scales with the scale", (gIdealW(0) > 0) andalso (gIdealW(1) > gIdealW(0) * 1.6) andalso (gIdealW(1) < gIdealW(0) * 1.9), _
+              gIdealW(0) & " -> " & gIdealW(1) )
+dim as long nFail = tkTest_Report( "tkSlider" )
+tkTest_Quit()
+end nFail

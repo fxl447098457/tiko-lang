@@ -4,11 +4,6 @@ A test is a block of its own, `test "name"` … `end test`, written beside the
 code it checks. `tiko test` finds every test in a project, builds them into one
 program and runs it.
 
-````admonish warning title="Status in this version"
-`tiko test` and `test` blocks arrive after tiko 0.1.6, the toolchain this site is pinned to.
-This example was compiled and run on Windows with the development toolchain.
-````
-
 A module, `conv/conv.tiko`, in a project whose `tiko.toml` names the package
 `temps`:
 

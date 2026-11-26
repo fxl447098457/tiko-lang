@@ -1,0 +1,662 @@
+' tkRating self-test (phases R0 + R1), one check per distinct behaviour. Real windows, real SDL
+' event queue: every input claim is made by PUSHING the SDL event a user would have produced and
+' pumping the host. Two passes, scale pinned at 1.0 and at 1.75. Geometry is asserted against
+' RATING-BADGE-AVATAR-CHIP.md §4.3's formulas, the display by pixels, and events are counted.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkRating"
+#import "vendor/tkControls/tkTest"
+using tkRating
+using tkTooltip
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gChanged, gHover, gMismatch, gParentWheels
+dim shared as double gLastChanged, gLastHover
+dim shared as boolean gDestroyInChanged
+dim shared as long gIdealW(0 to 1)
+
+sub OnChanged( byval hRating as TK_WIDGET ptr, byval nValue as double )
+    gChanged += 1
+    gLastChanged = nValue
+    ' state first: the getter already answers the new value
+    if gDestroyInChanged then
+        tkWidget_Destroy( hRating )
+    elseif tkRating_GetValue( hRating ) <> nValue then
+        gMismatch += 1
+    end if
+end sub
+
+sub OnHover( byval hRating as TK_WIDGET ptr, byval nHover as double )
+    gHover += 1
+    gLastHover = nHover
+end sub
+
+' R1 helpers ------------------------------------------------------------------------------------
+dim shared as long gItemPaints, gItemMask
+dim shared as TTF_Font ptr gIcons
+
+' Draws the even items as stock, the odd ones not at all; counts calls.
+sub PaintEvenItems( byval ii as TKRATING_ITEMPAINTINFO ptr )
+    gItemPaints += 1
+    gItemMask or= (1 shl ii->nItem)
+    if (ii->nItem and 1) = 0 then tkRating_PaintItemDefault( ii )
+end sub
+
+function FmtCap( byval hRating as TK_WIDGET ptr, byval nValue as double, byval nHover as double ) as ustring
+    if nHover < 0 then return ""                       ' no preview: the Caption
+    return "preview " & nHover
+end function
+
+' A canvas that paints a widgetless rating (tkRating_PaintInto) into gCanvasRc.
+dim shared as TKRECT gCanvasRc
+dim shared as double gCanvasValue
+dim shared as TKRATING_DRAWSPEC gSpec
+function CanvasProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg <> TKM_PAINT then return false
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, w->cw, w->ch )
+    m->pPaint->SetBackColor( tkTheme_Get().Window )
+    m->pPaint->PaintRect( @rc )
+    tkRating_PaintInto( m->pPaint, gCanvasRc, gCanvasValue, 5, @gSpec )
+    return true
+end function
+
+sub ResetCounts( )
+    gChanged = 0 : gHover = 0
+end sub
+
+function ParentProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg = TKM_MOUSEWHEEL then gParentWheels += 1 : return true
+    return false
+end function
+
+sub PaintStock( byval p as TKRATING_PAINTINFO ptr )
+    tkRating_PaintDefault( p )
+end sub
+
+sub PaintNothing( byval p as TKRATING_PAINTINFO ptr )
+end sub
+
+function WX( byval w as TK_WIDGET ptr, byval x as long ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return a.left + x
+end function
+
+function WY( byval w as TK_WIDGET ptr, byval y as long ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return a.top + y
+end function
+
+function PixW( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byval x as long, byval y as long ) as ulong
+    return tkTest_PixelAt( h, WX( w, x ), WY( w, y ) )
+end function
+
+' No focus, the pointer elsewhere, then a frame in the back buffer.
+sub RenderQuiet( byval h as TK_HOST ptr )
+    tkHost_SetFocus( h, 0 )
+    tkTest_PushMotion( h, 2, 2 )
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_MOUSE_LEAVE )
+    tkHost_RenderTo( h, false )
+end sub
+
+' The star of item rect r with a pen of 1 (§4.4, StarPts): its centre and outer radius.
+sub StarOf( byref r as TKRECT, byref cx as double, byref cy as double, byref rOut as double )
+    const PI_ = 3.14159265358979
+    dim as double w = r.right - r.left, hh = r.bottom - r.top
+    dim as double kw = 2 * sin( PI_ * 72 / 180 ), kh = 1 + cos( PI_ * 36 / 180 )
+    rOut = w / kw
+    if hh / kh < rOut then rOut = hh / kh
+    rOut -= 1
+    cx = r.left + w / 2
+    cy = r.top + (hh - rOut * kh) / 2 + rOut
+end sub
+
+' A pixel well inside the star at fraction fx of its width (-0.5 .. 0.5 of R from the centre),
+' on the row 0.15 R above the centre, where the star spans +-0.73 R.
+function StarPix( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byref r as TKRECT, byval dx as double ) as ulong
+    dim as double cx, cy, rr
+    StarOf( r, cx, cy, rr )
+    return PixW( w->pHost, w, int( cx + dx * rr ), int( cy - 0.15 * rr ) )
+end function
+
+function CX( byref r as TKRECT ) as long
+    return (r.left + r.right) \ 2
+end function
+
+function CY( byref r as TKRECT ) as long
+    return (r.top + r.bottom) \ 2
+end function
+
+' Any pixel in the widget-local rect r that is not c?
+function AnyNot( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byref r as TKRECT, byval c as ulong ) as boolean
+    for y as long = r.top to r.bottom - 1
+        for x as long = r.left to r.right - 1
+            if PixW( h, w, x, y ) <> c then return true
+        next
+    next
+    return false
+end function
+
+function HashW( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byref r as TKRECT ) as ulongint
+    return tkTest_HashRect( h, WX( w, r.left ), WY( w, r.top ), r.right - r.left, r.bottom - r.top )
+end function
+
+' ==========================================================================================
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkRating selftest", 720, 480, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host created", false, *SDL_GetError() ) : exit sub
+    tkTest_Check( "scale pinned", h->fScale = fScale, "" & h->fScale )
+    gIcons = tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_ICONS, 10 )
+    dim as TK_WIDGET ptr root = tkHost_Root( h )
+
+    ' ---- A: defaults, ideal size, geometry formulas -----------------------------------------
+    dim as TK_WIDGET ptr s = tkRating_Create( root, 900 )
+    dim as long sz = tkRating_GetItemSize( s ), sp = tkRating_GetItemSpacing( s ), fg, ft, iw, ih
+    tkRating_GetFocusRing( s, fg, ft )
+    tkTest_Check( "sizes scaled at create", sz = tkHost_Scale( h, 20 ) andalso sp = tkHost_Scale( h, 4 ) andalso fg = tkHost_Scale( h, 2 ), _
+                  sz & " " & sp & " " & fg )
+    tkTest_Check( "defaults: 5 items, 0, FULL, clear, writable, hover preview, empties shown", tkRating_GetItemCount( s ) = 5 _
+                  andalso tkRating_GetValue( s ) = 0 andalso tkRating_GetPrecision( s ) = TKRATING_FULL andalso tkRating_GetAllowClear( s ) _
+                  andalso tkRating_GetReadOnly( s ) = false andalso tkRating_GetHoverPreview( s ) andalso tkRating_GetShowEmpty( s ) _
+                  andalso tkRating_GetHoverValue( s ) = -1 )
+    dim as long rp = fg + ft
+    tkRating_GetIdealSize( s, iw, ih )
+    tkTest_Check( "ideal size before sizing = 5 sz + 4 sp + 2 rp, sz + 2 rp", iw = 5 * sz + 4 * sp + 2 * rp andalso ih = sz + 2 * rp, iw & "x" & ih )
+    gIdealW(iif( fScale > 1.5, 1, 0 )) = iw
+    dim as TKRECT ri, rz, rr, rf
+    tkTest_Check( "rect queries FALSE before sizing", tkRating_GetItemRect( s, 0, ri ) = false andalso tkRect_IsEmpty( ri ) _
+                  andalso tkRating_GetRowRect( s, rr ) = false andalso tkRating_HitTest( s, 5, 5 ) = TKRATING_HIT_NONE )
+    dim as TKRATING_COLORS cc
+    tkRating_GetColors( s, @cc )
+
+    ' wider and taller than ideal: the row hugs the left ring band, centred vertically
+    dim as long cw = iw + tkHost_Scale( h, 60 ), ch = ih + tkHost_Scale( h, 11 )
+    tkWidget_SetPos( s, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), cw, ch )
+    dim as long top = rp + ((ch - 2 * rp) - sz) \ 2
+    dim as long badItem = 0, badZone = 0
+    for i as long = 0 to 4
+        tkRating_GetItemRect( s, i, ri )
+        if (ri.left <> rp + i * (sz + sp)) orelse (ri.right <> ri.left + sz) orelse (ri.top <> top) orelse (ri.bottom <> top + sz) then badItem += 1
+        tkRating_GetItemZone( s, i, rz )
+        if (rz.left > ri.left) orelse (rz.right < ri.right) then badZone += 1         ' a zone holds its item
+        if i < 4 then
+            dim as TKRECT rz2
+            tkRating_GetItemZone( s, i + 1, rz2 )
+            if rz.right <> rz2.left then badZone += 1                                 ' and they tile
+        end if
+    next
+    tkTest_Check( "items: left = rp + i (sz + sp), top centred, sz square", badItem = 0, badItem & " off" )
+    tkTest_Check( "zones hold their item and tile the row", badZone = 0, badZone & " off" )
+    tkRating_GetRowRect( s, rr )
+    tkRating_GetFocusRect( s, rf )
+    dim as TKRECT rz0, rz4
+    tkRating_GetItemZone( s, 0, rz0 ) : tkRating_GetItemZone( s, 4, rz4 )
+
+    ' ValueFromPoint, every item, every precision
+    dim as long half = int( sz / 2 - 0.5 )           ' the last column whose centre is <= the middle
+    dim as long badFull = 0, badHalf = 0, badTenth = 0, badGap = 0
+    for i as long = 0 to 4
+        tkRating_GetItemRect( s, i, ri )
+        tkRating_SetPrecision( s, TKRATING_FULL )
+        if (tkRating_ValueFromPoint( s, ri.left ) <> i + 1) orelse (tkRating_ValueFromPoint( s, ri.right - 1 ) <> i + 1) then badFull += 1
+        tkRating_SetPrecision( s, TKRATING_HALF )
+        if (tkRating_ValueFromPoint( s, ri.left ) <> i + 0.5) orelse (tkRating_ValueFromPoint( s, ri.left + half ) <> i + 0.5) _
+           orelse (tkRating_ValueFromPoint( s, ri.left + half + 1 ) <> i + 1) orelse (tkRating_ValueFromPoint( s, ri.right - 1 ) <> i + 1) then badHalf += 1
+        tkRating_SetPrecision( s, TKRATING_TENTH )
+        if (tkRating_ValueFromPoint( s, ri.left ) <> i + 0.1) orelse (tkRating_ValueFromPoint( s, ri.right - 1 ) <> i + 1) _
+           orelse (str( tkRating_ValueFromPoint( s, ri.left + sz \ 2 ) ) <> str( i + (-int( -((sz \ 2 + 0.5) / sz * 10) )) / 10 )) then badTenth += 1
+        ' the half-gap left of an item belongs to it and means "the items before it, full"
+        if i > 0 then
+            tkRating_SetPrecision( s, TKRATING_HALF )
+            if tkRating_ValueFromPoint( s, ri.left - 1 ) <> i then badGap += 1
+            if tkRating_HitTest( s, ri.left - 1, CY( ri ) ) <> i then badGap += 1
+        end if
+    next
+    tkTest_Check( "FULL: anywhere on item i -> i + 1", badFull = 0, badFull & " off" )
+    tkTest_Check( "HALF: i + 0.5 up to the middle column, then i + 1", badHalf = 0, badHalf & " off" )
+    tkTest_Check( "TENTH: i + ceil( 10 f ) / 10, first column i + 0.1, last i + 1", badTenth = 0, badTenth & " off" )
+    tkTest_Check( "a left half-gap: the items before, full; its zone's item", badGap = 0, badGap & " off" )
+    tkRating_SetPrecision( s, TKRATING_FULL )
+    tkTest_Check( "left of the row: one step; right of it: all", tkRating_ValueFromPoint( s, 0 ) = 1 andalso tkRating_ValueFromPoint( s, cw - 1 ) = 5 )
+    tkRating_GetItemRect( s, 2, ri )
+    tkTest_Check( "HitTest: an item, outside the ring band", tkRating_HitTest( s, CX( ri ), CY( ri ) ) = 2 _
+                  andalso tkRating_HitTest( s, rf.right + 2, CY( ri ) ) = TKRATING_HIT_NONE andalso tkRating_HitTest( s, CX( ri ), rf.bottom + 1 ) = TKRATING_HIT_NONE )
+
+    ' ---- B: the value model (every setter silent) ----------------------------------------------
+    ResetCounts( )
+    tkRating_SetValueChangedCallback( s, @OnChanged )
+    tkRating_SetHoverChangedCallback( s, @OnHover )
+    tkRating_SetValue( s, -3 )
+    tkRating_SetValue( s, 9 )
+    tkTest_Check( "clamped at ItemCount", tkRating_GetValue( s ) = 5 )
+    tkRating_SetValue( s, 3.7 )
+    tkTest_Check( "a FULL rating keeps a set 3.7 (Precision governs input only)", tkRating_GetValue( s ) = 3.7, str( tkRating_GetValue( s ) ) )
+    tkRating_SetValue( s, 0.1 * 3 )
+    tkTest_Check( "0.1 * 3 carries no residue", str( tkRating_GetValue( s ) ) = "0.3", str( tkRating_GetValue( s ) ) )
+    tkRating_SetValue( s, 3.7 )
+    tkRating_SetItemCount( s, 3 )
+    tkTest_Check( "SetItemCount re-clamps the value", tkRating_GetItemCount( s ) = 3 andalso tkRating_GetValue( s ) = 3 )
+    tkRating_SetItemCount( s, 0 )
+    tkRating_SetItemCount( s, 99 )
+    tkRating_SetItemCount( s, 5 )
+    tkRating_SetPrecision( s, 42 )
+    tkRating_SetPrecision( s, TKRATING_HALF ) : tkRating_SetValue( s, 2.3 ) : tkRating_SetPrecision( s, TKRATING_FULL )
+    tkTest_Check( "SetPrecision does not re-snap the value", tkRating_GetValue( s ) = 2.3 )
+    tkTest_Check( "every setter above was SILENT", gChanged = 0 andalso gHover = 0, gChanged & " / " & gHover )
+
+    ' ---- C: the exact display, by pixels ------------------------------------------------------
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 100 )
+    tkRating_SetValue( s, 2.5 )
+    RenderQuiet( h )
+    dim as TKRECT r0, r2, r3, r4
+    tkRating_GetItemRect( s, 0, r0 ) : tkRating_GetItemRect( s, 2, r2 ) : tkRating_GetItemRect( s, 3, r3 ) : tkRating_GetItemRect( s, 4, r4 )
+    dim as double scx, scy, srr
+    StarOf( r2, scx, scy, srr )
+    dim as long cut = r2.left + cint( int( 0.5 * sz + 0.5 ) ), yRow = int( scy - 0.15 * srr )
+    tkTest_Check( "2.5: the fill ends at left + round( 0.5 sz )", PixW( h, s, cut - 1, yRow ) = cc.FillColor andalso PixW( h, s, cut, yRow ) = cc.EmptyColor, _
+                  hex( PixW( h, s, cut - 1, yRow ) ) & " " & hex( PixW( h, s, cut, yRow ) ) )
+    tkRating_SetValue( s, 3.7 )
+    RenderQuiet( h )
+    StarOf( r3, scx, scy, srr )
+    cut = r3.left + cint( int( 0.7 * sz + 0.5 ) ) : yRow = int( scy - 0.15 * srr )
+    tkRating_SetShowEmpty( s, false )
+    RenderQuiet( h )
+    tkTest_Check( "ShowEmpty off: an empty item is not drawn", StarPix( h, s, r4, 0 ) = cc.BackColor andalso StarPix( h, s, r0, 0 ) = cc.FillColor )
+    tkRating_SetShowEmpty( s, true )
+    tkRating_SetEnabled( s, false )
+    RenderQuiet( h )
+    tkTest_Check( "disabled colours", StarPix( h, s, r0, 0 ) = cc.FillColorDisabled andalso StarPix( h, s, r4, 0 ) = cc.EmptyColorDisabled )
+    tkRating_SetEnabled( s, true )
+    tkHost_SetFocus( h, s )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "focused: the ring round the row", PixW( h, s, rf.left + 0, CY( rf ) ) = cc.FocusRingColor, hex( PixW( h, s, rf.left, CY( rf ) ) ) )
+
+    ' ---- D: the mouse, through the real dispatch --------------------------------------------
+    tkRating_SetValue( s, 0 )
+    ResetCounts( )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    tkTest_Check( "hover item 2: preview 3, one HoverChanged, value untouched", tkRating_GetHoverValue( s ) = 3 andalso gHover = 1 _
+                  andalso gLastHover = 3 andalso tkRating_GetValue( s ) = 0 andalso gChanged = 0 )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "the preview is drawn in the hot colours", StarPix( h, s, r0, 0 ) = cc.FillColorHot andalso StarPix( h, s, r4, 0 ) = cc.EmptyColorHot, _
+                  hex( StarPix( h, s, r0, 0 ) ) )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) + 1 ), WY( s, CY( r2 ) ) )
+    tkTest_Check( "a move inside the same value: no event", gHover = 1 )
+    tkTest_PushMotion( h, WX( s, CX( r4 ) ), WY( s, CY( r4 ) ) )
+    tkTest_PushMotion( h, WX( s, CX( r4 ) ), WY( s, rf.bottom + 2 ) )
+    tkTest_Check( "off the row (still over the control): the preview ends, -1", tkRating_GetHoverValue( s ) = -1 andalso gHover = 3 andalso gLastHover = -1 )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    ResetCounts( )
+    tkTest_Click( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    tkTest_Check( "click item 2: value 3, one ValueChanged", tkRating_GetValue( s ) = 3 andalso gChanged = 1 andalso gLastChanged = 3, _
+                  tkRating_GetValue( s ) & " " & gChanged )
+    tkTest_Check( "the click took the focus and released the capture", tkRating_GetFocused( s ) andalso tkHost_GetCapture( h ) = 0 _
+                  andalso tkRating_IsPressed( s ) = false )
+    tkTest_Check( "after the change, the preview of that value is held back", tkRating_GetHoverValue( s ) = -1 andalso gLastHover = -1, _
+                  str( tkRating_GetHoverValue( s ) ) )
+    tkTest_Check( "inside the callbacks the getter already answered", gMismatch = 0, str( gMismatch ) )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) - 1 ), WY( s, CY( r2 ) ) )
+    tkTest_PushMotion( h, WX( s, CX( r3 ) ), WY( s, CY( r3 ) ) )
+    tkTest_Check( "...until the pointer reaches another value", tkRating_GetHoverValue( s ) = 4 )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    ResetCounts( )
+    tkTest_Click( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    tkTest_Check( "click the current value: cleared to 0 (AllowClear)", tkRating_GetValue( s ) = 0 andalso gChanged = 1 andalso gLastChanged = 0 )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "...and the clear is SEEN: no preview of the value just cleared", StarPix( h, s, r0, 0 ) = cc.EmptyColor, hex( StarPix( h, s, r0, 0 ) ) )
+    tkRating_SetAllowClear( s, false )
+    tkRating_SetValue( s, 3 )
+    ResetCounts( )
+    tkTest_Click( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    tkTest_Check( "no AllowClear: the current value again changes nothing", tkRating_GetValue( s ) = 3 andalso gChanged = 0 )
+    tkRating_SetAllowClear( s, true )
+    tkRating_SetPrecision( s, TKRATING_HALF )
+    dim as TKRECT r1
+    tkRating_GetItemRect( s, 1, r1 )
+    tkTest_Click( h, WX( s, r1.left + 1 ), WY( s, CY( r1 ) ) )
+    tkTest_Check( "HALF: the left half of item 1 sets 1.5", tkRating_GetValue( s ) = 1.5, str( tkRating_GetValue( s ) ) )
+    tkRating_SetPrecision( s, TKRATING_FULL )
+    ' a press drags the preview along; the release sets
+    tkRating_SetValue( s, 1 )
+    ResetCounts( )
+    tkTest_PushButton( h, true, WX( s, CX( r0 ) ), WY( s, CY( r0 ) ) )
+    tkTest_Check( "press: the capture, a preview, no value yet", tkHost_GetCapture( h ) = s andalso tkRating_IsPressed( s ) _
+                  andalso tkRating_GetHoverValue( s ) = 1 andalso gChanged = 0 )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    tkTest_PushMotion( h, WX( s, CX( r4 ) ), WY( s, CY( r4 ) ) )
+    tkTest_Check( "drag along: the preview follows", tkRating_GetHoverValue( s ) = 5 andalso tkRating_GetValue( s ) = 1 andalso gChanged = 0 )
+    tkTest_PushButton( h, false, WX( s, CX( r4 ) ), WY( s, CY( r4 ) ) )
+    tkTest_Check( "release: 5, one ValueChanged, capture gone", tkRating_GetValue( s ) = 5 andalso gChanged = 1 andalso tkHost_GetCapture( h ) = 0 )
+    ' cancelled three ways
+    ResetCounts( )
+    tkTest_PushButton( h, true, WX( s, CX( r1 ) ), WY( s, CY( r1 ) ) )
+    tkTest_PushMotion( h, WX( s, CX( r1 ) ), WY( s, rf.bottom + tkHost_Scale( h, 30 ) ) )
+    tkTest_PushButton( h, false, WX( s, CX( r1 ) ), WY( s, rf.bottom + tkHost_Scale( h, 30 ) ) )
+    tkTest_Check( "released off the row: cancelled, capture gone", tkRating_GetValue( s ) = 5 andalso gChanged = 0 andalso tkHost_GetCapture( h ) = 0 )
+    tkTest_PushButton( h, true, WX( s, CX( r1 ) ), WY( s, CY( r1 ) ) )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "Esc while pressed: cancelled, capture gone", tkRating_IsPressed( s ) = false andalso tkHost_GetCapture( h ) = 0 _
+                  andalso tkRating_GetHoverValue( s ) = -1 )
+    tkTest_PushButton( h, false, WX( s, CX( r1 ) ), WY( s, CY( r1 ) ) )
+    tkTest_PushButton( h, true, WX( s, CX( r1 ) ), WY( s, CY( r1 ) ) )
+    tkHost_ReleaseCapture( h )
+    tkTest_Check( "a lost capture cancels the press", tkRating_IsPressed( s ) = false andalso tkRating_GetHoverValue( s ) = -1 )
+    tkTest_PushButton( h, false, WX( s, CX( r1 ) ), WY( s, CY( r1 ) ) )
+    ' HoverPreview off: the preview lives only while pressed
+    tkRating_SetHoverPreview( s, false )
+    tkTest_PushMotion( h, WX( s, CX( r0 ) ), WY( s, CY( r0 ) ) )
+    tkTest_Check( "HoverPreview off: hovering previews nothing", tkRating_GetHoverValue( s ) = -1 )
+    tkTest_PushButton( h, true, WX( s, CX( r0 ) ), WY( s, CY( r0 ) ) )
+    tkTest_PushButton( h, false, WX( s, CX( r0 ) ), WY( s, CY( r0 ) ) )
+    tkTest_Check( "...and the release sets it and ends it", tkRating_GetValue( s ) = 1 andalso tkRating_GetHoverValue( s ) = -1 )
+    tkRating_SetHoverPreview( s, true )
+    ' read-only and disabled
+    tkRating_SetReadOnly( s, true )
+    ResetCounts( )
+    tkHost_SetFocus( h, 0 )
+    tkTest_PushMotion( h, WX( s, CX( r3 ) ), WY( s, CY( r3 ) ) )
+    tkTest_Click( h, WX( s, CX( r3 ) ), WY( s, CY( r3 ) ) )
+    tkTest_Check( "read-only: no preview, no change, but the focus", tkRating_GetHoverValue( s ) = -1 andalso tkRating_GetValue( s ) = 1 _
+                  andalso gChanged = 0 andalso gHover = 0 andalso tkRating_GetFocused( s ) )
+    tkTest_PushKey( h, SDLK_END )
+    tkRating_SetReadOnly( s, false )
+    tkRating_SetEnabled( s, false )
+    tkTest_Click( h, WX( s, CX( r3 ) ), WY( s, CY( r3 ) ) )
+    tkTest_Check( "disabled: a click does nothing", tkRating_GetValue( s ) = 1 andalso gChanged = 0 )
+    tkRating_SetEnabled( s, true )
+
+    ' ---- E: the keyboard (focused) ---------------------------------------------------------------
+    tkHost_SetFocus( h, s )
+    tkTest_PushMotion( h, 2, 2 )                       ' nothing previewed
+    tkRating_SetValue( s, 0 )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_RIGHT ) : tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "Right, Up: 0 -> 1 -> 2, one event each", tkRating_GetValue( s ) = 2 andalso gChanged = 2 )
+    tkTest_PushKey( h, SDLK_END )
+    tkTest_Check( "End: ItemCount", tkRating_GetValue( s ) = 5 andalso gChanged = 3 )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "Right at the top: no event", tkRating_GetValue( s ) = 5 andalso gChanged = 3 )
+    tkTest_PushKey( h, SDLK_LEFT ) : tkTest_PushKey( h, SDLK_DOWN )
+    tkTest_PushKey( h, SDLK_HOME )
+    tkTest_Check( "Home with AllowClear: 0", tkRating_GetValue( s ) = 0 andalso gChanged = 6 )
+    tkTest_PushKey( h, SDLK_LEFT )
+    tkTest_PushKey( h, SDLK_3 )
+    tkTest_Check( "'3': 3", tkRating_GetValue( s ) = 3 andalso gChanged = 7 )
+    tkTest_PushKey( h, SDLK_1, SDL_KMOD_ALT )
+    tkTest_Check( "Alt+1 is not the rating's (an accelerator)", tkRating_GetValue( s ) = 3 andalso gChanged = 7 )
+    tkTest_PushKey( h, SDLK_KP_4 )
+    tkTest_PushKey( h, SDLK_9 )
+    tkTest_Check( "'9' with 5 items: nothing", tkRating_GetValue( s ) = 4 andalso gChanged = 8 )
+    tkTest_PushKey( h, SDLK_BACKSPACE )
+    tkTest_Check( "Backspace: cleared", tkRating_GetValue( s ) = 0 andalso gChanged = 9 )
+    tkTest_PushKey( h, SDLK_2 ) : tkTest_PushKey( h, SDLK_0 )
+    tkRating_SetAllowClear( s, false )
+    tkRating_SetValue( s, 3 )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_HOME )
+    tkTest_Check( "no AllowClear: Home = one step", tkRating_GetValue( s ) = 1 andalso gChanged = 1 )
+    tkTest_PushKey( h, SDLK_LEFT ) : tkTest_PushKey( h, SDLK_DELETE )
+    tkTest_Check( "no AllowClear: Left at one step and Delete do nothing", tkRating_GetValue( s ) = 1 andalso gChanged = 1 )
+    tkRating_SetAllowClear( s, true )
+    tkRating_SetPrecision( s, TKRATING_HALF )
+    tkRating_SetValue( s, 2.3 )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "HALF: Right from an off-grid 2.3 -> 2.5", tkRating_GetValue( s ) = 2.5, str( tkRating_GetValue( s ) ) )
+    tkRating_SetValue( s, 2.3 )
+    tkTest_PushKey( h, SDLK_LEFT )
+    tkRating_SetPrecision( s, TKRATING_TENTH )
+    tkRating_SetValue( s, 0 )
+    tkTest_PushKey( h, SDLK_RIGHT ) : tkTest_PushKey( h, SDLK_RIGHT ) : tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "TENTH: three Rights = 0.3, no residue", str( tkRating_GetValue( s ) ) = "0.3", str( tkRating_GetValue( s ) ) )
+    tkRating_SetPrecision( s, TKRATING_FULL )
+    ' a key change while the pointer previews: the new value shows
+    tkRating_SetValue( s, 1 )
+    tkTest_PushMotion( h, WX( s, CX( r3 ) ), WY( s, CY( r3 ) ) )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "a key change ends the preview (HoverChanged -1) and shows the value", tkRating_GetValue( s ) = 2 _
+                  andalso tkRating_GetHoverValue( s ) = -1 andalso gHover = 1 andalso gLastHover = -1 andalso gChanged = 1 )
+
+    ' ---- F: the wheel is never taken -------------------------------------------------------------
+    dim as TK_WIDGET ptr par = tkWidget_CreateChild( root, 0, @ParentProc, 0 )
+    tkWidget_SetPos( par, tkHost_Scale( h, 20 ), tkHost_Scale( h, 120 ), cw, ch )
+    dim as TK_WIDGET ptr s2 = tkRating_Create( par, 902 )
+    tkWidget_SetPos( s2, 0, 0, cw, ch )
+    tkRating_SetValueChangedCallback( s2, @OnChanged )
+    tkHost_SetFocus( h, s2 )
+    gParentWheels = 0
+    ResetCounts( )
+    tkTest_PushWheel( h, WX( s2, CX( r2 ) ), WY( s2, CY( r2 ) ), 0, 1 )
+    tkTest_Check( "the wheel bubbles to the parent, focused or not", gParentWheels = 1 andalso tkRating_GetValue( s2 ) = 0 andalso gChanged = 0 )
+    tkHost_SetFocus( h, s )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab is not claimed: the focus moves on, no event", tkHost_GetFocus( h ) = s2 andalso gChanged = 0 )
+
+    ' ---- G: theme, pinned, PaintDefault, shape, rescale -------------------------------------------
+    tkTheme_Apply( tkTheme_Light() )
+    tkRating_GetColors( s2, @cc )
+    tkTest_Check( "a theme change re-colours an unpinned rating", cc.FillColor = tkTheme_Light().Warning andalso cc.BackColor = tkTheme_Light().Window )
+    dim as TKRATING_COLORS pin = cc
+    pin.FillColor = tkRGB( 10, 200, 30 )
+    tkRating_SetColors( s2, @pin )
+    tkTheme_Apply( tkTheme_Dark() )
+    tkRating_GetColors( s2, @cc )
+    tkTest_Check( "a pinned rating ignores the theme", cc.FillColor = tkRGB( 10, 200, 30 ) )
+    tkRating_UnpinColors( s2 )
+    tkRating_GetColors( s2, @cc )
+    tkRating_SetValue( s2, 5 )
+    tkRating_SetPaintCallback( s2, @PaintNothing )
+    RenderQuiet( h )
+    tkRating_SetPaintCallback( s2, @PaintStock )
+    RenderQuiet( h )
+    tkTest_Check( "PaintDefault draws the stock rating", StarPix( h, s2, r0, 0 ) = cc.FillColor, hex( StarPix( h, s2, r0, 0 ) ) )
+    tkRating_SetPaintCallback( s2, 0 )
+    tkRating_SetBorderThickness( s2, 3 )
+    tkTheme_Apply( tkTheme_Dark() )
+    tkTest_Check( "...pinned: the theme leaves it", tkRating_GetBorderThickness( s2 ) = 3 )
+    h->fScaleForced = fScale * 2
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
+    dim as long fg1, ft1
+    tkRating_GetFocusRing( s2, fg1, ft1 )
+    tkTest_Check( "rescale: item size, spacing, ring gap x2; ring thickness not", tkRating_GetItemSize( s2 ) = sz * 2 _
+                  andalso tkRating_GetItemSpacing( s2 ) = sp * 2 andalso fg1 = fg * 2 andalso ft1 = 1, tkRating_GetItemSize( s2 ) & " " & fg1 )
+    h->fScaleForced = fScale
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
+
+    ' ---- I: R1 -- shapes, glyphs, presets, placeholder, caption, item tips, PaintItem, PaintInto --
+    tkRating_SetBorderThickness( s, 1 )
+    tkRating_GetColors( s, @cc )
+    tkWidget_SetPos( s, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), cw, ch )
+    tkRating_SetPaintCallback( s, 0 )
+    tkTest_Check( "default shape STAR", tkRating_GetShape( s ) = TKRATING_STAR )
+    tkRating_SetShape( s, 77 )
+    tkTest_Check( "an unknown shape is ignored", tkRating_GetShape( s ) = TKRATING_STAR )
+    dim as long badShape = 0
+    dim as string shapeWhy
+    for shp as long = TKRATING_HEART to TKRATING_DIAMOND
+        tkRating_SetShape( s, shp )
+        tkRating_SetValue( s, 5 )
+        RenderQuiet( h )
+        dim as long icx = CX( r0 ), icy = CY( r0 ) + iif( shp = TKRATING_HEART, -(sz \ 10), 0 )
+        if PixW( h, s, icx, icy ) <> cc.FillColor then badShape += 1 : shapeWhy &= " fill" & shp
+        if (PixW( h, s, r0.left, r0.top ) <> cc.BackColor) orelse (PixW( h, s, r0.right - 1, r0.bottom - 1 ) <> cc.BackColor) then badShape += 1 : shapeWhy &= " corner" & shp
+        tkRating_SetValue( s, 0 )
+        RenderQuiet( h )
+        if PixW( h, s, icx, icy ) <> cc.EmptyColor then badShape += 1 : shapeWhy &= " empty" & shp
+    next
+    tkTest_Check( "HEART, CIRCLE, DIAMOND: centre filled / empty by the value, box corners untouched", badShape = 0, shapeWhy )
+    tkRating_SetShape( s, TKRATING_HEART )
+    tkRating_SetValue( s, 5 )
+    RenderQuiet( h )
+    tkTest_Check( "HEART: a lobe filled, the notch between the lobes not", _
+                  PixW( h, s, r0.left + sz \ 4, r0.top + sz \ 4 ) = cc.FillColor andalso PixW( h, s, CX( r0 ), r0.top + sz \ 12 ) = cc.BackColor, _
+                  hex( PixW( h, s, r0.left + sz \ 4, r0.top + sz \ 4 ) ) & " " & hex( PixW( h, s, CX( r0 ), r0.top + sz \ 12 ) ) )
+    tkRating_SetShape( s, TKRATING_DIAMOND )
+    RenderQuiet( h )
+    ' GLYPH: no font -> the star; with the icon font -> the glyph, coloured by the value
+    tkRating_SetShape( s, TKRATING_GLYPH )
+    tkRating_SetGlyphs( s, wchr( TK_ICON_SETTINGS ), "" )
+    RenderQuiet( h )
+    tkTest_Check( "GLYPH with no glyph font draws the star", StarPix( h, s, r0, 0 ) = cc.FillColor )
+    dim as ulongint hStar = HashW( h, s, r0 )
+    tkRating_ApplyFonts( s, 0, gIcons )
+    RenderQuiet( h )
+    dim as ulongint hGlyph5 = HashW( h, s, r0 )
+    tkRating_SetValue( s, 0 )
+    RenderQuiet( h )
+    dim as ulongint hGlyph0 = HashW( h, s, r0 )
+    tkTest_Check( "GLYPH with the font draws the glyph (not the star), and the value recolours it", (hGlyph5 <> hStar) andalso (hGlyph0 <> hGlyph5) _
+                  andalso AnyNot( h, s, r0, cc.BackColor ) )
+    dim as ustring gf, ge
+    tkRating_GetGlyphs( s, gf, ge )
+    tkRating_SetShape( s, TKRATING_STAR )
+    tkRating_SetGlyphFont( s, 0 )
+
+    ' size presets
+    tkRating_SetSize( s, TKRATING_SIZE_LARGE )
+    tkTest_Check( "Size LARGE = 28 design units", tkRating_GetItemSize( s ) = tkHost_Scale( h, 28 ) andalso tkRating_GetSize( s ) = TKRATING_SIZE_LARGE )
+    tkRating_SetSize( s, TKRATING_SIZE_SMALL )
+    tkRating_SetSize( s, 9 )
+    tkRating_SetItemSize( s, sz )
+    tkTest_Check( "SetItemSize makes it CUSTOM", tkRating_GetSize( s ) = TKRATING_SIZE_CUSTOM andalso tkRating_GetItemSize( s ) = sz )
+
+    ' the placeholder (shown under an unset value only)
+    ResetCounts( )
+    tkRating_SetValue( s, 0 )
+    tkRating_SetPlaceholderValue( s, 3.5 )
+    RenderQuiet( h )
+    tkTest_Check( "placeholder 3.5 under 0: item 0 in the placeholder colour", StarPix( h, s, r0, 0 ) = cc.PlaceholderColor, hex( StarPix( h, s, r0, 0 ) ) )
+    tkRating_SetValue( s, 2 )
+    RenderQuiet( h )
+    tkTest_Check( "a value hides the placeholder", StarPix( h, s, r0, 0 ) = cc.FillColor andalso StarPix( h, s, r2, 0 ) = cc.EmptyColor )
+    tkRating_SetValue( s, 0 )
+    tkTest_PushMotion( h, WX( s, CX( r1 ) ), WY( s, CY( r1 ) ) )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "a preview wins over the placeholder", StarPix( h, s, r0, 0 ) = cc.FillColorHot andalso StarPix( h, s, r3, -0.4 ) = cc.EmptyColorHot )
+    tkTest_PushMotion( h, 2, 2 )
+    tkRating_SetPlaceholderValue( s, 9 )
+    tkRating_SetPlaceholderValue( s, 0 )
+
+    ' the caption
+    dim as long iw0, ih0, iw1, ih1
+    tkRating_GetIdealSize( s, iw0, ih0 )
+    dim as TKRECT rcap
+    tkRating_SetCaption( s, "Good" )
+    tkRating_GetIdealSize( s, iw1, ih1 )
+    dim as long gap = tkRating_GetCaptionGap( s )
+    tkTest_Check( "ideal width + gap + the caption's width", iw1 = iw0 + gap + tkText_Width( h->pDefaultFont, "Good" ), iw0 & " -> " & iw1 )
+    tkTest_Check( "caption rect: ring right + gap .. client right", tkRating_GetCaptionRect( s, rcap ) andalso rcap.left = rf.right + gap _
+                  andalso rcap.right = cw andalso rcap.top = 0 andalso rcap.bottom = ch, tkRect_Str( rcap ) )
+    tkTest_Check( "HitTest on the caption", tkRating_HitTest( s, CX( rcap ), CY( rcap ) ) = TKRATING_HIT_CAPTION )
+    RenderQuiet( h )
+    tkTest_Check( "the caption is painted (ink in its rect)", AnyNot( h, s, rcap, cc.BackColor ) )
+    ResetCounts( )
+    tkTest_Click( h, WX( s, CX( rcap ) ), WY( s, CY( rcap ) ) )
+    tkTest_Check( "a click on the caption sets nothing", gChanged = 0 andalso tkRating_GetValue( s ) = 0 )
+    tkRating_SetFormatCaptionCallback( s, @FmtCap )
+    tkTest_Check( "FormatCaption "" falls back to Caption", tkRating_GetCaptionText( s ) = "Good" )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    tkTest_Check( "FormatCaption follows the preview", tkRating_GetCaptionText( s ) = "preview 3", tkRating_GetCaptionText( s ) )
+    tkTest_PushMotion( h, 2, 2 )
+    tkRating_SetFormatCaptionCallback( s, 0 )
+    tkRating_SetCaption( s, "" )
+
+    ' item tooltips: the tip's tool follows the item under the pointer
+    tkRating_SetTooltipText( s, "Rate it" )
+    tkRating_SetItemTooltip( s, 2, "Good" )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    tkTest_Check( "over item 2: its own tip", tkRating_GetTipItem( s ) = 2 andalso tkRating_GetTipText( s ) = "Good", tkRating_GetTipItem( s ) & " " & tkRating_GetTipText( s ) )
+    tkTest_PushMotion( h, WX( s, CX( r0 ) ), WY( s, CY( r0 ) ) )
+    tkTest_PushMotion( h, WX( s, CX( r0 ) ), WY( s, rf.bottom + 2 ) )
+    tkTest_Check( "off the row: tool -1, the rating's tip", tkRating_GetTipItem( s ) = -1 andalso tkRating_GetTipText( s ) = "Rate it" )
+    tkTest_PushMotion( h, 2, 2 )
+
+    ' PaintItem: per item, PaintItemDefault draws the stock one
+    tkRating_SetValue( s, 5 )
+    tkRating_SetPaintItemCallback( s, @PaintEvenItems )
+    RenderQuiet( h )
+    gItemPaints = 0 : gItemMask = 0
+    tkHost_RenderTo( h, false )                        ' exactly one frame
+    tkTest_Check( "PaintItemDefault draws the stock item; a skipped one is blank", StarPix( h, s, r0, 0 ) = cc.FillColor andalso StarPix( h, s, r1, 0 ) = cc.BackColor _
+                  andalso StarPix( h, s, r2, 0 ) = cc.FillColor )
+    tkRating_SetPaintItemCallback( s, 0 )
+
+    ' the widgetless rating
+    dim as TK_WIDGET ptr cv = tkWidget_CreateChild( root, 0, @CanvasProc, 0 )
+    tkWidget_SetPos( cv, tkHost_Scale( h, 20 ), tkHost_Scale( h, 300 ), tkHost_Scale( h, 300 ), tkHost_Scale( h, 40 ) )
+    dim as TKRATING_DRAWSPEC spec0
+    gSpec = spec0
+    gSpec.nItemSize = tkHost_Scale( h, 16 ) : gSpec.nSpacing = tkHost_Scale( h, 2 )
+    dim as long mw, mh
+    tkRating_MeasureSpec( 5, @gSpec, mw, mh )
+    tkTest_Check( "MeasureSpec: 5 size + 4 spacing", mw = 5 * gSpec.nItemSize + 4 * gSpec.nSpacing andalso mh = gSpec.nItemSize, mw & "x" & mh )
+    tkRating_MeasureSpec( 5, @spec0, mw, mh )
+    tkRect_Set( gCanvasRc, tkHost_Scale( h, 4 ), 0, tkHost_Scale( h, 4 ) + 5 * gSpec.nItemSize + 4 * gSpec.nSpacing, tkHost_Scale( h, 40 ) )
+    gCanvasValue = 3.5
+    tkHost_RenderTo( h, false )
+    dim as TKRATING_COLORS ct = tkRating_ThemeColors( tkTheme_Get() )
+    dim as TKRECT q0, q3, q4
+    dim as long qs = gSpec.nItemSize, qp = gSpec.nSpacing, qt = (tkHost_Scale( h, 40 ) - qs) \ 2
+    tkRect_Set( q0, gCanvasRc.left, qt, gCanvasRc.left + qs, qt + qs )
+    q3 = q0 : tkRect_Offset( q3, 3 * (qs + qp), 0 )
+    q4 = q0 : tkRect_Offset( q4, 4 * (qs + qp), 0 )
+    tkTest_Check( "PaintInto 3.5: item 3 half, item 4 empty", StarPix( h, cv, q3, -0.4 ) = ct.FillColor andalso StarPix( h, cv, q3, 0.4 ) = ct.EmptyColor _
+                  andalso StarPix( h, cv, q4, 0 ) = ct.EmptyColor )
+    gCanvasRc.right = q3.right                         ' a rect that ends after item 3
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "PaintInto clips to its rect", StarPix( h, cv, q4, 0 ) = tkTheme_Get().Window andalso StarPix( h, cv, q0, 0 ) = ct.FillColor )
+    gCanvasRc.right = q4.right
+    gSpec.bEnabled = false
+    tkHost_RenderTo( h, false )
+    gSpec.bEnabled = true
+    dim as TKRATING_COLORS cus = ct
+    cus.FillColor = tkRGB( 200, 40, 40 )
+    gSpec.pColors = @cus
+    gSpec.nShape = TKRATING_CIRCLE
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "PaintInto with its own colours and shape", PixW( h, cv, CX( q0 ), CY( q0 ) ) = cus.FillColor _
+                  andalso PixW( h, cv, q0.left, q0.top ) = tkTheme_Get().Window )
+    gSpec.pColors = 0
+    tkWidget_Destroy( cv )
+
+    ' ---- H: a callback that destroys the rating -----------------------------------------------------
+    tkHost_SetFocus( h, s2 )
+    tkRating_SetValue( s2, 2 )
+    ResetCounts( )
+    gDestroyInChanged = true
+    tkTest_PushKey( h, SDLK_RIGHT )
+    gDestroyInChanged = false
+    tkTest_Check( "a key's ValueChanged destroyed the rating: nothing crashed", gChanged = 1 andalso gLastChanged = 3 andalso tkHost_GetFocus( h ) <> s2 )
+    tkRating_SetValue( s, 0 )
+    tkTest_PushMotion( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    ResetCounts( )
+    gDestroyInChanged = true
+    tkTest_Click( h, WX( s, CX( r2 ) ), WY( s, CY( r2 ) ) )
+    gDestroyInChanged = false
+    tkTest_Check( "a click's ValueChanged destroyed the rating: nothing crashed", gChanged = 1 andalso gLastChanged = 3 )
+
+    tkHost_Destroy( h )
+end sub
+
+
+' ==========================================================================================
+if tkTest_Init() = false then end 99
+
+RunPass( 1.0 )
+RunPass( 1.75 )
+
+tkTest_Begin( "cross-pass" )
+tkTest_Check( "ideal width scales with the scale", (gIdealW(0) > 0) andalso (gIdealW(1) > gIdealW(0) * 1.6) andalso (gIdealW(1) < gIdealW(0) * 1.9), _
+              gIdealW(0) & " -> " & gIdealW(1) )
+dim as long nFail = tkTest_Report( "tkRating" )
+tkTest_Quit()
+end nFail

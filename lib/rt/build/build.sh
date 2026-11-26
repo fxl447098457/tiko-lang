@@ -1,7 +1,7 @@
 #!/bin/sh
 # build.sh -- build tiko-rt's archives with tiko.
 #
-#   build/build.sh [Debug|Release|RelWithDebInfo] [target ...]
+#   build/build.sh [Debug|Release|RelWithDebInfo|MinSizeRel] [target ...]
 #
 #   build/build.sh                       Debug, all three targets, st and mt
 #   build/build.sh Release win64         Release, win64 only
@@ -11,6 +11,11 @@
 #           lib/<target>/libfbmt.a (ENABLE_MT)
 # and on linux-x86_64 also
 #           lib/<target>/libfbpic.a, libfbmtpic.a   (the same, position-independent)
+#
+# MinSizeRel WRITES THE SIZE RUNTIME BESIDE THEM, not over them: libfb-s.a, libfbmt-s.a
+# (and libfbpic-s.a, libfbmtpic-s.a), every member at '-Os'. The driver links that set
+# under '-Os' when it is there (LinkExe), so a toolchain ships both. fbrt0.o is shared
+# and comes from the other configurations; MinSizeRel leaves it alone.
 #
 # THE PIC PAIR IS WHAT A LINUX SHARED LIBRARY LINKS. fbc ships both and names them
 # on its '-dll' line ('-lfbpic', measured with 'fbc -dll -v'), and tiko's driver
@@ -73,7 +78,9 @@ RT_SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 RT_JOBS=${TKORT_JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 
 CFG=${1:-Debug}
-FLAGS=$(rt_cfg_flags "$CFG") || rt_die "unknown configuration '$CFG' (Debug|Release|RelWithDebInfo)"
+FLAGS=$(rt_cfg_flags "$CFG") || rt_die "unknown configuration '$CFG' (Debug|Release|RelWithDebInfo|MinSizeRel)"
+# THE ARCHIVES' SUFFIX: '-s' for the size runtime, which lives beside the plain one.
+case "$CFG" in MinSizeRel) RT_SFX="-s" ;; *) RT_SFX="" ;; esac
 # THE C OBJECTS' DEBUG INFO FOLLOWS THE CONFIGURATION, and names no build directory. Every
 # Release libfb.a object carried its -cc1 line -- the worktree's path, the MSVC and SDK
 # versions -- because -g was passed in every configuration (review BLD-05). The prefix map
@@ -81,6 +88,11 @@ FLAGS=$(rt_cfg_flags "$CFG") || rt_die "unknown configuration '$CFG' (Debug|Rele
 case "$CFG" in
     Release|MinSizeRel) CDBG="" ;;
     *)                  CDBG="-g" ;;
+esac
+# THE C MEMBERS' LEVEL: -O2, or -Os in MinSizeRel as the tiko members get '-Os'.
+case "$CFG" in
+    MinSizeRel) COPT="-Os" ;;
+    *)          COPT="-O2" ;;
 esac
 CMAP="-ffile-prefix-map=$RT_ROOT=lib/rt"
 # ...in both spellings on Windows: clang is handed the source as C:/..., not /c/...
@@ -101,11 +113,12 @@ SOURCES=$(rt_sources)
 thread_vars( ) {
     picdef=""; cpic=""
     case $thread in
-        st)    archive=libfb.a;      mtdef="" ;;
-        mt)    archive=libfbmt.a;    mtdef="-d ENABLE_MT" ;;
-        stpic) archive=libfbpic.a;   mtdef="";             picdef="-pic"; cpic="-fPIC" ;;
-        mtpic) archive=libfbmtpic.a; mtdef="-d ENABLE_MT"; picdef="-pic"; cpic="-fPIC" ;;
+        st)    archive=libfb;      mtdef="" ;;
+        mt)    archive=libfbmt;    mtdef="-d ENABLE_MT" ;;
+        stpic) archive=libfbpic;   mtdef="";             picdef="-pic"; cpic="-fPIC" ;;
+        mtpic) archive=libfbmtpic; mtdef="-d ENABLE_MT"; picdef="-pic"; cpic="-fPIC" ;;
     esac
+    archive="$archive$RT_SFX.a"
 
     objdir="$RT_ROOT/obj/$target/$CFG/$thread"
     libdir="$RT_ROOT/lib/$target"
@@ -282,13 +295,13 @@ build_one( ) {
     # own C written against a documented signature, not a transliteration of a
     # body (PROVENANCE.md), and reaching for fb.h is how the second kind starts.
     #
-    # -O2 EVEN IN Debug. These are primitives -- an atomic wrapper compiled at -O0
+    # -O2 EVEN IN Debug ($COPT; -Os in MinSizeRel). These are primitives -- an atomic wrapper compiled at -O0
     # is a call around a call -- and there is no tiko-rt source to step through in
     # them. -g (CDBG) is passed outside Release so a backtrace names the file.
     for csrc in $(ls "$RT_ROOT"/src/c/*.c 2>/dev/null); do
         # fbrt0.c IS A LOOSE OBJECT, never a member: nothing refers to it by name, so
         # an archive search would never pull it in. build_rt0 installs it.
-        case $(basename "$csrc") in fbrt0.c) continue ;; esac
+        case $(basename "$csrc") in fbrt0.c|fbrtapp.c) continue ;; esac
         cobj="$objdir/$(basename "$csrc" .c).o"
         ctgt=$(rt_clang_triple "$target")
         [ -n "$ctgt" ] || ctgt=$(rt_target_triple "$target")
@@ -304,8 +317,14 @@ build_one( ) {
         # does not, so atomic.c came out as calls in the VM and as LL/SC here. Pinned to LL/SC:
         # it runs on every ARMv8, needs no helper library, and the cross-built runtime and the
         # native one are then the same code.
-        case "$target" in linux-arm64) cabi="-mno-outline-atomics" ;; esac
-        if ! "$CLANG" --target="$ctgt" -O2 $CDBG $CMAP -std=c99 -Wall -Wextra $cabi $cpic \
+        case "$target" in linux-arm64|android-arm64) cabi="-mno-outline-atomics" ;; esac
+        # ONE SECTION PER FUNCTION AND PER DATUM, as the FreeBASIC members already get
+        # (CompileIrArgs_). Without them a member is one .text, and once anything pulls it
+        # in, the link keeps every function in it -- msvccrt.o's 90 symbols reached a
+        # program that needs 13 of them (a user's size report, 2026-11-25). Roots the
+        # linker honours stay: the entry, /INCLUDE, .CRT$X* / .init_array by name.
+        if ! "$CLANG" --target="$ctgt" $COPT $CDBG $CMAP -std=c99 -Wall -Wextra $cabi $cpic \
+                -ffunction-sections -fdata-sections \
                 -c "$csrc" -o "$cobj"; then
             rt_die "$target/$thread: $(basename "$csrc") failed to compile"
         fi
@@ -360,7 +379,7 @@ build_one( ) {
     #
     # Sixth stale-artefact incident, same shape as the five above. The stamp lets
     # a reader of the archive CHECK rather than assume.
-    echo "$CFG" > "$libdir/.config"
+    echo "$CFG" > "$libdir/.config$RT_SFX"
 
     echo "build: $target/$archive [$CFG] -- $(echo $objs | wc -w) objects, $n text symbols"
 }
@@ -383,12 +402,19 @@ build_rt0( ) {
         -c "$RT_ROOT/src/c/fbrt0.c" -o "$_dir/fbrt0.o" \
         || rt_die "$_t: fbrt0.c failed to compile"
     case $_t in
-        linux-*)
+        linux-*|android-*)
             "$CLANG" --target="$_tri" -O2 $CDBG $CMAP -std=c99 -Wall -Wextra -fPIC \
                 -c "$RT_ROOT/src/c/fbrt0.c" -o "$_dir/fbrt0pic.o" \
                 || rt_die "$_t: fbrt0.c (pic) failed to compile" ;;
     esac
-    echo "build: $_t/fbrt0.o$(case $_t in linux-*) echo ' + fbrt0pic.o' ;; esac)"
+    echo "build: $_t/fbrt0.o$(case $_t in linux-*|android-*) echo ' + fbrt0pic.o' ;; esac)"
+    # AN ANDROID APP'S ENTRY, fbrtapp.o (src/c/fbrtapp.c): loose like fbrt0, named by the driver
+    # on a 'tiko -app' link only, which is always a shared libmain.so -- so PIC alone.
+    case $_t in
+        android-*)
+            "$CLANG" --target="$_tri" -O2 $CDBG $CMAP -std=c99 -Wall -Wextra -fPIC                 -c "$RT_ROOT/src/c/fbrtapp.c" -o "$_dir/fbrtapp.o"                 || rt_die "$_t: fbrtapp.c failed to compile"
+            echo "build: $_t/fbrtapp.o" ;;
+    esac
 }
 
 echo "build: tiko-rt [$CFG] with $TKORT_TIKO ($RT_JOBS jobs)"
@@ -396,9 +422,9 @@ for target in $TARGETS; do
     build_one "$target" st
     build_one "$target" mt
     case $target in
-        linux-*) build_one "$target" stpic
+        linux-*|android-*) build_one "$target" stpic
                  build_one "$target" mtpic ;;
     esac
-    build_rt0 "$target"
+    [ -n "$RT_SFX" ] || build_rt0 "$target"
 done
 echo "build: ok"

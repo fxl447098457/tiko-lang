@@ -1,0 +1,164 @@
+' tkReportBarcode self-test (BARCODE.md BC4): barcodes in tkReport bands. The item's opts both ways;
+' a report run before the painter is installed (a frame, no bars); then installed: every bar where
+' tkBarcode_PageGeometry puts it, a row the symbology refuses, an integer field, a SQLite source.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkReportBarcode"
+#import "vendor/tkControls/tkReportSqlite"
+#import "vendor/sqlite3"
+using tkTest
+using tkReportBarcode
+using tkReportSqlite
+using tkReport
+using tkBarcode
+using tkBind
+using tkPrint
+using tkHost
+using tkPaint
+
+function RF( byval l as single, byval t as single, byval r as single, byval b as single ) as TKRECTF
+    dim as TKRECTF rc
+    tkRectF_Set( rc, l, t, r, b )
+    return rc
+end function
+
+' Black filled rects (bars) and frames on page 0 inside the vertical band [y1, y2).
+sub CountOps( byval doc as TK_PRINTDOC ptr, byval y1 as single, byval y2 as single, byref nBars as int32, _
+              byref nFrames as int32, byref xFirst as single )
+    nBars = 0 : nFrames = 0 : xFirst = -1
+    for i as int32 = 0 to tkPrintDoc_GetOpCount( doc, 0 ) - 1
+        dim as TKPRINT_OPINFO oi
+        tkPrintDoc_GetOp( doc, 0, i, oi )
+        dim as single y = iif( oi.op = TKREC_FILLRECT, oi.y, oi.y0 )
+        if (y < y1) orelse (y >= y2) then continue for
+        if (oi.op = TKREC_FILLRECT) andalso ( ( oi.c and &h00FFFFFFul ) = 0 ) then
+            if nBars = 0 then xFirst = oi.x
+            nBars += 1
+        elseif (oi.op = TKREC_STROKE) andalso ( ( oi.c and &h00FFFFFFul ) = &h00E06C75ul ) then
+            nFrames += 1
+        end if
+    next
+end sub
+
+' A three-row product table: name, SKU (an EAN-13; the third's check digit is wrong), id.
+function Products( ) as TK_REPORT ptr
+    dim as TK_REPORT ptr r = tkReport_Create( "products" )
+    dim as TKPAGESETUP ps
+    ps.paper = TK_PAPER_A4
+    tkReport_SetPageSetup( r, ps )
+    tkReport_TableAddField( r, "Name" ) : tkReport_TableAddField( r, "Sku" ) : tkReport_TableAddField( r, "Id" )
+    dim as ustring names(0 to 2) = { "Widget", "Gadget", "Broken" }
+    dim as ustring skus(0 to 2) = { "5901234123457", "0012345678905", "5901234123458" }
+    for i as int32 = 0 to 2
+        dim as integer row = tkReport_TableAddRow( r )
+        tkReport_TableCell( r, row, 0 )->SetText( names(i) )
+        tkReport_TableCell( r, row, 1 )->SetText( skus(i) )
+        tkReport_TableCell( r, row, 2 )->SetInt( 1001 + i )
+    next
+    dim as TK_RBAND ptr d = tkReport_GetBand( r, TKRB_DETAIL )
+    tkRBand_SetHeight( d, 100 )
+    tkRBand_AddField( d, RF( 0, 0, 120, 14 ), 0 )
+    dim as TKBARCODE_SPEC ean
+    ean.nSymbology = TKBC_EAN13
+    dim as TKBARCODE_PAGELOOK pl
+    pl.nAlign = TKBC_ALIGN_LEFT
+    tkRBand_AddBarcode( d, RF( 130, 0, 330, 90 ), 1, ean, @pl )
+    dim as TKBARCODE_SPEC qr
+    qr.nSymbology = TKBC_QR
+    tkRBand_AddBarcode( d, RF( 360, 0, 460, 90 ), 2, qr )
+    return r
+end function
+
+sub Checks( )
+    tkTest_Begin( "reports" )
+    ' ---- opts both ways ------------------------------------------------------------------------
+    dim as TKBARCODE_SPEC s
+    s.nSymbology = TKBC_QR : s.opts(TKBC_OPT_ECC) = 3 : s.wszCaption = "a;b=c%" : s.bQuietZone = false
+    dim as TKBARCODE_PAGELOOK pl
+    pl.fXdimMm = 0.5 : pl.nAlign = TKBC_ALIGN_RIGHT : pl.fDpi = 203
+    dim as ustring o = tkReportBarcode_SpecToOpts( s, pl )
+    dim as TKBARCODE_SPEC s2
+    dim as TKBARCODE_PAGELOOK p2
+    dim as boolean ok = tkReportBarcode_OptsToSpec( o, s2, p2 )
+    tkTest_Check( "opts round-trip: symbology, ECC, quiet zone, an escaped caption, X, align, dpi", ok andalso s2.nSymbology = TKBC_QR _
+                  andalso s2.opts(TKBC_OPT_ECC) = 3 andalso s2.wszCaption = "a;b=c%" andalso s2.bQuietZone = false _
+                  andalso abs( p2.fXdimMm - 0.5 ) < 0.0001 andalso p2.nAlign = TKBC_ALIGN_RIGHT andalso p2.fDpi = 203, o )
+    tkTest_Check( "opts: an unknown symbology or key is refused", tkReportBarcode_OptsToSpec( "sym=Nope", s2, p2 ) = false _
+                  andalso tkReportBarcode_OptsToSpec( "sym=QR;colour=red", s2, p2 ) = false )
+
+    ' ---- before Install: a frame per barcode, no bars ---------------------------------------------
+    dim as TK_REPORT ptr r = Products( )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( r )
+    dim as int32 nb, nf
+    dim as single xf
+    CountOps( doc, 0, 2000, nb, nf, xf )
+    tkTest_Check( "not installed: each barcode item a red frame, no bar", nb = 0 andalso nf = 6, nb & " bars, " & nf & " frames" )
+    tkPrintDoc_Destroy( doc )
+
+    ' ---- installed --------------------------------------------------------------------------------
+    tkReportBarcode_Install( )
+    doc = tkReport_Run( r )
+    dim as TKPAGESETUP ps = tkPrintDoc_GetPageSetup( doc )
+    dim as single top = ps.marginT, x0 = ps.marginL
+    ' what tkBarcode makes of row 0's SKU in the item's rect
+    dim as TKBARCODE_SPEC ean
+    ean.nSymbology = TKBC_EAN13
+    dim as TKBARCODE_SYMBOL y0
+    tkBarcode_Encode( ean, "5901234123457", y0 )
+    dim as TKBARCODE_PAGELOOK plL
+    plL.nAlign = TKBC_ALIGN_LEFT
+    dim as TKBC_PAGEGEOM g
+    tkBarcode_PageGeometry( y0, ean, plL, RF( x0 + 130, top, x0 + 330, top + 90 ), g )
+    dim as TKBARCODE_SPEC qr
+    qr.nSymbology = TKBC_QR
+    dim as TKBARCODE_SYMBOL yq
+    tkBarcode_Encode( qr, "1001", yq )
+    CountOps( doc, top, top + 100, nb, nf, xf )
+    tkTest_Check( "row 1: the EAN-13's 30 bars and the id's QR runs, the first bar where PageGeometry puts it", _
+                  nb = y0.nRects + yq.nRects andalso abs( xf - ( g.x + y0.rects(0).x * g.xdim ) ) < 0.001 andalso nf = 0, _
+                  nb & " bars (" & y0.nRects & "+" & yq.nRects & "), x " & xf & " vs " & ( g.x + y0.rects(0).x * g.xdim ) )
+    dim as TKBARCODE_SYMBOL y1
+    tkBarcode_Encode( ean, "0012345678905", y1 )
+    dim as TKBARCODE_SYMBOL yq2
+    tkBarcode_Encode( qr, "1002", yq2 )
+    CountOps( doc, top + 100, top + 200, nb, nf, xf )
+    tkTest_Check( "row 2: its own symbols (a leading-zero SKU, the int field 1002 as text)", nb = y1.nRects + yq2.nRects andalso nf = 0, nb & " bars" )
+    dim as TKBARCODE_SYMBOL yq3
+    tkBarcode_Encode( qr, "1003", yq3 )
+    CountOps( doc, top + 200, top + 300, nb, nf, xf )
+    tkTest_Check( "row 3, a wrong check digit: the EAN's error frame, the QR still drawn, the report goes on", nb = yq3.nRects andalso nf = 1, nb & " bars, " & nf & " frames" )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( r )
+
+    ' ---- a SQLite source -----------------------------------------------------------------------------
+    dim as sqlite3 ptr db3
+    sqlite3_open( ":memory:", @db3 )
+    sqlite3_exec( db3, "create table p( name text, sku text ); insert into p values ('a', '9638507'), ('b', '96385074');", 0, 0, 0 )
+    dim as TK_REPORT ptr sr = tkReport_Create( "sql" )
+    dim as boolean opened = tkReportSqlite_Open( sr, db3, "select name, sku from p order by name" )
+    dim as TK_RBAND ptr sb = tkReport_GetBand( sr, TKRB_DETAIL )
+    tkRBand_SetHeight( sb, 80 )
+    dim as TKBARCODE_SPEC e8
+    e8.nSymbology = TKBC_EAN8
+    tkRBand_AddBarcode( sb, RF( 0, 0, 200, 70 ), tkReport_FindField( sr, "sku" ), e8 )
+    doc = tkReport_Run( sr )
+    dim as TKBARCODE_SYMBOL ya
+    tkBarcode_Encode( e8, "9638507", ya )
+    ps = tkPrintDoc_GetPageSetup( doc )
+    dim as int32 nb2, nf2
+    CountOps( doc, ps.marginT, ps.marginT + 80, nb, nf, xf )
+    CountOps( doc, ps.marginT + 80, ps.marginT + 160, nb2, nf2, xf )
+    tkTest_Check( "SQLite: a field found by name, a barcode per row (7 digits + check, 8 digits with it)", opened andalso nb = ya.nRects _
+                  andalso nb2 = ya.nRects andalso nf = 0 andalso nf2 = 0, nb & " / " & nb2 )
+    tkPrintDoc_Destroy( doc )
+    tkReportSqlite_Close( sr )
+    tkReport_Destroy( sr )
+    sqlite3_close( db3 )
+end sub
+
+if tkTest_Init() = false then end 99
+Checks( )
+dim as long nFail = tkTest_Report( "tkReportBarcode" )
+tkTest_Quit()
+end nFail

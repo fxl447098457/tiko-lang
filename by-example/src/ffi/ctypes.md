@@ -57,7 +57,7 @@ works on Windows, where the two agree, and loses the top half of every value
 on Linux and macOS. Nothing complains.
 ```
 
-`__FB_WIN32__`, `__FB_LINUX__` and `__FB_DARWIN__` are defined on their platforms, for the rare
+`TIKO_OS_WINDOWS`, `TIKO_OS_LINUX` and `TIKO_OS_MACOS` are defined on their platforms, for the rare
 declaration that must differ.
 
 ### Activities

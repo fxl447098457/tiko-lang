@@ -1,0 +1,179 @@
+' tkMatch perf gate A0-P (docs/tkControls/AUTOCOMPLETE.md section 4): per keystroke over 100 000
+' items, a full filter (no narrowing: the worst case) and a narrowed one, per mode; the fold paid at
+' add time; the sorted prefix range. Build with --profile release. Prints one line per measurement
+' (the median of REPS runs, in ms) and a PASS / FAIL per gate; exits with the number of gates failed.
+' THE GATES (author, 2026-11-22, A0-RESULTS.md): a full filter <= 10 ms (PREFIX, WORDPREFIX,
+' CONTAINS); EVERY keystroke, full or narrowed, <= 16 ms (one 60 Hz frame; this is FUZZY's full
+' gate); a narrowed keystroke never slower than the full filter of the same keystroke (within
+' NOISE_PCT + NOISE_MS: a narrowing that keeps every item costs the candidate list on top).
+' The first gate set had "narrowed <= 2 ms", which assumed a narrowed set is small; after one
+' common letter it is most of the source, and a ranked filter scores every candidate.
+' The items are SYNTHETIC (no word list ships with the tree): pseudo-words from syllables, and
+' "First Last" names from 60 x 60 name parts with a number.
+#import "vendor/tkControls/tkMatch"
+using tkMatch
+
+const REPS = 15
+const NITEMS = 100000
+const FRAME_MS = 16.0
+const NOISE_PCT = 10
+const NOISE_MS = 0.05
+
+dim shared as ulong gSeed = 777
+private function Next_( byval n as long ) as long
+    gSeed = gSeed * 1664525ul + 1013904223ul
+    return clng( (gSeed shr 8) mod culng( n ) )
+end function
+
+private function Median_( t() as double ) as double
+    dim as long n = ubound( t ) + 1
+    for i as long = 1 to n - 1
+        dim as double v = t(i)
+        dim as long j = i
+        while (j > 0) andalso (t(j - 1) > v)
+            t(j) = t(j - 1)
+            j -= 1
+        wend
+        t(j) = v
+    next
+    return t(n \ 2)
+end function
+
+dim shared as long gFailed
+
+private function Ms_( byval ms as double ) as string
+    dim as longint us = int( ms * 1000 + 0.5 )
+    dim as string f = str( us mod 1000 )
+    return str( us \ 1000 ) & "." & string( 3 - len( f ), "0" ) & f
+end function
+
+private sub Gate_( byref what as const string, byval ms as double, byval limit as double )
+    dim as string verdict = iif( ms <= limit, "PASS", "FAIL" )
+    if ms > limit then gFailed += 1
+    print "  " & verdict & "  " & what & ": " & Ms_( ms ) & " ms (gate " & limit & " ms)"
+end sub
+
+private sub Info_( byref what as const string, byval ms as double )
+    print "        " & what & ": " & Ms_( ms ) & " ms"
+end sub
+
+private sub Run_( byref title as const string, texts() as ustring, keys() as ustring, typed() as ustring )
+    print title
+    dim as long noCand(), m(), mPrev()
+    dim as TKMATCH_HIT h()
+    dim as TKMATCH_WORK w
+    dim as double t( 0 to REPS - 1 )
+    dim as string names_( 0 to 3 ) = { "PREFIX", "WORDPREFIX", "CONTAINS", "FUZZY" }
+    for mode as long = TKMATCH_PREFIX to TKMATCH_FUZZY
+        dim as double worstFull = 0, worstNarrow = 0, worstExcess = -1e9
+        dim as long nAtWorst = 0
+        dim as string slowerAt = ""           ' keystroke numbers (1 = the first letter)
+        for k as long = lbound( typed ) to ubound( typed )
+            dim as TKMATCH_QUERY q, qPrev
+            tkMatch_Prepare( q, mode, typed(k) )
+            dim as long nm
+            ' full: every item
+            for r as long = 0 to REPS - 1
+                dim as double t0 = timer( )
+                nm = tkMatch_Filter( q, texts(), keys(), noCand(), -1, m(), h(), 100, false, @w )
+                t(r) = (timer( ) - t0) * 1000
+            next
+            dim as double full = Median_( t() )
+            if full > worstFull then
+                worstFull = full
+                nAtWorst = nm             ' the slowest keystroke's count: may differ by host
+            end if
+            ' narrowed: the previous keystroke's matched set
+            if k > lbound( typed ) then
+                tkMatch_Prepare( qPrev, mode, typed(k - 1) )
+                tkMatch_Filter( qPrev, texts(), keys(), noCand(), -1, mPrev(), h(), 100, false, @w )
+                for r as long = 0 to REPS - 1
+                    dim as double t0 = timer( )
+                    tkMatch_Filter( q, texts(), keys(), mPrev(), ubound( mPrev ) + 1, m(), h(), 100, false, @w )
+                    t(r) = (timer( ) - t0) * 1000
+                next
+                dim as double nar = Median_( t() )
+                if nar > worstNarrow then worstNarrow = nar
+                ' how far narrowed exceeds full plus the noise allowance (> 0 = slower)
+                dim as double excess = nar - (full * (1 + NOISE_PCT / 100) + NOISE_MS)
+                if excess > worstExcess then worstExcess = excess
+                if excess > 0 then slowerAt &= "#" & (k - lbound( typed ) + 1) & " "
+            end if
+        next
+        dim as double limitFull = iif( mode = TKMATCH_FUZZY, FRAME_MS, 10.0 )
+        Gate_( names_(mode) & " full filter, worst keystroke (" & nAtWorst & " matched)", worstFull, limitFull )
+        Gate_( names_(mode) & " narrowed, worst keystroke", worstNarrow, FRAME_MS )
+        dim as boolean ok = len( slowerAt ) = 0
+        if ok = false then gFailed += 1
+        print "  " & iif( ok, "PASS", "FAIL" ) & "  " & names_(mode) & " narrowed never slower than full" & _
+              iif( ok, "", " -- slower at " & slowerAt ) & " (worst margin " & Ms_( -worstExcess ) & " ms)"
+    next
+end sub
+
+' ---- the data --------------------------------------------------------------------------------
+dim as string syl( 0 to 19 ) = { "ka", "lo", "mi", "ne", "ru", "sa", "to", "vi", "ste", "con", _
+                                 "pre", "tion", "al", "or", "in", "er", "an", "ble", "ment", "ing" }
+dim as string firsts( 0 to 11 ) = { "Anna", "Bruno", "Clara", "David", "Elena", "Frank", "Greta", "Hugo", "Irene", "Jonas", "Karin", "Steven" }
+dim as string lasts( 0 to 11 ) = { "Smith", "Jones", "Müller", "García", "Rossi", "Nowak", "Dubois", "Kowalski", "Stevens", "Andersson", "Ivanova", "Okafor" }
+
+' dynamic: four static 100 000-element ustring arrays in the main body are ~10 MB of stack
+dim as ustring words(), wkeys(), people(), pkeys(), sk()
+redim words( 0 to NITEMS - 1 ) : redim wkeys( 0 to NITEMS - 1 )
+redim people( 0 to NITEMS - 1 ) : redim pkeys( 0 to NITEMS - 1 )
+for i as long = 0 to NITEMS - 1
+    dim as string s = ""
+    for k as long = 1 to 2 + Next_( 3 )
+        s &= syl(Next_( 20 ))
+    next
+    words(i) = s
+    people(i) = firsts(Next_( 12 )) & syl(Next_( 20 )) & " " & lasts(Next_( 12 )) & syl(Next_( 20 )) & " " & str( Next_( 1000 ) )
+next
+
+print "tkMatch A0-P, " & NITEMS & " items per set, median of " & REPS
+dim as double tf( 0 to REPS - 1 )
+for r as long = 0 to REPS - 1
+    dim as double t0 = timer( )
+    for i as long = 0 to NITEMS - 1
+        wkeys(i) = tkMatch_Fold( words(i) )
+    next
+    tf(r) = (timer( ) - t0) * 1000
+next
+Info_( "fold " & NITEMS & " words (paid once, at add time)", Median_( tf() ) )
+for i as long = 0 to NITEMS - 1
+    pkeys(i) = tkMatch_Fold( people(i) )
+next
+
+dim as ustring typedW( 0 to 3 ) = { "c", "co", "con", "cons" }
+dim as ustring typedP( 0 to 4 ) = { "s", "st", "ste", "stev", "steve" }
+Run_( "words", words(), wkeys(), typedW() )
+Run_( "names", people(), pkeys(), typedP() )
+
+' sorted prefix: sort the word keys once, then the range
+redim sk( 0 to NITEMS - 1 )
+for i as long = 0 to NITEMS - 1
+    sk(i) = wkeys(i)
+next
+dim as long gap = NITEMS \ 2
+while gap > 0
+    for i as long = gap to NITEMS - 1
+        dim as ustring v = sk(i)
+        dim as long j = i
+        while (j >= gap) andalso (tkMatch_Compare( sk(j - gap), v ) > 0)
+            sk(j) = sk(j - gap)
+            j -= gap
+        wend
+        sk(j) = v
+    next
+    gap \= 2
+wend
+dim as long f, l, cnt
+for r as long = 0 to REPS - 1
+    dim as double t0 = timer( )
+    for k as long = 1 to 1000
+        cnt = tkMatch_PrefixRange( "cons", sk(), f, l )
+    next
+    tf(r) = (timer( ) - t0) * 1000 / 1000
+next
+Info_( "sorted prefix range 'cons' (" & cnt & " keys), per query", Median_( tf() ) )
+print "gates failed: " & gFailed
+end gFailed

@@ -1,0 +1,604 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPdf -- a tkPrint document as a PDF 1.7 file. Design: docs/tkControls/PRINTING.md (claude-docs)
+' §4.4 and §13 R2.
+'
+' Every page's display list is written as a content stream, op for op: outlines as paths (filled,
+' stroked, dashed), rects, gradients as axial shadings, images as image XObjects (with a soft
+' mask for alpha), clips as q / re W n / Q, links as Link annotations.
+'
+' TEXT is real text: each font file is embedded whole as a Type 0 font (CIDFontType2, Identity-H,
+' glyph ids as character codes, CIDToGIDMap /Identity) with a /W array for the glyphs used and a
+' ToUnicode CMap, so it can be searched and copied. A run is placed at its recorded origin and
+' baseline and fitted to its recorded width with Tz (95-105%): the screen measured it, and the PDF
+' viewer must not drift from that. Three kinds of run are drawn otherwise:
+'   * an icon font's glyphs (Private Use Area characters) as filled paths from the glyph outlines;
+'   * scripts that need shaping (Arabic, Hebrew, Indic, Thai, ...) as an image of SDL_ttf's own
+'     rendering at 300 dpi (decision P-4) -- with a warning;
+'   * a font that may not be embedded (OS/2 fsType restricted), a CFF font or a face of a
+'     collection: an image too, with a warning.
+#module "tkPdf"
+
+#import "../tkPrint" public
+using tkPrint
+using tkHost
+using tkPaint
+
+public type TKPDF_OPTIONS
+    bCompress as boolean = true        ' FlateDecode every stream
+    author    as ustring
+    subject   as ustring
+end type
+
+const PDF_RASTER_DPI = 300.0
+
+type PDF_W
+    doc      as TK_PRINTDOC ptr
+    o        as PDF_BUF
+    offs(any) as long
+    nObj     as long
+    bZip     as boolean
+    fontOf(any) as PDF_TTF ptr         ' per doc font (0: not loaded yet)
+    imgId(any) as long                 ' per doc image: its XObject (0: not used)
+    xImg(any) as SDL_Surface ptr       ' images made here (text drawn as an image)
+    xImgId(any) as long
+    nX       as long
+    gsUsed(0 to 255) as boolean        ' alpha ExtGStates
+    shades   as string                 ' /ShN << ... >> entries
+    nShade   as long
+    resId    as long
+end type
+
+private function NewId( byref w as PDF_W ) as long
+    w.nObj += 1
+    if w.nObj > ubound( w.offs ) then redim preserve w.offs( 0 to w.nObj * 2 + 31 )
+    return w.nObj
+end function
+
+private sub BeginObj( byref w as PDF_W, byval id as long )
+    w.offs(id) = w.o.n
+    w.o.AddStr( id & " 0 obj" & chr( 10 ) )
+end sub
+
+private sub WriteObj( byref w as PDF_W, byval id as long, byref body as string )
+    BeginObj( w, id )
+    w.o.AddStr( body & chr( 10 ) & "endobj" & chr( 10 ) )
+end sub
+
+' A stream object: dict entries (without << >>), then the data, deflated when asked.
+private sub WriteStream( byref w as PDF_W, byval id as long, byref dict as string, byval p as const ubyte ptr, _
+                         byval n as integer, byval bZip as boolean )
+    BeginObj( w, id )
+    if bZip andalso (n > 0) then
+        dim as PDF_BUF z
+        tkPdf_Deflate( p, n, z )
+        w.o.AddStr( "<< " & dict & " /Length " & z.n & " /Filter /FlateDecode >>" & chr( 10 ) & "stream" & chr( 10 ) )
+        w.o.AddBytes( @z.b(0), z.n )
+    else
+        w.o.AddStr( "<< " & dict & " /Length " & n & " >>" & chr( 10 ) & "stream" & chr( 10 ) )
+        w.o.AddBytes( p, n )
+    end if
+    w.o.AddStr( chr( 10 ) & "endstream" & chr( 10 ) & "endobj" & chr( 10 ) )
+end sub
+
+private sub WriteStreamStr( byref w as PDF_W, byval id as long, byref dict as string, byref s as string, byval bZip as boolean )
+    WriteStream( w, id, dict, cast( const ubyte ptr, strptr( s ) ), len( s ), bZip )
+end sub
+
+' ---- small helpers ---------------------------------------------------------------------------
+private function Rgb3( byval c as ulong ) as string
+    return PdfNum( ((c shr 16) and 255) / 255 ) & " " & PdfNum( ((c shr 8) and 255) / 255 ) & " " & PdfNum( (c and 255) / 255 )
+end function
+
+private function Hex4( byval v as ulong ) as string
+    return right( "0000" & hex( v ), 4 )
+end function
+
+' The next code point of a UTF-8 string from byte i (1-based), i advanced. Bad bytes are U+FFFD.
+private function NextCp( byref s as string, byref i as long ) as ulong
+    dim as ulong c = s[i - 1]
+    i += 1
+    if c < &h80 then return c
+    dim as long more = 0
+    if (c and &hE0) = &hC0 then
+        c and= &h1F : more = 1
+    elseif (c and &hF0) = &hE0 then
+        c and= &h0F : more = 2
+    elseif (c and &hF8) = &hF0 then
+        c and= &h07 : more = 3
+    else
+        return &hFFFD
+    end if
+    for k as long = 1 to more
+        if (i > len( s )) orelse ((s[i - 1] and &hC0) <> &h80) then return &hFFFD
+        c = (c shl 6) or (s[i - 1] and &h3F)
+        i += 1
+    next
+    return c
+end function
+
+' A PDF text string (Info entries): UTF-16BE with a BOM, in hex.
+private function TextStr( byref u8 as string ) as string
+    dim as string r = "<FEFF"
+    dim as long i = 1
+    while i <= len( u8 )
+        dim as ulong cp = NextCp( u8, i )
+        if cp >= &h10000 then
+            cp -= &h10000
+            r &= Hex4( &hD800 + (cp shr 10) ) & Hex4( &hDC00 + (cp and &h3FF) )
+        else
+            r &= Hex4( cp )
+        end if
+    wend
+    return r & ">"
+end function
+
+' A literal string for a URI: printable ASCII kept (\ ( ) escaped), the rest as \ddd octal.
+private function LitStr( byref u8 as string ) as string
+    dim as string r = "("
+    for i as long = 0 to len( u8 ) - 1
+        dim as ubyte c = u8[i]
+        if (c = 40) orelse (c = 41) orelse (c = 92) then
+            r &= "\" & chr( c )
+        elseif (c < 32) orelse (c > 126) then
+            r &= "\" & right( "00" & oct( c ), 3 )
+        else
+            r &= chr( c )
+        end if
+    next
+    return r & ")"
+end function
+
+' Characters whose text needs shaping (joining, reordering) that this writer does not do.
+private function NeedsShaping( byval cp as ulong ) as boolean
+    return ((cp >= &h0590) andalso (cp <= &h08FF)) orelse ((cp >= &h0900) andalso (cp <= &h0DFF)) _
+        orelse ((cp >= &h0E00) andalso (cp <= &h0FFF)) orelse ((cp >= &h1000) andalso (cp <= &h109F)) _
+        orelse ((cp >= &h1780) andalso (cp <= &h17FF)) orelse ((cp >= &hFB1D) andalso (cp <= &hFDFF)) _
+        orelse ((cp >= &hFE70) andalso (cp <= &hFEFF))
+end function
+
+private function IsIconCp( byval cp as ulong ) as boolean
+    return ((cp >= &hE000) andalso (cp <= &hF8FF)) orelse (cp >= &hF0000)
+end function
+
+' The doc font fi, read on first use. 0 when its bytes cannot be had.
+private function FontOf( byref w as PDF_W, byval fi as long ) as PDF_TTF ptr
+    if (fi < 0) orelse (fi >= w.doc->nFonts) then return 0
+    if fi > ubound( w.fontOf ) then redim preserve w.fontOf( 0 to w.doc->nFonts - 1 )
+    if w.fontOf(fi) then return w.fontOf(fi)
+    dim as PDF_TTF ptr f = new PDF_TTF
+    f->path = w.doc->fonts(fi).path : f->face = w.doc->fonts(fi).face : f->style = w.doc->fonts(fi).style
+    dim as const any ptr pd
+    dim as integer nd
+    dim as boolean owned
+    if tkHost_FontBytes( f->path, pd, nd, owned ) then
+        f->pData = pd : f->nData = nd : f->bOwned = owned
+        PdfTtf_Parse( f )
+    end if
+    f->resName = "F" & fi
+    w.fontOf(fi) = f
+    return f
+end function
+
+private function AlphaGs( byref w as PDF_W, byval a as long ) as string
+    w.gsUsed(a) = true
+    return "/GA" & a & " gs" & chr( 10 )
+end function
+
+' ---- the content of one page ---------------------------------------------------------------
+type PDF_PAGECTX
+    s        as string
+    h        as single                ' page height: y flips
+    curA     as long = 255            ' the alpha ExtGState in force
+    clipOpen as boolean
+end type
+
+private sub SetAlpha( byref w as PDF_W, byref c as PDF_PAGECTX, byval a as long )
+    if a = c.curA then exit sub
+    c.s &= AlphaGs( w, a )
+    c.curA = a
+end sub
+
+private function PtY( byref c as PDF_PAGECTX, byval y as single ) as string
+    return PdfNum( c.h - y )
+end function
+
+private sub PathPts( byref c as PDF_PAGECTX, byval pp as PR_PAGE ptr, byref q as PR_OP, byval bClose as boolean )
+    for k as long = 0 to q.n - 1
+        c.s &= PdfNum( pp->pts(q.i0 + k).x ) & " " & PtY( c, pp->pts(q.i0 + k).y ) & iif( k = 0, " m", " l" ) & chr( 10 )
+    next
+    if bClose then c.s &= "h" & chr( 10 )
+end sub
+
+' A gradient (op's gx0..gc1) as a shading resource; its name.
+private function Shading( byref w as PDF_W, byref c as PDF_PAGECTX, byref q as PR_OP ) as string
+    dim as string nm = "Sh" & w.nShade
+    w.nShade += 1
+    w.shades &= "/" & nm & " << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [" & PdfNum( q.gx0 ) & " " & PtY( c, q.gy0 ) & " " _
+              & PdfNum( q.gx1 ) & " " & PtY( c, q.gy1 ) & "] /Function << /FunctionType 2 /Domain [0 1] /C0 [" & Rgb3( q.gc0 ) _
+              & "] /C1 [" & Rgb3( q.gc1 ) & "] /N 1 >> /Extend [true true] >>" & chr( 10 )
+    return nm
+end function
+
+' An image placed at (x, y) top-left, w x h points.
+private sub PlaceImage( byref c as PDF_PAGECTX, byref nm as string, byval x as single, byval y as single, _
+                        byval iw as single, byval ih as single )
+    c.s &= "q " & PdfNum( iw ) & " 0 0 " & PdfNum( ih ) & " " & PdfNum( x ) & " " & PtY( c, y + ih ) & " cm /" & nm & " Do Q" & chr( 10 )
+end sub
+
+' A run drawn as an image of SDL_ttf's rendering (shaping, or a font that cannot be embedded).
+private sub TextAsImage( byref w as PDF_W, byref c as PDF_PAGECTX, byval f as PDF_TTF ptr, byref q as PR_OP, byref u8 as string )
+    dim as TTF_Font ptr tf = tkHost_OpenFontFace( f->path, 12, f->face )
+    if tf = 0 then exit sub
+    TTF_SetFontSizeDPI( tf, q.size * PDF_RASTER_DPI / 72, 72, 72 )
+    if f->style then TTF_SetFontStyle( tf, f->style )
+    dim as SDL_Color white
+    white.r = 255 : white.g = 255 : white.b = 255 : white.a = 255
+    dim as SDL_Surface ptr s0 = TTF_RenderText_Blended( tf, strptr( u8 ), len( u8 ), white )
+    tkHost_CloseFont( tf )
+    if s0 = 0 then exit sub
+    dim as SDL_Surface ptr s = SDL_ConvertSurface( s0, SDL_PIXELFORMAT_ARGB8888 )
+    SDL_DestroySurface( s0 )
+    if s = 0 then exit sub
+    ' the run's colour, the rendering's coverage times the colour's alpha
+    dim as ulong rgb_ = q.c and &hFFFFFFul, ca = (q.c shr 24) and 255
+    for y as long = 0 to s->h - 1
+        dim as ulong ptr row = cast( ulong ptr, cast( ubyte ptr, s->pixels ) + y * s->pitch )
+        for x as long = 0 to s->w - 1
+            dim as ulong a = ((row[x] shr 24) and 255) * ca \ 255
+            row[x] = (a shl 24) or rgb_
+        next
+    next
+    if w.nX > ubound( w.xImg ) then
+        redim preserve w.xImg( 0 to w.nX * 2 + 7 )
+        redim preserve w.xImgId( 0 to w.nX * 2 + 7 )
+    end if
+    w.xImg(w.nX) = s
+    w.xImgId(w.nX) = NewId( w )
+    dim as single k = 72 / PDF_RASTER_DPI
+    SetAlpha( w, c, 255 )
+    PlaceImage( c, "Tx" & w.nX, q.x, q.y, s->w * k, s->h * k )
+    w.nX += 1
+end sub
+
+' A run of text: real text, icon paths, or an image.
+private sub TextRun( byref w as PDF_W, byref c as PDF_PAGECTX, byval fi as long, byval size as single, byval x as single, _
+                     byval top as single, byval ascPt as single, byval tw as single, byval clr as ulong, byref u8 as string )
+    dim as PDF_TTF ptr f = FontOf( w, fi )
+    if (f = 0) orelse (f->bOk = false) then
+        tkPrintDoc_Warn( w.doc, "text in a font that could not be read was left out of the PDF" )
+        exit sub
+    end if
+    dim as boolean icon = false, shape = false
+    dim as long i = 1
+    while i <= len( u8 )
+        dim as ulong cp = NextCp( u8, i )
+        if IsIconCp( cp ) then icon = true
+        if NeedsShaping( cp ) then shape = true
+    wend
+    dim as PR_OP q
+    q.x = x : q.y = top : q.size = size : q.c = clr
+    if shape orelse f->bCff orelse f->bNoEmbed orelse (f->dirOff <> 0) then
+        if shape then
+            tkPrintDoc_Warn( w.doc, "text that needs shaping (Arabic, Hebrew, Indic ...) is an image in the PDF" )
+        else
+            tkPrintDoc_Warn( w.doc, "a font that cannot be embedded (CFF, collection, or restricted) is an image in the PDF: " & f->path )
+        end if
+        TextAsImage( w, c, f, q, u8 )
+        exit sub
+    end if
+    dim as double sc = size / f->upem
+    dim as double baseY = c.h - (top + ascPt)
+    SetAlpha( w, c, (clr shr 24) and 255 )
+    c.s &= Rgb3( clr ) & " rg" & chr( 10 )
+    if icon then
+        ' glyph outlines, filled: an icon font is not embedded for a handful of glyphs
+        dim as double pen = x
+        i = 1
+        while i <= len( u8 )
+            dim as long g = PdfTtf_Glyph( f, NextCp( u8, i ) )
+            dim as TTF_XF t
+            t.a = sc : t.d = sc : t.e = pen : t.f = baseY
+            PdfTtf_Outline( f, g, t, c.s )
+            pen += PdfTtf_Advance( f, g ) * sc
+        wend
+        c.s &= "f" & chr( 10 )
+        exit sub
+    end if
+    dim as string codes
+    dim as double natural = 0
+    i = 1
+    while i <= len( u8 )
+        dim as ulong cp = NextCp( u8, i )
+        dim as long g = PdfTtf_Glyph( f, cp )
+        f->used(g) = 1
+        if f->uni(g) = 0 then f->uni(g) = cp
+        codes &= Hex4( g )
+        natural += PdfTtf_Advance( f, g ) * sc
+    wend
+    dim as double tz = 100
+    if (natural > 0) andalso (tw > 0) then
+        tz = 100 * tw / natural
+        if (tz < 95) orelse (tz > 105) then tz = 100
+    end if
+    dim as string tm = "1 0 0 1 "
+    if f->style and TTF_STYLE_ITALIC then tm = "1 0 0.2126 1 "
+    c.s &= "BT /" & f->resName & " " & PdfNum( size ) & " Tf " & PdfNum( tz ) & " Tz " & tm & PdfNum( x ) & " " & PdfNum( baseY ) & " Tm"
+    if f->style and TTF_STYLE_BOLD then
+        c.s &= " 2 Tr " & PdfNum( size * 0.03 ) & " w " & Rgb3( clr ) & " RG"
+    else
+        c.s &= " 0 Tr"
+    end if
+    c.s &= " <" & codes & "> Tj ET" & chr( 10 )
+end sub
+
+private sub PageContent( byref w as PDF_W, byval page as long, byref c as PDF_PAGECTX, byref annots as string )
+    dim as TK_PRINTDOC ptr doc = w.doc
+    dim as PR_PAGE ptr pp = doc->pages(page)
+    c.h = pp->hPt
+    for i as long = 0 to pp->nOps - 1
+        dim byref as PR_OP q = pp->ops(i)
+        select case q.op
+        case TKREC_FILLPOLY
+            if q.bGrad then
+                dim as string nm = Shading( w, c, q )
+                SetAlpha( w, c, 255 )
+                c.s &= "q" & chr( 10 )
+                PathPts( c, pp, q, true )
+                c.s &= "W n /" & nm & " sh Q" & chr( 10 )
+            else
+                SetAlpha( w, c, (q.c shr 24) and 255 )
+                c.s &= Rgb3( q.c ) & " rg" & chr( 10 )
+                PathPts( c, pp, q, true )
+                c.s &= "f" & chr( 10 )
+            end if
+        case TKREC_STROKE, TKREC_STROKEOPEN
+            SetAlpha( w, c, (q.c shr 24) and 255 )
+            c.s &= Rgb3( q.c ) & " RG " & PdfNum( q.w ) & " w "
+            if q.op = TKREC_STROKE then
+                c.s &= "0 J 0 j [] 0 d" & chr( 10 )
+            else
+                c.s &= iif( q.bRound, "1 J 1 j ", "0 J 0 j " )
+                dim as single u = iif( q.w < 1, 1, q.w )
+                select case q.nDash
+                case TK_PENDASH_DASH : c.s &= "[" & PdfNum( 4 * u ) & " " & PdfNum( 3 * u ) & "] 0 d" & chr( 10 )
+                case TK_PENDASH_DOT : c.s &= "[" & PdfNum( u ) & " " & PdfNum( 2.5 * u ) & "] 0 d" & chr( 10 )
+                case TK_PENDASH_DASHDOT : c.s &= "[" & PdfNum( 4 * u ) & " " & PdfNum( 2.5 * u ) & " " & PdfNum( u ) & " " & PdfNum( 2.5 * u ) & "] 0 d" & chr( 10 )
+                case else : c.s &= "[] 0 d" & chr( 10 )
+                end select
+            end if
+            PathPts( c, pp, q, q.op = TKREC_STROKE )
+            c.s &= "S" & chr( 10 )
+        case TKREC_FILLRECT
+            SetAlpha( w, c, (q.c shr 24) and 255 )
+            c.s &= Rgb3( q.c ) & " rg " & PdfNum( q.x ) & " " & PtY( c, q.y + q.ch ) & " " & PdfNum( q.cw ) & " " & PdfNum( q.ch ) & " re f" & chr( 10 )
+        case TKREC_GRADRECT
+            dim as string nm = Shading( w, c, q )
+            SetAlpha( w, c, 255 )
+            c.s &= "q " & PdfNum( q.x ) & " " & PtY( c, q.y + q.ch ) & " " & PdfNum( q.cw ) & " " & PdfNum( q.ch ) & " re W n /" & nm & " sh Q" & chr( 10 )
+        case TKREC_CLIP
+            if c.clipOpen then c.s &= "Q" & chr( 10 ) : c.clipOpen = false : c.curA = 255
+            if q.n > 0 then
+                c.s &= "q " & PdfNum( q.x ) & " " & PtY( c, q.y + q.ch ) & " " & PdfNum( q.cw ) & " " & PdfNum( q.ch ) & " re W n" & chr( 10 )
+                c.clipOpen = true
+            end if
+        case TKREC_TEXT
+            TextRun( w, c, q.font, q.size, q.x, q.y, q.asc, q.tw, q.c, pp->strs(q.i0) )
+        case PR_LATE
+            dim as PDF_TTF ptr f = FontOf( w, q.font )
+            if (f = 0) orelse (f->bOk = false) then continue for
+            dim as string u8 = PrLateText( pp->strs(q.i0), page, doc->nPages, doc )
+            dim as double sc = q.size / f->upem, tw = 0, lh = (f->ascender - f->descender) * sc
+            dim as long k = 1
+            while k <= len( u8 )
+                tw += PdfTtf_Advance( f, PdfTtf_Glyph( f, NextCp( u8, k ) ) ) * sc
+            wend
+            dim as single x = q.x, top = q.y + (q.ch - lh) / 2
+            select case q.flags and 3
+            case TK_DT_CENTER : x = q.x + (q.cw - tw) / 2
+            case TK_DT_RIGHT : x = q.x + q.cw - tw
+            end select
+            if q.flags and TK_DT_TOP then top = q.y
+            if q.flags and TK_DT_BOTTOM then top = q.y + q.ch - lh
+            TextRun( w, c, q.font, q.size, x, top, iif( q.asc > 0, q.asc, f->ascender * sc ), tw, q.c, u8 )
+        case TKREC_IMAGE
+            if (q.img < 0) orelse (q.img >= doc->nImgs) then continue for
+            if q.img > ubound( w.imgId ) then redim preserve w.imgId( 0 to doc->nImgs - 1 )
+            if w.imgId(q.img) = 0 then w.imgId(q.img) = NewId( w )
+            SetAlpha( w, c, 255 )
+            PlaceImage( c, "Im" & q.img, q.x, q.y, q.cw, q.ch )
+        case PR_LINK
+            dim as string r = "/Rect [" & PdfNum( q.x ) & " " & PtY( c, q.y + q.ch ) & " " & PdfNum( q.x + q.cw ) & " " & PtY( c, q.y ) & "]"
+            if q.n >= 0 then
+                if q.n < doc->nPages then
+                    dim as PR_PAGE ptr tp = doc->pages(q.n)
+                    annots &= "<< /Type /Annot /Subtype /Link " & r & " /Border [0 0 0] /Dest [" & (5 + q.n) & " 0 R /XYZ 0 " _
+                            & PdfNum( tp->hPt - q.gy0 ) & " null] >>" & chr( 10 )
+                end if
+            else
+                annots &= "<< /Type /Annot /Subtype /Link " & r & " /Border [0 0 0] /A << /S /URI /URI " & LitStr( pp->strs(q.i0) ) & " >> >>" & chr( 10 )
+            end if
+        end select
+    next
+    if c.clipOpen then c.s &= "Q" & chr( 10 )
+end sub
+
+' ---- fonts and images at the end -------------------------------------------------------------
+private sub WriteFont( byref w as PDF_W, byval f as PDF_TTF ptr )
+    dim as long idCid = NewId( w ), idDesc = NewId( w ), idFile = NewId( w ), idUni = NewId( w )
+    dim as string nm = f->psName
+    if len( nm ) = 0 then nm = "TkFont" & f->objId
+    if f->style then nm &= "-S" & f->style
+    dim as double k = 1000 / f->upem
+    ' widths and the ToUnicode map, for the glyphs used
+    dim as string wArr, bf
+    dim as long nbf = 0
+    dim as string blocks
+    for g as long = 0 to f->numGlyphs - 1
+        if f->used(g) = 0 then continue for
+        wArr &= g & " [" & clng( PdfTtf_Advance( f, g ) * k ) & "] "
+        dim as ulong cp = f->uni(g)
+        dim as string u
+        if cp >= &h10000 then
+            u = Hex4( &hD800 + ((cp - &h10000) shr 10) ) & Hex4( &hDC00 + ((cp - &h10000) and &h3FF) )
+        else
+            u = Hex4( cp )
+        end if
+        bf &= "<" & Hex4( g ) & "> <" & u & ">" & chr( 10 )
+        nbf += 1
+        if nbf = 100 then
+            blocks &= "100 beginbfchar" & chr( 10 ) & bf & "endbfchar" & chr( 10 )
+            bf = "" : nbf = 0
+        end if
+    next
+    if nbf then blocks &= nbf & " beginbfchar" & chr( 10 ) & bf & "endbfchar" & chr( 10 )
+    WriteObj( w, f->objId, "<< /Type /Font /Subtype /Type0 /BaseFont /" & nm & " /Encoding /Identity-H /DescendantFonts [" _
+              & idCid & " 0 R] /ToUnicode " & idUni & " 0 R >>" )
+    WriteObj( w, idCid, "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /" & nm _
+              & " /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor " & idDesc _
+              & " 0 R /DW 1000 /W [" & wArr & "] /CIDToGIDMap /Identity >>" )
+    WriteObj( w, idDesc, "<< /Type /FontDescriptor /FontName /" & nm & " /Flags 4 /FontBBox [" & clng( f->xMin * k ) & " " _
+              & clng( f->yMin * k ) & " " & clng( f->xMax * k ) & " " & clng( f->yMax * k ) & "] /ItalicAngle 0 /Ascent " _
+              & clng( f->ascender * k ) & " /Descent " & clng( f->descender * k ) & " /CapHeight " & clng( f->ascender * k ) _
+              & " /StemV 80 /FontFile2 " & idFile & " 0 R >>" )
+    WriteStream( w, idFile, "/Length1 " & f->nData, f->pData, f->nData, w.bZip )
+    dim as string cm = "/CIDInit /ProcSet findresource begin" & chr( 10 ) & "12 dict begin" & chr( 10 ) & "begincmap" & chr( 10 ) _
+        & "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def" & chr( 10 ) _
+        & "/CMapName /Adobe-Identity-UCS def" & chr( 10 ) & "/CMapType 2 def" & chr( 10 ) _
+        & "1 begincodespacerange" & chr( 10 ) & "<0000> <FFFF>" & chr( 10 ) & "endcodespacerange" & chr( 10 ) & blocks _
+        & "endcmap" & chr( 10 ) & "CMapName currentdict /CMap defineresource pop" & chr( 10 ) & "end" & chr( 10 ) & "end" & chr( 10 )
+    WriteStreamStr( w, idUni, "", cm, w.bZip )
+end sub
+
+' An ARGB8888 surface as an RGB image XObject, with a soft mask when any pixel is not opaque.
+private sub WriteImage( byref w as PDF_W, byval id as long, byval s as SDL_Surface ptr )
+    dim as SDL_Surface ptr c = SDL_ConvertSurface( s, SDL_PIXELFORMAT_ARGB8888 )
+    if c = 0 then WriteObj( w, id, "<< >>" ) : exit sub
+    dim as long iw = c->w, ih = c->h
+    dim as ubyte rgb_( 0 to iw * ih * 3 - 1 ), alp( 0 to iw * ih - 1 )
+    dim as boolean anyA = false
+    for y as long = 0 to ih - 1
+        dim as ulong ptr row = cast( ulong ptr, cast( ubyte ptr, c->pixels ) + y * c->pitch )
+        for x as long = 0 to iw - 1
+            dim as ulong px = row[x]
+            dim as long k = y * iw + x
+            rgb_(k * 3) = (px shr 16) and 255 : rgb_(k * 3 + 1) = (px shr 8) and 255 : rgb_(k * 3 + 2) = px and 255
+            alp(k) = (px shr 24) and 255
+            if alp(k) <> 255 then anyA = true
+        next
+    next
+    SDL_DestroySurface( c )
+    dim as string dict = "/Type /XObject /Subtype /Image /Width " & iw & " /Height " & ih & " /ColorSpace /DeviceRGB /BitsPerComponent 8"
+    if anyA then
+        dim as long idM = NewId( w )
+        dict &= " /SMask " & idM & " 0 R"
+        WriteStream( w, id, dict, @rgb_(0), iw * ih * 3, true )
+        WriteStream( w, idM, "/Type /XObject /Subtype /Image /Width " & iw & " /Height " & ih & " /ColorSpace /DeviceGray /BitsPerComponent 8", _
+                     @alp(0), iw * ih, true )
+    else
+        WriteStream( w, id, dict, @rgb_(0), iw * ih * 3, true )
+    end if
+end sub
+
+' ---- the file --------------------------------------------------------------------------------
+' The whole PDF into outBuf. FALSE for no document / no pages.
+public function tkPdf_Write( byval doc as TK_PRINTDOC ptr, byref outBuf as PDF_BUF, byval pOpts as TKPDF_OPTIONS ptr = 0 ) as boolean
+    if (doc = 0) orelse (doc->nPages = 0) then return false
+    dim as TKPDF_OPTIONS opts
+    if pOpts then opts = *pOpts
+    dim as PDF_W w
+    w.doc = doc
+    w.bZip = opts.bCompress
+    redim w.fontOf( 0 to iif( doc->nFonts > 0, doc->nFonts - 1, 0 ) )
+    redim w.imgId( 0 to iif( doc->nImgs > 0, doc->nImgs - 1, 0 ) )
+    w.o.AddStr( "%PDF-1.7" & chr( 10 ) & "%" & chr( 226 ) & chr( 227 ) & chr( 207 ) & chr( 211 ) & chr( 10 ) )
+    ' 1 catalog, 2 pages, 3 info, 4 resources, 5.. pages (so a link can name any page's object)
+    for k as long = 1 to 4 : NewId( w ) : next
+    w.resId = 4
+    for p as long = 0 to doc->nPages - 1 : NewId( w ) : next
+    dim as string kids
+    for p as long = 0 to doc->nPages - 1
+        dim as PDF_PAGECTX c
+        dim as string annots
+        PageContent( w, p, c, annots )
+        dim as long idC = NewId( w )
+        WriteStreamStr( w, idC, "", c.s, w.bZip )
+        dim as string ann
+        if len( annots ) then
+            dim as long idA = NewId( w )
+            WriteObj( w, idA, "[" & chr( 10 ) & annots & "]" )
+            ann = " /Annots " & idA & " 0 R"
+        end if
+        dim as PR_PAGE ptr pp = doc->pages(p)
+        WriteObj( w, 5 + p, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " & PdfNum( pp->wPt ) & " " & PdfNum( pp->hPt ) _
+                  & "] /Resources 4 0 R /Contents " & idC & " 0 R" & ann & " >>" )
+        kids &= (5 + p) & " 0 R "
+    next
+    ' fonts (now that their glyphs are known), images, the resources that name them
+    dim as string fontRes, xRes, gsRes
+    for fi as long = 0 to ubound( w.fontOf )
+        dim as PDF_TTF ptr f = w.fontOf(fi)
+        if f = 0 then continue for
+        dim as boolean any_ = false
+        for g as long = 0 to f->numGlyphs - 1
+            if f->used(g) then any_ = true : exit for
+        next
+        if any_ then
+            f->objId = NewId( w )
+            WriteFont( w, f )
+            fontRes &= "/" & f->resName & " " & f->objId & " 0 R "
+        end if
+    next
+    for ii as long = 0 to doc->nImgs - 1
+        if (ii > ubound( w.imgId )) orelse (w.imgId(ii) = 0) then continue for
+        WriteImage( w, w.imgId(ii), doc->imgs(ii) )
+        xRes &= "/Im" & ii & " " & w.imgId(ii) & " 0 R "
+    next
+    for ii as long = 0 to w.nX - 1
+        WriteImage( w, w.xImgId(ii), w.xImg(ii) )
+        xRes &= "/Tx" & ii & " " & w.xImgId(ii) & " 0 R "
+        SDL_DestroySurface( w.xImg(ii) )
+    next
+    for a as long = 0 to 255
+        if w.gsUsed(a) then gsRes &= "/GA" & a & " << /Type /ExtGState /ca " & PdfNum( a / 255 ) & " /CA " & PdfNum( a / 255 ) & " >> "
+    next
+    WriteObj( w, 4, "<< /ProcSet [/PDF /Text /ImageB /ImageC]" & iif( len( fontRes ), " /Font << " & fontRes & ">>", "" ) _
+              & iif( len( xRes ), " /XObject << " & xRes & ">>", "" ) & iif( len( gsRes ), " /ExtGState << " & gsRes & ">>", "" ) _
+              & iif( len( w.shades ), " /Shading << " & w.shades & ">>", "" ) & " >>" )
+    WriteObj( w, 2, "<< /Type /Pages /Count " & doc->nPages & " /Kids [" & kids & "] >>" )
+    WriteObj( w, 1, "<< /Type /Catalog /Pages 2 0 R >>" )
+    dim as string info = "<< /Producer (tiko tkControls tkPdf)"
+    dim as string t8 = doc->title, a8 = opts.author, s8 = opts.subject
+    if len( t8 ) then info &= " /Title " & TextStr( t8 )
+    if len( a8 ) then info &= " /Author " & TextStr( a8 )
+    if len( s8 ) then info &= " /Subject " & TextStr( s8 )
+    WriteObj( w, 3, info & " >>" )
+    ' cross-reference table and trailer
+    dim as long xref = w.o.n
+    w.o.AddStr( "xref" & chr( 10 ) & "0 " & (w.nObj + 1) & chr( 10 ) & "0000000000 65535 f " & chr( 10 ) )
+    for id as long = 1 to w.nObj
+        w.o.AddStr( right( "0000000000" & w.offs(id), 10 ) & " 00000 n " & chr( 10 ) )
+    next
+    w.o.AddStr( "trailer" & chr( 10 ) & "<< /Size " & (w.nObj + 1) & " /Root 1 0 R /Info 3 0 R >>" & chr( 10 ) _
+                & "startxref" & chr( 10 ) & xref & chr( 10 ) & "%%EOF" & chr( 10 ) )
+    outBuf = w.o
+    for fi as long = 0 to ubound( w.fontOf )
+        dim as PDF_TTF ptr f = w.fontOf(fi)
+        if f = 0 then continue for
+        if f->bOwned andalso (f->pData <> 0) then SDL_free( cast( any ptr, f->pData ) )
+        delete f
+    next
+    return true
+end function
+
+' The document as a PDF file. FALSE when it cannot be written.
+public function tkPrintDoc_ExportPdf( byval doc as TK_PRINTDOC ptr, byref path as ustring, byval pOpts as TKPDF_OPTIONS ptr = 0 ) as boolean
+    dim as PDF_BUF b
+    if tkPdf_Write( doc, b, pOpts ) = false then return false
+    dim as string p8 = path
+    return SDL_SaveFile( strptr( p8 ), @b.b(0), b.n )
+end function

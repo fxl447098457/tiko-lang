@@ -1,0 +1,396 @@
+' tkInfoBar self-test. Real windows, real SDL events; scale pinned at 1.0 and 1.75. Geometry is
+' asserted against tkNotify's design constants scaled, not eyeballed. Also: tkLayout's two rules
+' (a hidden dock takes no slice; a dock may take its height from tkLayout_SetHeightFunc), and
+' that PaintText honours its colour's alpha (the toast fade depends on it).
+' One check per distinct behaviour (the author's rule, 2026-11-23): what was folded or cut is listed
+' in docs/tkControls/NOTIFICATIONS.md §18.
+#import "vendor/tkControls/tkInfoBar"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkLayout"
+#import "vendor/tkControls/tkTest"
+using tkInfoBar
+using tkNotify
+using tkButton
+using tkLabel
+using tkLayout
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gActions, gLastAction, gClosing, gClosed, gLastReason, gHeights, gLastHeight
+dim shared as boolean gVeto
+dim shared as TK_LAYOUT ptr gLayout
+
+sub OnAction( byval h as TK_WIDGET ptr, byval id as long )
+    gActions += 1
+    gLastAction = id
+end sub
+
+function OnClosing( byval h as TK_WIDGET ptr, byval reason as long ) as boolean
+    gClosing += 1
+    gLastReason = reason
+    return gVeto = false
+end function
+
+sub OnClosed( byval h as TK_WIDGET ptr, byval reason as long )
+    gClosed += 1
+    gLastReason = reason
+end sub
+
+sub OnHeight( byval h as TK_WIDGET ptr, byval cyDesign as long )
+    gHeights += 1
+    gLastHeight = cyDesign
+    if gLayout then tkLayout_Apply( gLayout )
+end sub
+
+function Px( byval h as TK_HOST ptr, byval v as long ) as long
+    return cint( v * h->fScale )
+end function
+
+function RectStr( byref rc as TKRECT ) as string
+    return tkRect_Str( rc )
+end function
+
+function Near( byval a as long, byval b as long, byval tol as long = 1 ) as boolean
+    return abs( a - b ) <= tol
+end function
+
+function Rgb_( byval c as ulong ) as ulong
+    return c and &hFFFFFFul
+end function
+
+' For the text-alpha probe: the surface's own paint hook draws one string at a chosen alpha.
+dim shared as long gProbeAlpha = -1
+sub ProbePaint( byval h as TK_HOST ptr, byval p as TK_PAINT ptr )
+    if gProbeAlpha < 0 then exit sub
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, Px( h, 200 ), Px( h, 40 ) )
+    p->SetBackColor( &hFF000000ul )
+    p->PaintRect( @rc )
+    p->SetFont( h->pDefaultFont )
+    p->SetForeColor( tkColor_WithAlpha( &hFFFFFFFFul, gProbeAlpha ) )
+    p->PaintText( "WWWW alpha probe", @rc, TK_DT_LEFT or TK_DT_VCENTER )
+end sub
+
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkInfoBar selftest", 640, 480, tkHost_FontDir() & TK_FONT_UI, fScale )
+    h->clrBack = &hFF102030ul
+    dim as TK_WIDGET ptr root_ = tkHost_Root( h )
+    dim as TK_WIDGET ptr B = tkInfoBar_Create( root_, 7 )
+    dim as TK_WIDGET ptr btn = tkButton_Create( root_, 8 )
+    tkButton_SetText( btn, "Next" )
+    tkWidget_SetPos( btn, Px( h, 20 ), Px( h, 400 ), Px( h, 100 ), Px( h, 30 ) )
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 50 )
+    gActions = 0 : gClosing = 0 : gClosed = 0 : gHeights = 0 : gVeto = false : gLayout = 0
+
+    tkTest_Check( "starts closed: hidden, wanting no height, animated", (tkInfoBar_IsOpen( B ) = false) andalso (B->isVisible = false) andalso _
+                  (tkInfoBar_GetPreferredHeight( B, 500 ) = 0) andalso tkInfoBar_GetAnimate( B ) )
+    tkInfoBar_SetAnimate( B, false )     ' the N0 checks below are about where things land, not motion
+
+    tkInfoBar_SetActionCallback( B, @OnAction )
+    tkInfoBar_SetClosingCallback( B, @OnClosing )
+    tkInfoBar_SetClosedCallback( B, @OnClosed )
+    tkInfoBar_SetHeightChangedCallback( B, @OnHeight )
+    tkInfoBar_SetTitle( B, "Update available" )
+    tkInfoBar_SetMessage( B, "Version 0.1.7 is ready." )
+    dim as long id1 = tkInfoBar_AddAction( B, "Install" )
+    dim as long id2 = tkInfoBar_AddAction( B, "Later" )
+    tkTest_Check( "action ids are 1, 2", (id1 = 1) andalso (id2 = 2), id1 & "," & id2 )
+
+    tkInfoBar_SetOpen( B, true )
+    tkTest_Check( "open: visible, no focus moved, no Closing / Closed", B->isVisible andalso (tkHost_GetFocus( h ) = 0) andalso (gClosing = 0) andalso (gClosed = 0) )
+
+    ' ---- LINE geometry at a wide width ----
+    dim as long W = Px( h, 620 )
+    dim as long prefW = tkInfoBar_GetPreferredHeight( B, W )
+    tkWidget_SetPos( B, Px( h, 10 ), Px( h, 10 ), W, prefW )
+    dim as TTF_Font ptr fText = h->pDefaultFont
+    dim as long btnH = tkText_Height( fText ) + 2 * Px( h, TKNOTIFY_BTNPADY )
+    dim as long rowH = Px( h, TKNOTIFY_CLOSECELL )
+    if btnH > rowH then rowH = btnH
+    ' the bold title is the same point size; its height can differ by a pixel
+    tkTest_Check( "wide: one line, the tallest part + padding high", (tkInfoBar_GetCurrentLayout( B ) = TKN_LAYOUT_LINE) andalso _
+                  (prefW >= rowH + 2 * Px( h, TKNOTIFY_PADY )) andalso (prefW <= rowH + 2 * Px( h, TKNOTIFY_PADY ) + 2), _
+                  prefW & " vs " & (rowH + 2 * Px( h, TKNOTIFY_PADY )) )
+    tkTest_Check( "height signal on open, in design units", (gHeights >= 1) andalso Near( gLastHeight, cint( prefW / h->fScale ) ), _
+                  gHeights & " / " & gLastHeight )
+    dim as TKRECT rcClose, rcA1, rcA2
+    tkInfoBar_GetPartRect( B, TKN_PART_CLOSE, rcClose )
+    tkInfoBar_GetPartRect( B, TKN_PART_ACTION1, rcA1 )
+    tkInfoBar_GetPartRect( B, TKN_PART_ACTION1 + 1, rcA2 )
+    tkTest_Check( "LINE: close at the right padding, the actions left of it in order, a gap apart", _
+                  (rcClose.right = W - Px( h, TKNOTIFY_PADX )) andalso (rcA2.right = rcClose.left - Px( h, TKNOTIFY_BTNGAP )) andalso _
+                  (rcA1.right = rcA2.left - Px( h, TKNOTIFY_BTNGAP )), RectStr( rcA1 ) & " " & RectStr( rcA2 ) & " " & RectStr( rcClose ) )
+    tkTest_Check( "a button is its text + padding wide", tkRect_Width( rcA1 ) = tkText_Width( fText, "Install" ) + 2 * Px( h, TKNOTIFY_BTNPADX ), RectStr( rcA1 ) )
+
+    ' ---- STACKED below the break width ----
+    dim as long Wn = Px( h, 260 )
+    dim as long prefN = tkInfoBar_GetPreferredHeight( B, Wn )
+    tkWidget_SetPos( B, Px( h, 10 ), Px( h, 10 ), Wn, prefN )
+    tkInfoBar_GetPartRect( B, TKN_PART_ACTION1, rcA1 )
+    dim as long textX = Px( h, TKNOTIFY_PADX ) + Px( h, TKNOTIFY_GLYPHCELL ) + Px( h, TKNOTIFY_GLYPHGAP )
+    tkTest_Check( "narrow: stacked, taller, the actions a last row at the text column", _
+                  (tkInfoBar_GetCurrentLayout( B ) = TKN_LAYOUT_STACKED) andalso (prefN > prefW) andalso (rcA1.left = textX) andalso _
+                  (rcA1.bottom = prefN - Px( h, TKNOTIFY_PADY )), RectStr( rcA1 ) & " cy " & prefN )
+    tkInfoBar_SetLayoutMode( B, TKN_LAYOUT_LINE )
+    tkTest_Check( "forced LINE stays one line when narrow", tkInfoBar_GetCurrentLayout( B ) = TKN_LAYOUT_LINE )
+    tkInfoBar_SetLayoutMode( B, TKN_LAYOUT_AUTO )
+    tkWidget_SetPos( B, Px( h, 10 ), Px( h, 10 ), W, prefW )
+
+    ' ---- paint ----
+    dim as TKNOTIFY_COLORS c
+    tkInfoBar_GetColors( B, @c )
+    dim as long sx = B->x + Px( h, 4 ), sy = B->y + prefW \ 2
+    tkInfoBar_SetSeverity( B, TKN_ERROR )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "the severity's fill", Rgb_( tkTest_PixelAt( h, sx, sy ) ) = Rgb_( c.ErrorBack ), hex( tkTest_PixelAt( h, sx, sy ) ) & " vs " & hex( c.ErrorBack ) )
+    tkInfoBar_SetSeverity( B, TKN_SUCCESS )
+    tkHost_RenderTo( h, false )
+    dim as ulong c0
+    dim as long gx = B->x + Px( h, TKNOTIFY_PADX ), gy = B->y + prefW \ 2 - Px( h, TKNOTIFY_GLYPHCELL ) \ 2
+    tkTest_Check( "the success glyph (&hF298) draws", tkTest_TonesIn( h, gx, gy, Px( h, TKNOTIFY_GLYPHCELL ), Px( h, TKNOTIFY_GLYPHCELL ), c0 ) > 2 )
+    tkInfoBar_SetSeverity( B, TKN_INFO )
+
+    ' ---- mouse ----
+    tkInfoBar_GetPartRect( B, TKN_PART_ACTION1, rcA1 )
+    tkInfoBar_GetPartRect( B, TKN_PART_ACTION1 + 1, rcA2 )
+    tkInfoBar_GetPartRect( B, TKN_PART_CLOSE, rcClose )
+    dim as long a2x = B->x + (rcA2.left + rcA2.right) \ 2, a2y = B->y + (rcA2.top + rcA2.bottom) \ 2
+    dim as long a1x = B->x + (rcA1.left + rcA1.right) \ 2, a1y = B->y + (rcA1.top + rcA1.bottom) \ 2
+    tkTest_Click( h, a2x, a2y )
+    tkTest_PumpFor( h, 20 )
+    tkTest_Check( "click an action: its id; the bar stays open; no focus taken", (gActions = 1) andalso (gLastAction = 2) andalso _
+                  tkInfoBar_IsOpen( B ) andalso (tkHost_GetFocus( h ) = 0), gActions & " id " & gLastAction )
+    tkTest_PushButton( h, true, a1x, a1y )
+    tkTest_PushMotion( h, Px( h, 600 ), Px( h, 300 ) )
+    tkTest_PushButton( h, false, Px( h, 600 ), Px( h, 300 ) )
+    tkTest_PumpFor( h, 20 )
+    tkTest_Check( "a press released outside is not an action, and lets go of capture", (gActions = 1) andalso (tkHost_GetCapture( h ) = 0), str( gActions ) )
+    tkInfoBar_SetActionEnabled( B, 1, false )
+    tkTest_Click( h, a1x, a1y )
+    tkTest_PumpFor( h, 20 )
+    tkTest_Check( "a disabled action does nothing", gActions = 1 )
+    tkInfoBar_SetActionEnabled( B, 1, true )
+    dim as long cxm = B->x + (rcClose.left + rcClose.right) \ 2, cym = B->y + (rcClose.top + rcClose.bottom) \ 2
+    gVeto = true
+    tkTest_Click( h, cxm, cym )
+    tkTest_PumpFor( h, 20 )
+    tkTest_Check( "close: Closing asked with BUTTON, and a veto keeps it open", (gClosing = 1) andalso (gLastReason = TKN_CLOSE_BUTTON) andalso _
+                  tkInfoBar_IsOpen( B ) andalso (gClosed = 0), gClosing & " r " & gLastReason )
+    gVeto = false
+    dim as long hBefore = gHeights
+    tkTest_Click( h, cxm, cym )
+    tkTest_PumpFor( h, 20 )
+    tkTest_Check( "close allowed: hidden, Closed with BUTTON, height 0 signalled", (tkInfoBar_IsOpen( B ) = false) andalso (B->isVisible = false) andalso _
+                  (gClosed = 1) andalso (gLastReason = TKN_CLOSE_BUTTON) andalso (gHeights = hBefore + 1) andalso (gLastHeight = 0), _
+                  gClosed & " r " & gLastReason & " h " & gLastHeight )
+
+    ' ---- keyboard ----
+    gClosing = 0 : gClosed = 0
+    tkInfoBar_SetOpen( B, true )
+    tkHost_FocusNext( h )
+    tkTest_Check( "Tab reaches the bar, on its first action", (tkHost_GetFocus( h ) = B) andalso (tkInfoBar_GetFocusPart( B ) = TKN_PART_ACTION1), str( tkInfoBar_GetFocusPart( B ) ) )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab: the next part", tkInfoBar_GetFocusPart( B ) = TKN_PART_ACTION1 + 1, str( tkInfoBar_GetFocusPart( B ) ) )
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_Check( "Enter presses it", (gActions = 2) andalso (gLastAction = 2), gActions & " id " & gLastAction )
+    dim as TK_MSG mc
+    mc.msg = TKM_CHAR : mc.text = " "
+    tkTest_Check( "the space's character is swallowed", tkWidget_Send( B, @mc ) )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab past the last part leaves the bar", tkHost_GetFocus( h ) = btn )
+    tkTest_PushKey( h, SDLK_TAB, SDL_KMOD_SHIFT )
+    tkInfoBar_SetActionEnabled( B, 1, false )
+    tkTest_PushKey( h, SDLK_TAB )     ' whichever part it landed on, Tab never visits a disabled action
+    tkTest_Check( "a disabled action is skipped", (tkHost_GetFocus( h ) = B) andalso (tkInfoBar_GetFocusPart( B ) <> TKN_PART_ACTION1), str( tkInfoBar_GetFocusPart( B ) ) )
+    tkInfoBar_SetActionEnabled( B, 1, true )
+    tkHost_SetFocus( h, B )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "Esc closes with KEY, and focus moves on", (gClosed = 1) andalso (gLastReason = TKN_CLOSE_KEY) andalso _
+                  (tkInfoBar_IsOpen( B ) = false) andalso (tkHost_GetFocus( h ) = btn), gClosed & " r " & gLastReason )
+    tkInfoBar_SetOpen( B, true )
+    tkInfoBar_SetClosable( B, false )
+    tkHost_SetFocus( h, B )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "not closable: Esc does nothing", tkInfoBar_IsOpen( B ) )
+    tkInfoBar_SetClosable( B, true )
+    tkInfoBar_SetTabStop( B, false )
+    tkTest_Check( "SetTabStop( false ) takes it out of Tab order", B->isFocusable = false )
+    tkInfoBar_SetTabStop( B, true )
+
+    ' ---- programmatic close is silent; SetText opens and closes ----
+    gClosing = 0 : gClosed = 0
+    hBefore = gHeights
+    tkInfoBar_SetOpen( B, false )
+    tkTest_Check( "programmatic close: no Closing / Closed, but the layout is told", (gClosing = 0) andalso (gClosed = 0) andalso _
+                  (gHeights = hBefore + 1) andalso (gLastHeight = 0), gHeights & " / " & gLastHeight )
+    tkInfoBar_SetText( B, "Payment overdue" )
+    dim as boolean bOpened = tkInfoBar_IsOpen( B )
+    tkInfoBar_SetText( B, "" )
+    tkTest_Check( "SetText opens on text and closes on empty, silently", bOpened andalso (tkInfoBar_IsOpen( B ) = false) andalso (gClosing = 0) andalso (gClosed = 0) )
+
+    ' ---- tkLayout: a hidden dock takes nothing; the dock height comes from the bar ----
+    dim as TK_WIDGET ptr content = tkLabel_Create( root_, 9 )
+    dim as TK_WIDGET ptr strip = tkLabel_Create( root_, 10 )
+    gLayout = tkLayout_Create( )
+    tkLayout_AddContainer( gLayout, root_, 640, 480 )
+    tkLayout_Add( gLayout, B, 0, 0, 640, 40, , TK_DOCK_TOP )
+    tkLayout_Add( gLayout, strip, 0, 0, 640, 24, , TK_DOCK_TOP )
+    tkLayout_Add( gLayout, content, 0, 0, 640, 100, , TK_DOCK_FILL )
+    tkLayout_SetHeightFunc( gLayout, B, @tkInfoBar_GetPreferredHeight )
+    tkLayout_Apply( gLayout )
+    tkTest_Check( "a closed (hidden) docked bar takes no slice", strip->y = 0, str( strip->y ) )
+    tkTest_Check( "a dock without a height function keeps its design height", strip->ch = Px( h, 24 ), str( strip->ch ) )
+    tkInfoBar_SetText( B, "Payment overdue" )          ' opens: HeightChanged -> Apply
+    dim as long want = tkInfoBar_GetPreferredHeight( B, root_->cw )
+    tkTest_Check( "an open bar docks at its preferred height; the next dock below it", (B->ch = want) andalso (B->cw = root_->cw) andalso (strip->y = want), _
+                  B->ch & " " & strip->y & " vs " & want )
+    tkInfoBar_SetMessage( B, string( 40, "w" ) & " " & string( 40, "w" ) & " " & string( 40, "w" ) & " " & string( 40, "w" ) )
+    dim as long want2 = tkInfoBar_GetPreferredHeight( B, root_->cw )
+    tkTest_Check( "a wrapped message is taller, and the layout follows", (want2 > want) andalso (B->ch = want2) andalso (strip->y = want2), B->ch & " " & strip->y & " vs " & want2 )
+    tkInfoBar_SetOpen( B, false )
+    tkTest_Check( "closing gives the strip back", strip->y = 0, str( strip->y ) )
+    tkLayout_Destroy( gLayout )
+    gLayout = 0
+
+    ' ---- N1: motion. The clock is pinned, so every step is exact. ----
+    tkInfoBar_SetAnimate( B, true )
+    tkInfoBar_SetMessage( B, "Payment overdue" )
+    gLayout = tkLayout_Create( )
+    tkLayout_AddContainer( gLayout, root_, 640, 480 )
+    tkLayout_Add( gLayout, B, 0, 0, 640, 40, , TK_DOCK_TOP )
+    tkLayout_Add( gLayout, strip, 0, 0, 640, 24, , TK_DOCK_TOP )
+    tkLayout_Add( gLayout, content, 0, 0, 640, 100, , TK_DOCK_FILL )
+    tkLayout_SetHeightFunc( gLayout, B, @tkInfoBar_GetPreferredHeight )
+    tkLayout_Apply( gLayout )
+    dim as longint t0 = 100000
+    tkInfoBar_TickForTest( B, t0 )
+    tkInfoBar_SetOpen( B, true )
+    tkTest_Check( "open: logically open at once, moving on the 15 ms clock from height 0", tkInfoBar_IsOpen( B ) andalso B->isVisible andalso _
+                  tkInfoBar_IsAnimating( B ) andalso (tkInfoBar_GetClockMs( B ) = 15) andalso (B->ch = 0), str( tkInfoBar_GetClockMs( B ) ) & " ch " & B->ch )
+    dim as long hPrev = 0, hMid = -1
+    dim as boolean bMono = true, bFollow = true
+    for k as long = 1 to 5
+        tkInfoBar_TickForTest( B, t0 + k * 25 )
+        if B->ch < hPrev then bMono = false
+        if strip->y <> B->ch then bFollow = false
+        hPrev = B->ch
+        if k = 3 then hMid = B->ch
+    next
+    tkTest_Check( "opening grows, and the dock below follows every frame", bMono andalso bFollow )
+    gClosing = 0
+    dim as TKRECT rcX
+    tkInfoBar_GetPartRect( B, TKN_PART_CLOSE, rcX )
+    ' where the close button is PAINTED now: the content is bottom-anchored while it moves, and
+    ' `want` (measured above for this message at this width) is the full height
+    dim as long yX = B->y + B->ch - want + (rcX.top + rcX.bottom) \ 2
+    dim as boolean bOnScreen = (yX > B->y) andalso (yX < B->y + B->ch)
+    tkTest_Click( h, B->x + (rcX.left + rcX.right) \ 2, yX )
+    tkTest_PumpFor( h, 10 )
+    tkTest_Check( "no input while it moves (a click on the painted close button)", bOnScreen andalso (gClosing = 0), yX & " " & gClosing )
+    tkInfoBar_TickForTest( B, t0 + TKINFOBAR_ANIM_MS )
+    dim as long full = tkInfoBar_GetPreferredHeight( B, root_->cw )
+    tkTest_Check( "lands at the full height", (B->ch = full) andalso (strip->y = full) andalso (tkInfoBar_IsAnimating( B ) = false), B->ch & " vs " & full )
+    tkTest_Check( "ease-out: halfway in time is 3/4 of the height", Near( hMid, cint( full * 0.75 ), 1 ), hMid & " vs " & cint( full * 0.75 ) )
+    tkTest_Check( "still: no timer", (tkInfoBar_GetClockMs( B ) = 0) andalso (tkWidget_HasTimer( B, TKINFOBAR_TIMER ) = false) )
+    ' a user close: logically closed and told at once; the bar moves out, then hides
+    dim as longint t1 = t0 + 1000
+    tkInfoBar_TickForTest( B, t1 )
+    gClosed = 0
+    tkHost_SetFocus( h, B )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "user close: told at once, still on screen moving out, focus moved on, no tab stop", (tkInfoBar_IsOpen( B ) = false) andalso (gClosed = 1) andalso _
+                  B->isVisible andalso tkInfoBar_IsAnimating( B ) andalso (tkHost_GetFocus( h ) = btn) andalso (B->isFocusable = false) )
+    tkInfoBar_TickForTest( B, t1 + TKINFOBAR_ANIM_MS )
+    tkTest_Check( "closed: hidden, the strip back at the top, no timer", (B->isVisible = false) andalso (strip->y = 0) andalso (tkInfoBar_GetClockMs( B ) = 0), B->isVisible & " " & strip->y )
+    dim as longint t2 = t1 + 1000
+    tkInfoBar_TickForTest( B, t2 )
+    tkInfoBar_SetOpen( B, true )
+    tkInfoBar_TickForTest( B, t2 + 75 )            ' 0.75 of the way open
+    tkInfoBar_SetOpen( B, false )
+    tkInfoBar_TickForTest( B, t2 + 150 )           ' 0.75 -> 0, half the time: 0.75 * (1 - 0.75)
+    tkTest_Check( "a reversal starts from where it was", Near( B->ch, cint( full * 0.1875 ), 1 ), B->ch & " vs " & cint( full * 0.1875 ) )
+    tkInfoBar_TickForTest( B, t2 + 400 )
+    tkInfoBar_SetOpen( B, true )
+    tkInfoBar_TickForTest( B, t2 + 430 )
+    tkInfoBar_SetAnimate( B, false )
+    tkTest_Check( "SetAnimate( false ) lands the move", (tkInfoBar_IsAnimating( B ) = false) andalso (B->ch = full) andalso (tkInfoBar_GetClockMs( B ) = 0), B->ch & " vs " & full )
+
+    ' ---- N1: progress ----
+    tkInfoBar_SetProgress( B, 50 )
+    dim as TKRECT rcP
+    dim as boolean bStrip = tkInfoBar_GetPartRect( B, TKN_PART_PROGRESS, rcP )
+    tkTest_Check( "progress: a strip in the bottom padding, inset like the content; no height change, no clock", bStrip andalso _
+                  (rcP.left = Px( h, TKNOTIFY_PADX )) andalso (rcP.right = B->cw - Px( h, TKNOTIFY_PADX )) andalso _
+                  (rcP.top >= full - Px( h, TKNOTIFY_PADY )) andalso (rcP.bottom <= full) andalso _
+                  (tkInfoBar_GetPreferredHeight( B, root_->cw ) = full) andalso (tkInfoBar_GetClockMs( B ) = 0), RectStr( rcP ) & " cy " & full )
+    tkInfoBar_GetColors( B, @c )
+    dim as long py = B->y + rcP.top
+    dim as long pw = rcP.right - rcP.left
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "50 %: the left quarter filled, the right quarter track", _
+                  (Rgb_( tkTest_PixelAt( h, B->x + rcP.left + pw \ 4, py ) ) = Rgb_( c.InfoGlyph )) andalso _
+                  (Rgb_( tkTest_PixelAt( h, B->x + rcP.left + (3 * pw) \ 4, py ) ) = Rgb_( c.ProgressTrack )) )
+    tkInfoBar_SetProgress( B, 150 )
+    dim as long nHi = tkInfoBar_GetProgress( B )
+    tkInfoBar_SetProgress( B, -7 )
+    tkTest_Check( "values clamp to 0..100", (nHi = 100) andalso (tkInfoBar_GetProgress( B ) = 0), nHi & " " & tkInfoBar_GetProgress( B ) )
+    dim as longint t3 = t2 + 5000
+    tkInfoBar_TickForTest( B, t3 )
+    tkInfoBar_SetProgress( B, TKN_PROGRESS_INDETERMINATE )
+    tkTest_Check( "indeterminate: the 30 ms clock runs", (tkInfoBar_GetClockMs( B ) = 30) andalso tkWidget_HasTimer( B, TKINFOBAR_TIMER ), str( tkInfoBar_GetClockMs( B ) ) )
+    tkInfoBar_TickForTest( B, t3 + TKINFOBAR_MARQUEE_MS \ 10 )      ' the segment near the left
+    tkHost_RenderTo( h, false )
+    dim as boolean bEarly = (Rgb_( tkTest_PixelAt( h, B->x + rcP.left + 1, py ) ) = Rgb_( c.InfoGlyph )) andalso _
+                            (Rgb_( tkTest_PixelAt( h, B->x + rcP.left + pw \ 2, py ) ) = Rgb_( c.ProgressTrack ))
+    tkInfoBar_TickForTest( B, t3 + TKINFOBAR_MARQUEE_MS \ 2 )       ' half way: the centre
+    tkHost_RenderTo( h, false )
+    dim as boolean bHalf = (Rgb_( tkTest_PixelAt( h, B->x + rcP.left + pw \ 2, py ) ) = Rgb_( c.InfoGlyph )) andalso _
+                           (Rgb_( tkTest_PixelAt( h, B->x + rcP.left + 1, py ) ) = Rgb_( c.ProgressTrack ))
+    tkTest_Check( "the segment moves: at the left early, at the centre half way", bEarly andalso bHalf )
+    tkInfoBar_SetOpen( B, false )
+    dim as long msClosed = tkInfoBar_GetClockMs( B )
+    tkInfoBar_SetOpen( B, true )
+    tkTest_Check( "the indeterminate clock stops when closed, runs again when open", (msClosed = 0) andalso (tkInfoBar_GetClockMs( B ) = 30) )
+    tkInfoBar_SetProgress( B, TKN_PROGRESS_NONE )
+    tkTest_Check( "no progress: no clock, no strip", (tkInfoBar_GetClockMs( B ) = 0) andalso (tkInfoBar_GetPartRect( B, TKN_PART_PROGRESS, rcP ) = false) )
+    tkInfoBar_SetOpen( B, false )
+    tkLayout_Destroy( gLayout )
+    gLayout = 0
+
+    ' ---- colours ----
+    dim as TKNOTIFY_COLORS cp = c, cr
+    cp.InfoBack = &hFF123456ul
+    tkInfoBar_SetColors( B, @cp )
+    tkInfoBar_ApplyTheme( B, tkTheme_Get( ) )
+    tkInfoBar_GetColors( B, @cr )
+    tkTest_Check( "pinned colours survive a theme", cr.InfoBack = &hFF123456ul )
+    tkInfoBar_UnpinColors( B )
+    tkInfoBar_GetColors( B, @cr )
+    tkTest_Check( "unpin returns to the theme", cr.InfoBack = tkNotify_ThemeColors( tkTheme_Get( ) ).InfoBack, hex( cr.InfoBack ) )
+
+    ' ---- PaintText honours its colour's alpha (a toast's fade depends on it) ----
+    h->OnPaint = @ProbePaint
+    gProbeAlpha = 255
+    tkHost_RenderTo( h, false )
+    dim as long nOpaque = tkTest_TonesIn( h, 0, 0, Px( h, 200 ), Px( h, 40 ), c0 )
+    gProbeAlpha = 0
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "text draws at alpha 255 and not at alpha 0", (nOpaque > 2) andalso (tkTest_TonesIn( h, 0, 0, Px( h, 200 ), Px( h, 40 ), c0 ) = 1), nOpaque & " " & hex( c0 ) )
+    gProbeAlpha = -1
+    h->OnPaint = 0
+
+    tkHost_Destroy( h )
+end sub
+
+if tkTest_Init() = false then end 99
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkInfoBar" )
+tkTest_Quit()
+end nFail

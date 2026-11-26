@@ -48,7 +48,7 @@ snippet's output matters it is shown in `'' →` comments.
 | One file | `tiko app.tiko` → `app.exe` (Windows) or `./app` |
 | Optimised | `tiko -O2 app.tiko` |
 | Debug + runtime checks | `tiko -g -exx app.tiko` (bounds, null pointers) |
-| Memory errors | `tiko -g -fsanitize=address app.tiko`, or `tiko build --profile asan`: use-after-free, double free, overflow (after tiko 0.1.6) |
+| Memory errors | `tiko -g -fsanitize=address app.tiko`, or `tiko build --profile asan`: use-after-free, double free, overflow |
 | Thread-safe runtime | `tiko -mt app.tiko`, or `#cmdline "-mt"` in the source |
 | Name the output | `-o name` (exact, so `-o name.exe` on Windows) |
 | Define a symbol | `-d NAME=value` |
@@ -85,8 +85,8 @@ options  = ["-mt"]
 | `tiko run [target] [-- args]` | builds an executable target and runs it |
 | `tiko check` | reports every error and warning, writes nothing |
 | `tiko clean` | removes what `tiko build` wrote |
-| `tiko test [dirs]` | builds the project's tests into one program and runs it (after tiko 0.1.6) |
-| `tiko doc [dirs]` | writes the modules' API pages into `out/doc/` (after tiko 0.1.6) |
+| `tiko test [dirs]` | builds the project's tests into one program and runs it |
+| `tiko doc [dirs]` | writes the modules' API pages into `out/doc/` |
 
 Diagnostics look like `file.tiko(5,35): error TKO0698: message`, then a caret excerpt.
 Fix the first error first.
@@ -847,11 +847,11 @@ print strlen( strptr( bytes ) )
 ## Preprocessor and platforms
 
 ```freebasic
-#if defined( __FB_WIN32__ )
+#if defined( TIKO_OS_WINDOWS )
     const PLATFORM = "windows"
-#elseif defined( __FB_LINUX__ )
+#elseif defined( TIKO_OS_LINUX )
     const PLATFORM = "linux"
-#elseif defined( __FB_DARWIN__ )
+#elseif defined( TIKO_OS_MACOS )
     const PLATFORM = "macos"
 #endif
 
@@ -868,14 +868,17 @@ print cbool( len( PLATFORM ) > 0 ); EDITION; " "; cbool( __LINE__ > 0 )
 ```
 
 - `#cmdline "-mt -d X=1"` puts compiler options in the source.
-- `#error "msg"`, `#assert`, `__FB_64BIT__`, `__FB_UNIX__`, `__FB_DEBUG__` and `__FB_MT__`
-  are available too.
+- `#error "msg"`, `#assert`, `TIKO_ARCH_X86_64`, `TIKO_ARCH_ARM64`, `__FB_64BIT__`, `__FB_DEBUG__`
+  and `__FB_MT__` are available too.
+- Test the platform with tiko's names, `TIKO_OS_WINDOWS`, `TIKO_OS_LINUX` and `TIKO_OS_MACOS` —
+  not the older `__FB_WIN32__`, `__FB_LINUX__`, `__FB_DARWIN__`, which exist only for existing
+  headers. "Any Unix" is `defined( TIKO_OS_LINUX ) orelse defined( TIKO_OS_MACOS )`.
 - Write code that builds on every platform. A branch for a platform you didn't build for
   is never compiled, so it can hide errors.
 
 ## Testing
 
-After tiko 0.1.6, a test is a `test "name" ... end test` block in a file named `*_test.tiko`.
+A test is a `test "name" ... end test` block in a file named `*_test.tiko`.
 Beside a module, starting `#module "<that module>"`, it reaches the module's private names;
 anywhere else it is a program of its own that uses the module through `#import`. Either way it
 does `#import "std/testing"` and checks with `testing.ExpectEq( got, want )`, `testing.Expect`,

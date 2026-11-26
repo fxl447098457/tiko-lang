@@ -1,0 +1,417 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rdialogs -- the Report Designer's dialogs (RD7). RecordDialog shows any rrecords.RecordSet: the data
+' sources, the parameters, Group and sort, an item's conditional styles. The list of records on the
+' left with Add / Remove / Up / Down; the selected record's fields on the right, then the list's own
+' fields (Group and sort's extra sort keys). A field's edit applies on Enter, focus lost, a pick or a
+' toggle, to a COPY of the report; OK checks that the copy still reads back as a .tkreport and hands
+' it over (TakeWork), which the canvas adopts as one undoable edit. Cancel drops the copy.
+#module "rdialogs"
+
+#import "std/containers"
+#import "std/strings"
+#import "tkc/i18n"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkCheckBox"
+#import "vendor/tkControls/tkScrollPanel"
+#import "vendor/tkControls/tkReportDef"
+#import "../rmodel"
+#import "../rrecords"
+using containers
+using tkApp
+using tkListTree
+using tkButton
+using tkLabel
+using tkTextBox
+using tkComboBox
+using tkCheckBox
+using tkScrollPanel
+using tkHost
+using tkReportDef
+using tkReport
+
+const as long REC_WIN_CX = 640
+const as long REC_WIN_CY = 440
+const as long REC_GAP = 8
+const as long REC_ROW_CY = 28
+const as long REC_LIST_CX = 200
+const as long REC_LABEL_CX = 110
+
+public type RDRow
+    Key   as ustring
+    Kind  as rmodel.RPropKind
+    Rec   as int32                     ' the record it edits; -1 the list's own field
+    Label as TK_WIDGET ptr
+    Edit  as TK_WIDGET ptr
+    Text  as ustring
+end type
+
+public type RecordDialog
+    Win      as TK_FORM ptr
+    Work     as TK_REPORTDEF ptr       ' the copy being edited; the dialog's until TakeWork
+    Recs     as rrecords.RecordSet
+    Cur      as int32 = -1
+    Rows     as Array( of RDRow )
+    Accepted as boolean
+    IsModal  as boolean
+    Updating as boolean
+    Lst      as TK_WIDGET ptr
+    BtnAdd   as TK_WIDGET ptr
+    BtnRemove as TK_WIDGET ptr
+    BtnUp    as TK_WIDGET ptr
+    BtnDown  as TK_WIDGET ptr
+    Scroll   as TK_WIDGET ptr
+    LblInfo  as TK_WIDGET ptr
+    BtnOk    as TK_WIDGET ptr
+    BtnCancel as TK_WIDGET ptr
+
+    declare sub Open( byval owner_ as TK_FORM ptr, byref title as const ustring, byval def as TK_REPORTDEF ptr, _
+                      byval kind_ as rrecords.RSet, byref item_ as const ustring = "" )
+    declare function RunModal( ) as boolean
+    declare sub Close( )
+    declare sub Finish( byval ok as boolean )
+    declare function TakeWork( ) as TK_REPORTDEF ptr
+    declare sub Layout( )
+    declare sub FillList( byval sel as int32 )
+    declare sub BuildRows( )
+    declare sub ShowValues( )
+    declare function CommitRow( byval r as long ) as boolean
+    declare function CommitAll( ) as boolean
+    declare function RowOf( byval w as TK_WIDGET ptr ) as long
+    declare sub AddRecord( )
+    declare sub RemoveRecord( )
+    declare sub MoveRecord( byval delta as int32 )
+    declare sub Pick( byval i as int32 )
+end type
+
+private function RecDlgOf( byval w as TK_WIDGET ptr ) as RecordDialog ptr
+    dim as TK_FORM ptr f = tkForm_FromWidget( w )
+    if f = 0 then return 0
+    return f->Tag
+end function
+
+private sub RaiseOwner_( byval f as TK_FORM ptr )
+    if (f <> 0) andalso (f->pOwner <> 0) then SDL_RaiseWindow( f->pOwner->host->win )
+end sub
+
+private sub OnRecButton( byval h as TK_WIDGET ptr, byval id as long )
+    dim as RecordDialog ptr d = RecDlgOf( h )
+    if d = 0 then exit sub
+    select case h
+    case d->BtnOk : d->Finish( true )
+    case d->BtnCancel : d->Finish( false )
+    case d->BtnAdd : d->AddRecord( )
+    case d->BtnRemove : d->RemoveRecord( )
+    case d->BtnUp : d->MoveRecord( -1 )
+    case d->BtnDown : d->MoveRecord( 1 )
+    end select
+end sub
+
+private sub OnRecSel( byval h as TK_WIDGET ptr, byval row as integer )
+    dim as RecordDialog ptr d = RecDlgOf( h )
+    if (d <> 0) andalso (d->Updating = false) then d->Pick( row )
+end sub
+
+private sub OnRecEnter( byval h as TK_WIDGET ptr )
+    dim as RecordDialog ptr d = RecDlgOf( h )
+    if d then d->CommitRow( d->RowOf( h ) )
+end sub
+
+private sub OnRecFocus( byval h as TK_WIDGET ptr, byval bGotFocus as boolean )
+    if bGotFocus then exit sub
+    dim as RecordDialog ptr d = RecDlgOf( h )
+    if d then d->CommitRow( d->RowOf( h ) )
+end sub
+
+private sub OnRecCombo( byval h as TK_WIDGET ptr, byval idxOld as long, byval idxNew as long )
+    dim as RecordDialog ptr d = RecDlgOf( h )
+    if d then d->CommitRow( d->RowOf( h ) )
+end sub
+
+private sub OnRecCheck( byval h as TK_WIDGET ptr, byval isChecked as boolean )
+    dim as RecordDialog ptr d = RecDlgOf( h )
+    if d then d->CommitRow( d->RowOf( h ) )
+end sub
+
+private function MakeRecButton_( byval parent as TK_WIDGET ptr, byref text as const ustring ) as TK_WIDGET ptr
+    dim as TK_WIDGET ptr b = tkButton_Create( parent, 1 )
+    dim as ustring t = text
+    tkButton_SetText( b, t )
+    tkButton_SetClickCallback( b, @OnRecButton )
+    return b
+end function
+
+' A dialog over a copy of def: the RecordSet kind_ (item_: the item whose rules).
+sub RecordDialog.Open( byval owner_ as TK_FORM ptr, byref title as const ustring, byval def as TK_REPORTDEF ptr, _
+                       byval kind_ as rrecords.RSet, byref item_ as const ustring = "" )
+    dim as ustring e
+    Work = tkReportDef_LoadText( tkReportDef_SaveText( def ), e )
+    if Work = 0 then exit sub
+    Recs.Init( Work, kind_, item_ )
+    dim as single sc = 0
+    if owner_ then sc = tkForm_Host( owner_ )->fScaleForced
+    dim as ustring t_ = title
+    Win = tkApp_NewForm( t_, REC_WIN_CX, REC_WIN_CY, owner_, sc )
+    if Win = 0 then exit sub
+    Win->Tag = @this
+    tkForm_OnClose( Win, function( byval f as TK_FORM ptr ) as boolean
+        RaiseOwner_( f )
+        return true
+    end function )
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    Lst = tkListTree_Create( root_, 1 )
+    tkListTree_SetPaintCallback( Lst, @tkListTree_PaintRowDefault )   ' a tkListTree draws no row by itself
+    tkListTree_SetSelChangeCallback( Lst, @OnRecSel )
+    BtnAdd = MakeRecButton_( root_, "+" )
+    BtnRemove = MakeRecButton_( root_, "-" )
+    BtnUp = MakeRecButton_( root_, wchr( &h2191 ) )
+    BtnDown = MakeRecButton_( root_, wchr( &h2193 ) )
+    Scroll = tkScrollPanel_Create( root_, 1 )
+    LblInfo = tkLabel_Create( root_, 1 )
+    tkLabel_SetWordWrap( LblInfo, true )
+    BtnOk = MakeRecButton_( root_, i18n.Tr( "designer.ok", "OK" ) )
+    BtnCancel = MakeRecButton_( root_, i18n.Tr( "designer.cancel", "Cancel" ) )
+    tkForm_OnSize( Win, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        cast( RecordDialog ptr, f->Tag )->Layout( )
+    end sub )
+    tkForm_Show( Win )
+    this.FillList( iif( Recs.Count( ) > 0, 0, -1 ) )
+    this.Pick( Cur )
+    this.Layout( )
+end sub
+
+function RecordDialog.RunModal( ) as boolean
+    IsModal = true
+    tkForm_ShowModalKeep( Win )
+    IsModal = false
+    return Accepted
+end function
+
+sub RecordDialog.Close( )
+    if Win then tkForm_Destroy( Win )
+    Win = 0
+    if Work then tkReportDef_Destroy( Work )
+    Work = 0
+end sub
+
+' The edited copy, now the caller's; 0 after a Cancel.
+function RecordDialog.TakeWork( ) as TK_REPORTDEF ptr
+    if Accepted = false then return 0
+    dim as TK_REPORTDEF ptr w = Work
+    Work = 0
+    return w
+end function
+
+' OK: what is still in the boxes counts; the copy must read back, else why not shows and the dialog
+' stays. Cancel: nothing.
+sub RecordDialog.Finish( byval ok as boolean )
+    if ok then
+        if this.CommitAll( ) = false then exit sub
+        dim as ustring e
+        dim as TK_REPORTDEF ptr t = tkReportDef_LoadText( tkReportDef_SaveText( Work ), e )
+        if t = 0 then
+            dim as long nl = instr( e, wchr( 10 ) )
+            if nl > 0 then e = left( e, nl - 1 )
+            tkLabel_SetText( LblInfo, e )
+            exit sub
+        end if
+        tkReportDef_Destroy( t )
+    end if
+    Accepted = ok
+    if IsModal then
+        RaiseOwner_( Win )
+        tkForm_EndModal( Win, iif( ok, 1, 0 ) )
+    end if
+end sub
+
+sub RecordDialog.Layout( )
+    if Win = 0 then exit sub
+    dim as TK_WIDGET ptr root_ = tkForm_Widget( Win )
+    dim as long g = tkForm_Scale( Win, REC_GAP ), rh = tkForm_Scale( Win, REC_ROW_CY )
+    dim as long cw = root_->cw, ch = root_->ch, lw = tkForm_Scale( Win, REC_LIST_CX ), bw = tkForm_Scale( Win, 96 )
+    dim as long bottomY = ch - g - rh, infoY = bottomY - g - 2 * rh
+    dim as long sb = (lw - 3 * g) \ 4
+    tkWidget_SetPos( Lst, g, g, lw, infoY - 3 * g - rh )
+    dim as long by = infoY - 2 * g - rh
+    tkWidget_SetPos( BtnAdd, g, by, sb, rh )
+    tkWidget_SetPos( BtnRemove, 2 * g + sb, by, sb, rh )
+    tkWidget_SetPos( BtnUp, 3 * g + 2 * sb, by, sb, rh )
+    tkWidget_SetPos( BtnDown, 4 * g + 3 * sb, by, lw - 3 * g - 3 * sb, rh )
+    dim as long rx = 2 * g + lw
+    tkWidget_SetPos( Scroll, rx, g, cw - rx - g, infoY - 2 * g )
+    tkWidget_SetPos( LblInfo, g, infoY, cw - 2 * g, 2 * rh )
+    tkWidget_SetPos( BtnCancel, cw - g - bw, bottomY, bw, rh )
+    tkWidget_SetPos( BtnOk, cw - 2 * (g + bw), bottomY, bw, rh )
+    ' the rows: a label and a box each
+    dim as long lab = tkForm_Scale( Win, REC_LABEL_CX ), w = tkScrollPanel_GetPanelWidth( Scroll )
+    if w <= 0 then w = Scroll->cw
+    dim as long y = 0
+    for i as long = 0 to Rows.Count( ) - 1
+        tkWidget_SetPos( Rows[i].Label, 0, y, lab - g, rh )
+        tkWidget_SetPos( Rows[i].Edit, lab, y, w - lab - g, rh )
+        y += rh + g \ 2
+    next
+    tkScrollPanel_SetContentHeight( Scroll, y )
+end sub
+
+sub RecordDialog.FillList( byval sel as int32 )
+    Updating = true
+    tkListTree_BeginUpdate( Lst )
+    tkListTree_Clear( Lst )
+    for i as int32 = 0 to Recs.Count( ) - 1
+        tkListTree_AddString( Lst, Recs.Label( i ), i )
+    next
+    tkListTree_EndUpdate( Lst )
+    if sel >= Recs.Count( ) then sel = Recs.Count( ) - 1
+    Cur = sel
+    tkListTree_SetCurSel( Lst, sel )
+    Updating = false
+end sub
+
+' Record i's fields, then the list's own.
+sub RecordDialog.Pick( byval i as int32 )
+    Cur = i
+    this.BuildRows( )
+    this.ShowValues( )
+    this.Layout( )
+end sub
+
+sub RecordDialog.BuildRows( )
+    Updating = true
+    if Scroll then tkWidget_Destroy( Scroll )
+    Rows.Clear( )
+    Scroll = tkScrollPanel_Create( tkForm_Widget( Win ), 1 )
+    dim as TK_WIDGET ptr panel_ = tkScrollPanel_GetPanel( Scroll )
+    for pass as int32 = 0 to 1
+        dim as int32 rec = iif( pass = 0, Cur, -1 )
+        if (pass = 0) andalso (Cur < 0) then continue for
+        dim as Array( of rmodel.RProp ) props
+        Recs.FieldsOf( rec, props )
+        for each pr as rmodel.RProp in props
+            dim as RDRow r
+            r.Key = pr.Key
+            r.Kind = pr.Kind
+            r.Rec = rec
+            r.Label = tkLabel_Create( panel_, 1 )
+            tkLabel_SetText( r.Label, pr.Key )        ' the file's own key, as the inspector shows it
+            select case pr.Kind
+            case rmodel.RPropKind.RPropBool
+                r.Edit = tkCheckBox_Create( panel_, Rows.Count( ) + 10 )
+                tkCheckBox_SetCheckChangedCallback( r.Edit, @OnRecCheck )
+            case rmodel.RPropKind.RPropEnum
+                r.Edit = tkComboBox_Create( panel_, Rows.Count( ) + 10 )
+                dim as ustring t = pr.Items & ","
+                dim as long a = 1
+                dim as long b = instr( a, t, "," )
+                while b > 0
+                    tkComboBox_AddItem( r.Edit, mid( t, a, b - a ) )
+                    a = b + 1
+                    b = instr( a, t, "," )
+                wend
+                tkComboBox_SetSelChangeCallback( r.Edit, @OnRecCombo )
+            case else
+                r.Edit = tkTextBox_Create( panel_, Rows.Count( ) + 10, false )
+                tkTextBox_SetEnterPressedCallback( r.Edit, @OnRecEnter )
+                tkTextBox_SetFocusCallback( r.Edit, @OnRecFocus )
+            end select
+            Rows.Push( r )
+        next
+    next
+    Updating = false
+end sub
+
+sub RecordDialog.ShowValues( )
+    Updating = true
+    for i as long = 0 to Rows.Count( ) - 1
+        dim as ustring v = Recs.GetValue( Rows[i].Rec, Rows[i].Key )
+        dim as TK_WIDGET ptr ed = Rows[i].Edit
+        select case Rows[i].Kind
+        case rmodel.RPropKind.RPropBool : tkCheckBox_SetChecked( ed, v = "true" )
+        case rmodel.RPropKind.RPropEnum : tkComboBox_SetCurSel( ed, tkComboBox_FindItemByText( ed, v ) )
+        case else : tkTextBox_SetText( ed, v )
+        end select
+        Rows[i].Text = v
+    next
+    Updating = false
+end sub
+
+function RecordDialog.RowOf( byval w as TK_WIDGET ptr ) as long
+    for i as long = 0 to Rows.Count( ) - 1
+        if Rows[i].Edit = w then return i
+    next
+    return -1
+end function
+
+' One field into the copy; false (why shown, the box back to what it was) when refused.
+function RecordDialog.CommitRow( byval r as long ) as boolean
+    if (r < 0) orelse (r >= Rows.Count( )) orelse Updating then return true
+    dim as TK_WIDGET ptr ed = Rows[r].Edit
+    dim as ustring v
+    select case Rows[r].Kind
+    case rmodel.RPropKind.RPropBool : if tkCheckBox_GetChecked( ed ) then v = "true" else v = "false"
+    case rmodel.RPropKind.RPropEnum : v = tkComboBox_GetText( ed )
+    case else : v = tkTextBox_GetText( ed )
+    end select
+    if v = Rows[r].Text then return true
+    dim as ustring fault = Recs.SetValue( Rows[r].Rec, Rows[r].Key, v )
+    if len( fault ) then
+        tkLabel_SetText( LblInfo, Rows[r].Key & ": " & fault )
+        this.ShowValues( )
+        return false
+    end if
+    tkLabel_SetText( LblInfo, "" )
+    Rows[r].Text = v
+    ' a label may have changed (a name, a group): the list says it again; a footer added or a
+    ' group moved shows in the other fields
+    dim as int32 keep = Cur
+    this.FillList( keep )
+    this.ShowValues( )
+    return true
+end function
+
+function RecordDialog.CommitAll( ) as boolean
+    for r as long = 0 to Rows.Count( ) - 1
+        if this.CommitRow( r ) = false then return false
+    next
+    return true
+end function
+
+sub RecordDialog.AddRecord( )
+    if this.CommitAll( ) = false then exit sub
+    dim as ustring fault = Recs.Add( )
+    if len( fault ) then
+        tkLabel_SetText( LblInfo, fault )
+        exit sub
+    end if
+    this.FillList( Recs.Count( ) - 1 )
+    this.Pick( Cur )
+end sub
+
+sub RecordDialog.RemoveRecord( )
+    if Cur < 0 then exit sub
+    dim as ustring fault = Recs.Remove( Cur )
+    if len( fault ) then
+        tkLabel_SetText( LblInfo, fault )
+        exit sub
+    end if
+    tkLabel_SetText( LblInfo, "" )
+    this.FillList( Cur )
+    this.Pick( Cur )
+end sub
+
+sub RecordDialog.MoveRecord( byval delta as int32 )
+    if (Cur < 0) orelse (this.CommitAll( ) = false) then exit sub
+    if Recs.Move( Cur, delta ) = false then exit sub
+    this.FillList( Cur + delta )
+    this.Pick( Cur )
+end sub

@@ -7,6 +7,20 @@
 
 <h3 align="center">Code you can read. Speed you can measure. Binaries you can ship.</h3>
 
+<p align="center">
+<a href="https://tiko-lang.net/"><b>tiko-lang.net</b></a> ·
+<a href="https://tiko-lang.net/book/">The book</a> ·
+<a href="https://tiko-lang.net/by-example/">By Example</a> ·
+<a href="https://tiko-lang.net/controls.html">tkControls gallery</a> ·
+<a href="wiki/Home.md">Docs</a>
+</p>
+
+<p align="center">
+<a href="https://github.com/PaulSquires/tiko-lang/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/PaulSquires/tiko-lang/ci.yml?branch=master&label=CI&logo=github" alt="CI"></a>
+<a href="https://github.com/PaulSquires/tiko-lang/releases/latest"><img src="https://img.shields.io/badge/release-v0.1.8-orange" alt="release"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0%2B%20%7C%20LGPL--2.1%20runtime-blue" alt="license"></a>
+</p>
+
 **tiko is a compiled, statically typed programming language for building fast, self-contained
 programs.** Its syntax is built to be read: blocks say what they close, keywords are words, and
 there is very little punctuation to learn. Underneath it is a systems language — generics, tuples,
@@ -195,7 +209,7 @@ Every diagnostic has a stable `TKOnnnn` id, a location and a caret. Add
 | | |
 | --- | --- |
 | **Compiles to** | Native x86-64 and arm64 executables, DLLs / shared objects / dylibs and static libraries, through LLVM |
-| **Platforms** | Windows x86-64 (MSVC ABI, no Visual Studio needed), Linux x86-64, Linux arm64 (aarch64, glibc 2.35 or newer), and macOS on Apple Silicon (arm64, macOS 13 or newer) |
+| **Platforms** | Windows x86-64 (MSVC ABI, no Visual Studio needed), Linux x86-64, Linux arm64 (aarch64, glibc 2.35 or newer), and macOS on Apple Silicon (arm64, macOS 13 or newer). Experimental: Android 10 or newer, arm64 phones and the x86-64 emulator, built from Windows as a signed APK ([Android](wiki/Android.md)) |
 | **Types** | Static, with inference (`var`), fixed-width names (`int32`, `uint8`, `float64`, …), generics, tuples, UDTs with methods, properties, operator overloading, single inheritance and virtual methods |
 | **Memory** | Deterministic: scope-based destruction, `defer`, `SharedPtr` / `WeakPtr`; no GC |
 | **Errors** | `Result( of T, E )` and `Optional( of T )`, plus runtime checks up to array bounds and null pointers with `-exx` |
@@ -224,6 +238,44 @@ Reference pages for each are in the [Feature Index](wiki/Feature-Index.md).
 - **tkedit:** a cross platform, gui multi buffer editor, packaged with every toolchain.
 - **Debugging:** `-g` emits DWARF with variables and types, which gdb and lldb can read.
 - **Testing:** the toolchain ships a unit-test framework.
+
+## tkEdit: write it, debug it, draw it
+
+tkEdit is in every toolchain archive for Windows, Linux and macOS. It is one file, written in
+tiko, and has an editor, a debugger and a visual form designer.
+
+<table>
+<tr>
+<td width="33%" valign="top"><a href=".github/readme/tkedit-tabs-themes.png"><img src=".github/readme/tkedit-tabs-themes.png" alt="tkEdit with a project open, three tabs and the project explorer, in light and dark themes"></a></td>
+<td width="33%" valign="top"><a href=".github/readme/tkedit-debug-themes.png"><img src=".github/readme/tkedit-debug-themes.png" alt="tkEdit stopped at a breakpoint, with locals, the call stack and breakpoints"></a></td>
+<td width="33%" valign="top"><a href=".github/readme/tkedit-designer-themes.png"><img src=".github/readme/tkedit-designer-themes.png" alt="The Form Designer: toolbox, a form of real controls, the object tree and properties"></a></td>
+</tr>
+<tr>
+<td valign="top"><b>Editor.</b> Multi-buffer editing with tiko-aware highlighting, a project explorer, light and dark themes, and build-and-run on <kbd>F5</kbd>. <a href="wiki/Quick-Start.md">Get started →</a></td>
+<td valign="top"><b>Debugger.</b> Breakpoints, stepping, run to cursor, and locals, globals and watches as trees. Hover over a name to see its value. It runs on lldb-dap. <a href="wiki/Debugging.md#in-tkedit">Debugging in tkEdit →</a></td>
+<td valign="top"><b>Form Designer.</b> Draw a window from real tkControls, double-click a control to write its handler, and bind controls to your data. The output is ordinary tiko source. <a href="wiki/Form-Designer.md">Form Designer guide →</a></td>
+</tr>
+</table>
+
+## tkControls: GUI controls that look the same on every system
+
+<a href="https://tiko-lang.net/controls.html#tkDataGrid"><img src=".github/readme/tkdatagrid.png" alt="tkDataGrid: 100,000 rows with typed columns, check boxes, progress cells and a multi-row selection"></a>
+
+[tkControls](wiki/Category-tkControls.md) is a GUI toolkit of over 60 owner-drawn controls, written in
+tiko on SDL3. It includes a data grid, charts, a code editor, date and time pickers, printing and
+reports. It ships with the toolchain: `#import "vendor/tkControls/tkButton"` and build.
+
+- **Windows, Linux and macOS** build from one source, with no changes. Every control draws itself.
+- **Android, experimentally:** the same source as an app, with touch, the screen keyboard and BACK
+  ([Android Setup Tutorial](wiki/Android-Setup-Tutorial.md)).
+- **Themeable:** light, dark, or your own palette. The fonts are bundled.
+- **Data-binding aware:** in the Form Designer a form's `LoadFrom` fills its controls from a
+  record, and `SaveTo` validates them and writes them back. Grids and lists fill from an
+  `Array( of T )`, and [tkDataGrid](wiki/tkDataGrid.md) also from an SQLite query.
+- **MPL 2.0:** you can use the controls in closed-source software.
+
+**[Explore the tkControls gallery →](https://tiko-lang.net/controls.html)** Every control has a
+screenshot, a description and a link to its reference page.
 
 ## Getting started
 

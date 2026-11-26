@@ -1,0 +1,780 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkRExpr -- the machine: one switch per op over the context's stack of RX_SLOTs. A slot is
+' written field by field, never copied whole in the hot path, so a number never touches a string.
+' EMPTY in -> EMPTY out for arithmetic and most functions; run-time errors give EMPTY and are
+' counted on the expression (RxRunError).
+#module "tkRExpr"
+
+#import "../tkBind"
+#import "std/chrono"
+
+using tkBind
+using tkCalendar
+using tkTimePanel
+
+declare function RxCompare( byref a as RX_SLOT, byref b as RX_SLOT ) as int32
+declare function RxLike( byref s as const ustring, byref pat as const ustring ) as boolean
+declare sub RxCallFn( byval x as TK_REXPR ptr, byval id as int32, byval nArgs as int32, byval st as RX_SLOT ptr, byref sp as int32 )
+declare sub RxCallHost( byval x as TK_REXPR ptr, byval h as int32, byval nArgs as int32, byval st as RX_SLOT ptr, byref sp as int32 )
+declare sub RxCoerce( byval x as TK_REXPR ptr, byref s as RX_SLOT, byval kind as int32 )
+
+' ---- values <-> slots ------------------------------------------------------------------------
+sub RxValueToSlot( byref v as TK_VALUE, byref s as RX_SLOT )
+    s.k = v.kind
+    select case v.kind
+    case TKV_TEXT : s.s = v.s
+    case TKV_INT : s.i = v.i
+    case TKV_FLOAT : s.n = v.f
+    case TKV_BOOL : s.i = iif( v.b, 1, 0 )
+    case TKV_DATE
+        if v.d.wYear = 0 then
+            s.k = TKV_EMPTY
+        else
+            s.i = RxDaysFromCivil( v.d.wYear, v.d.wMonth, v.d.wDay )
+        end if
+    case TKV_TIME
+        if v.t.wHour < 0 then
+            s.k = TKV_EMPTY
+        else
+            s.i = v.t.wHour * 3600 + v.t.wMinute * 60 + v.t.wSecond
+        end if
+    case else : s.k = TKV_EMPTY
+    end select
+end sub
+
+sub RxSlotToValue( byref s as RX_SLOT, byref v as TK_VALUE )
+    select case s.k
+    case TKV_TEXT : v.SetText( s.s )
+    case TKV_INT : v.SetInt( s.i )
+    case TKV_FLOAT : v.SetFloat( s.n )
+    case TKV_BOOL : v.SetBool( s.i <> 0 )
+    case TKV_DATE
+        dim as int64 y, m, d
+        RxCivilFromDays( s.i, y, m, d )
+        dim as TKDATE dt
+        dt.wYear = y : dt.wMonth = m : dt.wDay = d : dt.wDayOfWeek = RxWeekday( s.i ) - 1
+        v.SetDate( dt )
+    case TKV_TIME
+        dim as TKTIME tm
+        tm.wHour = s.i \ 3600 : tm.wMinute = (s.i \ 60) mod 60 : tm.wSecond = s.i mod 60
+        v.SetTime( tm )
+    case else : v.Clear( )
+    end select
+end sub
+
+private function P2( byval n as int64 ) as string
+    return right( "0" & n, 2 )
+end function
+
+function RxDateText( byval days as int64 ) as string
+    dim as int64 y, m, d
+    RxCivilFromDays( days, y, m, d )
+    return right( "000" & y, 4 ) & "-" & P2( m ) & "-" & P2( d )
+end function
+
+function RxTimeText( byval secs as int64 ) as string
+    return P2( secs \ 3600 ) & ":" & P2( (secs \ 60) mod 60 ) & ":" & P2( secs mod 60 )
+end function
+
+' A slot as plain text: numbers as STR, true / false, dates yyyy-mm-dd, times hh:mm:ss, empty "".
+function RxSlotText( byref s as RX_SLOT ) as ustring
+    select case s.k
+    case TKV_TEXT : return s.s
+    case TKV_INT : return str( s.i )
+    case TKV_FLOAT : return str( s.n )
+    case TKV_BOOL
+        if s.i then return "true"
+        return "false"
+    case TKV_DATE : return RxDateText( s.i )
+    case TKV_TIME : return RxTimeText( s.i )
+    end select
+    return ""
+end function
+
+private sub SetEmpty( byref s as RX_SLOT )
+    s.k = TKV_EMPTY
+end sub
+
+' "yyyy-mm-dd" -> days; FALSE when it is no date.
+function RxParseIsoDate( byref t as const ustring, byref days as int64 ) as boolean
+    dim as ustring s = trim( t )
+    if (len( s ) < 10) orelse (mid( s, 5, 1 ) <> "-") orelse (mid( s, 8, 1 ) <> "-") then return false
+    dim as int64 y = vallng( left( s, 4 ) ), m = vallng( mid( s, 6, 2 ) ), d = vallng( mid( s, 9, 2 ) )
+    if RxValidDate( y, m, d ) = false then return false
+    days = RxDaysFromCivil( y, m, d )
+    return true
+end function
+
+private function TextIsTrue( byref t as const ustring ) as boolean
+    select case lcase( trim( t ) )
+    case "true", "1", "-1", "yes", "on" : return true
+    end select
+    return false
+end function
+
+' A loaded value of another kind than the schema says: converted the way tkBind converts, or EMPTY
+' with a run-time error when it can't be.
+sub RxCoerce( byval x as TK_REXPR ptr, byref s as RX_SLOT, byval kind as int32 )
+    if (s.k = kind) orelse (s.k = TKV_EMPTY) then exit sub
+    select case kind
+    case TKV_TEXT
+        s.s = RxSlotText( s )
+        s.k = TKV_TEXT
+        exit sub
+    case TKV_INT
+        select case s.k
+        case TKV_FLOAT : s.i = clngint( s.n ) : s.k = TKV_INT : exit sub
+        case TKV_BOOL : s.k = TKV_INT : exit sub
+        case TKV_TEXT : s.i = vallng( trim( s.s ) ) : s.k = TKV_INT : exit sub
+        end select
+    case TKV_FLOAT
+        select case s.k
+        case TKV_INT, TKV_BOOL : s.n = s.i : s.k = TKV_FLOAT : exit sub
+        case TKV_TEXT : s.n = val( trim( s.s ) ) : s.k = TKV_FLOAT : exit sub
+        end select
+    case TKV_BOOL
+        select case s.k
+        case TKV_INT : s.i = iif( s.i <> 0, 1, 0 ) : s.k = TKV_BOOL : exit sub
+        case TKV_FLOAT : s.i = iif( s.n <> 0, 1, 0 ) : s.k = TKV_BOOL : exit sub
+        case TKV_TEXT : s.i = iif( TextIsTrue( s.s ), 1, 0 ) : s.k = TKV_BOOL : exit sub
+        end select
+    case TKV_DATE
+        if s.k = TKV_TEXT then
+            dim as int64 dd
+            if RxParseIsoDate( s.s, dd ) then
+                s.i = dd : s.k = TKV_DATE
+                exit sub
+            end if
+        end if
+    end select
+    RxRunError( x, "a value of " & RxKindName( s.k ) & " where " & RxKindName( kind ) & " was expected" )
+    s.k = TKV_EMPTY
+end sub
+
+private sub LoadFrom( byval x as TK_REXPR ptr, byval base_ as TK_VALUE ptr, byval idx as int32, byval kind as int32, _
+                      byref s as RX_SLOT )
+    if base_ = 0 then
+        s.k = TKV_EMPTY
+        exit sub
+    end if
+    dim as TK_VALUE ptr v = @base_[idx]
+    if v->kind = kind then
+        s.k = kind
+        select case kind
+        case TKV_INT : s.i = v->i
+        case TKV_FLOAT : s.n = v->f
+        case TKV_TEXT : s.s = v->s
+        case TKV_BOOL : s.i = iif( v->b, 1, 0 )
+        case else : RxValueToSlot( *v, s )
+        end select
+        exit sub
+    end if
+    RxValueToSlot( *v, s )
+    RxCoerce( x, s, kind )
+end sub
+
+private sub LoadBuiltin( byref ctx as TKREXPR_CTX, byval b as int32, byref s as RX_SLOT )
+    select case b
+    case TKRX_B_PAGENUMBER : s.k = TKV_INT : s.i = ctx.pageNumber
+    case TKRX_B_PAGECOUNT : s.k = TKV_INT : s.i = ctx.pageCount
+    case TKRX_B_ROWNUMBER : s.k = TKV_INT : s.i = ctx.rowNumber
+    case TKRX_B_GROUPROWNUMBER : s.k = TKV_INT : s.i = ctx.groupRowNumber
+    case TKRX_B_REPORTTITLE : s.k = TKV_TEXT : s.s = ctx.reportTitle
+    case TKRX_B_PRINTDATE
+        if ctx.printDate.wYear = 0 then RxClock( ctx )
+        s.k = TKV_DATE
+        s.i = RxDaysFromCivil( ctx.printDate.wYear, ctx.printDate.wMonth, ctx.printDate.wDay )
+    case TKRX_B_PRINTTIME
+        if ctx.printTime.wHour < 0 then RxClock( ctx )
+        s.k = TKV_TIME
+        s.i = ctx.printTime.wHour * 3600 + ctx.printTime.wMinute * 60 + ctx.printTime.wSecond
+    case else : s.k = TKV_EMPTY
+    end select
+end sub
+
+private sub CopySlot( byref d as RX_SLOT, byref s as RX_SLOT )
+    d.k = s.k
+    d.i = s.i
+    d.n = s.n
+    if s.k = TKV_TEXT then d.s = s.s
+end sub
+
+' ---- the machine -------------------------------------------------------------------------------
+sub RxRun( byval x as TK_REXPR ptr, byref ctx as TKREXPR_CTX, byref res as RX_SLOT )
+    dim as int32 need = x->maxDepth + 2
+    if ubound( ctx.stk ) + 1 < need then redim preserve ctx.stk( 0 to need + 7 )
+    dim as RX_SLOT ptr st = @ctx.stk(0)
+    dim as int32 sp = -1, ip = 0, nOps = x->nOps
+    dim as RX_OP ptr ops = @x->ops(0)
+    while ip < nOps
+        dim as RX_OP ptr o = @ops[ip]
+        select case o->op
+        case RXO_NOP
+        case RXO_LDCI
+            sp += 1 : st[sp].k = o->b : st[sp].i = o->i
+        case RXO_LDCF
+            sp += 1 : st[sp].k = TKV_FLOAT : st[sp].n = o->d
+        case RXO_LDCS
+            sp += 1 : st[sp].k = TKV_TEXT : st[sp].s = x->strs(o->a)
+        case RXO_LDE
+            sp += 1 : st[sp].k = TKV_EMPTY
+        case RXO_LDF
+            sp += 1 : LoadFrom( x, ctx.row, o->a, o->b, st[sp] )
+        case RXO_LDP
+            sp += 1 : LoadFrom( x, ctx.params, o->a, o->b, st[sp] )
+        case RXO_LDA
+            sp += 1 : LoadFrom( x, ctx.aggs, o->a, o->b, st[sp] )
+        case RXO_LDB
+            sp += 1 : LoadBuiltin( ctx, o->a, st[sp] )
+        case RXO_I2F
+            dim as RX_SLOT ptr s = @st[sp - o->a]
+            if s->k = TKV_INT then
+                s->n = s->i
+                s->k = TKV_FLOAT
+            end if
+        case RXO_ADDI, RXO_SUBI, RXO_MULI
+            sp -= 1
+            if (st[sp].k = TKV_EMPTY) orelse (st[sp + 1].k = TKV_EMPTY) then
+                st[sp].k = TKV_EMPTY
+            else
+                select case o->op
+                case RXO_ADDI : st[sp].i += st[sp + 1].i
+                case RXO_SUBI : st[sp].i -= st[sp + 1].i
+                case else : st[sp].i *= st[sp + 1].i
+                end select
+                st[sp].k = o->b
+                if o->b = TKV_TIME then st[sp].i = ((st[sp].i mod 86400) + 86400) mod 86400
+            end if
+        case RXO_IDIV, RXO_MODI
+            sp -= 1
+            if (st[sp].k = TKV_EMPTY) orelse (st[sp + 1].k = TKV_EMPTY) then
+                st[sp].k = TKV_EMPTY
+            elseif st[sp + 1].i = 0 then
+                RxRunError( x, "division by zero" )
+                st[sp].k = TKV_EMPTY
+            else
+                if o->op = RXO_IDIV then st[sp].i \= st[sp + 1].i else st[sp].i = st[sp].i mod st[sp + 1].i
+                st[sp].k = TKV_INT
+            end if
+        case RXO_NEGI
+            if st[sp].k <> TKV_EMPTY then st[sp].i = -st[sp].i
+        case RXO_ADDF, RXO_SUBF, RXO_MULF, RXO_DIVF, RXO_POWF
+            sp -= 1
+            if (st[sp].k = TKV_EMPTY) orelse (st[sp + 1].k = TKV_EMPTY) then
+                st[sp].k = TKV_EMPTY
+            else
+                select case o->op
+                case RXO_ADDF : st[sp].n += st[sp + 1].n
+                case RXO_SUBF : st[sp].n -= st[sp + 1].n
+                case RXO_MULF : st[sp].n *= st[sp + 1].n
+                case RXO_DIVF
+                    if st[sp + 1].n = 0 then
+                        RxRunError( x, "division by zero" )
+                        st[sp].k = TKV_EMPTY
+                    else
+                        st[sp].n /= st[sp + 1].n
+                    end if
+                case else
+                    if (st[sp].n < 0) andalso (st[sp + 1].n <> int( st[sp + 1].n )) then
+                        RxRunError( x, "a negative number to a fractional power" )
+                        st[sp].k = TKV_EMPTY
+                    else
+                        st[sp].n = st[sp].n ^ st[sp + 1].n
+                    end if
+                end select
+            end if
+        case RXO_NEGF
+            if st[sp].k <> TKV_EMPTY then st[sp].n = -st[sp].n
+        case RXO_CAT
+            sp -= 1
+            if (o->a = 1) andalso ((st[sp].k = TKV_EMPTY) orelse (st[sp + 1].k = TKV_EMPTY)) then
+                st[sp].k = TKV_EMPTY
+            else
+                if st[sp].k <> TKV_TEXT then
+                    st[sp].s = ""
+                    st[sp].k = TKV_TEXT
+                end if
+                if st[sp + 1].k = TKV_TEXT then st[sp].s &= st[sp + 1].s
+                if len( st[sp].s ) > RX_TEXT_CAP then
+                    st[sp].s = left( st[sp].s, RX_TEXT_CAP )
+                    RxRunError( x, "text longer than " & RX_TEXT_CAP & " characters was cut" )
+                end if
+            end if
+        case RXO_TOTEXT
+            if st[sp].k <> TKV_TEXT then
+                st[sp].s = RxSlotText( st[sp] )
+                st[sp].k = TKV_TEXT
+            end if
+        case RXO_CMP
+            sp -= 1
+            dim as int32 c = RxCompare( st[sp], st[sp + 1] )
+            dim as boolean r
+            if c > -2 then
+                select case o->a
+                case 0 : r = (c = 0)
+                case 1 : r = (c <> 0)
+                case 2 : r = (c < 0)
+                case 3 : r = (c <= 0)
+                case 4 : r = (c > 0)
+                case else : r = (c >= 0)
+                end select
+            end if
+            st[sp].k = TKV_BOOL
+            st[sp].i = iif( r, 1, 0 )
+        case RXO_LIKE
+            sp -= 1
+            dim as boolean r
+            if (st[sp].k = TKV_TEXT) andalso (st[sp + 1].k = TKV_TEXT) then r = RxLike( st[sp].s, st[sp + 1].s )
+            st[sp].k = TKV_BOOL
+            st[sp].i = iif( r, 1, 0 )
+        case RXO_IN
+            dim as int32 base_ = sp - o->a
+            dim as boolean r
+            for j as int32 = 1 to o->a
+                if RxCompare( st[base_], st[base_ + j] ) = 0 then
+                    r = true
+                    exit for
+                end if
+            next
+            sp = base_
+            st[sp].k = TKV_BOOL
+            st[sp].i = iif( r, 1, 0 )
+        case RXO_NOT
+            dim as boolean t = (st[sp].k = TKV_BOOL) andalso (st[sp].i <> 0)
+            st[sp].k = TKV_BOOL
+            st[sp].i = iif( t, 0, 1 )
+        case RXO_XOR
+            sp -= 1
+            dim as boolean ta = (st[sp].k = TKV_BOOL) andalso (st[sp].i <> 0)
+            dim as boolean tb = (st[sp + 1].k = TKV_BOOL) andalso (st[sp + 1].i <> 0)
+            st[sp].k = TKV_BOOL
+            st[sp].i = iif( ta <> tb, 1, 0 )
+        case RXO_JF, RXO_JT
+            dim as boolean t = (st[sp].k = TKV_BOOL) andalso (st[sp].i <> 0)
+            sp -= 1
+            if t = (o->op = RXO_JT) then
+                ip = o->a
+                continue while
+            end if
+        case RXO_JMP
+            ip = o->a
+            continue while
+        case RXO_JNE
+            if st[sp].k <> TKV_EMPTY then
+                ip = o->a
+                continue while
+            end if
+        case RXO_POP
+            sp -= 1
+        case RXO_PUSHB
+            sp += 1 : st[sp].k = TKV_BOOL : st[sp].i = o->i
+        case RXO_FN
+            RxCallFn( x, o->a, o->b, st, sp )
+        case RXO_FMTC
+            st[sp].s = RxFormatSlot( st[sp], x->fmts(o->a) )
+            st[sp].k = TKV_TEXT
+        case RXO_HOST
+            RxCallHost( x, o->a, o->b, st, sp )
+        end select
+        ip += 1
+    wend
+    CopySlot( res, st[0] )
+end sub
+
+' -2: not comparable (empty, or kinds that don't order); else -1 / 0 / 1.
+function RxCompare( byref a as RX_SLOT, byref b as RX_SLOT ) as int32
+    if (a.k = TKV_EMPTY) orelse (b.k = TKV_EMPTY) then return -2
+    if a.k = b.k then
+        select case a.k
+        case TKV_TEXT
+            if a.s = b.s then return 0
+            return iif( a.s < b.s, -1, 1 )
+        case TKV_FLOAT
+            if a.n = b.n then return 0
+            return iif( a.n < b.n, -1, 1 )
+        case else
+            if a.i = b.i then return 0
+            return iif( a.i < b.i, -1, 1 )
+        end select
+    end if
+    if ((a.k = TKV_INT) orelse (a.k = TKV_FLOAT)) andalso ((b.k = TKV_INT) orelse (b.k = TKV_FLOAT)) then
+        dim as float64 x = iif( a.k = TKV_INT, cast( float64, a.i ), a.n )
+        dim as float64 y = iif( b.k = TKV_INT, cast( float64, b.i ), b.n )
+        if x = y then return 0
+        return iif( x < y, -1, 1 )
+    end if
+    return -2
+end function
+
+' VB's Like, case-sensitive: * any run, ? one character, # one digit.
+function RxLike( byref s as const ustring, byref pat as const ustring ) as boolean
+    dim as int32 si = 1, pi_ = 1, star = 0, mark = 0
+    dim as int32 ns = len( s ), np = len( pat )
+    while si <= ns
+        dim as ustring pc = mid( pat, pi_, 1 )
+        if (pi_ <= np) andalso (pc = "*") then
+            star = pi_
+            mark = si
+            pi_ += 1
+            continue while
+        end if
+        dim as ustring c = mid( s, si, 1 )
+        dim as boolean ok
+        if pi_ <= np then
+            if pc = "?" then
+                ok = true
+            elseif pc = "#" then
+                ok = (c >= "0") andalso (c <= "9")
+            else
+                ok = (pc = c)
+            end if
+        end if
+        if ok then
+            si += 1
+            pi_ += 1
+        elseif star then
+            pi_ = star + 1
+            mark += 1
+            si = mark
+        else
+            return false
+        end if
+    wend
+    while (pi_ <= np) andalso (mid( pat, pi_, 1 ) = "*")
+        pi_ += 1
+    wend
+    return pi_ > np
+end function
+
+' ---- built-in functions --------------------------------------------------------------------------
+private function ArgInt( byref s as RX_SLOT ) as int64
+    if s.k = TKV_FLOAT then return cast( int64, fix( s.n ) )
+    return s.i
+end function
+
+private function ArgNum( byref s as RX_SLOT ) as float64
+    if s.k = TKV_FLOAT then return s.n
+    return s.i
+end function
+
+dim shared as ustring gRxMonthFull(1 to 12), gRxMonthAbbr(1 to 12)
+dim shared as boolean gRxMonthsSet
+
+' The names MonthName( ) gives, "January|February|..." and "Jan|Feb|..." (12 each). English by default.
+public sub tkRExpr_SetMonthNames( byref fullNames as const ustring, byref abbrNames as const ustring )
+    dim as ustring f = fullNames & "|", a = abbrNames & "|"
+    for m as int32 = 1 to 12
+        dim as int32 bf = instr( f, "|" ), ba = instr( a, "|" )
+        if bf then
+            gRxMonthFull(m) = left( f, bf - 1 )
+            f = mid( f, bf + 1 )
+        end if
+        if ba then
+            gRxMonthAbbr(m) = left( a, ba - 1 )
+            a = mid( a, ba + 1 )
+        end if
+    next
+    gRxMonthsSet = true
+end sub
+
+private sub EnsureMonths( )
+    if gRxMonthsSet then exit sub
+    tkRExpr_SetMonthNames( "January|February|March|April|May|June|July|August|September|October|November|December", _
+                           "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec" )
+end sub
+
+' days + n months, the day clamped to the new month's last.
+private function AddMonths( byval days as int64, byval nMonths as int64, byref ok as boolean ) as int64
+    dim as int64 y, m, d
+    RxCivilFromDays( days, y, m, d )
+    dim as int64 t = y * 12 + (m - 1) + nMonths
+    dim as int64 y2 = t \ 12, m2 = t mod 12
+    if m2 < 0 then
+        m2 += 12
+        y2 -= 1
+    end if
+    m2 += 1
+    ok = (y2 >= 1) andalso (y2 <= 9999)
+    if ok = false then return 0
+    dim as int64 dim_ = RxDaysInMonth( y2, m2 )
+    if d > dim_ then d = dim_
+    return RxDaysFromCivil( y2, m2, d )
+end function
+
+private function Pad( byref s as const ustring, byval w as int64, byref ch as const ustring, byval bLeft as boolean ) as ustring
+    if (w <= len( s )) orelse (w > RX_TEXT_CAP) then return s
+    dim as ustring c = left( ch, 1 )
+    if len( c ) = 0 then c = " "
+    dim as ustring padding
+    for i as int64 = 1 to w - len( s )
+        padding &= c
+    next
+    if bLeft then return padding & s
+    return s & padding
+end function
+
+private function ReplaceAll( byref s as const ustring, byref a as const ustring, byref b as const ustring ) as ustring
+    if len( a ) = 0 then return s
+    dim as ustring r
+    dim as int32 p = 1
+    do
+        dim as int32 q = instr( p, s, a )
+        if q = 0 then exit do
+        r &= mid( s, p, q - p ) & b
+        p = q + len( a )
+        if len( r ) > RX_TEXT_CAP then exit do
+    loop
+    return r & mid( s, p )
+end function
+
+sub RxCallFn( byval x as TK_REXPR ptr, byval id as int32, byval nArgs as int32, byval st as RX_SLOT ptr, byref sp as int32 )
+    dim as int32 b = sp - nArgs + 1
+    sp = b
+    dim as RX_SLOT ptr a0 = @st[b]
+    ' EMPTY in -> EMPTY out, except for the functions made to read it
+    select case id
+    case RXF_ISEMPTY
+        dim as boolean e = (a0->k = TKV_EMPTY)
+        a0->k = TKV_BOOL
+        a0->i = iif( e, 1, 0 )
+        exit sub
+    case RXF_STR
+        a0->s = RxSlotText( *a0 )
+        a0->k = TKV_TEXT
+        exit sub
+    case RXF_FORMAT
+        dim as ustring mask
+        if st[b + 1].k = TKV_TEXT then mask = st[b + 1].s
+        dim as RX_FMT f = RxParseFmt( mask )
+        a0->s = RxFormatSlot( *a0, f )
+        a0->k = TKV_TEXT
+        exit sub
+    case RXF_CHOOSE
+        dim as int64 k = iif( a0->k = TKV_EMPTY, 0, ArgInt( *a0 ) )
+        if (k >= 1) andalso (k <= nArgs - 1) then
+            CopySlot( *a0, st[b + k] )
+        else
+            a0->k = TKV_EMPTY
+        end if
+        exit sub
+    end select
+    for j as int32 = 0 to nArgs - 1
+        if st[b + j].k = TKV_EMPTY then
+            ' an optional text value left empty is not a reason; anything else is
+            a0->k = TKV_EMPTY
+            exit sub
+        end if
+    next
+    select case id
+    case RXF_BETWEEN
+        dim as int32 c1 = RxCompare( *a0, st[b + 1] ), c2 = RxCompare( *a0, st[b + 2] )
+        a0->k = TKV_BOOL
+        a0->i = iif( (c1 > -2) andalso (c2 > -2) andalso (c1 >= 0) andalso (c2 <= 0), 1, 0 )
+    case RXF_LEN
+        a0->i = len( a0->s ) : a0->k = TKV_INT
+    case RXF_LEFT
+        dim as int64 nc = ArgInt( st[b + 1] )
+        a0->s = left( a0->s, iif( nc < 0, 0, nc ) )
+    case RXF_RIGHT
+        dim as int64 nc = ArgInt( st[b + 1] )
+        a0->s = right( a0->s, iif( nc < 0, 0, nc ) )
+    case RXF_MID
+        dim as int64 st1 = ArgInt( st[b + 1] )
+        if st1 < 1 then st1 = 1
+        if nArgs = 3 then
+            dim as int64 nc = ArgInt( st[b + 2] )
+            a0->s = mid( a0->s, st1, iif( nc < 0, 0, nc ) )
+        else
+            a0->s = mid( a0->s, st1 )
+        end if
+    case RXF_UCASE : a0->s = ucase( a0->s )
+    case RXF_LCASE : a0->s = lcase( a0->s )
+    case RXF_TRIM : a0->s = trim( a0->s )
+    case RXF_LTRIM : a0->s = ltrim( a0->s )
+    case RXF_RTRIM : a0->s = rtrim( a0->s )
+    case RXF_INSTR
+        a0->i = instr( a0->s, st[b + 1].s ) : a0->k = TKV_INT
+    case RXF_INSTR3
+        dim as int64 st1 = ArgInt( *a0 )
+        if st1 < 1 then st1 = 1
+        a0->i = instr( st1, st[b + 1].s, st[b + 2].s ) : a0->k = TKV_INT
+    case RXF_REPLACE
+        a0->s = ReplaceAll( a0->s, st[b + 1].s, st[b + 2].s )
+    case RXF_VAL
+        a0->n = val( trim( a0->s ) ) : a0->k = TKV_FLOAT
+    case RXF_PADLEFT, RXF_PADRIGHT
+        dim as ustring ch = " "
+        if nArgs = 3 then ch = st[b + 2].s
+        a0->s = Pad( a0->s, ArgInt( st[b + 1] ), ch, id = RXF_PADLEFT )
+    case RXF_ABS
+        if a0->k = TKV_FLOAT then a0->n = abs( a0->n ) else a0->i = abs( a0->i )
+    case RXF_INT
+        if a0->k = TKV_FLOAT then a0->i = cast( int64, int( a0->n ) )
+        a0->k = TKV_INT
+    case RXF_FIX
+        if a0->k = TKV_FLOAT then a0->i = cast( int64, fix( a0->n ) )
+        a0->k = TKV_INT
+    case RXF_ROUND
+        dim as float64 v = ArgNum( *a0 )
+        dim as int64 dec = 0
+        if nArgs = 2 then dec = ArgInt( st[b + 1] )
+        if dec < 0 then dec = 0
+        if dec > 15 then dec = 15
+        dim as float64 m = 10 ^ dec
+        a0->n = sgn( v ) * int( abs( v ) * m + 0.5 ) / m
+        a0->k = TKV_FLOAT
+    case RXF_SGN
+        a0->i = sgn( ArgNum( *a0 ) ) : a0->k = TKV_INT
+    case RXF_SQR
+        dim as float64 v = ArgNum( *a0 )
+        if v < 0 then
+            RxRunError( x, "the square root of a negative number" )
+            a0->k = TKV_EMPTY
+        else
+            a0->n = sqr( v ) : a0->k = TKV_FLOAT
+        end if
+    case RXF_MIN2, RXF_MAX2
+        dim as int32 c = RxCompare( *a0, st[b + 1] )
+        if ((id = RXF_MIN2) andalso (c > 0)) orelse ((id = RXF_MAX2) andalso (c < 0)) then CopySlot( *a0, st[b + 1] )
+    case RXF_YEAR, RXF_MONTH, RXF_DAY
+        dim as int64 y, m, d
+        RxCivilFromDays( a0->i, y, m, d )
+        a0->i = iif( id = RXF_YEAR, y, iif( id = RXF_MONTH, m, d ) )
+        a0->k = TKV_INT
+    case RXF_WEEKDAY
+        a0->i = RxWeekday( a0->i ) : a0->k = TKV_INT
+    case RXF_HOUR : a0->i = a0->i \ 3600 : a0->k = TKV_INT
+    case RXF_MINUTE : a0->i = (a0->i \ 60) mod 60 : a0->k = TKV_INT
+    case RXF_SECOND : a0->i = a0->i mod 60 : a0->k = TKV_INT
+    case RXF_DATEADD
+        dim as ustring u = lcase( a0->s )
+        dim as int64 nn = ArgInt( st[b + 1] ), d0 = st[b + 2].i, r
+        dim as boolean ok = true
+        select case u
+        case "d", "y", "w" : r = d0 + nn
+        case "ww" : r = d0 + 7 * nn
+        case "m" : r = AddMonths( d0, nn, ok )
+        case "q" : r = AddMonths( d0, 3 * nn, ok )
+        case "yyyy" : r = AddMonths( d0, 12 * nn, ok )
+        case else
+            RxRunError( x, "DateAdd: """ & u & """ is no unit" )
+            ok = false
+        end select
+        if ok then
+            dim as int64 y, m, d
+            RxCivilFromDays( r, y, m, d )
+            ok = (y >= 1) andalso (y <= 9999)
+        end if
+        if ok then
+            a0->i = r : a0->k = TKV_DATE
+        else
+            a0->k = TKV_EMPTY
+        end if
+    case RXF_DATEDIFF
+        dim as ustring u = lcase( a0->s )
+        dim as int64 da = st[b + 1].i, db = st[b + 2].i
+        dim as int64 ya, ma, dda, yb, mb, ddb
+        RxCivilFromDays( da, ya, ma, dda )
+        RxCivilFromDays( db, yb, mb, ddb )
+        a0->k = TKV_INT
+        select case u
+        case "d", "y", "w" : a0->i = db - da
+        case "ww" : a0->i = (db - da) \ 7
+        case "m" : a0->i = (yb * 12 + mb) - (ya * 12 + ma)
+        case "q" : a0->i = (yb * 4 + (mb - 1) \ 3) - (ya * 4 + (ma - 1) \ 3)
+        case "yyyy" : a0->i = yb - ya
+        case else
+            RxRunError( x, "DateDiff: """ & u & """ is no unit" )
+            a0->k = TKV_EMPTY
+        end select
+    case RXF_DATESERIAL
+        dim as int64 y = ArgInt( *a0 ), m = ArgInt( st[b + 1] ), d = ArgInt( st[b + 2] )
+        dim as int64 t = y * 12 + (m - 1)
+        dim as int64 y2 = t \ 12, m2 = t mod 12
+        if m2 < 0 then
+            m2 += 12
+            y2 -= 1
+        end if
+        dim as int64 r = RxDaysFromCivil( y2, m2 + 1, 1 ) + d - 1
+        dim as int64 yy, mm, dd
+        RxCivilFromDays( r, yy, mm, dd )
+        if (yy < 1) orelse (yy > 9999) then
+            RxRunError( x, "DateSerial: the year is out of range" )
+            a0->k = TKV_EMPTY
+        else
+            a0->i = r : a0->k = TKV_DATE
+        end if
+    case RXF_TIMESERIAL
+        dim as int64 t = ArgInt( *a0 ) * 3600 + ArgInt( st[b + 1] ) * 60 + ArgInt( st[b + 2] )
+        a0->i = ((t mod 86400) + 86400) mod 86400 : a0->k = TKV_TIME
+    case RXF_MONTHNAME
+        dim as int64 m = ArgInt( *a0 )
+        EnsureMonths( )
+        if (m < 1) orelse (m > 12) then
+            a0->k = TKV_EMPTY
+        else
+            if (nArgs = 2) andalso (st[b + 1].i <> 0) then a0->s = gRxMonthAbbr(m) else a0->s = gRxMonthFull(m)
+            a0->k = TKV_TEXT
+        end if
+    case RXF_CINT
+        select case a0->k
+        case TKV_INT
+        case TKV_FLOAT : a0->i = clngint( a0->n )
+        case TKV_BOOL
+        case TKV_TEXT : a0->i = vallng( trim( a0->s ) )
+        case else
+            RxRunError( x, "CInt of " & RxKindName( a0->k ) )
+            a0->k = TKV_EMPTY
+            exit sub
+        end select
+        a0->k = TKV_INT
+    case RXF_CFLOAT
+        select case a0->k
+        case TKV_INT, TKV_BOOL : a0->n = a0->i
+        case TKV_FLOAT
+        case TKV_TEXT : a0->n = val( trim( a0->s ) )
+        case else
+            RxRunError( x, "CFloat of " & RxKindName( a0->k ) )
+            a0->k = TKV_EMPTY
+            exit sub
+        end select
+        a0->k = TKV_FLOAT
+    case RXF_CBOOL
+        select case a0->k
+        case TKV_INT : a0->i = iif( a0->i <> 0, 1, 0 )
+        case TKV_FLOAT : a0->i = iif( a0->n <> 0, 1, 0 )
+        case TKV_BOOL
+        case TKV_TEXT : a0->i = iif( TextIsTrue( a0->s ), 1, 0 )
+        case else
+            RxRunError( x, "CBool of " & RxKindName( a0->k ) )
+            a0->k = TKV_EMPTY
+            exit sub
+        end select
+        a0->k = TKV_BOOL
+    case RXF_CDATE
+        dim as int64 dd
+        if RxParseIsoDate( a0->s, dd ) then
+            a0->i = dd : a0->k = TKV_DATE
+        else
+            a0->k = TKV_EMPTY
+        end if
+    end select
+end sub
+
+sub RxCallHost( byval x as TK_REXPR ptr, byval h as int32, byval nArgs as int32, byval st as RX_SLOT ptr, byref sp as int32 )
+    dim as int32 b = sp - nArgs + 1
+    sp = b
+    dim as TK_VALUE args(0 to 31), r
+    for j as int32 = 0 to nArgs - 1
+        RxSlotToValue( st[b + j], args(j) )
+    next
+    dim as RX_HostFunc fp = gRxHostProc(h)
+    fp( @args(0), nArgs, r )
+    RxValueToSlot( r, st[b] )
+    if st[b].k <> TKV_EMPTY then RxCoerce( x, st[b], gRxHostRet(h) )
+end sub

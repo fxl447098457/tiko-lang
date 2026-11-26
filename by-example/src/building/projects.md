@@ -52,7 +52,7 @@ link: out/debug/greeter.exe is up to date
 | `tiko check` | reports every error and warning a build would, and writes nothing |
 | `tiko clean` | removes what `tiko build` wrote |
 
-Two more arrive after tiko 0.1.6, the toolchain this site is pinned to:
+Two more:
 [`tiko test`](../testing/tikotest.md) builds a project's tests into one
 program and runs it, and [`tiko doc`](../modules/documenting.md) writes its
 modules' documentation.

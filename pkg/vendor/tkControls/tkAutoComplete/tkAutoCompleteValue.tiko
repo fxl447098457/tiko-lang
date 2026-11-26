@@ -1,0 +1,280 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkAutoComplete, part three: modes and the value (phase A3 of docs/tkControls/AUTOCOMPLETE.md
+' sections 6.2 and 6.4). The types and core are in tkAutoComplete.tiko, the face in
+' tkAutoCompleteFace.tiko; this file sorts last.
+'
+' MODES. SUGGEST lists; APPEND completes the edit inline with the rest of the first enabled item
+' whose text starts with what was typed, SELECTED so the next character overtypes it, and lists
+' nothing; SUGGESTAPPEND does both (the list filters by what was typed, not the completion). The
+' completion is skipped after Backspace / Delete (or deleting would be impossible), during IME
+' composition, and when the caret is not at the end. It goes in through ReplaceSel, so it is
+' undoable and the typed prefix keeps the user's case. Escape on a completion removes it.
+'
+' THE VALUE. FREETEXT (the default): the value is the text; the selected item is the one last
+' committed, until the user types. LIMITTOLIST (a lookup): the value is an item. When the user
+' leaves the box (focus out, Enter, Tab) the text is RESOLVED: the selected item's own text, or
+' empty, stands; a text equal to an item's (case-blind) selects that item, as a commit does;
+' anything else fires NotInList( text, Action ):
+'   AC_REVERT (the default)  the text goes back to the selected item's, or empty
+'   AC_ACCEPT                the host added an item for it: looked up again, selected if there
+'   AC_KEEP                  the text stays, unselected, with the error tint, until the next change
+' LIMITTOLIST also turns AutoHighlight and ShowAllOnEmpty on (each settable after). GetSelectedId
+' is NoValueId (0 by default) while nothing is selected.
+#module "tkAutoComplete"
+
+#import "../tkHost" public
+#import "../tkTextBox" public
+#import "../tkMatch" public
+using tkHost
+using tkTextBox
+using tkMatch
+
+' The text typed went in: complete it inline when the mode says so. Called from the edit's change.
+sub AcTryAppend( byval p as TKAUTOCOMPLETE_STATE ptr )
+    p->nAppendItem = -1
+    if (p->nMode <> TKAC_MODE_APPEND) andalso (p->nMode <> TKAC_MODE_SUGGESTAPPEND) then exit sub
+    if p->bDeleting orelse (len( tkTextBox_GetComposition( p->wEdit ) ) > 0) then exit sub
+    dim as long nBytes = tkTextBox_GetTextLength( p->wEdit )
+    if (nBytes = 0) orelse (tkTextBox_GetCaret( p->wEdit ) <> nBytes) then exit sub
+    dim as ustring typed = p->sQuery
+    dim as ustring k = iif( p->bCaseSensitive, typed, tkMatch_Fold( typed ) )
+    dim as long n = len( typed )
+    for i as long = 0 to p->nItems - 1
+        if p->itEnabled(i) andalso (len( p->itText(i) ) > n) then
+            dim as ustring ik = iif( p->bCaseSensitive, p->itText(i), p->itKey(i) )
+            if left( ik, n ) = k then
+                tkTextBox_ReplaceSel( p->wEdit, mid( p->itText(i), n + 1 ) )      ' silent, undoable
+                tkTextBox_SetSel( p->wEdit, nBytes, -1 )
+                p->nAppendItem = i
+                exit sub
+            end if
+        end if
+    next
+end sub
+
+' Is the edit showing an inline completion (the selection running to the end, past the typed text)?
+function AcHasAppend( byval p as TKAUTOCOMPLETE_STATE ptr ) as boolean
+    if p->nAppendItem < 0 then return false
+    dim as integer s0, s1
+    tkTextBox_GetSel( p->wEdit, s0, s1 )
+    return (s1 > s0) andalso (s1 = tkTextBox_GetTextLength( p->wEdit ))
+end function
+
+' Escape on a completion: the typed text alone.
+sub AcDropAppend( byval p as TKAUTOCOMPLETE_STATE ptr )
+    tkTextBox_ReplaceSel( p->wEdit, "" )
+    p->nAppendItem = -1
+end sub
+
+' The first item whose text is text (case-blind), or -1.
+private function AcExact( byval p as TKAUTOCOMPLETE_STATE ptr, byref text as const ustring ) as long
+    dim as ustring k = tkMatch_Fold( text )
+    for i as long = 0 to p->nItems - 1
+        if p->itEnabled(i) andalso (p->itKey(i) = k) then return i
+    next
+    return -1
+end function
+
+' The user picked item idx without the list (a full match, an accepted completion): as a commit.
+sub AcSelectByUser( byval p as TKAUTOCOMPLETE_STATE ptr, byval idx as long )
+    p->bError = false
+    p->nAppendItem = -1
+    tkTextBox_SetText( p->wEdit, p->itText(idx) )
+    p->sQuery = p->itText(idx)
+    p->nSel = idx
+    p->bExtSel = false
+    AcEditColors( p )
+    AcFaceSync( p )
+    if p->TextChangedCallback then p->TextChangedCallback( p->hWin, true )
+    if p->ItemSelectedCallback then p->ItemSelectedCallback( p->hWin, idx, p->itId(idx) )
+    AcSearchNow( p )
+end sub
+
+' The user is leaving the box (focus out, Enter, Tab): settle the value.
+sub AcResolve( byval p as TKAUTOCOMPLETE_STATE ptr )
+    dim as ustring text = tkTextBox_GetText( p->wEdit )
+    ' a supplied row's value (or SetSelectedItem's) stands while its text does
+    if p->bExtSel andalso (text = p->sSelText) then exit sub
+    ' the feeds: a full match among the rows the host gave last selects that row
+    if AcSupplied( p ) andalso (len( text ) > 0) then
+        if AcSelectSuppliedText( p, text ) then exit sub
+    end if
+    if (p->nSel >= 0) andalso (p->nSel < p->nItems) then
+        if text = p->itText(p->nSel) then exit sub
+    end if
+    ' FREETEXT: a completion accepted, or a full match typed, selects its item; else free text
+    dim as long idx = AcExact( p, text )
+    if p->nPolicy = TKAC_VALUE_FREETEXT then
+        if idx >= 0 then AcSelectByUser( p, idx )
+        exit sub
+    end if
+    if len( text ) = 0 then
+        ' a lookup emptied: no value
+        if (p->nSel >= 0) orelse p->bExtSel then
+            p->nSel = -1
+            p->bExtSel = false
+            if p->ItemSelectedCallback then p->ItemSelectedCallback( p->hWin, -1, p->nNoValueId )
+        end if
+        exit sub
+    end if
+    if idx >= 0 then AcSelectByUser( p, idx ) : exit sub
+    dim as long action = AC_REVERT
+    if p->NotInListCallback then p->NotInListCallback( p->hWin, text, action )
+    if action = AC_ACCEPT then
+        idx = AcExact( p, text )
+        if idx >= 0 then AcSelectByUser( p, idx ) : exit sub
+        action = AC_REVERT
+    end if
+    if action = AC_KEEP then
+        p->nSel = -1
+        p->bError = true
+        AcEditColors( p )
+        exit sub
+    end if
+    ' AC_REVERT: the value stands; its text comes back (silently -- the value did not change)
+    p->bError = false
+    p->nAppendItem = -1
+    dim as ustring back = ""
+    if p->nSel >= 0 then back = p->itText(p->nSel)
+    if p->bExtSel then back = p->sSelText
+    tkTextBox_SetText( p->wEdit, back )
+    p->sQuery = back
+    AcEditColors( p )
+    AcFaceSync( p )
+end sub
+
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' ---- text and value ---------------------------------------------------------------------------
+public function tkAutoComplete_GetText( byval hAC as TK_WIDGET ptr ) as ustring
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then return ""
+    return tkTextBox_GetText( p->wEdit )
+end function
+
+' Silent: closes the list, filters nothing, selects nothing.
+public sub tkAutoComplete_SetText( byval hAC as TK_WIDGET ptr, byval s as ustring )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->bPreviewed = false
+    AcCloseList( p )
+    tkTextBox_SetText( p->wEdit, s )
+    p->sQuery = s
+    p->nSel = -1
+    p->bExtSel = false
+    p->nAppendItem = -1
+    if p->bError then p->bError = false : AcEditColors( p )
+    AcFaceSync( p )
+end sub
+
+' What the user typed -- not a row's text the arrows put in.
+public function tkAutoComplete_GetQueryText( byval hAC as TK_WIDGET ptr ) as ustring
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then return ""
+    return p->sQuery
+end function
+
+public function tkAutoComplete_GetSelectedIndex( byval hAC as TK_WIDGET ptr ) as long
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->nSel, -1 )
+end function
+
+' Silent: the item's text into the edit (-1: none selected, the text stays).
+public function tkAutoComplete_SetSelectedIndex( byval hAC as TK_WIDGET ptr, byval idx as long ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then return false
+    if idx = -1 then p->nSel = -1 : return true
+    if AcValid( p, idx ) = false then return false
+    tkAutoComplete_SetText( hAC, p->itText(idx) )
+    p->nSel = idx
+    return true
+end function
+
+' The selected item's id; NoValueId (0 by default) when none.
+public function tkAutoComplete_GetSelectedId( byval hAC as TK_WIDGET ptr ) as longint
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then return 0
+    if p->bExtSel then return p->nSelId
+    if AcValid( p, p->nSel ) = false then return p->nNoValueId
+    return p->itId(p->nSel)
+end function
+
+public sub tkAutoComplete_SetMode( byval hAC as TK_WIDGET ptr, byval nMode as long )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    AcCloseList( p )
+    p->nMode = nMode
+end sub
+
+public function tkAutoComplete_GetMode( byval hAC as TK_WIDGET ptr ) as long
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->nMode, 0 )
+end function
+
+' LIMITTOLIST turns AutoHighlight and ShowAllOnEmpty on, FREETEXT off; each can be set after.
+public sub tkAutoComplete_SetValuePolicy( byval hAC as TK_WIDGET ptr, byval nPolicy as long )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->nPolicy = nPolicy
+    dim as boolean bLookup = (nPolicy = TKAC_VALUE_LIMITTOLIST)
+    p->bAutoHighlight = bLookup
+    p->bShowAllOnEmpty = bLookup
+end sub
+
+public function tkAutoComplete_GetValuePolicy( byval hAC as TK_WIDGET ptr ) as long
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->nPolicy, 0 )
+end function
+
+' Down (or the drop button) on an empty box lists every item.
+public sub tkAutoComplete_SetShowAllOnEmpty( byval hAC as TK_WIDGET ptr, byval b as boolean )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p then p->bShowAllOnEmpty = b
+end sub
+
+public function tkAutoComplete_GetShowAllOnEmpty( byval hAC as TK_WIDGET ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return (p <> 0) andalso p->bShowAllOnEmpty
+end function
+
+' What GetSelectedId returns while nothing is selected (0 by default).
+public sub tkAutoComplete_SetNoValueId( byval hAC as TK_WIDGET ptr, byval id as longint )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p then p->nNoValueId = id
+end sub
+
+public function tkAutoComplete_GetNoValueId( byval hAC as TK_WIDGET ptr ) as longint
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->nNoValueId, 0 )
+end function
+
+' Silent: the item with this id, its text into the edit. FALSE (and no value, an empty box) when no
+' item has it.
+public function tkAutoComplete_SetSelectedId( byval hAC as TK_WIDGET ptr, byval id as longint ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then return false
+    dim as long idx = tkAutoComplete_FindItemById( hAC, id )
+    if idx < 0 then
+        tkAutoComplete_SetText( hAC, "" )
+        return false
+    end if
+    return tkAutoComplete_SetSelectedIndex( hAC, idx )
+end function
+
+' The error tint is up (LIMITTOLIST, NotInList said AC_KEEP).
+public function tkAutoComplete_GetError( byval hAC as TK_WIDGET ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return (p <> 0) andalso p->bError
+end function
+
+public sub tkAutoComplete_SetNotInListCallback( byval hAC as TK_WIDGET ptr, byval cb as AC_NotInListSub )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p then p->NotInListCallback = cb
+end sub

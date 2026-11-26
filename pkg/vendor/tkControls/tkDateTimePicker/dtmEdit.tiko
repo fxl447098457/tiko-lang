@@ -1,0 +1,478 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDateTimePicker -- the field's editing: stepping a segment, the digit-entry state machine (date
+' segments added to tkTimePicker's), month-name type-ahead, the keys, the clipboard, the spin
+' pair's auto-repeat and the wheel. Every change goes through DtmUserSet and notifies LAST, once.
+'
+' DIGITS: a first digit that no second could extend completes at once (hour24 3-9, hour12 2-9,
+' minute / second 6-9, month 2-9, day 4-9); the second completes; an impossible pair starts over
+' with its last digit. A year takes 4 digits (yy: 2; a short entry is 2000 + it). A fraction takes
+' its pattern's count. An entry also completes on : . - / or space (and moves on), on a pause, on
+' Enter, on the arrows and when the focus leaves. A month NAME segment takes letters too: each one
+' narrows to the first month whose name starts with what was typed. A weekday is never edited.
+#module "tkDateTimePicker"
+
+#import "../tkHost"
+#import "../tkTimePanel"
+using tkHost
+using tkTimePanel
+
+' The step of a minute / second segment when it is the finest time segment shown; 1 else.
+function DtmSegStep( byval p as TKDATETIMEPICKER_STATE ptr, byval kind as long ) as long
+    dim as boolean haveSec = false
+    for i as long = 0 to p->nSegs - 1
+        if p->segs( i ).kind = TKTP_SEG_SECOND then haveSec = true
+    next
+    select case kind
+    case TKTP_SEG_SECOND
+        return iif( p->nStep < 60, p->nStep, 1 )
+    case TKTP_SEG_MINUTE
+        if haveSec orelse (p->nStep < 60) then return 1
+        dim as long k = p->nStep \ 60
+        return iif( k > 59, 59, k )
+    end select
+    return 1
+end function
+
+' t with segment i moved one step (dirn +1 / -1), wrapping inside the segment with no carry.
+' bPage: PgUp / PgDn (10 minutes / seconds, an hour, the half day, 10 years, 3 months, a week).
+' Not clamped: DtmFinish clamps the day to the month and the value to the range.
+function DtmStepped( byval p as TKDATETIMEPICKER_STATE ptr, byval t as TKDATETIME, byval i as long, _
+                     byval dirn as long, byval bPage as boolean ) as TKDATETIME
+    dim as long kind = p->segs( i ).kind
+    select case kind
+    case TKTP_SEG_YEAR
+        t.wYear += dirn * iif( bPage, 10, 1 )
+        if t.wYear < 1 then t.wYear = 1
+        if t.wYear > 9999 then t.wYear = 9999
+    case TKTP_SEG_MONTH, TKTP_SEG_MONTHNAME
+        t.wMonth = ((t.wMonth - 1 + dirn * iif( bPage, 3, 1 )) mod 12 + 12) mod 12 + 1
+    case TKTP_SEG_DAY
+        dim as long dim_ = tkTimePanel_DaysInMonth( t.wYear, t.wMonth )
+        t.wDay = ((t.wDay - 1 + dirn * iif( bPage, 7, 1 )) mod dim_ + dim_) mod dim_ + 1
+    case TKTP_SEG_HOUR24
+        t.wHour = (t.wHour + dirn + 24) mod 24
+    case TKTP_SEG_HOUR12
+        dim as long half = iif( t.wHour >= 12, 12, 0 )
+        t.wHour = ((t.wHour mod 12) + dirn + 12) mod 12 + half
+    case TKTP_SEG_MINUTE, TKTP_SEG_SECOND
+        dim as long v = iif( kind = TKTP_SEG_MINUTE, t.wMinute, t.wSecond )
+        if bPage then
+            v = (v + dirn * 10 + 60) mod 60
+        else
+            dim as long st = DtmSegStep( p, kind )
+            if dirn > 0 then
+                v = ((v \ st) + 1) * st
+                if v > 59 then v = 0
+            else
+                if v = 0 then
+                    v = (59 \ st) * st
+                else
+                    v = ((v + st - 1) \ st - 1) * st
+                end if
+            end if
+        end if
+        if kind = TKTP_SEG_MINUTE then t.wMinute = v else t.wSecond = v
+    case TKTP_SEG_FRACTION
+        dim as long unit = iif( p->segs( i ).nLen = 1, 100, iif( p->segs( i ).nLen = 2, 10, 1 ) )
+        t.wMilliseconds = (t.wMilliseconds + dirn * unit + 1000) mod 1000
+    case TKTP_SEG_AMPM
+        t.wHour = (t.wHour + 12) mod 24
+    end select
+    return t
+end function
+
+' ---- digit entry ----------------------------------------------------------------------------------
+' The largest first digit that a second digit could still extend (-1: a year, which counts digits).
+function DtmFirstMax( byval kind as long ) as long
+    select case kind
+    case TKTP_SEG_HOUR24 : return 2
+    case TKTP_SEG_HOUR12, TKTP_SEG_MONTH, TKTP_SEG_MONTHNAME : return 1
+    case TKTP_SEG_DAY : return 3
+    case TKTP_SEG_YEAR : return -1
+    end select
+    return 5
+end function
+
+function DtmValidFor( byval kind as long, byval v as long ) as boolean
+    select case kind
+    case TKTP_SEG_HOUR24 : return (v >= 0) andalso (v <= 23)
+    case TKTP_SEG_HOUR12, TKTP_SEG_MONTH, TKTP_SEG_MONTHNAME : return (v >= 1) andalso (v <= 12)
+    case TKTP_SEG_DAY : return (v >= 1) andalso (v <= 31)
+    case TKTP_SEG_YEAR : return (v >= 1) andalso (v <= 9999)
+    end select
+    return (v >= 0) andalso (v <= 59)
+end function
+
+' A year as typed: 4 digits as they are; fewer (or yy) are 2000 + them.
+function DtmYearOf( byval p as TKDATETIMEPICKER_STATE ptr, byval i as long, byref digits as const string ) as long
+    dim as long v = valint( digits )
+    if (len( digits ) >= 4) andalso (p->segs( i ).nLen >= 4) then return v
+    if len( digits ) <= 2 then return 2000 + v
+    return v
+end function
+
+' Segment i set to v as the user typed it. TRUE when the value changed (the caller notifies).
+function DtmCompleteSeg( byval p as TKDATETIMEPICKER_STATE ptr, byval i as long, byval v as long, byval bAdvance as boolean ) as boolean
+    p->sEntry = ""
+    tkWidget_KillTimer( p->hWin, DTM_TIMER_ENTRY )
+    dim as TKDATETIME t = DtmBase( p )
+    select case p->segs( i ).kind
+    case TKTP_SEG_YEAR     : t.wYear = v
+    case TKTP_SEG_MONTH, TKTP_SEG_MONTHNAME : t.wMonth = v
+    case TKTP_SEG_DAY      : t.wDay = v
+    case TKTP_SEG_HOUR24   : t.wHour = v
+    case TKTP_SEG_HOUR12   : t.wHour = (v mod 12) + iif( t.wHour >= 12, 12, 0 )
+    case TKTP_SEG_MINUTE   : t.wMinute = v
+    case TKTP_SEG_SECOND   : t.wSecond = v
+    case TKTP_SEG_FRACTION : t.wMilliseconds = v
+    end select
+    dim as boolean bChanged = DtmUserSet( p, DtmFinish( p, t ) )
+    if bAdvance then
+        dim as long nx = DtmNextSeg( p, i, 1 )
+        if nx >= 0 then p->nFocusSeg = nx
+    end if
+    DtmRefresh( p )
+    return bChanged
+end function
+
+' A pending entry completed as it stands (no advance); one that is no value is dropped. Letters in a
+' month name were applied as they came: they are simply forgotten. TRUE when the value changed.
+function DtmCommitEntry( byval p as TKDATETIMEPICKER_STATE ptr ) as boolean
+    if len( p->sEntry ) = 0 then return false
+    dim as long i = p->nFocusSeg
+    if DtmIsEditable( p, i ) = false then p->sEntry = "" : return false
+    dim as long kind = p->segs( i ).kind
+    dim as string e = p->sEntry
+    dim as long v
+    if (len( e ) > 0) andalso ((asc( e, 1 ) < 48) orelse (asc( e, 1 ) > 57)) then
+        p->sEntry = ""
+        tkWidget_KillTimer( p->hWin, DTM_TIMER_ENTRY )
+        DtmRefresh( p )
+        return false
+    end if
+    select case kind
+    case TKTP_SEG_FRACTION : v = valint( left( e & "00", 3 ) )
+    case TKTP_SEG_YEAR     : v = DtmYearOf( p, i, e )
+    case else              : v = valint( e )
+    end select
+    if DtmValidFor( kind, v ) = false then
+        p->sEntry = ""
+        tkWidget_KillTimer( p->hWin, DTM_TIMER_ENTRY )
+        DtmRefresh( p )
+        return false
+    end if
+    return DtmCompleteSeg( p, i, v, false )
+end function
+
+' One digit typed. TRUE when the value changed.
+function DtmDigit( byval p as TKDATETIMEPICKER_STATE ptr, byval d as long ) as boolean
+    dim as long i = p->nFocusSeg
+    if DtmIsEditable( p, i ) = false then return false
+    dim as long kind = p->segs( i ).kind
+    if kind = TKTP_SEG_AMPM then return false
+    ' letters typed into a month name before: a digit starts over
+    if (len( p->sEntry ) > 0) andalso ((asc( p->sEntry, 1 ) < 48) orelse (asc( p->sEntry, 1 ) > 57)) then p->sEntry = ""
+    tkWidget_SetTimer( p->hWin, DTM_TIMER_ENTRY, TKTP_TYPE_TIMEOUT )
+    if kind = TKTP_SEG_FRACTION then
+        p->sEntry &= str( d )
+        if len( p->sEntry ) >= p->segs( i ).nLen then return DtmCompleteSeg( p, i, valint( left( p->sEntry & "00", 3 ) ), true )
+        DtmRefresh( p )
+        return false
+    end if
+    if kind = TKTP_SEG_YEAR then
+        p->sEntry &= str( d )
+        if len( p->sEntry ) >= iif( p->segs( i ).nLen >= 4, 4, 2 ) then
+            dim as long y = DtmYearOf( p, i, p->sEntry )
+            if DtmValidFor( kind, y ) then return DtmCompleteSeg( p, i, y, true )
+            p->sEntry = ""
+        end if
+        DtmRefresh( p )
+        return false
+    end if
+    if len( p->sEntry ) = 0 then
+        if d > DtmFirstMax( kind ) then return DtmCompleteSeg( p, i, d, true )
+        p->sEntry = str( d )
+        DtmRefresh( p )
+        return false
+    end if
+    dim as long v = valint( p->sEntry ) * 10 + d
+    if DtmValidFor( kind, v ) then return DtmCompleteSeg( p, i, v, true )
+    ' no such value: this digit starts over (Win32)
+    p->sEntry = ""
+    return DtmDigit( p, d )
+end function
+
+' ---- letters -------------------------------------------------------------------------------------------
+' The designator from a letter: 0 AM, 1 PM, -1 none.
+function DtmLetterHalf( byval p as TKDATETIMEPICKER_STATE ptr, byval key as long ) as long
+    if (key < SDLK_A) orelse (key > SDLK_A + 25) then return -1
+    dim as string ch = chr( key )
+    if lcase( left( p->sAm, 1 ) ) = ch then return 0
+    if lcase( left( p->sPm, 1 ) ) = ch then return 1
+    if ch = "a" then return 0
+    if ch = "p" then return 1
+    return -1
+end function
+
+function DtmHasAmPm( byval p as TKDATETIMEPICKER_STATE ptr ) as boolean
+    for i as long = 0 to p->nSegs - 1
+        if p->segs( i ).kind = TKTP_SEG_AMPM then return true
+    next
+    return false
+end function
+
+' A letter into a month name: the first month whose full or short name starts with what was typed
+' (within the pause); none -- this letter alone. 0 when nothing matches. Sets p->sEntry.
+function DtmMonthFromLetter( byval p as TKDATETIMEPICKER_STATE ptr, byval key as long ) as long
+    if (key < SDLK_A) orelse (key > SDLK_A + 25) then return 0
+    dim as ulongint now_ = SDL_GetTicks( )
+    if (len( p->sEntry ) > 0) andalso ((asc( p->sEntry, 1 ) >= 48) andalso (asc( p->sEntry, 1 ) <= 57)) then p->sEntry = ""
+    if now_ - p->nEntryTick > TKTP_TYPE_TIMEOUT then p->sEntry = ""
+    p->nEntryTick = now_
+    for attempt as long = 1 to 2
+        dim as ustring want = lcase( p->sEntry & chr( key ) )
+        for m as long = 1 to 12
+            if (left( lcase( p->names.month( m ) ), len( want ) ) = want) _
+               orelse (left( lcase( p->names.monthShort( m ) ), len( want ) ) = want) then
+                p->sEntry = want
+                return m
+            end if
+        next
+        if len( p->sEntry ) = 0 then exit for
+        p->sEntry = ""
+    next
+    p->sEntry = ""
+    return 0
+end function
+
+' ---- keys ----------------------------------------------------------------------------------------------
+' Step the segment as the user (Up / Down / spin / wheel). TRUE when the value changed.
+function DtmUserStep( byval p as TKDATETIMEPICKER_STATE ptr, byval i as long, byval dirn as long, byval bPage as boolean ) as boolean
+    if DtmIsEditable( p, i ) = false then return false
+    if tkTimePanel_IsDateTime( p->tm ) = false then
+        ' the first step of an empty field lands on today 00:00, clamped
+        return DtmUserSet( p, DtmFinish( p, DtmBase( p ) ) )
+    end if
+    return DtmUserSet( p, DtmFinish( p, DtmStepped( p, p->tm, i, dirn, bPage ) ) )
+end function
+
+' The pattern's text (not FormatDateTime's), which pastes back.
+function DtmCopy( byval p as TKDATETIMEPICKER_STATE ptr ) as boolean
+    if tkTimePanel_IsDateTime( p->tm ) = false then return false
+    tkHost_SetClipboardText( tkTimePanel_FormatPatternDT( p->tm, p->sPattern, p->sAm, p->sPm, @p->names ) )
+    return true
+end function
+
+' Pasted text: a date and time (ISO date first), else a time alone, which keeps the date.
+function DtmPaste( byval p as TKDATETIMEPICKER_STATE ptr, byref txt as const ustring ) as boolean
+    dim as TKDATETIME dt
+    if tkTimePanel_ParseLooseDateTime( txt, dt, p->sAm, p->sPm ) then return DtmUserSet( p, DtmFinish( p, dt ) )
+    dim as TKTIME t
+    if tkTimePanel_ParseLoose( txt, t, p->sAm, p->sPm ) = false then return false
+    dim as TKDATETIME b = DtmBase( p )
+    b.wHour = t.wHour : b.wMinute = t.wMinute : b.wSecond = t.wSecond : b.wMilliseconds = t.wMilliseconds
+    return DtmUserSet( p, DtmFinish( p, b ) )
+end function
+
+' The field's keys. TRUE when claimed; notifies last, once.
+function DtmKey( byval p as TKDATETIMEPICKER_STATE ptr, byval key as long, byval mods as long, byval scancode as long ) as boolean
+    dim as boolean bAlt = ((mods and SDL_KMOD_ALT) <> 0)
+    dim as boolean bCtrl = ((mods and (SDL_KMOD_CTRL or SDL_KMOD_GUI)) <> 0)
+    dim as boolean bShift = ((mods and SDL_KMOD_SHIFT) <> 0)
+    dim as boolean bChanged = false, bClaimed = true
+    if DtmIsEditable( p, p->nFocusSeg ) = false then p->nFocusSeg = DtmFirstSeg( p )
+    dim as long i = p->nFocusSeg
+    if bCtrl then
+        select case key
+        case SDLK_C
+            DtmCopy( p )
+        case SDLK_X
+            if DtmCopy( p ) andalso p->bAllowEmpty then p->sEntry = "" : bChanged = DtmUserSet( p, tkTimePanel_EmptyDateTime() )
+        case SDLK_V
+            p->sEntry = ""
+            tkWidget_KillTimer( p->hWin, DTM_TIMER_ENTRY )
+            bChanged = DtmPaste( p, tkHost_GetClipboardText() )
+            DtmRefresh( p )
+        case else
+            return false
+        end select
+        if bChanged then DtmNotify( p )
+        return true
+    end if
+    select case key
+    case SDLK_F4
+        if p->nButtonStyle <> TKDTM_BUTTON_DROPDOWN then return false
+        bChanged = DtmCommitEntry( p )
+        tkDateTimePicker_DropDown( p->hWin )
+    case SDLK_UP, SDLK_DOWN
+        bChanged = DtmCommitEntry( p )
+        if bAlt then
+            if p->nButtonStyle <> TKDTM_BUTTON_DROPDOWN then
+                bClaimed = bChanged
+            else
+                tkDateTimePicker_DropDown( p->hWin )
+            end if
+        else
+            if DtmUserStep( p, i, iif( key = SDLK_UP, 1, -1 ), false ) then bChanged = true
+        end if
+    case SDLK_PAGEUP, SDLK_PAGEDOWN
+        bChanged = DtmCommitEntry( p )
+        if DtmUserStep( p, i, iif( key = SDLK_PAGEUP, 1, -1 ), true ) then bChanged = true
+    case SDLK_LEFT, SDLK_RIGHT
+        bChanged = DtmCommitEntry( p )
+        dim as long nxLR = DtmNextSeg( p, i, iif( key = SDLK_RIGHT, 1, -1 ) )
+        if nxLR >= 0 then p->nFocusSeg = nxLR
+        tkWidget_Invalidate( p->hWin )
+    case SDLK_HOME, SDLK_END
+        bChanged = DtmCommitEntry( p )
+        p->nFocusSeg = iif( key = SDLK_HOME, DtmFirstSeg( p ), DtmLastSeg( p ) )
+        tkWidget_Invalidate( p->hWin )
+    case SDLK_TAB
+        if p->bTabMovesSegments = false then return false
+        dim as long nxTab = DtmNextSeg( p, i, iif( bShift, -1, 1 ) )
+        if nxTab < 0 then return false             ' past the ends: the focus walk takes it
+        bChanged = DtmCommitEntry( p )
+        p->nFocusSeg = nxTab
+        tkWidget_Invalidate( p->hWin )
+    case SDLK_RETURN, SDLK_KP_ENTER
+        ' claimed only to finish an entry: otherwise the form's default button has it
+        if len( p->sEntry ) = 0 then return false
+        bChanged = DtmCommitEntry( p )
+    case SDLK_ESCAPE
+        if len( p->sEntry ) = 0 then return false
+        p->sEntry = ""
+        tkWidget_KillTimer( p->hWin, DTM_TIMER_ENTRY )
+        DtmRefresh( p )
+    case SDLK_BACKSPACE, SDLK_DELETE
+        if len( p->sEntry ) then
+            p->sEntry = ""
+            tkWidget_KillTimer( p->hWin, DTM_TIMER_ENTRY )
+            DtmRefresh( p )
+        elseif p->bAllowEmpty then
+            bChanged = DtmUserSet( p, tkTimePanel_EmptyDateTime() )
+        end if
+    case SDLK_COLON, SDLK_SEMICOLON, SDLK_PERIOD, SDLK_KP_PERIOD, SDLK_SPACE, SDLK_MINUS, SDLK_KP_MINUS, SDLK_SLASH, SDLK_KP_DIVIDE
+        ' a separator: finish the segment and move on
+        bChanged = DtmCommitEntry( p )
+        dim as long nxSep = DtmNextSeg( p, i, 1 )
+        if nxSep >= 0 then p->nFocusSeg = nxSep
+        tkWidget_Invalidate( p->hWin )
+    case else
+        dim as long d = tkTimePanel_KeyDigit( key, scancode )
+        if d >= 0 then
+            bChanged = DtmDigit( p, d )
+        elseif (i >= 0) andalso (p->segs( i ).kind = TKTP_SEG_MONTHNAME) then
+            ' letters into a month name
+            dim as long mo = DtmMonthFromLetter( p, key )
+            if mo = 0 then return (key >= SDLK_A) andalso (key <= SDLK_A + 25)
+            dim as string keep = p->sEntry
+            bChanged = DtmCompleteSeg( p, i, mo, false )
+            p->sEntry = keep                        ' the letters stay, for the next one
+            tkWidget_SetTimer( p->hWin, DTM_TIMER_ENTRY, TKTP_TYPE_TIMEOUT )
+        else
+            dim as long half = DtmLetterHalf( p, key )
+            if (half < 0) orelse (DtmHasAmPm( p ) = false) then return false
+            bChanged = DtmCommitEntry( p )
+            dim as TKDATETIME tHalf = DtmBase( p )
+            tHalf.wHour = (tHalf.wHour mod 12) + half * 12
+            if DtmUserSet( p, DtmFinish( p, tHalf ) ) then bChanged = true
+        end if
+    end select
+    if bChanged then DtmNotify( p )
+    return bClaimed
+end function
+
+' ---- the timer: the entry pause, the spin's auto-repeat ------------------------------------------------
+sub DtmStartRepeat( byval p as TKDATETIMEPICKER_STATE ptr )
+    if (p->nRepeatDelay <= 0) orelse (p->nRepeatInterval <= 0) then exit sub
+    tkWidget_SetTimer( p->hWin, TK_TIMER_AUTOREPEAT, p->nRepeatDelay )
+    p->bRepeatOn = true
+end sub
+
+sub DtmStopRepeat( byval p as TKDATETIMEPICKER_STATE ptr )
+    if p->bRepeatOn then tkWidget_KillTimer( p->hWin, TK_TIMER_AUTOREPEAT )
+    p->bRepeatOn = false
+end sub
+
+function DtmTimer( byval p as TKDATETIMEPICKER_STATE ptr, byval id as long ) as boolean
+    select case id
+    case DTM_TIMER_ENTRY
+        tkWidget_KillTimer( p->hWin, DTM_TIMER_ENTRY )
+        if DtmCommitEntry( p ) then DtmNotify( p )
+        return true
+    case TK_TIMER_AUTOREPEAT
+        if p->bRepeatOn = false then return true
+        tkWidget_SetTimer( p->hWin, TK_TIMER_AUTOREPEAT, p->nRepeatInterval )
+        ' paused while the pointer is off the pressed half (NumericUpDown's rule)
+        if (p->nPressedPart = TKDTM_HIT_NONE) orelse (p->nHotPart <> p->nPressedPart) then return true
+        if DtmUserStep( p, p->nFocusSeg, iif( p->nPressedPart = TKDTM_HIT_SPINUP, 1, -1 ), false ) then DtmNotify( p )
+        return true
+    end select
+    return false
+end function
+
+' ---- mouse -------------------------------------------------------------------------------------------
+function DtmPress( byval p as TKDATETIMEPICKER_STATE ptr, byval x as single, byval y as single ) as boolean
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as long part = DtmHit( p, x, y )
+    dim as boolean bChanged = false
+    select case part
+    case TKDTM_HIT_BUTTON
+        ' the press that just closed our dropdown must not reopen it
+        if p->nClosedBySerial = tkHost_PressSerial() then return true
+        bChanged = DtmCommitEntry( p )
+        p->nPressedPart = TKDTM_HIT_BUTTON
+        tkWidget_Invalidate( w )
+        if p->isOpen then tkDateTimePicker_CloseUp( w ) else tkDateTimePicker_DropDown( w )
+        if bChanged then DtmNotify( p )
+    case TKDTM_HIT_SPINUP, TKDTM_HIT_SPINDOWN
+        tkHost_SetFocus( w->pHost, w )
+        bChanged = DtmCommitEntry( p )
+        p->nPressedPart = part
+        DtmSetHot( p, part )
+        tkHost_SetCapture( w )
+        DtmStartRepeat( p )
+        if DtmUserStep( p, p->nFocusSeg, iif( part = TKDTM_HIT_SPINUP, 1, -1 ), false ) then bChanged = true
+        if bChanged then DtmNotify( p )
+    case TKDTM_HIT_FIELD
+        tkHost_SetFocus( w->pHost, w )
+        dim as long seg = DtmSegAt( p, cint( x ) )
+        if seg <> p->nFocusSeg then bChanged = DtmCommitEntry( p )
+        if seg >= 0 then p->nFocusSeg = seg
+        tkWidget_Invalidate( w )
+        if bChanged then DtmNotify( p )
+    end select
+    return true
+end function
+
+sub DtmRelease( byval p as TKDATETIMEPICKER_STATE ptr )
+    DtmStopRepeat( p )
+    if tkHost_GetCapture( p->hWin->pHost ) = p->hWin then tkHost_ReleaseCapture( p->hWin->pHost )
+    if p->nPressedPart <> TKDTM_HIT_NONE then p->nPressedPart = TKDTM_HIT_NONE : tkWidget_Invalidate( p->hWin )
+end sub
+
+' The wheel over a focused field steps the segment under the pointer (a literal: the focused one).
+function DtmWheel( byval p as TKDATETIMEPICKER_STATE ptr, byval x as single, byval notches as single ) as boolean
+    if notches = 0 then return false
+    p->nWheelAccum += notches
+    dim as long n = fix( p->nWheelAccum )
+    if n = 0 then return true
+    p->nWheelAccum -= n
+    dim as boolean bChanged = DtmCommitEntry( p )
+    DtmEnsureLayout( p )
+    dim as long seg = p->nFocusSeg
+    for i as long = 0 to p->nSegs - 1
+        if DtmIsEditable( p, i ) andalso (x >= p->segX( i )) andalso (x < p->segX( i ) + p->segW( i )) then seg = i
+    next
+    if seg <> p->nFocusSeg then p->nFocusSeg = seg : tkWidget_Invalidate( p->hWin )
+    for k as long = 1 to abs( n )
+        if DtmUserStep( p, seg, sgn( n ), false ) then bChanged = true
+    next
+    if bChanged then DtmNotify( p )
+    return true
+end function

@@ -1,0 +1,236 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rwizardpass -- the Report Designer's last mile in the real window (RD8). Its "done when": wizard ->
+' preview -> Run -> print / PDF, end to end. New Report's wizard makes a grouped report with a
+' parameter; Shift+F7 shows it in the Preview over generated sample rows; the parameter strip's Run
+' (a click) makes it again with the value typed; the viewer writes the PDF; Shift+F7 goes back to
+' the bands. Then a second report over SQLite: its Preview reads the design database live.
+#module "selftest"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
+#import "tkc/cmdids"
+#import "tka/documents"
+#import "tka/mainwin"
+#import "tkd/rcanvas"
+#import "tkd/rdialogs"
+#import "vendor/sqlite3" link static
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkComboBox"
+#import "vendor/tkControls/tkLabel"
+#import "vendor/tkControls/tkPrint"
+#import "vendor/tkControls/tkReportViewer"
+#import "vendor/tkControls/tkReportDef"
+#import "vendor/tkControls/tkMenuBar"
+#import "vendor/tkControls/tkPopupMenu"
+using containers
+using cmdids
+using tkApp
+using tkHost
+using tkTest
+using tkTextBox
+using tkComboBox
+using tkLabel
+using tkPrint
+using tkPaint
+using tkReportViewer
+using tkReportDef
+using tkReport
+using tkMenuBar
+using tkPopupMenu
+
+dim shared as long gWzStep
+dim shared as double gWzStart
+dim shared as ustring gWzRefused
+
+private sub WzSet( byval d as rdialogs.WizardDialog ptr, byref key_ as const ustring, byref v as ustring )
+    dim as TK_WIDGET ptr e = d->EditOf( key_ )
+    if e = 0 then exit sub
+    if (key_ = "kind") orelse (key_ = "layout") orelse (key_ = "paper") then
+        tkComboBox_SetCurSel( e, tkComboBox_FindItemByText( e, v ) )
+    else
+        tkTextBox_SetText( e, v )
+    end if
+end sub
+
+' Posted before New Report opens the wizard; once it is modal, the answers, then OK (a refusal is
+' recorded and the wizard cancelled: never left open).
+private sub DriveWizard( byval payload as any ptr )
+    dim as mainwin.Window ptr w = payload
+    if (w->RptWizDlg = 0) orelse (w->RptWizDlg->IsModal = false) then
+        if timer - gWzStart < 30 then tkApp_RunOnUI( @DriveWizard, payload )
+        exit sub
+    end if
+    dim as rdialogs.WizardDialog ptr d = w->RptWizDlg
+    if gWzStep = 1 then
+        WzSet( d, "title", "Sales" )
+        WzSet( d, "source", "Orders" )
+        WzSet( d, "fields", "Customer, Amount:int" )
+        WzSet( d, "parameters", "MinAmount:int" )
+        WzSet( d, "group_by", "Customer" )
+        WzSet( d, "layout", "tabular" )
+    else
+        WzSet( d, "title", "Live" )
+        WzSet( d, "source", "Items" )
+        WzSet( d, "kind", "sqlite" )
+        WzSet( d, "sql", "select name, qty from items order by qty" )
+        WzSet( d, "design_db", "items.db" )
+        WzSet( d, "fields", "name, qty:int" )
+    end if
+    d->Finish( true )
+    if d->Accepted = false then
+        gWzRefused = tkLabel_GetText( d->LblInfo )
+        d->Finish( false )
+    end if
+end sub
+
+' The text a document shows, late slots filled ("Page 1 of 1").
+private function WzRuns( byval doc as TK_PRINTDOC ptr ) as ustring
+    dim as ustring s
+    if doc = 0 then return s
+    tkPrintDoc_Generate( doc )
+    dim as long np = tkPrintDoc_GetPageCount( doc )
+    for pg as long = 0 to np - 1
+        for i as long = 0 to tkPrintDoc_GetOpCount( doc, pg ) - 1
+            dim as TKPRINT_OPINFO oi
+            tkPrintDoc_GetOp( doc, pg, i, oi )
+            if oi.op = TKREC_TEXT then s &= oi.text & "|"
+            if oi.op = TKPRINT_OP_LATE then s &= PrLateText( oi.text, pg, np, doc ) & "|"
+        next
+    next
+    return s
+end function
+
+private function WzNew( byref mw as mainwin.Window, byval stp as long, byref path as const ustring ) as boolean
+    gWzStep = stp
+    gWzRefused = ""
+    gWzStart = timer
+    tkApp_RunOnUI( @DriveWizard, @mw )
+    dim as boolean ok = mw.NewReport( path )
+    tkTest_PumpFor( tkForm_Host( mw.form ), 80 )
+    if len( gWzRefused ) then print "  (wizard refused: "; gWzRefused; ")"
+    return ok
+end function
+
+public sub RWizardPass( byref t as Tally, byval sc as single )
+    dim as mainwin.Window mw
+    mw.ConfigDir = FreshConfig( )
+    mw.Ask = @ScriptedAsk
+    mw.Pick = @ScriptedPick
+    t.Check( mw.Create( sc ), P( sc, "rwizard: main window created" ) )
+    if mw.form = 0 then exit sub
+    mw.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( mw.form )
+    tkTest_PumpFor( h, 150 )
+    dim as ustring dir_ = fs.PathJoin( Files( ), "rwizard" & cint( sc * 100 ) )
+    fs.CreateDirAll( dir_ )
+
+    ' ---- New Report: the wizard makes the report in a folder of its own, open on its canvas
+    t.Check( mw.CanRun( Cmd.FormNewReport ), P( sc, "rwizard: New Report runs with no report open" ) )
+    t.Check( WzNew( mw, 1, fs.PathJoin( dir_, "rptSales.tkreport" ) ), P( sc, "rwizard: the wizard made rptSales" ) )
+    dim as DocRef d = mw.Active( )
+    dim as rcanvas.ReportCanvas ptr c = 0
+    if d then c = d->Report
+    t.Check( (c <> 0) andalso fs.IsFile( fs.PathJoin( dir_, "rptSales", "rptSales.tkreport" ) ) _
+             andalso (tkReportDef_FindBand( c->Def, "groupHeader1" ) >= 0) andalso (c->Def->sources(0).sort = "[Customer]") _
+             andalso (tkReportDef_FindParam( c->Def, "MinAmount" ) = 0), _
+             P( sc, "rwizard: rptSales/rptSales.tkreport on its canvas: a group, its sort, the parameter" ) )
+    if c = 0 then
+        mw.Destroy( )
+        exit sub
+    end if
+
+    ' ---- the Preview: generated sample rows, grouped, "Page 1 of 1"
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 120 )
+    dim as TK_PRINTDOC ptr doc = 0
+    if c->Viewer then doc = tkReportViewer_GetDocument( c->Viewer )
+    dim as ustring s = WzRuns( doc )
+    t.Check( c->Previewing andalso (c->Viewer <> 0) andalso c->Viewer->isVisible andalso (c->Glass->isVisible = false) _
+             andalso (mw.RPalettes.IsShown = false), P( sc, "rwizard: Shift+F7 shows the Preview in the bands' place, the palettes hidden" ) )
+    t.Check( (instr( s, "|Sales  MinAmount: 0|" ) > 0) andalso (instr( s, "|Customer 1|" ) > 0) andalso (instr( s, "|Customer 3|" ) > 0) _
+             andalso (instr( s, "|2 rows|" ) > 0) andalso (instr( s, "|5 rows in all|" ) > 0) andalso (instr( s, "|Page 1 of 1|" ) > 0), _
+             P( sc, "rwizard: the report over sample rows, grouped, counted, paged: " & left( s, 200 ) & " " & mw.Message ) )
+
+    ' ---- Run: the parameter strip's value, a click on Run, the report made again
+    dim as TK_WIDGET ptr pc = tkReportViewer_GetParamControl( c->Viewer, 0 )
+    dim as TK_WIDGET ptr run_ = tkReportViewer_GetRunButton( c->Viewer )
+    if (pc <> 0) andalso (run_ <> 0) then
+        tkTextBox_SetText( pc, "15" )
+        tkTest_PushMotion( h, tkTest_CX( run_ ), tkTest_CY( run_ ) )
+        tkTest_PumpFor( h, 15 )
+        tkTest_Click( h, tkTest_CX( run_ ), tkTest_CY( run_ ) )
+        tkTest_PumpFor( h, 80 )
+    end if
+    s = WzRuns( tkReportViewer_GetDocument( c->Viewer ) )
+    t.Check( instr( s, "|Sales  MinAmount: 15|" ) > 0, P( sc, "rwizard: Run makes it again with the value typed: " & left( s, 60 ) ) )
+
+    ' ---- the PDF, as the viewer's Export writes it
+    dim as ustring pdf = fs.PathJoin( dir_, "sales.pdf" )
+    t.Check( tkReportViewer_ExportPdf( c->Viewer, pdf ) andalso fs.IsFile( pdf ), P( sc, "rwizard: the Preview exports the PDF" ) )
+
+    ' ---- back to the bands
+    Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+    tkTest_PumpFor( h, 80 )
+    t.Check( (c->Previewing = false) andalso c->Glass->isVisible andalso (c->Viewer->isVisible = false) andalso mw.RPalettes.IsShown, _
+             P( sc, "rwizard: Shift+F7 again: the bands and the palettes" ) )
+
+    ' ---- Test Report (Alt+F5, author 2026-11-25): the Preview in a window of its own, the bands left
+    ' as they are; the Design menu says Test Report while a report is in front
+    Chord( h, SDLK_F5, SDL_SCANCODE_F5, SDL_KMOD_ALT )
+    tkTest_PumpFor( h, 120 )
+    doc = 0
+    if (mw.TestRpt <> 0) andalso (mw.TestRpt->Viewer <> 0) then doc = tkReportViewer_GetDocument( mw.TestRpt->Viewer )
+    s = WzRuns( doc )
+    t.Check( (mw.TestRptForm <> 0) andalso (instr( s, "|Customer 1|" ) > 0) andalso (c->Previewing = false) andalso c->Glass->isVisible _
+             andalso (mw.DesignLabels = 1), P( sc, "rwizard: Alt+F5 tests the report in a window of its own, the bands stay, the menu says Test Report: " & left( s, 60 ) ) )
+    scope
+        ' the relabelled row keeps its shortcut
+        dim as TK_MENU ptr dm = tkMenuBar_GetDropDown( mw.menuBar, clng( MenuGroup.Design ) )
+        dim as ustring acc = "?"
+        if dm then
+            for i as long = 0 to dm->itemCount - 1
+                if dm->items(i).id = clng( Cmd.FormTest ) then acc = dm->items(i).wszAccel
+            next
+        end if
+        t.Check( (len( acc ) > 0) andalso (acc = mw.ShortcutText( Cmd.FormTest )), P( sc, "rwizard: the Test Report row still shows its shortcut: " & acc ) )
+    end scope
+    mw.CloseTestReport( )
+    tkTest_PumpFor( h, 30 )
+    t.Check( (mw.TestRptForm = 0) andalso (mw.TestRpt = 0), P( sc, "rwizard: and the test window closes" ) )
+
+    ' ---- SQLite live: a design database beside the report, read by the Preview
+    dim as ustring live = fs.PathJoin( dir_, "rptLive" )
+    fs.CreateDirAll( live )
+    dim as sqlite3 ptr db
+    dim as string dbPath = fs.PathJoin( live, "items.db" )
+    fs.RemoveFile( fs.PathJoin( live, "items.db" ) )
+    sqlite3_open( strptr( dbPath ), @db )
+    sqlite3_exec( db, "create table items( name text, qty integer ); insert into items values( 'bolt', 3 ), ( 'nut', 9 );", 0, 0, 0 )
+    sqlite3_close( db )
+    t.Check( WzNew( mw, 2, fs.PathJoin( live, "rptLive.tkreport" ) ), P( sc, "rwizard: the wizard made rptLive" ) )
+    d = mw.Active( )
+    c = d->Report
+    if c then
+        Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+        tkTest_PumpFor( h, 120 )
+        s = ""
+        if c->Viewer then s = WzRuns( tkReportViewer_GetDocument( c->Viewer ) )
+        t.Check( (instr( s, "|bolt|3|nut|9|" ) > 0) andalso (c->Rows.Live.Count( ) = 1), P( sc, "rwizard: a SQLite source's Preview reads its design database live: " & left( s, 120 ) ) )
+        Chord( h, SDLK_F7, SDL_SCANCODE_F7, SDL_KMOD_SHIFT )
+        tkTest_PumpFor( h, 40 )
+    end if
+
+    for each dd as DocRef in mw.Docs
+        dd->Main.SetSavePoint( )
+    next
+    mw.Destroy( )
+end sub

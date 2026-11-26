@@ -15,6 +15,7 @@
 '' WHERE ZONES COME FROM, in order -- the first that has the id wins:
 ''     $TZDIR                        when set
 ''     /usr/share/zoneinfo           Linux and macOS (macOS links it to /var/db/timezone)
+''     the OS's packed tzdata        Android (/apex/com.android.tzdata/etc/tz/tzdata)
 ''     the embedded database         when the program imports std/tzdata
 '' Windows has no zone files of its own: there a named zone needs std/tzdata
 '' (or $TZDIR). "UTC" is built in everywhere.
@@ -368,6 +369,110 @@ function TimeZone.FixedOffset( byval seconds as long ) as TimeZone
     return z
 end function
 
+#ifdef __FB_ANDROID__
+'' ANDROID'S OWN DATABASE (docs/tiko-android A2, D-A2-2). Android has no /usr/share/zoneinfo:
+'' its zones are ONE packed file, kept current by the OS (the tzdata APEX), in this layout --
+'' measured on the emulator, docs/tiko-android FACTS A2:
+''
+''     char  version[12]       "tzdata2025a", NUL-padded
+''     be32  index, data, final  offsets from the start of the file
+''     index: (data - index) / 52 entries of
+''         char name[40]      the IANA id, NUL-padded
+''         be32 start, length  the zone's TZif, at data + start
+''         be32 unused
+''
+'' Each zone is an ordinary TZif file, which TzRules already parses. The device's zone is
+'' not a file at all but the system property persist.sys.timezone. Read once, under
+'' tzReg.lock, and kept: the bytes are the registry's from then on, as the embedded
+'' database's are. Defensive like the TZif reader: every offset is checked before use.
+extern "C"
+    declare function tzPropGet alias "__system_property_get" _
+        ( byval name_ as const zstring ptr, byval value as zstring ptr ) as long
+end extern
+
+const TZA_MAX_BYTES = 8 * 1024 * 1024
+dim shared as boolean tzaTried, tzaOk
+dim shared as string tzaBytes
+dim shared as ustring tzaVersion
+dim shared as containers.Array( of ustring ) tzaIds, tzaKeys
+dim shared as containers.Array( of long ) tzaOffs, tzaLens
+
+private function tzaBe32_( byval p as const ubyte ptr ) as longint
+    return ( clngint( p[0] ) shl 24 ) or ( clngint( p[1] ) shl 16 ) or ( clngint( p[2] ) shl 8 ) or clngint( p[3] )
+end function
+
+'' Called with tzReg.lock held.
+private sub tzaLoad_( )
+    if tzaTried then exit sub
+    tzaTried = true
+    dim as string paths( 0 to 1 ) = { "/apex/com.android.tzdata/etc/tz/tzdata", _
+                                      "/system/usr/share/zoneinfo/tzdata" }
+    dim as string b
+    for i as long = 0 to 1
+        if tzReadFile( paths( i ), TZA_MAX_BYTES, b ) then exit for
+        b = ""
+    next
+    dim as longint n = len( b )
+    if n < 24 orelse left( b, 6 ) <> "tzdata" then exit sub
+    dim as const ubyte ptr p = cptr( const ubyte ptr, strptr( b ) )
+    dim as longint ix = tzaBe32_( p + 12 ), dx = tzaBe32_( p + 16 ), fx = tzaBe32_( p + 20 )
+    if ix < 24 orelse dx < ix orelse fx < dx orelse fx > n orelse ( dx - ix ) mod 52 <> 0 then exit sub
+    dim as long cnt = clng( ( dx - ix ) \ 52 )
+    if cnt < 1 orelse cnt > 65536 then exit sub
+    for k as long = 0 to cnt - 1
+        dim as const ubyte ptr e = p + ix + 52 * k
+        dim as string nm
+        for i as long = 0 to 39
+            if e[i] = 0 then exit for
+            nm &= chr( e[i] )
+        next
+        dim as longint st = tzaBe32_( e + 40 ), ln = tzaBe32_( e + 44 )
+        if st < 0 orelse ln < 44 orelse dx + st + ln > fx then exit sub
+        if tzIdValid( nm ) = false then exit sub
+        tzaIds.Push( nm )
+        tzaKeys.Push( lcase( nm ) )
+        tzaOffs.Push( clng( dx + st ) )
+        tzaLens.Push( clng( ln ) )
+    next
+    dim as string ver
+    for i as long = 0 to 11
+        if p[i] = 0 then exit for
+        ver &= chr( p[i] )
+    next
+    tzaVersion = mid( ver, 7 )                              '' "tzdata2025a" -> "2025a"
+    tzaBytes = b
+    tzaOk = true
+end sub
+
+'' KEY (a lower-cased id) in Android's database: its spelling and its rules.
+function tzAndroidFind( byref key as const ustring, byref canon as ustring, byref r as TzRules ) as boolean
+    dim as const ubyte ptr q = nullptr
+    dim as long ln = 0
+    mutexlock( tzReg.lock )
+    tzaLoad_( )
+    if tzaOk then
+        for k as long = 0 to tzaKeys.Count( ) - 1
+            if tzaKeys[k] = key then
+                canon = tzaIds[k]
+                q = cptr( const ubyte ptr, strptr( tzaBytes ) ) + tzaOffs[k]
+                ln = tzaLens[k]
+                exit for
+            end if
+        next
+    end if
+    mutexunlock( tzReg.lock )
+    if q = nullptr then return false
+    return TzRules.TryParse( q, ln, r )
+end function
+
+'' The device's zone, the system property, or "".
+function tzAndroidLocalProp( ) as ustring
+    dim as zstring * 96 v                                  '' PROP_VALUE_MAX is 92
+    if tzPropGet( "persist.sys.timezone", @v ) <= 0 then return ""
+    return v
+end function
+#endif
+
 function TimeZone.TryFindById( byref zoneId as const ustring, byref result as TimeZone ) as boolean
     if ucase( zoneId ) = "UTC" then
         result = TimeZone.Utc( )
@@ -391,6 +496,20 @@ function TimeZone.TryFindById( byref zoneId as const ustring, byref result as Ti
                 exit for
             end if
         next
+#ifdef __FB_ANDROID__
+        if e = nullptr then
+            '' then the OS's own packed database
+            dim as ustring canon
+            dim as TzRules r
+            if tzAndroidFind( key, canon, r ) then
+                e = new TzEntry_
+                e->id = canon
+                e->key = key
+                e->kind = TZK_RULES
+                e->rules = r
+            end if
+        end if
+#endif
         if e = nullptr then
             '' the embedded database last
             dim as ustring canon
@@ -532,6 +651,12 @@ function tzLocalId( ) as ustring
         if TimeZone.TryFindById( s, z ) then return z.Id
         return ""                                           '' a POSIX TZ string, say
     end if
+#ifdef __FB_ANDROID__
+    '' ANDROID: no /etc/localtime; the zone is a system property, and Bionic's own localtime
+    '' reads the same one.
+    s = tzAndroidLocalProp( )
+    if len( s ) > 0 andalso TimeZone.TryFindById( s, z ) then return z.Id
+#endif
     dim as fs.FsResultUStr lk = fs.ReadLink( "/etc/localtime" )
     if lk.IsOk( ) then
         s = lk.Value( )
@@ -576,6 +701,21 @@ function TimeZone.AvailableIds( ) as containers.Array( of ustring )
     dim as containers.Array( of ustring ) ids, dirs
     tzSourceDirs( dirs )
     if dirs.Count( ) = 0 then
+#ifdef __FB_ANDROID__
+        '' no directory: Android's own database, when the OS has one
+        mutexlock( tzReg.lock )
+        tzaLoad_( )
+        if tzaOk then
+            for k as long = 0 to tzaIds.Count( ) - 1
+                if tzaIds[k] <> "Factory" then ids.Push( tzaIds[k] )
+            next
+        end if
+        mutexunlock( tzReg.lock )
+        if ids.Count( ) > 0 then
+            containers.Sort( ids )
+            return ids
+        end if
+#endif
         '' no directory: the embedded database, if there is one
         mutexlock( tzReg.lock )
         if tzReg.dbSet then
@@ -614,7 +754,11 @@ function TimeZone.DataVersion( ) as ustring
     if dirs.Count( ) = 0 then
         dim as ustring v
         mutexlock( tzReg.lock )
-        if tzReg.dbSet then v = tzReg.dbVersion
+#ifdef __FB_ANDROID__
+        tzaLoad_( )
+        if tzaOk then v = tzaVersion
+#endif
+        if len( v ) = 0 andalso tzReg.dbSet then v = tzReg.dbVersion
         mutexunlock( tzReg.lock )
         return v
     end if

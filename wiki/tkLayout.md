@@ -40,6 +40,8 @@ A dock takes a slice off the container's remaining client area. Docks are taken 
 
 A slice is cut short when less than its size remains. A docked control's other dimension is ignored, since the slice already fixes it. Docked controls ignore their anchor.
 
+A hidden docked control takes no slice, so the docks after it close up. Showing or hiding one with `tkWidget_Show` (a designed form's `Visible` property) applies its layout again at once, so a control that starts hidden can be shown later. The Form Designer's canvas shows every control, hidden or not.
+
 A container can restrict the area docks may use, for a frame that leaves a margin. Give `tkLayout_AddContainer` a client function and the docks use the rectangle it answers. [tkGroupBox](tkGroupBox)'s `tkGroupBox_GetClientRect` has the right shape.
 
 ## Importing

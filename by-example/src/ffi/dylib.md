@@ -24,7 +24,7 @@ missing.
 Library names differ by platform: `name.dll` on Windows, `libname.so` on Linux,
 often with a version number as in `libm.so.6`, and `libname.dylib` on macOS.
 The example loads the C runtime's maths library on each, chosen with
-`#if defined( __FB_WIN32__ )` and its `#elseif`s, and calls its `sqrt`.
+`#if defined( TIKO_OS_WINDOWS )` and its `#elseif`s, and calls its `sqrt`.
 
 `dylibsymbol` returns an untyped address. Assigning it to a variable of a
 function pointer type, here `MathFn`, makes it callable, and that type is a

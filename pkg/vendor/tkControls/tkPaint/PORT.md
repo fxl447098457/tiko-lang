@@ -16,7 +16,10 @@
 - Fonts are `TTF_Font ptr`.
 - `PaintText` honours TOP / BOTTOM besides the default VCENTER; `PaintTextEx` wraps.
 
-**Added:** `PushClip` / `PopClip`, and the UTF-8 text helpers (`tkText_*`).
+**Added:** `PushClip` / `PopClip`, and the UTF-8 text helpers (`tkText_*`). Recording for tkPrint
+(2026-11-23): `TK_PAINT.pfnRec` / `pRecCtx`, `TK_RECOP`, `TKREC_*`, `PlayOp`; every shape method
+draws through one of five record-aware helpers (`FillPolyP`, `StrokeClosedP`, `StrokeOpenP`,
+`FillRectP`, `GradRectP`), text through `DrawU8`, images through `PaintImage`, clips through `ApplyClip`.
 
 **Dropped:** `SetupBitmap`, `getMemDC`, `rcClient*`, `PaintClientRect` (a widget fills its own
 rect), `PaintIconButton` (no caller in the family), `SetSmoothingMode` (always AA).

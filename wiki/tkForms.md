@@ -104,6 +104,8 @@ end sub
 
 ## Translating captions
 
+A Translatable form asks `tkForms_Tr( "<Form>.<control>.<Property>", "<designed text>" )` for each caption as it is built. [tkLanguage](tkLanguage) answers from TOML catalogs, built into the program with `#embed` or read from files, and picks the user's language at start-up; the Form Designer generates those calls for a project with languages. To answer from your own table instead, install a translator yourself:
+
 ```freebasic
 function MyLookup( byref key as const ustring, byref text as const ustring ) as ustring
     return text      ' look the key up in your own table here
@@ -113,7 +115,9 @@ tkForms_SetTranslator( @MyLookup )
 print tkForms_Tr( "greeting", "Hello" )
 ```
 
-With no translator installed, `tkForms_Tr` returns the text it was given. `tkForms_SetTranslator( 0 )` removes the translator.
+With no translator installed, `tkForms_Tr` returns the text it was given. `tkForms_SetTranslator( 0 )` removes the translator. One translator is installed at a time: setting your own replaces tkLanguage's, and the reverse.
+
+Captions are read when a form is built: changing the translator does not relabel a form that is already open.
 
 ## FormBase
 
@@ -198,3 +202,4 @@ function tkForms_ObjectOf( byval w as TK_WIDGET ptr ) as any ptr
 - [tkControls](Category-tkControls)
 - [tkApp](tkApp), [tkHost](tkHost)
 - [tkLayout](tkLayout), [Form Designer](Form-Designer)
+- [tkLanguage](tkLanguage)

@@ -1,0 +1,1091 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkBadge -- a dot, a count ("99+"), a short text, a glyph or a presence state, in semantic colours.
+' New in tkControls; the design is C:\dev\docs\tkControls\RATING-BADGE-AVATAR-CHIP.md §5. Phases
+' B0 + B1.
+'
+' THREE WAYS TO USE IT:
+'   * STANDALONE -- tkBadge_Create: an ordinary, non-focusable widget, optionally with a label to
+'     its right (Ant's status badge, "* Active").
+'   * ATTACHED -- tkBadge_Attach( badge, target, corner, dx, dy, overlap ): the badge becomes an
+'     ADORNMENT of the target (tkHost, P0): painted over the target's corner, centred on it, free
+'     to overhang it, following it, never hit-tested -- a click on it reaches the target.
+'   * WIDGETLESS -- tkBadge_PaintInto( b, rc, spec ): the same badge in any paint context (a tab,
+'     a list row, a grid cell, an avatar's presence).
+'
+' CONTENT is an explicit Kind (§5.1, D-B2): each content setter switches it. A count over MaxCount
+' reads "99+", a negative one 0, and 0 shows nothing unless ShowZero. Invisible hides the paint
+' without touching the widget. Setters are silent; a badge has no user input that changes data.
+#module "tkBadge"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+
+public enum
+    TKBADGE_KIND_DOT = 0
+    TKBADGE_KIND_COUNT
+    TKBADGE_KIND_TEXT
+    TKBADGE_KIND_GLYPH          ' a glyph-font character; with no glyph font, a dot
+    TKBADGE_KIND_PRESENCE
+end enum
+
+' Status: the semantic colour (theme roles Accent, Accent, Success, Warning, Error, TextDim).
+public enum
+    TKBADGE_ACCENT = 0
+    TKBADGE_INFO
+    TKBADGE_SUCCESS
+    TKBADGE_WARNING
+    TKBADGE_ERROR
+    TKBADGE_NEUTRAL
+end enum
+
+public enum
+    TKBADGE_FILLED = 0          ' the status fill, contrasting ink
+    TKBADGE_OUTLINE             ' a status border and ink on the background
+    TKBADGE_TINT                ' the status at 20 % over the background, status ink
+end enum
+
+public enum
+    TKBADGE_PILL = 0            ' a circle when it holds one character
+    TKBADGE_ROUNDED
+    TKBADGE_SQUARE
+end enum
+
+' Height 16 / 20 / 24, dot 6 / 8 / 10 (design units).
+public enum
+    TKBADGE_SMALL = 0
+    TKBADGE_MEDIUM
+    TKBADGE_LARGE
+end enum
+
+public enum
+    TKBADGE_TOP_RIGHT = 0
+    TKBADGE_TOP_LEFT
+    TKBADGE_BOTTOM_RIGHT
+    TKBADGE_BOTTOM_LEFT
+end enum
+
+' RECT: the anchor is the target's corner. CIRCLE: the point at 45 degrees on the circle inscribed in
+' the target, r (1 - 1/sqrt 2) in from each edge -- for round targets (an avatar, a round button).
+public enum
+    TKBADGE_OVERLAP_RECT = 0
+    TKBADGE_OVERLAP_CIRCLE
+end enum
+
+' Colour plus a shape cue, so presence reads without colour vision (§5.4).
+public enum
+    TKBADGE_PRESENCE_AVAILABLE = 0      ' Success fill + a check
+    TKBADGE_PRESENCE_AWAY               ' Warning fill + clock hands
+    TKBADGE_PRESENCE_BUSY               ' Error fill
+    TKBADGE_PRESENCE_DND                ' Error fill + a bar
+    TKBADGE_PRESENCE_OFFLINE            ' a ring only (Neutral)
+    TKBADGE_PRESENCE_OOO                ' a ring + an arrow (Accent)
+    TKBADGE_PRESENCE_BLOCKED            ' a ring + a slash (Error)
+    TKBADGE_PRESENCE_UNKNOWN            ' a ring + "?" (Neutral)
+end enum
+
+public enum
+    TKBADGE_JUSTIFY_LEFT = 0
+    TKBADGE_JUSTIFY_CENTER
+    TKBADGE_JUSTIFY_RIGHT
+end enum
+
+public const as long TKBADGE_DEFAULT_MAXCOUNT = 99
+public const as long TKBADGE_DEFAULT_PADX     = 5       ' design units, either side of the text
+public const as long TKBADGE_DEFAULT_LABELGAP = 6
+public const as long TKBADGE_ATTACHED_RING    = 2       ' pixels, a rule: never scaled
+
+' Fill / Ink per status, in the TKBADGE_* status order -- tkBadge_StatusFill / StatusInk index it.
+public type TKBADGE_COLORS
+    BackColor          as ulong = &hFF21252Bul    ' what is under a standalone badge
+    RingColor          as ulong = &hFF21252Bul    ' the cut-out ring (what is under an attached badge)
+    LabelColor         as ulong = &hFFC8CDD6ul
+    LabelColorDisabled as ulong = &hFF606670ul
+    FillAccent         as ulong = &hFF569CD6ul
+    InkAccent          as ulong = &hFFFFFFFFul
+    FillInfo           as ulong = &hFF569CD6ul
+    InkInfo            as ulong = &hFFFFFFFFul
+    FillSuccess        as ulong = &hFF48970Dul
+    InkSuccess         as ulong = &hFFFFFFFFul
+    FillWarning        as ulong = &hFFE5C07Bul
+    InkWarning         as ulong = &hFF21252Bul
+    FillError          as ulong = &hFFE06C75ul
+    InkError           as ulong = &hFF21252Bul
+    FillNeutral        as ulong = &hFF969CA6ul
+    InkNeutral         as ulong = &hFF21252Bul
+    FillDisabled       as ulong = &hFF373C45ul
+    InkDisabled        as ulong = &hFF606670ul
+end type
+
+' Everything that decides a badge's look, with or without a widget.
+public type TKBADGE_SPEC
+    nKind          as long = TKBADGE_KIND_DOT
+    nCount         as long
+    wszText        as ustring
+    wszGlyph       as ustring
+    nPresence      as long = TKBADGE_PRESENCE_AVAILABLE
+    nStatus        as long = TKBADGE_ACCENT
+    nAppearance    as long = TKBADGE_FILLED
+    nShape         as long = TKBADGE_PILL
+    nSize          as long = TKBADGE_MEDIUM
+    nMaxCount      as long = TKBADGE_DEFAULT_MAXCOUNT      ' 0 = no cap
+    bShowZero      as boolean
+    bInvisible     as boolean
+    bEnabled       as boolean = true
+    nRing          as long                                  ' pixels round the badge, in RingColor
+    nDiameter      as long                                  ' a dot / presence size in pixels; 0 = the Size's
+    fText          as TTF_Font ptr                          ' 0 = no text drawn (PaintInto) / the surface's
+    fGlyph         as TTF_Font ptr
+    fScale         as single = 1
+    bCustom        as boolean                               ' clrFill / clrInk override the status
+    clrFill        as ulong
+    clrInk         as ulong
+    pColors        as TKBADGE_COLORS ptr                    ' 0 = the app theme's
+end type
+
+public type TKBADGE_PAINTINFO
+    hBadge     as TK_WIDGET ptr
+    b          as TK_PAINT ptr
+    rcClient   as TKRECT
+    rcBadge    as TKRECT            ' the badge with its ring; empty when nothing shows
+    rcLabel    as TKRECT            ' standalone label; empty when none
+    isEnabled  as boolean
+    isAttached as boolean
+end type
+
+public type TKBADGE_MESSAGEINFO
+    hBadge as TK_WIDGET ptr
+    msg    as long
+    x      as single
+    y      as single
+end type
+
+public type BDG_PaintCallbackSub as sub( byval p as TKBADGE_PAINTINFO ptr )
+public type BDG_MessageCallbackFunc as function( byval m as TKBADGE_MESSAGEINFO ptr ) as boolean
+
+public type TKBADGE_STATE
+    hWin            as TK_WIDGET ptr
+    id              as long
+    spec            as TKBADGE_SPEC
+    colors          as TKBADGE_COLORS
+    bColorsPinned   as boolean
+    bRingPinned     as boolean
+    wszLabel        as ustring
+    nJustify        as long = TKBADGE_JUSTIFY_LEFT
+    wszTooltip      as ustring
+    tip             as TKTIPHOST_STATE
+    ' attachment
+    hTarget         as TK_WIDGET ptr
+    hHome           as TK_WIDGET ptr       ' the parent before Attach
+    nCorner         as long
+    nOffX           as long                ' design units
+    nOffY           as long
+    nOverlap        as long
+    ' layout (standalone)
+    bLayoutDirty    as boolean = true
+    rcBadge         as TKRECT
+    rcLabel         as TKRECT
+    PaintCallback   as BDG_PaintCallbackSub
+    MessageCallback as BDG_MessageCallbackFunc
+end type
+
+' ==========================================================================================
+' The content model
+' ==========================================================================================
+' What a count reads: "" (hidden), "0" (ShowZero), "7", "99+".
+public function tkBadge_FormatCount( byval nCount as long, byval nMaxCount as long = TKBADGE_DEFAULT_MAXCOUNT, _
+                                     byval bShowZero as boolean = false ) as ustring
+    if nCount < 0 then nCount = 0
+    if nCount = 0 then return iif( bShowZero, "0", "" )
+    if (nMaxCount > 0) andalso (nCount > nMaxCount) then return str( nMaxCount ) & "+"
+    return str( nCount )
+end function
+
+private function SC( byref s as TKBADGE_SPEC, byval du as long ) as long
+    return cint( du * s.fScale )
+end function
+
+private function HeightDu( byval nSize as long ) as long
+    select case nSize
+    case TKBADGE_SMALL : return 16
+    case TKBADGE_LARGE : return 24
+    end select
+    return 20
+end function
+
+private function DotDu( byval nSize as long ) as long
+    select case nSize
+    case TKBADGE_SMALL : return 6
+    case TKBADGE_LARGE : return 10
+    end select
+    return 8
+end function
+
+' The text a TEXT / COUNT / GLYPH badge shows ("" for the others, or when there is none).
+private function ContentText( byref s as TKBADGE_SPEC ) as ustring
+    select case s.nKind
+    case TKBADGE_KIND_COUNT : return tkBadge_FormatCount( s.nCount, s.nMaxCount, s.bShowZero )
+    case TKBADGE_KIND_TEXT  : return s.wszText
+    case TKBADGE_KIND_GLYPH
+        if s.fGlyph <> 0 then return s.wszGlyph
+    end select
+    return ""
+end function
+
+' Does anything show? A count 0 without ShowZero, empty text, and Invisible do not.
+private function Showing( byref s as TKBADGE_SPEC ) as boolean
+    if s.bInvisible then return false
+    select case s.nKind
+    case TKBADGE_KIND_COUNT : return (s.nCount > 0) orelse s.bShowZero
+    case TKBADGE_KIND_TEXT  : return len( s.wszText ) > 0
+    end select
+    return true
+end function
+
+' Is it drawn as a round mark (a dot, a glyph-less glyph badge, a presence) rather than a pill?
+private function IsMark( byref s as TKBADGE_SPEC ) as boolean
+    select case s.nKind
+    case TKBADGE_KIND_DOT, TKBADGE_KIND_PRESENCE : return true
+    case TKBADGE_KIND_GLYPH : return (s.fGlyph = 0) orelse (len( s.wszGlyph ) = 0)
+    end select
+    return false
+end function
+
+' The badge's own size, ring excluded: a dot / presence is a circle; a pill is
+' max( height, text width + 2 PadX ) x height. FALSE (0 x 0) when nothing shows.
+private function BadgeBox( byref s as TKBADGE_SPEC, byval fText as TTF_Font ptr, byref w as long, byref h as long ) as boolean
+    w = 0 : h = 0
+    if Showing( s ) = false then return false
+    if IsMark( s ) then
+        dim as long d = s.nDiameter
+        if d <= 0 then d = SC( s, iif( s.nKind = TKBADGE_KIND_PRESENCE, HeightDu( s.nSize ) \ 2 + 2, DotDu( s.nSize ) ) )
+        w = d : h = d
+        return true
+    end if
+    h = SC( s, HeightDu( s.nSize ) )
+    dim as ustring t = ContentText( s )
+    dim as TTF_Font ptr f = iif( s.nKind = TKBADGE_KIND_GLYPH, s.fGlyph, fText )
+    dim as long tw = 0
+    if (f <> 0) andalso (len( t ) > 0) then tw = tkText_Width( f, t )
+    w = tw + 2 * SC( s, TKBADGE_DEFAULT_PADX )
+    if w < h then w = h
+    return true
+end function
+
+' ==========================================================================================
+' Colour
+' ==========================================================================================
+private function Lin( byval c as long ) as double
+    dim as double v = c / 255.0
+    if v <= 0.04045 then return v / 12.92
+    return ((v + 0.055) / 1.055) ^ 2.4
+end function
+
+private function Lum( byval c as ulong ) as double
+    return 0.2126 * Lin( (c shr 16) and 255 ) + 0.7152 * Lin( (c shr 8) and 255 ) + 0.0722 * Lin( c and 255 )
+end function
+
+' The WCAG 2 contrast ratio of two colours (1 .. 21).
+public function tkBadge_Contrast( byval a as ulong, byval b as ulong ) as double
+    dim as double la = Lum( a ), lb = Lum( b )
+    if la < lb then swap la, lb
+    return (la + 0.05) / (lb + 0.05)
+end function
+
+public function tkBadge_StatusFill( byref c as TKBADGE_COLORS, byval nStatus as long ) as ulong
+    if (nStatus < TKBADGE_ACCENT) orelse (nStatus > TKBADGE_NEUTRAL) then nStatus = TKBADGE_ACCENT
+    return cast( ulong ptr, @c )[4 + 2 * nStatus]
+end function
+
+public function tkBadge_StatusInk( byref c as TKBADGE_COLORS, byval nStatus as long ) as ulong
+    if (nStatus < TKBADGE_ACCENT) orelse (nStatus > TKBADGE_NEUTRAL) then nStatus = TKBADGE_ACCENT
+    return cast( ulong ptr, @c )[5 + 2 * nStatus]
+end function
+
+' Of the theme's inks, the one that reads best on fill.
+private function BestInk( byref t as TKTHEME_COLORS, byval fill as ulong ) as ulong
+    dim as ulong cand(0 to 3) = { t.SelectedText, t.TextStrong, t.Window, t.Text }
+    dim as ulong best = cand(0)
+    for i as long = 1 to 3
+        if tkBadge_Contrast( cand(i), fill ) > tkBadge_Contrast( best, fill ) then best = cand(i)
+    next
+    return best
+end function
+
+' Fill, ink and the background of this spec now (disabled, custom, status; the appearance applied).
+private sub Resolve( byref s as TKBADGE_SPEC, byval nStatus as long, byref fill as ulong, byref ink as ulong, _
+                     byref back as ulong, byref border as ulong )
+    dim as TKBADGE_COLORS ptr c = s.pColors
+    back = iif( s.nRing > 0, c->RingColor, c->BackColor )
+    if s.bEnabled = false then
+        fill = c->FillDisabled : ink = c->InkDisabled
+    elseif s.bCustom then
+        fill = s.clrFill : ink = s.clrInk
+    else
+        fill = tkBadge_StatusFill( *c, nStatus ) : ink = tkBadge_StatusInk( *c, nStatus )
+    end if
+    border = fill
+    select case s.nAppearance
+    case TKBADGE_OUTLINE
+        ink = fill : fill = back
+    case TKBADGE_TINT
+        ink = fill : fill = tkColor_Lerp( back, fill, 0.2 ) : border = fill
+    end select
+end sub
+
+' ==========================================================================================
+' Painting: rcOuter is the badge with its ring
+' ==========================================================================================
+private sub Mark( byval b as TK_PAINT ptr, byref rc as TKRECT, byval nPen as long, byval fx0 as single, _
+                  byval fy0 as single, byval fx1 as single, byval fy1 as single, byval fx2 as single = -1, _
+                  byval fy2 as single = -1 )
+    dim as long d = rc.right - rc.left
+    dim as TKPOINT pts(0 to 2)
+    pts(0).x = rc.left + cint( fx0 * d ) : pts(0).y = rc.top + cint( fy0 * d )
+    pts(1).x = rc.left + cint( fx1 * d ) : pts(1).y = rc.top + cint( fy1 * d )
+    dim as long n = 2
+    if fx2 >= 0 then pts(2).x = rc.left + cint( fx2 * d ) : pts(2).y = rc.top + cint( fy2 * d ) : n = 3
+    b->PaintPolyline( @pts(0), n, nPen )
+end sub
+
+private sub DrawPresence( byval b as TK_PAINT ptr, byref rc as TKRECT, byref s as TKBADGE_SPEC )
+    dim as long nStatus
+    dim as boolean bRingOnly
+    select case s.nPresence
+    case TKBADGE_PRESENCE_AVAILABLE : nStatus = TKBADGE_SUCCESS
+    case TKBADGE_PRESENCE_AWAY      : nStatus = TKBADGE_WARNING
+    case TKBADGE_PRESENCE_BUSY, TKBADGE_PRESENCE_DND : nStatus = TKBADGE_ERROR
+    case TKBADGE_PRESENCE_OOO       : nStatus = TKBADGE_ACCENT : bRingOnly = true
+    case TKBADGE_PRESENCE_BLOCKED   : nStatus = TKBADGE_ERROR : bRingOnly = true
+    case else                       : nStatus = TKBADGE_NEUTRAL : bRingOnly = true      ' OFFLINE, UNKNOWN
+    end select
+    dim as TKBADGE_SPEC f = s
+    f.nAppearance = iif( bRingOnly, TKBADGE_OUTLINE, TKBADGE_FILLED )
+    f.bCustom = false
+    dim as ulong fill, ink, back, border
+    Resolve( f, nStatus, fill, ink, back, border )
+    dim as long d = rc.right - rc.left
+    dim as long thick = d \ 8
+    if thick < 1 then thick = 1
+    dim as TKRECT r = rc
+    b->SetBackColor( fill )
+    b->SetPenColor( border )
+    b->PaintEllipse( @r, iif( bRingOnly, thick, 0 ) )
+    ' the mark's pen, before tkPaint's DPI scaling of polylines
+    dim as long pen = cint( d / 8 / s.fScale )
+    if pen < 1 then pen = 1
+    b->SetPenColor( ink )
+    select case s.nPresence
+    case TKBADGE_PRESENCE_AVAILABLE : Mark( b, r, pen, 0.28, 0.52, 0.44, 0.68, 0.72, 0.36 )
+    case TKBADGE_PRESENCE_AWAY      : Mark( b, r, pen, 0.5, 0.26, 0.5, 0.52, 0.68, 0.64 )
+    case TKBADGE_PRESENCE_DND       : Mark( b, r, pen, 0.28, 0.5, 0.72, 0.5 )
+    case TKBADGE_PRESENCE_OOO
+        Mark( b, r, pen, 0.7, 0.5, 0.3, 0.5 )
+        Mark( b, r, pen, 0.46, 0.34, 0.3, 0.5, 0.46, 0.66 )
+    case TKBADGE_PRESENCE_BLOCKED   : Mark( b, r, pen, 0.3, 0.7, 0.7, 0.3 )
+    case TKBADGE_PRESENCE_UNKNOWN
+        if s.fText then
+            dim as TTF_Font ptr fWas = b->pFont
+            b->SetFont( s.fText )
+            b->SetForeColor( ink )
+            b->PaintText( "?", @r, TK_DT_CENTER or TK_DT_VCENTER )
+            b->SetFont( fWas )
+        end if
+    end select
+end sub
+
+private sub DrawBadge( byval b as TK_PAINT ptr, byref rcOuter as TKRECT, byref s as TKBADGE_SPEC )
+    if (b = 0) orelse (s.pColors = 0) orelse (Showing( s ) = false) then exit sub
+    dim as TKRECT r = rcOuter
+    if s.nRing > 0 then
+        ' the cut-out: the ring colour round the badge, the badge's shape grown by the ring
+        dim as long hh = r.bottom - r.top
+        b->SetBackColor( s.pColors->RingColor )
+        b->PaintRoundRect( @r, iif( IsMark( s ) orelse (s.nShape = TKBADGE_PILL), hh, iif( s.nShape = TKBADGE_ROUNDED, hh \ 2, 0 ) ) )
+        tkRect_Inflate( r, -s.nRing, -s.nRing )
+    end if
+    if (r.right <= r.left) orelse (r.bottom <= r.top) then exit sub
+    if s.nKind = TKBADGE_KIND_PRESENCE then DrawPresence( b, r, s ) : exit sub
+    dim as ulong fill, ink, back, border
+    Resolve( s, s.nStatus, fill, ink, back, border )
+    dim as long h = r.bottom - r.top
+    dim as long curv = h                                            ' a pill, a circle for a mark
+    if IsMark( s ) = false then
+        select case s.nShape
+        case TKBADGE_ROUNDED : curv = h \ 2
+        case TKBADGE_SQUARE  : curv = 0
+        end select
+    end if
+    b->SetBackColor( fill )
+    b->SetPenColor( border )
+    if s.nAppearance = TKBADGE_OUTLINE then
+        b->PaintRoundBorderRect( @r, curv, 1 )
+    elseif curv > 0 then
+        b->PaintRoundRect( @r, curv )
+    else
+        b->PaintRect( @r )
+    end if
+    if IsMark( s ) then exit sub
+    dim as ustring t = ContentText( s )
+    dim as TTF_Font ptr f = iif( s.nKind = TKBADGE_KIND_GLYPH, s.fGlyph, s.fText )
+    if (len( t ) = 0) orelse (f = 0) then exit sub
+    dim as TTF_Font ptr fWas = b->pFont
+    dim as ulong inkWas = b->clrFore
+    b->SetFont( f )
+    b->SetForeColor( ink )
+    b->PaintText( t, @r, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_NOCLIP )
+    b->SetFont( fWas )
+    b->SetForeColor( inkWas )
+end sub
+
+' ==========================================================================================
+' Public: the widgetless badge
+' ==========================================================================================
+public declare function tkBadge_ThemeColors( byref t as TKTHEME_COLORS ) as TKBADGE_COLORS
+
+' The badge's size with its ring (0 x 0 when nothing shows).
+public sub tkBadge_MeasureSpec( byref s as TKBADGE_SPEC, byref nWidth as long, byref nHeight as long )
+    BadgeBox( s, s.fText, nWidth, nHeight )
+    if (nWidth > 0) andalso (s.nRing > 0) then nWidth += 2 * s.nRing : nHeight += 2 * s.nRing
+end sub
+
+' The badge centred in rc. s.pColors = 0: the app theme's colours. Text needs s.fText.
+public sub tkBadge_PaintInto( byval b as TK_PAINT ptr, byref rc as TKRECT, byref s as TKBADGE_SPEC )
+    if b = 0 then exit sub
+    dim as TKBADGE_SPEC sp = s
+    dim as TKBADGE_COLORS cTheme
+    if sp.pColors = 0 then
+        cTheme = tkBadge_ThemeColors( tkTheme_Get() )
+        sp.pColors = @cTheme
+    end if
+    dim as long w, h
+    tkBadge_MeasureSpec( sp, w, h )
+    if w <= 0 then exit sub
+    dim as TKRECT r
+    dim as long l = rc.left + ((rc.right - rc.left) - w) \ 2, t = rc.top + ((rc.bottom - rc.top) - h) \ 2
+    tkRect_Set( r, l, t, l + w, t + h )
+    DrawBadge( b, r, sp )
+end sub
+
+' ==========================================================================================
+' The widget
+' ==========================================================================================
+private function BG( byval w as TK_WIDGET ptr ) as TKBADGE_STATE ptr
+    if w = 0 then return 0
+    return cast( TKBADGE_STATE ptr, w->pData )
+end function
+
+private function TextFont( byval p as TKBADGE_STATE ptr ) as TTF_Font ptr
+    if p->spec.fText then return p->spec.fText
+    if (p->hWin <> 0) andalso (p->hWin->pHost <> 0) then return p->hWin->pHost->pDefaultFont
+    return 0
+end function
+
+' The spec as the widget draws it now: scale, fonts, enabled, colours.
+private function LiveSpec( byval p as TKBADGE_STATE ptr ) as TKBADGE_SPEC
+    dim as TKBADGE_SPEC s = p->spec
+    s.fScale = iif( p->hWin->pHost <> 0, p->hWin->pHost->fScale, 1 )
+    s.fText = TextFont( p )
+    s.bEnabled = tkWidget_IsEnabled( p->hWin )
+    s.pColors = @p->colors
+    return s
+end function
+
+private sub Refresh( byval p as TKBADGE_STATE ptr )
+    p->bLayoutDirty = true
+    tkWidget_Invalidate( p->hWin )
+end sub
+
+' Standalone: the badge (with its ring) placed by Justify and centred vertically; the label after it.
+private sub Layout( byval p as TKBADGE_STATE ptr )
+    p->bLayoutDirty = false
+    tkRect_SetEmpty( p->rcBadge ) : tkRect_SetEmpty( p->rcLabel )
+    dim as TK_WIDGET ptr w = p->hWin
+    if (w->cw <= 0) orelse (w->ch <= 0) then p->bLayoutDirty = true : exit sub
+    dim as TKBADGE_SPEC s = LiveSpec( p )
+    dim as long bw, bh
+    tkBadge_MeasureSpec( s, bw, bh )
+    if p->hTarget then
+        ' attached: the widget IS the badge
+        if bw > 0 then tkRect_Set( p->rcBadge, 0, 0, w->cw, w->ch )
+        exit sub
+    end if
+    dim as long lw = 0, gap = 0
+    dim as TTF_Font ptr f = TextFont( p )
+    if (len( p->wszLabel ) > 0) andalso (f <> 0) then lw = tkText_Width( f, p->wszLabel ) : gap = SC( s, TKBADGE_DEFAULT_LABELGAP )
+    dim as long total = bw + iif( (bw > 0) andalso (lw > 0), gap, 0 ) + lw
+    dim as long x = 0
+    select case p->nJustify
+    case TKBADGE_JUSTIFY_CENTER : x = (w->cw - total) \ 2
+    case TKBADGE_JUSTIFY_RIGHT  : x = w->cw - total
+    end select
+    if x < 0 then x = 0
+    if bw > 0 then
+        dim as long y = (w->ch - bh) \ 2
+        tkRect_Set( p->rcBadge, x, y, x + bw, y + bh )
+        x += bw + iif( lw > 0, gap, 0 )
+    end if
+    if lw > 0 then tkRect_Set( p->rcLabel, x, 0, w->cw, w->ch )
+end sub
+
+' Attached: the badge's rect in the target's coordinates -- centred on the corner (or the 45 degree
+' point of the inscribed circle), moved by the offset. 0 x 0 when nothing shows.
+private sub AttachedRect( byval p as TKBADGE_STATE ptr, byref rc as TKRECT )
+    tkRect_SetEmpty( rc )
+    dim as TK_WIDGET ptr t = p->hTarget
+    if t = 0 then exit sub
+    dim as TKBADGE_SPEC s = LiveSpec( p )
+    dim as long bw, bh
+    tkBadge_MeasureSpec( s, bw, bh )
+    if bw <= 0 then exit sub
+    dim as double k = 0
+    if p->nOverlap = TKBADGE_OVERLAP_CIRCLE then
+        dim as double r = iif( t->cw < t->ch, t->cw, t->ch ) / 2
+        k = r * (1 - 1 / sqr( 2 ))
+    end if
+    dim as double ax, ay
+    select case p->nCorner
+    case TKBADGE_TOP_LEFT     : ax = k : ay = k
+    case TKBADGE_BOTTOM_RIGHT : ax = t->cw - k : ay = t->ch - k
+    case TKBADGE_BOTTOM_LEFT  : ax = k : ay = t->ch - k
+    case else                 : ax = t->cw - k : ay = k
+    end select
+    ax += SC( s, p->nOffX ) : ay += SC( s, p->nOffY )
+    dim as long l = cint( ax ) - bw \ 2, tp = cint( ay ) - bh \ 2
+    tkRect_Set( rc, l, tp, l + bw, tp + bh )
+end sub
+
+private function CallMessage( byval p as TKBADGE_STATE ptr, byval m as TK_MSG ptr ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKBADGE_MESSAGEINFO mi
+    mi.hBadge = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    return p->MessageCallback( @mi )
+end function
+
+private sub RenderDefault( byval p as TKBADGE_STATE ptr, byval pi as TKBADGE_PAINTINFO ptr )
+    dim as TKBADGE_SPEC s = LiveSpec( p )
+    if tkRect_IsEmpty( pi->rcBadge ) = false then DrawBadge( pi->b, pi->rcBadge, s )
+    if (tkRect_IsEmpty( pi->rcLabel ) = false) andalso (len( p->wszLabel ) > 0) then
+        dim as TK_PAINT ptr b = pi->b
+        dim as TKRECT r = pi->rcLabel
+        dim as TTF_Font ptr fWas = b->pFont
+        b->SetFont( TextFont( p ) )
+        b->SetForeColor( iif( pi->isEnabled, p->colors.LabelColor, p->colors.LabelColorDisabled ) )
+        b->PaintText( p->wszLabel, @r, TK_DT_LEFT or TK_DT_VCENTER or TK_DT_ELLIPSIS )
+        b->SetFont( fWas )
+    end if
+end sub
+
+private sub OnPaint( byval p as TKBADGE_STATE ptr, byval b as TK_PAINT ptr )
+    if p->bLayoutDirty then Layout( p )
+    dim as TKBADGE_PAINTINFO pi
+    pi.hBadge = p->hWin
+    pi.b = b
+    tkRect_Set( pi.rcClient, 0, 0, p->hWin->cw, p->hWin->ch )
+    if p->hTarget = 0 then
+        ' standalone: its own background. Attached: nothing but the badge (it overhangs the target)
+        b->SetBackColor( p->colors.BackColor )
+        b->PaintRect( @pi.rcClient )
+    end if
+    pi.rcBadge = p->rcBadge
+    pi.rcLabel = p->rcLabel
+    pi.isEnabled = tkWidget_IsEnabled( p->hWin )
+    pi.isAttached = (p->hTarget <> 0)
+    if p->PaintCallback then
+        p->PaintCallback( @pi )
+    else
+        RenderDefault( p, @pi )
+    end if
+end sub
+
+public declare sub tkBadge_ApplyTheme( byval hBadge as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+private function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKBADGE_STATE ptr p = BG( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+    case TKM_ADORNLAYOUT
+        dim as TKRECT rc
+        AttachedRect( p, rc )
+        if (rc.left <> w->x) orelse (rc.top <> w->y) orelse (rc.right - rc.left <> w->cw) orelse (rc.bottom - rc.top <> w->ch) then
+            tkWidget_SetPos( w, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top )
+        end if
+        p->bLayoutDirty = true
+        return true
+    case TKM_SIZE, TKM_SCALECHANGED, TKM_ENABLE
+        Refresh( p )
+        return true
+    case TKM_THEMECHANGED
+        tkBadge_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_MOUSEMOVE, TKM_MOUSELEAVE, TKM_LBUTTONDOWN, TKM_LBUTTONUP, TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        CallMessage( p, m )                 ' standalone only: an attached badge is never hit
+        return true
+    case TKM_DESTROY
+        tkTipHost_Destroy( @p->tip )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+private function TipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKBADGE_STATE ptr p = BG( a )
+    if p = 0 then return ""
+    return p->wszTooltip
+end function
+
+' A standalone badge, child of hParent, created 0x0: size it from GetIdealSize. Not focusable.
+public function tkBadge_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKBADGE_STATE ptr p = new TKBADGE_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @Proc, p )
+    p->hWin = w
+    p->colors = tkBadge_ThemeColors( tkTheme_Of( w ) )
+    tkTheme_ResolveInto( w, tkTheme_Of( w ), cast( ulong ptr, @p->colors ), sizeof( TKBADGE_COLORS ) \ 4, "Badge" )
+    tkTipHost_Ensure( @p->tip, w, @TipText )
+    return w
+end function
+
+public function tkBadge_GetID( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return 0
+    return p->id
+end function
+
+public sub tkBadge_SetEnabled( byval hBadge as TK_WIDGET ptr, byval isEnabled as boolean )
+    if hBadge then tkWidget_Enable( hBadge, isEnabled )
+end sub
+
+' ---- content (every setter SILENT; each switches the Kind) -------------------------------------
+public sub tkBadge_SetDot( byval hBadge as TK_WIDGET ptr )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.nKind = TKBADGE_KIND_DOT
+    Refresh( p )
+end sub
+
+public sub tkBadge_SetCount( byval hBadge as TK_WIDGET ptr, byval nCount as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.nKind = TKBADGE_KIND_COUNT
+    p->spec.nCount = iif( nCount < 0, 0, nCount )
+    Refresh( p )
+end sub
+
+public function tkBadge_GetCount( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return 0
+    return p->spec.nCount
+end function
+
+public sub tkBadge_SetText( byval hBadge as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.nKind = TKBADGE_KIND_TEXT
+    p->spec.wszText = Text
+    Refresh( p )
+end sub
+
+public function tkBadge_GetText( byval hBadge as TK_WIDGET ptr ) as ustring
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return ""
+    return p->spec.wszText
+end function
+
+' A glyph-font character (ApplyFonts' glyph font); with none, a dot.
+public sub tkBadge_SetGlyph( byval hBadge as TK_WIDGET ptr, byval Glyph as ustring )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.nKind = TKBADGE_KIND_GLYPH
+    p->spec.wszGlyph = Glyph
+    Refresh( p )
+end sub
+
+public sub tkBadge_SetPresence( byval hBadge as TK_WIDGET ptr, byval nPresence as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (nPresence < TKBADGE_PRESENCE_AVAILABLE) orelse (nPresence > TKBADGE_PRESENCE_UNKNOWN) then exit sub
+    p->spec.nKind = TKBADGE_KIND_PRESENCE
+    p->spec.nPresence = nPresence
+    Refresh( p )
+end sub
+
+public function tkBadge_GetPresence( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return TKBADGE_PRESENCE_AVAILABLE
+    return p->spec.nPresence
+end function
+
+' The Kind as such, the content left as it is (a designed form sets it after the content, so the
+' designer's choice wins over whichever content setter ran last).
+public sub tkBadge_SetKind( byval hBadge as TK_WIDGET ptr, byval nKind as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (nKind < TKBADGE_KIND_DOT) orelse (nKind > TKBADGE_KIND_PRESENCE) then exit sub
+    p->spec.nKind = nKind
+    Refresh( p )
+end sub
+
+public function tkBadge_GetKind( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return TKBADGE_KIND_DOT
+    return p->spec.nKind
+end function
+
+public function tkBadge_GetMaxCount( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return TKBADGE_DEFAULT_MAXCOUNT
+    return p->spec.nMaxCount
+end function
+
+' 0 = no cap; negative is 0.
+public sub tkBadge_SetMaxCount( byval hBadge as TK_WIDGET ptr, byval nMax as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.nMaxCount = iif( nMax < 0, 0, nMax )
+    Refresh( p )
+end sub
+
+public function tkBadge_GetShowZero( byval hBadge as TK_WIDGET ptr ) as boolean
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return false
+    return p->spec.bShowZero
+end function
+
+public sub tkBadge_SetShowZero( byval hBadge as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.bShowZero = bOn
+    Refresh( p )
+end sub
+
+public function tkBadge_GetInvisible( byval hBadge as TK_WIDGET ptr ) as boolean
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return false
+    return p->spec.bInvisible
+end function
+
+' Hides the paint, keeps the widget (and a standalone badge's space).
+public sub tkBadge_SetInvisible( byval hBadge as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.bInvisible = bOn
+    Refresh( p )
+end sub
+
+' Whether anything is drawn: the Kind, its content, ShowZero and Invisible together.
+public function tkBadge_IsShowing( byval hBadge as TK_WIDGET ptr ) as boolean
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    return (p <> 0) andalso Showing( p->spec )
+end function
+
+' ---- look -------------------------------------------------------------------------------------
+public function tkBadge_GetStatus( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return TKBADGE_ACCENT
+    return p->spec.nStatus
+end function
+
+public sub tkBadge_SetStatus( byval hBadge as TK_WIDGET ptr, byval nStatus as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (nStatus < TKBADGE_ACCENT) orelse (nStatus > TKBADGE_NEUTRAL) then exit sub
+    p->spec.nStatus = nStatus
+    p->spec.bCustom = false
+    tkWidget_Invalidate( hBadge )
+end sub
+
+public function tkBadge_GetAppearance( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return TKBADGE_FILLED
+    return p->spec.nAppearance
+end function
+
+public sub tkBadge_SetAppearance( byval hBadge as TK_WIDGET ptr, byval nAppearance as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (nAppearance < TKBADGE_FILLED) orelse (nAppearance > TKBADGE_TINT) then exit sub
+    p->spec.nAppearance = nAppearance
+    tkWidget_Invalidate( hBadge )
+end sub
+
+public function tkBadge_GetShape( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return TKBADGE_PILL
+    return p->spec.nShape
+end function
+
+public sub tkBadge_SetShape( byval hBadge as TK_WIDGET ptr, byval nShape as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (nShape < TKBADGE_PILL) orelse (nShape > TKBADGE_SQUARE) then exit sub
+    p->spec.nShape = nShape
+    tkWidget_Invalidate( hBadge )
+end sub
+
+public function tkBadge_GetSize( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return TKBADGE_MEDIUM
+    return p->spec.nSize
+end function
+
+public sub tkBadge_SetSize( byval hBadge as TK_WIDGET ptr, byval nSize as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (nSize < TKBADGE_SMALL) orelse (nSize > TKBADGE_LARGE) then exit sub
+    p->spec.nSize = nSize
+    Refresh( p )
+end sub
+
+public function tkBadge_GetRing( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return 0
+    return p->spec.nRing
+end function
+
+' The cut-out ring's thickness in pixels (a rule: never scaled). Attaching sets 2 unless this ran.
+public sub tkBadge_SetRing( byval hBadge as TK_WIDGET ptr, byval nRing as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.nRing = iif( nRing < 0, 0, nRing )
+    p->bRingPinned = true
+    Refresh( p )
+end sub
+
+' A one-off colour pair instead of the status; SetStatus returns to the status.
+public sub tkBadge_SetCustomColors( byval hBadge as TK_WIDGET ptr, byval clrFill as ulong, byval clrInk as ulong )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.bCustom = true
+    p->spec.clrFill = clrFill
+    p->spec.clrInk = clrInk
+    tkWidget_Invalidate( hBadge )
+end sub
+
+' ---- standalone label -----------------------------------------------------------------------
+public function tkBadge_GetLabel( byval hBadge as TK_WIDGET ptr ) as ustring
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return ""
+    return p->wszLabel
+end function
+
+public sub tkBadge_SetLabel( byval hBadge as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->wszLabel = Text
+    Refresh( p )
+end sub
+
+public function tkBadge_GetJustify( byval hBadge as TK_WIDGET ptr ) as long
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return TKBADGE_JUSTIFY_LEFT
+    return p->nJustify
+end function
+
+public sub tkBadge_SetJustify( byval hBadge as TK_WIDGET ptr, byval nJustify as long )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (nJustify < TKBADGE_JUSTIFY_LEFT) orelse (nJustify > TKBADGE_JUSTIFY_RIGHT) then exit sub
+    p->nJustify = nJustify
+    Refresh( p )
+end sub
+
+' The badge plus (standalone) the gap and the label; valid before sizing.
+public sub tkBadge_GetIdealSize( byval hBadge as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    nWidth = 0 : nHeight = 0
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    dim as TKBADGE_SPEC s = LiveSpec( p )
+    tkBadge_MeasureSpec( s, nWidth, nHeight )
+    if p->hTarget then exit sub
+    dim as TTF_Font ptr f = TextFont( p )
+    if (len( p->wszLabel ) > 0) andalso (f <> 0) then
+        nWidth += iif( nWidth > 0, SC( s, TKBADGE_DEFAULT_LABELGAP ), 0 ) + tkText_Width( f, p->wszLabel )
+        if tkText_Height( f ) > nHeight then nHeight = tkText_Height( f )
+    end if
+end sub
+
+' The badge's rect (with its ring), widget-local; FALSE while nothing shows or not laid out.
+public function tkBadge_GetBadgeRect( byval hBadge as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    tkRect_SetEmpty( rc )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return false
+    if p->bLayoutDirty then Layout( p )
+    rc = p->rcBadge
+    return tkRect_IsEmpty( rc ) = false
+end function
+
+' ---- attachment (B1) ----------------------------------------------------------------------------
+' Hang the badge on hTarget's corner: it becomes an adornment of hTarget (tkWidget_SetAdorner) --
+' painted over the target, centred on the anchor, moved by (dx, dy) design units, following the
+' target, never hit-tested. The ring becomes 2 px unless SetRing ran. hTarget = 0 detaches.
+public declare sub tkBadge_Detach( byval hBadge as TK_WIDGET ptr, byval hNewParent as TK_WIDGET ptr = 0 )
+
+public sub tkBadge_Attach( byval hBadge as TK_WIDGET ptr, byval hTarget as TK_WIDGET ptr, _
+                          byval nCorner as long = TKBADGE_TOP_RIGHT, byval dx as long = 0, byval dy as long = 0, _
+                          byval nOverlap as long = TKBADGE_OVERLAP_RECT )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    if (hTarget = 0) orelse (hTarget = hBadge) then tkBadge_Detach( hBadge ) : exit sub
+    if p->hTarget = 0 then p->hHome = tkWidget_Parent( hBadge )
+    p->hTarget = hTarget
+    p->nCorner = nCorner : p->nOffX = dx : p->nOffY = dy : p->nOverlap = nOverlap
+    if p->bRingPinned = false then p->spec.nRing = TKBADGE_ATTACHED_RING
+    if tkWidget_Parent( hBadge ) <> hTarget then tkWidget_Reparent( hBadge, hTarget )
+    tkWidget_SetAdorner( hBadge, true )
+    tkTipHost_Pop( @p->tip )
+    Refresh( p )
+end sub
+
+' Back to a plain widget under hNewParent (0 = the parent it had before Attach), placed by the host.
+public sub tkBadge_Detach( byval hBadge as TK_WIDGET ptr, byval hNewParent as TK_WIDGET ptr = 0 )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (p->hTarget = 0) then exit sub
+    dim as TK_WIDGET ptr home = iif( hNewParent <> 0, hNewParent, p->hHome )
+    p->hTarget = 0
+    tkWidget_SetAdorner( hBadge, false )
+    if (home <> 0) andalso (home <> tkWidget_Parent( hBadge )) then tkWidget_Reparent( hBadge, home )
+    if p->bRingPinned = false then p->spec.nRing = 0
+    Refresh( p )
+end sub
+
+public function tkBadge_GetTarget( byval hBadge as TK_WIDGET ptr ) as TK_WIDGET ptr
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return cast( TK_WIDGET ptr, 0 )
+    return p->hTarget
+end function
+
+' ---- fonts --------------------------------------------------------------------------------------
+public sub tkBadge_SetFont( byval hBadge as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.fText = f
+    Refresh( p )
+end sub
+
+public function tkBadge_GetFont( byval hBadge as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return cast( TTF_Font ptr, 0 )
+    return p->spec.fText
+end function
+
+' The font a Glyph badge draws its glyph in (the designer's GlyphFont).
+public sub tkBadge_SetGlyphFont( byval hBadge as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->spec.fGlyph = f
+    Refresh( p )
+end sub
+
+' Text and glyph fonts; a 0 leaves that one alone.
+public sub tkBadge_ApplyFonts( byval hBadge as TK_WIDGET ptr, byval fText as TTF_Font ptr, byval fGlyph as TTF_Font ptr )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    if fText then p->spec.fText = fText
+    if fGlyph then p->spec.fGlyph = fGlyph
+    Refresh( p )
+end sub
+
+' ---- tooltip (standalone) -------------------------------------------------------------------
+public sub tkBadge_SetTooltipText( byval hBadge as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p then p->wszTooltip = Text
+end sub
+
+public function tkBadge_GetTooltipText( byval hBadge as TK_WIDGET ptr ) as ustring
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return ""
+    return p->wszTooltip
+end function
+
+public function tkBadge_GetTooltipHandle( byval hBadge as TK_WIDGET ptr ) as TK_TIP ptr
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then return 0
+    return tkTipHost_Tip( @p->tip )
+end function
+
+' ---- appearance ----------------------------------------------------------------------------
+public sub tkBadge_GetColors( byval hBadge as TK_WIDGET ptr, byval pColors as TKBADGE_COLORS ptr )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Copies the struct and PINS it: a theme change leaves this badge alone until UnpinColors.
+public sub tkBadge_SetColors( byval hBadge as TK_WIDGET ptr, byval pColors as TKBADGE_COLORS ptr )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hBadge )
+end sub
+
+' The badge's colours from the theme's roles (§5.6). Each ink is the theme ink that reads best on
+' its fill (WCAG contrast), computed here, so a theme file's own colours stay legible.
+public function tkBadge_ThemeColors( byref t as TKTHEME_COLORS ) as TKBADGE_COLORS
+    dim as TKBADGE_COLORS c
+    c.BackColor = t.Window
+    c.RingColor = t.Window
+    c.LabelColor = t.Text
+    c.LabelColorDisabled = t.TextDisabled
+    c.FillAccent = t.Accent
+    c.FillInfo = t.Accent
+    c.FillSuccess = t.Success
+    c.FillWarning = t.Warning
+    c.FillError = t.Error
+    c.FillNeutral = t.TextDim
+    c.FillDisabled = t.SurfaceDisabled
+    c.InkDisabled = t.TextDisabled
+    c.InkAccent = BestInk( t, c.FillAccent )
+    c.InkInfo = BestInk( t, c.FillInfo )
+    c.InkSuccess = BestInk( t, c.FillSuccess )
+    c.InkWarning = BestInk( t, c.FillWarning )
+    c.InkError = BestInk( t, c.FillError )
+    c.InkNeutral = BestInk( t, c.FillNeutral )
+    return c
+end function
+
+public sub tkBadge_ApplyTheme( byval hBadge as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hBadge, t )
+    p->colors = tkBadge_ThemeColors( tr )
+    tkTheme_ResolveInto( hBadge, tr, cast( ulong ptr, @p->colors ), sizeof( TKBADGE_COLORS ) \ 4, "Badge" )
+    tkWidget_Invalidate( hBadge )
+end sub
+
+public sub tkBadge_UnpinColors( byval hBadge as TK_WIDGET ptr )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkBadge_ApplyTheme( hBadge, tkTheme_Of( hBadge ) )
+end sub
+
+' ---- callbacks -----------------------------------------------------------------------------
+public sub tkBadge_PaintDefault( byval pi as TKBADGE_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKBADGE_STATE ptr p = BG( pi->hBadge )
+    if p then RenderDefault( p, pi )
+end sub
+
+public sub tkBadge_SetPaintCallback( byval hBadge as TK_WIDGET ptr, byval usersub as BDG_PaintCallbackSub )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p = 0 then exit sub
+    p->PaintCallback = usersub
+    tkWidget_Invalidate( hBadge )
+end sub
+
+public sub tkBadge_SetMessageCallback( byval hBadge as TK_WIDGET ptr, byval userfunc as BDG_MessageCallbackFunc )
+    dim as TKBADGE_STATE ptr p = BG( hBadge )
+    if p then p->MessageCallback = userfunc
+end sub

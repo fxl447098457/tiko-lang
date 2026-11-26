@@ -1,0 +1,320 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- the footer: a summary row under the rows (phase G7b).
+'
+' Each column may show a total of its own (TKDATAGRID_COLUMN.summary, SetColumnSummary): SUM,
+' COUNT (the non-empty cells, as SQL's COUNT( col )), AVG, MIN or MAX. SetSummaryScope says over
+' what: the rows the view shows (the default; filtered-out rows do not count), or the selected
+' cells (Excel's status bar).
+'
+' WHERE A TOTAL COMES FROM, in order:
+'   1. a source's Aggregate procedure (a database adds it up where the data is), while the grid
+'      filters nothing itself and the scope is the view;
+'   2. the grid adds it up -- one pass over the view's rows through DgRead -- when it may read
+'      every row: its own store, a source, or a virtual grid with INTERNAL sorting (the rule that
+'      lets it sort);
+'   3. otherwise the value is EMPTY, and the SummaryFormatting event may give one (HOST mode: the
+'      host knows its totals).
+' SUM of integers stays an integer (else a float), and SUM over nothing is 0; AVG is a float;
+' MIN / MAX compare as the sort does (text without case, dates as dates) and are EMPTY over nothing.
+' Values of another kind than the column's are converted first; ones that will not are skipped.
+'
+' CACHED. The totals are worked out at most once per change: DgWrite, DgChanged (rows, columns,
+' the view, a feed), InvalidateCells, SupplyRows and row moves mark them stale, and the next paint
+' (or GetSummary) works them out again; the selection scope also when the selection is not the one
+' they were taken over. SummaryFormatting is called once per summary column per working-out, with
+' the text prefilled from the value -- set both to change both.
+#module "tkDataGrid"
+
+#import "../tkHost"
+#import "../tkColumnHeader"
+using tkHost
+using tkPaint
+using tkColumnHeader
+
+type DG_SUMACC
+    n      as longint              ' values counted (COUNT: non-empty cells; SUM / AVG: numbers)
+    isum   as longint
+    fsum   as float64
+    bFloat as boolean              ' a float was added: SUM is a float
+    has    as boolean              ' MIN / MAX: best holds a value
+    best   as TKDG_VALUE
+end type
+
+' The totals are stale.
+sub DgSumInvalidate( byval p as TKDATAGRID_STATE ptr )
+    p->bSumValid = false
+end sub
+
+' -1 / 0 / 1 for two values of one kind (the sort's order).
+function DgSumCmp( byref a as const TKDG_VALUE, byref b as const TKDG_VALUE ) as long
+    select case a.kind
+    case TKDG_TEXT
+        dim as ustring x = lcase( a.s ), y = lcase( b.s )
+        if x < y then return -1
+        if x > y then return 1
+    case TKDG_FLOAT
+        if a.f < b.f then return -1
+        if a.f > b.f then return 1
+    case TKDG_INT
+        if a.i < b.i then return -1
+        if a.i > b.i then return 1
+    case TKDG_BOOL
+        if (a.b = false) andalso b.b then return -1
+        if a.b andalso (b.b = false) then return 1
+    case TKDG_DATE
+        dim as longint x = a.d.wYear * 10000 + a.d.wMonth * 100 + a.d.wDay
+        dim as longint y = b.d.wYear * 10000 + b.d.wMonth * 100 + b.d.wDay
+        if x < y then return -1
+        if x > y then return 1
+    end select
+    return 0
+end function
+
+private sub DgSumAdd( byval kind as long, byval valueKind as long, byref acc as DG_SUMACC, byref v0 as const TKDG_VALUE )
+    if v0.kind = TKDG_EMPTY then exit sub
+    select case kind
+    case TKDG_SUM_COUNT
+        acc.n += 1
+    case TKDG_SUM_SUM, TKDG_SUM_AVG
+        dim as TKDG_VALUE v = v0
+        if (v.kind <> TKDG_INT) andalso (v.kind <> TKDG_FLOAT) then
+            if DgConvert( v, TKDG_FLOAT ) = false then exit sub
+        end if
+        acc.n += 1
+        if v.kind = TKDG_INT then
+            acc.isum += v.i : acc.fsum += v.i
+        else
+            acc.fsum += v.f : acc.bFloat = true
+        end if
+    case TKDG_SUM_MIN, TKDG_SUM_MAX
+        dim as TKDG_VALUE v = v0
+        if DgConvert( v, valueKind ) = false then exit sub
+        if v.kind = TKDG_EMPTY then exit sub
+        if acc.has = false then
+            acc.best = v : acc.has = true
+        else
+            dim as long c = DgSumCmp( v, acc.best )
+            if ((kind = TKDG_SUM_MIN) andalso (c < 0)) orelse ((kind = TKDG_SUM_MAX) andalso (c > 0)) then acc.best = v
+        end if
+    end select
+end sub
+
+private sub DgSumResult( byval kind as long, byref acc as const DG_SUMACC, byref v as TKDG_VALUE )
+    v.Clear( )
+    select case kind
+    case TKDG_SUM_COUNT
+        v.SetInt( acc.n )
+    case TKDG_SUM_SUM
+        if acc.bFloat then v.SetFloat( acc.fsum ) else v.SetInt( acc.isum )
+    case TKDG_SUM_AVG
+        if acc.n > 0 then v.SetFloat( acc.fsum / acc.n )
+    case TKDG_SUM_MIN, TKDG_SUM_MAX
+        if acc.has then v = acc.best
+    end select
+end sub
+
+' May the grid read every row to add them up? (The rule that lets it sort them.)
+private function DgSumCanScan( byval p as TKDATAGRID_STATE ptr ) as boolean
+    select case p->feed
+    case DG_FEED_STORE : return true
+    case DG_FEED_VIRTUAL : return p->sortMode = TKDG_SORT_INTERNAL
+    end select
+    return DgSortModeOf( p ) <> TKDG_SORT_HOST
+end function
+
+' Works the totals out (when stale) over the view's rows or the selection.
+sub DgSumEnsure( byval p as TKDATAGRID_STATE ptr )
+    if p->bSumValid andalso ((p->sumScope <> TKDG_SUMSCOPE_SELECTION) orelse DgSetEqual( p->sel, p->sumSel )) then exit sub
+    p->bSumValid = true
+    p->sumSel = p->sel
+    if p->colCount = 0 then
+        erase p->sumVals : erase p->sumTexts
+        exit sub
+    end if
+    redim p->sumVals( 0 to p->colCount - 1 )
+    redim p->sumTexts( 0 to p->colCount - 1 )
+    dim as integer nSum = 0
+    for k as integer = 0 to p->colCount - 1
+        if p->cols(k).c.summary <> TKDG_SUM_NONE then nSum += 1
+    next
+    if nSum = 0 then exit sub
+    dim as boolean bSel = (p->sumScope = TKDG_SUMSCOPE_SELECTION)
+    ' 1. the source adds up (only the view's rows: the grid filters nothing of its own)
+    dim as boolean gridFilters = p->bViewMap andalso (p->viewCount <> p->rowCount)
+    dim as ubyte done( 0 to p->colCount - 1 )
+    if (p->feed = DG_FEED_SOURCE) andalso (p->src.Aggregate <> 0) andalso (bSel = false) andalso (gridFilters = false) then
+        for k as integer = 0 to p->colCount - 1
+            if p->cols(k).c.summary = TKDG_SUM_NONE then continue for
+            dim as TKDG_VALUE v
+            if p->src.Aggregate( p->src.pCtx, k, p->cols(k).c.summary, v ) then p->sumVals(k) = v : done(k) = 1
+        next
+    end if
+    ' 2. the grid adds up: one pass over the rows, every summary column at once
+    if DgSumCanScan( p ) then
+        dim as DG_SUMACC acc( 0 to p->colCount - 1 )
+        dim as integer nv = DgViewCount( p )
+        for vr as integer = 0 to nv - 1
+            dim as integer r = DgModelOf( p, vr )
+            if bSel andalso (DgSetHasRow( p->sel, r ) = false) then
+                ' a row with no whole-row selection may still have selected cells
+                dim as boolean anyCell = false
+                for k as integer = 0 to p->sel.nRects - 1
+                    if (vr >= p->sel.rects(k).row1) andalso (vr <= p->sel.rects(k).row2) then anyCell = true : exit for
+                next
+                if anyCell = false then continue for
+            end if
+            for k as integer = 0 to p->colCount - 1
+                if (p->cols(k).c.summary = TKDG_SUM_NONE) orelse (done(k) <> 0) then continue for
+                if bSel andalso (DgCellSelected( p, r, k ) = false) then continue for
+                dim as TKDG_VALUE v
+                DgRead( p, r, k, v )
+                DgSumAdd( p->cols(k).c.summary, p->cols(k).c.valueKind, acc(k), v )
+            next
+        next
+        for k as integer = 0 to p->colCount - 1
+            if (p->cols(k).c.summary <> TKDG_SUM_NONE) andalso (done(k) = 0) then DgSumResult( p->cols(k).c.summary, acc(k), p->sumVals(k) )
+        next
+    end if
+    ' 3. the text, and the host's word on it
+    for k as integer = 0 to p->colCount - 1
+        if p->cols(k).c.summary = TKDG_SUM_NONE then continue for
+        p->sumTexts(k) = DgDisplayText( p, k, p->sumVals(k) )
+        if p->SummaryFormattingCallback then p->SummaryFormattingCallback( p->hWin, k, p->cols(k).c.summary, p->sumVals(k), p->sumTexts(k) )
+    next
+end sub
+
+' ==========================================================================================
+' Painting
+' ==========================================================================================
+private sub DgPaintFooterRegion( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr, byval bFrozen as boolean, _
+                                 byref clip as TKRECT, byval font_ as TTF_Font ptr )
+    if clip.right <= clip.left then exit sub
+    b->PushClip( @clip )
+    dim as integer pad = DgScale( p, CDATAGRID_CELL_PAD )
+    dim as integer d0 = iif( bFrozen, 0, p->nFrozen ), d1 = iif( bFrozen, p->nFrozen - 1, p->colCount - 1 )
+    if d1 > p->colCount - 1 then d1 = p->colCount - 1
+    dim as TKRECT rc
+    for d as integer = d0 to d1
+        dim as integer k = p->order(d)
+        if p->cols(k).wPx <= 0 then continue for
+        dim as integer x = DgColLeft( p, k )
+        if x >= clip.right then exit for
+        if x + p->cols(k).wPx <= clip.left then continue for
+        if (p->cols(k).c.summary <> TKDG_SUM_NONE) andalso (k <= ubound( p->sumTexts )) then
+            tkRect_Set( rc, x + pad, clip.top, x + p->cols(k).wPx - pad, clip.bottom )
+            dim as long fl = TK_DT_VCENTER or TK_DT_ELLIPSIS
+            select case DgAlignOf( p->cols(k).c )
+            case TKDG_ALIGN_RIGHT : fl or= TK_DT_RIGHT
+            case TKDG_ALIGN_CENTER : fl or= TK_DT_CENTER
+            end select
+            b->SetFont( font_ )
+            b->SetForeColor( p->colors.FooterForeColor )
+            b->PaintText( p->sumTexts(k), @rc, fl )
+        end if
+        if p->nGridLines and TKDG_GRID_VERT then
+            tkRect_Set( rc, x + p->cols(k).wPx - 1, clip.top, x + p->cols(k).wPx, clip.bottom )
+            b->SetBackColor( p->colors.GridLineColor )
+            b->PaintRect( @rc )
+        end if
+    next
+    b->PopClip( )
+end sub
+
+' The footer band (nothing when hidden): its back, each summary column's text in the column's
+' place (frozen and scrolling columns, as the header), the line above it.
+sub DgPaintFooter( byval p as TKDATAGRID_STATE ptr, byval b as TK_PAINT ptr, byval hasFocus as boolean )
+    if p->bFooter = false then exit sub
+    DgSumEnsure( p )
+    dim as integer cw = p->wSurf->cw, ch = p->wSurf->ch, top = DgBodyBottom( p )
+    dim as integer rh = DgRhPx( p ), sl = DgScrollLeft( p )
+    if sl > cw then sl = cw
+    dim as TKRECT rc, clip
+    tkRect_Set( rc, 0, top, cw, ch )
+    b->SetBackColor( p->colors.FooterBackColor )
+    b->PaintRect( @rc )
+    dim as TTF_Font ptr font_ = iif( p->pFont <> 0, p->pFont, p->wSurf->pHost->pDefaultFont )
+    tkRect_Set( clip, sl, top, cw, ch )
+    DgPaintFooterRegion( p, b, false, clip, font_ )
+    tkRect_Set( clip, rh, top, sl, ch )
+    DgPaintFooterRegion( p, b, true, clip, font_ )
+    tkRect_Set( rc, 0, top, cw, top + 1 )
+    b->SetBackColor( p->colors.GridLineColor )
+    b->PaintRect( @rc )
+end sub
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' Shows the summary row under the rows (one row high). Silent.
+public sub tkDataGrid_ShowFooter( byval hGrid as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->bFooter = bShow
+    DgChanged( p )
+end sub
+
+public function tkDataGrid_IsFooterVisible( byval hGrid as TK_WIDGET ptr ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return (p <> 0) andalso p->bFooter
+end function
+
+' TKDG_SUM_NONE / SUM / COUNT / AVG / MIN / MAX for model column col. Silent.
+public function tkDataGrid_SetColumnSummary( byval hGrid as TK_WIDGET ptr, byval col as integer, byval kind as long ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return false
+    if (kind < TKDG_SUM_NONE) orelse (kind > TKDG_SUM_MAX) then return false
+    p->cols(col).c.summary = kind
+    DgChanged( p )
+    return true
+end function
+
+public function tkDataGrid_GetColumnSummary( byval hGrid as TK_WIDGET ptr, byval col as integer ) as long
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return TKDG_SUM_NONE
+    return p->cols(col).c.summary
+end function
+
+' TKDG_SUMSCOPE_VIEW (the rows shown) or TKDG_SUMSCOPE_SELECTION (the selected cells). Silent.
+public sub tkDataGrid_SetSummaryScope( byval hGrid as TK_WIDGET ptr, byval nScope as long )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then exit sub
+    p->sumScope = iif( nScope = TKDG_SUMSCOPE_SELECTION, TKDG_SUMSCOPE_SELECTION, TKDG_SUMSCOPE_VIEW )
+    DgChanged( p )
+end sub
+
+public function tkDataGrid_GetSummaryScope( byval hGrid as TK_WIDGET ptr ) as long
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, p->sumScope, TKDG_SUMSCOPE_VIEW )
+end function
+
+' The column's total now (worked out if stale, footer shown or not). FALSE: no such column or no
+' summary on it.
+public function tkDataGrid_GetSummary( byval hGrid as TK_WIDGET ptr, byval col as integer, byref v as TKDG_VALUE ) as boolean
+    v.Clear( )
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return false
+    if p->cols(col).c.summary = TKDG_SUM_NONE then return false
+    DgSumEnsure( p )
+    v = p->sumVals(col)
+    return true
+end function
+
+' The text the footer shows for the column ("" without a summary).
+public function tkDataGrid_GetSummaryText( byval hGrid as TK_WIDGET ptr, byval col as integer ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if (p = 0) orelse (DgValidCol( p, col ) = false) then return ""
+    if p->cols(col).c.summary = TKDG_SUM_NONE then return ""
+    DgSumEnsure( p )
+    return p->sumTexts(col)
+end function
+
+' The footer's height in pixels (0 while hidden).
+public function tkDataGrid_GetFooterHeightPx( byval hGrid as TK_WIDGET ptr ) as integer
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    return iif( p <> 0, DgFootHPx( p ), 0 )
+end function

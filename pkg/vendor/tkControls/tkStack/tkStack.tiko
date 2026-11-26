@@ -1,0 +1,300 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkStack -- a column (or a row) of controls, each below (or after) the one before: the layout of a
+' phone screen, where tkLayout's Anchor and Dock place controls on a designed form. A stack is no
+' widget of its own; it places its items inside a rectangle of their parent (tkStack_Apply), and
+' says how tall (or wide) the whole column is for a width (tkStack_Measure) -- what a tkScrollPanel
+' needs as its content height (docs/fasting-android PLAN §4.3).
+'
+' Every size is in DESIGN UNITS, scaled at apply time by the parent's host, as tkLayout's are. An
+' item's extent along the stack is FIXED, the control's own for the cross extent it gets (a
+' callback, in pixels: a wrapped label, a nested stack), or a FILL weight sharing what is left. Its
+' cross extent is the stack's (STRETCH) unless an alignment and a fixed cross size are given. A
+' HIDDEN item takes no space and no gap. A card -- a panel holding a stack of its own -- is
+' tkStack_AddStack: its height is its stack's, and applying the outer stack applies the inner one.
+'
+' Pure arithmetic over the items' sizes (tkStack_Layout) is separate from moving widgets, so it is
+' tested without a window.
+#module "tkStack"
+#import "../tkHost" public
+using tkHost
+using tkPaint
+
+public enum
+    TK_STACK_VERTICAL = 0
+    TK_STACK_HORIZONTAL
+end enum
+
+public enum
+    TK_STACK_STRETCH = 0     ' the stack's whole cross extent
+    TK_STACK_START
+    TK_STACK_CENTER
+    TK_STACK_END
+end enum
+
+' An item's extent along the stack, in PIXELS, for the cross extent (pixels) it is given.
+public type TKSTACK_SizeFunc as function( byval w as TK_WIDGET ptr, byval crossPx as long ) as long
+
+type TK_STACK_ as TK_STACK
+
+public type TKSTACK_ITEM
+    w as TK_WIDGET ptr
+    size as long             ' design units along the stack (FIXED)
+    fill as long             ' > 0: a FILL weight; size is then its minimum
+    fn as TKSTACK_SizeFunc   ' its own extent (pixels), when set
+    inner as TK_STACK_ ptr   ' a nested stack laid out inside w (tkStack_AddStack)
+    align as long            ' TK_STACK_*
+    cross as long            ' design units across, for a non-STRETCH alignment (0 = the stack's)
+    gapBefore as long        ' design units added before it (a section's space)
+end type
+
+public type TK_STACK
+    parent as TK_WIDGET ptr
+    orient as long
+    padL as long
+    padT as long
+    padR as long
+    padB as long
+    gap as long              ' design units between visible items
+    items as TKSTACK_ITEM ptr
+    n as long
+    cap as long
+end type
+
+public function tkStack_Create( byval parent as TK_WIDGET ptr, byval orient as long = TK_STACK_VERTICAL ) as TK_STACK ptr
+    dim as TK_STACK ptr s = callocate( sizeof( TK_STACK ) )
+    s->parent = parent
+    s->orient = orient
+    return s
+end function
+
+' Frees the stack and the stacks added to it (not the widgets).
+public sub tkStack_Destroy( byval s as TK_STACK ptr )
+    if s = 0 then exit sub
+    for i as long = 0 to s->n - 1
+        if s->items[i].inner then tkStack_Destroy( s->items[i].inner )
+    next
+    deallocate( s->items )
+    deallocate( s )
+end sub
+
+public sub tkStack_SetPadding( byval s as TK_STACK ptr, byval l as long, byval t as long, byval r as long, byval b as long )
+    if s then s->padL = l : s->padT = t : s->padR = r : s->padB = b
+end sub
+
+public sub tkStack_SetGap( byval s as TK_STACK ptr, byval gap as long )
+    if s then s->gap = gap
+end sub
+
+private function Push_( byval s as TK_STACK ptr, byval w as TK_WIDGET ptr ) as TKSTACK_ITEM ptr
+    if s->n = s->cap then
+        s->cap = iif( s->cap = 0, 8, s->cap * 2 )
+        s->items = reallocate( s->items, s->cap * sizeof( TKSTACK_ITEM ) )
+    end if
+    dim as TKSTACK_ITEM ptr it = @s->items[s->n]
+    clear( *it, 0, sizeof( TKSTACK_ITEM ) )
+    it->w = w
+    s->n += 1
+    return it
+end function
+
+' A control of a fixed extent along the stack (design units).
+public sub tkStack_Add( byval s as TK_STACK ptr, byval w as TK_WIDGET ptr, byval size as long )
+    if (s = 0) orelse (w = 0) then exit sub
+    Push_( s, w )->size = size
+end sub
+
+' A control whose extent is its own for the cross extent it gets (pixels in, pixels out).
+public sub tkStack_AddFunc( byval s as TK_STACK ptr, byval w as TK_WIDGET ptr, byval fn as TKSTACK_SizeFunc )
+    if (s = 0) orelse (w = 0) then exit sub
+    Push_( s, w )->fn = fn
+end sub
+
+' A control sharing what is left with the other FILL items, by weight; minSize is its least.
+public sub tkStack_AddFill( byval s as TK_STACK ptr, byval w as TK_WIDGET ptr, byval weight as long = 1, byval minSize as long = 0 )
+    if (s = 0) orelse (w = 0) then exit sub
+    dim as TKSTACK_ITEM ptr it = Push_( s, w )
+    it->fill = iif( weight < 1, 1, weight )
+    it->size = minSize
+end sub
+
+' A container w (a card) whose own items are the stack inner: w is as tall (or wide) as inner
+' measures, and inner is applied inside w. An inner stack of the OTHER orientation (a row in a
+' column) has no extent of its own along the outer one: size (design units) is it -- and a size
+' given wins for one of the same orientation too (a fixed-width row inside a row). The outer
+' stack owns inner from here on.
+public sub tkStack_AddStack( byval s as TK_STACK ptr, byval w as TK_WIDGET ptr, byval inner as TK_STACK ptr, byval size as long = 0 )
+    if (s = 0) orelse (w = 0) orelse (inner = 0) then exit sub
+    dim as TKSTACK_ITEM ptr it = Push_( s, w )
+    it->inner = inner
+    it->size = size
+end sub
+
+' Takes w out of the stack (its nested stack, if any, is freed); the widget stays. To move an item to
+' the end: Remove it, then add it again.
+public sub tkStack_Remove( byval s as TK_STACK ptr, byval w as TK_WIDGET ptr )
+    if s = 0 then exit sub
+    for i as long = 0 to s->n - 1
+        if s->items[i].w = w then
+            if s->items[i].inner then tkStack_Destroy( s->items[i].inner )
+            for j as long = i to s->n - 2
+                s->items[j] = s->items[j + 1]
+            next
+            s->n -= 1
+            exit sub
+        end if
+    next
+end sub
+
+' The LAST item added: its cross alignment and cross size (design units; 0 = the stack's).
+public sub tkStack_SetAlign( byval s as TK_STACK ptr, byval align as long, byval crossSize as long = 0 )
+    if (s = 0) orelse (s->n = 0) then exit sub
+    s->items[s->n - 1].align = align
+    s->items[s->n - 1].cross = crossSize
+end sub
+
+' The LAST item added: extra space before it (design units), beyond the gap.
+public sub tkStack_SetSpaceBefore( byval s as TK_STACK ptr, byval space as long )
+    if (s = 0) orelse (s->n = 0) then exit sub
+    s->items[s->n - 1].gapBefore = space
+end sub
+
+private function Sc_( byval s as TK_STACK ptr, byval v as long ) as long
+    if (s->parent = 0) orelse (s->parent->pHost = 0) then return v
+    return tkHost_Scale( s->parent->pHost, v )
+end function
+
+private function Shown_( byval it as TKSTACK_ITEM ptr ) as boolean
+    return it->w->isVisible
+end function
+
+public declare function tkStack_Measure( byval s as TK_STACK ptr, byval crossPx as long ) as long
+
+' One item's extent along the stack for crossPx (pixels): fixed, its own, or its stack's.
+private function Extent_( byval s as TK_STACK ptr, byval it as TKSTACK_ITEM ptr, byval crossPx as long ) as long
+    if it->inner then
+        if it->size > 0 then return Sc_( s, it->size )                  ' a size given wins
+        if it->inner->orient = s->orient then return tkStack_Measure( it->inner, crossPx )
+    end if
+    if it->fn then return it->fn( it->w, crossPx )
+    return Sc_( s, it->size )
+end function
+
+private function ItemCross_( byval s as TK_STACK ptr, byval it as TKSTACK_ITEM ptr, byval crossPx as long ) as long
+    if (it->align = TK_STACK_STRETCH) orelse (it->cross <= 0) then return crossPx
+    dim as long c = Sc_( s, it->cross )
+    return iif( c > crossPx, crossPx, c )
+end function
+
+' The whole stack's extent along it (padding included) for a cross extent of crossPx pixels -- the
+' content height a vertical stack inside a tkScrollPanel needs. FILL items count at their minimum.
+public function tkStack_Measure( byval s as TK_STACK ptr, byval crossPx as long ) as long
+    if s = 0 then return 0
+    dim as long inCross = crossPx - iif( s->orient = TK_STACK_VERTICAL, Sc_( s, s->padL ) + Sc_( s, s->padR ), Sc_( s, s->padT ) + Sc_( s, s->padB ) )
+    if inCross < 0 then inCross = 0
+    dim as long total = iif( s->orient = TK_STACK_VERTICAL, Sc_( s, s->padT ) + Sc_( s, s->padB ), Sc_( s, s->padL ) + Sc_( s, s->padR ) )
+    dim as long nShown = 0
+    for i as long = 0 to s->n - 1
+        dim as TKSTACK_ITEM ptr it = @s->items[i]
+        if Shown_( it ) = false then continue for
+        if nShown then total += Sc_( s, s->gap )
+        total += Sc_( s, it->gapBefore ) + Extent_( s, it, ItemCross_( s, it, inCross ) )
+        nShown += 1
+    next
+    return total
+end function
+
+' Where each item goes inside rc (parent-relative pixels): out(i) for item i; a hidden item gets an
+' empty rect. Moves nothing.
+public sub tkStack_Layout( byval s as TK_STACK ptr, byref rc as TKRECT, byval out_ as TKRECT ptr )
+    if s = 0 then exit sub
+    dim as boolean v = (s->orient = TK_STACK_VERTICAL)
+    dim as long x0 = rc.left + Sc_( s, s->padL ), y0 = rc.top + Sc_( s, s->padT )
+    dim as long x1 = rc.right - Sc_( s, s->padR ), y1 = rc.bottom - Sc_( s, s->padB )
+    dim as long cross = iif( v, x1 - x0, y1 - y0 ), room = iif( v, y1 - y0, x1 - x0 )
+    if cross < 0 then cross = 0
+    ' what the non-FILL items and the gaps take; then the rest is shared by weight
+    dim as long used = 0, weights = 0, nShown = 0
+    for i as long = 0 to s->n - 1
+        dim as TKSTACK_ITEM ptr it = @s->items[i]
+        if Shown_( it ) = false then continue for
+        if nShown then used += Sc_( s, s->gap )
+        used += Sc_( s, it->gapBefore )
+        if it->fill then
+            weights += it->fill
+            used += Sc_( s, it->size )
+        else
+            used += Extent_( s, it, ItemCross_( s, it, cross ) )
+        end if
+        nShown += 1
+    next
+    dim as long spare = room - used
+    if spare < 0 then spare = 0
+    dim as long pos_ = iif( v, y0, x0 ), given = 0, wLeft = weights
+    nShown = 0
+    for i as long = 0 to s->n - 1
+        dim as TKSTACK_ITEM ptr it = @s->items[i]
+        if Shown_( it ) = false then tkRect_Set( out_[i], 0, 0, 0, 0 ) : continue for
+        if nShown then pos_ += Sc_( s, s->gap )
+        pos_ += Sc_( s, it->gapBefore )
+        dim as long c = ItemCross_( s, it, cross ), e
+        if it->fill then
+            ' the last FILL item takes the remainder, so the shares always add up to spare
+            dim as long share = iif( wLeft = it->fill, spare - given, (spare * it->fill) \ weights )
+            given += share : wLeft -= it->fill
+            e = Sc_( s, it->size ) + share
+        else
+            e = Extent_( s, it, c )
+        end if
+        dim as long off = 0
+        select case it->align
+        case TK_STACK_CENTER : off = (cross - c) \ 2
+        case TK_STACK_END    : off = cross - c
+        end select
+        if v then
+            tkRect_Set( out_[i], x0 + off, pos_, x0 + off + c, pos_ + e )
+        else
+            tkRect_Set( out_[i], pos_, y0 + off, pos_ + e, y0 + off + c )
+        end if
+        pos_ += e
+        nShown += 1
+    next
+end sub
+
+' Places every item inside rc (parent-relative pixels), and each nested stack inside its container.
+public sub tkStack_Apply( byval s as TK_STACK ptr, byref rc as TKRECT )
+    if (s = 0) orelse (s->n = 0) then exit sub
+    dim as TKRECT ptr r = callocate( s->n * sizeof( TKRECT ) )
+    tkStack_Layout( s, rc, r )
+    for i as long = 0 to s->n - 1
+        dim as TKSTACK_ITEM ptr it = @s->items[i]
+        if Shown_( it ) = false then continue for
+        tkWidget_SetPos( it->w, r[i].left, r[i].top, r[i].right - r[i].left, r[i].bottom - r[i].top )
+        if it->inner then
+            dim as TKRECT ir
+            tkRect_Set( ir, 0, 0, r[i].right - r[i].left, r[i].bottom - r[i].top )
+            tkStack_Apply( it->inner, ir )
+        end if
+    next
+    deallocate( r )
+end sub
+
+' Lays the stack out in its parent's whole client area, the parent as tall as the stack needs when
+' bGrow (a tkScrollPanel's panel): returns that extent (pixels).
+public function tkStack_ApplyToParent( byval s as TK_STACK ptr, byval bGrow as boolean = false ) as long
+    if (s = 0) orelse (s->parent = 0) then return 0
+    dim as TK_WIDGET ptr p = s->parent
+    dim as long ext = tkStack_Measure( s, iif( s->orient = TK_STACK_VERTICAL, p->cw, p->ch ) )
+    dim as TKRECT rc
+    if s->orient = TK_STACK_VERTICAL then
+        tkRect_Set( rc, 0, 0, p->cw, iif( bGrow andalso (ext > p->ch), ext, p->ch ) )
+    else
+        tkRect_Set( rc, 0, 0, iif( bGrow andalso (ext > p->cw), ext, p->cw ), p->ch )
+    end if
+    tkStack_Apply( s, rc )
+    return ext
+end function

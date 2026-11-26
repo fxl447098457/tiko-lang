@@ -1,0 +1,965 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkChip -- a compact pill: a leading avatar / glyph / image, a label, a check mark when selected,
+' a count, a remove button. New in tkControls; the design is
+' C:\dev\docs\tkControls\RATING-BADGE-AVATAR-CHIP.md §7.1, §7.2. Phase C0 (tkChipGroup is C1 + C2).
+'
+' ANATOMY (§7.1), one layout for the chip and for every item of a group (TKCHIP_SPEC):
+'   [pad][leading][gap][label ...][gap][count][gap][remove][pad]
+' The check mark replaces the leading part when there is one (M3) and is otherwise inserted
+' (ReserveCheck keeps its room when unselected, so a row of chips does not jump).
+' KIND (§7.2, D-C1): ACTION (a Click), TOGGLE (Selected, SelectedChanged), INPUT (an entity with a
+' remove button; Selectable optional). The remove button is its own hit target, at least 24 px across:
+' a release on it fires RemoveRequested -- the HOST removes the chip; Delete / Backspace do the same.
+' Setters are silent; callbacks fire last, from snapshots (a callback may destroy the chip).
+#module "tkChip"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+#import "../tkImage" public
+#import "../tkBadge" public
+#import "../tkAvatar" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+using tkImage
+using tkBadge
+using tkAvatar
+
+public enum
+    TKCHIP_ACTION = 0
+    TKCHIP_TOGGLE
+    TKCHIP_INPUT
+end enum
+
+public enum
+    TKCHIP_LEAD_NONE = 0
+    TKCHIP_LEAD_AVATAR          ' tkAvatar_PaintInto: initials from AvatarName (else the label), or an image
+    TKCHIP_LEAD_GLYPH
+    TKCHIP_LEAD_IMAGE           ' a round image
+end enum
+
+public enum
+    TKCHIP_FILLED = 0
+    TKCHIP_OUTLINED
+end enum
+
+public enum
+    TKCHIP_PILL = 0
+    TKCHIP_ROUNDED
+end enum
+
+public enum
+    TKCHIP_SMALL = 0            ' height 24
+    TKCHIP_MEDIUM               ' height 32
+end enum
+
+' HitTest's answers.
+public enum
+    TKCHIP_HIT_NONE = 0
+    TKCHIP_HIT_BODY
+    TKCHIP_HIT_REMOVE
+end enum
+
+public const as long TKCHIP_DEFAULT_MAXLABEL = 200     ' design units; 0 = no limit
+public const as long TKCHIP_MIN_TARGET       = 24      ' the remove button's hit target, at least
+public const as long TKCHIP_FOCUSGAP         = 2
+public const as long TKCHIP_FOCUSTHICK       = 1
+
+' The Neutral status's colours; another status tints them at paint (§7.4).
+public type TKCHIP_COLORS
+    BackColor            as ulong = &hFF21252Bul
+    FocusRingColor       as ulong = &hFF61AFEFul
+    FillColor            as ulong = &hFF2C313Aul
+    FillColorHot         as ulong = &hFF373D48ul
+    FillColorPressed     as ulong = &hFF264F78ul
+    FillColorSelected    as ulong = &hFF264F78ul
+    FillColorSelectedHot as ulong = &hFF2E5E8Eul
+    FillColorDisabled    as ulong = &hFF282C33ul
+    BorderColor          as ulong = &hFF444A56ul
+    BorderColorHot       as ulong = &hFF5A6170ul
+    BorderColorSelected  as ulong = &hFF569CD6ul
+    BorderColorDisabled  as ulong = &hFF30343Cul
+    TextColor            as ulong = &hFFC8CDD6ul
+    TextColorSelected    as ulong = &hFFFFFFFFul
+    TextColorDisabled    as ulong = &hFF606670ul
+    CheckColor           as ulong = &hFFFFFFFFul
+    RemoveColor          as ulong = &hFF969CA6ul
+    RemoveColorHot       as ulong = &hFFE2E6EEul
+    RemoveBackHot        as ulong = &hFF4A5260ul
+end type
+
+' Everything that decides a chip's look and layout, with or without a widget.
+public type TKCHIP_SPEC
+    wszText        as ustring
+    nLead          as long = TKCHIP_LEAD_NONE
+    wszAvatarName  as ustring                 ' "" = the label
+    wszGlyph       as ustring
+    pImage         as tkImageFile ptr          ' LEAD_IMAGE, or LEAD_AVATAR's picture
+    bSelected      as boolean
+    bShowCheck     as boolean = true
+    bReserveCheck  as boolean
+    bRemovable     as boolean
+    nCount         as long                     ' > 0: a count badge
+    nStatus        as long = TKBADGE_NEUTRAL
+    nAppearance    as long = TKCHIP_FILLED
+    nShape         as long = TKCHIP_PILL
+    nSize          as long = TKCHIP_MEDIUM
+    nMaxLabel      as long = -1                ' pixels; -1 = TKCHIP_DEFAULT_MAXLABEL scaled; 0 = no limit
+    bEnabled       as boolean = true
+    bHot           as boolean
+    bPressed       as boolean
+    bRemoveHot     as boolean
+    fText          as TTF_Font ptr
+    fGlyph         as TTF_Font ptr
+    fAvatar        as TTF_Font ptr             ' the leading avatar's initials (tkAvatar_FitFont sizes it)
+    fScale         as single = 1
+    pColors        as TKCHIP_COLORS ptr        ' 0 = the app theme's
+end type
+
+' A chip's parts, laid out at a given top-left.
+public type TKCHIP_PARTS
+    rcChip         as TKRECT
+    rcLeading      as TKRECT                   ' empty when none
+    rcCheck        as TKRECT                   ' empty when no check is drawn (or reserved)
+    rcLabel        as TKRECT
+    rcCount        as TKRECT
+    rcRemove       as TKRECT                   ' the visible circle
+    rcRemoveTarget as TKRECT                   ' >= 24 px across, inside the chip
+    bLabelCut      as boolean                  ' the label is ellipsised
+end type
+
+public type TKCHIP_PAINTINFO
+    hChip      as TK_WIDGET ptr
+    b          as TK_PAINT ptr
+    rcClient   as TKRECT
+    parts      as TKCHIP_PARTS
+    isFocused  as boolean
+end type
+
+public type TKCHIP_MESSAGEINFO
+    hChip as TK_WIDGET ptr
+    msg   as long
+    x     as single
+    y     as single
+    key   as long
+    part  as long                    ' TKCHIP_HIT_*
+end type
+
+public type CHP_ClickCallbackSub as sub( byval hChip as TK_WIDGET ptr )
+public type CHP_SelectedChangedCallbackSub as sub( byval hChip as TK_WIDGET ptr, byval isSelected as boolean )
+public type CHP_RemoveRequestedCallbackSub as sub( byval hChip as TK_WIDGET ptr )
+public type CHP_PaintCallbackSub as sub( byval p as TKCHIP_PAINTINFO ptr )
+public type CHP_MessageCallbackFunc as function( byval m as TKCHIP_MESSAGEINFO ptr ) as boolean
+
+' ==========================================================================================
+' Layout (§7.1)
+' ==========================================================================================
+private function SC( byref s as TKCHIP_SPEC, byval du as long ) as long
+    return cint( du * s.fScale )
+end function
+
+private function HeightOf( byref s as TKCHIP_SPEC ) as long
+    return SC( s, iif( s.nSize = TKCHIP_SMALL, 24, 32 ) )
+end function
+
+private function HasLeading( byref s as TKCHIP_SPEC ) as boolean
+    select case s.nLead
+    case TKCHIP_LEAD_AVATAR : return true
+    case TKCHIP_LEAD_GLYPH  : return (len( s.wszGlyph ) > 0) andalso (s.fGlyph <> 0)
+    case TKCHIP_LEAD_IMAGE  : return (s.pImage <> 0) andalso (s.pImage->IsValid() <> 0)
+    end select
+    return false
+end function
+
+' Lay the chip out with its top-left at (x, y). The width follows from the parts.
+public sub tkChip_LayoutSpec( byref s as TKCHIP_SPEC, byval x as long, byval y as long, byref pt as TKCHIP_PARTS )
+    dim as TKCHIP_PARTS z
+    pt = z
+    dim as long h = HeightOf( s ), gap = SC( s, 4 )
+    dim as boolean bLead = HasLeading( s )
+    dim as boolean bCheckSlot = (bLead = false) andalso s.bShowCheck andalso (s.bSelected orelse s.bReserveCheck)
+    dim as long cx = x + iif( bLead orelse bCheckSlot, SC( s, 4 ), SC( s, 12 ) )
+    dim as long lead = h - 2 * SC( s, 4 )                  ' a leading part / the check's square
+    if bLead then
+        tkRect_Set( pt.rcLeading, cx, y + (h - lead) \ 2, cx + lead, y + (h - lead) \ 2 + lead )
+        if s.bShowCheck andalso s.bSelected then pt.rcCheck = pt.rcLeading     ' the check replaces it
+        cx += lead + gap
+    elseif bCheckSlot then
+        tkRect_Set( pt.rcCheck, cx, y + (h - lead) \ 2, cx + lead, y + (h - lead) \ 2 + lead )
+        if s.bSelected = false then tkRect_SetEmpty( pt.rcCheck )            ' reserved, not drawn
+        cx += lead + gap
+    end if
+    ' the label: its width, cut at MaxLabel
+    dim as long tw = iif( s.fText <> 0, tkText_Width( s.fText, s.wszText ), 0 )
+    dim as long maxw = iif( s.nMaxLabel < 0, SC( s, TKCHIP_DEFAULT_MAXLABEL ), s.nMaxLabel )
+    if (maxw > 0) andalso (tw > maxw) then tw = maxw : pt.bLabelCut = true
+    tkRect_Set( pt.rcLabel, cx, y, cx + tw, y + h )
+    cx += tw
+    if s.nCount > 0 then
+        dim as TKBADGE_SPEC bs
+        bs.nKind = TKBADGE_KIND_COUNT : bs.nCount = s.nCount : bs.nSize = TKBADGE_SMALL
+        bs.fText = s.fText : bs.fScale = s.fScale
+        dim as long bw, bh
+        tkBadge_MeasureSpec( bs, bw, bh )
+        cx += gap
+        tkRect_Set( pt.rcCount, cx, y + (h - bh) \ 2, cx + bw, y + (h - bh) \ 2 + bh )
+        cx += bw
+    end if
+    if s.bRemovable then
+        dim as long rd = h \ 2 + SC( s, 2 )
+        cx += gap
+        tkRect_Set( pt.rcRemove, cx, y + (h - rd) \ 2, cx + rd, y + (h - rd) \ 2 + rd )
+        cx += rd + SC( s, 4 )
+    else
+        cx += SC( s, 12 )
+    end if
+    tkRect_Set( pt.rcChip, x, y, cx, y + h )
+    if s.bRemovable then
+        ' the target: at least MIN_TARGET across, centred on the button, kept inside the chip
+        pt.rcRemoveTarget = pt.rcRemove
+        dim as long mt = SC( s, TKCHIP_MIN_TARGET )
+        dim as long gx = (mt - (pt.rcRemove.right - pt.rcRemove.left) + 1) \ 2
+        if gx > 0 then tkRect_Inflate( pt.rcRemoveTarget, gx, gx )
+        pt.rcRemoveTarget = tkRect_Intersect( pt.rcRemoveTarget, pt.rcChip )
+    end if
+end sub
+
+public sub tkChip_MeasureSpec( byref s as TKCHIP_SPEC, byref nWidth as long, byref nHeight as long )
+    dim as TKCHIP_PARTS pt
+    tkChip_LayoutSpec( s, 0, 0, pt )
+    nWidth = pt.rcChip.right : nHeight = pt.rcChip.bottom
+end sub
+
+' ==========================================================================================
+' Colour and painting
+' ==========================================================================================
+private sub Resolve( byref s as TKCHIP_SPEC, byref fill as ulong, byref border as ulong, byref ink as ulong, _
+                     byref check as ulong )
+    dim as TKCHIP_COLORS ptr c = s.pColors
+    if s.bEnabled = false then
+        fill = c->FillColorDisabled : border = c->BorderColorDisabled : ink = c->TextColorDisabled : check = ink
+        exit sub
+    end if
+    if s.nStatus <> TKBADGE_NEUTRAL then
+        ' a status: tinted when idle, the status itself when selected (the badge's TINT / FILLED)
+        dim as TKBADGE_COLORS bc = tkBadge_ThemeColors( tkTheme_Get() )
+        dim as ulong sf = tkBadge_StatusFill( bc, s.nStatus ), si = tkBadge_StatusInk( bc, s.nStatus )
+        if s.bSelected then
+            fill = sf : border = sf : ink = si : check = si
+        else
+            fill = tkColor_Lerp( c->BackColor, sf, iif( s.bHot orelse s.bPressed, 0.3, 0.2 ) ) : border = sf : ink = sf : check = sf
+        end if
+    elseif s.bPressed then
+        fill = c->FillColorPressed : border = c->BorderColorSelected : ink = c->TextColorSelected : check = c->CheckColor
+    elseif s.bSelected then
+        fill = iif( s.bHot, c->FillColorSelectedHot, c->FillColorSelected ) : border = c->BorderColorSelected
+        ink = c->TextColorSelected : check = c->CheckColor
+    else
+        fill = iif( s.bHot, c->FillColorHot, c->FillColor ) : border = iif( s.bHot, c->BorderColorHot, c->BorderColor )
+        ink = c->TextColor : check = c->CheckColor
+    end if
+    if s.nAppearance = TKCHIP_OUTLINED andalso (s.bSelected = false) andalso (s.bPressed = false) then
+        fill = iif( s.bHot, tkColor_Lerp( c->BackColor, fill, 0.5 ), c->BackColor )
+    end if
+end sub
+
+private sub DrawCheck( byval b as TK_PAINT ptr, byref rc as TKRECT, byval clr as ulong, byref s as TKCHIP_SPEC )
+    dim as double d = rc.right - rc.left
+    dim as TKPOINT pts(0 to 2)
+    pts(0).x = rc.left + cint( d * 0.2 ) : pts(0).y = rc.top + cint( d * 0.52 )
+    pts(1).x = rc.left + cint( d * 0.42 ) : pts(1).y = rc.top + cint( d * 0.72 )
+    pts(2).x = rc.left + cint( d * 0.82 ) : pts(2).y = rc.top + cint( d * 0.3 )
+    b->SetPenColor( clr )
+    b->PaintPolyline( @pts(0), 3, 2 )
+end sub
+
+private sub DrawRemove( byval b as TK_PAINT ptr, byref rc as TKRECT, byref s as TKCHIP_SPEC, byval ink as ulong )
+    dim as TKCHIP_COLORS ptr c = s.pColors
+    dim as TKRECT r = rc
+    if s.bRemoveHot andalso s.bEnabled then
+        b->SetBackColor( c->RemoveBackHot )
+        b->PaintEllipse( @r )
+    end if
+    dim as ulong clr = iif( s.bRemoveHot andalso s.bEnabled, c->RemoveColorHot, iif( s.nStatus <> TKBADGE_NEUTRAL, ink, c->RemoveColor ) )
+    dim as long d = r.right - r.left, k = d \ 3
+    b->SetPenColor( clr )
+    b->PaintLine( 2, r.left + k, r.top + k, r.right - k, r.bottom - k )
+    b->PaintLine( 2, r.left + k, r.bottom - k, r.right - k, r.top + k )
+end sub
+
+' The chip as the parts say; s.pColors must be set.
+private sub DrawChip( byval b as TK_PAINT ptr, byref pt as TKCHIP_PARTS, byref s as TKCHIP_SPEC )
+    dim as ulong fill, border, ink, check
+    Resolve( s, fill, border, ink, check )
+    dim as TKRECT r = pt.rcChip
+    dim as long h = r.bottom - r.top
+    dim as long curv = iif( s.nShape = TKCHIP_ROUNDED, SC( s, 12 ), h )
+    b->SetBackColor( fill )
+    b->SetPenColor( border )
+    if (s.nAppearance = TKCHIP_OUTLINED) orelse s.bSelected orelse (s.nStatus <> TKBADGE_NEUTRAL) then
+        b->PaintRoundBorderRect( @r, curv, 1 )
+    else
+        b->PaintRoundRect( @r, curv )
+    end if
+    ' leading part, or the check in its place
+    if tkRect_IsEmpty( pt.rcCheck ) = false then
+        DrawCheck( b, pt.rcCheck, check, s )
+    elseif tkRect_IsEmpty( pt.rcLeading ) = false then
+        dim as TKRECT rl = pt.rcLeading
+        select case s.nLead
+        case TKCHIP_LEAD_AVATAR
+            dim as TKAVATAR_SPEC av
+            av.wszName = iif( len( s.wszAvatarName ) > 0, s.wszAvatarName, s.wszText )
+            av.pImage = s.pImage
+            av.fText = s.fAvatar
+            av.fScale = s.fScale
+            av.bDark = tkTheme_Get().IsDark
+            if s.bEnabled = false then av.nActive = TKAVATAR_ACTIVE_INACTIVE
+            tkAvatar_PaintInto( b, rl, av )
+        case TKCHIP_LEAD_GLYPH
+            dim as TTF_Font ptr fWas = b->pFont
+            b->SetFont( s.fGlyph )
+            b->SetForeColor( ink )
+            b->PaintText( s.wszGlyph, @rl, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_NOCLIP )
+            b->SetFont( fWas )
+        case TKCHIP_LEAD_IMAGE
+            b->PaintImageShape( s.pImage->Texture( b->renderer ), @rl, rl.right - rl.left, TK_IMGFIT_COVER, _
+                                iif( s.bEnabled, 255, 128 ) )
+        end select
+    end if
+    ' the label
+    if s.fText then
+        dim as TKRECT rl = pt.rcLabel
+        dim as TTF_Font ptr fWas = b->pFont
+        b->SetFont( s.fText )
+        b->SetForeColor( ink )
+        b->PaintText( s.wszText, @rl, TK_DT_LEFT or TK_DT_VCENTER or TK_DT_ELLIPSIS )
+        b->SetFont( fWas )
+    end if
+    if s.nCount > 0 then
+        dim as TKBADGE_SPEC bs
+        bs.nKind = TKBADGE_KIND_COUNT : bs.nCount = s.nCount : bs.nSize = TKBADGE_SMALL
+        bs.fText = s.fText : bs.fScale = s.fScale : bs.bEnabled = s.bEnabled
+        bs.nStatus = iif( s.nStatus = TKBADGE_NEUTRAL, TKBADGE_ACCENT, s.nStatus )
+        dim as TKRECT rc = pt.rcCount
+        tkBadge_PaintInto( b, rc, bs )
+    end if
+    if s.bRemovable andalso s.bEnabled then DrawRemove( b, pt.rcRemove, s, ink )
+end sub
+
+' ==========================================================================================
+' Public: the widgetless chip
+' ==========================================================================================
+public declare function tkChip_ThemeColors( byref t as TKTHEME_COLORS ) as TKCHIP_COLORS
+
+' The chip with its top-left at (rc.left, centred in rc vertically), clipped to rc. s.pColors = 0:
+' the app theme's colours.
+public sub tkChip_PaintInto( byval b as TK_PAINT ptr, byref rc as TKRECT, byref s as TKCHIP_SPEC )
+    if b = 0 then exit sub
+    dim as TKCHIP_SPEC sp = s
+    dim as TKCHIP_COLORS cTheme
+    if sp.pColors = 0 then
+        cTheme = tkChip_ThemeColors( tkTheme_Get() )
+        sp.pColors = @cTheme
+    end if
+    dim as TKCHIP_PARTS pt
+    tkChip_LayoutSpec( sp, rc.left, rc.top + ((rc.bottom - rc.top) - HeightOf( sp )) \ 2, pt )
+    dim as TKRECT rcClip = rc
+    b->PushClip( @rcClip )
+    DrawChip( b, pt, sp )
+    b->PopClip()
+end sub
+
+' ==========================================================================================
+' The widget
+' ==========================================================================================
+public type TKCHIP_STATE
+    hWin             as TK_WIDGET ptr
+    id               as long
+    spec             as TKCHIP_SPEC
+    nMaxLabelDu      as long = -1                ' SetMaxLabelWidth's design units, rescaled with the scale
+    nKind            as long = TKCHIP_ACTION
+    bSelectable      as boolean                  ' INPUT chips: may also be selected
+    colors           as TKCHIP_COLORS
+    bColorsPinned    as boolean
+    imgOwn           as tkImageFile
+    fAvatar          as TTF_Font ptr             ' owned, for a leading avatar's initials
+    isFocused        as boolean
+    nPress           as long = TKCHIP_HIT_NONE   ' the part a live press began on
+    nHot             as long = TKCHIP_HIT_NONE
+    wszTooltip       as ustring
+    tip              as TKTIPHOST_STATE
+    ClickCallback    as CHP_ClickCallbackSub
+    SelectedCallback as CHP_SelectedChangedCallbackSub
+    RemoveCallback   as CHP_RemoveRequestedCallbackSub
+    PaintCallback    as CHP_PaintCallbackSub
+    MessageCallback  as CHP_MessageCallbackFunc
+end type
+
+private function CH( byval w as TK_WIDGET ptr ) as TKCHIP_STATE ptr
+    if w = 0 then return 0
+    return cast( TKCHIP_STATE ptr, w->pData )
+end function
+
+private function RingPad( byval p as TKCHIP_STATE ptr ) as long
+    return tkHost_Scale( p->hWin->pHost, TKCHIP_FOCUSGAP ) + TKCHIP_FOCUSTHICK
+end function
+
+private function TextFontOf( byval p as TKCHIP_STATE ptr ) as TTF_Font ptr
+    if p->spec.fText then return p->spec.fText
+    return p->hWin->pHost->pDefaultFont
+end function
+
+' The spec as drawn now, and its parts inside the ring band (vertically centred).
+private sub LiveParts( byval p as TKCHIP_STATE ptr, byref s as TKCHIP_SPEC, byref pt as TKCHIP_PARTS )
+    s = p->spec
+    s.fScale = p->hWin->pHost->fScale
+    s.fText = TextFontOf( p )
+    s.fAvatar = p->fAvatar
+    s.bEnabled = tkWidget_IsEnabled( p->hWin )
+    s.bHot = (p->nHot = TKCHIP_HIT_BODY) orelse (p->nHot = TKCHIP_HIT_REMOVE)
+    s.bPressed = (p->nPress = TKCHIP_HIT_BODY) andalso (p->nHot = TKCHIP_HIT_BODY)
+    s.bRemoveHot = (p->nHot = TKCHIP_HIT_REMOVE)
+    s.pColors = @p->colors
+    dim as long rp = RingPad( p )
+    tkChip_LayoutSpec( s, rp, (p->hWin->ch - HeightOf( s )) \ 2, pt )
+end sub
+
+private function PartAt( byval p as TKCHIP_STATE ptr, byval x as single, byval y as single ) as long
+    dim as TKCHIP_SPEC s
+    dim as TKCHIP_PARTS pt
+    LiveParts( p, s, pt )
+    if s.bRemovable andalso tkRect_Contains( pt.rcRemoveTarget, x, y ) then return TKCHIP_HIT_REMOVE
+    if tkRect_Contains( pt.rcChip, x, y ) then return TKCHIP_HIT_BODY
+    return TKCHIP_HIT_NONE
+end function
+
+private sub OnPaint( byval p as TKCHIP_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TKCHIP_PAINTINFO pi
+    pi.hChip = p->hWin
+    pi.b = b
+    tkRect_Set( pi.rcClient, 0, 0, p->hWin->cw, p->hWin->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @pi.rcClient )
+    dim as TKCHIP_SPEC s
+    LiveParts( p, s, pi.parts )
+    pi.isFocused = p->isFocused
+    if p->PaintCallback then
+        p->PaintCallback( @pi )
+        exit sub
+    end if
+    DrawChip( b, pi.parts, s )
+    if p->isFocused then
+        dim as TKRECT r = pi.parts.rcChip
+        dim as long g = RingPad( p )
+        tkRect_Inflate( r, g, g )
+        b->SetPenColor( p->colors.FocusRingColor )
+        b->PaintRoundOutline( @r, iif( s.nShape = TKCHIP_ROUNDED, SC( s, 12 ) + 2 * g, r.bottom - r.top ), TKCHIP_FOCUSTHICK )
+    end if
+end sub
+
+private function CallMessage( byval p as TKCHIP_STATE ptr, byval m as TK_MSG ptr, byval part as long ) as boolean
+    if p->MessageCallback = 0 then return false
+    dim as TKCHIP_MESSAGEINFO mi
+    mi.hChip = p->hWin
+    mi.msg = m->msg
+    mi.x = m->x : mi.y = m->y
+    mi.key = m->key
+    mi.part = part
+    return p->MessageCallback( @mi )
+end function
+
+' A user activation of the body: TOGGLE (or a selectable INPUT) flips Selected; ACTION / INPUT click.
+private sub Activate( byval p as TKCHIP_STATE ptr )
+    dim as TK_WIDGET ptr w = p->hWin
+    if (p->nKind = TKCHIP_TOGGLE) orelse ((p->nKind = TKCHIP_INPUT) andalso p->bSelectable) then
+        p->spec.bSelected = not p->spec.bSelected
+        tkWidget_Invalidate( w )
+        dim as CHP_SelectedChangedCallbackSub cb = p->SelectedCallback
+        dim as boolean v = p->spec.bSelected
+        if cb then cb( w, v )
+    else
+        dim as CHP_ClickCallbackSub cb = p->ClickCallback
+        if cb then cb( w )
+    end if
+end sub
+
+private sub RequestRemove( byval p as TKCHIP_STATE ptr )
+    dim as CHP_RemoveRequestedCallbackSub cb = p->RemoveCallback
+    if cb then cb( p->hWin )                         ' the host removes the chip
+end sub
+
+private sub SetHot( byval p as TKCHIP_STATE ptr, byval n as long )
+    if n <> p->nHot then p->nHot = n : tkWidget_Invalidate( p->hWin )
+end sub
+
+public declare sub tkChip_ApplyTheme( byval hChip as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+
+private function Proc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKCHIP_STATE ptr p = CH( w )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        OnPaint( p, m->pPaint )
+        return true
+    case TKM_SIZE, TKM_SCALECHANGED
+        if p->nMaxLabelDu > 0 then p->spec.nMaxLabel = tkHost_Scale( w->pHost, p->nMaxLabelDu )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_THEMECHANGED
+        tkChip_ApplyTheme( w, tkTheme_Of( w ) )
+        return true
+    case TKM_MOUSEMOVE
+        if tkWidget_IsEnabled( w ) = false then return true
+        dim as long part = PartAt( p, m->x, m->y )
+        SetHot( p, part )
+        CallMessage( p, m, part )
+        return true
+    case TKM_MOUSELEAVE
+        if p->nPress = TKCHIP_HIT_NONE then SetHot( p, TKCHIP_HIT_NONE )
+        CallMessage( p, m, TKCHIP_HIT_NONE )
+        return true
+    case TKM_LBUTTONDOWN
+        if tkWidget_IsEnabled( w ) = false then return true
+        dim as long part = PartAt( p, m->x, m->y )
+        tkTipHost_Pop( @p->tip )
+        tkHost_SetFocus( w->pHost, w )
+        if CallMessage( p, m, part ) then return true
+        if part = TKCHIP_HIT_NONE then return true
+        p->nPress = part
+        SetHot( p, part )
+        tkHost_SetCapture( w )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONUP
+        ' snapshot before releasing: TKM_CAPTURECHANGED arrives synchronously
+        dim as long began = p->nPress
+        p->nPress = TKCHIP_HIT_NONE
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        dim as long part = PartAt( p, m->x, m->y )
+        SetHot( p, iif( w->pHost->pHot = w, part, TKCHIP_HIT_NONE ) )      ' hot only where the host agrees
+        tkWidget_Invalidate( w )
+        if CallMessage( p, m, part ) then return true                 ' claimed: no click
+        ' a press that slid off its part is cancelled
+        if (began = TKCHIP_HIT_REMOVE) andalso (part = TKCHIP_HIT_REMOVE) then
+            RequestRemove( p )
+        elseif (began = TKCHIP_HIT_BODY) andalso (part = TKCHIP_HIT_BODY) then
+            Activate( p )
+        end if
+        return true
+    case TKM_CAPTURECHANGED
+        p->nPress = TKCHIP_HIT_NONE
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_RBUTTONDOWN, TKM_RBUTTONUP
+        CallMessage( p, m, PartAt( p, m->x, m->y ) )
+        return true
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        p->isFocused = (m->msg = TKM_SETFOCUS)
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_KEYDOWN
+        if tkWidget_IsEnabled( w ) = false then return false
+        if CallMessage( p, m, TKCHIP_HIT_NONE ) then return true
+        if (m->mods and (SDL_KMOD_CTRL or SDL_KMOD_ALT or SDL_KMOD_GUI)) <> 0 then return false   ' a chord is not ours
+        select case m->key
+        case SDLK_SPACE, SDLK_RETURN, SDLK_KP_ENTER
+            if m->bFlag = false then Activate( p )
+            return true
+        case SDLK_DELETE, SDLK_BACKSPACE
+            if p->spec.bRemovable = false then return false
+            if m->bFlag = false then RequestRemove( p )
+            return true
+        end select
+        return false
+    case TKM_ENABLE
+        if m->bFlag = false then p->nPress = TKCHIP_HIT_NONE : p->nHot = TKCHIP_HIT_NONE : tkTipHost_Pop( @p->tip )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_DESTROY
+        tkTipHost_Destroy( @p->tip )
+        if p->fAvatar then TTF_CloseFont( p->fAvatar )
+        delete p
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' The tip: TooltipText, else the full label when it is cut.
+private function TipText( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as TKCHIP_STATE ptr p = CH( a )
+    if p = 0 then return ""
+    if len( p->wszTooltip ) then return p->wszTooltip
+    dim as TKCHIP_SPEC s
+    dim as TKCHIP_PARTS pt
+    LiveParts( p, s, pt )
+    if pt.bLabelCut then return p->spec.wszText
+    return ""
+end function
+
+' A child of hParent, created 0x0: size it from GetIdealSize. A tab stop.
+public function tkChip_Create( byval hParent as TK_WIDGET ptr, byval ctrlId as long ) as TK_WIDGET ptr
+    if hParent = 0 then return 0
+    dim as TKCHIP_STATE ptr p = new TKCHIP_STATE
+    p->id = ctrlId
+    dim as TK_WIDGET ptr w = tkWidget_CreateChild( hParent, ctrlId, @Proc, p )
+    w->isFocusable = true
+    p->hWin = w
+    tkChip_ApplyTheme( w, tkTheme_Of( w ) )
+    tkTipHost_Ensure( @p->tip, w, @TipText )
+    return w
+end function
+
+public function tkChip_GetID( byval hChip as TK_WIDGET ptr ) as long
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then return 0
+    return p->id
+end function
+
+public sub tkChip_SetEnabled( byval hChip as TK_WIDGET ptr, byval isEnabled as boolean )
+    if hChip then tkWidget_Enable( hChip, isEnabled )
+end sub
+
+public function tkChip_GetFocused( byval hChip as TK_WIDGET ptr ) as boolean
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then return false
+    return p->isFocused
+end function
+
+' ---- content (setters silent) ---------------------------------------------------------------
+public function tkChip_GetText( byval hChip as TK_WIDGET ptr ) as ustring
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then return ""
+    return p->spec.wszText
+end function
+
+public sub tkChip_SetText( byval hChip as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.wszText = Text
+    tkWidget_Invalidate( hChip )
+end sub
+
+public function tkChip_GetKind( byval hChip as TK_WIDGET ptr ) as long
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then return TKCHIP_ACTION
+    return p->nKind
+end function
+
+' ACTION / TOGGLE / INPUT. INPUT makes the chip removable (SetRemovable can turn it off).
+public sub tkChip_SetKind( byval hChip as TK_WIDGET ptr, byval nKind as long )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if (p = 0) orelse (nKind < TKCHIP_ACTION) orelse (nKind > TKCHIP_INPUT) then exit sub
+    p->nKind = nKind
+    if nKind = TKCHIP_INPUT then p->spec.bRemovable = true
+    tkWidget_Invalidate( hChip )
+end sub
+
+public function tkChip_GetSelected( byval hChip as TK_WIDGET ptr ) as boolean
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then return false
+    return p->spec.bSelected
+end function
+
+' Silent.
+public sub tkChip_SetSelected( byval hChip as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.bSelected = bOn
+    tkWidget_Invalidate( hChip )
+end sub
+
+' An INPUT chip that the body click also selects.
+public sub tkChip_SetSelectable( byval hChip as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p then p->bSelectable = bOn
+end sub
+
+public function tkChip_GetRemovable( byval hChip as TK_WIDGET ptr ) as boolean
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then return false
+    return p->spec.bRemovable
+end function
+
+public sub tkChip_SetRemovable( byval hChip as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.bRemovable = bOn
+    tkWidget_Invalidate( hChip )
+end sub
+
+' A leading avatar: initials from name ("" = the label), or img (borrowed).
+public sub tkChip_SetLeadingAvatar( byval hChip as TK_WIDGET ptr, byval Name_ as ustring, byval pImage as tkImageFile ptr = 0 )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.nLead = TKCHIP_LEAD_AVATAR
+    p->spec.wszAvatarName = Name_
+    p->spec.pImage = pImage
+    if p->fAvatar = 0 then
+        dim as string fontPath = tkHost_FontDir() & TK_FONT_UI_BOLD
+        p->fAvatar = tkHost_OpenFontFace( fontPath, 10, 0 )
+    end if
+    tkWidget_Invalidate( hChip )
+end sub
+
+' A leading glyph (needs a glyph font: ApplyFonts).
+public sub tkChip_SetLeadingGlyph( byval hChip as TK_WIDGET ptr, byval Glyph as ustring )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.nLead = TKCHIP_LEAD_GLYPH
+    p->spec.wszGlyph = Glyph
+    tkWidget_Invalidate( hChip )
+end sub
+
+' A leading round image from a file (owned); a failed load leaves no leading part.
+public sub tkChip_SetLeadingImageFile( byval hChip as TK_WIDGET ptr, byval Path as ustring )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->imgOwn.Load( Path )
+    p->spec.nLead = TKCHIP_LEAD_IMAGE
+    p->spec.pImage = @p->imgOwn
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_SetLeadingImagePixels( byval hChip as TK_WIDGET ptr, byval w as long, byval h as long, byval argb as ulong ptr )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->imgOwn.LoadFromPixels( w, h, argb )
+    p->spec.nLead = TKCHIP_LEAD_IMAGE
+    p->spec.pImage = @p->imgOwn
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_ClearLeading( byval hChip as TK_WIDGET ptr )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.nLead = TKCHIP_LEAD_NONE
+    p->spec.pImage = 0
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_SetShowCheck( byval hChip as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.bShowCheck = bOn
+    tkWidget_Invalidate( hChip )
+end sub
+
+' Keep the check's room when unselected, so the width does not change as it toggles.
+public sub tkChip_SetReserveCheck( byval hChip as TK_WIDGET ptr, byval bOn as boolean )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.bReserveCheck = bOn
+    tkWidget_Invalidate( hChip )
+end sub
+
+' A count badge after the label; 0 = none.
+public sub tkChip_SetCount( byval hChip as TK_WIDGET ptr, byval nCount as long )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.nCount = iif( nCount < 0, 0, nCount )
+    tkWidget_Invalidate( hChip )
+end sub
+
+' ---- look -------------------------------------------------------------------------------------
+public sub tkChip_SetStatus( byval hChip as TK_WIDGET ptr, byval nStatus as long )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if (p = 0) orelse (nStatus < TKBADGE_ACCENT) orelse (nStatus > TKBADGE_NEUTRAL) then exit sub
+    p->spec.nStatus = nStatus
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_SetAppearance( byval hChip as TK_WIDGET ptr, byval nAppearance as long )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if (p = 0) orelse (nAppearance < TKCHIP_FILLED) orelse (nAppearance > TKCHIP_OUTLINED) then exit sub
+    p->spec.nAppearance = nAppearance
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_SetShape( byval hChip as TK_WIDGET ptr, byval nShape as long )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if (p = 0) orelse (nShape < TKCHIP_PILL) orelse (nShape > TKCHIP_ROUNDED) then exit sub
+    p->spec.nShape = nShape
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_SetSize( byval hChip as TK_WIDGET ptr, byval nSize as long )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if (p = 0) orelse (nSize < TKCHIP_SMALL) orelse (nSize > TKCHIP_MEDIUM) then exit sub
+    p->spec.nSize = nSize
+    tkWidget_Invalidate( hChip )
+end sub
+
+' The label's widest, design units; 0 = no limit. Beyond it the label is ellipsised and the
+' tip shows it whole.
+public sub tkChip_SetMaxLabelWidth( byval hChip as TK_WIDGET ptr, byval nDu as long )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->nMaxLabelDu = iif( nDu <= 0, 0, nDu )
+    p->spec.nMaxLabel = iif( nDu <= 0, 0, tkHost_Scale( hChip->pHost, nDu ) )
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_SetFont( byval hChip as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.fText = f
+    tkWidget_Invalidate( hChip )
+end sub
+
+' The font a leading glyph is drawn in (the designer's GlyphFont).
+public sub tkChip_SetGlyphFont( byval hChip as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->spec.fGlyph = f
+    tkWidget_Invalidate( hChip )
+end sub
+
+' Text and glyph fonts; a 0 leaves that one alone.
+public sub tkChip_ApplyFonts( byval hChip as TK_WIDGET ptr, byval fText as TTF_Font ptr, byval fGlyph as TTF_Font ptr )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    if fText then p->spec.fText = fText
+    if fGlyph then p->spec.fGlyph = fGlyph
+    tkWidget_Invalidate( hChip )
+end sub
+
+' The chip plus the focus ring's band; valid before sizing.
+public sub tkChip_GetIdealSize( byval hChip as TK_WIDGET ptr, byref nWidth as long, byref nHeight as long )
+    nWidth = 0 : nHeight = 0
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    dim as TKCHIP_SPEC s = p->spec
+    s.fScale = hChip->pHost->fScale
+    s.fText = TextFontOf( p )
+    tkChip_MeasureSpec( s, nWidth, nHeight )
+    dim as long rp = RingPad( p )
+    nWidth += 2 * rp : nHeight += 2 * rp
+end sub
+
+' The parts as laid out now (control-local).
+public sub tkChip_GetParts( byval hChip as TK_WIDGET ptr, byref pt as TKCHIP_PARTS )
+    dim as TKCHIP_PARTS z
+    pt = z
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    dim as TKCHIP_SPEC s
+    LiveParts( p, s, pt )
+end sub
+
+public function tkChip_HitTest( byval hChip as TK_WIDGET ptr, byval x as long, byval y as long ) as long
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then return TKCHIP_HIT_NONE
+    return PartAt( p, x, y )
+end function
+
+' ---- tooltip -----------------------------------------------------------------------------------
+public sub tkChip_SetTooltipText( byval hChip as TK_WIDGET ptr, byval Text as ustring )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p then p->wszTooltip = Text
+end sub
+
+public function tkChip_GetTipText( byval hChip as TK_WIDGET ptr ) as ustring
+    return TipText( 0, hChip, -1 )
+end function
+
+' ---- appearance -----------------------------------------------------------------------------
+public sub tkChip_GetColors( byval hChip as TK_WIDGET ptr, byval pColors as TKCHIP_COLORS ptr )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+public sub tkChip_SetColors( byval hChip as TK_WIDGET ptr, byval pColors as TKCHIP_COLORS ptr )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    tkWidget_Invalidate( hChip )
+end sub
+
+public function tkChip_ThemeColors( byref t as TKTHEME_COLORS ) as TKCHIP_COLORS
+    dim as TKCHIP_COLORS c
+    c.BackColor = t.Window
+    c.FocusRingColor = t.FocusRing
+    c.FillColor = t.Surface
+    c.FillColorHot = t.SurfaceHot
+    c.FillColorPressed = t.Selected
+    c.FillColorSelected = t.Selected
+    c.FillColorSelectedHot = tkColor_Lerp( t.Selected, t.Accent, 0.25 )
+    c.FillColorDisabled = t.SurfaceDisabled
+    c.BorderColor = t.Border
+    c.BorderColorHot = t.TextDim
+    c.BorderColorSelected = t.Accent
+    c.BorderColorDisabled = t.BorderDisabled
+    c.TextColor = t.Text
+    c.TextColorSelected = t.SelectedText
+    c.TextColorDisabled = t.TextDisabled
+    c.CheckColor = t.SelectedText
+    c.RemoveColor = t.TextDim
+    c.RemoveColorHot = t.TextStrong
+    c.RemoveBackHot = tkColor_Lerp( t.SurfaceHot, t.TextDim, 0.3 )
+    return c
+end function
+
+public sub tkChip_ApplyTheme( byval hChip as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hChip, t )
+    p->colors = tkChip_ThemeColors( tr )
+    tkTheme_ResolveInto( hChip, tr, cast( ulong ptr, @p->colors ), sizeof( TKCHIP_COLORS ) \ 4, "Chip" )
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_UnpinColors( byval hChip as TK_WIDGET ptr )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkChip_ApplyTheme( hChip, tkTheme_Of( hChip ) )
+end sub
+
+' ---- callbacks -----------------------------------------------------------------------------
+public sub tkChip_PaintDefault( byval pi as TKCHIP_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKCHIP_STATE ptr p = CH( pi->hChip )
+    if p = 0 then exit sub
+    dim as TKCHIP_SPEC s
+    dim as TKCHIP_PARTS pt
+    LiveParts( p, s, pt )
+    DrawChip( pi->b, pt, s )
+end sub
+
+public sub tkChip_SetClickCallback( byval hChip as TK_WIDGET ptr, byval usersub as CHP_ClickCallbackSub )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p then p->ClickCallback = usersub
+end sub
+
+public sub tkChip_SetSelectedChangedCallback( byval hChip as TK_WIDGET ptr, byval usersub as CHP_SelectedChangedCallbackSub )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p then p->SelectedCallback = usersub
+end sub
+
+public sub tkChip_SetRemoveRequestedCallback( byval hChip as TK_WIDGET ptr, byval usersub as CHP_RemoveRequestedCallbackSub )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p then p->RemoveCallback = usersub
+end sub
+
+public sub tkChip_SetPaintCallback( byval hChip as TK_WIDGET ptr, byval usersub as CHP_PaintCallbackSub )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p = 0 then exit sub
+    p->PaintCallback = usersub
+    tkWidget_Invalidate( hChip )
+end sub
+
+public sub tkChip_SetMessageCallback( byval hChip as TK_WIDGET ptr, byval userfunc as CHP_MessageCallbackFunc )
+    dim as TKCHIP_STATE ptr p = CH( hChip )
+    if p then p->MessageCallback = userfunc
+end sub

@@ -1,0 +1,481 @@
+' tkMatch self-test: folding (the lcase facts the module's header states), word starts, the four
+' modes and their runs, fzy against tkEdit's original port (kept below as RefScore / RefPositions,
+' score for score and position for position on random input), narrowing against a full refilter,
+' the capped ranked filter against a full sort, and the sorted prefix range against a scan.
+' Console only: no window, no SDL (so it runs on any host; tkTest's checker is copied below).
+#import "vendor/tkControls/tkMatch"
+#import "std/containers"
+using tkMatch
+using containers
+
+' ---- the checker: tkTest's three calls and summary line, without tkTest (which needs SDL) ------
+dim shared as long gPass, gFail
+dim shared as string gPassName
+private sub tkTest_Begin( byref passName as const string )
+    gPassName = passName
+end sub
+private sub tkTest_Check( byref name_ as const string, byval ok as boolean, byref detail as const string = "" )
+    if ok then
+        gPass += 1
+    else
+        gFail += 1
+        print "FAIL  [" & gPassName & "] " & name_ & "   " & detail
+    end if
+end sub
+private function tkTest_Report( byref title as string ) as long
+    print title & " selftest: " & gPass & " passed, " & gFail & " failed"
+    return gFail
+end function
+
+' ---- a deterministic generator (no rnd: the same strings on every host) -------------------------
+dim shared as ulong gSeed = 12345
+private function Next_( byval n as long ) as long
+    gSeed = gSeed * 1664525ul + 1013904223ul
+    return clng( (gSeed shr 8) mod culng( n ) )
+end function
+
+private function RandText_( byref alphabet as const ustring, byval minLen as long, byval maxLen as long ) as ustring
+    dim as long n = minLen + Next_( maxLen - minLen + 1 )
+    dim as ustring s = ""
+    for i as long = 1 to n
+        s &= mid( alphabet, 1 + Next_( len( alphabet ) ), 1 )
+    next
+    return s
+end function
+
+' ---- tkEdit's fzy port, as it was (tkedit/src/core/fuzzy before the move): the reference --------
+private function RefBonus( byval lastCh as ulong, byval ch as ulong ) as double
+    lastCh and= 255
+    ch and= 255
+    dim as long row = 0
+    if ( ch >= 65 ) andalso ( ch <= 90 ) then
+        row = 2
+    elseif ( ( ch >= 97 ) andalso ( ch <= 122 ) ) orelse ( ( ch >= 48 ) andalso ( ch <= 57 ) ) then
+        row = 1
+    end if
+    if row = 0 then return 0
+    select case lastCh
+    case 47 : return 0.9
+    case 45, 95, 32 : return 0.8
+    case 46 : return 0.6
+    case 97 to 122
+        if row = 2 then return 0.7
+    end select
+    return 0
+end function
+
+type RefMx
+    declare constructor( byval rows as long, byval cols as long )
+    declare function D( byval i as long, byval j as long ) byref as double
+    declare function M( byval i as long, byval j as long ) byref as double
+    m_cols as long
+    m_d as Array( of double )
+    m_m as Array( of double )
+end type
+
+constructor RefMx( byval rows as long, byval cols as long )
+    m_cols = cols
+    for k as long = 1 to rows * cols
+        m_d.Push( 0 )
+        m_m.Push( 0 )
+    next
+end constructor
+
+function RefMx.D( byval i as long, byval j as long ) byref as double
+    return m_d[i * m_cols + j]
+end function
+
+function RefMx.M( byval i as long, byval j as long ) byref as double
+    return m_m[i * m_cols + j]
+end function
+
+private function RefMax2( byval a as double, byval b as double ) as double
+    if a > b then return a
+    return b
+end function
+
+private function RefCompute( byref needle as const ustring, byref haystack as const ustring, _
+                             byref mx as RefMx, byref result as double ) as boolean
+    dim as long n = len( needle ), hlen = len( haystack )
+    if n = 0 orelse n > hlen then
+        result = TKMATCH_SCORE_MIN
+        return false
+    end if
+    dim as ustring ln = lcase( needle ), lh = lcase( haystack )
+    if ( n = hlen ) andalso ( ln = lh ) then
+        result = TKMATCH_SCORE_MAX
+        return false
+    end if
+    dim as Array( of double ) bonuses
+    dim as ulong lastCh = 47
+    for j as long = 0 to hlen - 1
+        bonuses.Push( RefBonus( lastCh, haystack[j] ) )
+        lastCh = haystack[j]
+    next
+    for i as long = 0 to n - 1
+        dim as double prevScore = TKMATCH_SCORE_MIN, prevM = TKMATCH_SCORE_MIN, prevD = TKMATCH_SCORE_MIN
+        dim as double gap = -0.01
+        if i = n - 1 then gap = -0.005
+        for j as long = 0 to hlen - 1
+            if ln[i] = lh[j] then
+                dim as double score = TKMATCH_SCORE_MIN
+                if i = 0 then
+                    score = ( j * -0.005 ) + bonuses[j]
+                elseif j > 0 then
+                    score = RefMax2( prevM + bonuses[j], prevD + 1.0 )
+                end if
+                if i > 0 then
+                    prevD = mx.D( i - 1, j )
+                    prevM = mx.M( i - 1, j )
+                end if
+                mx.D( i, j ) = score
+                prevScore = RefMax2( score, prevScore + gap )
+                mx.M( i, j ) = prevScore
+            else
+                if i > 0 then
+                    prevD = mx.D( i - 1, j )
+                    prevM = mx.M( i - 1, j )
+                end if
+                mx.D( i, j ) = TKMATCH_SCORE_MIN
+                prevScore = prevScore + gap
+                mx.M( i, j ) = prevScore
+            end if
+        next
+    next
+    result = mx.M( n - 1, hlen - 1 )
+    return true
+end function
+
+private function RefScore( byref needle as const ustring, byref haystack as const ustring ) as double
+    dim as RefMx mx = RefMx( len( needle ), len( haystack ) )
+    dim as double result
+    RefCompute( needle, haystack, mx, result )
+    return result
+end function
+
+private function RefPositions( byref needle as const ustring, byref haystack as const ustring ) as ustring
+    dim as Array( of long ) positions
+    dim as long n = len( needle ), hlen = len( haystack )
+    dim as RefMx mx = RefMx( n, hlen )
+    dim as double result
+    if RefCompute( needle, haystack, mx, result ) = false then
+        if result = TKMATCH_SCORE_MAX then
+            for i as long = 0 to n - 1
+                positions.Push( i )
+            next
+        end if
+    else
+        for i as long = 1 to n
+            positions.Push( 0 )
+        next
+        dim as boolean matchRequired = false
+        dim as long j = hlen - 1
+        for i as long = n - 1 to 0 step -1
+            while j >= 0
+                if ( mx.D( i, j ) <> TKMATCH_SCORE_MIN ) andalso ( matchRequired orelse ( mx.D( i, j ) = mx.M( i, j ) ) ) then
+                    if ( i > 0 ) andalso ( j > 0 ) then
+                        matchRequired = ( mx.M( i, j ) = mx.D( i - 1, j - 1 ) + 1.0 )
+                    else
+                        matchRequired = false
+                    end if
+                    positions[i] = j
+                    j -= 1
+                    exit while
+                end if
+                j -= 1
+            wend
+        next
+    end if
+    dim as ustring o
+    for each x as long in positions
+        if len( o ) then o &= ","
+        o &= str( x )
+    next
+    return o
+end function
+
+private function NewPositions( byref needle as const ustring, byref haystack as const ustring ) as ustring
+    dim as long p()
+    tkMatch_FuzzyPositions( needle, haystack, p() )
+    dim as ustring o
+    for i as long = lbound( p ) to ubound( p )
+        if len( o ) then o &= ","
+        o &= str( p(i) )
+    next
+    return o
+end function
+
+private function RunsText( byval mode as long, byref query as const ustring, byref text as const ustring ) as string
+    dim as TKMATCH_QUERY q
+    tkMatch_Prepare( q, mode, query )
+    dim as TKMATCH_RUN r()
+    dim as long n = tkMatch_Runs( q, text, tkMatch_KeyOf( q, text ), r() )
+    dim as string o
+    for i as long = 0 to n - 1
+        if len( o ) then o &= " "
+        o &= r(i).first & "+" & r(i).count
+    next
+    return o
+end function
+
+private function Matches( byval mode as long, byref query as const ustring, byref text as const ustring, _
+                          byval caseSensitive as boolean = false ) as boolean
+    dim as TKMATCH_QUERY q
+    tkMatch_Prepare( q, mode, query, caseSensitive )
+    return tkMatch_Test( q, text, tkMatch_KeyOf( q, text ) )
+end function
+
+' ==========================================================================================
+private sub Fold_( )
+    tkTest_Begin( "fold" )
+    ' Latin-1, Ext-A, Y-diaeresis, Greek, Cyrillic, capital sharp s, ASCII
+    dim as ustring u = wchr( &hC9, &hC4, &hD6, &hDC, &h100, &h141, &h178, &h391, &h416, &h1E9E, 65, 90 )
+    dim as ustring f = tkMatch_Fold( u )
+    tkTest_Check( "fold keeps the length", len( f ) = len( u ) )
+    dim as ulong want(0 to 11) = { &hE9, &hE4, &hF6, &hFC, &h101, &h142, &hFF, &h3B1, &h436, &hDF, 97, 122 }
+    dim as boolean ok = true
+    dim as string got
+    for i as long = 0 to 11
+        dim as ulong c = f[i]
+        got &= " " & hex( c )
+        if c <> want(i) then ok = false
+    next
+    tkTest_Check( "fold: Latin-1, Ext-A, Greek, Cyrillic, U+1E9E, ASCII", ok, got )
+    tkTest_Check( "fold: already lower is unchanged", tkMatch_Fold( "abc xyz" ) = "abc xyz" )
+    dim as ustring zh = "Zürich Straße", zq = "ÜRICH"
+    tkTest_Check( "contains across non-ASCII case", Matches( TKMATCH_CONTAINS, zq, zh ) )
+    tkTest_Check( "prefix across non-ASCII case", Matches( TKMATCH_PREFIX, "zü", zh ) )
+    tkTest_Check( "case-sensitive refuses the other case", Matches( TKMATCH_PREFIX, "zü", zh, true ) = false )
+    tkTest_Check( "case-sensitive takes its own case", Matches( TKMATCH_PREFIX, "Zü", zh, true ) )
+end sub
+
+private sub Words_( )
+    tkTest_Begin( "word starts" )
+    dim as ustring t = "getWindowRect x64Release my_file-name.ext (arg)"
+    dim as string got
+    for i as long = 0 to len( t ) - 1
+        if tkMatch_IsWordStart( t, i ) then got &= str( i ) & ","
+    next
+    ' g W R | x 64 R | m f n e | a
+    tkTest_Check( "word starts: camel, digit steps, separators", got = "0,3,9,14,15,17,25,28,33,38,43,", got )
+    tkTest_Check( "word start: past the end is none", tkMatch_IsWordStart( t, len( t ) ) = false )
+end sub
+
+private sub Modes_( )
+    tkTest_Begin( "modes" )
+    tkTest_Check( "prefix", Matches( TKMATCH_PREFIX, "jo", "John Smith" ) )
+    tkTest_Check( "prefix: not inside", Matches( TKMATCH_PREFIX, "sm", "John Smith" ) = false )
+    tkTest_Check( "wordprefix: second word", Matches( TKMATCH_WORDPREFIX, "smi", "John Smith" ) )
+    tkTest_Check( "wordprefix: camel word", Matches( TKMATCH_WORDPREFIX, "rect", "GetWindowRect" ) )
+    tkTest_Check( "wordprefix: not mid-word", Matches( TKMATCH_WORDPREFIX, "mith", "John Smith" ) = false )
+    tkTest_Check( "wordprefix: a later word after a false start", Matches( TKMATCH_WORDPREFIX, "ab", "cab abc" ) )
+    tkTest_Check( "wordprefix: query with a space", Matches( TKMATCH_WORDPREFIX, "john s", "Mr John Smith" ) )
+    tkTest_Check( "contains: mid-word", Matches( TKMATCH_CONTAINS, "mit", "John Smith" ) )
+    tkTest_Check( "contains: absent", Matches( TKMATCH_CONTAINS, "xyz", "John Smith" ) = false )
+    tkTest_Check( "fuzzy: in order", Matches( TKMATCH_FUZZY, "jsm", "John Smith" ) )
+    tkTest_Check( "fuzzy: out of order", Matches( TKMATCH_FUZZY, "smj", "John Smith" ) = false )
+    tkTest_Check( "every mode: the empty query matches", Matches( TKMATCH_PREFIX, "", "x" ) andalso _
+        Matches( TKMATCH_WORDPREFIX, "", "x" ) andalso Matches( TKMATCH_CONTAINS, "", "x" ) andalso Matches( TKMATCH_FUZZY, "", "x" ) )
+    tkTest_Check( "every mode: query longer than text", (Matches( TKMATCH_PREFIX, "abcd", "abc" ) orelse _
+        Matches( TKMATCH_CONTAINS, "abcd", "abc" ) orelse Matches( TKMATCH_FUZZY, "abcd", "abc" )) = false )
+
+    tkTest_Begin( "runs" )
+    tkTest_Check( "runs: prefix", RunsText( TKMATCH_PREFIX, "jo", "John Smith" ) = "0+2" )
+    tkTest_Check( "runs: wordprefix at the word", RunsText( TKMATCH_WORDPREFIX, "smi", "John Smith" ) = "5+3" )
+    tkTest_Check( "runs: contains, first occurrence", RunsText( TKMATCH_CONTAINS, "o", "foo boo" ) = "1+1" )
+    tkTest_Check( "runs: fuzzy merges neighbours", RunsText( TKMATCH_FUZZY, "amo", "app/models/order" ) = "0+1 4+2", _
+        RunsText( TKMATCH_FUZZY, "amo", "app/models/order" ) )
+    tkTest_Check( "runs: none for no match", RunsText( TKMATCH_CONTAINS, "zz", "abc" ) = "" )
+    tkTest_Check( "runs: none for the empty query", RunsText( TKMATCH_PREFIX, "", "abc" ) = "" )
+
+    tkTest_Begin( "score" )
+    dim as TKMATCH_QUERY q
+    tkMatch_Prepare( q, TKMATCH_CONTAINS, "ab" )
+    tkTest_Check( "score: at the start 3", tkMatch_Score( q, "abc", "abc" ) = 3 )
+    tkTest_Check( "score: at a word 2 (a later occurrence)", tkMatch_Score( q, "cab abc", "cab abc" ) = 2 )
+    tkTest_Check( "score: elsewhere 1", tkMatch_Score( q, "cab", "cab" ) = 1 )
+    tkTest_Check( "score: no match is SCORE_MIN", tkMatch_Score( q, "xyz", "xyz" ) = TKMATCH_SCORE_MIN )
+end sub
+
+' tkc/fuzzy's suite, through tkMatch's names
+private sub FuzzySuite_( )
+    tkTest_Begin( "fzy (fuzzysuite's checks)" )
+    tkTest_Check( "HasMatch: in order, any case", tkMatch_FuzzyHas( "fb", "FooBar" ) )
+    tkTest_Check( "HasMatch: the empty needle matches", tkMatch_FuzzyHas( "", "x" ) )
+    tkTest_Check( "HasMatch: out of order", tkMatch_FuzzyHas( "bf", "FooBar" ) = false )
+    tkTest_Check( "HasMatch: longer than the haystack", tkMatch_FuzzyHas( "foo", "fo" ) = false )
+    tkTest_Check( "HasMatch: each haystack character used once", tkMatch_FuzzyHas( "aa", "a" ) = false )
+    tkTest_Check( "Score: empty needle is SCORE_MIN", tkMatch_FuzzyScore( "", "abc" ) = TKMATCH_SCORE_MIN )
+    tkTest_Check( "Score: needle longer is SCORE_MIN", tkMatch_FuzzyScore( "abcd", "abc" ) = TKMATCH_SCORE_MIN )
+    tkTest_Check( "Score: same text, other case, is SCORE_MAX", tkMatch_FuzzyScore( "ABC", "abc" ) = TKMATCH_SCORE_MAX )
+    tkTest_Check( "consecutive matches beat a gap", tkMatch_FuzzyScore( "mo", "xmox" ) > tkMatch_FuzzyScore( "mo", "xmxo" ) )
+    tkTest_Check( "a leading match beats a later one", tkMatch_FuzzyScore( "a", "ab" ) > tkMatch_FuzzyScore( "a", "ba" ) )
+    tkTest_Check( "the slash bonus", tkMatch_FuzzyScore( "gr", "debug/gr" ) > tkMatch_FuzzyScore( "gr", "debugger" ) )
+    tkTest_Check( "the capital bonus", tkMatch_FuzzyScore( "fb", "fooBar" ) > tkMatch_FuzzyScore( "fb", "foobar" ) )
+    tkTest_Check( "the dot bonus", tkMatch_FuzzyScore( "md", "main.dlg" ) > tkMatch_FuzzyScore( "md", "maindlg" ) )
+    tkTest_Check( "_ and - are the same word bonus", tkMatch_FuzzyScore( "ab", "x_ab" ) = tkMatch_FuzzyScore( "ab", "x-ab" ) )
+    tkTest_Check( "positions: f at 0, b after the slash", NewPositions( "fb", "foo/bar" ) = "0,4" )
+    tkTest_Check( "positions: slash bonus, then consecutive o", NewPositions( "amo", "app/models/order" ) = "0,4,5" )
+    tkTest_Check( "positions: the SCORE_MAX case", NewPositions( "abc", "ABC" ) = "0,1,2" )
+    tkTest_Check( "positions: none for the empty needle", NewPositions( "", "abc" ) = "" )
+    tkTest_Check( "positions: none for a needle too long", NewPositions( "xyz", "xy" ) = "" )
+
+    tkTest_Begin( "fzy vs tkEdit's port, random" )
+    dim as ustring alpha = "abcAB/_-. xyZ"
+    dim as long nSame = 0, nPos = 0, nCases = 4000, firstBad = -1
+    dim as string badText
+    dim as TKMATCH_WORK w
+    for k as long = 1 to nCases
+        dim as ustring hay = RandText_( alpha, 0, 14 ), nee = RandText_( "abcxyAB/", 0, 4 )
+        dim as double a = RefScore( nee, hay )
+        dim as double b = tkMatch_FuzzyScore( nee, hay, @w )
+        if a = b then
+            nSame += 1
+        elseif firstBad < 0 then
+            firstBad = k : badText = "'" & nee & "' in '" & hay & "': " & a & " vs " & b
+        end if
+        if RefPositions( nee, hay ) = NewPositions( nee, hay ) then nPos += 1
+    next
+    tkTest_Check( "scores identical on " & nCases & " random pairs", nSame = nCases, nSame & " same; " & badText )
+    tkTest_Check( "positions identical on " & nCases & " random pairs", nPos = nCases, str( nPos ) )
+    ' the reused work area does not leak one call into the next
+    tkTest_Check( "a work area reused after a longer haystack", tkMatch_FuzzyScore( "ab", "xxxxxxxxxxxxxxxxxxxxab", @w ) = RefScore( "ab", "xxxxxxxxxxxxxxxxxxxxab" ) _
+        andalso tkMatch_FuzzyScore( "ab", "ab_", @w ) = RefScore( "ab", "ab_" ) )
+end sub
+
+private function Joined_( a() as long ) as string
+    dim as string o
+    for i as long = lbound( a ) to ubound( a )
+        o &= a(i) & ","
+    next
+    return o
+end function
+
+private sub Sets_( )
+    tkTest_Begin( "narrowing" )
+    dim as long n = 3000
+    dim as ustring texts( 0 to n - 1 ), keys( 0 to n - 1 )
+    for i as long = 0 to n - 1
+        texts(i) = RandText_( "abcdeAB _-", 3, 12 )
+        keys(i) = tkMatch_Fold( texts(i) )
+    next
+    dim as long noCand(), allM(), narrowM(), m1()
+    dim as TKMATCH_HIT h(), h2()
+    dim as long bad = 0, tried = 0, nRefined = 0
+    dim as string badText
+    for mode as long = TKMATCH_PREFIX to TKMATCH_FUZZY
+        for k as long = 1 to 250
+            dim as TKMATCH_QUERY q1, q2
+            dim as ustring s1 = RandText_( "abcde ", 0, 2 )
+            dim as ustring s2 = s1 & RandText_( "abcdeAB", 1, 2 )
+            ' sometimes a refinement that is not an append (contains / fuzzy take those too)
+            if (k mod 5 = 0) andalso (mode >= TKMATCH_CONTAINS) then s2 = RandText_( "ab", 1, 1 ) & s1 & "c"
+            tkMatch_Prepare( q1, mode, s1 )
+            tkMatch_Prepare( q2, mode, s2 )
+            tkMatch_Filter( q1, texts(), keys(), noCand(), -1, m1(), h() )
+            dim as long nAll = tkMatch_Filter( q2, texts(), keys(), noCand(), -1, allM(), h() )
+            if tkMatch_Extends( q2, q1 ) then
+                nRefined += 1
+                dim as long nNar = tkMatch_Filter( q2, texts(), keys(), m1(), ubound( m1 ) + 1, narrowM(), h2() )
+                tried += 1
+                if (nNar <> nAll) orelse (Joined_( narrowM() ) <> Joined_( allM() )) then
+                    bad += 1
+                    if len( badText ) = 0 then badText = "mode " & mode & " '" & s1 & "' -> '" & s2 & "'"
+                end if
+            end if
+        next
+    next
+    tkTest_Check( "narrowed = full refilter (" & tried & " refinements, 4 modes)", (bad = 0) andalso (tried > 900), badText & " tried " & tried )
+    dim as TKMATCH_QUERY qa, qb
+    tkMatch_Prepare( qa, TKMATCH_PREFIX, "ab" ) : tkMatch_Prepare( qb, TKMATCH_PREFIX, "a" )
+    tkTest_Check( "extends: an append", tkMatch_Extends( qa, qb ) )
+    tkTest_Check( "extends: not a deletion", tkMatch_Extends( qb, qa ) = false )
+    tkMatch_Prepare( qa, TKMATCH_CONTAINS, "xaby" ) : tkMatch_Prepare( qb, TKMATCH_CONTAINS, "ab" )
+    tkTest_Check( "extends: contains holds it", tkMatch_Extends( qa, qb ) )
+    tkMatch_Prepare( qa, TKMATCH_PREFIX, "xab" ) : tkMatch_Prepare( qb, TKMATCH_PREFIX, "ab" )
+    tkTest_Check( "extends: prefix needs the start", tkMatch_Extends( qa, qb ) = false )
+    tkMatch_Prepare( qa, TKMATCH_FUZZY, "aXbY" ) : tkMatch_Prepare( qb, TKMATCH_FUZZY, "ab" )
+    tkTest_Check( "extends: fuzzy subsequence", tkMatch_Extends( qa, qb ) )
+    tkMatch_Prepare( qa, TKMATCH_CONTAINS, "ab" ) : tkMatch_Prepare( qb, TKMATCH_PREFIX, "a" )
+    tkTest_Check( "extends: never across modes", tkMatch_Extends( qa, qb ) = false )
+
+    tkTest_Begin( "ranked, capped" )
+    dim as TKMATCH_QUERY qf
+    tkMatch_Prepare( qf, TKMATCH_FUZZY, "ab" )
+    dim as TKMATCH_HIT full(), cap()
+    dim as long mFull(), mCap()
+    dim as long nF = tkMatch_Filter( qf, texts(), keys(), noCand(), -1, mFull(), full() )
+    dim as long nC = tkMatch_Filter( qf, texts(), keys(), noCand(), -1, mCap(), cap(), 50 )
+    tkTest_Check( "capped: the total still counts every match", (nF = nC) andalso (nF > 50), nF & " / " & nC )
+    tkTest_Check( "capped: 50 rows", ubound( cap ) = 49 )
+    dim as boolean same = true, sorted_ = true
+    for i as long = 0 to 49
+        if (cap(i).index <> full(i).index) orelse (cap(i).score <> full(i).score) then same = false
+    next
+    for i as long = 1 to ubound( full )
+        if (full(i - 1).score < full(i).score) orelse _
+           ((full(i - 1).score = full(i).score) andalso (full(i - 1).index > full(i).index)) then sorted_ = false
+    next
+    tkTest_Check( "full: by score, ties in source order", sorted_ )
+    tkTest_Check( "capped: top-K = the full sort's first 50", same )
+    tkTest_Check( "matched(): every match, in source order, uncapped", ubound( mCap ) + 1 = nF )
+    dim as TKMATCH_QUERY qp
+    tkMatch_Prepare( qp, TKMATCH_CONTAINS, "a" )
+    dim as TKMATCH_HIT hp()
+    dim as long mp()
+    dim as long np_ = tkMatch_Filter( qp, texts(), keys(), noCand(), -1, mp(), hp(), 20 )
+    dim as boolean inOrder = (ubound( hp ) = 19)
+    for i as long = 0 to ubound( hp )
+        if hp(i).index <> mp(i) then inOrder = false
+    next
+    tkTest_Check( "unranked capped: the first 20 in source order", inOrder andalso (np_ > 20) )
+    dim as long n0 = tkMatch_Filter( qp, texts(), keys(), noCand(), 0, mp(), hp() )
+    tkTest_Check( "no candidates: nothing", (n0 = 0) andalso (ubound( hp ) < 0) )
+
+    tkTest_Begin( "sorted prefix range" )
+    dim as ustring sk( 0 to n - 1 )
+    for i as long = 0 to n - 1
+        sk(i) = keys(i)
+    next
+    ' insertion sort is too slow for 3000; a simple shell sort by tkMatch_Compare
+    dim as long gap = n \ 2
+    while gap > 0
+        for i as long = gap to n - 1
+            dim as ustring t = sk(i)
+            dim as long j = i
+            while (j >= gap) andalso (tkMatch_Compare( sk(j - gap), t ) > 0)
+                sk(j) = sk(j - gap)
+                j -= gap
+            wend
+            sk(j) = t
+        next
+        gap \= 2
+    wend
+    dim as long badR = 0
+    for k as long = 1 to 300
+        dim as ustring pq = tkMatch_Fold( RandText_( "abcde ", 0, 3 ) )
+        dim as long f, l
+        dim as long cnt = tkMatch_PrefixRange( pq, sk(), f, l )
+        dim as long lin = 0, lf = -1, ll = -2
+        for i as long = 0 to n - 1
+            if left( sk(i), len( pq ) ) = pq then
+                lin += 1
+                if lf < 0 then lf = i
+                ll = i
+            end if
+        next
+        if lin = 0 then
+            if cnt <> 0 then badR += 1
+        elseif (cnt <> lin) orelse (f <> lf) orelse (l <> ll) then
+            badR += 1
+        end if
+    next
+    tkTest_Check( "binary-searched range = a linear scan (300 queries)", badR = 0, str( badR ) )
+end sub
+
+Fold_( )
+Words_( )
+Modes_( )
+FuzzySuite_( )
+Sets_( )
+end tkTest_Report( "tkMatch" )

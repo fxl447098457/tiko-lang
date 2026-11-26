@@ -58,6 +58,36 @@ Vendor's **unprefixed** callback typedefs take an `LT_` prefix here (`LT_PaintCa
   draws nothing without a paint callback, and so does this.
 - `TKLISTTREE_PAINTINFO.hList` and `.hasFocus`.
 - Accessors: `GetSurface`, `GetEditor`, `GetItemHeightPx`, `IsDragging`.
+- **Check boxes** (2026-11-22, C1 of docs/tkControls/CHECKED-LISTS.md in the claude-docs repo; off
+  by default, nothing changes until `SetCheckBoxes`):
+  - a state per row (`LT_CHECK_UNCHECKED / CHECKED / MIXED` = tkCheckBox's `CHK_STATE_*`) that travels
+    with the row like `selected`; `SetRowCheckable` per row. Legacy header rows never have a box;
+  - a band after the twisty (box 16 in a band of 20, unscaled; the box never taller than the row
+    less 2 px each side). Every non-header row reserves it, so text keeps its column on an
+    uncheckable row. `pi.indent`, column 0's cell and the label editor all start after it.
+    `TKLISTTREE_PAINTINFO` gains `rcCheck`, `checkState`, `isCheckable`, `isCheckHot`, `isCheckPressed`;
+    `TKLISTTREE_MESSAGEINFO` gains `onCheck`;
+  - the control paints the box after the row, as it paints the twisty, through
+    `tkCheckBox_PaintMark` with `TKCHECKBOX_COLORS` (theme: `tkCheckBox_ThemeColors`; `SetCheckColors`
+    pins apart from the rows' colours; `UnpinColors` unpins both). `SetCheckOwnerDraw` leaves it to
+    the host's painter;
+  - the box: press + release over it toggles (tkCheckBox's model: captured, cancelled by sliding
+    off or by a lost capture); the row becomes the focus row, the selection is untouched, no drag,
+    no click-to-edit, a double click is two toggles and never Activate. `SetCheckOnClick`: a row
+    click selects and toggles;
+  - keys: Space toggles the focus row, and every selected row with it when the focus row is
+    selected among others; **Ctrl+Space is the old Space** (selection toggle) while check boxes
+    are on; `+` (keypad, `SDLK_PLUS`, the `=+` key) checks and `-` unchecks;
+  - `SetCheckMode( LT_CHECKMODE_THREESTATE )`: a user toggle cycles unchecked → checked → mixed;
+    `SetCheckCascade`: a user toggle takes the subtree and re-derives the ancestors (all checked /
+    all unchecked / mixed, uncheckable rows left out; a mixed box checks); `RecomputeChecks` derives
+    every parent in one O(n) reverse pass;
+  - events: `ItemCheck( h, row, oldState, byref newState ) as boolean` BEFORE (veto or rewrite),
+    `ItemChecked( h, row, newState )` AFTER the whole gesture -- one of each per gesture, however
+    many rows changed; setters (`SetCheck`, `CheckAll`, `RecomputeChecks`) are silent;
+  - queries: `GetCheck`, `GetCheckedCount`, `GetCheckedItems`, `GetCheckRect`.
+  tkListTree now imports tkCheckBox (`public`, for `TKCHECKBOX_COLORS`). Not in controls.toml yet
+  (the designer entry is C2).
 
 **Dropped (Win32-only):**
 - `FilterMessage`: the host routes Enter and Escape to the focused editor.

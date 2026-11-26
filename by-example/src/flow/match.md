@@ -15,12 +15,6 @@ value of the arm that matched:
 {{#include ../../examples/flow/match.out}}
 ```
 
-````admonish warning title="Status in this version"
-`match` arrives after tiko 0.1.6, the toolchain this site is pinned to. The
-examples on this page were compiled and run on Windows with the development
-toolchain.
-````
-
 | Form | Arms | Example |
 |---|---|---|
 | statement | `case pattern`, then a body of any length | `match temps(i)` above |

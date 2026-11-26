@@ -403,7 +403,7 @@ An import library or `.dll.a` with a matching name is found before the `.dll`, a
 `LD_LIBRARY_PATH=. ./hello` is fine for a quick test. To make the program look beside itself every time, record an *rpath* when you link. Add this at the top of `hello.tiko`:
 
 ```freebasic
-#ifdef __FB_LINUX__
+#ifdef TIKO_OS_LINUX
     #cmdline "-Wl -rpath,$ORIGIN"
 #endif
 ```

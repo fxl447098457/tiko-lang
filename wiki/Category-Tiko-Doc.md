@@ -67,14 +67,14 @@ Each module is built as a program that imports it builds it, through the module 
 | `<chain>.html` | the same as a web page, light or dark with the system, with the search box |
 | `index.md`, `index.html` | every module, with its import line and the first sentence of its overview |
 | `search.js` | every name, for the search box -- a script rather than JSON, so the search works on pages opened from the disk |
-| `doc.json` | everything, for tools: `{"format":1,"generator":"tiko 0.1.6","modules":[...]}` |
+| `doc.json` | everything, for tools: `{"format":1,"generator":"tiko 0.1.8","modules":[...]}` |
 
 `<chain>` is the module's package path with dots: `std.strings`, `myapp.src.util`.
 
 ### doc.json
 
 ```
-{"format":1,"generator":"tiko 0.1.6","modules":[
+{"format":1,"generator":"tiko 0.1.8","modules":[
   {"chain":"std.strings","import":"std/strings","name":"strings","files":["csv.tiko", ...],
    "summary":"...","doc":"<the overview>",
    "items":[

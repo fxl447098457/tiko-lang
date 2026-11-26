@@ -1,0 +1,248 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkDataGrid -- export: the grid as CSV (phase G7a).
+'
+' WHAT IS EXPORTED is what the user sees. The rows are the VIEW rows in view order: sorted, and
+' without the rows a filter hides. The placeholder new row is never exported. The columns are the
+' visible ones in DISPLAY order (or every column with bAllColumns, still in display order). With
+' bSelectedOnly, the rows are those with a selected cell and the columns those with one (all of
+' them when whole rows are selected), as Ctrl+C copies. A cell that is not selected is an empty
+' field.
+'
+' A FIELD is the cell's shown text, after CellFormatting (bFormatted), or its value in invariant
+' form: an integer, a float as str( ) writes it ("." decimals), true / false, a date as yyyy-mm-dd,
+' and "" for EMPTY. Each record is std/strings' JoinCsvRow (RFC 4180 quoting) plus CRLF or LF.
+' bGuardFormulas puts a ' before a TEXT value that starts with = + - @, a tab or a CR, so a
+' spreadsheet does not run it as a formula (OWASP's CSV injection advice). Numbers are never
+' changed by it.
+'
+' ExportCsv streams the file in 64K-character chunks and never holds the whole text, so a virtual
+' grid of a million rows costs a byte per row and one chunk (release, 15 columns: 100k rows 0.56 s, 1M rows
+' 6.3 s -- most of it formatting the cells). Every cell is read through DgRead, through the
+' block cache when it has the row, else from the feed synchronously (D-5), as copy does. A cell
+' being edited exports its committed value: export does not end the edit. Silent: no events.
+#module "tkDataGrid"
+
+#import "std/strings"
+#import "std/fs"
+#import "std/containers"
+#import "../tkHost"
+using tkHost
+
+const DG_CSV_CHUNK = 65536             ' characters ExportCsv gathers before a write
+
+public type TKDG_CSVOPTIONS
+    sep            as ustring = ","   ' "" counts as ","; ";" for a European Excel, chr(9) for TSV
+    bHeaders       as boolean = true  ' the captions as the first record
+    bFormatted     as boolean = true  ' the shown text (else the invariant value)
+    bSelectedOnly  as boolean         ' only the selection (else every view row)
+    bAllColumns    as boolean         ' hidden columns too (else the visible ones)
+    bBom           as boolean = true  ' ExportCsv starts with a UTF-8 BOM: Excel misreads UTF-8 without it
+    bCrLf          as boolean = true  ' CRLF record ends (RFC 4180), else LF
+    bGuardFormulas as boolean         ' a ' before a text value starting = + - @ tab CR
+end type
+
+' The display positions exported, in order; the count. A selection export narrows them to the
+' columns a rectangle covers unless whole rows are selected.
+private function DgExportCols( byval p as TKDATAGRID_STATE ptr, byref o as const TKDG_CSVOPTIONS, disp() as integer ) as integer
+    erase disp
+    if p->colCount = 0 then return 0
+    redim disp( 0 to p->colCount - 1 )
+    dim as boolean anyRows = p->sel.bAll orelse (p->sel.nSpans > 0)
+    dim as integer n = 0
+    for d as integer = 0 to p->colCount - 1
+        if (o.bAllColumns = false) andalso (p->cols( p->order(d) ).c.visible = false) then continue for
+        if o.bSelectedOnly andalso (anyRows = false) then
+            dim as boolean inRect = false
+            for k as integer = 0 to p->sel.nRects - 1
+                if (d >= p->sel.rects(k).disp1) andalso (d <= p->sel.rects(k).disp2) then inRect = true : exit for
+            next
+            if inRect = false then continue for
+        end if
+        disp(n) = d : n += 1
+    next
+    return n
+end function
+
+' A mark per view row: 1 = exported. Every row, or (bSelectedOnly) the rows with a selected cell.
+private function DgExportRows( byval p as TKDATAGRID_STATE ptr, byref o as const TKDG_CSVOPTIONS, used() as ubyte ) as integer
+    erase used
+    dim as integer nv = DgViewCount( p )
+    if nv <= 0 then return 0
+    redim used( 0 to nv - 1 )
+    if o.bSelectedOnly = false then
+        for v as integer = 0 to nv - 1 : used(v) = 1 : next
+        return nv
+    end if
+    for v as integer = 0 to nv - 1
+        if DgSetHasRow( p->sel, DgModelOf( p, v ) ) then used(v) = 1
+    next
+    for k as integer = 0 to p->sel.nRects - 1
+        for v as integer = p->sel.rects(k).row1 to iif( p->sel.rects(k).row2 < nv, p->sel.rects(k).row2, nv - 1 )
+            if v >= 0 then used(v) = 1
+        next
+    next
+    dim as integer n = 0
+    for v as integer = 0 to nv - 1 : n += used(v) : next
+    return n
+end function
+
+' One field: the shown or the invariant text, guarded.
+private function DgExportField( byval p as TKDATAGRID_STATE ptr, byval row as integer, byval col as integer, _
+                                byref o as const TKDG_CSVOPTIONS ) as ustring
+    dim as TKDG_VALUE v
+    DgRead( p, row, col, v )
+    dim as ustring s
+    if o.bFormatted then
+        s = DgDisplayText( p, col, v )
+        if p->CellFormattingCallback then
+            dim as TKDATAGRID_FORMATINFO fi
+            fi.hGrid = p->hWin : fi.row = row : fi.col = col : fi.value = @v
+            fi.text = s
+            fi.foreColor = p->colors.ForeColor : fi.backColor = p->colors.BackColor
+            fi.align = DgAlignOf( p->cols(col).c )
+            p->CellFormattingCallback( @fi )
+            s = fi.text
+        end if
+    else
+        s = DgDefaultText( v )
+    end if
+    if o.bGuardFormulas andalso (v.kind = TKDG_TEXT) andalso (len( s ) > 0) then
+        select case s[0]
+        case 61, 43, 45, 64, 9, 13         ' = + - @ tab CR
+            s = "'" & s
+        end select
+    end if
+    return s
+end function
+
+private sub DgExportHeader( byval p as TKDATAGRID_STATE ptr, disp() as integer, byval nCols as integer, _
+                            byref fields as containers.Array( of ustring ) )
+    fields.Clear( )
+    for j as integer = 0 to nCols - 1
+        dim as ustring c = p->cols( p->order( disp(j) ) ).c.caption
+        fields.Push( c )
+    next
+end sub
+
+' View row v's fields. A selection export leaves a cell that is not selected empty.
+private sub DgExportRecord( byval p as TKDATAGRID_STATE ptr, byref o as const TKDG_CSVOPTIONS, byval v as integer, _
+                            disp() as integer, byval nCols as integer, byref fields as containers.Array( of ustring ) )
+    fields.Clear( )
+    dim as integer row = DgModelOf( p, v )
+    for j as integer = 0 to nCols - 1
+        dim as integer col = p->order( disp(j) )
+        dim as ustring s
+        if (o.bSelectedOnly = false) orelse DgCellSelected( p, row, col ) then s = DgExportField( p, row, col, o )
+        fields.Push( s )
+    next
+end sub
+
+private function DgCsvSep( byref o as const TKDG_CSVOPTIONS ) as ustring
+    if len( o.sep ) = 0 then return ","
+    return o.sep
+end function
+
+' ==========================================================================================
+' Public API
+' ==========================================================================================
+' The export as one string (no BOM: that belongs to a file). Fine for a clipboard or a few
+' thousand rows; a big grid goes to a file with ExportCsv. "" when there is nothing to export.
+public function tkDataGrid_GetCsvText( byval hGrid as TK_WIDGET ptr, byref o as const TKDG_CSVOPTIONS ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return ""
+    dim as integer disp( any )
+    dim as integer nCols = DgExportCols( p, o, disp() )
+    if nCols = 0 then return ""
+    dim as ubyte used( any )
+    dim as integer nRows = DgExportRows( p, o, used() )
+    if (nRows = 0) andalso (o.bHeaders = false) then return ""
+    dim as ustring sep = DgCsvSep( o ), eol = wchr( 10 ), t
+    if o.bCrLf then eol = wchr( 13, 10 )
+    dim as containers.Array( of ustring ) fields
+    if o.bHeaders then
+        DgExportHeader( p, disp(), nCols, fields )
+        t &= strings.JoinCsvRow( fields, sep ) & eol
+    end if
+    for v as integer = 0 to ubound( used )
+        if used(v) = 0 then continue for
+        DgExportRecord( p, o, v, disp(), nCols, fields )
+        t &= strings.JoinCsvRow( fields, sep ) & eol
+    next
+    return t
+end function
+
+' Writes the export to path (created, or truncated). FALSE: the file could not be created or
+' written -- GetExportError says why; a file that failed part way is left as it is. A grid with
+' nothing to export still writes the BOM and the header record.
+public function tkDataGrid_ExportCsv( byval hGrid as TK_WIDGET ptr, byref path as const ustring, _
+                                      byref o as const TKDG_CSVOPTIONS ) as boolean
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return false
+    p->exportError = ""
+    dim as fs.File f
+    dim as fs.FsResultBool r = f.Create( path )
+    if r.IsOk( ) = false then
+        p->exportError = r.Failure( ).Message( )
+        return false
+    end if
+    if o.bBom then
+        r = f.WriteUtf8( wchr( &hFEFF ) )
+        if r.IsOk( ) = false then
+            p->exportError = r.Failure( ).Message( )
+            f.Close( )
+            return false
+        end if
+    end if
+    dim as integer disp( any )
+    dim as integer nCols = DgExportCols( p, o, disp() )
+    dim as ubyte used( any )
+    dim as integer nRows = DgExportRows( p, o, used() )
+    ' records are joined by std's JoinCsvRow and written DG_CSV_CHUNK characters at a time: one
+    ' write per record (std's CsvWriter) made the export a third slower
+    dim as ustring sep = DgCsvSep( o ), eol = wchr( 10 ), buf
+    if o.bCrLf then eol = wchr( 13, 10 )
+    dim as containers.Array( of ustring ) fields
+    if nCols > 0 then
+        if o.bHeaders then
+            DgExportHeader( p, disp(), nCols, fields )
+            buf = strings.JoinCsvRow( fields, sep ) & eol
+        end if
+        if nRows > 0 then
+            for v as integer = 0 to ubound( used )
+                if used(v) = 0 then continue for
+                DgExportRecord( p, o, v, disp(), nCols, fields )
+                buf &= strings.JoinCsvRow( fields, sep ) & eol
+                if len( buf ) >= DG_CSV_CHUNK then
+                    r = f.WriteUtf8( buf )
+                    if r.IsOk( ) = false then exit for
+                    buf = ""
+                end if
+            next
+        end if
+    end if
+    if r.IsOk( ) andalso (len( buf ) > 0) then r = f.WriteUtf8( buf )
+    if r.IsOk( ) then r = f.Flush( )
+    if r.IsOk( ) = false then
+        p->exportError = r.Failure( ).Message( )
+        f.Close( )
+        return false
+    end if
+    r = f.Close( )
+    if r.IsOk( ) = false then
+        p->exportError = r.Failure( ).Message( )
+        return false
+    end if
+    return true
+end function
+
+' Why the last ExportCsv returned FALSE ("" after one that worked).
+public function tkDataGrid_GetExportError( byval hGrid as TK_WIDGET ptr ) as ustring
+    dim as TKDATAGRID_STATE ptr p = DgState( hGrid )
+    if p = 0 then return ""
+    return p->exportError
+end function

@@ -1,0 +1,704 @@
+' tkTimePicker self-test (phases T2 + T3 of claude-docs docs/tkControls/TIMEPICKER.md). Real
+' windows, real SDL event queue: every input claim is made by PUSHING the event a user would have
+' produced and pumping. Two passes, scale pinned at 1.0 and 1.75. Geometry is asserted against
+' tkDatePicker's layout formulas (and against a real DatePicker of the same size); events counted.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTimePicker"
+#import "vendor/tkControls/tkDatePicker"
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkBind"
+#import "std/chrono"
+using tkTimePicker
+using tkTooltip
+using tkBind
+using tkCalendar
+using chrono
+using tkTimePanel
+using tkDatePicker
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gChanged, gDropOpen, gDropClose, gParentKeys, gParentWheels
+dim shared as TKTIME gLast
+dim shared as boolean gLastHas, gDestroyInChanged
+dim shared as long gNoonOff
+
+sub OnChanged( byval hCtrl as TK_WIDGET ptr, byval pTime as TKTIME ptr, byval bHasTime as boolean )
+    gChanged += 1
+    gLast = *pTime
+    gLastHas = bHasTime
+    if gDestroyInChanged then tkWidget_Destroy( hCtrl )
+end sub
+
+sub OnDrop( byval hCtrl as TK_WIDGET ptr, byval isOpen as boolean )
+    if isOpen then gDropOpen += 1 else gDropClose += 1
+end sub
+
+function OnItemDisabled( byval hCtrl as TK_WIDGET ptr, byval nKind as long, byval nValue as long ) as boolean
+    return (gNoonOff <> 0) andalso (nKind = TKTP_SEG_HOUR24) andalso (nValue = 12)
+end function
+
+sub ResetCounts( )
+    gChanged = 0 : gDropOpen = 0 : gDropClose = 0 : gParentKeys = 0 : gParentWheels = 0
+end sub
+
+function ParentProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    select case m->msg
+    case TKM_KEYDOWN : gParentKeys += 1 : return false
+    case TKM_MOUSEWHEEL : gParentWheels += 1 : return true
+    end select
+    return false
+end function
+
+function Tm( byval hh as long, byval mi as long, byval ss as long = 0, byval ms as long = 0 ) as TKTIME
+    return tkTimePanel_MakeTime( hh, mi, ss, ms )
+end function
+
+function Iso( byref t as const TKTIME ) as string
+    if tkTimePanel_IsTime( t ) = false then return "(none)"
+    return tkTimePanel_FormatIso( t, true, true )
+end function
+
+function GetT( byval c as TK_WIDGET ptr ) as TKTIME
+    dim as TKTIME t
+    tkTimePicker_GetTime( c, t )
+    return t
+end function
+
+function IsT( byval c as TK_WIDGET ptr, byval hh as long, byval mi as long, byval ss as long = 0, byval ms as long = 0 ) as boolean
+    return tkTimePanel_SameTime( GetT( c ), Tm( hh, mi, ss, ms ) )
+end function
+
+function WX( byval w as TK_WIDGET ptr, byval x as long ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return a.left + x
+end function
+
+function WY( byval w as TK_WIDGET ptr, byval y as long ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return a.top + y
+end function
+
+sub Keys( byval h as TK_HOST ptr, byref s as const string )
+    for i as long = 1 to len( s )
+        tkTest_PushKey( h, asc( s, i ) )
+    next
+end sub
+
+' Click item (col, i) of the open dropdown's panel, in the POPUP window.
+sub ClickPanelItem( byval c as TK_WIDGET ptr, byval col as long, byval i as long )
+    dim as TK_HOST ptr pop = tkTimePicker_GetPopup( c )
+    dim as TK_WIDGET ptr pnl = tkTimePicker_GetPanelHandle( c )
+    if (pop = 0) orelse (pnl = 0) then exit sub
+    tkHost_RenderTo( pop, false )
+    dim as TKRECT r
+    tkTimePanel_GetItemRect( pnl, col, i, r )
+    tkTest_Click( pop, WX( pnl, (r.left + r.right) \ 2 ), WY( pnl, (r.top + r.bottom) \ 2 ) )
+end sub
+
+sub ClickIcon( byval h as TK_HOST ptr, byval c as TK_WIDGET ptr )
+    dim as TKRECT r
+    tkTimePicker_GetIconRect( c, r )
+    tkTest_Click( h, WX( c, (r.left + r.right) \ 2 ), WY( c, (r.top + r.bottom) \ 2 ) )
+end sub
+
+function PixW( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byval x as long, byval y as long ) as ulong
+    return tkTest_PixelAt( h, WX( w, x ), WY( w, y ) )
+end function
+
+' ==========================================================================================
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkTimePicker selftest", 760, 560, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host created", false, *SDL_GetError() ) : exit sub
+    tkTest_Check( "scale pinned", h->fScale = fScale, "" & h->fScale )
+    dim as TK_WIDGET ptr root = tkHost_Root( h )
+    dim as TK_WIDGET ptr par = tkWidget_CreateChild( root, 1, @ParentProc, 0 )
+    tkWidget_SetPos( par, 0, 0, tkHost_Scale( h, 760 ), tkHost_Scale( h, 560 ) )
+    dim as TTF_Font ptr f = h->pDefaultFont
+
+    ' ---- A: defaults, ideal size, the sibling layout --------------------------------------------
+    dim as TK_WIDGET ptr c = tkTimePicker_Create( par, 900 )
+    tkTest_Check( "defaults: HH:mm, step 60, dropdown, AllowEmpty, no time, no text", tkTimePicker_GetFormat( c ) = "HH:mm" _
+                  andalso tkTimePicker_GetStep( c ) = 60 andalso tkTimePicker_GetButtonStyle( c ) = TKTP_BUTTON_DROPDOWN _
+                  andalso tkTimePicker_GetAllowEmpty( c ) andalso tkTimePicker_HasTime( c ) = false andalso tkTimePicker_GetText( c ) = "" )
+    tkTest_Check( "HH:mm: three segments, hour : minute", tkTimePicker_GetSegmentCount( c ) = 3 andalso tkTimePicker_GetSegmentKind( c, 0 ) = TKTP_SEG_HOUR24 _
+                  andalso tkTimePicker_GetSegmentKind( c, 1 ) = TKTP_SEG_LITERAL andalso tkTimePicker_GetSegmentKind( c, 2 ) = TKTP_SEG_MINUTE )
+    dim as long rad = tkTimePicker_GetCornerRadius( c ), bt = tkTimePicker_GetBorderThickness( c ), iconW = tkTimePicker_GetIconWidth( c )
+    tkTest_Check( "metrics: icon 28 and radius 6 scaled, border 1 unscaled", iconW = tkHost_Scale( h, 28 ) andalso rad = tkHost_Scale( h, 6 ) andalso bt = 1, _
+                  iconW & " " & rad & " " & bt )
+    dim as long pad = tkHost_Scale( h, 6 ), vpad = tkHost_Scale( h, 5 )
+    dim as long tw = tkText_Width( f, "10:58" )
+    if tkText_Width( f, "22:58" ) > tw then tw = tkText_Width( f, "22:58" )
+    dim as long iw, ih
+    tkTimePicker_GetIdealSize( c, iw, ih )
+    tkTest_Check( "ideal size = tkDatePicker's formula on the widest time", iw = rad + pad + tw + pad + 1 + iconW _
+                  andalso ih = tkText_Height( f ) + 2 * vpad + 2 * bt, iw & "x" & ih )
+    dim as long cx0 = tkHost_Scale( h, 20 ), cy0 = tkHost_Scale( h, 20 )
+    dim as long cw = iw + tkHost_Scale( h, 40 )
+    tkWidget_SetPos( c, cx0, cy0, cw, ih )
+    dim as TKRECT rIcon, rField, rFrame, rs0, rs1, rs2
+    tkTimePicker_GetIconRect( c, rIcon )
+    tkTimePicker_GetFieldRect( c, rField )
+    tkTimePicker_GetFrameRect( c, rFrame )
+    tkTest_Check( "icon = the right iconW pixels", rIcon.left = cw - iconW andalso rIcon.right = cw andalso rIcon.top = 0 andalso rIcon.bottom = ih, tkRect_Str( rIcon ) )
+    tkTest_Check( "field = radius .. divider, inset by the border", rField.left = rad andalso rField.right = cw - iconW - 1 _
+                  andalso rField.top = bt andalso rField.bottom = ih - bt, tkRect_Str( rField ) )
+    ' a real DatePicker of the same size lays out the same frame, field and icon
+    dim as TK_WIDGET ptr dp = tkDatePicker_Create( par, 950 )
+    tkWidget_SetPos( dp, cx0, cy0 + ih + tkHost_Scale( h, 300 ), cw, ih )
+    dim as TKRECT dIcon, dField
+    tkDatePicker_GetIconRect( dp, dIcon )
+    tkDatePicker_GetFieldRect( dp, dField )
+    tkTest_Check( "sibling: same icon and field rects as a DatePicker", dIcon.left = rIcon.left andalso dIcon.right = rIcon.right _
+                  andalso dField.left = rField.left andalso dField.right = rField.right andalso dField.top = rField.top andalso dField.bottom = rField.bottom, _
+                  tkRect_Str( dField ) & " vs " & tkRect_Str( rField ) )
+    dim as TKTIMEPICKER_COLORS cc
+    dim as TKDATEPICKER_COLORS dc
+    tkTimePicker_GetColors( c, @cc )
+    tkDatePicker_GetColors( dp, @dc )
+    tkTest_Check( "sibling: the frame colours equal the DatePicker's", cc.BackColor = dc.BackColor andalso cc.BorderColor = dc.BorderColor _
+                  andalso cc.FieldBackColor = dc.FieldBackColor andalso cc.FieldForeColor = dc.FieldForeColor andalso cc.IconColor = dc.IconColor _
+                  andalso cc.FocusBorderColor = dc.FocusBorderColor andalso cc.DividerColor = dc.DividerColor )
+
+    ' ---- B: silent setters, segments' geometry -------------------------------------------------------
+    ResetCounts( )
+    tkTimePicker_SetTimeChangedCallback( c, @OnChanged )
+    tkTimePicker_SetDropDownCallback( c, @OnDrop )
+    tkTimePicker_SetTime( c, Tm( 9, 5, 30 ) )
+    tkTest_Check( "SetTime keeps the hidden seconds; text 09:05", IsT( c, 9, 5, 30 ) andalso tkTimePicker_GetText( c ) = "09:05" )
+    tkTimePicker_GetSegmentRect( c, 0, rs0 )
+    tkTimePicker_GetSegmentRect( c, 1, rs1 )
+    tkTimePicker_GetSegmentRect( c, 2, rs2 )
+    tkTest_Check( "segments: from field + pad, each as wide as its text", rs0.left = rad + pad andalso rs0.right = rs0.left + tkText_Width( f, "09" ) _
+                  andalso rs1.left = rs0.right andalso rs1.right = rs1.left + tkText_Width( f, ":" ) andalso rs2.left = rs1.right _
+                  andalso rs2.right = rs2.left + tkText_Width( f, "05" ) andalso rs0.top = rField.top andalso rs0.bottom = rField.bottom, _
+                  tkRect_Str( rs0 ) & " " & tkRect_Str( rs2 ) )
+    tkTimePicker_SetRange( c, Tm( 17, 0 ), Tm( 9, 30 ) )
+    tkTest_Check( "SetRange swaps and clamps: 09:05:30 -> 09:30", IsT( c, 9, 30 ) )
+    tkTimePicker_SetRange( c, Tm( 0, 0 ), Tm( 0, 0 ), false, false )
+    tkTimePicker_StepBy( c, 2, 3 )
+    tkTest_Check( "StepBy minute +3: 09:33", IsT( c, 9, 33 ) )
+    tkTest_Check( "every setter above was SILENT", gChanged = 0, str( gChanged ) )
+
+    ' ---- C: typing -----------------------------------------------------------------------------------
+    tkHost_SetFocus( h, c )
+    tkTest_Check( "focus lands on the first segment", tkTimePicker_GetFocused( c ) andalso tkTimePicker_GetFocusedSegment( c ) = 0 )
+    ResetCounts( )
+    Keys( h, "14" )
+    tkTest_Check( "1 4: hour 14, one TimeChanged, focus moves to the minutes", IsT( c, 14, 33 ) andalso gChanged = 1 _
+                  andalso tkTimePicker_GetFocusedSegment( c ) = 2, Iso( GetT( c ) ) )
+    Keys( h, "3" )
+    tkTest_Check( "3 in the minutes: a pending entry, no event, value unchanged", tkTimePicker_GetPendingEntry( c ) = "3" andalso gChanged = 1 andalso IsT( c, 14, 33 ) )
+    Keys( h, "0" )
+    tkTest_Check( "0: 14:30, one more event; the last segment keeps the focus", IsT( c, 14, 30 ) andalso gChanged = 2 andalso tkTimePicker_GetFocusedSegment( c ) = 2 )
+    Keys( h, "7" )
+    tkTest_Check( "7 in the minutes completes at once: 14:07", IsT( c, 14, 7 ) andalso gChanged = 3 andalso tkTimePicker_GetPendingEntry( c ) = "" )
+    tkTest_PushKey( h, SDLK_HOME )
+    Keys( h, "3" )
+    tkTest_Check( "Home, 3: hour 03 at once, advance", IsT( c, 3, 7 ) andalso tkTimePicker_GetFocusedSegment( c ) = 2 )
+    tkTest_PushKey( h, SDLK_HOME )
+    Keys( h, "25" )
+    tkTest_Check( "2 5: 25 is no hour, so 5 starts over: hour 05", IsT( c, 5, 7 ), Iso( GetT( c ) ) )
+    tkTest_PushKey( h, SDLK_HOME )
+    ResetCounts( )
+    Keys( h, "1" )
+    tkTest_PumpFor( h, TKTP_TYPE_TIMEOUT + 200 )
+    tkTest_Check( "1 then a pause: hour 01, once, the focus stays", IsT( c, 1, 7 ) andalso gChanged = 1 andalso tkTimePicker_GetFocusedSegment( c ) = 0, Iso( GetT( c ) ) )
+    Keys( h, "8" )
+    tkTest_Check( "8 (completes at once)", IsT( c, 8, 7 ) )
+    tkTest_PushKey( h, SDLK_HOME )
+    Keys( h, "1" )
+    tkTest_PushKey( h, SDLK_SEMICOLON, SDL_KMOD_LSHIFT )
+    tkTest_Check( "1 then ':' finishes the hour and moves on: 01:07", IsT( c, 1, 7 ) andalso tkTimePicker_GetFocusedSegment( c ) = 2 )
+    ' a top-row key whose keycode is not a digit (AZERTY's '&') still types 1, by its scancode
+    tkTest_PushKey( h, SDLK_HOME )
+    tkTest_PushKey( h, SDLK_AMPERSAND, 0, true, SDL_SCANCODE_1 )
+    Keys( h, "6" )
+    tkTest_Check( "AZERTY's & (scancode 1) then 6: hour 16", IsT( c, 16, 7 ), Iso( GetT( c ) ) )
+    ' Esc abandons an entry; with none, Enter and Esc are the form's
+    tkTest_PushKey( h, SDLK_END )
+    ResetCounts( )
+    Keys( h, "4" )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "Esc abandons a pending entry: value unchanged, no event", IsT( c, 16, 7 ) andalso tkTimePicker_GetPendingEntry( c ) = "" andalso gChanged = 0 andalso gParentKeys = 0 )
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_Check( "with no entry Enter and Esc bubble to the parent", gParentKeys = 2, str( gParentKeys ) )
+    Keys( h, "4" )
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_Check( "Enter finishes an entry: 16:04, claimed", IsT( c, 16, 4 ) andalso gChanged = 1 andalso gParentKeys = 2 )
+
+    ' ---- D: stepping ----------------------------------------------------------------------------------
+    tkTimePicker_SetTime( c, Tm( 8, 59 ) )
+    tkTimePicker_SetFocusedSegment( c, 2 )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "Up at minute 59: 08:00 (wraps, no carry)", IsT( c, 8, 0 ) andalso gChanged = 1 )
+    tkTest_PushKey( h, SDLK_DOWN )
+    tkTest_Check( "Down at minute 00: 08:59", IsT( c, 8, 59 ) )
+    tkTest_PushKey( h, SDLK_PAGEUP )
+    tkTest_Check( "PgUp: +10 minutes, wrapping: 08:09", IsT( c, 8, 9 ) )
+    tkTimePicker_SetTime( c, Tm( 23, 0 ) )
+    tkTest_PushKey( h, SDLK_HOME )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "Up at hour 23: 00:00", IsT( c, 0, 0 ) )
+    tkTimePicker_SetStep( c, 900 )
+    tkTimePicker_SetTime( c, Tm( 8, 7 ) )
+    tkTest_PushKey( h, SDLK_END )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "step 900, finest minutes: Up from 07 to the grid: 08:15", IsT( c, 8, 15 ) )
+    tkTest_PushKey( h, SDLK_DOWN )
+    tkTest_PushKey( h, SDLK_DOWN )
+    tkTest_Check( "Down, Down: 00, then wraps to 45", IsT( c, 8, 45 ), Iso( GetT( c ) ) )
+    tkTimePicker_SetStep( c, 60 )
+    tkTimePicker_SetTime( c, Tm( 10, 20, 30, 500 ) )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "a user step zeroes what HH:mm hides: 10:21:00.000", IsT( c, 10, 21 ), Iso( GetT( c ) ) )
+    tkTimePicker_SetRange( c, Tm( 9, 30 ), Tm( 17, 0 ) )
+    tkTimePicker_SetTime( c, Tm( 9, 45 ) )
+    tkTest_PushKey( h, SDLK_HOME )
+    tkTest_PushKey( h, SDLK_DOWN )
+    tkTest_Check( "Down to 08:45 clamps to the min: 09:30", IsT( c, 9, 30 ) )
+    tkTimePicker_SetTime( c, Tm( 17, 0 ) )
+    tkTest_PushKey( h, SDLK_END )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "Up at the max clamps back to it: no event", IsT( c, 17, 0 ) andalso gChanged = 0 )
+    tkTimePicker_SetRange( c, Tm( 0, 0 ), Tm( 0, 0 ), false, false )
+
+    ' ---- E: empty, clipboard, letters, Tab ----------------------------------------------------------------
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_BACKSPACE )
+    tkTest_Check( "Backspace clears (AllowEmpty): one event, bHasTime FALSE", tkTimePicker_HasTime( c ) = false andalso gChanged = 1 andalso gLastHas = false )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "Up on an empty field: 00:00 (D-7)", IsT( c, 0, 0 ) andalso gChanged = 2 )
+    tkTest_PushKey( h, SDLK_DELETE )
+    tkTest_PushKey( h, SDLK_HOME )
+    Keys( h, "9" )
+    tkTest_Check( "typing into an empty field: 9 gives 09:00", IsT( c, 9, 0 ), Iso( GetT( c ) ) )
+    tkTimePicker_SetAllowEmpty( c, false )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_BACKSPACE )
+    tkTest_Check( "without AllowEmpty Backspace does nothing", IsT( c, 9, 0 ) andalso gChanged = 0 )
+    tkTimePicker_SetAllowEmpty( c, true )
+    tkTest_PushKey( h, SDLK_C, SDL_KMOD_LCTRL )
+    tkTest_Check( "Ctrl+C copies the text", tkHost_GetClipboardText() = "09:00", tkHost_GetClipboardText() )
+    tkHost_SetClipboardText( "2:45 pm" )
+    tkTest_PushKey( h, SDLK_V, SDL_KMOD_LCTRL )
+    tkTest_Check( "Ctrl+V pastes leniently: 14:45, one event", IsT( c, 14, 45 ) andalso gChanged = 1 )
+    tkHost_SetClipboardText( "banana" )
+    tkTest_PushKey( h, SDLK_V, SDL_KMOD_LCTRL )
+    tkTest_Check( "pasting no time changes nothing", IsT( c, 14, 45 ) andalso gChanged = 1 )
+    tkTest_PushKey( h, SDLK_X, SDL_KMOD_LCTRL )
+    tkTest_Check( "Ctrl+X copies and clears", tkHost_GetClipboardText() = "14:45" andalso tkTimePicker_HasTime( c ) = false andalso gChanged = 2 )
+    tkTimePicker_SetTime( c, Tm( 14, 45 ) )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_P )
+    tkTest_Check( "p with no AM/PM segment: not claimed", gParentKeys = 1 andalso IsT( c, 14, 45 ) )
+    dim as TK_WIDGET ptr c2 = tkTimePicker_Create( par, 901 )
+    tkWidget_SetPos( c2, cx0, cy0 + ih + tkHost_Scale( h, 20 ), cw, ih )
+    tkHost_SetFocus( h, c )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab leaves the picker by default (the next in the walk)", tkHost_GetFocus( h ) <> c andalso tkHost_GetFocus( h ) <> 0 )
+    tkTimePicker_SetTabMovesSegments( c, true )
+    tkHost_SetFocus( h, c )
+    tkTimePicker_SetFocusedSegment( c, 0 )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "TabMovesSegments: Tab to the minutes", tkHost_GetFocus( h ) = c andalso tkTimePicker_GetFocusedSegment( c ) = 2 )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "...and from the last segment it leaves", tkHost_GetFocus( h ) <> c andalso tkHost_GetFocus( h ) <> 0 )
+    tkTimePicker_SetTabMovesSegments( c, false )
+
+    ' ---- F: 12-hour and fractions -----------------------------------------------------------------------
+    tkTimePicker_SetFormat( c, "h:mm tt" )
+    tkTimePicker_GetIdealSize( c, iw, ih )
+    tkWidget_SetPos( c, cx0, cy0, iw + tkHost_Scale( h, 40 ), ih )
+    tkTimePicker_SetTime( c, Tm( 0, 5 ) )
+    tkTest_Check( "h:mm tt: five segments; 00:05 shows 12:05 AM", tkTimePicker_GetSegmentCount( c ) = 5 andalso tkTimePicker_GetText( c ) = "12:05 AM", tkTimePicker_GetText( c ) )
+    tkHost_SetFocus( h, c )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_END )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "Up on AM/PM: 12:05 PM", IsT( c, 12, 5 ) andalso gChanged = 1 )
+    tkTest_PushKey( h, SDLK_A )
+    tkTest_Check( "a: back to AM", IsT( c, 0, 5 ) )
+    tkTest_PushKey( h, SDLK_HOME )
+    Keys( h, "2" )
+    tkTest_Check( "2 in a 12-hour segment completes at once: 02:05", IsT( c, 2, 5 ) )
+    tkTest_PushKey( h, SDLK_HOME )
+    Keys( h, "12" )
+    tkTest_Check( "1 2: 12 AM = 00:05", IsT( c, 0, 5 ) )
+    tkTimePicker_SetTime( c, Tm( 11, 5 ) )
+    tkTest_PushKey( h, SDLK_HOME )
+    tkTest_PushKey( h, SDLK_UP )
+    tkTest_Check( "Up from 11 AM wraps inside the half day: 12 AM (00:05)", IsT( c, 0, 5 ), Iso( GetT( c ) ) )
+    tkTimePicker_SetFormat( c, "HH:mm:ss.fff" )
+    tkTimePicker_SetTime( c, Tm( 10, 0, 0 ) )
+    tkTest_PushKey( h, SDLK_END )
+    Keys( h, "125" )
+    tkTest_Check( "a fraction takes its three digits: .125", IsT( c, 10, 0, 0, 125 ), Iso( GetT( c ) ) )
+    tkTimePicker_SetFormat( c, "HH:mm" )
+    tkTimePicker_GetIdealSize( c, iw, ih )
+    tkWidget_SetPos( c, cx0, cy0, cw, ih )
+
+    ' ---- G: mouse and wheel ----------------------------------------------------------------------------------
+    tkTimePicker_SetTime( c, Tm( 10, 20 ) )
+    tkHost_SetFocus( h, c2 )
+    tkTimePicker_GetSegmentRect( c, 2, rs2 )
+    tkTest_Click( h, WX( c, (rs2.left + rs2.right) \ 2 ), WY( c, (rs2.top + rs2.bottom) \ 2 ) )
+    tkTest_Check( "a click on the minutes focuses the picker on them", tkHost_GetFocus( h ) = c andalso tkTimePicker_GetFocusedSegment( c ) = 2 )
+    tkTimePicker_GetSegmentRect( c, 0, rs0 )
+    ResetCounts( )
+    tkTest_PushWheel( h, WX( c, rs0.left + 1 ), WY( c, (rs0.top + rs0.bottom) \ 2 ), 0, 1 )
+    tkTest_Check( "wheel up over the hour (focused): 11:20, the hour takes the focus", IsT( c, 11, 20 ) andalso gChanged = 1 _
+                  andalso tkTimePicker_GetFocusedSegment( c ) = 0 andalso gParentWheels = 0 )
+    tkHost_SetFocus( h, c2 )
+    tkTest_PushWheel( h, WX( c, rs0.left + 1 ), WY( c, (rs0.top + rs0.bottom) \ 2 ), 0, 1 )
+    tkTest_Check( "unfocused, the wheel bubbles (D-8)", IsT( c, 11, 20 ) andalso gParentWheels = 1 )
+
+    ' ---- H: spin buttons -----------------------------------------------------------------------------------
+    tkTimePicker_SetButtonStyle( c, TKTP_BUTTON_SPIN )
+    dim as TKRECT rUp, rDn
+    tkTimePicker_GetSpinRect( c, true, rUp )
+    tkTimePicker_GetSpinRect( c, false, rDn )
+    tkTimePicker_GetIconRect( c, rIcon )
+    tkTest_Check( "spin halves split the button cell", rUp.left = rIcon.left andalso rUp.top = 0 andalso rUp.bottom = ih \ 2 _
+                  andalso rDn.top = ih \ 2 andalso rDn.bottom = ih andalso tkTimePicker_HitTest( c, rUp.left + 2, 1 ) = TKTPK_HIT_SPINUP, tkRect_Str( rUp ) )
+    tkHost_SetFocus( h, c )
+    tkTimePicker_SetFocusedSegment( c, 2 )
+    ResetCounts( )
+    tkTest_Click( h, WX( c, (rUp.left + rUp.right) \ 2 ), WY( c, (rUp.top + rUp.bottom) \ 2 ) )
+    tkTest_Check( "a click on the up half steps the focused segment: 11:21", IsT( c, 11, 21 ) andalso gChanged = 1 )
+    tkTimePicker_SetRepeat( c, 100, 50 )
+    tkTest_PushMotion( h, WX( c, (rDn.left + rDn.right) \ 2 ), WY( c, (rDn.top + rDn.bottom) \ 2 ) )
+    tkTest_PushButton( h, true, WX( c, (rDn.left + rDn.right) \ 2 ), WY( c, (rDn.top + rDn.bottom) \ 2 ) )
+    tkTest_PumpFor( h, 320 )
+    tkTest_PushButton( h, false, WX( c, (rDn.left + rDn.right) \ 2 ), WY( c, (rDn.top + rDn.bottom) \ 2 ) )
+    dim as long nRep = gChanged - 1
+    tkTest_Check( "holding the down half repeats (100 ms, then every 50)", nRep >= 3 andalso tkHost_GetCapture( h ) = 0, str( nRep ) & " steps" )
+    dim as long nAfter = gChanged
+    tkTest_PumpFor( h, 200 )
+    tkTest_Check( "released: the repeat stops", gChanged = nAfter )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_DOWN, SDL_KMOD_LALT )
+    tkTest_Check( "Alt+Down with spin buttons: not claimed, nothing opens", gParentKeys = 1 andalso tkTimePicker_IsDroppedDown( c ) = false )
+    tkTimePicker_SetButtonStyle( c, TKTP_BUTTON_NONE )
+    tkTest_Check( "style NONE: no button cell", tkTimePicker_GetIconRect( c, rIcon ) = false )
+    tkTimePicker_SetButtonStyle( c, TKTP_BUTTON_DROPDOWN )
+
+    ' ---- I: the dropdown ---------------------------------------------------------------------------------------
+    tkTimePicker_SetTime( c, Tm( 10, 20 ) )
+    tkHost_SetFocus( h, c )
+    tkTimePicker_SetFocusedSegment( c, 2 )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    dim as TK_WIDGET ptr pnl = tkTimePicker_GetPanelHandle( c )
+    tkTest_Check( "F4 opens: DropDown(true) once, a panel seeded with 10:20", tkTimePicker_IsDroppedDown( c ) andalso gDropOpen = 1 andalso (pnl <> 0) _
+                  andalso tkTimePanel_SameTime( tkTimePanel_GetTimeValue( pnl ), Tm( 10, 20 ) ) )
+    if pnl then
+        tkTest_Check( "the panel focuses the minutes column (the field's segment)", tkTimePanel_GetFocusedColumn( pnl ) = 1 )
+        tkTest_Check( "the popup is at least as wide as the field", tkWidget_Parent( pnl )->cw >= cw, tkWidget_Parent( pnl )->cw & " vs " & cw )
+    end if
+    ClickPanelItem( c, 0, 11 )
+    tkTest_Check( "a pick in the hours is PENDING: the field keeps 10:20, no event", IsT( c, 10, 20 ) andalso gChanged = 0 _
+                  andalso tkTimePicker_IsDroppedDown( c ), Iso( GetT( c ) ) )
+    tkTest_PushKey( h, SDLK_ESCAPE )
+    tkTest_PumpFor( h, 50 )
+    tkTest_Check( "Esc dismisses: closed, DropDown(false) once, value unchanged", tkTimePicker_IsDroppedDown( c ) = false andalso gDropClose = 1 _
+                  andalso IsT( c, 10, 20 ) andalso gChanged = 0 andalso tkTimePicker_GetPanelHandle( c ) = 0 )
+    tkTest_PushKey( h, SDLK_DOWN, SDL_KMOD_LALT )
+    tkTest_PumpFor( h, 150 )
+    tkTest_Check( "Alt+Down opens", tkTimePicker_IsDroppedDown( c ) )
+    ClickPanelItem( c, 0, 11 )
+    ClickPanelItem( c, 1, 22 )                 ' minute 20 is at the column's top: 22 is in view
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "a pick in the last column accepts: closed, 11:22, one event", tkTimePicker_IsDroppedDown( c ) = false andalso IsT( c, 11, 22 ) _
+                  andalso gChanged = 1, Iso( GetT( c ) ) )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    tkTest_PushKey( h, SDLK_DOWN )
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "Down + Enter in the panel accepts: 11:23", tkTimePicker_IsDroppedDown( c ) = false andalso IsT( c, 11, 23 ) andalso gChanged = 1, Iso( GetT( c ) ) )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "F4 in the panel dismisses", tkTimePicker_IsDroppedDown( c ) = false andalso gChanged = 1 )
+    ' the icon toggles; the press that closed it does not reopen it
+    ResetCounts( )
+    ClickIcon( h, c )
+    tkTest_PumpFor( h, 150 )
+    tkTest_Check( "icon click opens", tkTimePicker_IsDroppedDown( c ) andalso gDropOpen = 1 )
+    ClickIcon( h, c )
+    tkTest_PumpFor( h, 50 )
+    tkTest_Check( "a second icon click closes and does NOT reopen", tkTimePicker_IsDroppedDown( c ) = false andalso gDropOpen = 1 andalso gDropClose = 1 )
+    ClickIcon( h, c )
+    tkTest_PumpFor( h, 150 )
+    tkTest_Check( "the guard is one-shot: the next click opens", tkTimePicker_IsDroppedDown( c ) andalso gDropOpen = 2 )
+    tkTimePicker_CloseUp( c )
+    tkTest_PumpFor( h, 30 )
+    ' Now and OK
+    tkTimePicker_SetShowNow( c, true )
+    tkTimePicker_SetShowOK( c, true )
+    tkTimePicker_SetNow( c, Tm( 7, 45, 30 ) )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    dim as TK_WIDGET ptr ft = tkTimePicker_GetFooterHandle( c )
+    dim as TKRECT rNow, rOK
+    tkTimePicker_GetFooterButtonRects( c, rNow, rOK )
+    tkTest_Check( "the band: Now on the left half, OK on the right", (ft <> 0) andalso rNow.left = 0 andalso rNow.right = rOK.left _
+                  andalso rOK.right = ft->cw andalso rNow.bottom = tkHost_Scale( h, 30 ), tkRect_Str( rNow ) & " " & tkRect_Str( rOK ) )
+    if ft then
+        dim as TK_HOST ptr pop = tkTimePicker_GetPopup( c )
+        tkHost_RenderTo( pop, false )
+        tkTest_Click( pop, WX( ft, (rNow.left + rNow.right) \ 2 ), WY( ft, (rNow.top + rNow.bottom) \ 2 ) )
+        tkTest_PumpFor( h, 30 )
+    end if
+    tkTest_Check( "Now accepts the (pinned) time, hidden seconds zeroed: 07:45", tkTimePicker_IsDroppedDown( c ) = false andalso IsT( c, 7, 45 ) _
+                  andalso gChanged = 1, Iso( GetT( c ) ) )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    ClickPanelItem( c, 0, 8 )
+    ft = tkTimePicker_GetFooterHandle( c )
+    if ft then
+        dim as TK_HOST ptr pop = tkTimePicker_GetPopup( c )
+        tkHost_RenderTo( pop, false )
+        tkTest_Click( pop, WX( ft, (rOK.left + rOK.right) \ 2 ), WY( ft, (rOK.top + rOK.bottom) \ 2 ) )
+        tkTest_PumpFor( h, 30 )
+    end if
+    tkTest_Check( "pick hour 8, then OK: 08:45", tkTimePicker_IsDroppedDown( c ) = false andalso IsT( c, 8, 45 ) andalso gChanged = 2, Iso( GetT( c ) ) )
+    tkTimePicker_SetShowNow( c, false )
+    tkTimePicker_SetShowOK( c, false )
+    ' list mode, the range and ItemDisabled forwarded
+    tkTimePicker_SetPanelMode( c, TKTP_PANEL_LIST )
+    tkTimePicker_SetListRange( c, Tm( 8, 0 ), Tm( 18, 0 ), 1800 )
+    tkTimePicker_SetRange( c, Tm( 8, 30 ), Tm( 17, 0 ) )
+    ResetCounts( )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    pnl = tkTimePicker_GetPanelHandle( c )
+    if pnl then
+        tkTest_Check( "list mode: 21 items; the range is forwarded (08:00 and 17:30 disabled)", tkTimePanel_GetItemCount( pnl, 0 ) = 21 _
+                      andalso tkTimePanel_IsItemDisabled( pnl, 0, 0 ) andalso tkTimePanel_IsItemDisabled( pnl, 0, 19 ) andalso tkTimePanel_IsItemDisabled( pnl, 0, 18 ) = false )
+    end if
+    ClickPanelItem( c, 0, 3 )
+    tkTest_Check( "one click in the list picks and closes: 09:30", tkTimePicker_IsDroppedDown( c ) = false andalso IsT( c, 9, 30 ) andalso gChanged = 1, Iso( GetT( c ) ) )
+    tkTimePicker_SetPanelMode( c, TKTP_PANEL_COLUMNS )
+    tkTimePicker_SetRange( c, Tm( 0, 0 ), Tm( 0, 0 ), false, false )
+    gNoonOff = 1
+    tkTimePicker_SetItemDisabledCallback( c, @OnItemDisabled )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    pnl = tkTimePicker_GetPanelHandle( c )
+    tkTest_Check( "ItemDisabled is forwarded to the panel (hour 12 off)", (pnl <> 0) andalso tkTimePanel_IsItemDisabled( pnl, 0, 12 ) _
+                  andalso tkTimePanel_IsItemDisabled( pnl, 0, 11 ) = false )
+    tkTimePicker_SetEnabled( c, false )
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "disabling closes the dropdown", tkTimePicker_IsDroppedDown( c ) = false )
+    tkTimePicker_SetEnabled( c, true )
+    gNoonOff = 0
+    tkTimePicker_SetItemDisabledCallback( c, 0 )
+
+    ' ---- J: pixels and theme ------------------------------------------------------------------------------------
+    tkTimePicker_SetTime( c, Tm( 10, 20 ) )
+    tkHost_SetFocus( h, c )
+    tkTimePicker_SetFocusedSegment( c, 0 )
+    tkTimePicker_GetColors( c, @cc )
+    tkTest_PushMotion( h, 1, 1 )
+    tkHost_RenderTo( h, false )
+    tkTimePicker_GetSegmentRect( c, 0, rs0 )
+    tkTimePicker_GetSegmentRect( c, 2, rs2 )
+    dim as long ym = (rs0.top + rs0.bottom) \ 2
+    tkTest_Check( "the focused segment is filled with SegmentBackColorFocused", PixW( h, c, rs0.left, ym ) = cc.SegmentBackColorFocused, hex( PixW( h, c, rs0.left, ym ) ) )
+    tkTest_Check( "the field behind the text is FieldBackColor", PixW( h, c, rs2.right + tkHost_Scale( h, 6 ), ym ) = cc.FieldBackColor, hex( PixW( h, c, rs2.right + tkHost_Scale( h, 6 ), ym ) ) )
+    tkTest_Check( "focused: the border is FocusBorderColor", PixW( h, c, cw \ 2, 0 ) = cc.FocusBorderColor, hex( PixW( h, c, cw \ 2, 0 ) ) )
+    tkHost_SetFocus( h, c2 )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "unfocused: BorderColor, no segment fill", PixW( h, c, cw \ 2, 0 ) = cc.BorderColor andalso PixW( h, c, rs0.left, ym ) <> cc.SegmentBackColorFocused, _
+                  hex( PixW( h, c, cw \ 2, 0 ) ) )
+    dim as TKTIMEPICKER_COLORS pin = cc
+    pin.FieldBackColor = &hFF102030ul
+    tkTimePicker_SetColors( c, @pin )
+    tkTimePicker_ApplyTheme( c, tkTheme_Light() )
+    tkTimePicker_GetColors( c, @cc )
+    tkTest_Check( "pinned colours survive a theme", cc.FieldBackColor = &hFF102030ul )
+    tkTimePicker_UnpinColors( c )
+    tkTimePicker_GetColors( c, @cc )
+    tkTest_Check( "UnpinColors: the theme again", cc.FieldBackColor = tkTheme_Dark().Surface, hex( cc.FieldBackColor ) )
+
+    ' ---- K: rescale ---------------------------------------------------------------------------------------------
+    tkHost_SetFocus( h, c )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    dim as boolean bWasOpen = tkTimePicker_IsDroppedDown( c )
+    h->fScaleForced = fScale * 2
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
+    tkTest_PumpFor( h, 30 )
+    tkTest_Check( "rescale x2: icon width x2, radius x2, an open dropdown closes", bWasOpen andalso tkTimePicker_GetIconWidth( c ) = iconW * 2 _
+                  andalso tkTimePicker_GetCornerRadius( c ) = rad * 2 andalso tkTimePicker_IsDroppedDown( c ) = false, tkTimePicker_GetIconWidth( c ) & " " & bWasOpen )
+    h->fScaleForced = fScale
+    tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
+    tkTest_Check( "rescale back", tkTimePicker_GetIconWidth( c ) = iconW andalso tkTimePicker_GetCornerRadius( c ) = rad )
+
+    ' ---- L: destroying from a callback, and while open ---------------------------------------------------------
+    tkHost_SetFocus( h, c )
+    tkTimePicker_SetFocusedSegment( c, 2 )
+    ResetCounts( )
+    gDestroyInChanged = true
+    tkTest_PushKey( h, SDLK_UP )
+    gDestroyInChanged = false
+    tkTest_Check( "TimeChanged destroyed the picker: nothing crashed", gChanged = 1 andalso tkHost_GetFocus( h ) <> c )
+    tkHost_SetFocus( h, c2 )
+    tkTest_PushKey( h, SDLK_F4 )
+    tkTest_PumpFor( h, 150 )
+    tkTest_Check( "a second picker opens", tkTimePicker_IsDroppedDown( c2 ) )
+    tkWidget_Destroy( c2 )
+    tkTest_PumpFor( h, 50 )
+    tkTest_Check( "destroyed while open: the popup goes, nothing crashed", true )
+
+    tkHost_Destroy( h )
+end sub
+
+
+' ==========================================================================================
+' T4: the time kind in tkBind (TIMEPICKER.md §10). One check per behaviour (the author's test
+' budget); LoadFrom / SaveTo lines spelled as codegen spells them, against a real TimePicker.
+type ApptRec
+    t   as TKTIME
+    lt  as chrono.LocalTime
+    s   as ustring
+    dtm as DateTime
+end type
+
+sub RunBinding( )
+    tkTest_Begin( "binding" )
+    dim as ApptRec r
+    dim as chrono.LocalTime fresh
+    tkTest_Check( "a default LocalTime loads as 00:00, not as no time", tkTimePanel_SameTime( tkBind_Time( fresh ), Tm( 0, 0 ) ) )
+    tkTest_Check( "LocalTime.Invalid loads as no time", tkTimePanel_IsTime( tkBind_Time( chrono.LocalTime.Invalid( ) ) ) = false )
+    tkBind_Put( r.lt, Tm( 9, 30, 15, 250 ) )
+    tkTest_Check( "TKTIME -> LocalTime -> TKTIME round trip", tkTimePanel_SameTime( tkBind_Time( r.lt ), Tm( 9, 30, 15, 250 ) ) )
+    tkBind_Put( r.lt, tkTimePanel_EmptyTime( ) )
+    tkTest_Check( "no time saves as LocalTime.Invalid", r.lt.IsValid = false )
+    tkBind_Put( r.s, Tm( 6, 7 ) )
+    dim as ustring sLoose = "2:30 pm"
+    tkTest_Check( "time -> text is ISO; text -> time takes lenient text", r.s = "06:07:00" andalso tkTimePanel_SameTime( tkBind_Time( sLoose ), Tm( 14, 30 ) ), r.s )
+    ' the DateTime pair, in one call, on a NEW record (Invalid DateTime)
+    tkBind_Put( r.dtm, tkCalendar_MakeDate( 2027, 1, 2 ), Tm( 9, 15 ) )
+    tkTest_Check( "pair on a new record: both halves land", r.dtm.IsValid andalso r.dtm.Year = 2027 andalso r.dtm.Day = 2 andalso r.dtm.Hour = 9 andalso r.dtm.Minute = 15 )
+    r.dtm = DateTime( 2026, 11, 23, 14, 5, 0, 0 ).WithOffset( -210 )
+    tkBind_Put( r.dtm, tkCalendar_MakeDate( 2027, 1, 2 ), Tm( 9, 15 ) )
+    tkTest_Check( "pair keeps the offset", r.dtm.HasOffset andalso r.dtm.OffsetMinutes = -210 andalso r.dtm.Hour = 9 )
+    dim as TKDATE noDate
+    tkBind_Put( r.dtm, noDate, Tm( 9, 15 ) )
+    tkTest_Check( "pair with no date clears the field", r.dtm.IsValid = false )
+    r.dtm = DateTime( 2026, 11, 23, 14, 5, 0, 0 )
+    tkBind_Put( r.dtm, Tm( 8, 0 ) )
+    tkTest_Check( "a lone time half keeps the date", r.dtm.Day = 23 andalso r.dtm.Hour = 8 )
+    tkTest_Check( "DateTime loads into both kinds", tkBind_Date( r.dtm ).wDay = 23 andalso tkTimePanel_SameTime( tkBind_Time( r.dtm ), Tm( 8, 0 ) ) )
+    ' codegen's line shapes against a real control
+    dim as TK_HOST ptr h = tkHost_Create( "tkTimePicker binding", 300, 200, tkHost_FontDir() & TK_FONT_UI, 1.0 )
+    dim as TK_WIDGET ptr c = tkTimePicker_Create( tkHost_Root( h ), 1 )
+    gChanged = 0
+    tkTimePicker_SetTimeChangedCallback( c, @OnChanged )
+    tkBind_Put( r.lt, Tm( 17, 45 ) )
+    tkTimePicker_SetTimeValue( c, tkBind_Time( r.lt ) )
+    tkTimePicker_SetTime( c, Tm( 18, 0 ) )
+    tkBind_Put( r.lt, tkTimePicker_GetTimeValue( c ) )
+    tkTest_Check( "LoadFrom / SaveTo lines: a real picker loads 17:45 silently, saves 18:00", gChanged = 0 andalso r.lt.Hour = 18 andalso r.lt.Minute = 0 )
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+' FormatTime and Tooltip (one check per behaviour; scale-independent, so one pass)
+dim shared as long gTipPart, gTipSeg, gTipCalls
+
+sub OnFmt( byval hCtrl as TK_WIDGET ptr, byval pTime as TKTIME ptr, byref sOut as ustring )
+    if pTime->wHour >= 12 then exit sub                  ' afternoons keep the pattern's text
+    sOut = "morning appointment at " & sOut
+end sub
+
+function OnTip( byval t as TKTIMEPICKER_TOOLTIPINFO ptr ) as boolean
+    gTipCalls += 1
+    gTipPart = t->nPart
+    gTipSeg = t->nSegment
+    if t->nPart <> TKTPK_HIT_FIELD then return false
+    t->outText = "segment " & t->nSegment
+    return true
+end function
+
+sub RunCallbacks( )
+    tkTest_Begin( "format and tooltip" )
+    dim as TK_HOST ptr h = tkHost_Create( "tkTimePicker callbacks", 500, 400, tkHost_FontDir() & TK_FONT_UI, 1.0 )
+    dim as TK_WIDGET ptr c = tkTimePicker_Create( tkHost_Root( h ), 1 )
+    dim as TK_WIDGET ptr c2 = tkTimePicker_Create( tkHost_Root( h ), 2 )
+    tkTimePicker_SetTime( c, Tm( 9, 30 ) )
+    dim as long w0, h0, w1, h1
+    tkTimePicker_GetIdealSize( c, w0, h0 )
+    tkTimePicker_SetFormatCallback( c, @OnFmt )
+    tkTimePicker_GetIdealSize( c, w1, h1 )
+    tkWidget_SetPos( c, 10, 10, w1, h1 )
+    tkWidget_SetPos( c2, 10, 60, w0, h0 )
+    tkTest_Check( "FormatTime replaces GetText", tkTimePicker_GetText( c ) = "morning appointment at 09:30", tkTimePicker_GetText( c ) )
+    tkTimePicker_SetTime( c, Tm( 14, 0 ) )
+    tkTest_Check( "an empty answer keeps the pattern's text", tkTimePicker_GetText( c ) = "14:00", tkTimePicker_GetText( c ) )
+    tkTest_Check( "the ideal size makes room for the formatted text", w1 > w0 + tkText_Width( h->pDefaultFont, "morning appointment at" ) - 4, w0 & " -> " & w1 )
+    tkTimePicker_SetTime( c, Tm( 9, 30 ) )
+    tkHost_SetFocus( h, c )
+    tkTest_PushKey( h, SDLK_C, SDL_KMOD_LCTRL )
+    tkTest_Check( "Ctrl+C still copies the pattern's text", tkHost_GetClipboardText() = "09:30", tkHost_GetClipboardText() )
+    ' the dropdown's list labels go through FormatTime too, and the popup is measured with them
+    tkTimePicker_SetPanelMode( c, TKTP_PANEL_LIST )
+    tkTimePicker_SetListRange( c, Tm( 8, 0 ), Tm( 11, 0 ), 3600 )
+    tkWidget_SetPos( c, 10, 10, w0, h1 )            ' a narrow field: the popup must measure its own labels
+    tkTimePicker_DropDown( c )
+    tkTest_PumpFor( h, 150 )
+    dim as TK_WIDGET ptr pnl = tkTimePicker_GetPanelHandle( c )
+    dim as TKRECT rcCol
+    if pnl then tkTimePanel_GetColumnRect( pnl, 0, rcCol )
+    tkTest_Check( "list labels are formatted, and the popup is wide enough for them", (pnl <> 0) _
+                  andalso tkTimePanel_GetItemText( pnl, 0, 0 ) = "morning appointment at 08:00" _
+                  andalso pnl->cw >= tkText_Width( h->pDefaultFont, "morning appointment at 08:00" ), _
+                  tkTimePanel_GetItemText( pnl, 0, 0 ) )
+    tkTimePicker_CloseUp( c )
+    tkTest_PumpFor( h, 30 )
+    ' Tooltip: made on demand; asked with the part and segment under the pointer
+    tkTest_Check( "no tip until a Tooltip callback is set", tkTimePicker_GetTooltipHandle( c2 ) = 0 )
+    tkTimePicker_SetTime( c2, Tm( 7, 45 ) )
+    tkTimePicker_SetTooltipCallback( c2, @OnTip )
+    dim as TK_TIP ptr tip = tkTimePicker_GetTooltipHandle( c2 )
+    dim as TKRECT rs, ri
+    tkTimePicker_GetSegmentRect( c2, 2, rs )
+    tkHost_SetFocus( h, 0 )
+    tkHost_RenderTo( h, false )
+    tkTest_PushMotion( h, WX( c2, (rs.left + rs.right) \ 2 ), WY( c2, (rs.top + rs.bottom) \ 2 ) )
+    tkTooltip_Show( tip )
+    tkTest_Check( "over the minutes: the callback sees the field and segment 2, and the tip shows", tkTooltip_IsVisible( tip ) _
+                  andalso gTipPart = TKTPK_HIT_FIELD andalso gTipSeg = 2, gTipPart & " " & gTipSeg )
+    tkTooltip_Hide( tip )
+    tkTimePicker_GetIconRect( c2, ri )
+    tkTest_PushMotion( h, WX( c2, (ri.left + ri.right) \ 2 ), WY( c2, (ri.top + ri.bottom) \ 2 ) )
+    tkTooltip_Show( tip )
+    tkTest_Check( "over the button the callback says no: no tip", tkTooltip_IsVisible( tip ) = false andalso gTipPart = TKTPK_HIT_BUTTON, str( gTipPart ) )
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+if tkTest_Init() = false then end 99
+RunBinding( )
+RunCallbacks( )
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkTimePicker" )
+tkTest_Quit()
+end nFail

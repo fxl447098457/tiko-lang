@@ -1,0 +1,591 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkAutoComplete, part two: the search face (phase A2 of docs/tkControls/AUTOCOMPLETE.md) and the
+' appearance API. The module's types and core are in tkAutoComplete.tiko, which sorts first.
+'
+' THE FACE is two small widgets laid over the edit's ends -- children of the container created after
+' the edit, so they paint on top of it (tkHost clears nothing under a widget): the search glyph at
+' the left, the clear button at the right, shown only while there is text. The edit's margins keep
+' its text clear of both cells. With no glyph font (SetGlyphFont / ApplyFonts) they are drawn as
+' shapes -- a lens and handle, a cross -- as tkDatePicker draws its icon until it gets one; with
+' one, TK_ICON_SEARCH / TK_ICON_CLOSE (or the glyph SetSearchGlyph names).
+'
+' THE DROP BUTTON (SetDropButton, phase A3) is a third cell, at the far right: a click lists every
+' item (the selected one highlighted), a second click closes the list. The press that closes the
+' list is passed through to the button (the list lets its dismissing click land), so the button
+' asks tkHost_PressSerial whether THIS press just closed it, and then does not reopen.
+'
+' SEARCH fires SearchDelay ms after the user's last change -- the change to empty too, so a host's
+' filter resets -- and at once on Enter, the clear button, Escape and a commit.
+#module "tkAutoComplete"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkPopupMenu" public
+#import "../tkTextBox" public
+#import "../tkMatch" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkPopupMenu
+using tkTextBox
+using tkMatch
+
+private function AcCell( byval p as TKAUTOCOMPLETE_STATE ptr ) as long
+    return tkHost_Scale( p->hWin->pHost, TKAUTOCOMPLETE_GLYPHCELL )
+end function
+
+sub AcFaceInvalidate( byval p as TKAUTOCOMPLETE_STATE ptr )
+    if p->wGlyph then tkWidget_Invalidate( p->wGlyph )
+    if p->wClear then tkWidget_Invalidate( p->wClear )
+    if p->wDrop then tkWidget_Invalidate( p->wDrop )
+end sub
+
+' The clear button shows while there is text.
+sub AcFaceSync( byval p as TKAUTOCOMPLETE_STATE ptr )
+    if p->wClear = 0 then exit sub
+    dim as boolean bShow = len( tkTextBox_GetText( p->wEdit ) ) > 0
+    if bShow <> tkWidget_IsVisible( p->wClear ) then tkWidget_Show( p->wClear, bShow )
+    if bShow = false then p->bClearHot = false
+end sub
+
+' A glyph centred in rc: the glyph font's character, else the shape.
+private sub AcPaintGlyph( byval p as TKAUTOCOMPLETE_STATE ptr, byval b as TK_PAINT ptr, byref rc as TKRECT, _
+                          byval code as ulong, byval bCross as boolean, byval clr as ulong )
+    if p->pGlyphFont then
+        b->SetFont( p->pGlyphFont )
+        b->SetForeColor( clr )
+        b->PaintText( wchr( code ), @rc, TK_DT_CENTER )
+        exit sub
+    end if
+    dim as single sc = p->hWin->pHost->fScale
+    dim as long s = cint( TKAUTOCOMPLETE_GLYPHSIZE * sc )
+    dim as long pen = iif( cint( 1.6 * sc ) < 1, 1, cint( 1.6 * sc ) )
+    dim as long cx = (rc.left + rc.right) \ 2, cy = (rc.top + rc.bottom) \ 2
+    b->SetPenColor( clr )
+    if code = TK_ICON_CHEVRON_DOWN then
+        dim as long hw = (s * 3) \ 8, hv = (s * 3) \ 16
+        b->PaintLine( pen, cx - hw, cy - hv, cx, cy + hv )
+        b->PaintLine( pen, cx, cy + hv, cx + hw, cy - hv )
+    elseif bCross then
+        dim as long hh = (s * 3) \ 8
+        b->PaintLine( pen, cx - hh, cy - hh, cx + hh, cy + hh )
+        b->PaintLine( pen, cx - hh, cy + hh, cx + hh, cy - hh )
+    else
+        ' a lens in the upper left of the box, its handle to the lower right corner
+        dim as long l = cx - s \ 2, t = cy - s \ 2, d = (s * 7) \ 10
+        dim as TKRECT lens
+        tkRect_Set( lens, l, t, l + d, t + d )
+        b->SetBackColor( p->colors.BackColor )
+        b->PaintEllipse( @lens, pen )
+        b->PaintLine( pen, l + (d * 85) \ 100, t + (d * 85) \ 100, cx + s \ 2, cy + s \ 2 )
+    end if
+end sub
+
+private function AcGlyphProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = cast( TKAUTOCOMPLETE_STATE ptr, w->pData )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        AcPaintGlyph( p, m->pPaint, rc, p->nSearchGlyph, false, p->colors.GlyphColor )
+        return true
+    case TKM_LBUTTONDOWN
+        ' decoration: a click on it is a click in the box
+        tkHost_SetFocus( w->pHost, p->wEdit )
+        return true
+    case TKM_DESTROY
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+private function AcClearProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = cast( TKAUTOCOMPLETE_STATE ptr, w->pData )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        AcPaintGlyph( p, m->pPaint, rc, TK_ICON_CLOSE, true, iif( p->bClearHot, p->colors.GlyphColorHot, p->colors.GlyphColor ) )
+        return true
+    case TKM_MOUSEMOVE
+        dim as boolean bIn = (m->x >= 0) andalso (m->x < w->cw) andalso (m->y >= 0) andalso (m->y < w->ch)
+        if bIn <> p->bClearHot then p->bClearHot = bIn : tkWidget_Invalidate( w )
+        return true
+    case TKM_MOUSELEAVE
+        if p->bClearHot then p->bClearHot = false : tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONDOWN
+        tkHost_SetFocus( w->pHost, p->wEdit )
+        return true
+    case TKM_LBUTTONUP
+        if (m->x >= 0) andalso (m->x < w->cw) andalso (m->y >= 0) andalso (m->y < w->ch) then AcClearByUser( p )
+        return true
+    case TKM_DESTROY
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' Every item listed, the selected one highlighted (the drop button's).
+private sub AcOpenAll( byval p as TKAUTOCOMPLETE_STATE ptr )
+    tkWidget_KillTimer( p->hWin, AC_TIMER_DELAY )
+    dim as ustring typed = tkTextBox_GetText( p->wEdit )
+    p->sQuery = ""
+    AcFilter( p )
+    p->sQuery = typed
+    if AcRowCount( p ) = 0 then exit sub
+    AcShowResults( p )
+    if p->isOpen = false then exit sub
+    for r as long = 0 to p->nShown - 1
+        if (p->nSel >= 0) andalso (p->hits(r).index = p->nSel) then
+            tkAutoComplete_SetHighlight( p->hWin, r )
+            exit for
+        end if
+    next
+end sub
+
+private function AcDropProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = cast( TKAUTOCOMPLETE_STATE ptr, w->pData )
+    if p = 0 then return false
+    select case m->msg
+    case TKM_PAINT
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        AcPaintGlyph( p, m->pPaint, rc, TK_ICON_CHEVRON_DOWN, false, iif( p->bDropHot, p->colors.GlyphColorHot, p->colors.GlyphColor ) )
+        return true
+    case TKM_MOUSEMOVE
+        dim as boolean bIn = (m->x >= 0) andalso (m->x < w->cw) andalso (m->y >= 0) andalso (m->y < w->ch)
+        if bIn <> p->bDropHot then p->bDropHot = bIn : tkWidget_Invalidate( w )
+        return true
+    case TKM_MOUSELEAVE
+        if p->bDropHot then p->bDropHot = false : tkWidget_Invalidate( w )
+        return true
+    case TKM_LBUTTONDOWN
+        ' on the DOWN, as a combo's; a press that has just closed the list leaves it closed
+        tkHost_SetFocus( w->pHost, p->wEdit )
+        if p->isOpen then
+            AcCancel( p )
+        elseif p->nClosedSerial <> tkHost_PressSerial( ) then
+            AcOpenAll( p )
+        end if
+        return true
+    case TKM_DESTROY
+        w->pData = 0
+        return true
+    end select
+    return false
+end function
+
+' The edit over the whole control, the glyph and clear cells over its ends, the edit's margins
+' keeping its text out of them. Each cell's widget exists only while its part is on.
+sub AcFaceLayout( byval p as TKAUTOCOMPLETE_STATE ptr )
+    if p->wEdit = 0 then exit sub
+    dim as TK_WIDGET ptr w = p->hWin
+    dim as long cell = AcCell( p )
+    if (p->nSearchGlyph <> 0) andalso (p->wGlyph = 0) then
+        p->wGlyph = tkWidget_CreateChild( w, 0, @AcGlyphProc, p )
+    elseif (p->nSearchGlyph = 0) andalso (p->wGlyph <> 0) then
+        tkWidget_Destroy( p->wGlyph )
+        p->wGlyph = 0
+    end if
+    if p->bDropButton andalso (p->wDrop = 0) then
+        p->wDrop = tkWidget_CreateChild( w, 0, @AcDropProc, p )
+    elseif (p->bDropButton = false) andalso (p->wDrop <> 0) then
+        tkWidget_Destroy( p->wDrop )
+        p->wDrop = 0
+    end if
+    if p->bClearButton andalso (p->wClear = 0) then
+        p->wClear = tkWidget_CreateChild( w, 0, @AcClearProc, p )
+    elseif (p->bClearButton = false) andalso (p->wClear <> 0) then
+        tkWidget_Destroy( p->wClear )
+        p->wClear = 0
+    end if
+    tkWidget_SetPos( p->wEdit, 0, 0, w->cw, w->ch )
+    if p->wGlyph then tkWidget_SetPos( p->wGlyph, 0, 0, cell, w->ch )
+    ' from the right: the drop button, then the clear button
+    dim as long xr = w->cw
+    if p->wDrop then xr -= cell : tkWidget_SetPos( p->wDrop, xr, 0, cell, w->ch )
+    if p->wClear then xr -= cell : tkWidget_SetPos( p->wClear, xr, 0, cell, w->ch )
+    tkTextBox_SetMargins( p->wEdit, iif( p->wGlyph <> 0, cell, 0 ), w->cw - xr )
+    AcFaceSync( p )
+end sub
+
+sub AcSearchNow( byval p as TKAUTOCOMPLETE_STATE ptr )
+    tkWidget_KillTimer( p->hWin, AC_TIMER_SEARCH )
+    if p->SearchCallback = 0 then exit sub
+    p->nSearches += 1
+    p->SearchCallback( p->hWin, tkTextBox_GetText( p->wEdit ) )
+end sub
+
+' A user change: Search after the pause (at once with no delay).
+sub AcSearchArm( byval p as TKAUTOCOMPLETE_STATE ptr )
+    if p->SearchCallback = 0 then exit sub
+    if p->nSearchDelay > 0 then
+        tkWidget_SetTimer( p->hWin, AC_TIMER_SEARCH, p->nSearchDelay )
+    else
+        AcSearchNow( p )
+    end if
+end sub
+
+' The clear button, or Escape on a search box: the user emptied it.
+sub AcClearByUser( byval p as TKAUTOCOMPLETE_STATE ptr )
+    p->bPreviewed = false
+    AcCloseList( p )
+    tkWidget_KillTimer( p->hWin, AC_TIMER_DELAY )
+    tkTextBox_SetText( p->wEdit, "" )
+    p->sQuery = ""
+    p->nSel = -1
+    AcFaceSync( p )
+    tkHost_SetFocus( p->hWin->pHost, p->wEdit )
+    if p->TextChangedCallback then p->TextChangedCallback( p->hWin, false )
+    AcSearchNow( p )
+end sub
+
+
+' ==========================================================================================
+' The list's rows (moved from tkAutoComplete.tiko in A4)
+' ==========================================================================================
+' ---- painting --------------------------------------------------------------------------------
+' text with its runs in matchFore (and the bold font), cut with an ellipsis when it overflows rc.
+private sub AcPaintRuns( byval p as TKAUTOCOMPLETE_STATE ptr, byval b as TK_PAINT ptr, byval f as TTF_Font ptr, _
+                         byref s as ustring, runs() as TKMATCH_RUN, byval nRuns as long, _
+                         byref rc as TKRECT, byval fore as ulong, byval matchFore as ulong )
+    b->SetFont( f )
+    b->SetForeColor( fore )
+    if nRuns = 0 then
+        b->PaintText( s, @rc, TK_DT_LEFT or TK_DT_ELLIPSIS )
+        exit sub
+    end if
+    dim as long avail = rc.right - rc.left
+    if avail <= 0 then exit sub
+    ' how many characters show: all, or as many as fit before an ellipsis
+    dim as long nShow = len( s )
+    dim as ustring ell = wchr( &h2026 )
+    dim as boolean bCut = tkText_Width( f, s ) > avail
+    if bCut then
+        dim as long room = avail - tkText_Width( f, ell )
+        dim as long lo = 0, hi = len( s )
+        while lo < hi
+            dim as long m = (lo + hi + 1) \ 2
+            if tkText_Width( f, left( s, m ) ) <= room then
+                lo = m
+            else
+                hi = m - 1
+            end if
+        wend
+        nShow = lo
+    end if
+    dim as long pos_ = 0, k = 0
+    while pos_ < nShow
+        dim as long segEnd = nShow, bMatch = 0
+        if k < nRuns then
+            if runs(k).first <= pos_ then
+                bMatch = 1
+                segEnd = runs(k).first + runs(k).count
+                k += 1
+            else
+                segEnd = runs(k).first
+            end if
+        end if
+        if segEnd > nShow then segEnd = nShow
+        if segEnd > pos_ then
+            dim as TKRECT r = rc
+            r.left = rc.left + tkText_Width( f, left( s, pos_ ) )
+            dim as TTF_Font ptr fs = f
+            if bMatch andalso p->bMatchBold andalso (p->pBold <> 0) then fs = p->pBold
+            b->SetFont( fs )
+            b->SetForeColor( iif( bMatch, matchFore, fore ) )
+            b->PaintText( mid( s, pos_ + 1, segEnd - pos_ ), @r, TK_DT_LEFT )
+        end if
+        pos_ = segEnd
+    wend
+    if bCut then
+        dim as TKRECT r = rc
+        r.left = rc.left + tkText_Width( f, left( s, nShow ) )
+        b->SetFont( f )
+        b->SetForeColor( fore )
+        b->PaintText( ell, @r, TK_DT_LEFT )
+    end if
+end sub
+
+sub AcListPaint( byval p as TKAUTOCOMPLETE_STATE ptr, byval b as TK_PAINT ptr )
+    dim as TK_WIDGET ptr w = p->wList
+    dim as TKRECT rcAll
+    tkRect_Set( rcAll, 0, 0, w->cw, w->ch )
+    b->SetBackColor( p->colors.ListBackColor )
+    b->PaintRect( @rcAll )
+    dim as TTF_Font ptr f = AcFont( p )
+    dim as long pad = AcSc( p, TKAUTOCOMPLETE_ROWPAD ), gap = AcSc( p, TKAUTOCOMPLETE_DETAILGAP )
+    dim as TKMATCH_RUN runs()
+    for v as long = 0 to AcVisRows( p ) - 1
+        dim as long row = p->nTop + v
+        dim as TKRECT r
+        if AcRowRect( p, row, r ) = false then continue for
+        dim as TKRECT rt = r
+        rt.left += pad : rt.right -= pad
+        if row >= p->nShown then
+            b->SetFont( f )
+            b->SetForeColor( p->colors.DetailForeColor )
+            b->PaintText( AcStatusText( p ), @rt, TK_DT_LEFT or TK_DT_ELLIPSIS )
+            continue for
+        end if
+        dim as ustring rowText = AcRowText( p, row ), rowDetail = AcRowDetail( p, row )
+        dim as ulong fore = p->colors.ListForeColor, matchFore = p->colors.MatchForeColor
+        dim as ulong detailFore = p->colors.DetailForeColor
+        if AcRowEnabled( p, row ) = false then
+            fore = p->colors.ListForeColorDisabled : matchFore = fore : detailFore = fore
+        elseif row = p->nHot then
+            b->SetBackColor( p->colors.ListBackColorHot )
+            b->PaintRect( @r )
+            fore = p->colors.ListForeColorHot : matchFore = fore : detailFore = fore
+        end if
+        ' the detail, right-aligned, given at most what the text leaves (and never over half)
+        if len( rowDetail ) then
+            dim as long avail = rt.right - rt.left
+            dim as long dw = tkText_Width( f, rowDetail )
+            dim as long tw = tkText_Width( f, rowText )
+            dim as long room = avail - tw - gap
+            if room < avail \ 2 then room = avail \ 2
+            if dw > room then dw = room
+            if dw > 0 then
+                dim as TKRECT rd = rt
+                rd.left = rt.right - dw
+                b->SetFont( f )
+                b->SetForeColor( detailFore )
+                b->PaintText( rowDetail, @rd, TK_DT_RIGHT or TK_DT_ELLIPSIS )
+                rt.right = rd.left - gap
+            end if
+        end if
+        dim as long nRuns = tkMatch_Runs( p->q, rowText, AcRowKey( p, row ), runs(), @p->work )
+        AcPaintRuns( p, b, f, rowText, runs(), nRuns, rt, fore, matchFore )
+    next
+    b->SetPenColor( p->colors.ListBorderColor )
+    b->PaintRoundOutline( @rcAll, 0, AcBorder( p ) )
+end sub
+
+
+' ==========================================================================================
+' Public API: the search face
+' ==========================================================================================
+' TKAC_STYLE_SEARCH turns the glyph, the clear button and ClearOnEscape on; TKAC_STYLE_INPUT off.
+' Each can be set on its own after.
+public sub tkAutoComplete_SetStyle( byval hAC as TK_WIDGET ptr, byval nStyle as long )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->nStyle = nStyle
+    dim as boolean bSearchFace = (nStyle = TKAC_STYLE_SEARCH)
+    p->bClearButton = bSearchFace
+    p->bClearOnEscape = bSearchFace
+    p->nSearchGlyph = iif( bSearchFace, TK_ICON_SEARCH, 0 )
+    AcFaceLayout( p )
+end sub
+
+public function tkAutoComplete_GetStyle( byval hAC as TK_WIDGET ptr ) as long
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->nStyle, 0 )
+end function
+
+public sub tkAutoComplete_SetClearButton( byval hAC as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->bClearButton = bShow
+    AcFaceLayout( p )
+end sub
+
+public function tkAutoComplete_GetClearButton( byval hAC as TK_WIDGET ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return (p <> 0) andalso p->bClearButton
+end function
+
+' Escape on a closed list with text clears it (and searches for "").
+public sub tkAutoComplete_SetClearOnEscape( byval hAC as TK_WIDGET ptr, byval b as boolean )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p then p->bClearOnEscape = b
+end sub
+
+public function tkAutoComplete_GetClearOnEscape( byval hAC as TK_WIDGET ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return (p <> 0) andalso p->bClearOnEscape
+end function
+
+' The leading glyph: a codepoint of the glyph font (TK_ICON_SEARCH by the search style), 0 = none.
+' Without a glyph font a lens is drawn whatever the codepoint.
+public sub tkAutoComplete_SetSearchGlyph( byval hAC as TK_WIDGET ptr, byval code as ulong )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->nSearchGlyph = code
+    AcFaceLayout( p )
+end sub
+
+public function tkAutoComplete_GetSearchGlyph( byval hAC as TK_WIDGET ptr ) as ulong
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->nSearchGlyph, 0 )
+end function
+
+' ms after the last change before Search; 0 = on every change.
+public sub tkAutoComplete_SetSearchDelay( byval hAC as TK_WIDGET ptr, byval ms as long )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p then p->nSearchDelay = iif( ms < 0, 0, ms )
+end sub
+
+public function tkAutoComplete_GetSearchDelay( byval hAC as TK_WIDGET ptr ) as long
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->nSearchDelay, 0 )
+end function
+
+' Borrowed; 0 = the vector glyphs.
+public sub tkAutoComplete_SetGlyphFont( byval hAC as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->pGlyphFont = f
+    AcFaceInvalidate( p )
+end sub
+
+public function tkAutoComplete_GetGlyphFont( byval hAC as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->pGlyphFont, 0 )
+end function
+
+' The glyph's / the clear button's cell, control-local; FALSE when that part is off (the clear
+' button's also while the box is empty).
+public function tkAutoComplete_GetGlyphRect( byval hAC as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    tkRect_SetEmpty( rc )
+    if (p = 0) orelse (p->wGlyph = 0) then return false
+    tkRect_Set( rc, p->wGlyph->x, p->wGlyph->y, p->wGlyph->x + p->wGlyph->cw, p->wGlyph->y + p->wGlyph->ch )
+    return true
+end function
+
+public function tkAutoComplete_GetDropRect( byval hAC as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    tkRect_SetEmpty( rc )
+    if (p = 0) orelse (p->wDrop = 0) then return false
+    tkRect_Set( rc, p->wDrop->x, p->wDrop->y, p->wDrop->x + p->wDrop->cw, p->wDrop->y + p->wDrop->ch )
+    return true
+end function
+
+' A chevron cell at the far right: a click lists every item.
+public sub tkAutoComplete_SetDropButton( byval hAC as TK_WIDGET ptr, byval bShow as boolean )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->bDropButton = bShow
+    AcFaceLayout( p )
+end sub
+
+public function tkAutoComplete_GetDropButton( byval hAC as TK_WIDGET ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return (p <> 0) andalso p->bDropButton
+end function
+
+public function tkAutoComplete_GetClearRect( byval hAC as TK_WIDGET ptr, byref rc as TKRECT ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    tkRect_SetEmpty( rc )
+    if (p = 0) orelse (p->wClear = 0) then return false
+    if tkWidget_IsVisible( p->wClear ) = false then return false
+    tkRect_Set( rc, p->wClear->x, p->wClear->y, p->wClear->x + p->wClear->cw, p->wClear->y + p->wClear->ch )
+    return true
+end function
+
+
+' ==========================================================================================
+' Public API: appearance
+' ==========================================================================================
+' ---- appearance --------------------------------------------------------------------------------
+public sub tkAutoComplete_GetColors( byval hAC as TK_WIDGET ptr, byval pColors as TKAUTOCOMPLETE_COLORS ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    *pColors = p->colors
+end sub
+
+' Copies and PINS (a theme change leaves them).
+public sub tkAutoComplete_SetColors( byval hAC as TK_WIDGET ptr, byval pColors as TKAUTOCOMPLETE_COLORS ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p = 0) orelse (pColors = 0) then exit sub
+    p->colors = *pColors
+    p->bColorsPinned = true
+    AcEditColors( p )
+    if p->pList then p->pList->clrBack = p->colors.ListBackColor
+    if p->wList then tkWidget_Invalidate( p->wList )
+    AcFaceInvalidate( p )
+end sub
+
+public function tkAutoComplete_ThemeColors( byref t as TKTHEME_COLORS ) as TKAUTOCOMPLETE_COLORS
+    dim as TKAUTOCOMPLETE_COLORS c
+    dim as TKTEXTBOX_COLORS e = tkTextBox_ThemeColors( t )
+    c.ForeColor = e.ForeColor : c.BackColor = e.BackColor : c.CueColor = e.CueColor
+    c.BorderColor = e.BorderColor : c.FocusBorderColor = e.FocusBorderColor : c.OuterBackColor = e.OuterBackColor
+    c.SelBackColor = e.SelBackColor : c.SelForeColor = e.SelForeColor : c.ForeColorDisabled = e.ForeColorDisabled
+    dim as TKPOPUPMENU_COLORS l = tkPopupMenu_ThemeColors( t )
+    c.ListBackColor = l.BackColor : c.ListForeColor = l.ForeColor
+    c.ListBackColorHot = l.BackColorHot : c.ListForeColorHot = l.ForeColorHot
+    c.ListForeColorDisabled = l.ForeColorDisabled : c.ListBorderColor = l.BorderColor
+    c.MatchForeColor = t.Accent
+    c.DetailForeColor = t.TextDim
+    c.GlyphColor = t.TextDim
+    c.GlyphColorHot = t.Text
+    c.ErrorColor = t.Error
+    return c
+end function
+
+public sub tkAutoComplete_ApplyTheme( byval hAC as TK_WIDGET ptr, byref t as TKTHEME_COLORS )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if (p = 0) orelse p->bColorsPinned then exit sub
+    dim as TKTHEME_COLORS tr = tkTheme_Styled( hAC, t )
+    p->colors = tkAutoComplete_ThemeColors( tr )
+    tkTheme_ResolveInto( hAC, tr, cast( ulong ptr, @p->colors ), sizeof( TKAUTOCOMPLETE_COLORS ) \ 4, "AutoComplete" )
+    AcEditColors( p )
+    if p->pList then p->pList->clrBack = p->colors.ListBackColor
+    if p->wList then tkWidget_Invalidate( p->wList )
+    AcFaceInvalidate( p )
+end sub
+
+public sub tkAutoComplete_UnpinColors( byval hAC as TK_WIDGET ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->bColorsPinned = false
+    tkAutoComplete_ApplyTheme( hAC, tkTheme_Of( hAC ) )
+end sub
+
+public function tkAutoComplete_GetFont( byval hAC as TK_WIDGET ptr ) as TTF_Font ptr
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return iif( p <> 0, p->pFont, 0 )
+end function
+
+' Borrowed: the edit's and the list's.
+public sub tkAutoComplete_SetFont( byval hAC as TK_WIDGET ptr, byval f as TTF_Font ptr )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    AcCloseList( p )
+    p->pFont = f
+    tkTextBox_SetFont( p->wEdit, f )
+end sub
+
+' The form's fonts: the text, and the glyph font for the search glyph and the clear button.
+public sub tkAutoComplete_ApplyFonts( byval hAC as TK_WIDGET ptr, byval fText as TTF_Font ptr, byval fGlyph as TTF_Font ptr )
+    if fText then tkAutoComplete_SetFont( hAC, fText )
+    if fGlyph then tkAutoComplete_SetGlyphFont( hAC, fGlyph )
+end sub
+
+' Matched characters in a bold face too (borrowed; 0 keeps colour only).
+public sub tkAutoComplete_SetMatchBold( byval hAC as TK_WIDGET ptr, byval bBold as boolean, byval fBold as TTF_Font ptr = 0 )
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    if p = 0 then exit sub
+    p->bMatchBold = bBold
+    if fBold then p->pBold = fBold
+    if p->wList then tkWidget_Invalidate( p->wList )
+end sub
+
+public function tkAutoComplete_GetMatchBold( byval hAC as TK_WIDGET ptr ) as boolean
+    dim as TKAUTOCOMPLETE_STATE ptr p = AC( hAC )
+    return (p <> 0) andalso p->bMatchBold
+end function
+

@@ -10,7 +10,8 @@
   pinned to its side's padding, the caption taking the leftover span, degenerate span when starved);
 - ResolveMood / ResolveColors, the 17-field colour struct and its dark defaults, `ThemeColors`
   role for role;
-- two states only (no indeterminate: neither vendor nor PsPlatform has one);
+- two states only (no indeterminate: neither vendor nor PsPlatform has one) -- for the CONTROL;
+  the shared painter draws a mixed mark (see Added);
 - single line with end ellipsis; no mnemonics; no hit test (clicking the caption toggles);
 - press → slide off → release; capture lost cancels the press;
 - Space AND Enter (and keypad Enter) toggle; the message callback can veto either;
@@ -57,6 +58,14 @@
 - `tkCheckBox_DrawVectorBox( b, rcCell, isChecked, clrBox, clrBack )`, `tkCheckBox_VectorSquare`,
   `tkCheckBox_VectorPen` -- public so a paint callback (or a sibling such as tkOptionButton) can
   draw the built-in box;
+- (2026-11-22, C0 of docs/tkControls/CHECKED-LISTS.md in the claude-docs repo) `CHK_STATE_UNCHECKED /
+  CHECKED / MIXED`; `tkCheckBox_DrawVectorMark( b, rcCell, nState, clrBox, clrBack )` -- MIXED is the
+  checked fill with a bar knocked out (middle half of the side, max(2, side*14\100) thick) -- and
+  `tkCheckBox_PaintMark( b, rcCell, nState, pColors, nMood, nBoxStyle, fGlyph, glyphs )`, the whole
+  box as the control draws it, for controls that paint check boxes of their own (ListTree rows).
+  The control's own painter now goes through PaintMark: its pixels are unchanged (render hashes
+  of box and control, 16 cases at 1.0 and 1.75, identical before and after). The CheckBox control
+  itself stays two-state; MIXED in the glyph style falls back to the vector mark (no mixed glyph);
 - probes `tkCheckBox_GetHot`, `GetPressed` (the live gesture), `GetTextSize`;
 - `tkCheckBox_PaintDefault( p )`: the stock drawing, for a paint callback (the form designer's
   Paint event).

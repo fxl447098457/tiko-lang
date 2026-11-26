@@ -24,6 +24,7 @@
 #include once "codegen/toolchain.ti"
 #include once "codegen/objinfo.ti"
 #include once "codegen/dllimplib.ti"
+#include once "driver/androidapp.ti"
 #include once "codegen/llvmemit.ti"
 #include once "mir/rtl.ti"
 #include once "driver/cimportmode.ti"
@@ -159,9 +160,10 @@ end function
 private function OutputSuffix_( byref o as Tko.DriverOptions ) as string
     select case o.outKind
     case Tko.OUT_DLL
+        if o.app then return iif( o.appBundle, ".aab", ".apk" )   '' -app: driver/androidapp.ti
         select case Tko.TargetOs( o.target )
         case Tko.OS_WINDOWS : return ".dll"
-        case Tko.OS_LINUX   : return ".so"
+        case Tko.OS_LINUX, Tko.OS_ANDROID : return ".so"
         case Tko.OS_DARWIN  : return ".dylib"
         end select
         Tko.TargetIce( "OutputSuffix_", o.target )
@@ -192,7 +194,7 @@ private function DefaultOutputPath_( byref o as Tko.DriverOptions ) as string
     '' writes sub/libdl.so, while on Windows it writes dl.dll. An explicit -o is taken
     '' as given in both cases -- 'fbc -dll dl.bas -x out/custom.so' writes custom.so.
     dim as boolean prefixed = (o.outKind = Tko.OUT_STATICLIB) orelse _
-        ((o.outKind = Tko.OUT_DLL) andalso (Tko.TargetIsWindows( o.target ) = false))
+        ((o.outKind = Tko.OUT_DLL) andalso (Tko.TargetIsWindows( o.target ) = false) andalso (o.app = false))
     if prefixed then
         dim as int32 cut = 0
         for i as int32 = len( stem ) to 1 step -1
@@ -440,7 +442,7 @@ function EmitStopFile_ _
     if tools.found = false then
         return ToolFail_( ctx, Tko.EXIT_NO_TOOLCHAIN, Tko.TKO0111, tools.why )
     end if
-    tools.optLevel = ctx.options.optLevel
+    tools.optLevel = ctx.options.optLevel : tools.optSize = ctx.options.optSize
     dim as int32 rc = Tko.Codegen.CompileIrAsm( tools, td, irPath, outp, ctx.options.keepTemps )
     if rc <> 0 then return ToolFail_( ctx, Tko.EXIT_TOOL_FAILED, Tko.TKO0113, irPath, str( rc ) )
     return Tko.EXIT_OK
@@ -553,7 +555,7 @@ function BuildFromIr _
     end if
     '' THE OPTIMISATION LEVEL -- see ToolPaths.optLevel. The link does not need it; the
     '' compile of each module's IR is where clang optimises.
-    tools.optLevel = ctx.options.optLevel
+    tools.optLevel = ctx.options.optLevel : tools.optSize = ctx.options.optSize
     '' A SHARED LIBRARY'S MODULES ARE COMPILED AS PIC on ELF -- see CompileIr. The link
     '' sets this again; the compile needs it first.
     tools.buildDll = (ctx.options.outKind = Tko.OUT_DLL)
@@ -595,7 +597,6 @@ function BuildFromIr _
     return ObjectChecks_( ctx, rc, irPath, objPath, td.objFormat, td.triple )
 end function
 
-
 '' '-lib': the objects into an archive, and no link at all.
 private function ArchiveAll _
     ( byref ctx as Tko.CompilerContext, byref objs as Tko.StrVec, _
@@ -630,9 +631,7 @@ private function LinkAll _
     ( byref ctx as Tko.CompilerContext, byref objs as Tko.StrVec, _
       byref td as Tko.Codegen.TargetDescription, byref keep as Tko.StrVec ) as int32
 
-
-    dim as Tko.Codegen.ToolPaths tools = _
-        Tools_( ctx )
+    dim as Tko.Codegen.ToolPaths tools = Tools_( ctx )
     if tools.found = false then
         return ToolFail_( ctx, Tko.EXIT_NO_TOOLCHAIN, Tko.TKO0111, tools.why )
     end if
@@ -691,7 +690,7 @@ private function LinkAll _
     tools.stripSymbols = (ctx.options.debugInfo = false) andalso (ctx.options.sanitizeAddress = false)   '' ASan names frames by symbol
     tools.threadSafe = Tko.LinkThreadSafe( ctx )
     tools.guiSubsystem = ctx.options.guiSubsystem
-    tools.stackSize = ctx.options.stackSize
+    tools.stackSize = ctx.options.stackSize : tools.optSize = ctx.options.optSize   '' '-Os': the size runtime
 
     '' THE IMPORT LIBRARY'S NAME FOLLOWS THE OUTPUT, not the source. Measured:
     '' 'fbc -dll thing.bas -x custom.dll' writes libcustom.dll.a. So it is built
@@ -713,15 +712,17 @@ private function LinkAll _
         tools.implibPath = left( stem, cut ) & "lib" & mid( stem, cut + 1 ) & ".dll.a"
     end if
 
-    tools.noRpath = ctx.options.noRpath
-    dim as int32 rc = Tko.Codegen.LinkExe( tools, td, objs, ctx.options.outputPath )
+    tools.noRpath = ctx.options.noRpath : tools.app = ctx.options.app    '' -app links <out>.libmain.so
+    dim as int32 rc = Tko.Codegen.LinkExe( tools, td, objs, iif( ctx.options.app, Tko.AndroidApp.LinkPath( ctx ), ctx.options.outputPath ) )
     if rc = Tko.Codegen.LINK_NO_RT0 then
         return ToolFail_( ctx, Tko.EXIT_TOOL_FAILED, Tko.TKO0111, _
             "the runtime's startup object (fbrt0.o) is on no library path -- add one with -p" )
     end if
+    if (rc = Tko.Codegen.LINK_NO_NDK) orelse (rc = Tko.Codegen.LINK_NO_RTAPP) then return ToolFail_( ctx, Tko.EXIT_TOOL_FAILED, Tko.TKO0111, tools.why )
     if rc <> 0 then
         return ToolFail_( ctx, Tko.EXIT_TOOL_FAILED, Tko.TKO0116, str( rc ) )
     end if
+    dim as string appWhy : if ctx.options.app andalso (Tko.AndroidApp.Package( ctx, appWhy ) = false) then return ToolFail_( ctx, Tko.EXIT_TOOL_FAILED, Tko.TKO0196, ctx.options.outputPath, appWhy )
 
     '' '-g' ON MACH-O: the DWARF is in the objects deleted below, so into '<out>.dSYM' first.
     dim as int32 drc = 0
@@ -1117,7 +1118,7 @@ function Run _
             '' (audit F-74, CG-16).
             dim as string resPath = StripExt_( rcInputs[i] ) & ".res"
             if len( ctx.options.outputPath ) then resPath = ctx.options.outputPath & ".rc" & str( i + 1 ) & ".res"
-            dim as int32 rrc = Tko.Codegen.CompileRc( rt_, rcInputs[i], resPath )
+            dim as int32 rrc = Tko.Codegen.CompileRc( rt_, rcInputs[i], resPath, ctx.options.includePaths )
             if rrc <> 0 then
                 ctx.diags.ReportGlobal( Tko.TKO0110, rcInputs[i], str( rrc ) )
             else
@@ -1305,7 +1306,7 @@ function Run _
                 '' after the link step, not in it, so an up-to-date link still puts back one deleted.
                 dim as string cpSrc, cpDst
                 dim as boolean wantLibs = (toolExit = Tko.EXIT_OK) andalso (ctx.options.noCopyLibs = false)
-                if wantLibs then wantLibs = (ctx.options.outKind <> Tko.OUT_STATICLIB)
+                if wantLibs then wantLibs = (ctx.options.outKind <> Tko.OUT_STATICLIB) andalso (ctx.options.app = false)   '' an app's are assets
                 if wantLibs andalso (Tko.Modules.CopyVendorLibs( ctx, ctx.options.outputPath, cpSrc, cpDst ) = false) then
                     toolExit = ToolFail_( ctx, Tko.EXIT_TOOL_FAILED, Tko.TKO0171, cpSrc, cpDst )
                 end if

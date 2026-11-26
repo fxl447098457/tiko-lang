@@ -16,6 +16,8 @@ Define created at compile time if the OS has filesystem behavior styled like com
 
 ## Remarks
 
+In tiko only `windows-x86_64` is a PC OS, so tiko code tests [`TIKO_OS_WINDOWS`](Category-Tiko-Compiler-Define) instead.
+
 ### Differences from QB
 
 - New to FreeBASIC
@@ -26,6 +28,7 @@ Define created at compile time if the OS has filesystem behavior styled like com
 - [`__FB_DOS__`](Fb-Dos)
 - [`__FB_XBOX__`](Fb-Xbox)
 - [`__FB_UNIX__`](Fb-Unix)
+- [`TIKO_OS_WINDOWS`](Category-Tiko-Compiler-Define)
 - [Compiler Option: -target](Compiler-Option-Target)
 
 ## Examples

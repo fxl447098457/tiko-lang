@@ -48,6 +48,12 @@ An archive fetched with `curl` or `gh release download` is not marked.
 
 Optional, also from Homebrew: `openssl@3` for [std/tls and std/http](Category-Http), and `sdl3` (with `sdl3_image`, `sdl3_ttf`, `sdl3_mixer`) for [vendor/SDL3](Vendor-Packages). The graphics library (`SCREEN`, `PSET`) needs nothing installed: it draws through Cocoa on macOS, as it draws through X11 on Linux and GDI on Windows.
 
+## Building for Android
+
+> **Experimental.** See [Android](Android) for what works and what may still change.
+
+The Windows toolchain also builds for Android phones (`-target android-arm64`) and the Android emulator (`-target android-x86_64`), on Android 10 or newer. `-app` packs an SDL3 or [tkControls](Category-tkControls) program as a signed APK. Besides clang it needs Android's NDK, SDK and a JDK, which Android Studio installs where tiko finds them: the [Android Setup Tutorial](Android-Setup-Tutorial) goes from a bare PC to an app on a phone.
+
 ## A first tour
 
 ```freebasic

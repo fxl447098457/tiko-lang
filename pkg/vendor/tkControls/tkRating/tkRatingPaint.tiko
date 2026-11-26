@@ -1,0 +1,348 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkRating's painting: the item shapes, the one item painter the control, a PaintItem callback's
+' PaintItemDefault and the widgetless tkRating_PaintInto all share, the caption and the ring.
+' Types live in tkRating.tiko (it sorts first).
+#module "tkRating"
+
+#import "../tkHost" public
+#import "../tkTheme" public
+#import "../tkTooltip" public
+using tkHost
+using tkPaint
+using tkTheme
+using tkTooltip
+
+' ==========================================================================================
+' Shapes. Each builds its outline in widget-local EDGE coordinates (PaintPolygonF), fitted to rc,
+' centred, and inset by half the pen and the half-pixel AA fringe so nothing spills out of rc.
+' ==========================================================================================
+const RT_PI = 3.14159265358979
+
+' A regular five-point star (inner radius 0.382 of the outer), centred on its own bounding box.
+private function StarPts( byref rc as TKRECT, byval nPen as long, pts() as SDL_FPoint ) as long
+    dim as double w = rc.right - rc.left, h = rc.bottom - rc.top
+    ' the star's box: width 2R sin 72, height R (1 + cos 36)
+    dim as double kw = 2 * sin( RT_PI * 72 / 180 ), kh = 1 + cos( RT_PI * 36 / 180 )
+    dim as double rOut = w / kw
+    if h / kh < rOut then rOut = h / kh
+    rOut -= nPen / 2 + 0.5
+    if rOut < 1 then rOut = 1
+    dim as double rIn = rOut * 0.381966
+    dim as double cx = rc.left + w / 2
+    dim as double cy = rc.top + (h - rOut * kh) / 2 + rOut
+    redim pts( 0 to 9 )
+    for k as long = 0 to 9
+        dim as double a = -RT_PI / 2 + k * RT_PI / 5
+        dim as double rr = iif( (k and 1) = 0, rOut, rIn )
+        pts(k).x = cx + rr * cos( a )
+        pts(k).y = cy + rr * sin( a )
+    next
+    return 10
+end function
+
+' The classic heart curve x = 16 sin^3 t, y = -(13 cos t - 5 cos 2t - 2 cos 3t - cos 4t), 48
+' samples, scaled to fit rc with its proportions kept and centred on its own bounding box.
+private function HeartPts( byref rc as TKRECT, byval nPen as long, pts() as SDL_FPoint ) as long
+    const N_ = 48
+    redim pts( 0 to N_ - 1 )
+    dim as double mnx = 1e9, mxx = -1e9, mny = 1e9, mxy = -1e9
+    for k as long = 0 to N_ - 1
+        dim as double t = 2 * RT_PI * k / N_
+        dim as double s = sin( t )
+        pts(k).x = 16 * s * s * s
+        pts(k).y = -(13 * cos( t ) - 5 * cos( 2 * t ) - 2 * cos( 3 * t ) - cos( 4 * t ))
+        if pts(k).x < mnx then mnx = pts(k).x
+        if pts(k).x > mxx then mxx = pts(k).x
+        if pts(k).y < mny then mny = pts(k).y
+        if pts(k).y > mxy then mxy = pts(k).y
+    next
+    dim as double inset = nPen / 2 + 0.5
+    dim as double w = (rc.right - rc.left) - 2 * inset, h = (rc.bottom - rc.top) - 2 * inset
+    if (w < 1) orelse (h < 1) then return 0
+    dim as double k = w / (mxx - mnx)
+    if h / (mxy - mny) < k then k = h / (mxy - mny)
+    dim as double ox = rc.left + ((rc.right - rc.left) - (mxx - mnx) * k) / 2
+    dim as double oy = rc.top + ((rc.bottom - rc.top) - (mxy - mny) * k) / 2
+    for j as long = 0 to N_ - 1
+        pts(j).x = ox + (pts(j).x - mnx) * k
+        pts(j).y = oy + (pts(j).y - mny) * k
+    next
+    return N_
+end function
+
+private function CirclePts( byref rc as TKRECT, byval nPen as long, pts() as SDL_FPoint ) as long
+    const N_ = 40
+    dim as double w = rc.right - rc.left, h = rc.bottom - rc.top
+    dim as double r = iif( w < h, w, h ) / 2 - (nPen / 2 + 0.5)
+    if r < 1 then r = 1
+    dim as double cx = rc.left + w / 2, cy = rc.top + h / 2
+    redim pts( 0 to N_ - 1 )
+    for k as long = 0 to N_ - 1
+        dim as double a = 2 * RT_PI * k / N_
+        pts(k).x = cx + r * cos( a )
+        pts(k).y = cy + r * sin( a )
+    next
+    return N_
+end function
+
+' A rhombus touching the middle of each side of the item's square.
+private function DiamondPts( byref rc as TKRECT, byval nPen as long, pts() as SDL_FPoint ) as long
+    dim as double w = rc.right - rc.left, h = rc.bottom - rc.top
+    dim as double s = iif( w < h, w, h ) / 2
+    ' the inset along the axes for a perpendicular inset of nPen/2 + 0.5 on a 45 degree edge
+    dim as double r = s - (nPen / 2 + 0.5) * 1.41421356
+    if r < 1 then r = 1
+    dim as double cx = rc.left + w / 2, cy = rc.top + h / 2
+    redim pts( 0 to 3 )
+    pts(0).x = cx : pts(0).y = cy - r
+    pts(1).x = cx + r : pts(1).y = cy
+    pts(2).x = cx : pts(2).y = cy + r
+    pts(3).x = cx - r : pts(3).y = cy
+    return 4
+end function
+
+private function ShapePts( byval nShape as long, byref rc as TKRECT, byval nPen as long, pts() as SDL_FPoint ) as long
+    select case nShape
+    case TKRATING_HEART   : return HeartPts( rc, nPen, pts() )
+    case TKRATING_CIRCLE  : return CirclePts( rc, nPen, pts() )
+    case TKRATING_DIAMOND : return DiamondPts( rc, nPen, pts() )
+    end select
+    return StarPts( rc, nPen, pts() )
+end function
+
+' ==========================================================================================
+' One item
+' ==========================================================================================
+' The three colours of an item in a mood (disabled > preview > placeholder > normal, the caller's
+' choice of mood).
+private sub ItemColors( byref c as TKRATING_COLORS, byval nMood as long, byref clrFill as ulong, _
+                        byref clrEmpty as ulong, byref clrBorder as ulong )
+    select case nMood
+    case TKRATING_MOOD_DISABLED
+        clrFill = c.FillColorDisabled : clrEmpty = c.EmptyColorDisabled : clrBorder = c.BorderColorDisabled
+    case TKRATING_MOOD_PREVIEW
+        clrFill = c.FillColorHot : clrEmpty = c.EmptyColorHot : clrBorder = c.BorderColor
+    case TKRATING_MOOD_PLACEHOLDER
+        clrFill = c.PlaceholderColor : clrEmpty = c.EmptyColor : clrBorder = c.BorderColor
+    case else
+        clrFill = c.FillColor : clrEmpty = c.EmptyColor : clrBorder = c.BorderColor
+    end select
+end sub
+
+' A glyph centred in rc, in clr, with the glyph font; the paint's font is put back.
+private sub DrawGlyph( byval b as TK_PAINT ptr, byref rc as TKRECT, byref g as ustring, byval clr as ulong, _
+                       byval f as TTF_Font ptr )
+    dim as TTF_Font ptr fWas = b->pFont
+    dim as ulong clrWas = b->clrFore
+    b->SetFont( f )
+    b->SetForeColor( clr )
+    dim as TKRECT r = rc
+    b->PaintText( g, @r, TK_DT_CENTER or TK_DT_VCENTER or TK_DT_NOCLIP )
+    b->SetFont( fWas )
+    b->SetForeColor( clrWas )
+end sub
+
+' The stock item: the empty shape (unless ShowEmpty is off), then the filled shape clipped to the
+' filled fraction -- left + round( fr * width ) -- so the display is exact.
+private sub DrawItemDefault( byval b as TK_PAINT ptr, byref rc as TKRECT, byval fr as double, _
+                             byref spec as TKRATING_DRAWSPEC, byval nMood as long )
+    if (b = 0) orelse (spec.pColors = 0) then exit sub
+    if fr < 0 then fr = 0
+    if fr > 1 then fr = 1
+    dim as ulong clrFill, clrEmpty, clrBorder
+    ItemColors( *spec.pColors, nMood, clrFill, clrEmpty, clrBorder )
+    dim as TKRECT rcFill = rc
+    rcFill.right = rc.left + cint( int( fr * (rc.right - rc.left) + 0.5 ) )
+    if fr >= 1 then rcFill.right = rc.right
+    dim as boolean bGlyph = (spec.nShape = TKRATING_GLYPH) andalso (spec.fGlyph <> 0) andalso (len( spec.wszGlyphFilled ) > 0)
+    if bGlyph then
+        dim as ustring gEmpty = iif( len( spec.wszGlyphEmpty ) > 0, spec.wszGlyphEmpty, spec.wszGlyphFilled )
+        if spec.bShowEmpty andalso (fr < 1) then DrawGlyph( b, rc, gEmpty, clrEmpty, spec.fGlyph )
+        if fr > 0 then
+            b->PushClip( @rcFill )
+            DrawGlyph( b, rc, spec.wszGlyphFilled, clrFill, spec.fGlyph )
+            b->PopClip()
+        end if
+        exit sub
+    end if
+    dim as SDL_FPoint pts()
+    dim as long n = ShapePts( spec.nShape, rc, spec.nBorder, pts() )
+    if n < 3 then exit sub
+    if spec.bShowEmpty andalso (fr < 1) then
+        b->SetBackColor( clrEmpty )
+        b->SetPenColor( clrBorder )
+        b->PaintPolygonF( @pts(0), n, spec.nBorder )
+    end if
+    if fr > 0 then
+        b->PushClip( @rcFill )
+        b->SetBackColor( clrFill )
+        b->SetPenColor( clrFill )
+        b->PaintPolygonF( @pts(0), n, spec.nBorder )
+        b->PopClip()
+    end if
+end sub
+
+' The drawing settings of a live rating.
+private function SpecOf( byval p as TKRATING_STATE ptr ) as TKRATING_DRAWSPEC
+    dim as TKRATING_DRAWSPEC s
+    s.nShape = p->nShape
+    s.wszGlyphFilled = p->wszGlyphFilled
+    s.wszGlyphEmpty = p->wszGlyphEmpty
+    s.fGlyph = p->fGlyph
+    s.nItemSize = p->nItemSize
+    s.nSpacing = p->nSpacing
+    s.nBorder = p->nBorderThick
+    s.bShowEmpty = p->bShowEmpty
+    s.pColors = @p->colors
+    return s
+end function
+
+' What is drawn and in which mood: the preview, else the placeholder under an unset value, else
+' the value; disabled wins over all.
+private sub DisplayOf( byval isEnabled as boolean, byval nValue as double, byval nPreview as double, _
+                       byval nPlaceholder as double, byref nDisplay as double, byref nMood as long )
+    if nPreview >= 0 then
+        nDisplay = nPreview : nMood = TKRATING_MOOD_PREVIEW
+    elseif (nValue <= 0) andalso (nPlaceholder > 0) then
+        nDisplay = nPlaceholder : nMood = TKRATING_MOOD_PLACEHOLDER
+    else
+        nDisplay = nValue : nMood = TKRATING_MOOD_NORMAL
+    end if
+    if isEnabled = false then nMood = TKRATING_MOOD_DISABLED
+end sub
+
+' ==========================================================================================
+' The control's painter
+' ==========================================================================================
+private sub RenderDefault( byval p as TKRATING_STATE ptr, byval pi as TKRATING_PAINTINFO ptr )
+    dim as TK_PAINT ptr b = pi->b
+    if tkRect_IsEmpty( pi->rcRow ) then exit sub
+    dim as TKRATING_DRAWSPEC spec = SpecOf( p )
+    for i as long = 0 to pi->nItems - 1
+        dim as double fr = pi->nDisplay - i
+        if fr < 0 then fr = 0
+        if fr > 1 then fr = 1
+        if p->PaintItemCallback then
+            dim as TKRATING_ITEMPAINTINFO ii
+            ii.hRating = p->hWin
+            ii.b = b
+            ii.nItem = i
+            ii.rcItem = p->rcItem(i)
+            ii.nFill = fr
+            ii.nMood = pi->nMood
+            ii.isFocused = pi->isFocused
+            p->PaintItemCallback( @ii )
+        else
+            DrawItemDefault( b, p->rcItem(i), fr, spec, pi->nMood )
+        end if
+    next
+    if (len( pi->wszCaption ) > 0) andalso (tkRect_IsEmpty( pi->rcCaption ) = false) then
+        dim as TKRECT r = pi->rcCaption
+        dim as TTF_Font ptr fWas = b->pFont
+        if p->fText then b->SetFont( p->fText )
+        b->SetForeColor( iif( pi->isEnabled, p->colors.CaptionColor, p->colors.CaptionColorDisabled ) )
+        b->PaintText( pi->wszCaption, @r, TK_DT_LEFT or TK_DT_VCENTER or TK_DT_ELLIPSIS )
+        b->SetFont( fWas )
+    end if
+    if pi->isFocused andalso (p->nFocusThick > 0) then
+        dim as TKRECT r = pi->rcFocus
+        b->SetPenColor( p->colors.FocusRingColor )
+        b->PaintRoundOutline( @r, (r.bottom - r.top) \ 2, p->nFocusThick )
+    end if
+end sub
+
+private sub OnPaint( byval p as TKRATING_STATE ptr, byval b as TK_PAINT ptr )
+    EnsureLayout( p )
+    dim as TKRATING_PAINTINFO pi
+    pi.hRating = p->hWin
+    pi.b = b
+    tkRect_Set( pi.rcClient, 0, 0, p->hWin->cw, p->hWin->ch )
+    b->SetBackColor( p->colors.BackColor )
+    b->PaintRect( @pi.rcClient )
+    pi.rcRow = p->rcRow
+    pi.rcFocus = p->rcFocus
+    pi.rcCaption = p->rcCaption
+    pi.nItems = p->nItems
+    pi.nValue = p->nValue
+    pi.nPlaceholder = p->nPlaceholder
+    DisplayOf( p->isEnabled, p->nValue, p->nPreview, p->nPlaceholder, pi.nDisplay, pi.nMood )
+    pi.isPreview = (p->nPreview >= 0)
+    pi.isPressed = p->isPressed
+    pi.isEnabled = p->isEnabled
+    pi.isFocused = p->isFocused
+    pi.isReadOnly = p->isReadOnly
+    pi.wszCaption = CaptionText( p )
+    if p->PaintCallback then
+        p->PaintCallback( @pi )
+    else
+        RenderDefault( p, @pi )
+    end if
+end sub
+
+' ==========================================================================================
+' Public: the painters for callbacks, and the widgetless rating
+' ==========================================================================================
+' A paint callback's way to draw the rating as it would have been drawn, then add to it.
+public sub tkRating_PaintDefault( byval pi as TKRATING_PAINTINFO ptr )
+    if pi = 0 then exit sub
+    dim as TKRATING_STATE ptr p = RT( pi->hRating )
+    if p then RenderDefault( p, pi )
+end sub
+
+' A PaintItem callback's way to draw one item as the stock painter would.
+public sub tkRating_PaintItemDefault( byval ii as TKRATING_ITEMPAINTINFO ptr )
+    if ii = 0 then exit sub
+    dim as TKRATING_STATE ptr p = RT( ii->hRating )
+    if p = 0 then exit sub
+    dim as TKRATING_DRAWSPEC spec = SpecOf( p )
+    DrawItemDefault( ii->b, ii->rcItem, ii->nFill, spec, ii->nMood )
+end sub
+
+' The width and height a row of nItems takes under spec (its nItemSize must be > 0).
+public sub tkRating_MeasureSpec( byval nItems as long, byval pSpec as TKRATING_DRAWSPEC ptr, _
+                                 byref nWidth as long, byref nHeight as long )
+    nWidth = 0 : nHeight = 0
+    if (pSpec = 0) orelse (pSpec->nItemSize <= 0) then exit sub
+    if nItems < 1 then nItems = 1
+    if nItems > TKRATING_MAX_ITEMS then nItems = TKRATING_MAX_ITEMS
+    dim as long sp = iif( pSpec->nSpacing >= 0, pSpec->nSpacing, pSpec->nItemSize \ 5 )
+    nWidth = nItems * pSpec->nItemSize + (nItems - 1) * sp
+    nHeight = pSpec->nItemSize
+end sub
+
+' A rating with no widget -- a grid cell, a list row, a report. The row starts at rc's left and is
+' centred vertically; everything is clipped to rc. Items are nItemSize square (0: rc's height),
+' nSpacing apart (-1: a fifth of the size). pSpec = 0, or its pColors = 0: the app theme's look.
+public sub tkRating_PaintInto( byval b as TK_PAINT ptr, byref rc as TKRECT, byval nValue as double, _
+                               byval nItems as long, byval pSpec as TKRATING_DRAWSPEC ptr = 0 )
+    if b = 0 then exit sub
+    if tkRect_IsEmpty( rc ) then exit sub
+    dim as TKRATING_DRAWSPEC spec
+    if pSpec then spec = *pSpec
+    dim as TKRATING_COLORS cTheme
+    if spec.pColors = 0 then
+        cTheme = tkRating_ThemeColors( tkTheme_Get() )
+        spec.pColors = @cTheme
+    end if
+    if nItems < 1 then nItems = 1
+    if nItems > TKRATING_MAX_ITEMS then nItems = TKRATING_MAX_ITEMS
+    dim as long sz = iif( spec.nItemSize > 0, spec.nItemSize, rc.bottom - rc.top )
+    dim as long sp = iif( spec.nSpacing >= 0, spec.nSpacing, sz \ 5 )
+    dim as double nDisplay
+    dim as long nMood
+    DisplayOf( spec.bEnabled, nValue, iif( spec.bPreview, nValue, -1.0 ), spec.nPlaceholder, nDisplay, nMood )
+    dim as long top = rc.top + ((rc.bottom - rc.top) - sz) \ 2
+    dim as TKRECT rcClip = rc
+    b->PushClip( @rcClip )
+    for i as long = 0 to nItems - 1
+        dim as TKRECT r
+        tkRect_Set( r, rc.left + i * (sz + sp), top, rc.left + i * (sz + sp) + sz, top + sz )
+        DrawItemDefault( b, r, nDisplay - i, spec, nMood )
+    next
+    b->PopClip()
+end sub

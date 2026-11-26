@@ -1,0 +1,138 @@
+' The half of the form you write. The rest is frmOrders.design.tiko, generated from
+' frmOrders.tkform: don't edit that one.
+'
+' Every order, in one DataGrid that IS an SQLite query (tkDataGridSqlite): the grid's columns are
+' the designer's, its rows are orderdb.ORDERS_QUERY read a block at a time as you scroll. Sorting
+' (a header click) becomes the query's ORDER BY, the filter row becomes a WHERE, and the footer's
+' count and sum are SELECT count / sum over the same WHERE -- SQLite does the work, the grid never
+' holds every row. A double click opens the order in frmOrder; after a save the query is run again.
+#module "frmOrders"
+
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkDataGrid"
+#import "vendor/tkControls/tkDataGridSqlite"
+#import "vendor/sqlite3"
+#import "vendor/tkControls/tkMessageBox"
+#import "../askbox"
+#import "../orderdb"
+#import "../frmOrder"
+#import "../frmReport"
+#import "../rptOrderList"
+using tkApp
+using tkDataGrid
+using tkDataGridSqlite
+using tkMessageBox
+
+dim shared as frmOrder.Form dlgOrder
+
+public partial type Form
+    Query as TKDGSQL ptr        ' the grid's rows; closed by Release
+    Changed as boolean          ' an order was saved here: the caller reads its data again
+    declare sub Release( )
+    declare sub ShowCount( )
+    declare sub OpenRow( byval row as int32 )
+    declare function FilterText( ) as ustring
+end type
+
+sub Form.Form_Load( )
+    ' false: keep the designer's columns (their widths, kinds and footer totals); the query's
+    ' columns fill them in order.
+    Query = tkDataGridSqlite_Open( grdAll.Handle, orderdb.Connection( ), orderdb.ORDERS_QUERY, false )
+    if Query = 0 then
+        lblCount.Text = "The orders can't be read: " & orderdb.LastError( )
+        exit sub
+    end if
+    ShowCount( )
+end sub
+
+sub Form.Form_Destroy( )
+    Release( )
+end sub
+
+' Close the query (the grid is unbound). The caller does this once the dialog is closed.
+sub Form.Release( )
+    if Query then tkDataGridSqlite_Close( Query )
+    Query = 0
+end sub
+
+sub Form.ShowCount( )
+    dim as int32 n = tkDataGrid_GetRowCount( grdAll.Handle )
+    dim as ustring where = tkDataGridSqlite_GetWhere( Query )
+    lblCount.Text = n & iif( n = 1, " order", " orders" ) & iif( len( where ), " match the filters", " in all" )
+end sub
+
+' The filter row (or Clear filters) changed: SQLite has counted the rows again.
+sub Form.grdAll_FilterChanged( )
+    ShowCount( )
+end sub
+
+sub Form.btnClearFilters_Click( )
+    tkDataGrid_ClearColumnFilters( grdAll.Handle )
+    ShowCount( )
+end sub
+
+sub Form.grdAll_CellActivate( byval row as integer, byval col as integer )
+    OpenRow( row )
+end sub
+
+' Amounts with two decimals: the grid shows a float64 as it is (147.4), this makes it 147.40.
+sub Form.grdAll_CellFormatting( byval p as TKDATAGRID_FORMATINFO ptr )
+    if (p->col = 6) andalso (p->value->kind = TKDG_FLOAT) then p->text = orderdb.Money( p->value->f )
+end sub
+
+' The footer's total likewise.
+sub Form.grdAll_SummaryFormatting( byval col as integer, byval kind as int32, byref v as TKDG_VALUE, byref text as ustring )
+    if (col = 6) andalso (v.kind = TKDG_FLOAT) then text = orderdb.Money( v.f )
+end sub
+
+sub Form.btnOpen_Click( )
+    dim as integer row, col
+    if tkDataGrid_GetCurrentCell( grdAll.Handle, row, col ) then OpenRow( row )
+end sub
+
+' The order on a row of the grid (its first column is the order's id) in the order dialog.
+sub Form.OpenRow( byval row as int32 )
+    if (Query = 0) orelse (row < 0) then exit sub
+    dim as int64 id = tkDataGrid_GetCellInt( grdAll.Handle, row, 0 )
+    dim as orderdb.Order o
+    if orderdb.LoadOrder( id, o ) = false then exit sub
+    if dlgOrder.IsOpen( ) = false then dlgOrder.Build( Handle )
+    dlgOrder.Edit( o )
+    if dlgOrder.ShowModal( Handle ) <> 1 then exit sub
+    dim as ustring e = orderdb.SaveOrder( dlgOrder.Ord )
+    if len( e ) then
+        askbox.Ask( Handle, "The order can't be saved:" & wchr( 10 ) & e, "All orders", MBX_ICON_ERROR, MBX_BTN_OK )
+        exit sub
+    end if
+    Changed = true
+    tkDataGridSqlite_Refresh( Query )        ' the data changed under the grid: count and read it again
+    ShowCount( )
+end sub
+
+' The grid as it is shown -- its filters, its sort -- printed by the designed report rptOrderList,
+' whose data source is this grid (kind grid). The Filters parameter says which filters are on.
+sub Form.btnPrintList_Click( )
+    dim as rptOrderList.Report r
+    r.SetOrdersGrid( grdAll.Handle )
+    r.Filters = FilterText( )
+    dim as frmReport.Form f
+    f.Build( Handle )
+    r.ShowIn( f.rvReport.Handle )
+    f.ShowModal( Handle )
+end sub
+
+' The filter row as words: "Status: Open; Total: >100" ("" when no column is filtered).
+function Form.FilterText( ) as ustring
+    dim as ustring s
+    for c as integer = 0 to tkDataGrid_GetColumnCount( grdAll.Handle ) - 1
+        dim as ustring f = tkDataGrid_GetColumnFilterText( grdAll.Handle, c )
+        if len( f ) = 0 then continue for
+        if len( s ) then s &= "; "
+        s &= tkDataGrid_GetColumnCaption( grdAll.Handle, c ) & ": " & f
+    next
+    return s
+end function
+
+sub Form.btnClose_Click( )
+    EndModal( 0 )
+end sub

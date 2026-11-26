@@ -1,0 +1,419 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPrint -- the page API: drawing on a page in POINTS.
+'
+' Every call converts to pixels at PR_PXPERPT (10 per point, 720 dpi) and draws through the
+' page's own recording TK_PAINT, so the shapes, pens, text layout (alignment, ellipsis, word
+' wrap) and their meaning are tkPaint's -- the TK_DT_* flags included -- and the page receives
+' exactly the primitives tkPaint produced. Positions are therefore exact to 0.1 pt.
+'
+' Colours are tkPaint's ARGB. Fill colour fills, line colour strokes, text colour writes. Pens are
+' in points; a stroke sits INSIDE a rect or ellipse (tkPaint's rule), centred on a line.
+#module "tkPrint"
+
+#import "../tkHost"
+using tkHost
+using tkPaint
+
+private function PgPx( byval v as single ) as long
+    return clng( int( v * PR_PXPERPT + 0.5 ) )
+end function
+
+private sub ToPx( byref rc as TKRECTF, byref r as TKRECT )
+    tkRect_Set( r, PgPx( rc.left ), PgPx( rc.top ), PgPx( rc.right ), PgPx( rc.bottom ) )
+end sub
+
+private function PenPx( byval pg as TK_PAGE ptr ) as long
+    dim as long w = PgPx( pg->penPt )
+    if (w < 1) andalso (pg->penPt > 0) then w = 1
+    return w
+end function
+
+private function Live( byval pg as TK_PAGE ptr ) as boolean
+    if pg = 0 then return false
+    return (pg->doc <> 0) andalso (pg->index >= 0) andalso (pg->index < pg->doc->nPages)
+end function
+
+' ---- page facts --------------------------------------------------------------------------
+public function tkPage_GetIndex( byval pg as TK_PAGE ptr ) as long
+    if Live( pg ) = false then return -1
+    return pg->index
+end function
+
+public sub tkPage_GetSize( byval pg as TK_PAGE ptr, byref w as single, byref h as single )
+    w = 0 : h = 0
+    if Live( pg ) = false then exit sub
+    w = pg->doc->pages(pg->index)->wPt : h = pg->doc->pages(pg->index)->hPt
+end sub
+
+' The printable area: the page less its setup's margins.
+public sub tkPage_GetMarginRect( byval pg as TK_PAGE ptr, byref rc as TKRECTF )
+    tkRectF_Set( rc, 0, 0, 0, 0 )
+    if Live( pg ) = false then exit sub
+    dim as PR_PAGE ptr pp = pg->doc->pages(pg->index)
+    tkRectF_Set( rc, pp->setup.marginL, pp->setup.marginT, pp->wPt - pp->setup.marginR, pp->hPt - pp->setup.marginB )
+end sub
+
+' ---- state -------------------------------------------------------------------------------
+public sub tkPage_SetFillColor( byval pg as TK_PAGE ptr, byval c as ulong )
+    if pg then pg->clrFill = c
+end sub
+
+public sub tkPage_SetLineColor( byval pg as TK_PAGE ptr, byval c as ulong )
+    if pg then pg->clrLine = c
+end sub
+
+public sub tkPage_SetTextColor( byval pg as TK_PAGE ptr, byval c as ulong )
+    if pg then pg->clrText = c
+end sub
+
+' Pen width in points (0.5 pt default; anything above 0 draws at least 0.1 pt) and dash style.
+public sub tkPage_SetPen( byval pg as TK_PAGE ptr, byval widthPt as single, byval nDash as long = TK_PENDASH_SOLID )
+    if pg = 0 then exit sub
+    pg->penPt = widthPt : pg->nDash = nDash
+end sub
+
+' The page font. FALSE when it cannot be opened (the previous font stays).
+public function tkPage_SetFont( byval pg as TK_PAGE ptr, byref fs as TKFONTSPEC ) as boolean
+    if pg = 0 then return false
+    dim as TK_PRINTDOC ptr doc = pg->doc
+    dim as single pt = iif( fs.pt > 0, fs.pt, 10.0 )
+    dim as string key = fs.src & "|" & fs.face & "|" & pt & "|" & fs.bold & "|" & fs.italic
+    for i as long = 0 to doc->nPfs - 1
+        if doc->pfs(i).key = key then
+            pg->pFont = doc->pfs(i).f : pg->fontPt = pt
+            return true
+        end if
+    next
+    dim as string path = fs.src
+    dim as long st = 0
+    if len( path ) = 0 then
+        dim as string dir_ = tkHost_FontDir()
+        if fs.bold then
+            path = dir_ & TK_FONT_UI_BOLD
+            if fs.italic then st = TTF_STYLE_ITALIC
+        elseif fs.italic then
+            path = dir_ & TK_FONT_UI_ITALIC
+        else
+            path = dir_ & TK_FONT_UI
+        end if
+    else
+        if fs.bold then st = st or TTF_STYLE_BOLD
+        if fs.italic then st = st or TTF_STYLE_ITALIC
+    end if
+    dim as TTF_Font ptr f = tkHost_OpenFontFace( path, pt, fs.face )
+    if f = 0 then
+        PrWarn( doc, "font not found: " & path )
+        return false
+    end if
+    TTF_SetFontSizeDPI( f, pt * PR_PXPERPT, 72, 72 )
+    if st then TTF_SetFontStyle( f, st )
+    if doc->nPfs > ubound( doc->pfs ) then redim preserve doc->pfs( 0 to doc->nPfs * 2 + 7 )
+    doc->pfs(doc->nPfs).key = key
+    doc->pfs(doc->nPfs).f = f
+    doc->nPfs += 1
+    pg->pFont = f : pg->fontPt = pt
+    return true
+end function
+
+' The UI font at pt points when the host has set none.
+private function EnsureFont( byval pg as TK_PAGE ptr ) as boolean
+    if pg->pFont then return true
+    dim as TKFONTSPEC fs
+    return tkPage_SetFont( pg, fs )
+end function
+
+' ---- shapes ------------------------------------------------------------------------------
+public sub tkPage_FillRect( byval pg as TK_PAGE ptr, byref rc as TKRECTF )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.SetBackColor( pg->clrFill )
+    pg->p.PaintRect( @r )
+end sub
+
+' tkPage_FillRect at its EXACT position: not snapped to the page's 0.1 pt grid. For geometry whose
+' edges must land where computed -- a barcode's bars, whose widths a 0.1 pt snap would change by
+' up to 10 % of a module (tkBarcode, docs/tkControls/BARCODE.md §7). PDF keeps 0.001 pt.
+public sub tkPage_FillRectExact( byval pg as TK_PAGE ptr, byref rc as TKRECTF )
+    if Live( pg ) = false then exit sub
+    if (rc.right <= rc.left) orelse (rc.bottom <= rc.top) orelse (pg->p.pfnRec = 0) then exit sub
+    dim as TK_RECOP o
+    o.op = TKREC_FILLRECT
+    o.rc.x = rc.left * PR_PXPERPT + pg->p.ox : o.rc.y = rc.top * PR_PXPERPT + pg->p.oy
+    o.rc.w = ( rc.right - rc.left ) * PR_PXPERPT : o.rc.h = ( rc.bottom - rc.top ) * PR_PXPERPT
+    o.c = pg->clrFill
+    pg->p.pfnRec( pg->p.pRecCtx, @o )
+end sub
+
+' A frame of the pen's width, inside rc.
+public sub tkPage_StrokeRect( byval pg as TK_PAGE ptr, byref rc as TKRECTF )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.SetPenColor( pg->clrLine )
+    pg->p.PaintRoundOutline( @r, 0, PenPx( pg ) )
+end sub
+
+' Corner RADIUS in points (tkPaint's curvature is a diameter).
+public sub tkPage_FillRoundRect( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byval radiusPt as single )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.SetBackColor( pg->clrFill )
+    pg->p.PaintRoundRect( @r, PgPx( radiusPt * 2 ) )
+end sub
+
+public sub tkPage_StrokeRoundRect( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byval radiusPt as single )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.SetPenColor( pg->clrLine )
+    pg->p.PaintRoundOutline( @r, PgPx( radiusPt * 2 ), PenPx( pg ) )
+end sub
+
+public sub tkPage_FillEllipse( byval pg as TK_PAGE ptr, byref rc as TKRECTF )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.SetBackColor( pg->clrFill )
+    pg->p.PaintEllipse( @r, 0 )
+end sub
+
+' The outline only (inside rc).
+public sub tkPage_StrokeEllipse( byval pg as TK_PAGE ptr, byref rc as TKRECTF )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.SetBackColor( 0 )                     ' transparent: the recorder drops the fill
+    pg->p.SetPenColor( pg->clrLine )
+    pg->p.PaintEllipse( @r, PenPx( pg ) )
+end sub
+
+' A straight line in the line colour, pen width and dash, centred on the points.
+public sub tkPage_Line( byval pg as TK_PAGE ptr, byval x1 as single, byval y1 as single, _
+                        byval x2 as single, byval y2 as single )
+    if Live( pg ) = false then exit sub
+    pg->p.SetPenColor( pg->clrLine )
+    if pg->nDash = TK_PENDASH_SOLID then
+        pg->p.PaintLine( PenPx( pg ), PgPx( x1 ), PgPx( y1 ), PgPx( x2 ), PgPx( y2 ) )
+    else
+        dim as TKPOINT pts(0 to 1)
+        pts(0).x = PgPx( x1 ) : pts(0).y = PgPx( y1 ) : pts(1).x = PgPx( x2 ) : pts(1).y = PgPx( y2 )
+        pg->p.SetPenDashStyle( pg->nDash )
+        pg->p.PaintPolyline( @pts(0), 2, PenPx( pg ) )
+        pg->p.SetPenDashStyle( TK_PENDASH_SOLID )
+    end if
+end sub
+
+private sub PtsPx( byval pts as TKPOINTF ptr, byval n as long, q() as TKPOINT )
+    redim q( 0 to n - 1 )
+    for i as long = 0 to n - 1
+        q(i).x = PgPx( pts[i].x ) : q(i).y = PgPx( pts[i].y )
+    next
+end sub
+
+public sub tkPage_Polyline( byval pg as TK_PAGE ptr, byval pts as TKPOINTF ptr, byval n as long )
+    if (Live( pg ) = false) orelse (pts = 0) orelse (n < 2) then exit sub
+    dim as TKPOINT q()
+    PtsPx( pts, n, q() )
+    pg->p.SetPenColor( pg->clrLine )
+    pg->p.SetPenDashStyle( pg->nDash )
+    pg->p.PaintPolyline( @q(0), n, PenPx( pg ) )
+    pg->p.SetPenDashStyle( TK_PENDASH_SOLID )
+end sub
+
+' Filled with the fill colour; bStroke also outlines it with the pen.
+public sub tkPage_Polygon( byval pg as TK_PAGE ptr, byval pts as TKPOINTF ptr, byval n as long, _
+                           byval bStroke as boolean = false )
+    if (Live( pg ) = false) orelse (pts = 0) orelse (n < 3) then exit sub
+    dim as TKPOINT q()
+    PtsPx( pts, n, q() )
+    pg->p.SetBackColor( pg->clrFill )
+    pg->p.SetPenColor( pg->clrLine )
+    pg->p.PaintPolygon( @q(0), n, iif( bStroke, PenPx( pg ), 0 ) )
+end sub
+
+' A wedge of the ellipse in rc (degrees, clockwise from +x), filled; bStroke outlines it.
+public sub tkPage_Pie( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byval startDeg as single, _
+                       byval sweepDeg as single, byval bStroke as boolean = false )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.SetBackColor( pg->clrFill )
+    pg->p.SetPenColor( pg->clrLine )
+    pg->p.PaintPie( @r, startDeg, sweepDeg, iif( bStroke, PenPx( pg ), 0 ) )
+end sub
+
+public sub tkPage_GradientRect( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byval c1 as ulong, _
+                                byval c2 as ulong, byval nMode as long = TK_GRADIENT_VERTICAL )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.PaintGradientRect( @r, c1, c2, nMode )
+end sub
+
+' ---- clipping ----------------------------------------------------------------------------
+public sub tkPage_PushClip( byval pg as TK_PAGE ptr, byref rc as TKRECTF )
+    if Live( pg ) = false then exit sub
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.PushClip( @r )
+end sub
+
+public sub tkPage_PopClip( byval pg as TK_PAGE ptr )
+    if Live( pg ) = false then exit sub
+    pg->p.PopClip()
+end sub
+
+' ---- text --------------------------------------------------------------------------------
+' Text in rc by tkPaint's TK_DT_* flags: one line (vertically centred unless TOP / BOTTOM,
+' ELLIPSIS to cut) or, with TK_DT_WORDBREAK or a line break in s, wrapped lines from the TOP
+' (VCENTER / BOTTOM move the block). Returns the height the text takes, in points.
+public function tkPage_Text( byval pg as TK_PAGE ptr, byref s as ustring, byref rc as TKRECTF, _
+                             byval flags as long = 0 ) as single
+    if (Live( pg ) = false) orelse (len( s ) = 0) then return 0
+    if EnsureFont( pg ) = false then return 0
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.SetFont( pg->pFont )
+    pg->p.SetForeColor( pg->clrText )
+    dim as boolean multi = ((flags and TK_DT_WORDBREAK) <> 0) orelse (instr( s, chr( 10 ) ) > 0)
+    if multi then
+        pg->p.PaintTextEx( s, @r, flags )
+        dim as long wpx = iif( (flags and TK_DT_WORDBREAK) <> 0, r.right - r.left, &h3FFFFFFF )
+        return tkText_MeasureWrapped( pg->pFont, s, wpx ) / PR_PXPERPT
+    end if
+    pg->p.PaintText( s, @r, flags )
+    return tkText_Height( pg->pFont ) / PR_PXPERPT
+end function
+
+' The width of s in the page font, points.
+public function tkPage_MeasureText( byval pg as TK_PAGE ptr, byref s as ustring ) as single
+    if pg = 0 then return 0
+    if EnsureFont( pg ) = false then return 0
+    return tkText_Width( pg->pFont, s ) / PR_PXPERPT
+end function
+
+' The height s takes wrapped to widthPt, points.
+public function tkPage_MeasureWrapped( byval pg as TK_PAGE ptr, byref s as ustring, byval widthPt as single ) as single
+    if pg = 0 then return 0
+    if EnsureFont( pg ) = false then return 0
+    return tkText_MeasureWrapped( pg->pFont, s, PgPx( widthPt ) ) / PR_PXPERPT
+end function
+
+' One line's height and the distance between lines, points.
+public function tkPage_TextHeight( byval pg as TK_PAGE ptr ) as single
+    if pg = 0 then return 0
+    if EnsureFont( pg ) = false then return 0
+    return tkText_Height( pg->pFont ) / PR_PXPERPT
+end function
+
+public function tkPage_LineSkip( byval pg as TK_PAGE ptr ) as single
+    if pg = 0 then return 0
+    if EnsureFont( pg ) = false then return 0
+    return tkText_LineSkip( pg->pFont ) / PR_PXPERPT
+end function
+
+' Text known only when the document is complete: fmt's {p} is the page number (from 1) and {n}
+' the page count, filled in at replay. One line, aligned in rc by TK_DT_LEFT / CENTER / RIGHT,
+' vertically centred unless TK_DT_TOP / BOTTOM. No ellipsis, no clip.
+public sub tkPage_LateText( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byref fmt as ustring, _
+                            byval flags as long = 0 )
+    if (Live( pg ) = false) orelse (len( fmt ) = 0) then exit sub
+    if EnsureFont( pg ) = false then exit sub
+    dim as TK_PRINTDOC ptr doc = pg->doc
+    dim as PR_PAGE ptr pp = doc->pages(pg->index)
+    if pp->nOps > ubound( pp->ops ) then redim preserve pp->ops( 0 to pp->nOps * 2 + 63 )
+    dim as PR_OP blank
+    pp->ops(pp->nOps) = blank
+    dim as PR_OP ptr q = @pp->ops(pp->nOps)
+    pp->nOps += 1
+    q->op = PR_LATE : q->c = pg->clrText : q->flags = flags
+    q->font = PrFontRef( doc, pg->pFont ) : q->size = PrFontPx( pg->pFont ) / PR_PXPERPT
+    q->asc = TTF_GetFontAscent( pg->pFont ) / PR_PXPERPT
+    q->x = rc.left : q->y = rc.top : q->cw = rc.right - rc.left : q->ch = rc.bottom - rc.top
+    dim as string u8 = fmt
+    q->i0 = PrAddStr( pp, u8 )
+end sub
+
+' ---- images ------------------------------------------------------------------------------
+' An image surface into rc by tkPaint's fit modes (ASPECT, STRETCH, CENTER = natural size at
+' 72 dpi, i.e. one pixel per point), clipped to rc. The pixels are copied into the document.
+public function tkPage_ImageSurface( byval pg as TK_PAGE ptr, byval s as SDL_Surface ptr, byref rc as TKRECTF, _
+                                     byval nFit as long = TK_IMGFIT_ASPECT ) as boolean
+    if (Live( pg ) = false) orelse (s = 0) then return false
+    dim as single bw = rc.right - rc.left, bh = rc.bottom - rc.top
+    if (bw <= 0) orelse (bh <= 0) orelse (s->w <= 0) orelse (s->h <= 0) then return false
+    dim as TK_PRINTDOC ptr doc = pg->doc
+    dim as long ii = PrAddImage( doc, s, 0 )
+    if ii < 0 then return false
+    dim as single dw, dh
+    select case nFit
+    case TK_IMGFIT_STRETCH : dw = bw : dh = bh
+    case TK_IMGFIT_CENTER : dw = s->w : dh = s->h
+    case else
+        dim as single k = bw / s->w
+        if bh / s->h < k then k = bh / s->h
+        dw = s->w * k : dh = s->h * k
+    end select
+    dim as TKRECT r
+    ToPx( rc, r )
+    pg->p.ApplyClip( @r )
+    dim as PR_PAGE ptr pp = doc->pages(pg->index)
+    if pp->nOps > ubound( pp->ops ) then redim preserve pp->ops( 0 to pp->nOps * 2 + 63 )
+    dim as PR_OP blank
+    pp->ops(pp->nOps) = blank
+    dim as PR_OP ptr q = @pp->ops(pp->nOps)
+    pp->nOps += 1
+    q->op = TKREC_IMAGE : q->img = ii
+    q->x = rc.left + (bw - dw) / 2 : q->y = rc.top + (bh - dh) / 2 : q->cw = dw : q->ch = dh
+    pg->p.ApplyClip( 0 )
+    return true
+end function
+
+' An image file or registered resource name (tkHost_LoadSurface). FALSE when it cannot be read.
+public function tkPage_Image( byval pg as TK_PAGE ptr, byref file as ustring, byref rc as TKRECTF, _
+                              byval nFit as long = TK_IMGFIT_ASPECT ) as boolean
+    if Live( pg ) = false then return false
+    dim as SDL_Surface ptr s = tkHost_LoadSurface( file )
+    if s = 0 then
+        PrWarn( pg->doc, "image not found: " & file )
+        return false
+    end if
+    dim as boolean ok = tkPage_ImageSurface( pg, s, rc, nFit )
+    SDL_DestroySurface( s )
+    return ok
+end function
+
+' ---- links -------------------------------------------------------------------------------
+' A clickable rect, drawn as nothing (draw the text or button yourself). In a preview the cursor
+' becomes a hand over it; a click opens url (tkPage_Link) or goes to a page (tkPage_LinkToPage).
+private sub AddLink( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byref url as string, byval target as long, _
+                     byval targetY as single )
+    dim as PR_PAGE ptr pp = pg->doc->pages(pg->index)
+    if pp->nOps > ubound( pp->ops ) then redim preserve pp->ops( 0 to pp->nOps * 2 + 63 )
+    dim as PR_OP blank
+    pp->ops(pp->nOps) = blank
+    dim as PR_OP ptr q = @pp->ops(pp->nOps)
+    pp->nOps += 1
+    q->op = PR_LINK : q->n = target : q->gy0 = targetY
+    q->x = rc.left : q->y = rc.top : q->cw = rc.right - rc.left : q->ch = rc.bottom - rc.top
+    q->i0 = PrAddStr( pp, url )
+end sub
+
+public sub tkPage_Link( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byref url as ustring )
+    if (Live( pg ) = false) orelse (len( url ) = 0) then exit sub
+    dim as string u8 = url
+    AddLink( pg, rc, u8, -1, 0 )
+end sub
+
+' A link to page 'page' (from 0), scrolled to y points down it.
+public sub tkPage_LinkToPage( byval pg as TK_PAGE ptr, byref rc as TKRECTF, byval page as long, byval yPt as single = 0 )
+    if (Live( pg ) = false) orelse (page < 0) then exit sub
+    AddLink( pg, rc, "", page, yPt )
+end sub

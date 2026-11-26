@@ -99,7 +99,7 @@ solution to exercise 2 uses `strtol`, which returns `long`, for that reason.
 ```
 
 `__FB_MSVC__` is defined when the program is built against Microsoft's C runtime — the default
-on Windows, the `windows-x86_64` target. `__FB_WIN32__`, `__FB_LINUX__` and `__FB_DARWIN__` name the platform. The
+on Windows, the `windows-x86_64` target. `TIKO_OS_WINDOWS`, `TIKO_OS_LINUX` and `TIKO_OS_MACOS` name the platform. The
 `crt/` headers (`crt/string.bi`, `crt/stdlib.bi`, `crt/math.bi` and the rest, or all of them at
 once through `crt.bi`) declare the C runtime by hand, ready to use.
 

@@ -1,0 +1,472 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportDef -- reading a .tkreport (format 1) into the model. STRICT: an unknown key, a value of
+' the wrong TOML type, an unknown kind or a link to an id that is not there is an error naming
+' where it is ("band 'g1h': ...", "item 'total': ..."), so a hand-edited file fails loudly.
+#module "tkReportDef"
+
+#import "../tkReport"
+#import "../tkRExpr"
+#import "std/config"
+using tkReport
+using tkRExpr
+using tkBind
+using tkPrint
+
+private sub Er( byref errs as ustring, byref msg as const ustring )
+    if len( errs ) then errs &= chr( 10 )
+    errs &= msg
+end sub
+
+' Every key of table t is one of 'allowed' (space-separated, with spaces around).
+private sub OnlyKeys( byval t as config.TomlValue ptr, byref allowed as const string, byref where as const ustring, byref errs as ustring )
+    for i as long = 0 to t->Count( ) - 1
+        dim as string k = t->KeyAt( i )
+        if instr( allowed, " " & k & " " ) = 0 then Er( errs, where & ": unknown key '" & k & "'" )
+    next
+end sub
+
+private sub GStr( byval t as config.TomlValue ptr, byref k as const ustring, byref v as ustring, byref where as const ustring, byref errs as ustring )
+    dim as config.TomlValue ptr p = t->Find( k )
+    if p = 0 then exit sub
+    if p->Kind( ) <> config.TOML_STRING then
+        Er( errs, where & ": " & k & " must be text" )
+        exit sub
+    end if
+    v = p->AsString( ).ValueOr( "" )
+end sub
+
+private sub GNum( byval t as config.TomlValue ptr, byref k as const ustring, byref v as float32, byref where as const ustring, byref errs as ustring )
+    dim as config.TomlValue ptr p = t->Find( k )
+    if p = 0 then exit sub
+    if (p->Kind( ) <> config.TOML_INT) andalso (p->Kind( ) <> config.TOML_FLOAT) then
+        Er( errs, where & ": " & k & " must be a number" )
+        exit sub
+    end if
+    v = p->AsFloat( ).ValueOr( 0 )
+end sub
+
+private sub GInt( byval t as config.TomlValue ptr, byref k as const ustring, byref v as int32, byref where as const ustring, byref errs as ustring )
+    dim as config.TomlValue ptr p = t->Find( k )
+    if p = 0 then exit sub
+    if p->Kind( ) <> config.TOML_INT then
+        Er( errs, where & ": " & k & " must be a whole number" )
+        exit sub
+    end if
+    v = p->AsInt( ).ValueOr( 0 )
+end sub
+
+private sub GI64( byval t as config.TomlValue ptr, byref k as const ustring, byref v as int64, byref where as const ustring, byref errs as ustring )
+    dim as config.TomlValue ptr p = t->Find( k )
+    if p = 0 then exit sub
+    if p->Kind( ) <> config.TOML_INT then
+        Er( errs, where & ": " & k & " must be a whole number" )
+        exit sub
+    end if
+    v = p->AsInt( ).ValueOr( 0 )
+end sub
+
+private sub GBool( byval t as config.TomlValue ptr, byref k as const ustring, byref v as boolean, byref where as const ustring, byref errs as ustring )
+    dim as config.TomlValue ptr p = t->Find( k )
+    if p = 0 then exit sub
+    if p->Kind( ) <> config.TOML_BOOL then
+        Er( errs, where & ": " & k & " must be true or false" )
+        exit sub
+    end if
+    v = p->AsBool( ).ValueOr( false )
+end sub
+
+' [[name]]: the array of tables, or 0 (an error when 'name' is something else).
+private function Tables( byval t as config.TomlValue ptr, byref k as const ustring, byref where as const ustring, byref errs as ustring ) as config.TomlValue ptr
+    dim as config.TomlValue ptr p = t->Find( k )
+    if p = 0 then return 0
+    if p->Kind( ) <> config.TOML_ARRAY then
+        Er( errs, where & ": " & k & " must be a list of [[" & k & "]] tables" )
+        return 0
+    end if
+    for i as long = 0 to p->Count( ) - 1
+        if p->Item( i ).Kind( ) <> config.TOML_TABLE then
+            Er( errs, where & ": " & k & " must be a list of [[" & k & "]] tables" )
+            return 0
+        end if
+    next
+    return p
+end function
+
+private sub CheckColor( byref s as const ustring, byref k as const ustring, byref where as const ustring, byref errs as ustring )
+    if len( s ) = 0 then exit sub
+    if RdColor( s, 1 ) = 1 andalso RdColor( s, 2 ) = 2 then Er( errs, where & ": " & k & " """ & s & """ is not a colour (#RRGGBB or #AARRGGBB)" )
+end sub
+
+private function IsOneOf( byref s as const ustring, byref words as const string ) as boolean
+    return instr( words, " " & s & " " ) > 0
+end function
+
+' "group:N" for N >= 0
+private function GroupRef( byref s as const ustring ) as boolean
+    if left( s, 6 ) <> "group:" then return false
+    dim as ustring n = mid( s, 7 )
+    if len( n ) = 0 then return false
+    for i as long = 1 to len( n )
+        if (mid( n, i, 1 ) < "0") orelse (mid( n, i, 1 ) > "9") then return false
+    next
+    return true
+end function
+
+function RdRead( byval def as TK_REPORTDEF ptr, byref root as config.TomlValue, byref errs as ustring ) as boolean
+    dim as config.TomlValue ptr t = @root
+    OnlyKeys( t, " format report parameter source calc band item ", "the file", errs )
+    dim as int32 fmt = 0
+    GInt( t, "format", fmt, "the file", errs )
+    if fmt <> 1 then Er( errs, "the file: format must be 1 (it is " & fmt & ")" )
+
+    ' [report]
+    dim as config.TomlValue ptr rp = t->Find( "report" )
+    if rp then
+        if rp->Kind( ) <> config.TOML_TABLE then
+            Er( errs, "[report] must be a table" )
+        else
+            OnlyKeys( rp, " title paper paper_size landscape margins units data_module bool_text events ", "[report]", errs )
+            GStr( rp, "title", def->title, "[report]", errs )
+            GStr( rp, "paper", def->paper, "[report]", errs )
+            if (len( def->paper ) > 0) andalso (IsOneOf( lcase( def->paper ), " a4 letter legal a3 a5 b5 tabloid executive custom " ) = false) then
+                Er( errs, "[report]: paper """ & def->paper & """ is not one of A4 Letter Legal A3 A5 B5 Tabloid Executive Custom" )
+            end if
+            dim as config.TomlValue ptr ps = rp->Find( "paper_size" )
+            if ps then
+                if (ps->Kind( ) <> config.TOML_ARRAY) orelse (ps->Count( ) <> 2) then
+                    Er( errs, "[report]: paper_size must be [width, height] in points" )
+                else
+                    def->paperW = ps->Item( 0 ).AsFloat( ).ValueOr( 0 )
+                    def->paperH = ps->Item( 1 ).AsFloat( ).ValueOr( 0 )
+                end if
+            end if
+            GBool( rp, "landscape", def->landscape, "[report]", errs )
+            dim as config.TomlValue ptr mg = rp->Find( "margins" )
+            if mg then
+                if (mg->Kind( ) <> config.TOML_ARRAY) orelse (mg->Count( ) <> 4) then
+                    Er( errs, "[report]: margins must be [left, top, right, bottom] in points" )
+                else
+                    def->mL = mg->Item( 0 ).AsFloat( ).ValueOr( 0 ) : def->mT = mg->Item( 1 ).AsFloat( ).ValueOr( 0 )
+                    def->mR = mg->Item( 2 ).AsFloat( ).ValueOr( 0 ) : def->mB = mg->Item( 3 ).AsFloat( ).ValueOr( 0 )
+                end if
+            end if
+            GStr( rp, "units", def->units, "[report]", errs )
+            if IsOneOf( def->units, " mm in pt " ) = false then Er( errs, "[report]: units must be mm, in or pt" )
+            GStr( rp, "data_module", def->dataModule, "[report]", errs )
+            GStr( rp, "bool_text", def->boolText, "[report]", errs )
+            dim as config.TomlValue ptr ev = rp->Find( "events" )
+            if ev then
+                if ev->Kind( ) <> config.TOML_TABLE then
+                    Er( errs, "[report.events] must be a table" )
+                else
+                    for i as long = 0 to ev->Count( ) - 1
+                        dim as ustring k = ev->KeyAt( i )
+                        if IsOneOf( k, " BeforePrint PaintItem " ) = false then Er( errs, "[report.events]: no event '" & k & "' (BeforePrint, PaintItem)" )
+                        redim preserve def->evNames( 0 to def->nEvents )
+                        redim preserve def->evHandlers( 0 to def->nEvents )
+                        def->evNames(def->nEvents) = k
+                        def->evHandlers(def->nEvents) = ev->Item( i ).AsString( ).ValueOr( "" )
+                        def->nEvents += 1
+                    next
+                end if
+            end if
+        end if
+    end if
+
+    ' [[parameter]]
+    dim as config.TomlValue ptr a = Tables( t, "parameter", "the file", errs )
+    if a then
+        redim def->params( 0 to a->Count( ) - 1 )
+        for i as long = 0 to a->Count( ) - 1
+            dim as config.TomlValue ptr e = @a->Item( i )
+            dim byref as TKRD_PARAM pr = def->params(i)
+            dim as ustring where = "parameter " & (i + 1)
+            GStr( e, "name", pr.name_, where, errs )
+            if len( pr.name_ ) then where = "parameter '" & pr.name_ & "'"
+            OnlyKeys( e, " name type default prompt required ", where, errs )
+            dim as ustring ty = "text"
+            GStr( e, "type", ty, where, errs )
+            pr.kind = RdKindOf( ty )
+            if pr.kind = TKV_EMPTY then Er( errs, where & ": type """ & ty & """ is not text, int, float, bool, date or time" )
+            GStr( e, "default", pr.default_, where, errs )
+            GStr( e, "prompt", pr.prompt, where, errs )
+            GBool( e, "required", pr.required, where, errs )
+            if len( pr.name_ ) = 0 then Er( errs, where & ": a parameter needs a name" )
+            for j as long = 0 to i - 1
+                if lcase( def->params(j).name_ ) = lcase( pr.name_ ) then Er( errs, where & ": the name is used twice" )
+            next
+        next
+        def->nParams = a->Count( )
+    end if
+
+    ' [[source]] with [[source.field]]
+    a = Tables( t, "source", "the file", errs )
+    if a then
+        redim def->sources( 0 to a->Count( ) - 1 )
+        for i as long = 0 to a->Count( ) - 1
+            dim as config.TomlValue ptr e = @a->Item( i )
+            dim byref as TKRD_SOURCE s = def->sources(i)
+            dim as ustring where = "source " & (i + 1)
+            GStr( e, "name", s.name_, where, errs )
+            if len( s.name_ ) then where = "source '" & s.name_ & "'"
+            OnlyKeys( e, " name kind parent relation item_type items_source sql params grid sort filter design_db field ", where, errs )
+            GStr( e, "kind", s.kind, where, errs )
+            if IsOneOf( s.kind, " array sqlite grid listtree host " ) = false then Er( errs, where & ": kind """ & s.kind & """ is not array, sqlite, grid, listtree or host" )
+            GStr( e, "parent", s.parent, where, errs )
+            GStr( e, "relation", s.relation, where, errs )
+            GStr( e, "item_type", s.itemType, where, errs )
+            GStr( e, "items_source", s.itemsSource, where, errs )
+            GStr( e, "sql", s.sql, where, errs )
+            GStr( e, "grid", s.grid, where, errs )
+            GStr( e, "sort", s.sort, where, errs )
+            GStr( e, "filter", s.filter, where, errs )
+            GStr( e, "design_db", s.designDb, where, errs )
+            dim as config.TomlValue ptr pp = e->Find( "params" )
+            if pp then
+                if pp->Kind( ) <> config.TOML_TABLE then
+                    Er( errs, where & ": params must be a table { Name = ""expression"" }" )
+                else
+                    redim s.pNames( 0 to iif( pp->Count( ) > 0, pp->Count( ) - 1, 0 ) )
+                    redim s.pExprs( 0 to iif( pp->Count( ) > 0, pp->Count( ) - 1, 0 ) )
+                    for j as long = 0 to pp->Count( ) - 1
+                        s.pNames(j) = pp->KeyAt( j )
+                        if pp->Item( j ).Kind( ) <> config.TOML_STRING then Er( errs, where & ": params." & pp->KeyAt( j ) & " must be an expression as text" )
+                        s.pExprs(j) = pp->Item( j ).AsString( ).ValueOr( "" )
+                    next
+                    s.nPar = pp->Count( )
+                end if
+            end if
+            dim as config.TomlValue ptr ff = Tables( e, "field", where, errs )
+            if ff then
+                redim s.fields( 0 to ff->Count( ) - 1 )
+                for j as long = 0 to ff->Count( ) - 1
+                    dim as config.TomlValue ptr fe = @ff->Item( j )
+                    dim as ustring fw = where & " field " & (j + 1)
+                    OnlyKeys( fe, " name kind ", fw, errs )
+                    GStr( fe, "name", s.fields(j).name_, fw, errs )
+                    dim as ustring fk = "text"
+                    GStr( fe, "kind", fk, fw, errs )
+                    s.fields(j).kind = RdKindOf( fk )
+                    if s.fields(j).kind = TKV_EMPTY then Er( errs, fw & ": kind """ & fk & """ is not text, int, float, bool, date or time" )
+                    if len( s.fields(j).name_ ) = 0 then Er( errs, fw & ": a field needs a name" )
+                next
+                s.nFields = ff->Count( )
+            end if
+            if len( s.name_ ) = 0 then Er( errs, where & ": a source needs a name" )
+            for j as long = 0 to i - 1
+                if lcase( def->sources(j).name_ ) = lcase( s.name_ ) then Er( errs, where & ": the name is used twice" )
+            next
+            if (s.kind = "sqlite") andalso (len( s.sql ) = 0) then Er( errs, where & ": an sqlite source needs its sql" )
+        next
+        def->nSources = a->Count( )
+        for i as long = 0 to def->nSources - 1
+            dim byref as TKRD_SOURCE s = def->sources(i)
+            if len( s.parent ) = 0 then continue for
+            dim as int32 m = tkReportDef_FindSource( def, s.parent )
+            if m < 0 then
+                Er( errs, "source '" & s.name_ & "': no source '" & s.parent & "' (its parent)" )
+            elseif len( def->sources(m).parent ) then
+                Er( errs, "source '" & s.name_ & "': one level of master-detail only ('" & s.parent & "' is a child itself)" )
+            end if
+        next
+    end if
+
+    ' [[calc]]
+    a = Tables( t, "calc", "the file", errs )
+    if a then
+        redim def->calcs( 0 to a->Count( ) - 1 )
+        for i as long = 0 to a->Count( ) - 1
+            dim as config.TomlValue ptr e = @a->Item( i )
+            dim byref as TKRD_CALC c = def->calcs(i)
+            dim as ustring where = "calc " & (i + 1)
+            GStr( e, "name", c.name_, where, errs )
+            if len( c.name_ ) then where = "calc '" & c.name_ & "'"
+            OnlyKeys( e, " source name expr ", where, errs )
+            GStr( e, "source", c.source, where, errs )
+            GStr( e, "expr", c.expr, where, errs )
+            if (len( c.name_ ) = 0) orelse (len( c.expr ) = 0) then Er( errs, where & ": a calculated field needs a name and an expr" )
+            if (len( c.source ) > 0) andalso (tkReportDef_FindSource( def, c.source ) < 0) then Er( errs, where & ": no source '" & c.source & "'" )
+        next
+        def->nCalcs = a->Count( )
+    end if
+
+    ' [[band]]
+    a = Tables( t, "band", "the file", errs )
+    if a then
+        redim def->bands( 0 to a->Count( ) - 1 )
+        for i as long = 0 to a->Count( ) - 1
+            dim as config.TomlValue ptr e = @a->Item( i )
+            dim byref as TKRD_BAND b = def->bands(i)
+            dim as ustring where = "band " & (i + 1)
+            GStr( e, "id", b.id, where, errs )
+            if len( b.id ) then where = "band '" & b.id & "'"
+            OnlyKeys( e, " id kind parent source level group height can_grow page_break_before page_break_after repeat print_on_first_page print_at_bottom visible back ", where, errs )
+            GStr( e, "kind", b.kind, where, errs )
+            if IsOneOf( b.kind, " report_header page_header group_header detail detail_report group_footer report_footer page_footer no_data " ) = false then
+                Er( errs, where & ": kind """ & b.kind & """ is not a band kind" )
+            end if
+            GStr( e, "parent", b.parent, where, errs )
+            GStr( e, "source", b.source, where, errs )
+            GInt( e, "level", b.level, where, errs )
+            GStr( e, "group", b.group_, where, errs )
+            GNum( e, "height", b.height, where, errs )
+            GBool( e, "can_grow", b.canGrow, where, errs )
+            GBool( e, "page_break_before", b.breakBefore, where, errs )
+            GBool( e, "page_break_after", b.breakAfter, where, errs )
+            GBool( e, "repeat", b.repeat_, where, errs )
+            GBool( e, "print_on_first_page", b.printOnFirstPage, where, errs )
+            GBool( e, "print_at_bottom", b.printAtBottom, where, errs )
+            GStr( e, "visible", b.visible, where, errs )
+            GStr( e, "back", b.back, where, errs )
+            CheckColor( b.back, "back", where, errs )
+            if len( b.id ) = 0 then Er( errs, where & ": a band needs an id" )
+            if b.level < 0 then Er( errs, where & ": level must be 0 or more" )
+            if (len( b.source ) > 0) andalso (tkReportDef_FindSource( def, b.source ) < 0) then Er( errs, where & ": no source '" & b.source & "'" )
+            if (len( b.group_ ) > 0) andalso (b.kind <> "group_header") then Er( errs, where & ": only a group_header says what it groups on" )
+            for j as long = 0 to i - 1
+                if lcase( def->bands(j).id ) = lcase( b.id ) then Er( errs, where & ": the id is used twice" )
+            next
+        next
+        def->nBands = a->Count( )
+        ' links: a detail_report's parent is a detail; a band inside one is its header, detail or footer
+        for i as long = 0 to def->nBands - 1
+            dim byref as TKRD_BAND b = def->bands(i)
+            if len( b.parent ) = 0 then
+                if b.kind = "detail_report" then Er( errs, "band '" & b.id & "': a detail_report needs its parent (the master's detail band)" )
+                continue for
+            end if
+            dim as int32 pb = -1
+            for j as long = 0 to def->nBands - 1
+                if lcase( def->bands(j).id ) = lcase( b.parent ) then pb = j
+            next
+            if pb < 0 then
+                Er( errs, "band '" & b.id & "': no band '" & b.parent & "' (its parent)" )
+            elseif b.kind = "detail_report" then
+                if def->bands(pb).kind <> "detail" then Er( errs, "band '" & b.id & "': a detail_report's parent must be a detail band" )
+                if len( b.source ) = 0 then Er( errs, "band '" & b.id & "': a detail_report needs the child source it shows" )
+            elseif def->bands(pb).kind <> "detail_report" then
+                Er( errs, "band '" & b.id & "': only a detail_report holds bands" )
+            elseif IsOneOf( b.kind, " report_header detail report_footer " ) = false then
+                Er( errs, "band '" & b.id & "': inside a detail_report a band is its report_header, detail or report_footer" )
+            end if
+        next
+    end if
+
+    ' [[item]] with [[item.rule]]
+    a = Tables( t, "item", "the file", errs )
+    if a then
+        redim def->items( 0 to a->Count( ) - 1 )
+        for i as long = 0 to a->Count( ) - 1
+            dim as config.TomlValue ptr e = @a->Item( i )
+            dim byref as TKRD_ITEM it = def->items(i)
+            dim as ustring where = "item " & (i + 1)
+            GStr( e, "id", it.id, where, errs )
+            if len( it.id ) then where = "item '" & it.id & "'"
+            OnlyKeys( e, " id band kind rect text expr format align valign wrap can_grow font fore back border line_color pen visible reset running incr tag rule ", where, errs )
+            GStr( e, "band", it.band, where, errs )
+            GStr( e, "kind", it.kind, where, errs )
+            if IsOneOf( it.kind, " text field line box image check custom " ) = false then Er( errs, where & ": kind """ & it.kind & """ is not text, field, line, box, image, check or custom" )
+            dim as config.TomlValue ptr rc = e->Find( "rect" )
+            if rc then
+                if (rc->Kind( ) <> config.TOML_ARRAY) orelse (rc->Count( ) <> 4) then
+                    Er( errs, where & ": rect must be [x, y, w, h] in points" )
+                else
+                    it.x = rc->Item( 0 ).AsFloat( ).ValueOr( 0 ) : it.y = rc->Item( 1 ).AsFloat( ).ValueOr( 0 )
+                    it.w = rc->Item( 2 ).AsFloat( ).ValueOr( 0 ) : it.h = rc->Item( 3 ).AsFloat( ).ValueOr( 0 )
+                end if
+            end if
+            GStr( e, "text", it.text, where, errs )
+            GStr( e, "expr", it.expr, where, errs )
+            GStr( e, "format", it.format, where, errs )
+            GStr( e, "align", it.align, where, errs )
+            if IsOneOf( it.align, " left center right " ) = false then Er( errs, where & ": align must be left, center or right" )
+            GStr( e, "valign", it.valign, where, errs )
+            if IsOneOf( it.valign, " top middle bottom " ) = false then Er( errs, where & ": valign must be top, middle or bottom" )
+            GBool( e, "wrap", it.wrap, where, errs )
+            GBool( e, "can_grow", it.canGrow, where, errs )
+            dim as config.TomlValue ptr fo = e->Find( "font" )
+            if fo then
+                if fo->Kind( ) <> config.TOML_TABLE then
+                    Er( errs, where & ": font must be a table { size = 9, bold = true }" )
+                else
+                    OnlyKeys( fo, " src size bold italic ", where & " font", errs )
+                    GStr( fo, "src", it.fontSrc, where & " font", errs )
+                    GNum( fo, "size", it.fontSize, where & " font", errs )
+                    GBool( fo, "bold", it.bold, where & " font", errs )
+                    GBool( fo, "italic", it.italic, where & " font", errs )
+                end if
+            end if
+            GStr( e, "fore", it.fore, where, errs )
+            CheckColor( it.fore, "fore", where, errs )
+            GStr( e, "back", it.back, where, errs )
+            CheckColor( it.back, "back", where, errs )
+            GStr( e, "border", it.border, where, errs )
+            dim as ustring rest = trim( it.border )
+            while len( rest )
+                dim as long sp = instr( rest, " " )
+                dim as ustring w = rest
+                if sp then
+                    w = left( rest, sp - 1 )
+                    rest = trim( mid( rest, sp + 1 ) )
+                else
+                    rest = ""
+                end if
+                if IsOneOf( w, " all left top right bottom " ) = false then Er( errs, where & ": border """ & w & """ is not all, left, top, right or bottom" )
+            wend
+            GStr( e, "line_color", it.lineColor, where, errs )
+            CheckColor( it.lineColor, "line_color", where, errs )
+            GNum( e, "pen", it.pen, where, errs )
+            GStr( e, "visible", it.visible, where, errs )
+            GStr( e, "reset", it.reset, where, errs )
+            if (IsOneOf( it.reset, " auto page report " ) = false) andalso (GroupRef( it.reset ) = false) then Er( errs, where & ": reset must be auto, page, report or group:N" )
+            GBool( e, "running", it.running, where, errs )
+            GStr( e, "incr", it.incr, where, errs )
+            if (IsOneOf( it.incr, " row master " ) = false) andalso (GroupRef( it.incr ) = false) then Er( errs, where & ": incr must be row, master or group:N" )
+            GI64( e, "tag", it.tag, where, errs )
+            dim as config.TomlValue ptr rl = Tables( e, "rule", where, errs )
+            if rl then
+                redim it.rules( 0 to rl->Count( ) - 1 )
+                for j as long = 0 to rl->Count( ) - 1
+                    dim as config.TomlValue ptr re = @rl->Item( j )
+                    dim as ustring rw = where & " rule " & (j + 1)
+                    OnlyKeys( re, " when fore back bold italic hide ", rw, errs )
+                    dim byref as TKRD_RULE ru = it.rules(j)
+                    GStr( re, "when", ru.when_, rw, errs )
+                    GStr( re, "fore", ru.fore, rw, errs )
+                    CheckColor( ru.fore, "fore", rw, errs )
+                    GStr( re, "back", ru.back, rw, errs )
+                    CheckColor( ru.back, "back", rw, errs )
+                    dim as boolean bb, ii
+                    if re->Has( "bold" ) then
+                        GBool( re, "bold", bb, rw, errs )
+                        ru.bold = iif( bb, 1, 0 )
+                    end if
+                    if re->Has( "italic" ) then
+                        GBool( re, "italic", ii, rw, errs )
+                        ru.italic = iif( ii, 1, 0 )
+                    end if
+                    GBool( re, "hide", ru.hide, rw, errs )
+                    if len( ru.when_ ) = 0 then Er( errs, rw & ": a rule needs its when" )
+                next
+                it.nRules = rl->Count( )
+            end if
+            if len( it.id ) = 0 then Er( errs, where & ": an item needs an id" )
+            dim as boolean found
+            for j as long = 0 to def->nBands - 1
+                if lcase( def->bands(j).id ) = lcase( it.band ) then found = true
+            next
+            if found = false then Er( errs, where & ": no band '" & it.band & "'" )
+            for j as long = 0 to i - 1
+                if lcase( def->items(j).id ) = lcase( it.id ) then Er( errs, where & ": the id is used twice" )
+            next
+            if (it.kind = "field") andalso (len( it.expr ) = 0) then Er( errs, where & ": a field item needs its expr" )
+        next
+        def->nItems = a->Count( )
+    end if
+    return len( errs ) = 0
+end function

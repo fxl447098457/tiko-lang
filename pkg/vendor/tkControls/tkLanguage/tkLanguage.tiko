@@ -1,0 +1,331 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkLanguage -- a designed program's captions in another language (wiki/tkLanguage.md). A catalog
+' is a TOML file of translated texts, keyed the way tkForms_Tr keys a caption: "frmMain.btnOK.Text".
+' Catalogs are registered by language code, built into the program (#embed) or as files beside it;
+' tkLanguage_Use parses one and installs it as tkForms' translator. A key the catalog lacks keeps
+' the text the form was designed with.
+'
+'   tkLanguage_AddData( code, name, p, n )  a catalog's UTF-8 bytes, BORROWED (an #embed array)
+'   tkLanguage_AddFile( code, name, path )  a catalog file, read when it is used
+'   tkLanguage_Count / _Code( i ) / _Name( i )   what is registered, 0 to Count - 1
+'   tkLanguage_SetBase( code, name )        the forms' own language: no catalog, the designed text
+'   tkLanguage_Use( code )                  that catalog becomes the program's; "" or the base = none
+'   tkLanguage_UseLocales( list )           the first registered of "fr_CA,de,..." (ll_CC, then ll)
+'   tkLanguage_UseSystem( )                 tkLanguage_UseLocales with the user's preferred locales
+'   tkLanguage_Current / _Warnings          the code in use; what the last Use skipped or why it failed
+'
+' A later registration for a code replaces the earlier one, so a file registered after the built-in
+' data overrides it. Codes match without regard to case, and "-" matches "_" ("pt-BR" = "pt_BR").
+'
+' The catalog (tkEdit's own format, tkedit/src/core/i18n/i18n.tiko): format = 1, name = "...",
+' then tables of strings, flattened: table path & "." & key, a quoted key's dots its own. The designer
+' writes one table a form -- [frmMain] "btnOK.Text" = "OK" is "frmMain.btnOK.Text" -- and nested
+' tables work too: [frmItems.mnuMain] "3" = "Ouvrir" is "frmItems.mnuMain.3". A top-level table whose name starts
+' with "_" ([_source], the designer's) is not text and is skipped. The reader is lenient: only text
+' that isn't TOML fails; anything else it can't use is noted in tkLanguage_Warnings and skipped.
+'
+' tkForms_Tr is asked when a form is BUILT: a form already open keeps its captions until it is
+' built again.
+#module "tkLanguage"
+
+#import "std/config"
+#import "std/fs"
+#import "std/codec"
+#import "std/containers"
+#import "../tkForms"
+using tkForms
+
+public const as long TKLANGUAGE_FORMAT = 1
+
+type LANG_
+    Code as ustring
+    Name as ustring
+    Path as ustring                 ' "" = the bytes at p
+    p as const ubyte ptr
+    n as longint
+end type
+
+dim shared as LANG_ gLangs_( any )
+dim shared as long gnLangs_
+dim shared as containers.Map( of ustring, ustring ) gTexts_
+dim shared as ustring gCurrent_
+dim shared as ustring gWarnings_
+dim shared as ustring gBaseCode_
+dim shared as ustring gBaseName_
+dim shared as boolean gTranslating_     ' a catalog is installed
+
+' "pt-BR" and "PT_br" are one code.
+private function Norm_( byref code as const ustring ) as ustring
+    dim as ustring s = lcase( trim( code ) )
+    for i as long = 0 to len( s ) - 1
+        if s[i] = asc( "-" ) then s[i] = asc( "_" )
+    next
+    return s
+end function
+
+private function Find_( byref code as const ustring ) as long
+    dim as ustring c = Norm_( code )
+    for i as long = 0 to gnLangs_ - 1
+        if Norm_( gLangs_( i ).Code ) = c then return i
+    next
+    return -1
+end function
+
+' The slot for code: its old one when it is registered already, else a new one at the end.
+private function Slot_( byref code as const ustring ) as long
+    dim as long i = Find_( code )
+    if i >= 0 then return i
+    redim preserve gLangs_( 0 to gnLangs_ )
+    gnLangs_ += 1
+    return gnLangs_ - 1
+end function
+
+public sub tkLanguage_AddData( byref code as const ustring, byref langName as const ustring, _
+                               byval p as const ubyte ptr, byval n as longint )
+    if len( Norm_( code ) ) = 0 then exit sub
+    dim as long i = Slot_( code )
+    with gLangs_( i )
+        .Code = trim( code ) : .Name = langName : .Path = "" : .p = p : .n = n
+    end with
+end sub
+
+public sub tkLanguage_AddFile( byref code as const ustring, byref langName as const ustring, _
+                               byref path as const ustring )
+    if len( Norm_( code ) ) = 0 then exit sub
+    dim as long i = Slot_( code )
+    with gLangs_( i )
+        .Code = trim( code ) : .Name = langName : .Path = path : .p = 0 : .n = 0
+    end with
+end sub
+
+public function tkLanguage_Count( ) as long
+    return gnLangs_
+end function
+
+public function tkLanguage_Code( byval i as long ) as ustring
+    if (i < 0) orelse (i >= gnLangs_) then return ""
+    return gLangs_( i ).Code
+end function
+
+public function tkLanguage_Name( byval i as long ) as ustring
+    if (i < 0) orelse (i >= gnLangs_) then return ""
+    return gLangs_( i ).Name
+end function
+
+' The language the forms were designed in: their own text, no catalog. Using it removes the
+' translator, and tkLanguage_UseLocales stops at it as at a registered language. "" = not said.
+public sub tkLanguage_SetBase( byref code as const ustring, byref langName as const ustring )
+    gBaseCode_ = trim( code )
+    gBaseName_ = langName
+    if gTranslating_ = false then gCurrent_ = gBaseCode_
+end sub
+
+public function tkLanguage_BaseCode( ) as ustring
+    return gBaseCode_
+end function
+
+public function tkLanguage_BaseName( ) as ustring
+    return gBaseName_
+end function
+
+private function IsBase_( byref code as const ustring ) as boolean
+    return (len( gBaseCode_ ) > 0) andalso (Norm_( code ) = Norm_( gBaseCode_ ))
+end function
+
+' The code in use, as it was registered; the base code (tkLanguage_SetBase) while the designed text
+' shows, "" when there is no base.
+public function tkLanguage_Current( ) as ustring
+    return gCurrent_
+end function
+
+' What the last tkLanguage_Use skipped, or why it failed: one line each; "" = nothing.
+public function tkLanguage_Warnings( ) as ustring
+    return gWarnings_
+end function
+
+' ---- reading a catalog ------------------------------------------------------------------------
+
+private sub Warn_( byref w as ustring, byref what as const ustring )
+    if len( w ) then w &= !"\n"
+    w &= what
+end sub
+
+' Every string under t, as prefix.key.
+private sub Flatten_( byref t as config.TomlValue, byref prefix as const ustring, _
+                      byref m as containers.Map( of ustring, ustring ), byref w as ustring )
+    for i as long = 0 to t.Count( ) - 1
+        dim as ustring k = prefix & "." & t.KeyAt( i )
+        dim byref as config.TomlValue v = t.Item( i )
+        select case v.Kind( )
+        case config.TOML_TABLE
+            Flatten_( v, k, m, w )
+        case config.TOML_STRING
+            dim as ustring s = v.AsString( ).ValueOr( "" )
+            m.Put( k, s )
+        case else
+            Warn_( w, k & ": not a string; skipped" )
+        end select
+    next
+end sub
+
+' text as a catalog into m. false only when it is not TOML.
+private function Parse_( byref text as const ustring, byref m as containers.Map( of ustring, ustring ), _
+                         byref w as ustring ) as boolean
+    dim as config.ConfigResultToml r = config.ParseToml( text )
+    if r.IsOk( ) = false then
+        Warn_( w, r.Failure( ).Message( ) )
+        return false
+    end if
+    dim byref as config.TomlValue root = r.Value( )
+    for i as long = 0 to root.Count( ) - 1
+        dim as ustring k = root.KeyAt( i )
+        dim byref as config.TomlValue v = root.Item( i )
+        if k = "format" then
+            dim as longint f = 0
+            if v.AsInt( ).ValueOr( f ) <> TKLANGUAGE_FORMAT then Warn_( w, "format: not " & TKLANGUAGE_FORMAT & "; read anyway" )
+        elseif k = "name" then
+            ' the registered name is the one shown; the file's is for people reading it
+        elseif left( k, 1 ) = "_" then
+            ' [_source] and the like: the designer's, not text
+        elseif v.Kind( ) = config.TOML_TABLE then
+            Flatten_( v, k, m, w )
+        else
+            Warn_( w, k & ": not a table; skipped" )
+        end if
+    next
+    return true
+end function
+
+' Registered catalog i's text. false (w says why) when it can't be read.
+private function Text_( byval i as long, byref text as ustring, byref w as ustring ) as boolean
+    with gLangs_( i )
+        if len( .Path ) then
+            dim as fs.FsResultUStr r = fs.ReadAllText( .Path )
+            if r.IsOk( ) = false then
+                Warn_( w, .Path & ": " & r.Failure( ).Message( ) )
+                return false
+            end if
+            text = r.Value( )
+            return true
+        end if
+        dim as codec.EncResultText r = codec.DecodeText( .p, .n, codec.Utf8( ) )
+        if r.IsOk( ) = false then
+            Warn_( w, .Code & ": " & r.Failure( ).Message( ) )
+            return false
+        end if
+        text = r.Value( )
+        return true
+    end with
+end function
+
+private function Translate_( byref key as const ustring, byref text as const ustring ) as ustring
+    dim as ustring k = key, s             ' TryGet takes a non-const key
+    if gTexts_.TryGet( k, s ) then return s
+    return text
+end function
+
+' ---- choosing one ------------------------------------------------------------------------------
+
+' code's catalog becomes the program's: tkForms_Tr answers from it, and with the text it was given
+' for a key it lacks. "" or the base code = none, the designed text. false (tkLanguage_Warnings says
+' why) when code isn't registered or its catalog can't be read or isn't TOML; what was in use stays.
+public function tkLanguage_Use( byref code as const ustring ) as boolean
+    dim as ustring w
+    if (len( Norm_( code ) ) = 0) orelse IsBase_( code ) then
+        tkForms_SetTranslator( 0 )
+        gTexts_.Clear( )
+        gTranslating_ = false
+        gCurrent_ = gBaseCode_
+        gWarnings_ = ""
+        return true
+    end if
+    dim as long i = Find_( code )
+    if i < 0 then
+        gWarnings_ = "'" & code & "': no such language"
+        return false
+    end if
+    dim as ustring text
+    dim as containers.Map( of ustring, ustring ) m
+    if (Text_( i, text, w ) = false) orelse (Parse_( text, m, w ) = false) then
+        gWarnings_ = w
+        return false
+    end if
+    gTexts_ = m
+    gTranslating_ = true
+    gCurrent_ = gLangs_( i ).Code
+    gWarnings_ = w
+    tkForms_SetTranslator( @Translate_ )
+    return true
+end function
+
+' One candidate: the base (the designed text) or a registered language that can be used. A matching
+' catalog that fails adds its reason to w.
+private function TryLocale_( byref code as const ustring, byref w as ustring ) as boolean
+    if IsBase_( code ) then
+        tkLanguage_Use( "" )
+        gWarnings_ = w
+        return true
+    end if
+    if Find_( code ) < 0 then return false
+    if tkLanguage_Use( code ) then return true
+    Warn_( w, gWarnings_ )
+    return false
+end function
+
+' The first entry of a comma-separated locale list ("fr_CA,de") that is the base language or a
+' registered one, each tried as ll_CC, then as ll; a catalog that can't be read is passed over. The
+' base: the designed text, and true. None: the designed text too, and false.
+public function tkLanguage_UseLocales( byref locales as const ustring ) as boolean
+    dim as ustring rest = locales, w
+    while len( rest )
+        dim as long comma = instr( rest, "," )
+        dim as ustring one
+        if comma then
+            one = Norm_( left( rest, comma - 1 ) )
+            rest = mid( rest, comma + 1 )
+        else
+            one = Norm_( rest )
+            rest = ""
+        end if
+        dim as long cut = instr( one, "." )                    ' "de_DE.UTF-8", "de_DE@euro"
+        if cut then one = left( one, cut - 1 )
+        cut = instr( one, "@" )
+        if cut then one = left( one, cut - 1 )
+        if len( one ) = 0 then continue while
+        if TryLocale_( one, w ) then return true
+        dim as long bar = instr( one, "_" )
+        if bar > 1 then
+            if TryLocale_( left( one, bar - 1 ), w ) then return true
+        end if
+    wend
+    tkLanguage_Use( "" )
+    gWarnings_ = w
+    return false
+end function
+
+' The user's preferred locales as tkLanguage_UseLocales takes them: "fr_CA,de".
+public function tkLanguage_SystemLocales( ) as ustring
+    dim as long n
+    dim as SDL_Locale ptr ptr pp = SDL_GetPreferredLocales( @n )
+    if pp = 0 then return ""
+    dim as ustring s
+    for i as long = 0 to n - 1
+        if pp[i] = 0 then continue for
+        if pp[i]->language = 0 then continue for
+        if len( s ) then s &= ","
+        s &= *pp[i]->language
+        if pp[i]->country then s &= "_" & *pp[i]->country
+    next
+    SDL_free( pp )
+    return s
+end function
+
+' The language the user prefers, if it is registered (tkLanguage_UseLocales); else none.
+public function tkLanguage_UseSystem( ) as boolean
+    return tkLanguage_UseLocales( tkLanguage_SystemLocales( ) )
+end function

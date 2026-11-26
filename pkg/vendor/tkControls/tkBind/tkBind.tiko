@@ -1,0 +1,500 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkBind -- the conversions a designed form's LoadFrom / SaveTo go through (Form Designer B1). The
+' designer knows a control's kind but not a record field's type, so every call names the field and
+' the compiler picks the overload:
+'
+'     tkTextBox_SetText( txtAge.Handle, tkBind_Text( r.Age ) )        ' load: field -> the kind
+'     tkBind_Put( r.Age, tkTextBox_GetText( txtAge.Handle ) )         ' save: the kind -> field
+'
+' KINDS and the value each carries: text = ustring, bool = boolean, int = longint, float = float64,
+' date = TKDATE, time = TKTIME, datetime = TKDATETIME (both tkTimePanel). FIELDS: boolean, byte .. ulongint, integer, uinteger,
+' single, double, ustring, string, TKDATE, TKTIME, chrono.LocalDate, chrono.LocalTime and
+' chrono.DateTime (date and time halves). A date or a time binds only to a text field or one of its
+' own; a pairing with no overload is a compile error, which is the point.
+'
+' THE RULES (B1: lenient; strict parsing and error reporting are B2):
+'   text -> number     trimmed, then VALLNG / VAL: text that is not a number is 0
+'   float -> integer   rounds as CLNGINT does (to even); a narrower field wraps as an assignment does
+'   text -> bool       true, 1, -1, yes, on (any case, trimmed); anything else is false
+'   bool -> text       "true" / "false"
+'   number -> text     STR
+'   date <-> text      ISO yyyy-mm-dd; "" and text that is not a date are no date
+'   time <-> text      ISO HH:mm:ss (.fff when there are milliseconds); in, ISO first, then
+'                      tkTimePanel_ParseLoose (2:30 pm); text that is no time is no time
+'   no date            an all-zero TKDATE (wYear = 0), an Invalid LocalDate (its default), ""
+'   no time            an empty TKTIME (wHour = -1), LocalTime.Invalid() -- NOT a default LocalTime,
+'                      which is midnight -- and ""
+'   DateTime           its date and time load into a DatePicker and a TimePicker. Saving: one call
+'                      for the pair, Put( f, date, time ), which codegen emits when both bind the
+'                      field (half-saves would drop the time on a new record, whose DateTime is
+'                      Invalid); no date clears the field, no time is midnight. The lone halves,
+'                      for a form that binds one control to it, keep the other half and the offset.
+' chrono.LocalTime is always written qualified: the SDL imports bring crt's localtime, and names
+' are case-blind (TKO0919).
+' Nothing here notifies: LoadFrom calls the controls' silent setters.
+#module "tkBind"
+
+#import "std/chrono"
+#import "../tkCalendar" public
+#import "../tkTimePanel" public
+using chrono
+using tkCalendar
+using tkTimePanel
+
+' ---- TK_VALUE: one typed value, as tkDataGrid and tkReport read cells and fields ---------------
+' (claude-docs docs/tkControls/PRINTING.md decision P-16.) The kinds are numbered as tkDataGrid's
+' TKDG_* so the two can be one type; TKV_TIME is new. The setters keep kind right; an all-zero date
+' is no date, so SetDate of one makes the value EMPTY.
+public enum
+    TKV_EMPTY = 0           ' no value: a database NULL, a field not filled
+    TKV_TEXT
+    TKV_INT
+    TKV_FLOAT
+    TKV_BOOL
+    TKV_DATE
+    TKV_TIME
+end enum
+
+public type TK_VALUE
+    kind as long = TKV_EMPTY
+    s    as ustring          ' TKV_TEXT
+    i    as longint          ' TKV_INT
+    f    as float64          ' TKV_FLOAT
+    b    as boolean          ' TKV_BOOL
+    d    as TKDATE           ' TKV_DATE
+    t    as TKTIME           ' TKV_TIME
+    declare sub SetText( byref v as const ustring )
+    declare sub SetInt( byval v as longint )
+    declare sub SetFloat( byval v as float64 )
+    declare sub SetBool( byval v as boolean )
+    declare sub SetDate( byref v as const TKDATE )
+    declare sub SetTime( byref v as const TKTIME )
+    declare sub Clear( )
+    declare function AsFloat( ) as float64       ' INT / FLOAT / BOOL as a number, else 0
+    declare function IsNumber( ) as boolean
+end type
+
+sub TK_VALUE.Clear( )
+    dim as TKDATE nd
+    dim as TKTIME nt
+    this.kind = TKV_EMPTY : this.s = "" : this.i = 0 : this.f = 0 : this.b = false : this.d = nd : this.t = nt
+end sub
+sub TK_VALUE.SetText( byref v as const ustring )
+    this.Clear( ) : this.kind = TKV_TEXT : this.s = v
+end sub
+sub TK_VALUE.SetInt( byval v as longint )
+    this.Clear( ) : this.kind = TKV_INT : this.i = v
+end sub
+sub TK_VALUE.SetFloat( byval v as float64 )
+    this.Clear( ) : this.kind = TKV_FLOAT : this.f = v
+end sub
+sub TK_VALUE.SetBool( byval v as boolean )
+    this.Clear( ) : this.kind = TKV_BOOL : this.b = v
+end sub
+sub TK_VALUE.SetDate( byref v as const TKDATE )
+    this.Clear( )
+    if v.wYear = 0 then exit sub
+    this.kind = TKV_DATE : this.d = v
+end sub
+sub TK_VALUE.SetTime( byref v as const TKTIME )
+    this.Clear( )
+    if v.wHour < 0 then exit sub                  ' -1 = no time: EMPTY
+    this.kind = TKV_TIME : this.t = v
+end sub
+function TK_VALUE.AsFloat( ) as float64
+    select case this.kind
+    case TKV_INT : return this.i
+    case TKV_FLOAT : return this.f
+    case TKV_BOOL : return iif( this.b, 1, 0 )
+    end select
+    return 0
+end function
+function TK_VALUE.IsNumber( ) as boolean
+    return (this.kind = TKV_INT) orelse (this.kind = TKV_FLOAT)
+end function
+
+' ---- the text rules -------------------------------------------------------------------------
+
+private function TextBool_( byref s as const ustring ) as boolean
+    select case lcase( trim( s ) )
+    case "true", "1", "-1", "yes", "on" : return true
+    end select
+    return false
+end function
+
+private function TextInt_( byref s as const ustring ) as longint
+    return vallng( trim( s ) )
+end function
+
+private function TextFloat_( byref s as const ustring ) as float64
+    return val( trim( s ) )
+end function
+
+private function Pad_( byval n as long, byval w as long ) as ustring
+    dim as ustring s = str( n )
+    if len( s ) < w then s = string( w - len( s ), "0" ) & s
+    return s
+end function
+
+private function IsoOf_( byref d as const TKDATE ) as ustring
+    if d.wYear = 0 then return ""
+    return Pad_( d.wYear, 4 ) & "-" & Pad_( d.wMonth, 2 ) & "-" & Pad_( d.wDay, 2 )
+end function
+
+private function DateOfLocal_( byref ld as LocalDate ) as TKDATE
+    dim as TKDATE none_
+    if ld.IsValid = false then return none_
+    return tkCalendar_MakeDate( ld.Year, ld.Month, ld.Day )
+end function
+
+private function LocalOfDate_( byref d as const TKDATE ) as LocalDate
+    dim as LocalDate none_                  ' Invalid
+    if d.wYear = 0 then return none_
+    return LocalDate( d.wYear, d.wMonth, d.wDay )
+end function
+
+private function DateOfText_( byref s as const ustring ) as TKDATE
+    dim as LocalDate ld
+    dim as ustring t = trim( s )
+    if LocalDate.TryParseIso( t, ld ) = false then
+        dim as TKDATE none_
+        return none_
+    end if
+    return DateOfLocal_( ld )
+end function
+
+private function LocalText_( byref ld as LocalDate ) as ustring
+    if ld.IsValid = false then return ""
+    return ld.ToIsoString( )
+end function
+
+' ---- load: a field's value as the control's kind ---------------------------------------------
+
+public function tkBind_Text overload( byval v as boolean ) as ustring : return iif( v, "true", "false" ) : end function
+public function tkBind_Text( byval v as byte ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as ubyte ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as short ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as ushort ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as long ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as ulong ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as longint ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as ulongint ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as integer ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as uinteger ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as single ) as ustring : return str( v ) : end function
+public function tkBind_Text( byval v as double ) as ustring : return str( v ) : end function
+public function tkBind_Text( byref v as const ustring ) as ustring : return v : end function
+public function tkBind_Text( byref v as const string ) as ustring : return v : end function
+public function tkBind_Text( byref v as const TKDATE ) as ustring : return IsoOf_( v ) : end function
+public function tkBind_Text( byref v as LocalDate ) as ustring : return LocalText_( v ) : end function
+public function tkBind_Bool overload( byval v as boolean ) as boolean : return v : end function
+public function tkBind_Bool( byval v as byte ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as ubyte ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as short ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as ushort ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as long ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as ulong ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as longint ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as ulongint ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as integer ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as uinteger ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as single ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byval v as double ) as boolean : return v <> 0 : end function
+public function tkBind_Bool( byref v as const ustring ) as boolean : return TextBool_( v ) : end function
+public function tkBind_Bool( byref v as const string ) as boolean : return TextBool_( v ) : end function
+public function tkBind_Int overload( byval v as boolean ) as longint : return iif( v, 1, 0 ) : end function
+public function tkBind_Int( byval v as byte ) as longint : return v : end function
+public function tkBind_Int( byval v as ubyte ) as longint : return v : end function
+public function tkBind_Int( byval v as short ) as longint : return v : end function
+public function tkBind_Int( byval v as ushort ) as longint : return v : end function
+public function tkBind_Int( byval v as long ) as longint : return v : end function
+public function tkBind_Int( byval v as ulong ) as longint : return v : end function
+public function tkBind_Int( byval v as longint ) as longint : return v : end function
+public function tkBind_Int( byval v as ulongint ) as longint : return v : end function
+public function tkBind_Int( byval v as integer ) as longint : return v : end function
+public function tkBind_Int( byval v as uinteger ) as longint : return v : end function
+public function tkBind_Int( byval v as single ) as longint : return clngint( v ) : end function
+public function tkBind_Int( byval v as double ) as longint : return clngint( v ) : end function
+public function tkBind_Int( byref v as const ustring ) as longint : return TextInt_( v ) : end function
+public function tkBind_Int( byref v as const string ) as longint : return TextInt_( v ) : end function
+public function tkBind_Float overload( byval v as boolean ) as float64 : return iif( v, 1.0, 0.0 ) : end function
+public function tkBind_Float( byval v as byte ) as float64 : return v : end function
+public function tkBind_Float( byval v as ubyte ) as float64 : return v : end function
+public function tkBind_Float( byval v as short ) as float64 : return v : end function
+public function tkBind_Float( byval v as ushort ) as float64 : return v : end function
+public function tkBind_Float( byval v as long ) as float64 : return v : end function
+public function tkBind_Float( byval v as ulong ) as float64 : return v : end function
+public function tkBind_Float( byval v as longint ) as float64 : return v : end function
+public function tkBind_Float( byval v as ulongint ) as float64 : return v : end function
+public function tkBind_Float( byval v as integer ) as float64 : return v : end function
+public function tkBind_Float( byval v as uinteger ) as float64 : return v : end function
+public function tkBind_Float( byval v as single ) as float64 : return v : end function
+public function tkBind_Float( byval v as double ) as float64 : return v : end function
+public function tkBind_Float( byref v as const ustring ) as float64 : return TextFloat_( v ) : end function
+public function tkBind_Float( byref v as const string ) as float64 : return TextFloat_( v ) : end function
+public function tkBind_Date overload( byref v as const ustring ) as TKDATE : return DateOfText_( v ) : end function
+public function tkBind_Date( byref v as const string ) as TKDATE : return DateOfText_( v ) : end function
+public function tkBind_Date( byref v as const TKDATE ) as TKDATE : return v : end function
+public function tkBind_Date( byref v as LocalDate ) as TKDATE : return DateOfLocal_( v ) : end function
+' ---- save: the control's value into a field ------------------------------------------------
+
+public sub tkBind_Put overload( byref f as boolean, byref v as const ustring ) : f = TextBool_( v ) : end sub
+public sub tkBind_Put( byref f as byte, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as ubyte, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as short, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as ushort, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as long, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as ulong, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as longint, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as ulongint, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as integer, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as uinteger, byref v as const ustring ) : f = TextInt_( v ) : end sub
+public sub tkBind_Put( byref f as single, byref v as const ustring ) : f = TextFloat_( v ) : end sub
+public sub tkBind_Put( byref f as double, byref v as const ustring ) : f = TextFloat_( v ) : end sub
+public sub tkBind_Put( byref f as ustring, byref v as const ustring ) : f = v : end sub
+public sub tkBind_Put( byref f as string, byref v as const ustring ) : f = v : end sub
+public sub tkBind_Put( byref f as TKDATE, byref v as const ustring ) : f = DateOfText_( v ) : end sub
+public sub tkBind_Put( byref f as LocalDate, byref v as const ustring ) : f = LocalOfDate_( DateOfText_( v ) ) : end sub
+public sub tkBind_Put( byref f as boolean, byval v as boolean ) : f = v : end sub
+public sub tkBind_Put( byref f as byte, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as ubyte, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as short, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as ushort, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as long, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as ulong, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as longint, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as ulongint, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as integer, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as uinteger, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as single, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as double, byval v as boolean ) : f = iif( v, 1, 0 ) : end sub
+public sub tkBind_Put( byref f as ustring, byval v as boolean ) : f = iif( v, "true", "false" ) : end sub
+public sub tkBind_Put( byref f as string, byval v as boolean ) : f = iif( v, "true", "false" ) : end sub
+public sub tkBind_Put( byref f as boolean, byval v as longint ) : f = (v <> 0) : end sub
+public sub tkBind_Put( byref f as byte, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as ubyte, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as short, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as ushort, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as long, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as ulong, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as longint, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as ulongint, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as integer, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as uinteger, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as single, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as double, byval v as longint ) : f = v : end sub
+public sub tkBind_Put( byref f as ustring, byval v as longint ) : f = str( v ) : end sub
+public sub tkBind_Put( byref f as string, byval v as longint ) : f = str( v ) : end sub
+public sub tkBind_Put( byref f as boolean, byval v as float64 ) : f = (v <> 0) : end sub
+public sub tkBind_Put( byref f as byte, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as ubyte, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as short, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as ushort, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as long, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as ulong, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as longint, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as ulongint, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as integer, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as uinteger, byval v as float64 ) : f = clngint( v ) : end sub
+public sub tkBind_Put( byref f as single, byval v as float64 ) : f = v : end sub
+public sub tkBind_Put( byref f as double, byval v as float64 ) : f = v : end sub
+public sub tkBind_Put( byref f as ustring, byval v as float64 ) : f = str( v ) : end sub
+public sub tkBind_Put( byref f as string, byval v as float64 ) : f = str( v ) : end sub
+public sub tkBind_Put( byref f as ustring, byref v as const TKDATE ) : f = IsoOf_( v ) : end sub
+public sub tkBind_Put( byref f as string, byref v as const TKDATE ) : f = IsoOf_( v ) : end sub
+public sub tkBind_Put( byref f as TKDATE, byref v as const TKDATE ) : f = v : end sub
+public sub tkBind_Put( byref f as LocalDate, byref v as const TKDATE ) : f = LocalOfDate_( v ) : end sub
+
+' ---- the time kind (TIMEPICKER.md §10) ----------------------------------------------------------
+
+private function TimeOfLocal_( byref lt as chrono.LocalTime ) as TKTIME
+    if lt.IsValid = false then return tkTimePanel_EmptyTime( )
+    return tkTimePanel_MakeTime( lt.Hour, lt.Minute, lt.Second, lt.Millisecond )
+end function
+
+private function LocalOfTime_( byref t as const TKTIME ) as chrono.LocalTime
+    if tkTimePanel_IsTime( t ) = false then return chrono.LocalTime.Invalid( )
+    return chrono.LocalTime( t.wHour, t.wMinute, t.wSecond, t.wMilliseconds )
+end function
+
+private function TimeOfText_( byref s as const ustring ) as TKTIME
+    dim as TKTIME t
+    if tkTimePanel_ParseIso( s, t ) then return t
+    if tkTimePanel_ParseLoose( s, t ) then return t
+    return tkTimePanel_EmptyTime( )
+end function
+
+private function TimeText_( byref t as const TKTIME ) as ustring
+    return tkTimePanel_FormatIso( t, true, t.wMilliseconds <> 0 )
+end function
+
+' load
+public function tkBind_Time overload( byref v as const TKTIME ) as TKTIME : return v : end function
+public function tkBind_Time( byref v as chrono.LocalTime ) as TKTIME : return TimeOfLocal_( v ) : end function
+public function tkBind_Time( byref v as DateTime ) as TKTIME
+    if v.IsValid = false then return tkTimePanel_EmptyTime( )
+    return tkTimePanel_MakeTime( v.Hour, v.Minute, v.Second, v.Millisecond )
+end function
+public function tkBind_Time( byref v as const ustring ) as TKTIME : return TimeOfText_( v ) : end function
+public function tkBind_Time( byref v as const string ) as TKTIME : return TimeOfText_( v ) : end function
+public function tkBind_Text( byref v as const TKTIME ) as ustring : return TimeText_( v ) : end function
+public function tkBind_Text( byref v as chrono.LocalTime ) as ustring : return TimeText_( TimeOfLocal_( v ) ) : end function
+public function tkBind_Date( byref v as DateTime ) as TKDATE
+    dim as TKDATE none_
+    if v.IsValid = false then return none_
+    return tkCalendar_MakeDate( v.Year, v.Month, v.Day )
+end function
+
+' save
+public sub tkBind_Put( byref f as TKTIME, byval v as TKTIME ) : f = v : end sub
+public sub tkBind_Put( byref f as chrono.LocalTime, byval v as TKTIME ) : f = LocalOfTime_( v ) : end sub
+public sub tkBind_Put( byref f as ustring, byval v as TKTIME ) : f = TimeText_( v ) : end sub
+public sub tkBind_Put( byref f as string, byval v as TKTIME ) : f = TimeText_( v ) : end sub
+public sub tkBind_Put( byref f as TKTIME, byref v as const ustring ) : f = TimeOfText_( v ) : end sub
+public sub tkBind_Put( byref f as chrono.LocalTime, byref v as const ustring ) : f = LocalOfTime_( TimeOfText_( v ) ) : end sub
+
+' DateTime: the pair in one call (what codegen emits when a date and a time control bind the field)
+public sub tkBind_Put( byref f as DateTime, byref d as const TKDATE, byval t as TKTIME )
+    dim as LocalDate ld = LocalOfDate_( d )
+    if ld.IsValid = false then f = DateTime.Invalid( ) : exit sub
+    dim as chrono.LocalTime lt = LocalOfTime_( t )
+    if lt.IsValid = false then lt = chrono.LocalTime.Midnight( )
+    dim as DateTime r = DateTime.FromDateTime( ld, lt )
+    if f.IsValid andalso f.HasOffset then r = r.WithOffset( f.OffsetMinutes )
+    f = r
+end sub
+
+' DateTime: one half, the other half and the offset kept (a form binding one control to it)
+public sub tkBind_Put( byref f as DateTime, byref v as const TKDATE )
+    dim as LocalDate ld = LocalOfDate_( v )
+    if ld.IsValid = false then f = DateTime.Invalid( ) : exit sub
+    dim as chrono.LocalTime lt = chrono.LocalTime.Midnight( )
+    if f.IsValid then lt = f.GetTimeOfDay( )
+    dim as DateTime r = DateTime.FromDateTime( ld, lt )
+    if f.IsValid andalso f.HasOffset then r = r.WithOffset( f.OffsetMinutes )
+    f = r
+end sub
+
+public sub tkBind_Put( byref f as DateTime, byval v as TKTIME )
+    if f.IsValid = false then exit sub                  ' no date to put a time on
+    dim as chrono.LocalTime lt = LocalOfTime_( v )
+    if lt.IsValid = false then lt = chrono.LocalTime.Midnight( )
+    dim as LocalDate ld = f.GetDate( )
+    dim as DateTime r = DateTime.FromDateTime( ld, lt )
+    if f.HasOffset then r = r.WithOffset( f.OffsetMinutes )
+    f = r
+end sub
+
+' ---- the datetime kind (tkDateTimePicker) -------------------------------------------------------
+' TKDATETIME (tkTimePanel) <-> chrono.DateTime, TKDATETIME and text. No value is wYear = 0,
+' DateTime.Invalid() and "". Text out is ISO yyyy-mm-ddTHH:mm:ss (.fff when there are
+' milliseconds); in, ISO first, then tkTimePanel_ParseLooseDateTime. A DateTime's offset is
+' ignored on load and kept on save.
+
+private function DtOfDateTime_( byref v as DateTime ) as TKDATETIME
+    if v.IsValid = false then return tkTimePanel_EmptyDateTime( )
+    return tkTimePanel_MakeDateTime( v.Year, v.Month, v.Day, v.Hour, v.Minute, v.Second, v.Millisecond )
+end function
+
+private function DtOfText_( byref s as const ustring ) as TKDATETIME
+    dim as TKDATETIME t
+    if tkTimePanel_ParseIsoDateTime( s, t ) then return t
+    if tkTimePanel_ParseLooseDateTime( s, t ) then return t
+    return tkTimePanel_EmptyDateTime( )
+end function
+
+private function DtText_( byref t as const TKDATETIME ) as ustring
+    return tkTimePanel_FormatIsoDateTime( t, true, t.wMilliseconds <> 0 )
+end function
+
+private sub PutDateTime_( byref f as DateTime, byref t as const TKDATETIME )
+    if tkTimePanel_IsDateTime( t ) = false then f = DateTime.Invalid( ) : exit sub
+    dim as LocalDate ld = LocalOfDate_( tkCalendar_MakeDate( t.wYear, t.wMonth, t.wDay ) )
+    dim as chrono.LocalTime lt = chrono.LocalTime( t.wHour, t.wMinute, t.wSecond, t.wMilliseconds )
+    dim as DateTime r = DateTime.FromDateTime( ld, lt )
+    if f.IsValid andalso f.HasOffset then r = r.WithOffset( f.OffsetMinutes )
+    f = r
+end sub
+
+' load
+public function tkBind_DateTime overload( byref v as const TKDATETIME ) as TKDATETIME : return v : end function
+public function tkBind_DateTime( byref v as DateTime ) as TKDATETIME : return DtOfDateTime_( v ) : end function
+public function tkBind_DateTime( byref v as const ustring ) as TKDATETIME : return DtOfText_( v ) : end function
+public function tkBind_DateTime( byref v as const string ) as TKDATETIME : return DtOfText_( v ) : end function
+public function tkBind_Text( byref v as const TKDATETIME ) as ustring : return DtText_( v ) : end function
+
+' save
+public sub tkBind_Put( byref f as TKDATETIME, byval v as TKDATETIME ) : f = v : end sub
+public sub tkBind_Put( byref f as DateTime, byval v as TKDATETIME ) : PutDateTime_( f, v ) : end sub
+public sub tkBind_Put( byref f as ustring, byval v as TKDATETIME ) : f = DtText_( v ) : end sub
+public sub tkBind_Put( byref f as string, byval v as TKDATETIME ) : f = DtText_( v ) : end sub
+public sub tkBind_Put( byref f as TKDATETIME, byref v as const ustring ) : f = DtOfText_( v ) : end sub
+
+' ---- a field as a TK_VALUE (printing R5: what a designed ReportViewer's fill goes through) ----
+' The field's own kind: integers INT, single / double FLOAT, text TEXT, dates DATE, times TIME. A
+' DateTime gives its date. No date / no time is EMPTY, as TK_VALUE's setters make it. v = 0: nothing.
+public sub tkBind_ToValue overload( byval x as boolean, byval v as TK_VALUE ptr )
+    if v then v->SetBool( x )
+end sub
+public sub tkBind_ToValue( byval x as byte, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as ubyte, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as short, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as ushort, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as long, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as ulong, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as longint, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as ulongint, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as integer, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as uinteger, byval v as TK_VALUE ptr )
+    if v then v->SetInt( x )
+end sub
+public sub tkBind_ToValue( byval x as single, byval v as TK_VALUE ptr )
+    if v then v->SetFloat( x )
+end sub
+public sub tkBind_ToValue( byval x as double, byval v as TK_VALUE ptr )
+    if v then v->SetFloat( x )
+end sub
+public sub tkBind_ToValue( byref x as const ustring, byval v as TK_VALUE ptr )
+    if v then v->SetText( x )
+end sub
+public sub tkBind_ToValue( byref x as const string, byval v as TK_VALUE ptr )
+    if v then v->SetText( x )
+end sub
+public sub tkBind_ToValue( byref x as const TKDATE, byval v as TK_VALUE ptr )
+    if v then v->SetDate( x )
+end sub
+public sub tkBind_ToValue( byref x as LocalDate, byval v as TK_VALUE ptr )
+    if v then v->SetDate( DateOfLocal_( x ) )
+end sub
+public sub tkBind_ToValue( byref x as DateTime, byval v as TK_VALUE ptr )
+    if v then v->SetDate( tkBind_Date( x ) )
+end sub
+public sub tkBind_ToValue( byref x as const TKTIME, byval v as TK_VALUE ptr )
+    if v then v->SetTime( x )
+end sub
+public sub tkBind_ToValue( byref x as chrono.LocalTime, byval v as TK_VALUE ptr )
+    if v then v->SetTime( TimeOfLocal_( x ) )
+end sub

@@ -1,0 +1,1245 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkRExpr -- the compiler: a lexer and a precedence-climbing parser that type-checks against the
+' schema WHILE it emits the code, so a compiled expression never meets a kind it did not expect
+' (a field whose row value is of another kind is converted on load). Each parse step returns the
+' kind it left on the stack, or RXK_ERR once an error is recorded (the first error wins).
+'
+' Precedence, loosest first: or orelse xor | and andalso | not | comparison like in | & | + - |
+' * / \ mod | unary - | ^ (right to left, binds tighter than unary minus: -2 ^ 2 = -4).
+#module "tkRExpr"
+
+#import "../tkBind"
+#import "std/chrono"
+
+using tkBind
+using tkCalendar
+using tkTimePanel
+
+const RXK_ERR = -1
+const RX_MAX_NEST = 48
+const RX_MAX_ARGS = 32
+const RX_MAX_OPS = 100000
+
+enum
+    RXT_END = 0
+    RXT_INT
+    RXT_FLOAT
+    RXT_STR
+    RXT_DATE
+    RXT_TIME
+    RXT_FIELD
+    RXT_PARAM
+    RXT_ID
+    RXT_OP
+    RXT_LP
+    RXT_RP
+    RXT_COMMA
+end enum
+
+type RX_PARSER
+    src    as ustring
+    n      as int32
+    p      as int32 = 1
+    tk     as int32
+    tpos   as int32
+    tlen   as int32
+    tstr   as ustring
+    ti     as int64
+    tf     as float64
+    x      as TK_REXPR ptr        ' the code being written: the root, or an aggregate's argument
+    root   as TK_REXPR ptr
+    sch    as TKREXPR_SCHEMA ptr
+    perr   as TKREXPR_ERROR ptr
+    failed as boolean
+    nest   as int32
+    inAgg  as boolean
+    declare sub Nxt( )
+    declare function Fail( byref msg as const ustring, byval col as int32, byval length as int32 ) as int32
+    declare function FailHere( byref msg as const ustring ) as int32
+    declare function Emit( byval op as int32, byval delta as int32, byval a as int32 = 0, byval b as int32 = 0, _
+                           byval i as int64 = 0, byval d as float64 = 0 ) as int32
+    declare function AddStr( byref s as const ustring ) as int32
+    declare function IsWord( byref w as const ustring ) as boolean
+    declare function IsOp( byref o as const ustring ) as boolean
+    declare function POr( ) as int32
+    declare function PAnd( ) as int32
+    declare function PNot( ) as int32
+    declare function PCmp( ) as int32
+    declare function PCat( ) as int32
+    declare function PAdd( ) as int32
+    declare function PMul( ) as int32
+    declare function PUnary( ) as int32
+    declare function PAtom( ) as int32
+    declare function PCall( byref nm as const ustring, byval namePos as int32, byval nameLen as int32 ) as int32
+    declare function PIif( ) as int32
+    declare function PIfEmpty( ) as int32
+    declare function PAgg( byval fn as int32, byref nm as const ustring, byval namePos as int32, byval nameLen as int32 ) as int32
+    declare function PArgs( kinds() as int32, starts() as int32, nops() as int32 ) as int32
+    declare function Arith( byref op as const ustring, byval ka as int32, byval kb as int32, byval opPos as int32, byval opLen as int32 ) as int32
+    declare function Comparable( byval ka as int32, byval kb as int32, byval relop as int32, byval opPos as int32, byval opLen as int32 ) as boolean
+    declare sub ToFloatAt( byval nopIdx as int32, byval k as int32, byval target as int32 )
+    declare function FindField( byref nm as const ustring ) as int32
+    declare function FindParam( byref nm as const ustring ) as int32
+    declare function IsConstText( byval start as int32, byref s as ustring ) as boolean
+end type
+
+' ---- kinds -----------------------------------------------------------------------------------
+function RxKindName( byval k as int32 ) as ustring
+    select case k
+    case TKV_TEXT : return "text"
+    case TKV_INT : return "a whole number"
+    case TKV_FLOAT : return "a number"
+    case TKV_BOOL : return "true / false"
+    case TKV_DATE : return "a date"
+    case TKV_TIME : return "a time"
+    end select
+    return "empty"
+end function
+
+private function IsNumK( byval k as int32 ) as boolean
+    return (k = TKV_INT) orelse (k = TKV_FLOAT) orelse (k = TKV_EMPTY)
+end function
+
+private function NotBool( byval k as int32 ) as boolean
+    return (k <> TKV_BOOL) andalso (k <> TKV_EMPTY)
+end function
+
+' The kind two values join to (iif's branches, Choose's values): equal, empty with anything, int
+' with float = float. RXK_ERR when they do not join.
+function RxJoin( byval ka as int32, byval kb as int32 ) as int32
+    if ka = TKV_EMPTY then return kb
+    if kb = TKV_EMPTY then return ka
+    if ka = kb then return ka
+    if ((ka = TKV_INT) andalso (kb = TKV_FLOAT)) orelse ((ka = TKV_FLOAT) andalso (kb = TKV_INT)) then return TKV_FLOAT
+    return RXK_ERR
+end function
+
+private function Ordinal( byval i as int32 ) as ustring
+    select case i
+    case 1 : return "1st"
+    case 2 : return "2nd"
+    case 3 : return "3rd"
+    end select
+    return i & "th"
+end function
+
+' ---- the parser's tools ---------------------------------------------------------------------
+function RX_PARSER.Fail( byref msg as const ustring, byval col as int32, byval length as int32 ) as int32
+    if failed = false then
+        failed = true
+        perr->msg = msg
+        perr->col = col
+        perr->length = iif( length < 1, 1, length )
+    end if
+    return RXK_ERR
+end function
+
+function RX_PARSER.FailHere( byref msg as const ustring ) as int32
+    return Fail( msg, tpos, tlen )
+end function
+
+function RX_PARSER.Emit( byval op as int32, byval delta as int32, byval a as int32 = 0, byval b as int32 = 0, _
+                         byval i as int64 = 0, byval d as float64 = 0 ) as int32
+    if x->nOps >= RX_MAX_OPS then
+        Fail( "the expression is too long", 1, n )
+        return 0
+    end if
+    if x->nOps > ubound( x->ops ) then redim preserve x->ops( 0 to x->nOps * 2 + 15 )
+    dim as RX_OP ptr o = @x->ops(x->nOps)
+    o->op = op : o->a = a : o->b = b : o->i = i : o->d = d
+    x->nOps += 1
+    x->depth += delta
+    if x->depth > x->maxDepth then x->maxDepth = x->depth
+    return x->nOps - 1
+end function
+
+function RX_PARSER.AddStr( byref s as const ustring ) as int32
+    if x->nStrs > ubound( x->strs ) then redim preserve x->strs( 0 to x->nStrs * 2 + 7 )
+    x->strs(x->nStrs) = s
+    x->nStrs += 1
+    return x->nStrs - 1
+end function
+
+function RX_PARSER.IsWord( byref w as const ustring ) as boolean
+    return (tk = RXT_ID) andalso (lcase( tstr ) = w)
+end function
+
+function RX_PARSER.IsOp( byref o as const ustring ) as boolean
+    return (tk = RXT_OP) andalso (tstr = o)
+end function
+
+' Converts the value a NOP placeholder follows when it is an int and the join is float.
+sub RX_PARSER.ToFloatAt( byval nopIdx as int32, byval k as int32, byval target as int32 )
+    if (target = TKV_FLOAT) andalso (k = TKV_INT) then
+        x->ops(nopIdx).op = RXO_I2F
+        x->ops(nopIdx).a = 0
+    end if
+end sub
+
+' TRUE when the code from 'start' to the end is one text constant (a Format mask, a DateAdd unit).
+function RX_PARSER.IsConstText( byval start as int32, byref s as ustring ) as boolean
+    if x->nOps - start <> 1 then return false
+    if x->ops(start).op <> RXO_LDCS then return false
+    s = x->strs(x->ops(start).a)
+    return true
+end function
+
+function RX_PARSER.FindField( byref nm as const ustring ) as int32
+    dim as ustring l = lcase( nm )
+    for f as int32 = 0 to sch->nFields - 1
+        if lcase( sch->names(f) ) = l then return f
+    next
+    if len( sch->defaultSource ) > 0 then            ' [Qty], [Home.City]: under the default source
+        dim as ustring q = lcase( sch->defaultSource ) & "." & l
+        for f as int32 = 0 to sch->nFields - 1
+            if lcase( sch->names(f) ) = q then return f
+        next
+    end if
+    return -1
+end function
+
+function RX_PARSER.FindParam( byref nm as const ustring ) as int32
+    dim as ustring l = lcase( nm )
+    for k as int32 = 0 to sch->nParams - 1
+        if lcase( sch->pnames(k) ) = l then return k
+    next
+    return -1
+end function
+
+' ---- the lexer ---------------------------------------------------------------------------------
+private function IsDigitC( byref c as const ustring ) as boolean
+    return (len( c ) = 1) andalso (c >= "0") andalso (c <= "9")
+end function
+
+private function IsIdStart( byref c as const ustring ) as boolean
+    dim as ustring l = lcase( c )
+    return ((l >= "a") andalso (l <= "z") andalso (len( l ) = 1)) orelse (c = "_")
+end function
+
+' "#2026-11-25#" -> days; "#14:30#" / "#14:30:15#" -> seconds. FALSE when it is neither.
+private function ParseDateTimeLit( byref s as const ustring, byref isDate as boolean, byref v as int64 ) as boolean
+    if (len( s ) = 10) andalso (mid( s, 5, 1 ) = "-") andalso (mid( s, 8, 1 ) = "-") then
+        for i as int32 = 1 to 10
+            if (i <> 5) andalso (i <> 8) andalso (IsDigitC( mid( s, i, 1 ) ) = false) then return false
+        next
+        dim as int64 y = vallng( left( s, 4 ) ), m = vallng( mid( s, 6, 2 ) ), d = vallng( mid( s, 9, 2 ) )
+        if RxValidDate( y, m, d ) = false then return false
+        isDate = true
+        v = RxDaysFromCivil( y, m, d )
+        return true
+    end if
+    if ((len( s ) = 5) orelse (len( s ) = 8)) andalso (mid( s, 3, 1 ) = ":") then
+        if (len( s ) = 8) andalso (mid( s, 6, 1 ) <> ":") then return false
+        for i as int32 = 1 to len( s )
+            if (i <> 3) andalso (i <> 6) andalso (IsDigitC( mid( s, i, 1 ) ) = false) then return false
+        next
+        dim as int64 h = vallng( left( s, 2 ) ), mi = vallng( mid( s, 4, 2 ) ), se = 0
+        if len( s ) = 8 then se = vallng( mid( s, 7, 2 ) )
+        if (h > 23) orelse (mi > 59) orelse (se > 59) then return false
+        isDate = false
+        v = h * 3600 + mi * 60 + se
+        return true
+    end if
+    return false
+end function
+
+sub RX_PARSER.Nxt( )
+    while p <= n
+        dim as ustring c = mid( src, p, 1 )
+        if (c = " ") orelse (c = chr( 9 )) orelse (c = chr( 10 )) orelse (c = chr( 13 )) then p += 1 else exit while
+    wend
+    tpos = p : tlen = 0 : tstr = ""
+    if p > n then
+        tk = RXT_END
+        exit sub
+    end if
+    dim as ustring c = mid( src, p, 1 )
+    dim as int32 q = p
+    if IsDigitC( c ) orelse ((c = ".") andalso IsDigitC( mid( src, p + 1, 1 ) )) then
+        dim as boolean isF
+        while (q <= n) andalso IsDigitC( mid( src, q, 1 ) )
+            q += 1
+        wend
+        if (mid( src, q, 1 ) = ".") andalso IsDigitC( mid( src, q + 1, 1 ) ) then
+            isF = true
+            q += 1
+            while (q <= n) andalso IsDigitC( mid( src, q, 1 ) )
+                q += 1
+            wend
+        end if
+        dim as ustring e = lcase( mid( src, q, 1 ) )
+        if e = "e" then
+            dim as int32 r = q + 1
+            if (mid( src, r, 1 ) = "+") orelse (mid( src, r, 1 ) = "-") then r += 1
+            if IsDigitC( mid( src, r, 1 ) ) then
+                isF = true
+                q = r
+                while (q <= n) andalso IsDigitC( mid( src, q, 1 ) )
+                    q += 1
+                wend
+            end if
+        end if
+        tstr = mid( src, p, q - p )
+        tlen = q - p
+        p = q
+        if isF then
+            tk = RXT_FLOAT
+            tf = val( tstr )
+        else
+            if len( tstr ) > 18 then
+                FailHere( "the number " & tstr & " is too large" )
+                tk = RXT_END
+                exit sub
+            end if
+            tk = RXT_INT
+            ti = vallng( tstr )
+        end if
+        exit sub
+    end if
+    if c = """" then
+        q = p + 1
+        dim as ustring s
+        do
+            if q > n then
+                tlen = n - p + 1
+                FailHere( "the text has no closing """ )
+                tk = RXT_END
+                exit sub
+            end if
+            dim as ustring d = mid( src, q, 1 )
+            if d = """" then
+                if mid( src, q + 1, 1 ) = """" then
+                    s &= """"
+                    q += 2
+                    continue do
+                end if
+                exit do
+            end if
+            s &= d
+            q += 1
+        loop
+        tk = RXT_STR
+        tstr = s
+        tlen = q - p + 1
+        p = q + 1
+        exit sub
+    end if
+    if (c = "[") orelse (c = "#") then
+        dim as ustring closer = iif( c = "[", "]", "#" )
+        q = instr( p + 1, src, closer )
+        if q = 0 then
+            tlen = n - p + 1
+            FailHere( iif( c = "[", "the field name has no closing ]", "the date or time has no closing #" ) )
+            tk = RXT_END
+            exit sub
+        end if
+        tstr = mid( src, p + 1, q - p - 1 )
+        tlen = q - p + 1
+        p = q + 1
+        if c = "[" then
+            if len( trim( tstr ) ) = 0 then
+                FailHere( "[] names no field" )
+                tk = RXT_END
+                exit sub
+            end if
+            tk = RXT_FIELD
+            exit sub
+        end if
+        dim as boolean isDate
+        if ParseDateTimeLit( tstr, isDate, ti ) = false then
+            FailHere( "#" & tstr & "# is not a date (#yyyy-mm-dd#) or a time (#hh:mm# or #hh:mm:ss#)" )
+            tk = RXT_END
+            exit sub
+        end if
+        tk = iif( isDate, RXT_DATE, RXT_TIME )
+        exit sub
+    end if
+    if (c = "@") orelse IsIdStart( c ) then
+        q = p + 1
+        while q <= n
+            dim as ustring d = mid( src, q, 1 )
+            if IsIdStart( d ) orelse IsDigitC( d ) then q += 1 else exit while
+        wend
+        tlen = q - p
+        if c = "@" then
+            tstr = mid( src, p + 1, q - p - 1 )
+            if len( tstr ) = 0 then
+                FailHere( "@ names no parameter" )
+                tk = RXT_END
+                p = q
+                exit sub
+            end if
+            tk = RXT_PARAM
+        else
+            tstr = mid( src, p, q - p )
+            tk = RXT_ID
+        end if
+        p = q
+        exit sub
+    end if
+    select case c
+    case "("
+        tk = RXT_LP
+    case ")"
+        tk = RXT_RP
+    case ","
+        tk = RXT_COMMA
+    case "<", ">", "=", "+", "-", "*", "/", "\", "^", "&"
+        tk = RXT_OP
+        dim as ustring two = mid( src, p, 2 )
+        if (two = "<>") orelse (two = "<=") orelse (two = ">=") then
+            tstr = two
+            tlen = 2
+            p += 2
+            exit sub
+        end if
+        tstr = c
+    case else
+        tlen = 1
+        FailHere( "unexpected '" & c & "'" )
+        tk = RXT_END
+        p += 1
+        exit sub
+    end select
+    tlen = 1
+    p += 1
+end sub
+
+' ---- the grammar -------------------------------------------------------------------------------
+function RX_PARSER.POr( ) as int32
+    nest += 1
+    if nest > RX_MAX_NEST then return FailHere( "the expression is nested too deeply" )
+    dim as int32 k = PAnd( )
+    while (k <> RXK_ERR) andalso (IsWord( "or" ) orelse IsWord( "orelse" ) orelse IsWord( "xor" ))
+        dim as ustring w = lcase( tstr )
+        dim as int32 opPos = tpos, opLen = tlen
+        if NotBool( k ) then return Fail( "'" & w & "' needs true / false values, not " & RxKindName( k ), opPos, opLen )
+        Nxt( )
+        if w = "xor" then
+            dim as int32 k2 = PAnd( )
+            if k2 = RXK_ERR then return RXK_ERR
+            if NotBool( k2 ) then return Fail( "'xor' needs true / false values, not " & RxKindName( k2 ), opPos, opLen )
+            Emit( RXO_XOR, -1 )
+        else
+            ' a JT T ; b JT T ; false ; JMP E ; T: true ; E:
+            dim as int32 j1 = Emit( RXO_JT, -1 )
+            dim as int32 k2 = PAnd( )
+            if k2 = RXK_ERR then return RXK_ERR
+            if NotBool( k2 ) then return Fail( "'" & w & "' needs true / false values, not " & RxKindName( k2 ), opPos, opLen )
+            dim as int32 j2 = Emit( RXO_JT, -1 )
+            Emit( RXO_PUSHB, 1, 0, 0, 0 )
+            dim as int32 j3 = Emit( RXO_JMP, 0 )
+            x->depth -= 1
+            x->ops(j1).a = x->nOps
+            x->ops(j2).a = x->nOps
+            Emit( RXO_PUSHB, 1, 0, 0, 1 )
+            x->ops(j3).a = x->nOps
+        end if
+        k = TKV_BOOL
+    wend
+    nest -= 1
+    return k
+end function
+
+function RX_PARSER.PAnd( ) as int32
+    dim as int32 k = PNot( )
+    while (k <> RXK_ERR) andalso (IsWord( "and" ) orelse IsWord( "andalso" ))
+        dim as ustring w = lcase( tstr )
+        dim as int32 opPos = tpos, opLen = tlen
+        if NotBool( k ) then return Fail( "'" & w & "' needs true / false values, not " & RxKindName( k ), opPos, opLen )
+        Nxt( )
+        ' a JF F ; b JF F ; true ; JMP E ; F: false ; E:
+        dim as int32 j1 = Emit( RXO_JF, -1 )
+        dim as int32 k2 = PNot( )
+        if k2 = RXK_ERR then return RXK_ERR
+        if NotBool( k2 ) then return Fail( "'" & w & "' needs true / false values, not " & RxKindName( k2 ), opPos, opLen )
+        dim as int32 j2 = Emit( RXO_JF, -1 )
+        Emit( RXO_PUSHB, 1, 0, 0, 1 )
+        dim as int32 j3 = Emit( RXO_JMP, 0 )
+        x->depth -= 1
+        x->ops(j1).a = x->nOps
+        x->ops(j2).a = x->nOps
+        Emit( RXO_PUSHB, 1, 0, 0, 0 )
+        x->ops(j3).a = x->nOps
+        k = TKV_BOOL
+    wend
+    return k
+end function
+
+function RX_PARSER.PNot( ) as int32
+    if IsWord( "not" ) then
+        dim as int32 opPos = tpos, opLen = tlen
+        Nxt( )
+        dim as int32 k = PNot( )
+        if k = RXK_ERR then return RXK_ERR
+        if NotBool( k ) then return Fail( "'not' needs a true / false value, not " & RxKindName( k ), opPos, opLen )
+        Emit( RXO_NOT, 0 )
+        return TKV_BOOL
+    end if
+    return PCmp( )
+end function
+
+private function RelOp( byref s as const ustring ) as int32
+    select case s
+    case "=" : return 0
+    case "<>" : return 1
+    case "<" : return 2
+    case "<=" : return 3
+    case ">" : return 4
+    case ">=" : return 5
+    end select
+    return -1
+end function
+
+function RX_PARSER.Comparable( byval ka as int32, byval kb as int32, byval relop as int32, byval opPos as int32, byval opLen as int32 ) as boolean
+    if (ka = TKV_EMPTY) orelse (kb = TKV_EMPTY) then
+        Fail( "a comparison with empty is never true: use IsEmpty( )", opPos, opLen )
+        return false
+    end if
+    if (ka = kb) orelse ((ka = TKV_INT orelse ka = TKV_FLOAT) andalso (kb = TKV_INT orelse kb = TKV_FLOAT)) then
+        if (ka = TKV_BOOL) andalso (relop > 1) then
+            Fail( "true / false values can only be compared with = or <>", opPos, opLen )
+            return false
+        end if
+        return true
+    end if
+    Fail( "can't compare " & RxKindName( ka ) & " with " & RxKindName( kb ), opPos, opLen )
+    return false
+end function
+
+function RX_PARSER.PCmp( ) as int32
+    dim as int32 k = PCat( )
+    if k = RXK_ERR then return RXK_ERR
+    dim as int32 opPos = tpos, opLen = tlen
+    if (tk = RXT_OP) andalso (RelOp( tstr ) >= 0) then
+        dim as int32 r = RelOp( tstr )
+        Nxt( )
+        dim as int32 k2 = PCat( )
+        if k2 = RXK_ERR then return RXK_ERR
+        if Comparable( k, k2, r, opPos, opLen ) = false then return RXK_ERR
+        Emit( RXO_CMP, -1, r )
+        k = TKV_BOOL
+    elseif IsWord( "like" ) then
+        Nxt( )
+        dim as int32 k2 = PCat( )
+        if k2 = RXK_ERR then return RXK_ERR
+        if ((k <> TKV_TEXT) andalso (k <> TKV_EMPTY)) orelse ((k2 <> TKV_TEXT) andalso (k2 <> TKV_EMPTY)) then
+            return Fail( "'like' matches text with a text pattern", opPos, opLen )
+        end if
+        Emit( RXO_LIKE, -1 )
+        k = TKV_BOOL
+    elseif IsWord( "in" ) then
+        Nxt( )
+        if tk <> RXT_LP then return FailHere( "'in' needs a list: x in (a, b, c)" )
+        Nxt( )
+        dim as int32 cnt
+        do
+            dim as int32 iPos = tpos
+            dim as int32 kj = POr( )
+            if kj = RXK_ERR then return RXK_ERR
+            if Comparable( k, kj, 0, iPos, tpos - iPos ) = false then return RXK_ERR
+            cnt += 1
+            if tk = RXT_COMMA then
+                Nxt( )
+                continue do
+            end if
+            if tk = RXT_RP then exit do
+            return FailHere( "',' or ')' expected" )
+        loop
+        Nxt( )
+        Emit( RXO_IN, -cnt, cnt )
+        k = TKV_BOOL
+    else
+        return k
+    end if
+    if ((tk = RXT_OP) andalso (RelOp( tstr ) >= 0)) orelse IsWord( "like" ) orelse IsWord( "in" ) then
+        return FailHere( "one comparison at a time: join two with 'and'" )
+    end if
+    return k
+end function
+
+function RX_PARSER.PCat( ) as int32
+    dim as int32 k = PAdd( )
+    if (k = RXK_ERR) orelse (IsOp( "&" ) = false) then return k
+    if k <> TKV_TEXT then Emit( RXO_TOTEXT, 0 )
+    while IsOp( "&" )
+        Nxt( )
+        dim as int32 k2 = PAdd( )
+        if k2 = RXK_ERR then return RXK_ERR
+        if k2 <> TKV_TEXT then Emit( RXO_TOTEXT, 0 )
+        Emit( RXO_CAT, -1, 0 )
+    wend
+    return TKV_TEXT
+end function
+
+' Both operands are on the stack (a under b). Emits the operation for their kinds; its kind.
+function RX_PARSER.Arith( byref op as const ustring, byval ka as int32, byval kb as int32, byval opPos as int32, byval opLen as int32 ) as int32
+    dim as boolean intA = (ka = TKV_INT) orelse (ka = TKV_EMPTY), intB = (kb = TKV_INT) orelse (kb = TKV_EMPTY)
+    select case op
+    case "+", "-"
+        if op = "+" then
+            if ((ka = TKV_TEXT) orelse (ka = TKV_EMPTY)) andalso ((kb = TKV_TEXT) orelse (kb = TKV_EMPTY)) andalso _
+               ((ka = TKV_TEXT) orelse (kb = TKV_TEXT)) then
+                Emit( RXO_CAT, -1, 1 )
+                return TKV_TEXT
+            end if
+            if ((ka = TKV_DATE) andalso intB) orelse ((kb = TKV_DATE) andalso intA) then
+                Emit( RXO_ADDI, -1, 0, TKV_DATE )
+                return TKV_DATE
+            end if
+            if ((ka = TKV_TIME) andalso intB) orelse ((kb = TKV_TIME) andalso intA) then
+                Emit( RXO_ADDI, -1, 0, TKV_TIME )
+                return TKV_TIME
+            end if
+        else
+            if (ka = TKV_DATE) andalso (kb = TKV_DATE) then
+                Emit( RXO_SUBI, -1, 0, TKV_INT )
+                return TKV_INT
+            end if
+            if (ka = TKV_DATE) andalso intB then
+                Emit( RXO_SUBI, -1, 0, TKV_DATE )
+                return TKV_DATE
+            end if
+            if (ka = TKV_TIME) andalso (kb = TKV_TIME) then
+                Emit( RXO_SUBI, -1, 0, TKV_INT )
+                return TKV_INT
+            end if
+            if (ka = TKV_TIME) andalso intB then
+                Emit( RXO_SUBI, -1, 0, TKV_TIME )
+                return TKV_TIME
+            end if
+        end if
+        if (ka = TKV_TEXT) orelse (kb = TKV_TEXT) then
+            if op = "+" then return Fail( "'+' can't add text and " & RxKindName( iif( ka = TKV_TEXT, kb, ka ) ) & ": use & to join text", opPos, opLen )
+            return Fail( "'-' can't subtract text", opPos, opLen )
+        end if
+    case "\", "mod"
+        if (intA = false) orelse (intB = false) then
+            return Fail( "'" & op & "' needs whole numbers, not " & RxKindName( iif( intA, kb, ka ) ) & ": use Int( )", opPos, opLen )
+        end if
+        Emit( iif( op = "\", RXO_IDIV, RXO_MODI ), -1 )
+        return TKV_INT
+    end select
+    if (IsNumK( ka ) = false) orelse (IsNumK( kb ) = false) then
+        return Fail( "'" & op & "' needs numbers, not " & RxKindName( iif( IsNumK( ka ), kb, ka ) ), opPos, opLen )
+    end if
+    dim as boolean asInt = intA andalso intB andalso (op <> "/") andalso (op <> "^")
+    if asInt then
+        select case op
+        case "+" : Emit( RXO_ADDI, -1, 0, TKV_INT )
+        case "-" : Emit( RXO_SUBI, -1, 0, TKV_INT )
+        case "*" : Emit( RXO_MULI, -1, 0, TKV_INT )
+        end select
+        return TKV_INT
+    end if
+    if ka = TKV_INT then Emit( RXO_I2F, 0, 1 )
+    if kb = TKV_INT then Emit( RXO_I2F, 0, 0 )
+    select case op
+    case "+" : Emit( RXO_ADDF, -1 )
+    case "-" : Emit( RXO_SUBF, -1 )
+    case "*" : Emit( RXO_MULF, -1 )
+    case "/" : Emit( RXO_DIVF, -1 )
+    case "^" : Emit( RXO_POWF, -1 )
+    end select
+    return TKV_FLOAT
+end function
+
+function RX_PARSER.PAdd( ) as int32
+    dim as int32 k = PMul( )
+    while (k <> RXK_ERR) andalso (IsOp( "+" ) orelse IsOp( "-" ))
+        dim as ustring o = tstr
+        dim as int32 opPos = tpos, opLen = tlen
+        Nxt( )
+        dim as int32 k2 = PMul( )
+        if k2 = RXK_ERR then return RXK_ERR
+        k = Arith( o, k, k2, opPos, opLen )
+    wend
+    return k
+end function
+
+function RX_PARSER.PMul( ) as int32
+    dim as int32 k = PUnary( )
+    while (k <> RXK_ERR) andalso (IsOp( "*" ) orelse IsOp( "/" ) orelse IsOp( "\" ) orelse IsWord( "mod" ))
+        dim as ustring o = lcase( tstr )
+        dim as int32 opPos = tpos, opLen = tlen
+        Nxt( )
+        dim as int32 k2 = PUnary( )
+        if k2 = RXK_ERR then return RXK_ERR
+        k = Arith( o, k, k2, opPos, opLen )
+    wend
+    return k
+end function
+
+function RX_PARSER.PUnary( ) as int32
+    if IsOp( "-" ) orelse IsOp( "+" ) then
+        dim as boolean neg = IsOp( "-" )
+        dim as int32 opPos = tpos, opLen = tlen
+        Nxt( )
+        dim as int32 k = PUnary( )
+        if k = RXK_ERR then return RXK_ERR
+        if IsNumK( k ) = false then return Fail( "a sign needs a number, not " & RxKindName( k ), opPos, opLen )
+        if neg then Emit( iif( k = TKV_FLOAT, RXO_NEGF, RXO_NEGI ), 0 )
+        return iif( k = TKV_EMPTY, TKV_INT, k )
+    end if
+    dim as int32 k = PAtom( )
+    if (k <> RXK_ERR) andalso IsOp( "^" ) then
+        dim as int32 opPos = tpos, opLen = tlen
+        Nxt( )
+        dim as int32 k2 = PUnary( )
+        if k2 = RXK_ERR then return RXK_ERR
+        k = Arith( "^", k, k2, opPos, opLen )
+    end if
+    return k
+end function
+
+' A report value: PageNumber, PageCount ... (an optional "( )" after it).
+private function BuiltinValue( byref l as const ustring, byref kind as int32 ) as int32
+    select case l
+    case "pagenumber" : kind = TKV_INT : return TKRX_B_PAGENUMBER
+    case "pagecount" : kind = TKV_INT : return TKRX_B_PAGECOUNT
+    case "rownumber" : kind = TKV_INT : return TKRX_B_ROWNUMBER
+    case "grouprownumber" : kind = TKV_INT : return TKRX_B_GROUPROWNUMBER
+    case "reporttitle" : kind = TKV_TEXT : return TKRX_B_REPORTTITLE
+    case "printdate", "today" : kind = TKV_DATE : return TKRX_B_PRINTDATE
+    case "printtime", "now" : kind = TKV_TIME : return TKRX_B_PRINTTIME
+    end select
+    return -1
+end function
+
+private function AggOf( byref l as const ustring ) as int32
+    select case l
+    case "sum" : return TKRX_AGG_SUM
+    case "count" : return TKRX_AGG_COUNT
+    case "avg" : return TKRX_AGG_AVG
+    case "min" : return TKRX_AGG_MIN
+    case "max" : return TKRX_AGG_MAX
+    case "first" : return TKRX_AGG_FIRST
+    case "last" : return TKRX_AGG_LAST
+    case "groupcount" : return TKRX_AGG_GROUPCOUNT
+    end select
+    return -1
+end function
+
+' A built-in function's id, its argument signature (T text, I whole number, N number, D date,
+' M time, B true/false, A anything; '?' = may be left out, from there on) and its result kind
+' (RXK_ERR = worked out by the caller).
+private function FnSig( byref l as const ustring, byref id as int32, byref sig as string, byref ret as int32 ) as boolean
+    ret = RXK_ERR
+    select case l
+    case "isempty" : id = RXF_ISEMPTY : sig = "A" : ret = TKV_BOOL
+    case "between" : id = RXF_BETWEEN : sig = "A A A" : ret = TKV_BOOL
+    case "len" : id = RXF_LEN : sig = "T" : ret = TKV_INT
+    case "left" : id = RXF_LEFT : sig = "T I" : ret = TKV_TEXT
+    case "right" : id = RXF_RIGHT : sig = "T I" : ret = TKV_TEXT
+    case "mid" : id = RXF_MID : sig = "T I I?" : ret = TKV_TEXT
+    case "ucase" : id = RXF_UCASE : sig = "T" : ret = TKV_TEXT
+    case "lcase" : id = RXF_LCASE : sig = "T" : ret = TKV_TEXT
+    case "trim" : id = RXF_TRIM : sig = "T" : ret = TKV_TEXT
+    case "ltrim" : id = RXF_LTRIM : sig = "T" : ret = TKV_TEXT
+    case "rtrim" : id = RXF_RTRIM : sig = "T" : ret = TKV_TEXT
+    case "instr" : id = RXF_INSTR : sig = "A T T?" : ret = TKV_INT
+    case "replace" : id = RXF_REPLACE : sig = "T T T" : ret = TKV_TEXT
+    case "str", "cstr" : id = RXF_STR : sig = "A" : ret = TKV_TEXT
+    case "val" : id = RXF_VAL : sig = "T" : ret = TKV_FLOAT
+    case "format" : id = RXF_FORMAT : sig = "A T" : ret = TKV_TEXT
+    case "padleft" : id = RXF_PADLEFT : sig = "T I T?" : ret = TKV_TEXT
+    case "padright" : id = RXF_PADRIGHT : sig = "T I T?" : ret = TKV_TEXT
+    case "abs" : id = RXF_ABS : sig = "N"
+    case "int" : id = RXF_INT : sig = "N" : ret = TKV_INT
+    case "fix" : id = RXF_FIX : sig = "N" : ret = TKV_INT
+    case "round" : id = RXF_ROUND : sig = "N I?" : ret = TKV_FLOAT
+    case "sgn" : id = RXF_SGN : sig = "N" : ret = TKV_INT
+    case "sqr" : id = RXF_SQR : sig = "N" : ret = TKV_FLOAT
+    case "choose" : id = RXF_CHOOSE : sig = "I A"
+    case "year" : id = RXF_YEAR : sig = "D" : ret = TKV_INT
+    case "month" : id = RXF_MONTH : sig = "D" : ret = TKV_INT
+    case "day" : id = RXF_DAY : sig = "D" : ret = TKV_INT
+    case "weekday" : id = RXF_WEEKDAY : sig = "D" : ret = TKV_INT
+    case "hour" : id = RXF_HOUR : sig = "M" : ret = TKV_INT
+    case "minute" : id = RXF_MINUTE : sig = "M" : ret = TKV_INT
+    case "second" : id = RXF_SECOND : sig = "M" : ret = TKV_INT
+    case "dateadd" : id = RXF_DATEADD : sig = "T I D" : ret = TKV_DATE
+    case "datediff" : id = RXF_DATEDIFF : sig = "T D D" : ret = TKV_INT
+    case "dateserial" : id = RXF_DATESERIAL : sig = "I I I" : ret = TKV_DATE
+    case "timeserial" : id = RXF_TIMESERIAL : sig = "I I I" : ret = TKV_TIME
+    case "monthname" : id = RXF_MONTHNAME : sig = "I B?" : ret = TKV_TEXT
+    case "cint" : id = RXF_CINT : sig = "A" : ret = TKV_INT
+    case "cfloat", "cdbl" : id = RXF_CFLOAT : sig = "A" : ret = TKV_FLOAT
+    case "cbool" : id = RXF_CBOOL : sig = "A" : ret = TKV_BOOL
+    case "cdate" : id = RXF_CDATE : sig = "T" : ret = TKV_DATE
+    case else : return false
+    end select
+    return true
+end function
+
+function RxIsBuiltinName( byref lname as const ustring ) as boolean
+    dim as int32 id, kind
+    dim as string sig
+    if FnSig( lname, id, sig, kind ) then return true
+    if (BuiltinValue( lname, kind ) >= 0) orelse (AggOf( lname ) >= 0) then return true
+    select case lname
+    case "iif", "ifempty", "param", "and", "andalso", "or", "orelse", "xor", "not", "mod", "like", "in", _
+         "true", "false", "empty"
+        return true
+    end select
+    return false
+end function
+
+private function SigAccepts( byref c as const string, byval k as int32 ) as boolean
+    if k = TKV_EMPTY then return true
+    select case c
+    case "A" : return true
+    case "T" : return k = TKV_TEXT
+    case "I", "N" : return (k = TKV_INT) orelse (k = TKV_FLOAT)
+    case "D" : return k = TKV_DATE
+    case "M" : return k = TKV_TIME
+    case "B" : return k = TKV_BOOL
+    end select
+    return false
+end function
+
+private function SigWord( byref c as const string ) as ustring
+    select case c
+    case "T" : return "text"
+    case "I" : return "a whole number"
+    case "N" : return "a number"
+    case "D" : return "a date"
+    case "M" : return "a time"
+    case "B" : return "true / false"
+    end select
+    return "a value"
+end function
+
+' After "(": the values up to ")", each followed by a NOP placeholder. The count, or -1.
+function RX_PARSER.PArgs( kinds() as int32, starts() as int32, nops() as int32 ) as int32
+    dim as int32 cnt
+    if tk = RXT_RP then
+        Nxt( )
+        return 0
+    end if
+    do
+        if cnt >= RX_MAX_ARGS then
+            FailHere( "too many values (" & RX_MAX_ARGS & " at most)" )
+            return -1
+        end if
+        starts(cnt) = x->nOps
+        dim as int32 k = POr( )
+        if k = RXK_ERR then return -1
+        nops(cnt) = Emit( RXO_NOP, 0 )
+        kinds(cnt) = k
+        cnt += 1
+        if tk = RXT_COMMA then
+            Nxt( )
+            continue do
+        end if
+        if tk = RXT_RP then exit do
+        FailHere( "',' or ')' expected" )
+        return -1
+    loop
+    Nxt( )
+    return cnt
+end function
+
+' iif( c, a, b ): c JF E ; a NOP JMP X ; E: b NOP ; X:  -- only the branch taken is evaluated.
+function RX_PARSER.PIif( ) as int32
+    dim as int32 cPos = tpos
+    dim as int32 kc = POr( )
+    if kc = RXK_ERR then return RXK_ERR
+    if NotBool( kc ) then return Fail( "iif's condition must be true / false, not " & RxKindName( kc ), cPos, tpos - cPos )
+    if tk <> RXT_COMMA then return FailHere( "iif( condition, value if true, value if false ): ',' expected" )
+    Nxt( )
+    dim as int32 jf = Emit( RXO_JF, -1 )
+    dim as int32 aPos = tpos
+    dim as int32 ka = POr( )
+    if ka = RXK_ERR then return RXK_ERR
+    dim as int32 na = Emit( RXO_NOP, 0 )
+    if tk <> RXT_COMMA then return FailHere( "iif( condition, value if true, value if false ): ',' expected" )
+    Nxt( )
+    dim as int32 jm = Emit( RXO_JMP, 0 )
+    x->depth -= 1
+    x->ops(jf).a = x->nOps
+    dim as int32 kb = POr( )
+    if kb = RXK_ERR then return RXK_ERR
+    dim as int32 nb = Emit( RXO_NOP, 0 )
+    if tk <> RXT_RP then return FailHere( "')' expected" )
+    dim as int32 k = RxJoin( ka, kb )
+    if k = RXK_ERR then return Fail( "iif's two values are of different kinds: " & RxKindName( ka ) & " and " & RxKindName( kb ), aPos, tpos - aPos )
+    Nxt( )
+    x->ops(jm).a = x->nOps
+    ToFloatAt( na, ka, k )
+    ToFloatAt( nb, kb, k )
+    return k
+end function
+
+' IfEmpty( a, b ): a NOP JNE X ; POP ; b NOP ; X:  -- b only when a is empty.
+function RX_PARSER.PIfEmpty( ) as int32
+    dim as int32 aPos = tpos
+    dim as int32 ka = POr( )
+    if ka = RXK_ERR then return RXK_ERR
+    dim as int32 na = Emit( RXO_NOP, 0 )
+    if tk <> RXT_COMMA then return FailHere( "IfEmpty( value, value if empty ): ',' expected" )
+    Nxt( )
+    dim as int32 jn = Emit( RXO_JNE, 0 )
+    Emit( RXO_POP, -1 )
+    dim as int32 kb = POr( )
+    if kb = RXK_ERR then return RXK_ERR
+    dim as int32 nb = Emit( RXO_NOP, 0 )
+    if tk <> RXT_RP then return FailHere( "')' expected" )
+    dim as int32 k = RxJoin( ka, kb )
+    if k = RXK_ERR then return Fail( "IfEmpty's two values are of different kinds: " & RxKindName( ka ) & " and " & RxKindName( kb ), aPos, tpos - aPos )
+    Nxt( )
+    x->ops(jn).a = x->nOps
+    ToFloatAt( na, ka, k )
+    ToFloatAt( nb, kb, k )
+    return k
+end function
+
+' Sum( e ) ... : e is compiled as an expression of its own; the call loads the total's result.
+function RX_PARSER.PAgg( byval fn as int32, byref nm as const ustring, byval namePos as int32, byval nameLen as int32 ) as int32
+    if sch->noAggregates then return Fail( "a total (" & nm & ") can't be used here", namePos, nameLen )
+    if inAgg then return Fail( "a total inside a total", namePos, nameLen )
+    dim as TK_REXPR ptr arg
+    dim as int32 ka = TKV_EMPTY
+    if tk = RXT_RP then
+        if fn = TKRX_AGG_COUNT then
+            fn = TKRX_AGG_COUNTROWS
+        elseif fn <> TKRX_AGG_GROUPCOUNT then
+            return FailHere( nm & "( ) needs a value to total" )
+        end if
+        Nxt( )
+    else
+        if fn = TKRX_AGG_GROUPCOUNT then return FailHere( "GroupCount( ) takes no value" )
+        arg = new TK_REXPR
+        dim as TK_REXPR ptr saved = x
+        dim as int32 aPos = tpos
+        x = arg
+        inAgg = true
+        ka = POr( )
+        inAgg = false
+        x = saved
+        if ka = RXK_ERR then
+            tkRExpr_Destroy( arg )
+            return RXK_ERR
+        end if
+        arg->kind = ka
+        arg->src = mid( src, aPos, tpos - aPos )
+        dim as ustring bad
+        select case fn
+        case TKRX_AGG_SUM, TKRX_AGG_AVG
+            if (ka <> TKV_INT) andalso (ka <> TKV_FLOAT) then bad = nm & " needs numbers, not " & RxKindName( ka )
+        case TKRX_AGG_MIN, TKRX_AGG_MAX
+            if (ka = TKV_BOOL) orelse (ka = TKV_EMPTY) then bad = nm & " needs values that order, not " & RxKindName( ka )
+        case TKRX_AGG_FIRST, TKRX_AGG_LAST
+            if ka = TKV_EMPTY then bad = nm & " needs a value, not empty"
+        end select
+        if len( bad ) then
+            tkRExpr_Destroy( arg )
+            return Fail( bad, aPos, tpos - aPos )
+        end if
+        if tk <> RXT_RP then
+            tkRExpr_Destroy( arg )
+            return FailHere( "')' expected" )
+        end if
+        Nxt( )
+    end if
+    dim as int32 kr
+    select case fn
+    case TKRX_AGG_COUNT, TKRX_AGG_COUNTROWS, TKRX_AGG_GROUPCOUNT : kr = TKV_INT
+    case TKRX_AGG_AVG : kr = TKV_FLOAT
+    case else : kr = ka
+    end select
+    dim as int32 k = root->nAggs
+    redim preserve root->aggFn( 0 to k )
+    redim preserve root->aggArg( 0 to k )
+    redim preserve root->aggKind( 0 to k )
+    root->aggFn(k) = fn
+    root->aggArg(k) = arg
+    root->aggKind(k) = kr
+    root->nAggs += 1
+    Emit( RXO_LDA, 1, k, kr )
+    return kr
+end function
+
+' After "name(": a function call.
+function RX_PARSER.PCall( byref nm as const ustring, byval namePos as int32, byval nameLen as int32 ) as int32
+    dim as ustring l = lcase( nm )
+    select case l
+    case "iif" : return PIif( )
+    case "ifempty" : return PIfEmpty( )
+    case "param"
+        if tk <> RXT_STR then return FailHere( "Param( ) needs a parameter's name as text: Param( ""From"" )" )
+        dim as int32 pi = FindParam( tstr )
+        if pi < 0 then return FailHere( "no parameter """ & tstr & """" )
+        Nxt( )
+        if tk <> RXT_RP then return FailHere( "')' expected" )
+        Nxt( )
+        x->usesParams = true
+        Emit( RXO_LDP, 1, pi, sch->pkinds(pi) )
+        return sch->pkinds(pi)
+    end select
+    dim as int32 kinds(0 to RX_MAX_ARGS - 1), starts(0 to RX_MAX_ARGS - 1), nops(0 to RX_MAX_ARGS - 1)
+    dim as int32 fn = AggOf( l )
+    ' Min / Max with one value total a column; with two they pick one.
+    if (fn >= 0) andalso (((l <> "min") andalso (l <> "max")) orelse (tk = RXT_RP)) then return PAgg( fn, nm, namePos, nameLen )
+    if (l = "min") orelse (l = "max") then
+        dim as int32 mark = x->nOps, mDepth = x->depth
+        dim as int32 savedP = p, savedTk = tk, savedPos = tpos, savedLen = tlen
+        dim as ustring savedStr = tstr
+        dim as int64 savedI = ti
+        dim as float64 savedF = tf
+        ' one value: a total; look ahead by parsing, then rewind
+        dim as int32 nAggsBefore = root->nAggs
+        dim as int32 c = PArgs( kinds(), starts(), nops() )
+        if c < 0 then return RXK_ERR
+        if c = 1 then
+            ' rewind and parse again as a total (the look-ahead's code is dropped)
+            x->nOps = mark : x->depth = mDepth
+            for k as int32 = nAggsBefore to root->nAggs - 1
+                tkRExpr_Destroy( root->aggArg(k) )
+            next
+            root->nAggs = nAggsBefore
+            p = savedP : tk = savedTk : tpos = savedPos : tlen = savedLen : tstr = savedStr : ti = savedI : tf = savedF
+            return PAgg( iif( l = "min", TKRX_AGG_MIN, TKRX_AGG_MAX ), nm, namePos, nameLen )
+        end if
+        if c <> 2 then return Fail( nm & " takes one value (a total) or two (the " & iif( l = "min", "smaller", "larger" ) & ")", namePos, nameLen )
+        if Comparable( kinds(0), kinds(1), 2, namePos, nameLen ) = false then return RXK_ERR
+        dim as int32 kj = RxJoin( kinds(0), kinds(1) )
+        ToFloatAt( nops(0), kinds(0), kj )
+        ToFloatAt( nops(1), kinds(1), kj )
+        Emit( RXO_FN, -1, iif( l = "min", RXF_MIN2, RXF_MAX2 ), 2 )
+        return kj
+    end if
+    ' a host function
+    dim as int32 id, ret
+    dim as string sig
+    if FnSig( l, id, sig, ret ) = false then
+        dim as int32 h = RxFindHost( l )
+        if h < 0 then return Fail( "no function '" & nm & "'", namePos, nameLen )
+        dim as int32 c = PArgs( kinds(), starts(), nops() )
+        if c < 0 then return RXK_ERR
+        if c <> gRxHostN(h) then return Fail( nm & " takes " & gRxHostN(h) & " value" & iif( gRxHostN(h) = 1, "", "s" ), namePos, nameLen )
+        for j as int32 = 0 to c - 1
+            dim as int32 want = gRxHostArgs(gRxHostFirst(h) + j)
+            if (kinds(j) <> want) andalso (kinds(j) <> TKV_EMPTY) andalso _
+               ((want <> TKV_FLOAT) orelse (kinds(j) <> TKV_INT)) then
+                return Fail( nm & "'s " & Ordinal( j + 1 ) & " value must be " & RxKindName( want ) & ", not " & RxKindName( kinds(j) ), namePos, nameLen )
+            end if
+            if (want = TKV_FLOAT) andalso (kinds(j) = TKV_INT) then ToFloatAt( nops(j), TKV_INT, TKV_FLOAT )
+        next
+        Emit( RXO_HOST, 1 - c, h, c )
+        return gRxHostRet(h)
+    end if
+    dim as int32 c = PArgs( kinds(), starts(), nops() )
+    if c < 0 then return RXK_ERR
+    ' the signature: required values, then optional ones; Choose's last repeats
+    dim as int32 nReq, nMax
+    dim as string sc(0 to 7)
+    dim as int32 ns
+    dim as string w = sig & " "
+    dim as int32 sp0 = 1
+    for i as int32 = 1 to len( w )
+        if mid( w, i, 1 ) = " " then
+            sc(ns) = mid( w, sp0, i - sp0 )
+            ns += 1
+            sp0 = i + 1
+        end if
+    next
+    for i as int32 = 0 to ns - 1
+        if right( sc(i), 1 ) = "?" then
+            sc(i) = left( sc(i), 1 )
+        else
+            nReq = i + 1
+        end if
+    next
+    nMax = ns
+    if id = RXF_CHOOSE then nMax = RX_MAX_ARGS
+    if (c < nReq) orelse (c > nMax) then
+        dim as ustring want_
+        if id = RXF_CHOOSE then
+            want_ = "an index and at least one value"
+        elseif nReq = nMax then
+            want_ = nReq & " value" & iif( nReq = 1, "", "s" )
+        else
+            want_ = nReq & " to " & nMax & " values"
+        end if
+        return Fail( nm & " takes " & want_, namePos, nameLen )
+    end if
+    ' InStr( s, find ) or InStr( start, s, find )
+    if id = RXF_INSTR then
+        if c = 3 then
+            id = RXF_INSTR3
+            sc(0) = "I" : sc(1) = "T" : sc(2) = "T"
+        else
+            sc(0) = "T" : sc(1) = "T"
+        end if
+    end if
+    for j as int32 = 0 to c - 1
+        dim as string want = sc(iif( j < ns, j, ns - 1 ))
+        if SigAccepts( want, kinds(j) ) = false then
+            return Fail( nm & "'s " & Ordinal( j + 1 ) & " value must be " & SigWord( want ) & ", not " & RxKindName( kinds(j) ), namePos, nameLen )
+        end if
+    next
+    select case id
+    case RXF_ABS
+        ret = iif( kinds(0) = TKV_FLOAT, TKV_FLOAT, TKV_INT )
+    case RXF_CHOOSE
+        ret = TKV_EMPTY
+        for j as int32 = 1 to c - 1
+            ret = RxJoin( ret, kinds(j) )
+            if ret = RXK_ERR then return Fail( "Choose's values are of different kinds", namePos, nameLen )
+        next
+        for j as int32 = 1 to c - 1
+            ToFloatAt( nops(j), kinds(j), ret )
+        next
+    case RXF_BETWEEN
+        if Comparable( kinds(0), kinds(1), 2, namePos, nameLen ) = false then return RXK_ERR
+        if Comparable( kinds(0), kinds(2), 2, namePos, nameLen ) = false then return RXK_ERR
+    case RXF_FORMAT
+        ' a text constant as the mask (its LDCS and NOP are the last two ops): compiled now, once
+        if (x->nOps - starts(1) = 2) andalso (x->ops(starts(1)).op = RXO_LDCS) then
+            dim as ustring mask = x->strs(x->ops(starts(1)).a)
+            x->nOps = starts(1)
+            x->depth -= 1
+            if x->nFmts > ubound( x->fmts ) then redim preserve x->fmts( 0 to x->nFmts * 2 + 3 )
+            x->fmts(x->nFmts) = RxParseFmt( mask )
+            x->nFmts += 1
+            Emit( RXO_FMTC, 0, x->nFmts - 1 )
+            return TKV_TEXT
+        end if
+    case RXF_DATEADD, RXF_DATEDIFF
+        if (x->nOps > starts(0) + 1) andalso (starts(1) - starts(0) = 2) andalso (x->ops(starts(0)).op = RXO_LDCS) then
+            dim as ustring u = lcase( x->strs(x->ops(starts(0)).a) )
+            dim as boolean ok
+            select case u
+            case "d", "y", "w", "ww", "m", "q", "yyyy" : ok = true
+            end select
+            if ok = false then return Fail( nm & ": """ & u & """ is no unit (d, ww, m, q, yyyy)", namePos, nameLen )
+        end if
+    end select
+    Emit( RXO_FN, 1 - c, id, c )
+    return ret
+end function
+
+function RX_PARSER.PAtom( ) as int32
+    select case tk
+    case RXT_INT
+        Emit( RXO_LDCI, 1, 0, TKV_INT, ti )
+        Nxt( )
+        return TKV_INT
+    case RXT_FLOAT
+        Emit( RXO_LDCF, 1, 0, 0, 0, tf )
+        Nxt( )
+        return TKV_FLOAT
+    case RXT_STR
+        Emit( RXO_LDCS, 1, AddStr( tstr ) )
+        Nxt( )
+        return TKV_TEXT
+    case RXT_DATE, RXT_TIME
+        dim as int32 k = iif( tk = RXT_DATE, TKV_DATE, TKV_TIME )
+        Emit( RXO_LDCI, 1, 0, k, ti )
+        Nxt( )
+        return k
+    case RXT_FIELD
+        dim as int32 f = FindField( trim( tstr ) )
+        if f < 0 then return FailHere( "no field [" & tstr & "]" )
+        Nxt( )
+        x->usesFields = true
+        Emit( RXO_LDF, 1, f, sch->kinds(f) )
+        return sch->kinds(f)
+    case RXT_PARAM
+        dim as int32 pi = FindParam( tstr )
+        if pi < 0 then return FailHere( "no parameter @" & tstr )
+        Nxt( )
+        x->usesParams = true
+        Emit( RXO_LDP, 1, pi, sch->pkinds(pi) )
+        return sch->pkinds(pi)
+    case RXT_LP
+        Nxt( )
+        dim as int32 k = POr( )
+        if k = RXK_ERR then return RXK_ERR
+        if tk <> RXT_RP then return FailHere( "')' expected" )
+        Nxt( )
+        return k
+    case RXT_ID
+        dim as ustring nm = tstr, l = lcase( tstr )
+        dim as int32 namePos = tpos, nameLen = tlen
+        select case l
+        case "true", "false"
+            Emit( RXO_PUSHB, 1, 0, 0, iif( l = "true", 1, 0 ) )
+            Nxt( )
+            return TKV_BOOL
+        case "empty"
+            Emit( RXO_LDE, 1 )
+            Nxt( )
+            return TKV_EMPTY
+        case "and", "andalso", "or", "orelse", "xor", "mod", "like", "in"
+            return FailHere( "a value expected before '" & nm & "'" )
+        end select
+        Nxt( )
+        dim as int32 kind
+        dim as int32 b = BuiltinValue( l, kind )
+        if b >= 0 then
+            if tk = RXT_LP then
+                Nxt( )
+                if tk <> RXT_RP then return FailHere( nm & " takes no value" )
+                Nxt( )
+            end if
+            x->uses(b) = true
+            Emit( RXO_LDB, 1, b )
+            return kind
+        end if
+        if tk <> RXT_LP then
+            if RxIsBuiltinName( l ) orelse (RxFindHost( l ) >= 0) then return Fail( nm & " needs '(' and its values", namePos, nameLen )
+            return Fail( "'" & nm & "' is not known (a field is written [" & nm & "], a parameter @" & nm & ")", namePos, nameLen )
+        end if
+        Nxt( )
+        return PCall( nm, namePos, nameLen )
+    case RXT_END
+        if failed then return RXK_ERR
+        return Fail( "a value expected at the end", n + 1, 1 )
+    case RXT_RP
+        return FailHere( "a value expected before ')'" )
+    case RXT_COMMA
+        return FailHere( "a value expected before ','" )
+    end select
+    return FailHere( "a value expected before '" & tstr & "'" )
+end function
+
+' ---- the entry point -----------------------------------------------------------------------------
+function RxCompileInto( byref src as const ustring, byref sch as TKREXPR_SCHEMA, byval x as TK_REXPR ptr, _
+                        byref err_ as TKREXPR_ERROR ) as boolean
+    dim as RX_PARSER ps
+    ps.src = src
+    ps.n = len( src )
+    ps.x = x
+    ps.root = x
+    ps.sch = @sch
+    ps.perr = @err_
+    x->src = src
+    if len( trim( src ) ) = 0 then
+        ps.Fail( "the expression is empty", 1, 1 )
+        return false
+    end if
+    ps.Nxt( )
+    if ps.failed then return false
+    dim as int32 k = ps.POr( )
+    if (k <> RXK_ERR) andalso (ps.tk <> RXT_END) then
+        if ps.tk = RXT_RP then
+            k = ps.FailHere( "')' without its '('" )
+        else
+            k = ps.FailHere( "unexpected '" & mid( src, ps.tpos, ps.tlen ) & "': an operator or the end expected" )
+        end if
+    end if
+    if (k = RXK_ERR) orelse ps.failed then return false
+    if x->depth <> 1 then
+        ps.Fail( "internal: the stack is " & x->depth & " at the end", 1, 1 )
+        return false
+    end if
+    x->kind = k
+    return true
+end function

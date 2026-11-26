@@ -15,7 +15,7 @@ type REC
     nDown as long : nUp as long : nRDown as long : nMDown as long
     nWheel as long : nKey as long : nChar as long : nIme as long
     nSetFocus as long : nKillFocus as long : nTimer as long : nDestroy as long
-    nScale as long : nPaint as long : nCapLost as long
+    nScale as long : nPaint as long : nCapLost as long : nAdorn as long
     lastX as single : lastY as single : lastClicks as long : wheelY as single
     lastKey as long : text as string : imeStart as long : fNew as single
     claimKeys as boolean       ' consume every key
@@ -77,6 +77,19 @@ function ProbeProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
     case TKM_DESTROY : r->nDestroy += 1 : return true
     end select
     return false
+end function
+
+' An adornment probe: on TKM_ADORNLAYOUT it centres itself (adornW x adornH) on its target's
+' top-right corner, as an attached badge does; everything else is ProbeProc's.
+dim shared as long gAdornW, gAdornH
+function AdornProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg = TKM_ADORNLAYOUT then
+        Rx( w )->nAdorn += 1
+        dim as TK_WIDGET ptr t = tkWidget_Parent( w )
+        tkWidget_SetPos( w, t->cw - gAdornW \ 2, -(gAdornH \ 2), gAdornW, gAdornH )
+        return true
+    end if
+    return ProbeProc( w, m )
 end function
 
 ' A probe widget at scaled design coordinates.
@@ -275,6 +288,19 @@ sub RunPass( byval fScale as single )
     tkTest_PumpFor( h, 120 )
     tkTest_Check( "killed timer: no more ticks", Rx( F4 )->nTimer = nT, nT & " -> " & Rx( F4 )->nTimer )
 
+    ' ---- back in the foreground (Android HOME, then the app again) -------------------------------
+    ' SDL calls watchers for the event (on Android it is never queued); the window is dirty again
+    ' and presented TWICE, because the first present after the return never reaches the screen.
+    if fScale = 1 then
+        tkHost_Pump( h )
+        dim as long nF = h->nFrames
+        dim as SDL_Event fg
+        fg.type = SDL_EVENT_DID_ENTER_FOREGROUND
+        SDL_PushEvent( @fg )
+        tkHost_Pump( h )
+        tkTest_Check( "foreground: repainted and presented twice", h->nFrames = nF + 2, nF & " -> " & h->nFrames )
+    end if
+
     ' ---- cursor follows the hot widget ----------------------------------------------------------
     tkWidget_SetCursor( C, TK_CURSOR_IBEAM )
     tkTest_PushMotion( h, S( h, 130 ), S( h, 90 ) )
@@ -299,10 +325,84 @@ sub RunPass( byval fScale as single )
     tkTest_Check( "hidden widget not hit", tkHost_HitTest( h, S( h, 130 ), S( h, 90 ) ) = P )
     tkWidget_Show( C, true )
 
+    ' ---- adornments (tkWidget_SetAdorner): painted over and beyond the target, never hit -------
+    gAdornW = S( h, 24 ) : gAdornH = S( h, 16 )
+    dim as TK_WIDGET ptr AP = Probe( root, h, 20, 380, 360, 90 )
+    dim as TK_WIDGET ptr AT = Probe( AP, h, 40, 30, 100, 40 )
+    dim as TK_WIDGET ptr AD = tkWidget_CreateChild( AT, 0, @AdornProc, NewRec() )
+    Rx( AP )->paintColor = &hFF202020ul : Rx( AT )->paintColor = &hFF00FF00ul : Rx( AD )->paintColor = &hFF0000FFul
+    AD->isFocusable = true
+    tkHost_SetFocus( h, AD )
+    tkTest_Check( "adorn: (a plain child takes focus first)", tkHost_GetFocus( h ) = AD )
+    tkWidget_SetAdorner( AD, true )
+    tkTest_Check( "adorn: becoming an adornment gives up focus", (tkHost_GetFocus( h ) = 0) andalso tkWidget_IsAdorner( AD ) )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "adorn: TKM_ADORNLAYOUT before its paint", (Rx( AD )->nAdorn = 1) andalso (Rx( AD )->nPaint = 1), Rx( AD )->nAdorn & "/" & Rx( AD )->nPaint )
+    tkTest_Check( "adorn: placing itself during the paint leaves the host clean", h->bDirty = false )
+    dim as TKRECT rT
+    tkWidget_AbsRect( AT, rT )
+    tkTest_Check( "adorn: centred on the target's top-right corner", AbsStr( AD ) = tkRect_Str( type<TKRECT>( rT.right - gAdornW \ 2, rT.top - gAdornH \ 2, rT.right - gAdornW \ 2 + gAdornW, rT.top - gAdornH \ 2 + gAdornH ) ), AbsStr( AD ) )
+    dim as long xIn = rT.right - S( h, 4 ), yIn = rT.top + S( h, 4 )       ' over the target
+    dim as long xOut = rT.right + S( h, 4 ), yOut = rT.top - S( h, 4 )     ' beyond it
+    tkTest_Check( "adorn: painted over the target", tkTest_PixelAt( h, xIn, yIn ) = &hFF0000FFul, hex( tkTest_PixelAt( h, xIn, yIn ) ) )
+    tkTest_Check( "adorn: painted beyond the target (overhang)", tkTest_PixelAt( h, xOut, yOut ) = &hFF0000FFul, hex( tkTest_PixelAt( h, xOut, yOut ) ) )
+    tkTest_Check( "adorn: a hit over the target reaches the target", tkHost_HitTest( h, xIn, yIn ) = AT )
+    tkTest_Check( "adorn: a hit on the overhang reaches what is below", tkHost_HitTest( h, xOut, yOut ) = AP )
+    tkTest_PushMotion( h, xIn, yIn )
+    tkTest_PushButton( h, true, xIn, yIn ) : tkTest_PushButton( h, false, xIn, yIn )
+    tkTest_Check( "adorn: a click on it goes to the target", (Rx( AT )->nDown = 1) andalso (Rx( AD )->nDown = 0) )
+    ' Tab never lands on it, even focusable
+    dim as boolean bTabbed = false
+    for i as long = 1 to 12
+        tkHost_FocusNext( h )
+        if tkHost_GetFocus( h ) = AD then bTabbed = true
+    next
+    tkTest_Check( "adorn: never in the Tab order", bTabbed = false )
+    ' it follows the target: moved, then resized
+    tkWidget_SetPos( AT, S( h, 150 ), S( h, 40 ), S( h, 100 ), S( h, 40 ) )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "adorn: follows a moved target", tkTest_PixelAt( h, xIn, yIn ) <> &hFF0000FFul )
+    tkWidget_AbsRect( AT, rT )
+    tkTest_Check( "adorn: ...to its new corner", tkTest_PixelAt( h, rT.right + S( h, 4 ), rT.top - S( h, 4 ) ) = &hFF0000FFul )
+    tkWidget_SetSize( AT, S( h, 60 ), S( h, 40 ) )
+    tkHost_RenderTo( h, false )
+    tkWidget_AbsRect( AT, rT )
+    tkTest_Check( "adorn: follows a resized target", tkTest_PixelAt( h, rT.right + S( h, 4 ), rT.top - S( h, 4 ) ) = &hFF0000FFul )
+    ' a sibling above the target covers it as it covers the target
+    dim as TK_WIDGET ptr ASib = Probe( AP, h, 190, 0, 40, 40 )
+    Rx( ASib )->paintColor = &hFFFFFF00ul
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "adorn: a sibling above the target covers it", tkTest_PixelAt( h, rT.right + S( h, 4 ), rT.top - S( h, 4 ) ) = &hFFFFFF00ul )
+    tkWidget_Destroy( ASib )
+    ' clipped by the target's parent, like any child of it
+    tkWidget_SetPos( AT, S( h, 300 ), S( h, 30 ), S( h, 60 ), S( h, 40 ) )     ' corner on AP's right edge
+    tkHost_RenderTo( h, false )
+    tkWidget_AbsRect( AT, rT )
+    tkTest_Check( "adorn: clipped by the target's parent", (tkTest_PixelAt( h, rT.right - S( h, 4 ), rT.top + S( h, 4 ) ) = &hFF0000FFul) _
+                  andalso (tkTest_PixelAt( h, rT.right + S( h, 4 ), rT.top + S( h, 4 ) ) <> &hFF0000FFul) )
+    ' hidden with its target, and not laid out then
+    dim as long nAdornBefore = Rx( AD )->nAdorn
+    tkWidget_Show( AT, false )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "adorn: hidden with its target", (tkTest_PixelAt( h, rT.right - S( h, 4 ), rT.top + S( h, 4 ) ) <> &hFF0000FFul) andalso (Rx( AD )->nAdorn = nAdornBefore) )
+    tkWidget_Show( AT, true )
+    ' hidden itself
+    tkWidget_Show( AD, false )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "adorn: hidden on its own", tkTest_PixelAt( h, rT.right - S( h, 4 ), rT.top + S( h, 4 ) ) <> &hFF0000FFul )
+    tkWidget_Show( AD, true )
+    ' back to a plain child: clipped to the target, in the hit test again
+    tkWidget_SetAdorner( AD, false )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "adorn: off again -- a plain child, clipped to its parent", tkTest_PixelAt( h, rT.right - S( h, 4 ), rT.top - S( h, 4 ) ) <> &hFF0000FFul )
+    tkTest_Check( "adorn: off again -- hit-tested", tkHost_HitTest( h, rT.right - S( h, 4 ), rT.top + S( h, 4 ) ) = AD )
+    tkWidget_SetAdorner( AD, true )
+
     ' ---- rescale reaches every widget ---------------------------------------------------------
     h->fScaleForced = fScale * 2
     tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
     tkTest_Check( "TKM_SCALECHANGED to nested widgets", Rx( F3 )->nScale = 1 andalso Rx( F3 )->fNew = fScale * 2 andalso Rx( C )->nScale = 1 )
+    tkTest_Check( "TKM_SCALECHANGED reaches an adornment", Rx( AD )->nScale = 1 )
     h->fScaleForced = fScale
     tkTest_PushWindowEvent( h, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED )
 
@@ -436,6 +536,9 @@ sub RunPass( byval fScale as single )
     tkTest_Check( "destroy reaches the whole subtree", rF2->nDestroy = 1 andalso rF3->nDestroy = 1 andalso rG->nDestroy = 1 )
     tkTest_Check( "destroying the focus clears focus", tkHost_GetFocus( h ) = 0 )
     tkTest_Check( "destroyed subtree gone from hit test", tkHost_HitTest( h, S( h, 115 ), S( h, 315 ) ) = 0 )
+    dim as REC ptr rAD = Rx( AD )
+    tkWidget_Destroy( AT )
+    tkTest_Check( "destroying a target destroys its adornment", rAD->nDestroy = 1 )
 
     ' ---- an always-on-top window's popups and dialogs are on top too (else they open behind it) ----
     SDL_SetWindowAlwaysOnTop( h->win, true )
@@ -505,11 +608,68 @@ sub DropPass( byval fScale as single )
     tkHost_Destroy( h )
 end sub
 
+' ---- touch (A5, D-A5-3): the gesture layer runs with virtual surfaces only ---------------------
+sub TouchPass( byval fScale as single )
+    tkTest_Begin( "touch " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkHost touch", 400, 300, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host created", false, *SDL_GetError() ) : exit sub
+    if tkTest_Virtual( h ) = false then
+        ' the layer is off on the desktop: SDL's own touch-as-mouse is left alone
+        tkTest_Skip( "gestures", "touch gestures run with virtual surfaces only (Android, TK_VIRTUAL=1)" )
+        tkHost_Destroy( h )
+        exit sub
+    end if
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 60 )
+    dim as TK_WIDGET ptr W = Probe( tkHost_Root( h ), h, 20, 20, 300, 200 )
+    Rx( W )->claimWheel = true
+    dim as single cx = tkTest_CX( W ), cy = tkTest_CY( W )
+    ' SDL's order: the touch-mouse event, then the finger's. A swipe: the finger passes the slop
+    ' before the tap timeout -- no press at all, and the rest is wheel, up the finger = down the
+    ' content (negative notches)
+    tkTest_PushTouchMouse( h, true, cx, cy )
+    tkTest_PushFinger( h, SDL_EVENT_FINGER_DOWN, cx, cy )
+    tkHost_Pump( h )
+    tkTest_Check( "a touch is not a press yet", Rx( W )->nDown = 0, "" & Rx( W )->nDown )
+    tkTest_PushFinger( h, SDL_EVENT_FINGER_MOTION, cx, cy - S( h, 40 ) )
+    tkTest_PushFinger( h, SDL_EVENT_FINGER_MOTION, cx, cy - S( h, 80 ) )
+    tkHost_Pump( h )
+    tkTest_Check( "a swipe becomes wheel notches", Rx( W )->nWheel >= 1 andalso Rx( W )->wheelY < 0, Rx( W )->nWheel & " " & Rx( W )->wheelY )
+    tkTest_PushTouchMouse( h, false, cx, cy - S( h, 80 ) )
+    tkTest_PushFinger( h, SDL_EVENT_FINGER_UP, cx, cy - S( h, 80 ) )
+    tkTest_PumpFor( h, 150 )
+    tkTest_Check( "a swipe never presses", (Rx( W )->nDown = 0) andalso (Rx( W )->nUp = 0), Rx( W )->nDown & " " & Rx( W )->nUp )
+    ' a finger held: its press after the tap timeout; still after TK_LONGPRESS_MS, the press is
+    ' taken back and the right button goes there
+    dim as long r0 = Rx( W )->nRDown
+    tkTest_PushTouchMouse( h, true, cx, cy )
+    tkTest_PushFinger( h, SDL_EVENT_FINGER_DOWN, cx, cy )
+    tkTest_PumpFor( h, 250 )
+    tkTest_Check( "a held finger gets its press after the tap timeout", Rx( W )->nDown = 1, "" & Rx( W )->nDown )
+    tkTest_PumpFor( h, 400 )
+    tkTest_Check( "a long press is the right button", Rx( W )->nRDown = r0 + 1, "" & Rx( W )->nRDown )
+    tkTest_PushTouchMouse( h, false, cx, cy )
+    tkTest_PushFinger( h, SDL_EVENT_FINGER_UP, cx, cy )
+    tkTest_PumpFor( h, 50 )
+    ' a tap: down and up before the timeout -- press and release together, an ordinary click
+    dim as long d0 = Rx( W )->nDown, u0 = Rx( W )->nUp, w0 = Rx( W )->nWheel
+    tkTest_PushTouchMouse( h, true, cx, cy )
+    tkTest_PushFinger( h, SDL_EVENT_FINGER_DOWN, cx, cy )
+    tkTest_PushTouchMouse( h, false, cx, cy )
+    tkTest_PushFinger( h, SDL_EVENT_FINGER_UP, cx, cy )
+    tkHost_Pump( h )
+    tkTest_Check( "a tap is a click", (Rx( W )->nDown = d0 + 1) andalso (Rx( W )->nUp = u0 + 1) andalso (Rx( W )->nWheel = w0), _
+                  (Rx( W )->nDown - d0) & " " & (Rx( W )->nUp - u0) )
+    tkHost_Destroy( h )
+end sub
+
 if tkTest_Init() = false then end 99
 RunPass( 1.0 )
 RunPass( 1.75 )
 DropPass( 1.0 )
 DropPass( 1.75 )
+TouchPass( 1.0 )
+TouchPass( 1.75 )
 dim as long nFail = tkTest_Report( "tkHost" )
 tkTest_Quit()
 end nFail

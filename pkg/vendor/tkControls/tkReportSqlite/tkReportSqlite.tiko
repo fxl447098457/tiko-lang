@@ -1,0 +1,399 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportSqlite -- an SQLite query as a tkReport's data (PRINTING.md §10.3; phase R4). Its own module
+' so a report that does not read SQLite does not link it.
+'
+' One prepared statement: the result's columns are the fields (their names; their kinds from the
+' declared column types -- INT, REAL / FLOAT / DOUBLE / NUMERIC / DECIMAL, BOOL, DATE, TIME, else
+' text), each step a row, sqlite3_reset to lay the report out again. A NULL is an EMPTY value. Rows
+' must arrive in the report's group order: ORDER BY in the query, or the report's sort keys
+' (tkReport_AddSortKey), which wrap it -- select * from ( <sql> ) order by ... (QSort).
+'
+' PARAMETERS: a report filtered on what the user chose takes it as a parameter, never pasted into
+' the SQL -- tkReportSqlite_OpenEx( rpt, db, "select ... where region = ? order by ...", params() ).
+#module "tkReportSqlite"
+
+#import "vendor/sqlite3"
+#import "../tkReport" public
+#import "../tkReportDef"
+using tkReport
+using tkReportDef
+using tkBind
+using tkCalendar
+using tkTimePanel
+using tkPrint
+using tkHost
+using tkPaint
+
+type RSQ_CTX
+    stmt     as sqlite3_stmt ptr
+    nCols    as long
+    names(any) as ustring
+    kinds(any) as long
+    db       as sqlite3 ptr           ' to prepare again, sorted (QSort)
+    sql      as string                ' the query as given
+    pv(any)  as TK_VALUE              ' its parameters by position (1 = pv(0))
+    nP       as long
+end type
+
+private function KindOf( byref decl as string ) as long
+    dim as string d = ucase( decl )
+    if instr( d, "BOOL" ) then return TKV_BOOL
+    if instr( d, "INT" ) then return TKV_INT
+    if instr( d, "REAL" ) orelse instr( d, "FLOA" ) orelse instr( d, "DOUB" ) orelse instr( d, "NUM" ) orelse instr( d, "DEC" ) then return TKV_FLOAT
+    if instr( d, "DATE" ) then return TKV_DATE
+    if instr( d, "TIME" ) then return TKV_TIME
+    return TKV_TEXT
+end function
+
+private function QFieldCount( byval p as any ptr ) as long
+    return cast( RSQ_CTX ptr, p )->nCols
+end function
+private function QFieldName( byval p as any ptr, byval f as long ) as ustring
+    dim as RSQ_CTX ptr c = p
+    if (f < 0) orelse (f >= c->nCols) then return ""
+    return c->names(f)
+end function
+private function QFieldKind( byval p as any ptr, byval f as long ) as long
+    dim as RSQ_CTX ptr c = p
+    if (f < 0) orelse (f >= c->nCols) then return TKV_EMPTY
+    return c->kinds(f)
+end function
+private function QRowCount( byval p as any ptr ) as integer
+    return -1
+end function
+private function QNext( byval p as any ptr ) as boolean
+    return sqlite3_step( cast( RSQ_CTX ptr, p )->stmt ) = SQLITE_ROW
+end function
+private function QRewind( byval p as any ptr ) as boolean
+    return sqlite3_reset( cast( RSQ_CTX ptr, p )->stmt ) = SQLITE_OK
+end function
+private sub QGet( byval p as any ptr, byval f as long, byref v as TK_VALUE )
+    dim as RSQ_CTX ptr c = p
+    v.Clear( )
+    if (f < 0) orelse (f >= c->nCols) then exit sub
+    dim as long t = sqlite3_column_type( c->stmt, f )
+    if t = SQLITE_NULL then exit sub
+    select case c->kinds(f)
+    case TKV_INT : v.SetInt( sqlite3_column_int64( c->stmt, f ) )
+    case TKV_FLOAT : v.SetFloat( sqlite3_column_double( c->stmt, f ) )
+    case TKV_BOOL : v.SetBool( sqlite3_column_int64( c->stmt, f ) <> 0 )
+    case else
+        dim as const zstring ptr z = cast( const zstring ptr, sqlite3_column_text( c->stmt, f ) )
+        dim as string s = iif( z, *z, "" )
+        if (c->kinds(f) = TKV_DATE) andalso (len( s ) >= 10) andalso (mid( s, 5, 1 ) = "-") then
+            dim as TKDATE d
+            d.wYear = valint( left( s, 4 ) ) : d.wMonth = valint( mid( s, 6, 2 ) ) : d.wDay = valint( mid( s, 9, 2 ) )
+            v.SetDate( d )
+        elseif (c->kinds(f) = TKV_TIME) andalso (len( s ) >= 5) andalso (mid( s, 3, 1 ) = ":") then
+            dim as TKTIME tm
+            tm.wHour = valint( left( s, 2 ) ) : tm.wMinute = valint( mid( s, 4, 2 ) )
+            if len( s ) >= 8 then tm.wSecond = valint( mid( s, 7, 2 ) )
+            v.SetTime( tm )
+        else
+            v.SetText( s )
+        end if
+    end select
+end sub
+
+' A value as a parameter: never pasted into the SQL. A date is bound as yyyy-mm-dd text, a time as
+' HH:mm:ss, as the columns are read back.
+private sub BindValue( byval st as sqlite3_stmt ptr, byval i as long, byref v as const TK_VALUE )
+    select case v.kind
+    case TKV_INT   : sqlite3_bind_int64( st, i, v.i )
+    case TKV_FLOAT : sqlite3_bind_double( st, i, v.f )
+    case TKV_BOOL  : sqlite3_bind_int( st, i, iif( v.b, 1, 0 ) )
+    case TKV_DATE
+        dim as string s = right( "000" & v.d.wYear, 4 ) & "-" & right( "0" & v.d.wMonth, 2 ) & "-" & right( "0" & v.d.wDay, 2 )
+        sqlite3_bind_text( st, i, s, -1, SQLITE_TRANSIENT )
+    case TKV_TIME
+        dim as string s = right( "0" & v.t.wHour, 2 ) & ":" & right( "0" & v.t.wMinute, 2 ) & ":" & right( "0" & v.t.wSecond, 2 )
+        sqlite3_bind_text( st, i, s, -1, SQLITE_TRANSIENT )
+    case TKV_TEXT
+        dim as string s = v.s
+        sqlite3_bind_text( st, i, s, -1, SQLITE_TRANSIENT )
+    case else      : sqlite3_bind_null( st, i )
+    end select
+end sub
+
+' A column name as an SQL identifier: "name", a " doubled.
+private function QuoteId( byref s as const string ) as string
+    dim as string r = """"
+    for i as long = 1 to len( s )
+        if mid( s, i, 1 ) = """" then r &= """""" else r &= mid( s, i, 1 )
+    next
+    return r & """"
+end function
+
+' The source sorts itself: the query again, wrapped -- select * from ( <sql> ) order by "a" desc, "b" --
+' with the same parameters. FALSE (the old statement kept) when that does not prepare.
+private function QSort( byval p as any ptr, byval keys as TKREPORT_SORTKEY ptr, byval nKeys as long ) as boolean
+    dim as RSQ_CTX ptr c = p
+    if (c->db = 0) orelse (nKeys < 1) then return nKeys < 1
+    dim as string ob
+    for j as long = 0 to nKeys - 1
+        if (keys[j].field < 0) orelse (keys[j].field >= c->nCols) then return false
+        if j then ob &= ", "
+        dim as string nm = c->names(keys[j].field)
+        ob &= QuoteId( nm )
+        if keys[j].desc then ob &= " desc"
+    next
+    dim as string s8 = "select * from ( " & c->sql & " ) order by " & ob
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( c->db, strptr( s8 ), len( s8 ), @st, 0 ) <> SQLITE_OK then return false
+    for i as long = 0 to c->nP - 1
+        BindValue( st, i + 1, c->pv(i) )
+    next
+    sqlite3_finalize( c->stmt )
+    c->stmt = st
+    return true
+end function
+
+' The report reads rows of 'sql' on db, with a '?' (or ?NNN, :name) for each value that comes from
+' outside the program; params(0) is parameter 1, bound once (sqlite3_reset, which lays the report
+' out again, keeps them). FALSE (and nothing changed) when it does not prepare, or params() does not
+' hold exactly as many values as the query has parameters. The statement lives until
+' tkReportSqlite_Close (before the database is closed). The source can sort (tkReport_AddSortKey):
+' it wraps the query in an ORDER BY of its result's columns.
+' The statement's columns into c: names, and kinds from their declared types.
+private sub ReadColumns( byval c as RSQ_CTX ptr )
+    c->nCols = sqlite3_column_count( c->stmt )
+    redim c->names( 0 to iif( c->nCols > 0, c->nCols - 1, 0 ) )
+    redim c->kinds( 0 to iif( c->nCols > 0, c->nCols - 1, 0 ) )
+    for f as long = 0 to c->nCols - 1
+        dim as const zstring ptr nm = sqlite3_column_name( c->stmt, f ), dt = sqlite3_column_decltype( c->stmt, f )
+        dim as string n8, d8
+        if nm then n8 = *nm
+        if dt then d8 = *dt
+        c->names(f) = n8
+        c->kinds(f) = KindOf( d8 )
+    next
+end sub
+
+private sub SourceOf( byval c as RSQ_CTX ptr, byref src as TKREPORT_SOURCE )
+    src.pCtx = c
+    src.FieldCount = @QFieldCount : src.FieldName = @QFieldName : src.FieldKind = @QFieldKind
+    src.RowCount = @QRowCount : src.MoveNext = @QNext : src.GetValue = @QGet : src.Rewind = @QRewind
+    src.Sort = @QSort
+end sub
+
+' A statement over sql with params(0) as parameter 1 ...: its context (0 when it does not prepare or
+' the count of parameters differs), and the source reading it.
+private function MakeSource( byval db as sqlite3 ptr, byref sql as const ustring, params() as TK_VALUE, _
+                             byref src as TKREPORT_SOURCE ) as RSQ_CTX ptr
+    if db = 0 then return 0
+    dim as string s8 = sql
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, strptr( s8 ), len( s8 ), @st, 0 ) <> SQLITE_OK then return 0
+    dim as long n = ubound( params ) - lbound( params ) + 1
+    if n < 0 then n = 0
+    if n <> sqlite3_bind_parameter_count( st ) then
+        sqlite3_finalize( st )
+        return 0
+    end if
+    for i as long = 0 to n - 1
+        BindValue( st, i + 1, params(lbound( params ) + i) )
+    next
+    dim as RSQ_CTX ptr c = new RSQ_CTX
+    c->stmt = st
+    c->db = db
+    c->sql = s8
+    c->nP = n
+    if n > 0 then
+        redim c->pv( 0 to n - 1 )
+        for i as long = 0 to n - 1 : c->pv(i) = params(lbound( params ) + i) : next
+    end if
+    ReadColumns( c )
+    SourceOf( c, src )
+    return c
+end function
+
+' The values of a prepared statement's parameters by name: each :name / @name / $name takes the
+' value whose name matches (sign left out, case-insensitive). FALSE when one has none, or is a bare ?.
+private function NamedToPos( byval st as sqlite3_stmt ptr, names() as ustring, vals() as TK_VALUE, pos_() as TK_VALUE ) as boolean
+    dim as long n = sqlite3_bind_parameter_count( st )
+    erase pos_
+    if n > 0 then redim pos_( 0 to n - 1 )
+    for i as long = 1 to n
+        dim as const zstring ptr z = sqlite3_bind_parameter_name( st, i )
+        dim as string pn
+        if z then pn = *z
+        if len( pn ) < 2 then return false
+        pn = lcase( mid( pn, 2 ) )
+        dim as long found = -1
+        for k as long = lbound( names ) to ubound( names )
+            dim as string nk = names(k)
+            if lcase( nk ) = pn then found = k : exit for
+        next
+        if (found < 0) orelse (found > ubound( vals )) then return false
+        pos_(i - 1) = vals(found)
+    next
+    return true
+end function
+
+' The report reads rows of 'sql' on db, with a '?' (or ?NNN, :name) for each value that comes from
+' outside the program; params(0) is parameter 1, bound once (sqlite3_reset, which lays the report
+' out again, keeps them). FALSE (and nothing changed) when it does not prepare, or params() does not
+' hold exactly as many values as the query has parameters. The statement lives until
+' tkReportSqlite_Close (before the database is closed). The source can sort (tkReport_AddSortKey):
+' it wraps the query in an ORDER BY of its result's columns.
+public function tkReportSqlite_OpenEx( byval rpt as TK_REPORT ptr, byval db as sqlite3 ptr, byref sql as ustring, _
+                                       params() as TK_VALUE ) as boolean
+    if rpt = 0 then return false
+    dim as TKREPORT_SOURCE src
+    if MakeSource( db, sql, params(), src ) = 0 then return false
+    tkReport_SetSource( rpt, src )
+    return true
+end function
+
+' As OpenEx, with the parameters by NAME: each :name, @name or $name of the query takes the value
+' whose name matches (without its sign, case-insensitive) -- a report's parameter @From is :From.
+' FALSE when one of the query's parameters has no value, or is a bare ?.
+public function tkReportSqlite_OpenNamed( byval rpt as TK_REPORT ptr, byval db as sqlite3 ptr, byref sql as ustring, _
+                                          names() as ustring, vals() as TK_VALUE ) as boolean
+    if (rpt = 0) orelse (db = 0) then return false
+    dim as string s8 = sql
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, strptr( s8 ), len( s8 ), @st, 0 ) <> SQLITE_OK then return false
+    dim as TK_VALUE pos_(any)
+    dim as boolean ok = NamedToPos( st, names(), vals(), pos_() )
+    sqlite3_finalize( st )
+    if ok = false then return false
+    return tkReportSqlite_OpenEx( rpt, db, sql, pos_() )
+end function
+
+' A query with no parameters. One that has some needs OpenEx: here it is refused (FALSE).
+public function tkReportSqlite_Open( byval rpt as TK_REPORT ptr, byval db as sqlite3 ptr, byref sql as ustring ) as boolean
+    dim as TK_VALUE none_( any )
+    return tkReportSqlite_OpenEx( rpt, db, sql, none_() )
+end function
+
+' Finalize the statement tkReportSqlite_Open made for this report.
+public sub tkReportSqlite_Close( byval rpt as TK_REPORT ptr )
+    if rpt = 0 then exit sub
+    if (rpt->bSrc = false) orelse (rpt->src.MoveNext <> @QNext) then exit sub    ' not ours
+    dim as RSQ_CTX ptr c = rpt->src.pCtx
+    sqlite3_finalize( c->stmt )
+    delete c
+    dim as TKREPORT_SOURCE none_
+    rpt->src = none_
+    rpt->bSrc = false
+end sub
+
+' ==========================================================================================
+' A report definition's sqlite sources (Report Designer RD3): tkReportSqlite_BindDef
+' ==========================================================================================
+type RSQ_CHILD
+    c    as RSQ_CTX ptr
+    def  as TK_REPORTDEF ptr
+    si   as long
+end type
+
+type RSQ_BIND
+    db           as sqlite3 ptr
+    opened(any)  as RSQ_CTX ptr
+    nOpen        as long
+    kids(any)    as RSQ_CHILD ptr
+    nKids        as long
+end type
+
+private sub BTrack( byval b as RSQ_BIND ptr, byval c as RSQ_CTX ptr )
+    redim preserve b->opened( 0 to b->nOpen )
+    b->opened(b->nOpen) = c
+    b->nOpen += 1
+end sub
+
+private sub BClose( byval p as any ptr, byval bFinal as boolean )
+    dim as RSQ_BIND ptr b = p
+    if b = 0 then exit sub
+    for i as long = 0 to b->nOpen - 1
+        sqlite3_finalize( b->opened(i)->stmt )
+        delete b->opened(i)
+    next
+    b->nOpen = 0
+    for i as long = 0 to b->nKids - 1
+        delete b->kids(i)
+    next
+    b->nKids = 0
+    if bFinal then delete b
+end sub
+
+' A master (or single) source: its params evaluated, bound by name, the statement opened.
+private function BOpenRows( byval def as TK_REPORTDEF ptr, byval si as int32, byval p as any ptr, _
+                            byref src as TKREPORT_SOURCE ) as boolean
+    dim as RSQ_BIND ptr b = p
+    dim as ustring names(any), errs
+    dim as TK_VALUE vals(any), pos_(any)
+    if tkReportDef_EvalParams( def, si, names(), vals(), errs ) < 0 then return false
+    dim as string s8 = def->sources(si).sql
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( b->db, strptr( s8 ), len( s8 ), @st, 0 ) <> SQLITE_OK then return false
+    dim as boolean ok = NamedToPos( st, names(), vals(), pos_() )
+    sqlite3_finalize( st )
+    if ok = false then return false
+    dim as RSQ_CTX ptr c = MakeSource( b->db, def->sources(si).sql, pos_(), src )
+    if c = 0 then return false
+    BTrack( b, c )
+    return true
+end function
+
+' A child's rows for one master row: its params from the master's values, bound again.
+private function CChildOpen( byval p as any ptr, byval master as TK_VALUE ptr, byval nMaster as int32 ) as boolean
+    dim as RSQ_CHILD ptr k = p
+    dim as ustring names(any)
+    dim as TK_VALUE vals(any), pos_(any)
+    if tkReportDef_EvalChildParams( k->def, k->si, master, names(), vals() ) < 0 then return false
+    sqlite3_reset( k->c->stmt )
+    sqlite3_clear_bindings( k->c->stmt )
+    if NamedToPos( k->c->stmt, names(), vals(), pos_() ) = false then return false
+    for i as long = 0 to ubound( pos_ )
+        BindValue( k->c->stmt, i + 1, pos_(i) )
+    next
+    return true
+end function
+
+private function BOpenChild( byval def as TK_REPORTDEF ptr, byval si as int32, byval p as any ptr, _
+                             byref child as TKRD_CHILD ) as boolean
+    dim as RSQ_BIND ptr b = p
+    dim as string s8 = def->sources(si).sql
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( b->db, strptr( s8 ), len( s8 ), @st, 0 ) <> SQLITE_OK then return false
+    dim as RSQ_CTX ptr c = new RSQ_CTX
+    c->stmt = st
+    c->db = b->db
+    c->sql = s8
+    ReadColumns( c )
+    BTrack( b, c )
+    dim as RSQ_CHILD ptr k = new RSQ_CHILD
+    k->c = c : k->def = def : k->si = si
+    redim preserve b->kids( 0 to b->nKids )
+    b->kids(b->nKids) = k
+    b->nKids += 1
+    child.pCtx = k
+    SourceOf( c, child.rows )
+    child.Open = @CChildOpen
+    return true
+end function
+
+' Source 'name' of the definition reads its sql on db: a master with its params = { Name = "@Param" }
+' bound by name, or a child whose params name master fields ({ OrderId = "[Orders.Id]" }) bound
+' again for each master row. db must stay open while the definition makes and lays out reports.
+public function tkReportSqlite_BindDef( byval def as TK_REPORTDEF ptr, byref name_ as const ustring, byval db as sqlite3 ptr ) as boolean
+    if (def = 0) orelse (db = 0) then return false
+    dim as RSQ_BIND ptr b = new RSQ_BIND
+    b->db = db
+    dim as TKRD_BINDING bd
+    bd.pCtx = b
+    bd.OpenRows = @BOpenRows
+    bd.OpenChild = @BOpenChild
+    bd.CloseAll = @BClose
+    if tkReportDef_Bind( def, name_, bd ) = false then
+        delete b
+        return false
+    end if
+    return true
+end function

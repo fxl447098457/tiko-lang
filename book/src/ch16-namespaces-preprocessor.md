@@ -365,12 +365,19 @@ platform symbols tiko defines:
 
 | Symbol | Defined on |
 |---|---|
-| `__FB_WIN32__` | Windows |
-| `__FB_LINUX__`, `__FB_UNIX__` | Linux, with `__FB_ARM__` too on `linux-arm64` |
-| `__FB_DARWIN__`, `__FB_UNIX__`, `__FB_ARM__` | macOS |
+| `TIKO_OS_WINDOWS` | Windows |
+| `TIKO_OS_LINUX` | Linux |
+| `TIKO_OS_MACOS` | macOS |
+| `TIKO_OS_ANDROID` | Android (experimental; Chapter 31) |
+| `TIKO_ARCH_X86_64` | `windows-x86_64`, `linux-x86_64` and `android-x86_64` |
+| `TIKO_ARCH_ARM64` | `linux-arm64`, `macos-arm64` and `android-arm64` |
 | `__FB_64BIT__` | every 64-bit target |
 | `__FB_MSVC__` | the `windows-x86_64` target |
 | `__TIKO_VERSION__` | always: tiko's version, as a string |
+
+The older `__FB_` spellings — `__FB_WIN32__`, `__FB_LINUX__`, `__FB_DARWIN__`, `__FB_UNIX__`,
+`__FB_X86__`, `__FB_ARM__` — are defined as well, for existing headers (Appendix D). tiko code
+tests the `TIKO_` names.
 
 You define your own on the command line: `-d NAME=value` is `#define NAME value` before the first
 line of every file.
@@ -509,8 +516,8 @@ never need to write it; any other is `TKO0317`.
   supplying the same name is `TKO0919`.
 - Macros substitute text: parenthesise parameters and bodies, use `#` to quote, `##` to paste, and
   `#macro` for whole statements. Prefer a function unless the macro generates code.
-- `#if` tests a value and `#ifdef` tests a definition. Platform symbols include `__FB_WIN32__`,
-  `__FB_LINUX__`, `__FB_DARWIN__`, `__FB_64BIT__` and `__FB_MSVC__`; `-d` defines your own.
+- `#if` tests a value and `#ifdef` tests a definition. Platform symbols include `TIKO_OS_WINDOWS`,
+  `TIKO_OS_LINUX`, `TIKO_OS_MACOS`, `__FB_64BIT__` and `__FB_MSVC__`; `-d` defines your own.
 - `defined( )`, `#if typeof`, `#assert` and `#error` check the program while it compiles. `#error`
   reports and the compiler reads on.
 - `__FILE__`, `__LINE__`, `__FUNCTION__` and `__DATE_ISO__` describe the source; `#line` renumbers

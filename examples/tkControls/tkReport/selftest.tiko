@@ -1,0 +1,294 @@
+' tkReport self-test (printing phase R4). One check per behaviour: value formatting; group footers
+' with THEIR group's last row and totals; report totals; pages that end above the page footer, with
+' "Page {p} of {n}"; no group header alone at a page's bottom; a group header repeated on a page the
+' group continues on; BeforePrint skipping bands; a second layout equal to the first; a tkListTree as
+' the data; the table printer shrinking, then going across pages with column 1 repeated; an SQLite
+' query as the data (types and NULL); R5's table source at 10,000 rows, its 100 group totals and
+' the report total checked (and timed). One pass.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkReportSqlite"
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkReportGrid"
+#import "vendor/tkControls/tkDataGrid"
+#import "vendor/sqlite3"
+using tkTest
+using tkReportSqlite
+using tkReport
+using tkBind
+using tkCalendar
+using tkListTree
+using tkPrint
+using tkHost
+using tkPaint
+using tkReportGrid
+using tkDataGrid
+
+' 60 rows: region A (rows 0..24), region B (25..59)
+const NROWS = 60
+dim shared as boolean gHideUnpaid
+
+sub GetRow( byval rpt as TK_REPORT ptr, byval row as integer, byval f as long, byref v as TK_VALUE )
+    select case f
+    case 0 : v.SetText( iif( row < 25, "A", "B" ) )
+    case 1 : v.SetText( "Product " & (row + 1) )
+    case 2 : v.SetInt( row + 1 )                           ' Qty
+    case 3 : v.SetFloat( (row + 1) * 1.5 )                 ' Price
+    case 4 : v.SetBool( (row mod 3) <> 0 )                 ' Paid
+    end select
+end sub
+
+function OnlyPaid( byval rpt as TK_REPORT ptr, byval band as TK_RBAND ptr, byval row as TK_VALUE ptr ) as boolean
+    if gHideUnpaid andalso (band->kind = TKRB_DETAIL) then return row[4].b
+    return true
+end function
+
+function RF( byval l as single, byval t as single, byval rr as single, byval b as single ) as TKRECTF
+    dim as TKRECTF rc
+    tkRectF_Set( rc, l, t, rr, b )
+    return rc
+end function
+
+function MakeReport( byval repeatHdr as boolean ) as TK_REPORT ptr
+    dim as TK_REPORT ptr rpt = tkReport_Create( "Sales" )
+    dim as ustring names(0 to 4) = { "Region", "Product", "Qty", "Price", "Paid" }
+    dim as long kinds(0 to 4) = { TKV_TEXT, TKV_TEXT, TKV_INT, TKV_FLOAT, TKV_BOOL }
+    tkReport_SetFields( rpt, names(), kinds() )
+    tkReport_SetRowCount( rpt, NROWS )
+    tkReport_SetGetValueCallback( rpt, @GetRow )
+    tkReport_AddGroup( rpt, 0 )
+    dim as TK_RBAND ptr b = tkReport_GetBand( rpt, TKRB_PAGE_HEADER )
+    tkRBand_SetHeight( b, 24 ) : tkRBand_AddLabel( b, RF( 0, 0, 300, 24 ), "Sales by region" )
+    b = tkReport_GetBand( rpt, TKRB_GROUP_HEADER, 0 )
+    tkRBand_SetHeight( b, 20 ) : b->repeatOnEveryPage = repeatHdr
+    tkRBand_AddLabel( b, RF( 0, 0, 60, 20 ), "Region:" ) : tkRBand_AddField( b, RF( 60, 0, 200, 20 ), 0 )
+    b = tkReport_GetBand( rpt, TKRB_DETAIL )
+    tkRBand_SetHeight( b, 16 )
+    tkRBand_AddField( b, RF( 10, 0, 200, 16 ), 1 )
+    tkRBand_AddField( b, RF( 200, 0, 260, 16 ), 2, "", TK_DT_RIGHT )
+    tkRBand_AddField( b, RF( 270, 0, 360, 16 ), 3, "#,##0.00", TK_DT_RIGHT )
+    tkRBand_AddCheckBox( b, RF( 370, 0, 390, 16 ), 4 )
+    b = tkReport_GetBand( rpt, TKRB_GROUP_FOOTER, 0 )
+    tkRBand_SetHeight( b, 20 )
+    tkRBand_AddLabel( b, RF( 0, 0, 60, 20 ), "Total" ) : tkRBand_AddField( b, RF( 60, 0, 120, 20 ), 0 )
+    tkRBand_AddSummary( b, RF( 200, 0, 260, 20 ), 2, TKRS_SUM, 0, "0" )
+    b = tkReport_GetBand( rpt, TKRB_REPORT_FOOTER )
+    tkRBand_SetHeight( b, 20 )
+    tkRBand_AddLabel( b, RF( 0, 0, 60, 20 ), "Rows" )
+    tkRBand_AddSummary( b, RF( 60, 0, 120, 20 ), 2, TKRS_COUNT )
+    tkRBand_AddSummary( b, RF( 200, 0, 260, 20 ), 2, TKRS_SUM, TKRS_SCOPE_REPORT, "#,##0" )
+    b = tkReport_GetBand( rpt, TKRB_PAGE_FOOTER )
+    tkRBand_SetHeight( b, 16 ) : tkRBand_AddPageInfo( b, RF( 0, 0, 480, 16 ) )
+    tkReport_SetBeforePrintCallback( rpt, @OnlyPaid )
+    return rpt
+end function
+
+' Every text run of a page, in order ("|"-joined), and the lowest bottom of any run that is not
+' the page footer's.
+function PageTexts( byval doc as TK_PRINTDOC ptr, byval page as long, byref lowest as single ) as string
+    dim as string s
+    lowest = 0
+    for i as long = 0 to tkPrintDoc_GetOpCount( doc, page ) - 1
+        dim as TKPRINT_OPINFO oi
+        tkPrintDoc_GetOp( doc, page, i, oi )
+        if oi.op = TKREC_TEXT then
+            s &= oi.text & "|"
+            if oi.y + oi.size > lowest then lowest = oi.y + oi.size
+        elseif oi.op = TKPRINT_OP_LATE then
+            s &= "<late>" & oi.text & "|"
+        end if
+    next
+    return s
+end function
+
+sub RunPass( )
+    tkTest_Begin( "report" )
+    ' ---- formatting ----------------------------------------------------------------------------
+    dim as TK_VALUE v
+    v.SetFloat( 1234.5 ) : dim as string a1 = tkReport_FormatValue( v, "$#,##0.00" )
+    v.SetFloat( 0.256 ) : dim as string a2 = tkReport_FormatValue( v, "0.0%" )
+    dim as TKDATE d : d.wYear = 2026 : d.wMonth = 3 : d.wDay = 7
+    v.SetDate( d ) : dim as string a3 = tkReport_FormatValue( v, "dd/mm/yyyy" )
+    v.SetBool( false ) : dim as string a4 = tkReport_FormatValue( v, "Y|N" )
+    v.SetInt( -1234567 ) : dim as string a5 = tkReport_FormatValue( v, "#,##0" )
+    tkTest_Check( "formatting: currency, percent, date, bool, grouped negative", (a1 = "$1,234.50") andalso (a2 = "25.6%") _
+                  andalso (a3 = "07/03/2026") andalso (a4 = "N") andalso (a5 = "-1,234,567"), a1 & " " & a2 & " " & a3 & " " & a4 & " " & a5 )
+
+    ' ---- the banded report -----------------------------------------------------------------------
+    dim as TK_REPORT ptr rpt = MakeReport( true )
+    dim as TK_PRINTDOC ptr doc = tkReport_Run( rpt )
+    dim as long np = tkPrintDoc_GetPageCount( doc )
+    dim as string all_
+    dim as single lowest, footerTop
+    dim as TKRECTF m
+    dim as TKPAGESETUP ps = tkPrintDoc_GetPageSetup( doc )
+    dim as single pw, ph
+    tkPageSetup_PageSize( ps, pw, ph )
+    footerTop = ph - ps.marginB - 16
+    dim as boolean fits = true, footers = true, widow = false
+    for p as long = 0 to np - 1
+        dim as string t = PageTexts( doc, p, lowest )
+        all_ &= t
+        if lowest > footerTop + 0.5 then fits = false
+        if instr( t, "<late>Page {p} of {n}|" ) = 0 then footers = false
+        ' the last run above the footer must not be a group header's "Region:" + its region
+        dim as long k = instrrev( t, "<late>" )
+        dim as string body = left( t, k - 1 )
+        if right( body, 10 ) = "Region:|A|" orelse right( body, 10 ) = "Region:|B|" then widow = true
+    next
+    ' A's footer: Total|A|325 (1+..+25); B's: Total|B|1505 (26+..+60)
+    tkTest_Check( "group footers: their own group's region and total", (instr( all_, "Total|A|325|" ) > 0) _
+                  andalso (instr( all_, "Total|B|1505|" ) > 0), mid( all_, instr( all_, "Total" ), 60 ) )
+    tkTest_Check( "report footer: 60 rows, 1,830 in all", instr( all_, "Rows|60|1,830|" ) > 0 )
+    tkTest_Check( "pages: more than one, every band above the page footer, each footer late", (np >= 2) andalso fits andalso footers, _
+                  np & " pages, fits " & fits & ", footers " & footers )
+    tkTest_Check( "no group header alone at the bottom of a page", widow = false )
+    dim as string p2 = PageTexts( doc, 1, lowest )
+    tkTest_Check( "a group header repeats on a page its group continues on", left( p2, len( "Sales by region|Region:|" ) ) = "Sales by region|Region:|", left( p2, 60 ) )
+    dim as string first1 = PageTexts( doc, 0, lowest )
+    tkPrintDoc_Generate( doc )
+    tkTest_Check( "laid out again: the same pages", (tkPrintDoc_GetPageCount( doc ) = np) andalso (PageTexts( doc, 0, lowest ) = first1) )
+    gHideUnpaid = true
+    tkPrintDoc_Generate( doc )
+    dim as string hidden_
+    for p as long = 0 to tkPrintDoc_GetPageCount( doc ) - 1 : hidden_ &= PageTexts( doc, p, lowest ) : next
+    gHideUnpaid = false
+    ' unpaid rows: 1, 4, 7 ... (row mod 3 = 0); "Product 1" gone, "Product 2" kept
+    tkTest_Check( "BeforePrint skips a band: unpaid rows left out", (instr( hidden_, "Product 1|" ) = 0) andalso (instr( hidden_, "Product 2|" ) > 0) )
+    tkPrintDoc_Destroy( doc )
+    tkReport_Destroy( rpt )
+
+    ' ---- a ListTree as the data, and the table printer ------------------------------------------
+    dim as TK_HOST ptr h = tkHost_Create( "tkReport selftest", 640, 480, tkHost_FontDir() & TK_FONT_UI, 1.0 )
+    dim as TK_WIDGET ptr lt = tkListTree_Create( tkHost_Root( h ), 1 )
+    tkWidget_SetPos( lt, 0, 0, 600, 400 )
+    for c as long = 0 to 5
+        tkListTree_AddColumn( lt, "Col " & (c + 1), 220 )
+    next
+    for r as long = 0 to 79
+        dim as long row = tkListTree_AddString( lt, "Name " & (r + 1) )
+        for c as long = 1 to 5 : tkListTree_SetCellText( lt, row, c, str( r * 10 + c ) ) : next
+    next
+    dim as TK_REPORT ptr lr = tkReport_Create( "list" )
+    tkReport_SourceFromListTree( lr, lt )
+    dim as TK_RBAND ptr db = tkReport_GetBand( lr, TKRB_DETAIL )
+    tkRBand_SetHeight( db, 14 ) : tkRBand_AddField( db, RF( 0, 0, 100, 14 ), 0 ) : tkRBand_AddField( db, RF( 100, 0, 200, 14 ), 3 )
+    dim as TK_PRINTDOC ptr ld = tkReport_Run( lr )
+    dim as string lt1 = PageTexts( ld, 0, lowest )
+    tkTest_Check( "a ListTree as the data: its rows, its columns", (left( lt1, len( "Name 1|3|Name 2|13|" ) ) = "Name 1|3|Name 2|13|") _
+                  andalso (tkReport_FindField( lr, "Col 4" ) = 3) andalso (tkReport_GetRowsRead( lr ) = 80), left( lt1, 40 ) )
+    tkPrintDoc_Destroy( ld )
+    tkReport_Destroy( lr )
+
+    dim as TKTABLEPRINT_OPTIONS to_
+    to_.title = "List"
+    dim as TK_TABLEPRINT ptr tp = tkTablePrint_FromListTree( lt, to_ )
+    dim as TK_PRINTDOC ptr td = tkTablePrint_CreateDoc( tp )
+    tkPrintDoc_Generate( td )
+    dim as single sc
+    dim as long cps
+    tkTablePrint_GetLayout( tp, sc, cps )
+    ' 6 x 220 px = 990 pt against ~482 pt: 0.49 < 0.6, so 0.6 and across pages
+    tkTest_Check( "table: too wide even at 60% -- across pages at 60%, column 1 repeated", (abs( sc - 0.6 ) < 0.001) andalso (cps >= 2) _
+                  andalso (left( PageTexts( td, tkPrintDoc_GetPageCount( td ) \ cps, lowest ), len( "Col 1|" ) ) = "Col 1|"), _
+                  "scale " & sc & " col pages " & cps )
+    tkPrintDoc_Destroy( td )
+    tkTablePrint_Destroy( tp )
+    to_.minScale = 0.4
+    tp = tkTablePrint_FromListTree( lt, to_ )
+    td = tkTablePrint_CreateDoc( tp )
+    tkPrintDoc_Generate( td )
+    tkTablePrint_GetLayout( tp, sc, cps )
+    tkTest_Check( "table: shrunk to fit when it can (one column page)", (sc < 0.6) andalso (sc >= 0.4) andalso (cps = 1), "scale " & sc & " col pages " & cps )
+    tkPrintDoc_Destroy( td )
+    tkTablePrint_Destroy( tp )
+    tkHost_Destroy( h )
+
+    ' ---- SQLite -------------------------------------------------------------------------------
+    dim as sqlite3 ptr db3
+    sqlite3_open( ":memory:", @db3 )
+    sqlite3_exec( db3, "create table t( name text, qty integer, price real ); insert into t values ('a', 1, 2.5), ('b', null, 4.0), ('c', 3, null);", 0, 0, 0 )
+    dim as TK_REPORT ptr sr = tkReport_Create( "sql" )
+    dim as boolean opened = tkReportSqlite_Open( sr, db3, "select name, qty, price from t order by name" )
+    dim as TK_RBAND ptr sb = tkReport_GetBand( sr, TKRB_DETAIL )
+    tkRBand_SetHeight( sb, 14 )
+    tkRBand_AddField( sb, RF( 0, 0, 60, 14 ), 0 ) : tkRBand_AddField( sb, RF( 60, 0, 120, 14 ), 1 ) : tkRBand_AddField( sb, RF( 120, 0, 200, 14 ), 2, "0.00" )
+    dim as TK_RBAND ptr sf = tkReport_GetBand( sr, TKRB_REPORT_FOOTER )
+    tkRBand_AddSummary( sf, RF( 60, 0, 120, 14 ), 1, TKRS_COUNT )
+    dim as TK_PRINTDOC ptr sd = tkReport_Run( sr )
+    dim as string st = PageTexts( sd, 0, lowest )
+    ' row b's qty is NULL: no text, and COUNT counts 2
+    tkTest_Check( "SQLite: rows in order, a NULL left empty, numbers typed", opened andalso (st = "a|1|2.50|b|4.00|c|3|2|"), st )
+    tkPrintDoc_Destroy( sd )
+    tkReportSqlite_Close( sr )
+    tkReport_Destroy( sr )
+
+    ' parameters: values from outside go in bound, never pasted into the SQL
+    dim as TK_REPORT ptr pr = tkReport_Create( "sqlp" )
+    dim as TK_VALUE pv(1)
+    pv(0).SetText( "a' or '1'='1" ) : pv(1).SetInt( 2 )
+    tkTest_Check( "SQLite: Open refuses a query with parameters", _
+                  tkReportSqlite_Open( pr, db3, "select name from t where name <> ? order by name" ) = false )
+    dim as TK_VALUE one_(0)
+    one_(0).SetText( "a" )
+    tkTest_Check( "SQLite: OpenEx refuses the wrong number of parameters", _
+                  tkReportSqlite_OpenEx( pr, db3, "select name from t where name <> ? and qty >= ? order by name", one_() ) = false )
+    opened = tkReportSqlite_OpenEx( pr, db3, "select name, qty from t where name <> ? and qty >= ? order by name", pv() )
+    dim as TK_RBAND ptr pb = tkReport_GetBand( pr, TKRB_DETAIL )
+    tkRBand_SetHeight( pb, 14 )
+    tkRBand_AddField( pb, RF( 0, 0, 60, 14 ), 0 ) : tkRBand_AddField( pb, RF( 60, 0, 120, 14 ), 1 )
+    sd = tkReport_Run( pr )
+    st = PageTexts( sd, 0, lowest )
+    ' the quote trick is text compared with name, so every row passes it; qty >= 2 leaves c alone
+    tkTest_Check( "SQLite: OpenEx binds its parameters (a quote in one is only text)", opened andalso (st = "c|3|"), st )
+    tkPrintDoc_Destroy( sd )
+    tkReportSqlite_Close( pr )
+    tkReport_Destroy( pr )
+    sqlite3_close( db3 )
+
+    ' ---- R5: the table source, 10,000 rows in 100 groups ----------------------------------------
+    dim as TK_REPORT ptr tr = tkReport_Create( "big" )
+    tkReport_TableAddField( tr, "Group" ) : tkReport_TableAddField( tr, "Amount" )
+    dim as longint want(0 to 99), wantAll = 0
+    for r as long = 0 to 9999
+        dim as integer row = tkReport_TableAddRow( tr )
+        tkReport_TableCell( tr, row, 0 )->SetText( "g" & (r \ 100) )
+        tkReport_TableCell( tr, row, 1 )->SetInt( (r mod 7) + 1 )
+        want(r \ 100) += (r mod 7) + 1 : wantAll += (r mod 7) + 1
+    next
+    tkReport_AddGroup( tr, 0 )
+    tkRBand_SetHeight( tkReport_GetBand( tr, TKRB_DETAIL ), 10 )
+    tkRBand_AddField( tkReport_GetBand( tr, TKRB_DETAIL ), RF( 0, 0, 80, 10 ), 1 )
+    dim as TK_RBAND ptr gf = tkReport_GetBand( tr, TKRB_GROUP_FOOTER, 0 )
+    tkRBand_SetHeight( gf, 12 )
+    tkRBand_AddLabel( gf, RF( 0, 0, 20, 12 ), "T" ) : tkRBand_AddField( gf, RF( 20, 0, 80, 12 ), 0 )
+    tkRBand_AddSummary( gf, RF( 80, 0, 160, 12 ), 1, TKRS_SUM, 0, "0" )
+    dim as TK_RBAND ptr rf_ = tkReport_GetBand( tr, TKRB_REPORT_FOOTER )
+    tkRBand_AddLabel( rf_, RF( 0, 0, 20, 12 ), "ALL" ) : tkRBand_AddSummary( rf_, RF( 80, 0, 160, 12 ), 1, TKRS_SUM, TKRS_SCOPE_REPORT, "0" )
+    dim as double t0 = timer
+    dim as TK_PRINTDOC ptr bd = tkReport_Run( tr )
+    dim as double ms = (timer - t0) * 1000
+    dim as string r5Text
+    for pg as long = 0 to tkPrintDoc_GetPageCount( bd ) - 1 : r5Text &= PageTexts( bd, pg, lowest ) : next
+    dim as long nT = 0, at_ = instr( r5Text, "|T|g" ), bad = -1
+    while at_ > 0 : nT += 1 : at_ = instr( at_ + 1, r5Text, "|T|g" ) : wend
+    for g as long = 0 to 99
+        if instr( r5Text, "|T|g" & g & "|" & want(g) & "|" ) = 0 then bad = g : exit for
+    next
+    print "10,000 rows: " & tkPrintDoc_GetPageCount( bd ) & " pages in " & clng( ms ) & " ms"
+    tkTest_Check( "table source, 10,000 rows: 100 group totals and the report total right", (tkReport_GetRowsRead( tr ) = 10000) _
+                  andalso (nT = 100) andalso (bad < 0) andalso (instr( r5Text, "|ALL|" & wantAll & "|" ) > 0), _
+                  "read " & tkReport_GetRowsRead( tr ) & ", footers " & nT & ", first wrong group " & bad )
+    tkPrintDoc_Destroy( bd )
+    tkReport_Destroy( tr )
+end sub
+
+#include once "selftest_rd2.tiko"
+
+if tkTest_Init() = false then end 1
+RunPass( )
+RunRd2Pass( )
+dim as long nFail = tkTest_Report( "tkReport" )
+tkTest_Quit()
+end nFail

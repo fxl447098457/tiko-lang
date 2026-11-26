@@ -1,0 +1,508 @@
+' orderdb -- the program's data: one SQLite database of customers, products, orders and their
+' lines, and the records the forms bind to. The forms never see SQL for a record; they call the
+' procedures here. (frmOrders is the exception on purpose: its grid IS a query, through
+' tkDataGridSqlite, and ORDERS_QUERY is that query.)
+'
+'   customer     the people who order          -> Customer (frmCustomers binds one)
+'   product      what can be ordered           -> Product  (frmOrder's product list)
+'   orders       one order of one customer     -> Order    (frmOrder binds one)
+'   order_line   a product, a quantity, a price -> OrderLine (frmOrder's lines grid)
+'
+' A new database gets the sample data of seed.tiko (tools/makeseed.py writes it).
+#module "orderdb"
+
+#import "std/containers" public
+#import "std/chrono" public
+#import "vendor/sqlite3" public
+using containers
+
+' ---- the records -------------------------------------------------------------------------------
+
+' One line of an order. Product is the product's name, shown; ProductId is what is stored.
+public type OrderLine
+    Id as int64
+    ProductId as int64
+    Product as ustring
+    Qty as int32
+    UnitPrice as float64
+    declare function Total( ) as float64
+end type
+
+function OrderLine.Total( ) as float64
+    return Qty * UnitPrice
+end function
+
+' One order. Amount is the stored total (orders.total), what lists show without reading the lines;
+' Total( ) adds up the lines, and SaveOrder stores it as the new Amount.
+public type Order
+    Id as int64                          ' 0 until saved
+    CustomerId as int64
+    Customer as ustring                  ' the customer's company, shown
+    OrderDate as chrono.LocalDate
+    Status as ustring
+    Shipped as boolean
+    Notes as ustring
+    Amount as float64
+    Lines as Array( of OrderLine )       ' only filled by LoadOrder
+    declare function Total( ) as float64
+end type
+
+function Order.Total( ) as float64
+    dim as float64 t = 0
+    for i as int32 = 0 to Lines.Count( ) - 1
+        t += Lines[i].Total( )
+    next
+    return t
+end function
+
+' One customer, with a summary of each of its orders (no lines) for the form's orders grid.
+public type Customer
+    Id as int64                          ' 0 until saved
+    Company as ustring
+    Contact as ustring
+    Email as ustring
+    Phone as ustring
+    City as ustring
+    Country as ustring
+    Tier as ustring
+    Active as boolean = true
+    CreditLimit as float64
+    Since as chrono.LocalDate
+    Rating as float64
+    Notes as ustring
+    Orders as Array( of Order )
+    declare function SameAs( byref o as Customer ) as boolean
+    declare sub TrimFields( )
+end type
+
+' The stored fields equal (Orders is not compared: it is never written through a Customer).
+function Customer.SameAs( byref o as Customer ) as boolean
+    if (Id <> o.Id) orelse (Company <> o.Company) orelse (Contact <> o.Contact) then return false
+    if (Email <> o.Email) orelse (Phone <> o.Phone) orelse (City <> o.City) then return false
+    if (Country <> o.Country) orelse (Tier <> o.Tier) orelse (Active <> o.Active) then return false
+    if (CreditLimit <> o.CreditLimit) orelse (Rating <> o.Rating) orelse (Notes <> o.Notes) then return false
+    if Since.IsValid <> o.Since.IsValid then return false
+    if Since.IsValid andalso (Since <> o.Since) then return false
+    return true
+end function
+
+sub Customer.TrimFields( )
+    Company = trim( Company ) : Contact = trim( Contact ) : Email = trim( Email )
+    Phone = trim( Phone ) : City = trim( City ) : Country = trim( Country )
+end sub
+
+public type Product
+    Id as int64
+    Name as ustring
+    Category as ustring
+    Price as float64
+end type
+
+' A ComboBox's choice where the shown text is also the value stored.
+public type Choice
+    Name as ustring
+end type
+
+private function NewChoice_( byref s as const ustring ) as Choice
+    dim as Choice c
+    c.Name = s
+    return c
+end function
+
+' A customer's tier: frmCustomers' cboTier lists these.
+public function Tiers( ) as Array( of Choice )
+    dim as Array( of Choice ) a
+    a.Push( NewChoice_( "Standard" ) ) : a.Push( NewChoice_( "Silver" ) )
+    a.Push( NewChoice_( "Gold" ) ) : a.Push( NewChoice_( "Platinum" ) )
+    return a
+end function
+
+' An order's status: frmOrder's cboStatus lists these.
+public function Statuses( ) as Array( of Choice )
+    dim as Array( of Choice ) a
+    a.Push( NewChoice_( "Open" ) ) : a.Push( NewChoice_( "Shipped" ) )
+    a.Push( NewChoice_( "Delivered" ) ) : a.Push( NewChoice_( "Cancelled" ) )
+    return a
+end function
+
+' The query frmOrders' grid shows: every order, one row each. Its columns' declared types give the
+' grid's kinds (INTEGER -> number, DATE -> date, BOOL -> check, REAL -> number), so it names
+' table columns, never expressions -- the total is stored for exactly this reason.
+public const as string ORDERS_QUERY = "select o.id as ""Order"", o.order_date as ""Date"", c.company as ""Customer"", " _
+    & "c.country as ""Country"", o.status as ""Status"", o.shipped as ""Shipped"", o.total as ""Total"" " _
+    & "from orders o join customer c on c.id = o.customer_id"
+
+' ---- the connection ----------------------------------------------------------------------------
+
+dim shared as sqlite3 ptr db
+
+' The open connection (frmOrders hands it to tkDataGridSqlite); null when closed.
+public function Connection( ) as sqlite3 ptr
+    return db
+end function
+
+' What SQLite says went wrong with the last call on the connection.
+public function LastError( ) as ustring
+    if db = nullptr then return "the database is not open"
+    dim as string msg = *sqlite3_errmsg( db )
+    return msg
+end function
+
+' Run SQL that returns no rows: "" or SQLite's reason.
+function RunSql( byref sql as const ustring ) as ustring
+    if sqlite3_exec( db, sql, nullptr, nullptr, nullptr ) <> SQLITE_OK then return LastError( )
+    return ""
+end function
+
+' A column of the current row as text. SQLite's text is UTF-8; a string holding UTF-8 becomes a
+' ustring correctly.
+function ColText( byval st as sqlite3_stmt ptr, byval col as int32 ) as ustring
+    dim as string bytes
+    var p = sqlite3_column_text( st, col )
+    if p <> nullptr then bytes = *cast( zstring ptr, p )
+    return bytes
+end function
+
+' A DATE column ("yyyy-mm-dd") as a LocalDate; Invalid (no date) for NULL or anything else.
+function ColDate( byval st as sqlite3_stmt ptr, byval col as int32 ) as chrono.LocalDate
+    dim as chrono.LocalDate d = chrono.LocalDate.Invalid( )
+    dim as ustring s = ColText( st, col )
+    if len( s ) then chrono.LocalDate.TryParseIso( s, d )
+    return d
+end function
+
+' Bind text; an empty ustring reaches C as a null pointer, which SQLite stores as NULL: bind "".
+sub BindText( byval st as sqlite3_stmt ptr, byval i as int32, byref s as const ustring )
+    if len( s ) then
+        sqlite3_bind_text( st, i, s, -1, SQLITE_TRANSIENT )
+    else
+        sqlite3_bind_text( st, i, "", 0, SQLITE_STATIC )
+    end if
+end sub
+
+' Bind a date as "yyyy-mm-dd", or NULL for none.
+sub BindDate( byval st as sqlite3_stmt ptr, byval i as int32, byref d as chrono.LocalDate )
+    if d.IsValid then
+        BindText( st, i, d.ToIsoString( ) )
+    else
+        sqlite3_bind_null( st, i )
+    end if
+end sub
+
+' Step a statement that returns no rows, and finalize it: "" or SQLite's reason.
+function StepDone( byval st as sqlite3_stmt ptr ) as ustring
+    dim as int32 rc = sqlite3_step( st )
+    dim as ustring e
+    if rc <> SQLITE_DONE then e = LastError( )
+    sqlite3_finalize( st )
+    return e
+end function
+
+' select count(*) ...
+function CountOf( byref sql as const ustring ) as int32
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, sql, -1, @st, nullptr ) <> SQLITE_OK then return -1
+    dim as int32 n = -1
+    if sqlite3_step( st ) = SQLITE_ROW then n = sqlite3_column_int( st, 0 )
+    sqlite3_finalize( st )
+    return n
+end function
+
+' Open (or make) the database at path: the tables made, and the sample data put in when it has no
+' customers yet (seed = false leaves it empty). "" when it is open, else why not.
+public function OpenData( byref path as const ustring, byval seed as boolean = true ) as ustring
+    CloseData( )
+    if sqlite3_open( path, @db ) <> SQLITE_OK then
+        dim as ustring e = LastError( )
+        sqlite3_close( db ) : db = nullptr
+        return e
+    end if
+    dim as ustring e = RunSql( "pragma foreign_keys = on;" _
+        & "create table if not exists customer( id integer primary key, company text not null, " _
+        & "contact text not null default '', email text not null default '', phone text not null default '', " _
+        & "city text not null default '', country text not null default '', tier text not null default 'Standard', " _
+        & "active bool not null default 1, credit_limit real not null default 0, since date, " _
+        & "rating real not null default 0, notes text not null default '' );" _
+        & "create table if not exists product( id integer primary key, name text not null, " _
+        & "category text not null default '', price real not null default 0 );" _
+        & "create table if not exists orders( id integer primary key, " _
+        & "customer_id integer not null references customer( id ), order_date date not null, " _
+        & "status text not null default 'Open', shipped bool not null default 0, " _
+        & "total real not null default 0, notes text not null default '' );" _
+        & "create table if not exists order_line( id integer primary key, " _
+        & "order_id integer not null references orders( id ), product_id integer not null references product( id ), " _
+        & "qty integer not null default 1, unit_price real not null default 0 );" _
+        & "create index if not exists ix_orders_customer on orders( customer_id );" _
+        & "create index if not exists ix_line_order on order_line( order_id );" )
+    if len( e ) then return e
+    if seed andalso (CountOf( "select count(*) from customer" ) = 0) then
+        e = RunSql( "begin;" & SeedSql( ) & "commit;" )
+        if len( e ) then RunSql( "rollback;" ) : return e
+    end if
+    return ""
+end function
+
+public sub CloseData( )
+    if db then sqlite3_close( db )
+    db = nullptr
+end sub
+
+' ---- customers ---------------------------------------------------------------------------------
+
+const as string CUSTOMER_COLUMNS = "company, contact, email, phone, city, country, tier, active, credit_limit, since, rating, notes"
+
+' The order summaries (no lines) of one customer, newest first.
+public function LoadCustomerOrders( byval customerId as int64, byref list as Array( of Order ) ) as ustring
+    list.Clear( )
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, "select o.id, o.customer_id, c.company, o.order_date, o.status, o.shipped, o.notes, o.total " _
+                           & "from orders o join customer c on c.id = o.customer_id where o.customer_id = ? " _
+                           & "order by o.order_date desc, o.id desc", -1, @st, nullptr ) <> SQLITE_OK then return LastError( )
+    sqlite3_bind_int64( st, 1, customerId )
+    do while sqlite3_step( st ) = SQLITE_ROW
+        dim as Order o
+        o.Id = sqlite3_column_int64( st, 0 )
+        o.CustomerId = sqlite3_column_int64( st, 1 )
+        o.Customer = ColText( st, 2 )
+        o.OrderDate = ColDate( st, 3 )
+        o.Status = ColText( st, 4 )
+        o.Shipped = sqlite3_column_int( st, 5 ) <> 0
+        o.Notes = ColText( st, 6 )
+        o.Amount = sqlite3_column_double( st, 7 )
+        list.Push( o )
+    loop
+    sqlite3_finalize( st )
+    return ""
+end function
+
+' Every customer by company, each with its order summaries.
+public function LoadCustomers( byref list as Array( of Customer ) ) as ustring
+    list.Clear( )
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, "select id, " & CUSTOMER_COLUMNS & " from customer order by company collate nocase", _
+                           -1, @st, nullptr ) <> SQLITE_OK then return LastError( )
+    do while sqlite3_step( st ) = SQLITE_ROW
+        dim as Customer c
+        c.Id = sqlite3_column_int64( st, 0 )
+        c.Company = ColText( st, 1 )
+        c.Contact = ColText( st, 2 )
+        c.Email = ColText( st, 3 )
+        c.Phone = ColText( st, 4 )
+        c.City = ColText( st, 5 )
+        c.Country = ColText( st, 6 )
+        c.Tier = ColText( st, 7 )
+        c.Active = sqlite3_column_int( st, 8 ) <> 0
+        c.CreditLimit = sqlite3_column_double( st, 9 )
+        c.Since = ColDate( st, 10 )
+        c.Rating = sqlite3_column_double( st, 11 )
+        c.Notes = ColText( st, 12 )
+        list.Push( c )
+    loop
+    sqlite3_finalize( st )
+    for i as int32 = 0 to list.Count( ) - 1
+        dim as ustring e = LoadCustomerOrders( list[i].Id, list[i].Orders )
+        if len( e ) then return e
+    next
+    return ""
+end function
+
+' Insert a new customer (Id 0, which then gets its id) or update one.
+public function SaveCustomer( byref c as Customer ) as ustring
+    dim as ustring sql
+    if c.Id = 0 then
+        sql = "insert into customer( " & CUSTOMER_COLUMNS & " ) values( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )"
+    else
+        sql = "update customer set company = ?, contact = ?, email = ?, phone = ?, city = ?, country = ?, " _
+            & "tier = ?, active = ?, credit_limit = ?, since = ?, rating = ?, notes = ? where id = ?"
+    end if
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, sql, -1, @st, nullptr ) <> SQLITE_OK then return LastError( )
+    BindText( st, 1, c.Company ) : BindText( st, 2, c.Contact ) : BindText( st, 3, c.Email )
+    BindText( st, 4, c.Phone ) : BindText( st, 5, c.City ) : BindText( st, 6, c.Country )
+    BindText( st, 7, c.Tier )
+    sqlite3_bind_int( st, 8, iif( c.Active, 1, 0 ) )
+    sqlite3_bind_double( st, 9, c.CreditLimit )
+    BindDate( st, 10, c.Since )
+    sqlite3_bind_double( st, 11, c.Rating )
+    BindText( st, 12, c.Notes )
+    if c.Id then sqlite3_bind_int64( st, 13, c.Id )
+    dim as ustring e = StepDone( st )
+    if len( e ) then return e
+    if c.Id = 0 then c.Id = sqlite3_last_insert_rowid( db )
+    return ""
+end function
+
+' Delete a customer with every order and line of it, all or nothing.
+public function DeleteCustomer( byval id as int64 ) as ustring
+    dim as ustring e = RunSql( "savepoint delcust" )
+    if len( e ) then return e
+    dim as sqlite3_stmt ptr st
+    dim as string steps(0 to 2) = { _
+        "delete from order_line where order_id in ( select id from orders where customer_id = ? )", _
+        "delete from orders where customer_id = ?", _
+        "delete from customer where id = ?" }
+    for i as int32 = 0 to 2
+        if sqlite3_prepare_v2( db, steps(i), -1, @st, nullptr ) <> SQLITE_OK then
+            e = LastError( )
+        else
+            sqlite3_bind_int64( st, 1, id )
+            e = StepDone( st )
+        end if
+        if len( e ) then
+            RunSql( "rollback to delcust; release delcust" )
+            return e
+        end if
+    next
+    return RunSql( "release delcust" )
+end function
+
+' ---- products ----------------------------------------------------------------------------------
+
+public function LoadProducts( byref list as Array( of Product ) ) as ustring
+    list.Clear( )
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, "select id, name, category, price from product order by name collate nocase", _
+                           -1, @st, nullptr ) <> SQLITE_OK then return LastError( )
+    do while sqlite3_step( st ) = SQLITE_ROW
+        dim as Product p
+        p.Id = sqlite3_column_int64( st, 0 )
+        p.Name = ColText( st, 1 )
+        p.Category = ColText( st, 2 )
+        p.Price = sqlite3_column_double( st, 3 )
+        list.Push( p )
+    loop
+    sqlite3_finalize( st )
+    return ""
+end function
+
+' ---- orders ------------------------------------------------------------------------------------
+
+' One order with its lines: false when there is none.
+public function LoadOrder( byval id as int64, byref o as Order ) as boolean
+    dim as Array( of Order ) one
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( db, "select o.id, o.customer_id, c.company, o.order_date, o.status, o.shipped, o.notes, o.total " _
+                           & "from orders o join customer c on c.id = o.customer_id where o.id = ?", -1, @st, nullptr ) <> SQLITE_OK then return false
+    sqlite3_bind_int64( st, 1, id )
+    dim as boolean found = (sqlite3_step( st ) = SQLITE_ROW)
+    if found then
+        o.Id = sqlite3_column_int64( st, 0 )
+        o.CustomerId = sqlite3_column_int64( st, 1 )
+        o.Customer = ColText( st, 2 )
+        o.OrderDate = ColDate( st, 3 )
+        o.Status = ColText( st, 4 )
+        o.Shipped = sqlite3_column_int( st, 5 ) <> 0
+        o.Notes = ColText( st, 6 )
+        o.Amount = sqlite3_column_double( st, 7 )
+    end if
+    sqlite3_finalize( st )
+    if found = false then return false
+    o.Lines.Clear( )
+    if sqlite3_prepare_v2( db, "select l.id, l.product_id, p.name, l.qty, l.unit_price from order_line l " _
+                           & "join product p on p.id = l.product_id where l.order_id = ? order by l.id", -1, @st, nullptr ) <> SQLITE_OK then return false
+    sqlite3_bind_int64( st, 1, id )
+    do while sqlite3_step( st ) = SQLITE_ROW
+        dim as OrderLine l
+        l.Id = sqlite3_column_int64( st, 0 )
+        l.ProductId = sqlite3_column_int64( st, 1 )
+        l.Product = ColText( st, 2 )
+        l.Qty = sqlite3_column_int( st, 3 )
+        l.UnitPrice = sqlite3_column_double( st, 4 )
+        o.Lines.Push( l )
+    loop
+    sqlite3_finalize( st )
+    return true
+end function
+
+' A new, empty order for a customer, dated today.
+public function NewOrder( byref c as Customer ) as Order
+    dim as Order o
+    o.CustomerId = c.Id
+    o.Customer = c.Company
+    o.OrderDate = chrono.WallClock.Today( )
+    o.Status = "Open"
+    return o
+end function
+
+' Insert or update an order and replace its lines, all or nothing. Amount becomes Total( ).
+public function SaveOrder( byref o as Order ) as ustring
+    dim as ustring e = RunSql( "savepoint saveorder" )
+    if len( e ) then return e
+    o.Amount = o.Total( )
+    dim as sqlite3_stmt ptr st
+    dim as ustring sql
+    if o.Id = 0 then
+        sql = "insert into orders( customer_id, order_date, status, shipped, notes, total ) values( ?, ?, ?, ?, ?, ? )"
+    else
+        sql = "update orders set customer_id = ?, order_date = ?, status = ?, shipped = ?, notes = ?, total = ? where id = ?"
+    end if
+    if sqlite3_prepare_v2( db, sql, -1, @st, nullptr ) <> SQLITE_OK then
+        e = LastError( )
+    else
+        sqlite3_bind_int64( st, 1, o.CustomerId )
+        BindDate( st, 2, o.OrderDate )
+        BindText( st, 3, o.Status )
+        sqlite3_bind_int( st, 4, iif( o.Shipped, 1, 0 ) )
+        BindText( st, 5, o.Notes )
+        sqlite3_bind_double( st, 6, o.Amount )
+        if o.Id then sqlite3_bind_int64( st, 7, o.Id )
+        e = StepDone( st )
+        if (len( e ) = 0) andalso (o.Id = 0) then o.Id = sqlite3_last_insert_rowid( db )
+    end if
+    if len( e ) = 0 then
+        if sqlite3_prepare_v2( db, "delete from order_line where order_id = ?", -1, @st, nullptr ) <> SQLITE_OK then
+            e = LastError( )
+        else
+            sqlite3_bind_int64( st, 1, o.Id )
+            e = StepDone( st )
+        end if
+    end if
+    for i as int32 = 0 to o.Lines.Count( ) - 1
+        if len( e ) then exit for
+        if sqlite3_prepare_v2( db, "insert into order_line( order_id, product_id, qty, unit_price ) values( ?, ?, ?, ? )", _
+                               -1, @st, nullptr ) <> SQLITE_OK then
+            e = LastError( )
+            exit for
+        end if
+        sqlite3_bind_int64( st, 1, o.Id )
+        sqlite3_bind_int64( st, 2, o.Lines[i].ProductId )
+        sqlite3_bind_int( st, 3, o.Lines[i].Qty )
+        sqlite3_bind_double( st, 4, o.Lines[i].UnitPrice )
+        e = StepDone( st )
+        if len( e ) = 0 then o.Lines[i].Id = sqlite3_last_insert_rowid( db )
+    next
+    if len( e ) then
+        RunSql( "rollback to saveorder; release saveorder" )
+        return e
+    end if
+    return RunSql( "release saveorder" )
+end function
+
+' Delete an order and its lines.
+public function DeleteOrder( byval id as int64 ) as ustring
+    dim as ustring e = RunSql( "savepoint delorder" )
+    if len( e ) then return e
+    dim as sqlite3_stmt ptr st
+    for i as int32 = 0 to 1
+        dim as string sql = iif( i = 0, "delete from order_line where order_id = ?", "delete from orders where id = ?" )
+        if sqlite3_prepare_v2( db, sql, -1, @st, nullptr ) <> SQLITE_OK then
+            e = LastError( )
+        else
+            sqlite3_bind_int64( st, 1, id )
+            e = StepDone( st )
+        end if
+        if len( e ) then
+            RunSql( "rollback to delorder; release delorder" )
+            return e
+        end if
+    next
+    return RunSql( "release delorder" )
+end function
+
+' An amount as text with two decimals: 1234.5 -> "1234.50".
+public function Money( byval d as float64 ) as ustring
+    dim as int64 cents = clngint( d * 100 )
+    dim as string sign = iif( cents < 0, "-", "" )
+    cents = abs( cents )
+    return sign & (cents \ 100) & "." & right( "0" & (cents mod 100), 2 )
+end function

@@ -1,0 +1,716 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPrint -- print documents: pages recorded once as display lists in POINTS, replayed to every
+' device. Design: docs/tkControls/PRINTING.md (claude-docs); this is phase R0 (the page model,
+' the recorder, replay to SDL, raster and PNG). Preview control, PDF and printers come later.
+'
+' THE MODEL. A TK_PRINTDOC holds pages; a page is a list of ops in points (1/72 inch, origin
+' top-left, y down). Ops are tkPaint's own primitives -- filled / stroked outlines, rects,
+' gradients, text runs, images, clips -- plus LATE text (page number, page count) resolved when
+' the page is replayed, which is how "Page 3 of 12" needs no second pass.
+'
+' TWO PRODUCERS, ONE RECORDER. Both draw through a TK_PAINT whose pfnRec is set (tkPaint's record
+' mode), so a page holds exactly what tkPaint would have drawn:
+'   * the page API (tkPage_*, prPage.tiko): points in, a TK_PAINT at PR_PXPERPT pixels per point
+'     underneath, so geometry and text measurement are tkPaint's at 720 dpi;
+'   * tkPrint_PaintWidget: any widget's own TKM_PAINT (and its children's), recorded at the
+'     widget's pixel geometry and mapped uniformly into a rect of the page.
+'
+' REPLAY (prReplay.tiko) maps the ops back to pixels at any scale and calls TK_PAINT.PlayOp: the
+' preview, PNG export and (later) the Windows raster printer are the same code. A recording
+' replayed at the scale it was recorded at is the same pixels as painting directly.
+'
+' FONTS are recorded by their source (tkHost_FontSource: the name or path, the face) and their
+' size in points on the page; replay opens them again at its own pixel size.
+#module "tkPrint"
+
+#import "../tkHost" public
+using tkHost
+using tkPaint
+
+' ---- units and rects ---------------------------------------------------------------------
+public const TK_PT_PER_INCH = 72.0
+public const TK_PT_PER_MM = 2.834645669
+
+' The page API's recording resolution: pixels per point under tkPage_* (720 dpi).
+const PR_PXPERPT = 10.0
+
+public type TKRECTF
+    left   as single
+    top    as single
+    right  as single
+    bottom as single
+end type
+
+public type TKPOINTF
+    x as single
+    y as single
+end type
+
+public sub tkRectF_Set( byref rc as TKRECTF, byval l as single, byval t as single, byval r as single, byval b as single )
+    rc.left = l : rc.top = t : rc.right = r : rc.bottom = b
+end sub
+
+' ---- paper and page setup ----------------------------------------------------------------
+public enum
+    TK_PAPER_DEFAULT = 0      ' Letter or A4 by the user's locale (tkPrint_DefaultPaper)
+    TK_PAPER_A4
+    TK_PAPER_LETTER
+    TK_PAPER_LEGAL
+    TK_PAPER_A3
+    TK_PAPER_A5
+    TK_PAPER_B5               ' ISO B5
+    TK_PAPER_TABLOID
+    TK_PAPER_EXECUTIVE
+    TK_PAPER_CUSTOM           ' widthPt / heightPt as given
+end enum
+
+public type TKPAGESETUP
+    paper     as long = TK_PAPER_DEFAULT
+    widthPt   as single           ' portrait width; filled from paper unless CUSTOM
+    heightPt  as single
+    landscape as boolean
+    marginL   as single = 56.69   ' 20 mm, from the paper's edge
+    marginT   as single = 56.69
+    marginR   as single = 56.69
+    marginB   as single = 56.69
+end type
+
+' The regions CLDR lists as using US Letter; everyone else gets A4 (decision P-6).
+public function tkPrint_DefaultPaper() as long
+    dim as long n
+    dim as SDL_Locale ptr ptr pp = SDL_GetPreferredLocales( @n )
+    if pp = 0 then return TK_PAPER_A4
+    dim as string cc
+    if (n > 0) andalso (pp[0] <> 0) andalso (pp[0]->country <> 0) then cc = ucase( *pp[0]->country )
+    SDL_free( pp )
+    if len( cc ) = 0 then return TK_PAPER_A4
+    if instr( " BZ CA CL CO CR GT MX NI PA PE PH PR SV US VE ", " " & cc & " " ) then return TK_PAPER_LETTER
+    return TK_PAPER_A4
+end function
+
+' A paper's portrait size in points. FALSE for DEFAULT / CUSTOM / unknown.
+public function tkPrint_PaperSize( byval paper as long, byref w as single, byref h as single ) as boolean
+    select case paper
+    case TK_PAPER_A4 : w = 595.276 : h = 841.890
+    case TK_PAPER_LETTER : w = 612 : h = 792
+    case TK_PAPER_LEGAL : w = 612 : h = 1008
+    case TK_PAPER_A3 : w = 841.890 : h = 1190.551
+    case TK_PAPER_A5 : w = 419.528 : h = 595.276
+    case TK_PAPER_B5 : w = 498.898 : h = 708.661
+    case TK_PAPER_TABLOID : w = 792 : h = 1224
+    case TK_PAPER_EXECUTIVE : w = 522 : h = 756
+    case else : return false
+    end select
+    return true
+end function
+
+' DEFAULT becomes the locale's paper; a named paper fills widthPt / heightPt.
+public sub tkPageSetup_Resolve( byref ps as TKPAGESETUP )
+    if ps.paper = TK_PAPER_DEFAULT then ps.paper = tkPrint_DefaultPaper()
+    if ps.paper <> TK_PAPER_CUSTOM then tkPrint_PaperSize( ps.paper, ps.widthPt, ps.heightPt )
+    if ps.widthPt <= 0 then ps.widthPt = 595.276
+    if ps.heightPt <= 0 then ps.heightPt = 841.890
+end sub
+
+' The page as printed: landscape swaps the sides.
+public sub tkPageSetup_PageSize( byref ps as TKPAGESETUP, byref w as single, byref h as single )
+    w = ps.widthPt : h = ps.heightPt
+    if ps.landscape then swap w, h
+end sub
+
+' ---- fonts -------------------------------------------------------------------------------
+' How the page API names a font. src "" is tkControls' own UI font (Inter), whose bundled bold
+' and italic faces bold / italic pick; any other src gets SDL_ttf's synthetic style (P-3).
+public type TKFONTSPEC
+    src       as string           ' a tkHost resource name or a font file; "" = the UI font
+    face      as long             ' face index in a collection
+    pt        as single = 10
+    bold      as boolean
+    italic    as boolean
+end type
+
+' ---- the display list ----------------------------------------------------------------------
+' One more op beside tkPaint's TKREC_*: text resolved at replay.
+public const PR_LATE = 100
+' A link: rect; i0 = the URL (string index), n = the target page (-1: the URL), gy0 = target y.
+public const PR_LINK = 101
+
+' Late text: the format's {p} becomes the page number, {n} the page count.
+public type PR_OP
+    op     as long
+    c      as ulong
+    w      as single              ' stroke width, points
+    nDash  as long
+    bRound as boolean
+    i0     as long                ' first point in the page's pool; TEXT / LATE: string index
+    n      as long                ' point count; CLIP: 0 = none
+    x      as single              ' rect (FILLRECT, GRADRECT, IMAGE, CLIP, LATE); TEXT: line top-left
+    y      as single
+    cw     as single
+    ch     as single
+    bGrad  as boolean
+    gx0    as single
+    gy0    as single
+    gx1    as single
+    gy1    as single
+    gc0    as ulong
+    gc1    as ulong
+    font   as long                ' the doc's font table
+    size   as single              ' the font's size on the page, points
+    tw     as single              ' TEXT: measured width, points
+    asc    as single              ' TEXT / LATE: the font's ascent (top of the line to the baseline), points
+    img    as long                ' the doc's image table
+    sx     as single              ' IMAGE: source rect in the image (sw = 0: all of it)
+    sy     as single
+    sw     as single
+    sh     as single
+    flags  as long                ' LATE: TK_DT_* alignment
+end type
+
+public type PR_PAGE
+    wPt    as single
+    hPt    as single
+    setup  as TKPAGESETUP
+    ops(any) as PR_OP
+    nOps   as long
+    pts(any) as SDL_FPoint
+    nPts   as long
+    strs(any) as string
+    nStrs  as long
+end type
+
+public type PR_FONTREF
+    path   as string
+    face   as long
+    style  as long                ' TTF_STYLE_* (synthetic bold / italic)
+end type
+
+public type PR_PAGEFONT                   ' a font the page API opened: key -> font
+    key    as string
+    f      as TTF_Font ptr
+end type
+
+public type TK_PRINTDOC as TK_PRINTDOC_
+public type TK_PAGE as TK_PAGE_
+
+' The pull-style producer (WinForms' PrintPage): draw page pageIndex, TRUE = more pages follow.
+public type PR_PrintPageFunc as function( byval doc as TK_PRINTDOC ptr, byval pg as TK_PAGE ptr, _
+                                          byval pageIndex as long ) as boolean
+
+' The pen the page API draws with -- one per document, moved to each new page.
+public type TK_PAGE_
+    doc     as TK_PRINTDOC ptr
+    index   as long
+    p       as TK_PAINT           ' the page API's recorder
+    pFont   as TTF_Font ptr       ' the page API's current font
+    fontPt  as single
+    clrFill as ulong = &hFFFFFFFFul
+    clrLine as ulong = &hFF000000ul
+    clrText as ulong = &hFF000000ul
+    penPt   as single = 0.5
+    nDash   as long
+    ' the mapping in force for the op being recorded: point = pixel * mk + (mx, my)
+    mk      as single = 0.1
+    mx      as single
+    my      as single
+    pCapR   as SDL_Renderer ptr   ' the renderer an IMAGE op's texture belongs to
+end type
+
+public type TK_PRINTDOC_
+    title    as ustring
+    setup    as TKPAGESETUP
+    pages(any) as PR_PAGE ptr
+    nPages   as long
+    fonts(any) as PR_FONTREF
+    nFonts   as long
+    imgs(any) as SDL_Surface ptr  ' ARGB8888, owned
+    imgKey(any) as any ptr        ' the texture an image was captured from (0: from a file)
+    nImgs    as long
+    pfs(any) as PR_PAGEFONT
+    nPfs     as long
+    pen      as TK_PAGE
+    cbPage   as PR_PrintPageFunc
+    pUser    as any ptr
+    warnings as ustring
+    serial   as long              ' +1 whenever a page is added or the pages are cleared
+    nGenNext as long = -1         ' the page index GenerateStep calls back for next; -1 = not generating
+    slots(any) as string          ' late slots: text filled when its scope closes ({s:N} in a LATE text)
+    nSlots   as long
+end type
+
+sub PrWarn( byval doc as TK_PRINTDOC ptr, byref s as ustring )
+    if instr( doc->warnings, s ) then exit sub
+    if len( doc->warnings ) then doc->warnings &= chr( 10 )
+    doc->warnings &= s
+end sub
+
+' ---- the document --------------------------------------------------------------------------
+public function tkPrintDoc_Create( byref title as ustring = "" ) as TK_PRINTDOC ptr
+    dim as TK_PRINTDOC ptr doc = new TK_PRINTDOC
+    doc->title = title
+    tkPageSetup_Resolve( doc->setup )
+    doc->pen.doc = doc
+    doc->pen.index = -1
+    return doc
+end function
+
+private sub FreePages( byval doc as TK_PRINTDOC ptr )
+    for i as long = 0 to doc->nPages - 1
+        delete doc->pages(i)
+        doc->pages(i) = 0
+    next
+    doc->nPages = 0
+    doc->pen.index = -1
+end sub
+
+' Pages, images and the fonts the page API opened. Pages and fonts only: a document can be
+' generated again.
+public sub tkPrintDoc_Clear( byval doc as TK_PRINTDOC ptr )
+    if doc = 0 then exit sub
+    FreePages( doc )
+    for i as long = 0 to doc->nImgs - 1
+        if doc->imgs(i) then SDL_DestroySurface( doc->imgs(i) )
+        doc->imgs(i) = 0
+    next
+    doc->nImgs = 0
+    doc->nFonts = 0
+    doc->serial += 1
+    doc->nGenNext = -1
+    erase doc->slots
+    doc->nSlots = 0
+    doc->warnings = ""
+end sub
+
+public sub tkPrintDoc_Destroy( byval doc as TK_PRINTDOC ptr )
+    if doc = 0 then exit sub
+    tkPrintDoc_Clear( doc )
+    for i as long = 0 to doc->nPfs - 1
+        tkHost_CloseFont( doc->pfs(i).f )
+    next
+    delete doc
+end sub
+
+public sub tkPrintDoc_SetPageSetup( byval doc as TK_PRINTDOC ptr, byref ps as TKPAGESETUP )
+    if doc = 0 then exit sub
+    doc->setup = ps
+    tkPageSetup_Resolve( doc->setup )
+end sub
+
+public function tkPrintDoc_GetPageSetup( byval doc as TK_PRINTDOC ptr ) as TKPAGESETUP
+    dim as TKPAGESETUP ps
+    if doc then ps = doc->setup
+    return ps
+end function
+
+public sub tkPrintDoc_SetTitle( byval doc as TK_PRINTDOC ptr, byref title as ustring )
+    if doc then doc->title = title
+end sub
+
+public function tkPrintDoc_GetTitle( byval doc as TK_PRINTDOC ptr ) as ustring
+    if doc = 0 then return ""
+    return doc->title
+end function
+
+public sub tkPrintDoc_SetUserData( byval doc as TK_PRINTDOC ptr, byval p as any ptr )
+    if doc then doc->pUser = p
+end sub
+
+public function tkPrintDoc_GetUserData( byval doc as TK_PRINTDOC ptr ) as any ptr
+    if doc = 0 then return 0
+    return doc->pUser
+end function
+
+public function tkPrintDoc_GetPageCount( byval doc as TK_PRINTDOC ptr ) as long
+    if doc = 0 then return 0
+    return doc->nPages
+end function
+
+public function tkPrintDoc_GetPageSize( byval doc as TK_PRINTDOC ptr, byval page as long, _
+                                        byref w as single, byref h as single ) as boolean
+    if (doc = 0) orelse (page < 0) orelse (page >= doc->nPages) then return false
+    w = doc->pages(page)->wPt : h = doc->pages(page)->hPt
+    return true
+end function
+
+' Add a line to the warnings (an output device's: a font drawn as an image ...). Never repeated.
+public sub tkPrintDoc_Warn( byval doc as TK_PRINTDOC ptr, byref s as ustring )
+    if doc then PrWarn( doc, s )
+end sub
+
+' Substituted fonts, unreadable images: one line each, never repeated.
+public function tkPrintDoc_Warnings( byval doc as TK_PRINTDOC ptr ) as ustring
+    if doc = 0 then return ""
+    return doc->warnings
+end function
+
+' A new page with this page setup; the pen moves to it (any earlier TK_PAGE ptr is this same pen).
+public function tkPrintDoc_AddPageEx( byval doc as TK_PRINTDOC ptr, byref ps as TKPAGESETUP ) as TK_PAGE ptr
+    if doc = 0 then return 0
+    dim as PR_PAGE ptr pp = new PR_PAGE
+    pp->setup = ps
+    tkPageSetup_Resolve( pp->setup )
+    tkPageSetup_PageSize( pp->setup, pp->wPt, pp->hPt )
+    if doc->nPages > ubound( doc->pages ) then redim preserve doc->pages( 0 to doc->nPages * 2 + 7 )
+    doc->pages(doc->nPages) = pp
+    doc->nPages += 1
+    doc->serial += 1
+    dim as TK_PAGE ptr pg = @doc->pen
+    pg->index = doc->nPages - 1
+    pg->mk = 1 / PR_PXPERPT : pg->mx = 0 : pg->my = 0
+    pg->pCapR = 0
+    ' the page API's painter: the whole page, at PR_PXPERPT pixels per point
+    dim as TK_PAINT blank
+    pg->p = blank
+    pg->p.pfnRec = @PrRecSub
+    pg->p.pRecCtx = pg
+    pg->p.fScale = 1
+    pg->p.pFont = pg->pFont
+    pg->p.Begin( 0, 0, clng( int( pp->wPt * PR_PXPERPT + 0.5 ) ), clng( int( pp->hPt * PR_PXPERPT + 0.5 ) ) )
+    return pg
+end function
+
+public function tkPrintDoc_AddPage( byval doc as TK_PRINTDOC ptr ) as TK_PAGE ptr
+    if doc = 0 then return 0
+    return tkPrintDoc_AddPageEx( doc, doc->setup )
+end function
+
+public sub tkPrintDoc_SetPrintPageCallback( byval doc as TK_PRINTDOC ptr, byval cb as PR_PrintPageFunc )
+    if doc then doc->cbPage = cb
+end sub
+
+' Clear the pages and get ready to call the PrintPage callback from page 0 (GenerateStep).
+public sub tkPrintDoc_BeginGenerate( byval doc as TK_PRINTDOC ptr )
+    if doc = 0 then exit sub
+    tkPrintDoc_Clear( doc )
+    if doc->cbPage then doc->nGenNext = 0
+end sub
+
+' Up to nMax more pages from the PrintPage callback. TRUE while more remain: a preview calls it on
+' idle ticks so its first pages show before the last are made (WPF's DynamicDocumentPaginator).
+public function tkPrintDoc_GenerateStep( byval doc as TK_PRINTDOC ptr, byval nMax as long = 1 ) as boolean
+    if (doc = 0) orelse (doc->nGenNext < 0) orelse (doc->cbPage = 0) then return false
+    for k as long = 1 to iif( nMax < 1, 1, nMax )
+        dim as long i = doc->nGenNext
+        dim as TK_PAGE ptr pg = tkPrintDoc_AddPage( doc )
+        if (doc->cbPage( doc, pg, i ) = false) orelse (i + 1 >= 100000) then
+            doc->nGenNext = -1
+            return false
+        end if
+        doc->nGenNext = i + 1
+    next
+    return true
+end function
+
+' TRUE when no generation is under way: the page count is final.
+public function tkPrintDoc_IsComplete( byval doc as TK_PRINTDOC ptr ) as boolean
+    if doc = 0 then return true
+    return doc->nGenNext < 0
+end function
+
+' Stop a generation; the pages made so far stay, and the count is final.
+public sub tkPrintDoc_Cancel( byval doc as TK_PRINTDOC ptr )
+    if doc then doc->nGenNext = -1
+end sub
+
+' Changes whenever pages are added or cleared: a cache of rendered pages keys on it.
+public function tkPrintDoc_GetSerial( byval doc as TK_PRINTDOC ptr ) as long
+    if doc = 0 then return 0
+    return doc->serial
+end function
+
+' Clear the pages and run the PrintPage callback until it says there are no more (or 100 000
+' pages). The page count.
+public function tkPrintDoc_Generate( byval doc as TK_PRINTDOC ptr ) as long
+    if doc = 0 then return 0
+    tkPrintDoc_BeginGenerate( doc )
+    while tkPrintDoc_GenerateStep( doc, 1000 )
+    wend
+    return doc->nPages
+end function
+
+' The link under (xPt, yPt) on a page, the last one drawn winning: a URL, or a target page
+' (from 0) and y. FALSE when there is none.
+public function tkPrintDoc_LinkAt( byval doc as TK_PRINTDOC ptr, byval page as long, byval xPt as single, _
+                                   byval yPt as single, byref url as ustring, byref targetPage as long, _
+                                   byref targetY as single ) as boolean
+    if (doc = 0) orelse (page < 0) orelse (page >= doc->nPages) then return false
+    dim as PR_PAGE ptr pp = doc->pages(page)
+    for i as long = pp->nOps - 1 to 0 step -1
+        dim byref as PR_OP q = pp->ops(i)
+        if q.op <> PR_LINK then continue for
+        if (xPt >= q.x) andalso (xPt < q.x + q.cw) andalso (yPt >= q.y) andalso (yPt < q.y + q.ch) then
+            targetPage = q.n : targetY = q.gy0
+            url = iif( q.n < 0, pp->strs(q.i0), "" )
+            return true
+        end if
+    next
+    return false
+end function
+
+' ---- the recorder --------------------------------------------------------------------------
+private function NewOp( byval pp as PR_PAGE ptr ) as PR_OP ptr
+    if pp->nOps > ubound( pp->ops ) then redim preserve pp->ops( 0 to pp->nOps * 2 + 63 )
+    dim as PR_OP blank
+    pp->ops(pp->nOps) = blank
+    pp->nOps += 1
+    return @pp->ops(pp->nOps - 1)
+end function
+
+private function AddPts( byval pp as PR_PAGE ptr, byval n as long ) as long
+    dim as long i0 = pp->nPts
+    if i0 + n - 1 > ubound( pp->pts ) then redim preserve pp->pts( 0 to (i0 + n) * 2 + 63 )
+    pp->nPts += n
+    return i0
+end function
+
+function PrAddStr( byval pp as PR_PAGE ptr, byref s as string ) as long
+    if pp->nStrs > ubound( pp->strs ) then redim preserve pp->strs( 0 to pp->nStrs * 2 + 15 )
+    pp->strs(pp->nStrs) = s
+    pp->nStrs += 1
+    return pp->nStrs - 1
+end function
+
+' The doc's font table: one entry per (source, face, style). -1 for a font tkHost did not open.
+function PrFontRef( byval doc as TK_PRINTDOC ptr, byval f as TTF_Font ptr ) as long
+    dim as string path
+    dim as long face
+    if tkHost_FontSource( f, path, face ) = false then
+        PrWarn( doc, "a font not opened through tkHost was replaced by the UI font" )
+        path = tkHost_FontDir() & TK_FONT_UI : face = 0
+    end if
+    dim as long st = TTF_GetFontStyle( f )
+    for i as long = 0 to doc->nFonts - 1
+        if (doc->fonts(i).path = path) andalso (doc->fonts(i).face = face) andalso (doc->fonts(i).style = st) then return i
+    next
+    if doc->nFonts > ubound( doc->fonts ) then redim preserve doc->fonts( 0 to doc->nFonts * 2 + 7 )
+    doc->fonts(doc->nFonts).path = path
+    doc->fonts(doc->nFonts).face = face
+    doc->fonts(doc->nFonts).style = st
+    doc->nFonts += 1
+    return doc->nFonts - 1
+end function
+
+' A font's size in pixels: its point size at its own DPI.
+function PrFontPx( byval f as TTF_Font ptr ) as single
+    dim as long hd = 72, vd = 72
+    TTF_GetFontDPI( f, @hd, @vd )
+    if vd <= 0 then vd = 72
+    return TTF_GetFontSize( f ) * vd / 72
+end function
+
+' An image surface into the doc's table (copied, ARGB8888). key: a texture already captured.
+function PrAddImage( byval doc as TK_PRINTDOC ptr, byval s as SDL_Surface ptr, byval key as any ptr ) as long
+    if s = 0 then return -1
+    dim as SDL_Surface ptr c = SDL_ConvertSurface( s, SDL_PIXELFORMAT_ARGB8888 )
+    if c = 0 then return -1
+    if doc->nImgs > ubound( doc->imgs ) then
+        redim preserve doc->imgs( 0 to doc->nImgs * 2 + 7 )
+        redim preserve doc->imgKey( 0 to doc->nImgs * 2 + 7 )
+    end if
+    doc->imgs(doc->nImgs) = c
+    doc->imgKey(doc->nImgs) = key
+    doc->nImgs += 1
+    return doc->nImgs - 1
+end function
+
+' A texture's pixels, read back through a target texture on its own renderer (blend NONE, so
+' they are copied exactly). -1 when it cannot be read.
+private function CaptureTexture( byval doc as TK_PRINTDOC ptr, byval r as SDL_Renderer ptr, byval tex as SDL_Texture ptr ) as long
+    for i as long = 0 to doc->nImgs - 1
+        if doc->imgKey(i) = tex then return i
+    next
+    if (r = 0) orelse (tex = 0) then return -1
+    dim as single tw, th
+    SDL_GetTextureSize( tex, @tw, @th )
+    if (tw < 1) orelse (th < 1) then return -1
+    dim as SDL_Texture ptr tgt = SDL_CreateTexture( r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, clng( tw ), clng( th ) )
+    if tgt = 0 then return -1
+    dim as SDL_Texture ptr old = SDL_GetRenderTarget( r )
+    dim as SDL_BlendMode bm
+    SDL_GetTextureBlendMode( tex, @bm )
+    SDL_SetRenderTarget( r, tgt )
+    SDL_SetRenderClipRect( r, 0 )
+    SDL_SetRenderDrawColor( r, 0, 0, 0, 0 )
+    SDL_RenderClear( r )
+    SDL_SetTextureBlendMode( tex, SDL_BLENDMODE_NONE )
+    SDL_RenderTexture( r, tex, 0, 0 )
+    SDL_SetTextureBlendMode( tex, bm )
+    dim as SDL_Surface ptr s = SDL_RenderReadPixels( r, 0 )
+    SDL_SetRenderTarget( r, old )
+    SDL_DestroyTexture( tgt )
+    if s = 0 then return -1
+    dim as long k = PrAddImage( doc, s, tex )
+    SDL_DestroySurface( s )
+    return k
+end function
+
+sub PrRecSub( byval pCtx as any ptr, byval o as TK_RECOP ptr )
+    dim as TK_PAGE ptr pg = pCtx
+    if (pg = 0) orelse (o = 0) then exit sub
+    dim as TK_PRINTDOC ptr doc = pg->doc
+    if (pg->index < 0) orelse (pg->index >= doc->nPages) then exit sub
+    dim as PR_PAGE ptr pp = doc->pages(pg->index)
+    dim as single k = pg->mk, mx = pg->mx, my = pg->my
+    select case o->op
+    case TKREC_FILLPOLY, TKREC_STROKE, TKREC_STROKEOPEN
+        if (o->n <= 0) orelse (o->pts = 0) then exit sub
+        if ((o->c shr 24) = 0) andalso (o->bGrad = false) then exit sub      ' invisible
+        dim as PR_OP ptr q = NewOp( pp )
+        q->op = o->op : q->c = o->c : q->w = o->w * k : q->nDash = o->nDash : q->bRound = o->bRound
+        q->i0 = AddPts( pp, o->n ) : q->n = o->n
+        for i as long = 0 to o->n - 1
+            pp->pts(q->i0 + i).x = o->pts[i].x * k + mx
+            pp->pts(q->i0 + i).y = o->pts[i].y * k + my
+        next
+        if o->bGrad then
+            q->bGrad = true : q->gc0 = o->gc0 : q->gc1 = o->gc1
+            q->gx0 = o->gx0 * k + mx : q->gy0 = o->gy0 * k + my
+            q->gx1 = o->gx1 * k + mx : q->gy1 = o->gy1 * k + my
+        end if
+    case TKREC_FILLRECT, TKREC_GRADRECT, TKREC_CLIP
+        if (o->op = TKREC_FILLRECT) andalso ((o->c shr 24) = 0) then exit sub
+        dim as PR_OP ptr q
+        ' consecutive clips: only the last one matters
+        if (o->op = TKREC_CLIP) andalso (pp->nOps > 0) andalso (pp->ops(pp->nOps - 1).op = TKREC_CLIP) then
+            q = @pp->ops(pp->nOps - 1)
+        else
+            q = NewOp( pp )
+        end if
+        q->op = o->op : q->c = o->c : q->n = o->n
+        q->x = o->rc.x * k + mx : q->y = o->rc.y * k + my : q->cw = o->rc.w * k : q->ch = o->rc.h * k
+        if o->bGrad then
+            q->bGrad = true : q->gc0 = o->gc0 : q->gc1 = o->gc1
+            q->gx0 = o->gx0 * k + mx : q->gy0 = o->gy0 * k + my
+            q->gx1 = o->gx1 * k + mx : q->gy1 = o->gy1 * k + my
+        end if
+    case TKREC_TEXT
+        if (o->pFont = 0) orelse (len( o->sText ) = 0) orelse ((o->c shr 24) = 0) then exit sub
+        dim as long fi = PrFontRef( doc, o->pFont )
+        dim as PR_OP ptr q = NewOp( pp )
+        q->op = TKREC_TEXT : q->c = o->c : q->font = fi
+        q->size = PrFontPx( o->pFont ) * k
+        q->x = o->x * k + mx : q->y = o->y * k + my : q->tw = o->tw * k
+        q->asc = TTF_GetFontAscent( o->pFont ) * k
+        q->i0 = PrAddStr( pp, o->sText )
+    case TKREC_IMAGE
+        dim as long ii = CaptureTexture( doc, pg->pCapR, o->tex )
+        if ii < 0 then
+            PrWarn( doc, "an image that could not be read was printed as a grey box" )
+            dim as PR_OP ptr q = NewOp( pp )
+            q->op = TKREC_FILLRECT : q->c = &hFFC0C0C0ul
+            q->x = o->rc.x * k + mx : q->y = o->rc.y * k + my : q->cw = o->rc.w * k : q->ch = o->rc.h * k
+            exit sub
+        end if
+        dim as PR_OP ptr q = NewOp( pp )
+        q->op = TKREC_IMAGE : q->img = ii
+        q->x = o->rc.x * k + mx : q->y = o->rc.y * k + my : q->cw = o->rc.w * k : q->ch = o->rc.h * k
+        q->sx = o->src.x : q->sy = o->src.y : q->sw = o->src.w : q->sh = o->src.h
+    end select
+end sub
+
+' ---- inspection (tests, diagnostics) -------------------------------------------------------
+public type TKPRINT_OPINFO
+    op     as long                ' TKREC_* or TKPRINT_OP_LATE
+    c      as ulong
+    w      as single              ' stroke width, points
+    n      as long                ' point count (CLIP: 0 = none)
+    x      as single              ' rect / text origin, points
+    y      as single
+    cw     as single
+    ch     as single
+    x0     as single              ' the first point (outline ops)
+    y0     as single
+    size   as single              ' font size, points
+    tw     as single              ' text width, points
+    text   as string              ' TEXT: the run; LATE: the format
+    font   as string              ' the font's source
+end type
+public const TKPRINT_OP_LATE = PR_LATE
+
+public function tkPrintDoc_GetOpCount( byval doc as TK_PRINTDOC ptr, byval page as long ) as long
+    if (doc = 0) orelse (page < 0) orelse (page >= doc->nPages) then return 0
+    return doc->pages(page)->nOps
+end function
+
+public function tkPrintDoc_GetOp( byval doc as TK_PRINTDOC ptr, byval page as long, byval i as long, _
+                                  byref info as TKPRINT_OPINFO ) as boolean
+    if (doc = 0) orelse (page < 0) orelse (page >= doc->nPages) then return false
+    dim as PR_PAGE ptr pp = doc->pages(page)
+    if (i < 0) orelse (i >= pp->nOps) then return false
+    dim as TKPRINT_OPINFO blank
+    info = blank
+    dim as PR_OP ptr q = @pp->ops(i)
+    info.op = q->op : info.c = q->c : info.w = q->w : info.n = q->n
+    info.x = q->x : info.y = q->y : info.cw = q->cw : info.ch = q->ch
+    info.size = q->size : info.tw = q->tw
+    select case q->op
+    case TKREC_FILLPOLY, TKREC_STROKE, TKREC_STROKEOPEN
+        if q->n > 0 then info.x0 = pp->pts(q->i0).x : info.y0 = pp->pts(q->i0).y
+    case TKREC_TEXT, PR_LATE, PR_LINK
+        info.text = pp->strs(q->i0)
+        if (q->font >= 0) andalso (q->font < doc->nFonts) then info.font = doc->fonts(q->font).path
+    end select
+    return true
+end function
+
+' ---- printing a widget -----------------------------------------------------------------------
+private sub PaintWidgetTree( byval pg as TK_PAGE ptr, byval w as TK_WIDGET ptr, byval ax as long, _
+                             byval ay as long, byref rcClip as TKRECT )
+    dim as TK_HOST ptr h = w->pHost
+    dim as TK_PAINT wp
+    wp.renderer = h->renderer
+    wp.engine = h->engine
+    wp.pFont = h->pDefaultFont
+    wp.fScale = h->fScale
+    wp.pfnRec = @PrRecSub
+    wp.pRecCtx = pg
+    pg->pCapR = h->renderer
+    wp.Begin( ax, ay, w->cw, w->ch, @rcClip )
+    if tkRect_IsEmpty( wp.rcClip ) then exit sub
+    dim as TK_MSG m
+    m.msg = TKM_PAINT
+    m.pPaint = @wp
+    tkWidget_Send( w, @m )
+    dim as TKRECT rcKids = rcClip
+    if w->bClipChildren then rcKids = wp.rcClip
+    dim as TK_WIDGET ptr c = w->pFirst
+    while c
+        if c->isVisible andalso (c->cw > 0) andalso (c->ch > 0) then
+            PaintWidgetTree( pg, c, ax + c->x, ay + c->y, rcKids )
+        end if
+        c = c->pNext
+    wend
+end sub
+
+' Record widget w -- its own TKM_PAINT and its children's, in z-order, exactly as tkHost paints
+' them -- into rc on the page, scaled uniformly to fit and centred. Its pixel geometry is the
+' widget's current one (decision P-8). A surface's root (tkHost_Root) prints the whole form,
+' without the surface's own OnPaint background.
+public function tkPrint_PaintWidget( byval pg as TK_PAGE ptr, byval w as TK_WIDGET ptr, byref rc as TKRECTF ) as boolean
+    if (pg = 0) orelse (w = 0) then return false
+    if (pg->index < 0) orelse (w->pHost = 0) orelse (w->cw <= 0) orelse (w->ch <= 0) then return false
+    dim as single rw = rc.right - rc.left, rh = rc.bottom - rc.top
+    if (rw <= 0) orelse (rh <= 0) then return false
+    dim as single k = rw / w->cw
+    if rh / w->ch < k then k = rh / w->ch
+    ' recorded at the widget's own window position -- the very coordinates tkHost paints it at, so
+    ' a replay at that origin and scale repeats tkPaint's arithmetic exactly -- then mapped
+    dim as TKRECT ab
+    tkWidget_AbsRect( w, ab )
+    dim as single sk = pg->mk, sx = pg->mx, sy = pg->my
+    pg->mk = k
+    pg->mx = rc.left + (rw - w->cw * k) / 2 - ab.left * k
+    pg->my = rc.top + (rh - w->ch * k) / 2 - ab.top * k
+    dim as TKRECT rcAll
+    tkRect_Set( rcAll, ab.left, ab.top, ab.left + w->cw, ab.top + w->ch )
+    PaintWidgetTree( pg, w, ab.left, ab.top, rcAll )
+    pg->mk = sk : pg->mx = sx : pg->my = sy
+    pg->pCapR = 0
+    pg->p.ApplyClip( 0 )                  ' the page API's own clip again
+    return true
+end function

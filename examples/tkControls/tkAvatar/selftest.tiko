@@ -1,0 +1,252 @@
+' tkAvatar self-test (phases A0 + A1), one check per distinct behaviour. Real windows; two passes,
+' scale pinned at 1.0 and 1.75. Initials and palette against fixed tables (the palette indices were
+' computed independently: FNV-1a 32 in Python), the fallback chain and the marks by pixels.
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkAvatar"
+#import "vendor/tkControls/tkTest"
+using tkAvatar
+using tkBadge
+using tkImage
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gClicks
+dim shared as TKRECT gPiRc
+dim shared as TKAVATAR_SPEC gPiSpec
+
+sub OnClick( byval hAvatar as TK_WIDGET ptr )
+    gClicks += 1
+end sub
+
+function CanvasProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    if m->msg <> TKM_PAINT then return false
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, w->cw, w->ch )
+    m->pPaint->SetBackColor( tkTheme_Get().Window )
+    m->pPaint->PaintRect( @rc )
+    tkAvatar_PaintInto( m->pPaint, gPiRc, gPiSpec )
+    return true
+end function
+
+function Px( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byval x as long, byval y as long ) as ulong
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return tkTest_PixelAt( h, a.left + x, a.top + y )
+end function
+
+function WX( byval w as TK_WIDGET ptr, byval x as long ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return a.left + x
+end function
+
+function WY( byval w as TK_WIDGET ptr, byval y as long ) as long
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    return a.top + y
+end function
+
+' Every channel within tol.
+function Near( byval a as ulong, byval b as ulong, byval tol as long ) as boolean
+    for k as long = 0 to 2
+        if abs( cast( long, (a shr (k * 8)) and 255 ) - cast( long, (b shr (k * 8)) and 255 ) ) > tol then return false
+    next
+    return true
+end function
+
+' u8 -> ustring (the source file is ASCII; non-ASCII names are spelled with wchr).
+function U( byref s as ustring ) as ustring
+    return s
+end function
+
+' ==========================================================================================
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkAvatar selftest", 640, 400, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host created", false, *SDL_GetError() ) : exit sub
+    dim as TK_WIDGET ptr root = tkHost_Root( h )
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 50 )
+
+    ' ---- initials and palette: tables --------------------------------------------------------
+    dim as ustring eAcute = wchr( &hC9 ) & "lodie Durand", eLow = wchr( &hE9 ) & "lodie durand"
+    dim as ustring combined = "e" & wchr( &h301 ) & "mile zola"
+    dim as ustring cjk = wchr( &h674E, &h5C0F, &h9F99 ), hebrew = wchr( &h5E9, &h5DC, &h5D5, &h5DD )
+    dim as string bad
+    if tkAvatar_Initials( "John Smith" ) <> "JS" then bad &= " JS"
+    if tkAvatar_Initials( "Mary Jane Watson" ) <> "MW" then bad &= " MW"
+    if tkAvatar_Initials( "john" ) <> "J" then bad &= " J"
+    if tkAvatar_Initials( "John Smith", 1 ) <> "J" then bad &= " max1"
+    if tkAvatar_Initials( eLow ) <> wchr( &hC9 ) & "D" then bad &= " eD(ucase)"
+    if tkAvatar_Initials( combined ) <> "E" & wchr( &h301 ) & "Z" then bad &= " combining"
+    if tkAvatar_Initials( "(Contractor) Ann Lee" ) <> "AL" then bad &= " brackets"
+    if tkAvatar_Initials( "Ann Lee [Admin]" ) <> "AL" then bad &= " trailing-brackets"
+    if tkAvatar_Initials( "O'Brien Pat" ) <> "OP" then bad &= " apostrophe"
+    if tkAvatar_Initials( "Jean-Luc Picard" ) <> "JP" then bad &= " hyphen"
+    if tkAvatar_Initials( "+1 555 0100" ) <> "" then bad &= " phone"
+    if tkAvatar_Initials( "   " ) <> "" then bad &= " blank"
+    if tkAvatar_Initials( cjk ) <> "" then bad &= " cjk"
+    if tkAvatar_Initials( hebrew ) <> "" then bad &= " hebrew"
+    tkTest_Check( "initials: first + last word, filtered, upper-cased, scripts without initials", len( bad ) = 0, bad )
+    bad = ""
+    if tkAvatar_PaletteIndex( "John Smith" ) <> 7 then bad &= " js"
+    if tkAvatar_PaletteIndex( "Mary Jane Watson" ) <> 14 then bad &= " mjw"
+    if tkAvatar_PaletteIndex( "ann@example.com" ) <> 5 then bad &= " mail"
+    if tkAvatar_PaletteIndex( eAcute ) <> 6 then bad &= " utf8"
+    if tkAvatar_PaletteIndex( cjk ) <> 14 then bad &= " cjk"
+    if tkAvatar_PaletteIndex( "a" ) <> 12 then bad &= " a"
+    if tkAvatar_PaletteIndex( "" ) <> -1 then bad &= " empty"
+    tkTest_Check( "palette index = FNV-1a 32 of the UTF-8 mod 16 (fixed table)", len( bad ) = 0, bad )
+    dim as long worstOk = 1
+    for dk as long = 0 to 1
+        for i as long = 0 to TKAVATAR_PALETTE_SIZE - 1
+            dim as ulong bk, ik
+            tkAvatar_PaletteColors( dk = 0, i, bk, ik )
+            if tkBadge_Contrast( bk, ik ) < 4.5 then worstOk = 0
+        next
+    next
+    tkTest_Check( "every palette pair reads at >= 4.5:1, both halves", worstOk = 1 )
+
+    ' ---- the widget: fallback chain by pixels -----------------------------------------------------
+    dim as TK_WIDGET ptr a = tkAvatar_Create( root, 1 )
+    dim as long iw, ih
+    tkAvatar_GetIdealSize( a, iw, ih )
+    tkTest_Check( "ideal size: 32 + the ring band both ways", iw = tkHost_Scale( h, 32 ) + 8 andalso ih = iw )
+    tkAvatar_SetSize( a, 48 )
+    tkAvatar_GetIdealSize( a, iw, ih )
+    tkWidget_SetPos( a, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), iw, ih )
+    dim as TKRECT sq
+    tkAvatar_GetAvatarRect( a, sq )
+    dim as long d = sq.right - sq.left, cx = (sq.left + sq.right) \ 2, cy = (sq.top + sq.bottom) \ 2
+    dim as TKAVATAR_COLORS cc
+    tkAvatar_GetColors( a, @cc )
+    ' the person (no name): neutral colours, a head, shoulders clipped to the circle
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "no name: the person in neutral ink, head and shoulders", Px( h, a, cx, cy - (12 * d) \ 100 ) = cc.NeutralInk _
+                  andalso Px( h, a, cx, sq.bottom - 3 ) = cc.NeutralInk andalso Px( h, a, sq.left + d \ 4, sq.top + d \ 4 ) = cc.NeutralBack, _
+                  hex( Px( h, a, cx, cy - (12 * d) \ 100 ) ) & " " & hex( Px( h, a, cx, sq.bottom - 3 ) ) )
+    ' inside the shoulders' ellipse but outside the circle: background only if they are clipped
+    tkTest_Check( "...the shoulders stay inside the circle", Px( h, a, cx - (30 * d) \ 100, sq.bottom - 2 ) = cc.BackColor, _
+                  hex( Px( h, a, cx - (30 * d) \ 100, sq.bottom - 2 ) ) )
+    ' the initials: the palette pair for the name
+    tkAvatar_SetDisplayName( a, "John Smith" )
+    tkHost_RenderTo( h, false )
+    dim as ulong pb, pk
+    tkAvatar_PaletteColors( true, 7, pb, pk )
+    tkTest_Check( "a name: its palette background, the initials JS", Px( h, a, sq.left + 3, cy ) = pb andalso tkAvatar_GetEffectiveInitials( a ) = "JS", _
+                  hex( Px( h, a, sq.left + 3, cy ) ) )
+    tkAvatar_SetColorKey( a, "a" )
+    dim as ulong eb, ek
+    tkAvatar_GetEffectiveColors( a, eb, ek )
+    tkAvatar_PaletteColors( true, 12, pb, pk )
+    tkTest_Check( "ColorKey chooses the colour instead of the name", eb = pb )
+    tkAvatar_SetColorKey( a, "" )
+    ' the image
+    dim as ulong px8(0 to 63)
+    for i as long = 0 to 63 : px8(i) = &hFFFF2020ul : next
+    tkAvatar_SetImagePixels( a, 8, 8, @px8(0) )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "an image: drawn round (centre image, square corner background)", Px( h, a, cx, cy ) = &hFFFF2020ul _
+                  andalso Px( h, a, sq.left + 1, sq.top + 1 ) = cc.BackColor andalso tkAvatar_GetImageValid( a ) )
+    tkAvatar_SetShape( a, TKAVATAR_SQUARE )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "SQUARE: the corner is the image", Px( h, a, sq.left + 1, sq.top + 1 ) = &hFFFF2020ul )
+    tkAvatar_SetShape( a, TKAVATAR_CIRCLE )
+    tkAvatar_SetImageFile( a, "no-such-file.png" )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "a failed load: no image, back to the initials", tkAvatar_GetImageValid( a ) = false andalso Px( h, a, cx, cy ) <> &hFFFF2020ul )
+    ' an encoded image from memory (a BMP written and read back as bytes)
+    dim as SDL_Surface ptr sf = SDL_CreateSurface( 6, 6, SDL_PIXELFORMAT_ARGB8888 )
+    SDL_FillSurfaceRect( sf, 0, SDL_MapSurfaceRGBA( sf, 30, 200, 60, 255 ) )
+    SDL_SaveBMP( sf, "avatar-selftest.bmp" )
+    SDL_DestroySurface( sf )
+    dim as uinteger nBytes
+    dim as any ptr bytes = SDL_LoadFile( "avatar-selftest.bmp", @nBytes )
+    tkAvatar_SetImageData( a, bytes, nBytes )
+    SDL_free( bytes )
+    SDL_RemovePath( "avatar-selftest.bmp" )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "SetImageData decodes an image from memory; the old file's path is dropped", Px( h, a, cx, cy ) = tkRGB( 30, 200, 60 ) _
+                  andalso tkAvatar_GetImageFile( a ) = "", hex( Px( h, a, cx, cy ) ) )
+    ' a large photo is drawn from a pre-scaled copy (at most twice the diameter)
+    dim as ulong big(any)
+    redim big( 0 to 400 * 400 - 1 )
+    for i as long = 0 to ubound( big ) : big(i) = &hFF2050C0ul : next
+    tkAvatar_SetImagePixels( a, 400, 400, @big(0) )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "a 400 px photo is drawn from a copy <= 2 x the diameter", tkAvatar_GetDrawnImageWidth( a ) <= 2 * d _
+                  andalso Px( h, a, cx, cy ) = &hFF2050C0ul, "" & tkAvatar_GetDrawnImageWidth( a ) )
+    dim as long aw = a->cw, ah = a->ch
+    tkWidget_SetSize( a, 260, 260 )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "grown to where the original is drawn, the drawn width is the original's", tkAvatar_GetDrawnImageWidth( a ) = 400, _
+                  "" & tkAvatar_GetDrawnImageWidth( a ) )
+    tkWidget_SetSize( a, aw, ah )
+    tkAvatar_ClearImage( a )
+
+    ' ---- presence, active, inactive, size -----------------------------------------------------
+    tkAvatar_SetPresence( a, TKBADGE_PRESENCE_AVAILABLE )
+    tkHost_RenderTo( h, false )
+    dim as TKRECT rp
+    tkAvatar_GetPresenceRect( a, rp )
+    dim as TKBADGE_COLORS bc = tkBadge_ThemeColors( tkTheme_Get() )
+    tkTest_Check( "presence: 30 % of the diameter at the 45 degree point, a success disc", (rp.right - rp.left) = cint( d * 0.3 ) _
+                  andalso Px( h, a, (rp.left + rp.right) \ 2, rp.top + (rp.bottom - rp.top) \ 4 ) = bc.FillSuccess, _
+                  tkRect_Str( rp ) & " " & hex( Px( h, a, (rp.left + rp.right) \ 2, rp.top + (rp.bottom - rp.top) \ 4 ) ) )
+    tkAvatar_SetPresence( a, TKAVATAR_PRESENCE_NONE )
+    tkAvatar_SetActive( a, TKAVATAR_ACTIVE_ACTIVE )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "ACTIVE: a ring outside the avatar", Px( h, a, cx, sq.top - TKAVATAR_RING_GAP - 1 ) = cc.ActiveRingColor, _
+                  hex( Px( h, a, cx, sq.top - TKAVATAR_RING_GAP - 1 ) ) )
+    tkAvatar_SetActive( a, TKAVATAR_ACTIVE_INACTIVE )
+    tkHost_RenderTo( h, false )
+    tkAvatar_GetEffectiveColors( a, eb, ek )
+    tkTest_Check( "INACTIVE: half opacity", Near( Px( h, a, sq.left + 3, cy ), tkColor_Lerp( cc.BackColor, eb, 128 / 255 ), 2 ), _
+                  hex( Px( h, a, sq.left + 3, cy ) ) & " vs " & hex( tkColor_Lerp( cc.BackColor, eb, 128 / 255 ) ) )
+    tkAvatar_SetActive( a, TKAVATAR_ACTIVE_UNSET )
+    tkWidget_SetSize( a, tkHost_Scale( h, 20 ) + 8, tkHost_Scale( h, 20 ) + 8 )
+    tkTest_Check( "under 24 px: one initial", tkAvatar_GetEffectiveInitials( a ) = "J" )
+    tkWidget_SetSize( a, iw, ih )
+
+    ' ---- input: click, tip ---------------------------------------------------------------------
+    tkAvatar_SetClickCallback( a, @OnClick )
+    gClicks = 0
+    tkTest_Click( h, WX( a, cx ), WY( a, cy ) )
+    tkTest_PushButton( h, true, WX( a, cx ), WY( a, cy ) )
+    tkTest_PushButton( h, false, WX( a, iw + 20 ), WY( a, cy ) )
+    tkTest_Check( "Click: a press and release inside, not one released outside", gClicks = 1 andalso tkHost_GetCapture( h ) = 0 )
+    dim as boolean nameTip = (tkAvatar_GetTipText( a ) = "John Smith")
+    tkAvatar_SetTooltipText( a, "Open profile" )
+    tkTest_Check( "the tip is the name, a TooltipText wins", nameTip andalso tkAvatar_GetTipText( a ) = "Open profile" )
+
+    ' ---- theme, widgetless ---------------------------------------------------------------------
+    tkTheme_Apply( tkTheme_Light() )
+    tkAvatar_GetEffectiveColors( a, eb, ek )
+    tkAvatar_PaletteColors( false, 7, pb, pk )
+    tkTest_Check( "a light theme takes the light half of the palette", eb = pb )
+    tkTheme_Apply( tkTheme_Dark() )
+    dim as TK_WIDGET ptr cv = tkWidget_CreateChild( root, 3, @CanvasProc, 0 )
+    tkWidget_SetPos( cv, tkHost_Scale( h, 200 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 60 ), tkHost_Scale( h, 60 ) )
+    dim as TKAVATAR_SPEC s0
+    gPiSpec = s0
+    gPiSpec.wszName = "Mary Jane Watson"
+    gPiSpec.fScale = h->fScale
+    tkRect_Set( gPiRc, 0, 0, tkHost_Scale( h, 60 ), tkHost_Scale( h, 60 ) )
+    tkHost_RenderTo( h, false )
+    tkAvatar_PaletteColors( true, 14, pb, pk )
+    tkTest_Check( "PaintInto: the name's palette colour, round", Px( h, cv, 3, tkHost_Scale( h, 30 ) ) = pb andalso Px( h, cv, 1, 1 ) = tkTheme_Get().Window, _
+                  hex( Px( h, cv, 3, tkHost_Scale( h, 30 ) ) ) )
+
+    tkHost_Destroy( h )
+end sub
+
+' ==========================================================================================
+if tkTest_Init() = false then end 99
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkAvatar" )
+tkTest_Quit()
+end nFail

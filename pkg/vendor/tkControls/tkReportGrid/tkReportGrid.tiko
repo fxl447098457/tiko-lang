@@ -1,0 +1,173 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkReportGrid -- a tkDataGrid as a tkReport's data (Report Designer RD2; claude-docs
+' docs/tkReportDesigner/SPEC.md "Data binding"). Its own module, so a report that reads no grid does
+' not link one.
+'
+'   tkReportGrid_Open( rpt, hGrid )      the grid as it is shown: its VISIBLE columns in DISPLAY
+'                                        order are the fields (named by the column's key, else its
+'                                        caption; typed by its value kind), its rows in VIEW order
+'                                        (sorted and filtered as the user left them), typed values.
+'   tkReportGrid_Close( rpt )            before the grid goes
+'
+' The values are read from the grid as the report lays out (no copy): the grid must outlive the
+' layout. The rows are the view's when a layout starts (Rewind). The source does not sort (the
+' grid's view order is the order): sort the grid, or group by what it is sorted by.
+#module "tkReportGrid"
+
+#import "../tkReport" public
+#import "../tkDataGrid"
+#import "../tkReportDef"
+using tkReport
+using tkDataGrid
+using tkReportDef
+using tkBind
+using tkHost
+
+type RGRID_CTX
+    hGrid      as TK_WIDGET ptr
+    cols(any)  as integer               ' field f = model column cols(f)
+    names(any) as ustring
+    kinds(any) as long
+    nCols      as long
+    nView      as integer
+    pos_       as integer = -1
+end type
+
+private function GFieldCount( byval p as any ptr ) as long
+    return cast( RGRID_CTX ptr, p )->nCols
+end function
+private function GFieldName( byval p as any ptr, byval f as long ) as ustring
+    dim as RGRID_CTX ptr c = p
+    if (f < 0) orelse (f >= c->nCols) then return ""
+    return c->names(f)
+end function
+private function GFieldKind( byval p as any ptr, byval f as long ) as long
+    dim as RGRID_CTX ptr c = p
+    if (f < 0) orelse (f >= c->nCols) then return TKV_EMPTY
+    return c->kinds(f)
+end function
+private function GRowCount( byval p as any ptr ) as integer
+    return cast( RGRID_CTX ptr, p )->nView
+end function
+private function GRewind( byval p as any ptr ) as boolean
+    dim as RGRID_CTX ptr c = p
+    c->nView = tkDataGrid_GetViewCount( c->hGrid )
+    c->pos_ = -1
+    return true
+end function
+private function GNext( byval p as any ptr ) as boolean
+    dim as RGRID_CTX ptr c = p
+    if c->pos_ + 1 >= c->nView then
+        c->pos_ = c->nView
+        return false
+    end if
+    c->pos_ += 1
+    return true
+end function
+private sub GGet( byval p as any ptr, byval f as long, byref v as TK_VALUE )
+    dim as RGRID_CTX ptr c = p
+    v.Clear( )
+    if (f < 0) orelse (f >= c->nCols) orelse (c->pos_ < 0) orelse (c->pos_ >= c->nView) then exit sub
+    dim as integer row = tkDataGrid_ViewToModel( c->hGrid, c->pos_ )
+    if row < 0 then exit sub
+    tkDataGrid_GetCell( c->hGrid, row, c->cols(f), v )   ' TKDG_VALUE is TK_VALUE (P-16)
+end sub
+
+' The grid's visible columns and view as a source: its context (0 when it shows no column).
+private function MakeGridSource( byval hGrid as TK_WIDGET ptr, byref src as TKREPORT_SOURCE ) as RGRID_CTX ptr
+    if hGrid = 0 then return 0
+    dim as RGRID_CTX ptr c = new RGRID_CTX
+    c->hGrid = hGrid
+    dim as integer n = tkDataGrid_GetColumnCount( hGrid )
+    for d as integer = 0 to n - 1
+        dim as integer col = tkDataGrid_ColumnAtDisplay( hGrid, d )
+        if (col < 0) orelse (tkDataGrid_GetColumnVisible( hGrid, col ) = false) then continue for
+        dim as TKDATAGRID_COLUMN ci
+        tkDataGrid_GetColumnInfo( hGrid, col, ci )
+        redim preserve c->cols( 0 to c->nCols )
+        redim preserve c->names( 0 to c->nCols )
+        redim preserve c->kinds( 0 to c->nCols )
+        c->cols(c->nCols) = col
+        c->names(c->nCols) = ci.key
+        if len( ci.key ) = 0 then c->names(c->nCols) = ci.caption
+        c->kinds(c->nCols) = ci.valueKind
+        c->nCols += 1
+    next
+    if c->nCols = 0 then
+        delete c
+        return 0
+    end if
+    c->nView = tkDataGrid_GetViewCount( hGrid )
+    src.pCtx = c
+    src.FieldCount = @GFieldCount : src.FieldName = @GFieldName : src.FieldKind = @GFieldKind
+    src.RowCount = @GRowCount : src.MoveNext = @GNext : src.GetValue = @GGet : src.Rewind = @GRewind
+    return c
+end function
+
+' The grid as the report's source. FALSE when there is no grid or it shows no column.
+public function tkReportGrid_Open( byval rpt as TK_REPORT ptr, byval hGrid as TK_WIDGET ptr ) as boolean
+    if rpt = 0 then return false
+    dim as TKREPORT_SOURCE src
+    if MakeGridSource( hGrid, src ) = 0 then return false
+    tkReport_SetSource( rpt, src )
+    return true
+end function
+
+public sub tkReportGrid_Close( byval rpt as TK_REPORT ptr )
+    if rpt = 0 then exit sub
+    if (rpt->bSrc = false) orelse (rpt->src.MoveNext <> @GNext) then exit sub    ' not ours
+    delete cast( RGRID_CTX ptr, rpt->src.pCtx )
+    dim as TKREPORT_SOURCE none_
+    rpt->src = none_
+    rpt->bSrc = false
+end sub
+
+' ---- a report definition's grid source (Report Designer RD3) --------------------------------------
+type RGRID_BIND
+    hGrid       as TK_WIDGET ptr
+    opened(any) as RGRID_CTX ptr
+    nOpen       as long
+end type
+
+private sub GBClose( byval p as any ptr, byval bFinal as boolean )
+    dim as RGRID_BIND ptr b = p
+    if b = 0 then exit sub
+    for i as long = 0 to b->nOpen - 1
+        delete b->opened(i)
+    next
+    b->nOpen = 0
+    if bFinal then delete b
+end sub
+
+private function GBOpenRows( byval def as TK_REPORTDEF ptr, byval si as int32, byval p as any ptr, _
+                             byref src as TKREPORT_SOURCE ) as boolean
+    dim as RGRID_BIND ptr b = p
+    dim as RGRID_CTX ptr c = MakeGridSource( b->hGrid, src )
+    if c = 0 then return false
+    redim preserve b->opened( 0 to b->nOpen )
+    b->opened(b->nOpen) = c
+    b->nOpen += 1
+    return true
+end function
+
+' Source 'name' of the definition is the grid as shown (a master or single source; a grid is not a
+' child). The grid must outlive the definition's reports.
+public function tkReportGrid_BindDef( byval def as TK_REPORTDEF ptr, byref name_ as const ustring, byval hGrid as TK_WIDGET ptr ) as boolean
+    if (def = 0) orelse (hGrid = 0) then return false
+    dim as RGRID_BIND ptr b = new RGRID_BIND
+    b->hGrid = hGrid
+    dim as TKRD_BINDING bd
+    bd.pCtx = b
+    bd.OpenRows = @GBOpenRows
+    bd.CloseAll = @GBClose
+    if tkReportDef_Bind( def, name_, bd ) = false then
+        delete b
+        return false
+    end if
+    return true
+end function

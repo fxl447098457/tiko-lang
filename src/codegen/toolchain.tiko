@@ -55,6 +55,126 @@ private function SearchPath_( byref exeName as string ) as string
     return ""
 end function
 
+'' ANDROID'S NDK (docs/tiko-android A1, D-A1-4). tiko compiles Android with its own clang;
+'' the NDK supplies only what the LINK needs and no LLVM install has: Bionic's sysroot (libc.so
+'' and its siblings as stubs, crtbegin_dynamic.o, crtend_android.o) and the compiler-rt
+'' builtins plus libunwind.a built for Android. Measured (FACTS "Compilers and linking"):
+'' clang 23 without them looks in its own lib/clang/23/lib/<triple>/ and fails on both.
+''
+'' FOUND, IN ORDER: TIKO_ANDROID_NDK; ANDROID_NDK_HOME and ANDROID_NDK_ROOT, the two names
+'' Google's own tools and Gradle read; then the highest-numbered <sdk>/ndk/<version> under
+'' ANDROID_HOME, ANDROID_SDK_ROOT and the SDK's default place on this host (Android Studio's
+'' and the command-line tools' alike). An NDK is a directory with this host's prebuilt
+'' sysroot in it; a variable that names anything else is reported, not skipped.
+#if defined( __FB_WIN32__ )
+    const NDK_HOST_ = "windows-x86_64"
+#elseif defined( __FB_DARWIN__ )
+    const NDK_HOST_ = "darwin-x86_64"
+#else
+    const NDK_HOST_ = "linux-x86_64"
+#endif
+
+'' Forward slashes and no trailing one: these paths go into a response file, which reads a
+'' backslash as an escape (driver/link-response-file).
+private function SlashPath_( byval p as string ) as string
+    for i as int32 = 0 to len( p ) - 1
+        if p[i] = asc( "\" ) then p[i] = asc( "/" )
+    next
+    while (len( p ) > 1) andalso (right( p, 1 ) = "/")
+        p = left( p, len( p ) - 1 )
+    wend
+    return p
+end function
+
+private function NdkIsValid_( byref ndk as string ) as boolean
+    return FileExists_( ndk & "/toolchains/llvm/prebuilt/" & NDK_HOST_ & "/sysroot/usr/include/stdio.h" )
+end function
+
+'' "30.0.16248370" as a key that sorts as the version does: each dotted part right-aligned.
+'' Also the SDK's build-tools and platforms (driver/androidapp.tiko).
+function AndroidVersionKey( byref v as string ) as string
+    dim as string k, part
+    for i as int32 = 1 to len( v ) + 1
+        dim as string ch = mid( v, i, 1 )
+        if (ch = ".") orelse (len( ch ) = 0) then
+            k &= right( string( 12, "0" ) & part, 12 ) & "."
+            part = ""
+        else
+            part &= ch
+        end if
+    next
+    return k
+end function
+
+private function NdkUnderSdk_( byref sdk as string ) as string
+    if len( sdk ) = 0 then return ""
+    dim as string root = SlashPath_( sdk ) & "/ndk/"
+    dim as string best, bestKey
+    dim as string d = dir( root & "*", &h10 )
+    while len( d ) > 0
+        if (d <> ".") andalso (d <> "..") andalso NdkIsValid_( root & d ) then
+            dim as string k = AndroidVersionKey( d )
+            if k > bestKey then
+                bestKey = k
+                best = root & d
+            end if
+        end if
+        d = dir( )
+    wend
+    return best
+end function
+
+'' WHERE AN SDK MAY BE, in order: ANDROID_HOME, ANDROID_SDK_ROOT, then the default place on this
+'' host (Android Studio's and the command-line tools' alike). An entry is "" when unset.
+sub AndroidSdkCandidates( sdks() as string )
+    sdks( 0 ) = SlashPath_( environ( "ANDROID_HOME" ) )
+    sdks( 1 ) = SlashPath_( environ( "ANDROID_SDK_ROOT" ) )
+    sdks( 2 ) = ""
+    #if defined( __FB_WIN32__ )
+        if len( environ( "LOCALAPPDATA" ) ) > 0 then sdks( 2 ) = SlashPath_( environ( "LOCALAPPDATA" ) ) & "/Android/Sdk"
+    #elseif defined( __FB_DARWIN__ )
+        if len( environ( "HOME" ) ) > 0 then sdks( 2 ) = environ( "HOME" ) & "/Library/Android/sdk"
+    #else
+        if len( environ( "HOME" ) ) > 0 then sdks( 2 ) = environ( "HOME" ) & "/Android/Sdk"
+    #endif
+end sub
+
+private function AndroidNdk_( byref why as string ) as string
+    dim as string vars( 0 to 2 ) = { "TIKO_ANDROID_NDK", "ANDROID_NDK_HOME", "ANDROID_NDK_ROOT" }
+    for i as int32 = 0 to 2
+        dim as string v = environ( vars( i ) )
+        if len( v ) > 0 then
+            v = SlashPath_( v )
+            if NdkIsValid_( v ) then return v
+            why = vars( i ) & " is '" & v & "', which has no toolchains/llvm/prebuilt/" & NDK_HOST_ & "/sysroot"
+            return ""
+        end if
+    next
+    dim as string sdks( 0 to 2 )
+    AndroidSdkCandidates( sdks() )
+    for i as int32 = 0 to 2
+        dim as string n = NdkUnderSdk_( sdks( i ) )
+        if len( n ) > 0 then return n
+    next
+    why = "no Android NDK -- set ANDROID_NDK_HOME (or TIKO_ANDROID_NDK) to one, or install one " & _
+          "into the SDK's ndk folder (sdkmanager ""ndk;<version>"")"
+    return ""
+end function
+
+'' The NDK clang's resource directory: the one holding this arch's Android builtins.
+private function NdkResourceDir_( byref prebuilt as string, byref arch as string ) as string
+    dim as string root = prebuilt & "/lib/clang/"
+    dim as string d = dir( root & "*", &h10 )
+    while len( d ) > 0
+        if (d <> ".") andalso (d <> "..") andalso _
+           FileExists_( root & d & "/lib/linux/libclang_rt.builtins-" & arch & "-android.a" ) then
+            return root & d
+        end if
+        d = dir( )
+    wend
+    return ""
+end function
+
 function FindTools _
     ( byref clangOpt as string, byref libOpt as containers.Array( of string ) ) as ToolPaths
 
@@ -376,12 +496,45 @@ end function
 '' '-fo' AND NOT '/fo'. llvm-rc accepts both, and the dash form is the one that
 '' survives being pasted into a shell: MSYS rewrote '/fo' into a path and llvm-rc
 '' then complained that exactly one input file should be provided, naming neither.
+''
+'' THE BUNDLED win/rc HEADERS ARE THE FALLBACK, not the first choice. llvm-rc finds
+'' <windows.h> only in a Windows SDK, so on a machine without one every '.rc' that
+'' includes it failed. fbc points INCLUDE at <inc>/win/rc before GoRC, but those
+'' headers SHADOW an SDK's: measured, an SDK user's 'LANGUAGE LANG_ENGLISH,...' then
+'' failed. llvm-rc's own -I and INCLUDE both search before the SDK and it has no
+'' -idirafter (its '--preprocessor-arg' is windres-only, silently ignored), so tiko
+'' runs llvm-rc's preprocess step itself -- the same clang command line 'llvm-rc -v'
+'' prints, plus '-idirafter' -- and hands llvm-rc the result. '-I <rc's dir>' keeps
+'' an ICON or MANIFEST path resolving where llvm-rc looked for it before: beside the
+'' '.rc', which the preprocessed file is not.
+private function RcHeaderDir_( byref incPaths as Tko.StrVec ) as string
+    for i as int32 = incPaths.Count - 1 to 0 step -1
+        dim as string d = incPaths[i] & "/win/rc"
+        if FileExists_( d & "/windows.h" ) then return d
+    next
+    return ""
+end function
+
 function CompileRc _
     ( byref t as ToolPaths, byref rcPath as string, _
-      byref resPath as string ) as int32
+      byref resPath as string, byref incPaths as Tko.StrVec ) as int32
 
     if FileExists_( t.rcExe ) = false then return -1
-    return Exec_( t, t.rcExe, "-fo " & Q( resPath ) & " " & Q( rcPath ) )
+    dim as string hdrDir = RcHeaderDir_( incPaths )
+    if len( hdrDir ) = 0 then return Exec_( t, t.rcExe, "-fo " & Q( resPath ) & " " & Q( rcPath ) )
+
+    dim as string rcDir = "."
+    for i as int32 = len( rcPath ) to 1 step -1
+        dim as string ch = mid( rcPath, i, 1 )
+        if (ch = "/") orelse (ch = "\") then rcDir = left( rcPath, i - 1 ) : exit for
+    next
+    dim as string ppPath = resPath & ".i"
+    dim as int32 rc = Exec_( t, t.clangExe, "--driver-mode=gcc -target x86_64-pc-windows-msvc-coff -E -xc " & _
+                                             "-DRC_INVOKED -idirafter " & Q( hdrDir ) & " " & Q( rcPath ) & _
+                                             " -o " & Q( ppPath ) )
+    if rc = 0 then rc = Exec_( t, t.rcExe, "-no-preprocess -I " & Q( rcDir ) & " -fo " & Q( resPath ) & " " & Q( ppPath ) )
+    kill( ppPath )
+    return rc
 end function
 
 '' WHY THERE IS NO ARCHIVER, or "" when there is one. 'exit -1' named nothing: a missing
@@ -498,7 +651,11 @@ private function CompileIrArgs_ _
     '' worse than a link error. The command line's --sysroot wins over the cfg's.
     dim as string sr = SysrootFor_( target )
     if len( sr ) > 0 then cmd += " --sysroot=" & Q( sr )
-    if (t.optLevel > 0) andalso (t.optLevel <= 3) then cmd += " -O" & t.optLevel
+    if t.optSize then
+        cmd += " -Os"
+    elseif (t.optLevel > 0) andalso (t.optLevel <= 3) then
+        cmd += " -O" & t.optLevel
+    end if
     '' ONE SECTION PER PROCEDURE AND PER GLOBAL, so the link can drop what nothing reaches
     '' (LinkExe's --gc-sections / /OPT:REF). Without them a unit is one .text, and a module
     '' that emits every method of its classes -- pkg/fbx's gui -- linked every one of them
@@ -551,7 +708,11 @@ function CompileIrAsm _
     dim as string cmd = _
         "-target " & target.triple & " -Wno-override-module -S " & _
         Q( irPath ) & " -o " & Q( asmPath )
-    if (t.optLevel > 0) andalso (t.optLevel <= 3) then cmd += " -O" & t.optLevel
+    if t.optSize then
+        cmd += " -Os"
+    elseif (t.optLevel > 0) andalso (t.optLevel <= 3) then
+        cmd += " -O" & t.optLevel
+    end if
     if (t.buildDll orelse t.pic) andalso (target.objFormat <> OBJ_COFF) then cmd += " -fPIC"
     cmd += AsanCompileFlags_( t )
     dim as int32 rc = Exec_( t, t.clangExe, cmd )
@@ -628,9 +789,13 @@ function LinkExe _
     '' host every link died with clang's 'invalid linker name in argument
     '' -fuse-ld=lld'. Beside clang or on the system path it is used; otherwise clang
     '' links with the platform's own ld. ELF records no link time either way.
+    '' NOT FOR ANDROID: the NDK's link is lld's (16 KB segments with no flag, FACTS), and
+    '' clang finds ld.lld in its own resolved install dir -- Ubuntu's lld-18 puts it in
+    '' /usr/lib/llvm-18/bin with only ld.lld-18 in /usr/bin, which the probe below misses.
     #ifndef __FB_WIN32__
         dim as int32 sl = instrrev( t.clangExe, "/" )
-        if (FileExists_( left( t.clangExe, sl ) & "ld.lld" ) = false) andalso _
+        if (target.layout.osKind <> Tko.OS_ANDROID) andalso _
+           (FileExists_( left( t.clangExe, sl ) & "ld.lld" ) = false) andalso _
            (FileExists_( "/usr/bin/ld.lld" ) = false) then
             cmd = "-target " & target.triple
             viaLld = false
@@ -661,6 +826,26 @@ function LinkExe _
             end if
         end if
         if len( sdk ) > 0 then cmd += " -isysroot " & Q( sdk )
+    end if
+
+    '' ANDROID LINKS AGAINST THE NDK, from any host: its sysroot for Bionic's stubs and crt
+    '' objects, and its clang's resource directory for libclang_rt.builtins and libunwind.a,
+    '' which clang's Android driver names on every link. Borrowing the resource directory is
+    '' safe HERE because nothing is compiled from C at link time -- its headers are never read.
+    '' clang's Android driver makes the executable PIE, and lld aligns its segments to 16 KB
+    '' with no flag (measured, docs/tiko-android FACTS).
+    dim as boolean android = (target.layout.osKind = Tko.OS_ANDROID)
+    if android then
+        dim as string ndk = AndroidNdk_( t.why )
+        if len( ndk ) = 0 then return LINK_NO_NDK
+        dim as string prebuilt = ndk & "/toolchains/llvm/prebuilt/" & NDK_HOST_
+        dim as string arch = left( target.triple, instr( target.triple, "-" ) - 1 )
+        dim as string res = NdkResourceDir_( prebuilt, arch )
+        if len( res ) = 0 then
+            t.why = "the NDK at '" & ndk & "' has no libclang_rt.builtins-" & arch & "-android.a"
+            return LINK_NO_NDK
+        end if
+        cmd += " --sysroot=" & Q( prebuilt & "/sysroot" ) & " -resource-dir " & Q( res )
     end if
 
     '' A REPRODUCIBLE LINK. lld writes the wall clock into the COFF header's TimeDateStamp,
@@ -724,7 +909,8 @@ function LinkExe _
             if macho then
                 cmd += " -dynamiclib -Wl,-install_name," & Q( "@rpath/" & mid( outPath, cut_ + 1 ) )
             else
-                cmd += " -shared -Wl,-soname," & mid( outPath, cut_ + 1 )
+                '' An app's is libmain.so, the name SDLActivity loads, whatever the file is called.
+                cmd += " -shared -Wl,-soname," & iif( t.app, "libmain.so", mid( outPath, cut_ + 1 ) )
             end if
         end if
     end if
@@ -770,8 +956,14 @@ function LinkExe _
     '' see it here. The MinGW frontend folds nothing unless asked.
     '' ld64's is -dead_strip, which keeps __mod_init_func and exported symbols as roots; it
     '' folds nothing unless asked.
+    ''
+    '' AND .CRT INTO .rdata ON THE MSVC TARGET. lld-link otherwise gives the structor tables
+    '' a section of their own -- 56 bytes padded to a 512-byte file block, in every exe.
+    '' The $-suffix sort that orders .CRT$XCA..$XCZ happens before the merge, so the order
+    '' is the same: measured 2026-11-25, priority, plain and global-object constructors and
+    '' destructors print identically, and a hello world is 15,872 -> 15,360 bytes.
     if target.layout.isMsvc then
-        cmd += " -Xlinker -opt:ref -Xlinker -opt:noicf"
+        cmd += " -Xlinker -opt:ref -Xlinker -opt:noicf -Xlinker -merge:.CRT=.rdata"
     elseif macho then
         cmd += " -Wl,-dead_strip"
     else
@@ -828,7 +1020,7 @@ function LinkExe _
     '' tiko-rt's msvcinit.c does the same job, pulled in by /INCLUDE:tkort_msvc_init_ below.
     '' MACH-O HAS NO PIC VARIANTS: every arm64 Mach-O object is position-independent, and
     '' tiko-rt builds one fbrt0.o and one pair of archives there.
-    dim as boolean rt0Missing = false
+    dim as boolean rt0Missing = false, appMissing = false
     if (target.layout.isMsvc = false) then
         dim as string rt0 = "fbrt0.o"
         if t.buildDll andalso (target.objFormat = OBJ_ELF) then rt0 = "fbrt0pic.o"
@@ -844,6 +1036,18 @@ function LinkExe _
             end if
         next
         if rt0Found = false then rt0Missing = true
+        '' AN APP'S ENTRY (lib/rt/src/c/fbrtapp.c), loose like fbrt0 and found the same way.
+        if t.app then
+            dim as boolean appFound = false
+            for i as int32 = 0 to t.libPaths.Count - 1
+                if FileExists_( t.libPaths[i] & "/fbrtapp.o" ) then
+                    cmd += " " & Q( t.libPaths[i] & "/fbrtapp.o" )
+                    appFound = true
+                    exit for
+                end if
+            next
+            if appFound = false then appMissing = true : t.why = "the runtime's app entry (fbrtapp.o) is on no library path -- add one with -p"
+        end if
 
         '' A MACH-O EXECUTABLE ENTERS AT fbrt0's tko_darwin_entry, which runs main( ) itself
         '' -- unless the program uses graphics, when libtkogfx's strong tko_darwin_start
@@ -1052,12 +1256,18 @@ function LinkExe _
     '' AND THE PIC BUILD OF IT FOR AN ELF SHARED LIBRARY: libfbpic.a / libfbmtpic.a,
     '' fbc's names and fbc's rule ('-lfbpic' on its Linux '-dll' line). The plain
     '' archives are not position-independent and ld refuses them in a .so.
-    dim as string rtName = iif( t.threadSafe, "/libfbmt.a", "/libfb.a" )
-    if t.buildDll andalso (target.objFormat = OBJ_ELF) then
-        rtName = iif( t.threadSafe, "/libfbmtpic.a", "/libfbpic.a" )
-    end if
+    ''
+    '' AND UNDER '-Os' THE SIZE RUNTIME, the same archive built at '-Os' and suffixed -s
+    '' (libfb-s.a, libfbmt-s.a, libfbpic-s.a, libfbmtpic-s.a; lib/rt's MinSizeRel), PATH BY
+    '' PATH: where a directory has the -s archive it is named in place of the plain one,
+    '' and where it has not -- an older toolchain, a hand-built runtime -- the plain one is,
+    '' so '-Os' never fails a link that '-O2' would make. Never both from one directory:
+    '' they define the same symbols.
+    dim as string rtBase = iif( t.threadSafe, "/libfbmt", "/libfb" )
+    if t.buildDll andalso (target.objFormat = OBJ_ELF) then rtBase &= "pic"
     for i as int32 = 0 to t.libPaths.Count - 1
-        dim as string rtLib = t.libPaths[i] & rtName
+        dim as string rtLib = t.libPaths[i] & rtBase & ".a"
+        if t.optSize andalso FileExists_( t.libPaths[i] & rtBase & "-s.a" ) then rtLib = t.libPaths[i] & rtBase & "-s.a"
         if FileExists_( rtLib ) then cmd += " " & Q( rtLib )
     next
 
@@ -1185,6 +1395,12 @@ function LinkExe _
         '' MACH-O. libm and pthreads are inside libSystem, which clang's darwin driver always
         '' links; tgoto and tputs come from the SDK's ncurses, macOS's terminfo.
         cmd += " -lncurses"
+    elseif android then
+        '' BIONIC. libm and libdl are their own stubs; pthreads are in libc, and the NDK ships
+        '' no libpthread for '-lpthread' to find. Android has no terminfo: tiko-rt's console
+        '' writes its own VT100 sequences there (docs/tiko-android D-A1-6).
+        cmd += " -lm -ldl"
+        if t.app then cmd += " -llog"     '' fbrtapp.o's logcat
     else
         '' ELF. '-ltinfo' is the counterpart of the pair above: the runtime's console
         '' layer calls tgoto and tputs, which live in terminfo. '-lm' and '-lpthread'
@@ -1229,9 +1445,9 @@ function LinkExe _
     end if
     '' NOT LINKED WITHOUT fbrt0.o (review RT-03), but '-v' still shows the line -- the driver
     '' tests read it on hosts with no sysroot to link against.
-    if rt0Missing then
+    if rt0Missing orelse appMissing then
         if t.verbose then print Q( t.clangExe ) & " " & cmd
-        return LINK_NO_RT0
+        return iif( rt0Missing, LINK_NO_RT0, LINK_NO_RTAPP )
     end if
     return Exec_( t, t.clangExe, cmd )
 end function

@@ -1,0 +1,371 @@
+' tkOrders self-test: the data module against a real SQLite file (seeded with the sample data),
+' then the forms built over it, in a folder of its own (never the user's data folder).
+' The navigator's and the list's callbacks are driven the way the generated thunks drive them
+' (handler first, then the generated move). The three designed reports -- an array, an SQL query
+' and a DataGrid as their data -- are made over the same data, and their text is checked against
+' SQLite's own counts and sums. The modal windows (message boxes, ShowModal) are left to a person:
+' nothing here makes one appear (no delete through the form, no refused SaveTo).
+#import "std/containers"
+#import "std/fs"
+#import "std/chrono"
+#import "vendor/sqlite3"
+#import "vendor/tkControls/tkTest"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkDataGrid"
+#import "vendor/tkControls/tkNavigator"
+#import "vendor/tkControls/tkStatusBar"
+#import "vendor/tkControls/tkComboBox"
+#import "./appTheme"
+#import "./orderdb"
+#import "./frmCustomers"
+#import "./frmOrders"
+#import "./frmOrder"
+#import "./frmInvoice"
+#import "./frmReport"
+#import "./rptSales"
+#import "./rptOrderList"
+#import "vendor/tkControls/tkPrint"
+#import "vendor/tkControls/tkReportViewer"
+#import "vendor/tkControls/tkDataGridSqlite"
+using containers
+using tkApp
+using tkDataGrid
+using tkNavigator
+using tkStatusBar
+using tkComboBox
+using tkHost
+using tkTest
+using tkPrint
+using tkPaint
+using tkReportViewer
+using tkDataGridSqlite
+
+' One number from SQL, on the program's connection.
+function SqlNum( byref sql as const ustring ) as float64
+    dim as sqlite3_stmt ptr st
+    if sqlite3_prepare_v2( orderdb.Connection( ), sql, -1, @st, nullptr ) <> SQLITE_OK then return -1
+    dim as float64 v = -1
+    if sqlite3_step( st ) = SQLITE_ROW then v = sqlite3_column_double( st, 0 )
+    sqlite3_finalize( st )
+    return v
+end function
+
+function Near( byval a as float64, byval b as float64 ) as boolean
+    return abs( a - b ) < 0.005
+end function
+
+' Every text a report document draws, "|" after each, page by page ("Page 1 of 2" resolved).
+function DocText( byval doc as TK_PRINTDOC ptr ) as string
+    dim as string s
+    if doc = 0 then return s
+    tkPrintDoc_Generate( doc )
+    dim as long np = tkPrintDoc_GetPageCount( doc )
+    for pg as long = 0 to np - 1
+        for i as long = 0 to tkPrintDoc_GetOpCount( doc, pg ) - 1
+            dim as TKPRINT_OPINFO oi
+            tkPrintDoc_GetOp( doc, pg, i, oi )
+            if oi.op = TKREC_TEXT then s &= oi.text & "|"
+            if oi.op = TKPRINT_OP_LATE then s &= PrLateText( oi.text, pg, np, doc ) & "|"
+        next
+    next
+    return s
+end function
+
+' An amount as the reports' "#,##0.00" shows it: 12345.5 -> "12,345.50".
+function Thousands( byval d as float64 ) as string
+    dim as string m = orderdb.Money( d )
+    dim as long p = instr( m, "." )
+    dim as string ip = left( m, p - 1 ), r
+    while len( ip ) > 3
+        r = "," & right( ip, 3 ) & r
+        ip = left( ip, len( ip ) - 3 )
+    wend
+    return ip & r & mid( m, p )
+end function
+
+' How many times what occurs in s.
+function Occurs( byref s as const string, byref what as const string ) as int32
+    dim as int32 n = 0, p = instr( s, what )
+    while p
+        n += 1
+        p = instr( p + len( what ), s, what )
+    wend
+    return n
+end function
+
+dim as ustring none
+dim as ustring dir_ = fs.CreateTempDir( "tkorders" ).ValueOr( none )
+dim as ustring dbFile = fs.PathJoin( dir_, "orders.db" )
+
+dim as TKAPP_OPTIONS opts
+appTheme.ApplyOptions( opts )
+if tkApp_Init( opts ) = false then
+    print "tkApp_Init failed"
+    end 98
+end if
+appTheme.Install( )
+
+tkTest_Begin( "orderdb" )
+scope
+    tkTest_Check( "a temp folder", len( dir_ ) > 0 )
+    dim as ustring e = orderdb.OpenData( dbFile )
+    tkTest_Check( "opens (and makes, and seeds) the database", e = "", e )
+    tkTest_Check( "the file is there", fs.IsFile( dbFile ) )
+    tkTest_Check( "25 sample customers", SqlNum( "select count(*) from customer" ) = 25 )
+    tkTest_Check( "16 sample products", SqlNum( "select count(*) from product" ) = 16 )
+    tkTest_Check( "100 sample orders", SqlNum( "select count(*) from orders" ) = 100 )
+    tkTest_Check( "every order has lines", SqlNum( "select count(*) from orders where id not in ( select order_id from order_line )" ) = 0 )
+    tkTest_Check( "every stored total is its lines' sum", _
+        SqlNum( "select count(*) from orders o where abs( o.total - ( select sum( qty * unit_price ) from order_line where order_id = o.id ) ) > 0.005" ) = 0 )
+    orderdb.CloseData( )
+    tkTest_Check( "opening again does not seed twice", (orderdb.OpenData( dbFile ) = "") andalso (SqlNum( "select count(*) from customer" ) = 25) )
+
+    dim as Array( of orderdb.Customer ) list
+    tkTest_Check( "loads every customer", (orderdb.LoadCustomers( list ) = "") andalso (list.Count( ) = 25) )
+    tkTest_Check( "by company", (list.Count( ) = 25) andalso (list[0].Company = "Alder & Finch Outfitters") )
+    dim as int32 nOrders = 0
+    for i as int32 = 0 to list.Count( ) - 1
+        nOrders += list[i].Orders.Count( )
+    next
+    tkTest_Check( "each with its orders", nOrders = 100, str( nOrders ) )
+    dim as int32 k = -1
+    for i as int32 = 0 to list.Count( ) - 1
+        if list[i].City = "Kraków" then k = i
+    next
+    tkTest_Check( "UTF-8 text survives", k >= 0 )
+    tkTest_Check( "a date column reads as a LocalDate", list[0].Since.IsValid andalso (list[0].Since.Year >= 2015) )
+
+    dim as orderdb.Order o
+    tkTest_Check( "an order with its lines", orderdb.LoadOrder( 1, o ) andalso (o.Lines.Count( ) > 0) andalso (len( o.Lines[0].Product ) > 0) )
+    tkTest_Check( "Total( ) adds up the lines = the stored Amount", Near( o.Total( ), o.Amount ), o.Total( ) & " vs " & o.Amount )
+    tkTest_Check( "Money", (orderdb.Money( 1234.5 ) = "1234.50") andalso (orderdb.Money( 0.05 ) = "0.05") andalso (orderdb.Money( -2 ) = "-2.00") )
+
+    dim as orderdb.Customer c
+    c.Company = "Test Kitchen" : c.Tier = "Gold" : c.Since = chrono.LocalDate( 2026, 11, 24 ) : c.CreditLimit = 1500
+    e = orderdb.SaveCustomer( c )
+    tkTest_Check( "inserts a customer", (e = "") andalso (c.Id > 25), e )
+    dim as orderdb.Order n = orderdb.NewOrder( c )
+    dim as orderdb.OrderLine l
+    l.ProductId = 3 : l.Qty = 4 : l.UnitPrice = 2.5
+    n.Lines.Push( l )
+    e = orderdb.SaveOrder( n )
+    tkTest_Check( "saves a new order, its total stored", (e = "") andalso (n.Id = 101) andalso Near( SqlNum( "select total from orders where id = 101" ), 10 ), e )
+    n.Lines[0].Qty = 6
+    e = orderdb.SaveOrder( n )
+    tkTest_Check( "saves it again: lines replaced, not added", (e = "") andalso (SqlNum( "select count(*) from order_line where order_id = 101" ) = 1) _
+        andalso Near( SqlNum( "select total from orders where id = 101" ), 15 ) )
+    e = orderdb.DeleteCustomer( c.Id )
+    tkTest_Check( "deletes a customer with its orders and lines", (e = "") andalso (SqlNum( "select count(*) from orders where id = 101" ) = 0) _
+        andalso (SqlNum( "select count(*) from order_line where order_id = 101" ) = 0), e )
+    orderdb.CloseData( )
+end scope
+
+tkTest_Begin( "frmCustomers" )
+scope
+    dim as frmCustomers.Form f
+    f.DataFile = dbFile
+    f.Build( )
+    f.Show( )
+    dim as TK_HOST ptr h = tkForm_Host( f.Handle )
+    tkTest_PumpFor( h, 100 )
+    dim as TK_WIDGET ptr grd = f.grdCustomers.Handle, nav = f.navCustomers.Handle
+    tkTest_Check( "the list holds every customer", tkDataGrid_GetRowCount( grd ) = 25, str( tkDataGrid_GetRowCount( grd ) ) )
+    tkTest_Check( "the navigator counts them", tkNavigator_GetCount( nav ) = 25 )
+    tkTest_Check( "and stands on the first", tkNavigator_GetPosition( nav ) = 0 )
+    tkTest_Check( "the status bar counts", tkStatusBar_GetText( f.sbMain.Handle, 0 ) = "25 customers" )
+    tkTest_Check( "the boxes show the first", (f.txtCompany.Text = "Alder & Finch Outfitters") andalso (f.txtCity.Text = f.Customers[0].City) )
+    tkTest_Check( "the tier combo shows its value", tkComboBox_GetCurSel( f.cboTier.Handle ) >= 0 )
+    tkTest_Check( "the orders grid holds the customer's orders", tkDataGrid_GetRowCount( f.grdOrders.Handle ) = f.Customers[0].Orders.Count( ) )
+    dim as TKDG_VALUE v
+    dim as float64 want = 0
+    for i as int32 = 0 to f.Customers[0].Orders.Count( ) - 1
+        want += f.Customers[0].Orders[i].Amount
+    next
+    tkTest_Check( "its footer sums the totals", tkDataGrid_GetSummary( f.grdOrders.Handle, 4, v ) andalso Near( v.f, want ), v.f & " vs " & want )
+
+    ' an edit, then Next: the navigator's handler saves it to the database before the move
+    f.txtCity.Text = "Seattle"
+    dim as boolean allow = true
+    f.navCustomers_Navigate( TKNAV_NEXT, 1, allow )
+    if allow then f.navCustomers_Go_( TKNAV_NEXT, 1 )
+    tkTest_Check( "Next moves", tkNavigator_GetPosition( nav ) = 1 )
+    tkTest_Check( "and the edit reached SQLite", SqlNum( "select count(*) from customer where city = 'Seattle' and company = 'Alder & Finch Outfitters'" ) = 1 )
+    tkTest_Check( "the boxes show the second", f.txtCompany.Text = f.Customers[1].Company )
+
+    ' an edit, then a click in the list: the generated move saves it into the record, the handler into SQLite
+    f.txtPhone.Text = "+1 555 0100"
+    tkDataGrid_SetCurrentCell( grd, 5, 0 )
+    f.navCustomers_FromList_( )
+    f.grdCustomers_CurrentCellChanged( 5, 0 )
+    tkTest_Check( "a click in the list moves the navigator", tkNavigator_GetPosition( nav ) = 5 )
+    tkTest_Check( "and the edit reached SQLite", SqlNum( "select count(*) from customer where phone = '+1 555 0100'" ) = 1 )
+
+    ' bound controls of every kind: a value changed in each, then Save
+    f.rtgRating.Value = 1
+    f.chkActive.Checked = false
+    f.nudCredit.Value = 7500
+    f.cboTier.SelectedIndex = 3
+    f.btnSave_Click( )
+    dim as int32 id5 = f.Customers[5].Id
+    tkTest_Check( "Save writes every bound kind", _
+        SqlNum( "select count(*) from customer where id = " & id5 & " and rating = 1 and active = 0 and credit_limit = 7500 and tier = 'Platinum'" ) = 1 )
+
+    ' Revert drops what is typed
+    f.txtCompany.Text = "Not kept"
+    f.btnRevert_Click( )
+    tkTest_Check( "Revert drops the edit", (f.txtCompany.Text = f.Customers[5].Company) andalso (f.IsDirty( f.Customers[5] ) = false) )
+
+    ' New, a company typed, then Save: inserted
+    allow = true
+    f.navCustomers_Navigate( TKNAV_NEW, -1, allow )
+    if allow then f.navCustomers_Go_( TKNAV_NEW, -1 )
+    tkTest_Check( "New adds a record", (tkNavigator_GetCount( nav ) = 26) andalso (tkNavigator_GetPosition( nav ) = 25) andalso (f.txtCompany.Text = "") )
+    f.txtCompany.Text = "Zinnia Supper Club"
+    f.cboTier.SelectedIndex = 0
+    f.btnSave_Click( )
+    tkTest_Check( "and Save inserts it", (SqlNum( "select count(*) from customer" ) = 26) andalso (f.Customers[25].Id > 0) )
+    tkTest_Check( "the list shows it", tkDataGrid_GetCellText( grd, 25, 0 ) = "Zinnia Supper Club" )
+
+    ' ---- frmOrder over one of the first customer's orders ----
+    f.Reload( f.Customers[0].Id )
+    tkTest_Check( "Reload selects by id", tkNavigator_GetPosition( nav ) = 0 )
+    dim as orderdb.Order o
+    orderdb.LoadOrder( f.Customers[0].Orders[0].Id, o )
+    dim as frmOrder.Form d
+    d.Build( f.Handle )
+    d.Edit( o )
+    tkTest_PumpFor( h, 30 )
+    dim as TK_WIDGET ptr gl = d.grdLines.Handle
+    dim as int32 nLines = o.Lines.Count( )
+    tkTest_Check( "the dialog shows the order", (d.lblCustomer.Text = f.Customers[0].Company) andalso (tkDataGrid_GetRowCount( gl ) = nLines) )
+    tkTest_Check( "its status combo", d.cboStatus.SelectedIndex >= 0 )
+    tkTest_Check( "a method column shows Total( )", Near( tkDataGrid_GetCellFloat( gl, 0, 3 ), o.Lines[0].Total( ) ) )
+    tkTest_Check( "the product list is filled", tkComboBox_GetCount( d.cboProduct.Handle ) = 16 )
+    tkDataGrid_SetCellFloat( gl, 0, 1, 9 )
+    tkTest_Check( "a live grid: a cell edit is in the array at once", d.Ord.Lines[0].Qty = 9 )
+    tkTest_Check( "and the footer follows", tkDataGrid_GetSummary( gl, 3, v ) andalso Near( v.f, d.Ord.Total( ) ) )
+    ' a product the order does not have yet
+    dim as int32 pick = -1
+    for i as int32 = 0 to d.Products.Count( ) - 1
+        dim as boolean has = false
+        for j as int32 = 0 to d.Ord.Lines.Count( ) - 1
+            if d.Ord.Lines[j].ProductId = d.Products[i].Id then has = true
+        next
+        if has = false then pick = i : exit for
+    next
+    d.Ord.Notes = ""
+    d.txtNotes.Text = "Ring the bell"
+    tkTest_Check( "Add line adds one", d.AddProduct( pick, 2 ) andalso (tkDataGrid_GetRowCount( gl ) = nLines + 1) )
+    tkTest_Check( "keeping what was typed in the boxes", d.txtNotes.Text = "Ring the bell" )
+    tkTest_Check( "the same product again adds to its line", d.AddProduct( pick, 1 ) andalso (tkDataGrid_GetRowCount( gl ) = nLines + 1) _
+        andalso (d.Ord.Lines[nLines].Qty = 3) )
+    tkTest_Check( "OK's collect", d.Collect( ) andalso (d.Ord.Notes = "Ring the bell") )
+    dim as ustring e = orderdb.SaveOrder( d.Ord )
+    tkTest_Check( "the order saves", e = "", e )
+    tkTest_Check( "with its new total", Near( SqlNum( "select total from orders where id = " & d.Ord.Id ), d.Ord.Total( ) ) )
+
+    ' ---- rptInvoice (an array source with a child): the order in the invoice window ----
+    scope
+        dim as frmInvoice.Form fi
+        fi.Build( f.Handle )
+        fi.ShowOrder( d.Ord )
+        fi.Show( f.Handle )
+        tkTest_PumpFor( h, 30 )
+        dim as string s = DocText( tkReportViewer_GetDocument( fi.rvInvoice.Handle ) )
+        tkTest_Check( "rptInvoice: the order's header", (instr( s, "|" & f.Customers[0].Company & "|" ) > 0) _
+            andalso (instr( s, "|Invoice no.|" & d.Ord.Id & "|" ) > 0) andalso (instr( s, "Notes: Ring the bell" ) > 0), s )
+        dim as boolean every = true
+        for i as int32 = 0 to d.Ord.Lines.Count( ) - 1
+            if instr( s, "|" & d.Ord.Lines[i].Product & "|" & d.Ord.Lines[i].Qty & "|" & Thousands( d.Ord.Lines[i].UnitPrice ) _
+                      & "|" & Thousands( d.Ord.Lines[i].Total( ) ) & "|" ) = 0 then every = false
+        next
+        tkTest_Check( "every line: product, qty, price, amount", every, s )
+        tkTest_Check( "the total is the lines' sum", instr( s, "|Total|" & Thousands( d.Ord.Total( ) ) & "|" ) > 0, s )
+        fi.Close( )
+    end scope
+    orderdb.LoadCustomerOrders( f.Customers[0].Id, f.Customers[0].Orders )
+    f.LoadFrom( f.Customers[0] )
+    tkTest_Check( "the customer's orders grid shows it", Near( tkDataGrid_GetCellFloat( f.grdOrders.Handle, 0, 4 ), d.Ord.Total( ) ) )
+    d.Close( )
+
+    ' ---- frmOrders: the grid is an SQLite query ----
+    dim as frmOrders.Form a
+    a.Build( f.Handle )
+    a.Show( f.Handle )
+    tkTest_PumpFor( h, 50 )
+    dim as TK_WIDGET ptr ga = a.grdAll.Handle
+    tkTest_Check( "the query opened", a.Query <> 0 )
+    tkTest_Check( "every order is a row", tkDataGrid_GetRowCount( ga ) = 100, str( tkDataGrid_GetRowCount( ga ) ) )
+    tkTest_Check( "the count label", a.lblCount.Text = "100 orders in all", a.lblCount.Text )
+    tkTest_Check( "the footer's sum is SQLite's", tkDataGrid_GetSummary( ga, 6, v ) andalso Near( v.f, SqlNum( "select sum( total ) from orders" ) ) )
+    tkTest_Check( "SummaryFormatting gives it two decimals", tkDataGrid_GetSummaryText( ga, 6 ) = orderdb.Money( v.f ), tkDataGrid_GetSummaryText( ga, 6 ) )
+    tkTest_Check( "a date column", tkDataGrid_GetCellDate( ga, 0, 1 ).wYear >= 2025 )
+    tkDataGrid_SetColumnFilterText( ga, 4, "Cancelled" )
+    a.grdAll_FilterChanged( )
+    dim as int32 nCancelled = SqlNum( "select count(*) from orders where status = 'Cancelled'" )
+    tkTest_Check( "the filter row is a WHERE", (nCancelled > 0) andalso (tkDataGrid_GetRowCount( ga ) = nCancelled), tkDataGrid_GetRowCount( ga ) & " vs " & nCancelled )
+    tkTest_Check( "and the footer follows it", tkDataGrid_GetSummary( ga, 6, v ) _
+        andalso Near( v.f, SqlNum( "select sum( total ) from orders where status = 'Cancelled'" ) ) )
+    tkTest_Check( "the label says so", instr( a.lblCount.Text, "match the filters" ) > 0, a.lblCount.Text )
+
+    ' ---- rptOrderList (a grid source): the grid as the user left it ----
+    scope
+        dim as rptOrderList.Report r
+        r.SetOrdersGrid( ga )
+        r.Filters = a.FilterText( )
+        dim as ustring errs
+        dim as TK_PRINTDOC ptr doc = r.CreateDoc( errs )
+        dim as string s = DocText( doc )
+        tkTest_Check( "rptOrderList: only the filtered rows", (Occurs( s, "|Cancelled|" ) = nCancelled) andalso (Occurs( s, "|Delivered|" ) = 0) _
+            andalso (instr( s, "|" & nCancelled & " orders|" ) > 0), s & " " & errs )
+        tkTest_Check( "its sum is SQLite's", instr( s, "|" & Thousands( SqlNum( "select sum( total ) from orders where status = 'Cancelled'" ) ) & "|" ) > 0, s )
+        tkTest_Check( "the Filters parameter is printed", instr( s, "|Filtered: Status: Cancelled|" ) > 0, s )
+        tkPrintDoc_Destroy( doc )
+    end scope
+    a.btnClearFilters_Click( )
+    tkTest_Check( "Clear filters", tkDataGrid_GetRowCount( ga ) = 100 )
+    a.Release( )
+    tkTest_Check( "Release closes the query", a.Query = 0 )
+
+    ' ---- rptSales (an SQLite source with parameters) in the report window ----
+    scope
+        dim as rptSales.Report r
+        tkTest_Check( "rptSales: the date parameters start at their defaults", (r.FromDate.wYear = 2025) andalso (r.ToDate.wMonth = 12) )
+        r.SetDatabase( orderdb.Connection( ) )
+        dim as frmReport.Form fr
+        fr.Build( f.Handle )
+        tkTest_Check( "ShowIn the report window", r.ShowIn( fr.rvReport.Handle ) )
+        fr.Show( f.Handle )
+        tkTest_PumpFor( h, 30 )
+        dim as string s = DocText( tkReportViewer_GetDocument( fr.rvReport.Handle ) )
+        dim as string w = "from orders where order_date between '2025-01-01' and '2025-12-31' and status <> 'Cancelled'"
+        dim as int32 n = SqlNum( "select count(*) " & w )
+        tkTest_Check( "every 2025 order not cancelled, and their sum", (n > 0) _
+            andalso (instr( s, "|All customers: " & n & " orders|" & Thousands( SqlNum( "select sum( total ) " & w ) ) & "|" ) > 0), s )
+        tkTest_Check( "a group per customer", Occurs( s, " orders|" ) = SqlNum( "select count( distinct customer_id ) " & w ) + 1, s )
+        tkTest_Check( "no cancelled order", instr( s, "|Cancelled|" ) = 0 )
+        fr.Close( )
+        r.FromDate.wYear = 2026 : r.ToDate.wYear = 2026
+        dim as ustring errs
+        dim as TK_PRINTDOC ptr doc = r.CreateDoc( errs )
+        s = DocText( doc )
+        w = "from orders where order_date between '2026-01-01' and '2026-12-31' and status <> 'Cancelled'"
+        tkTest_Check( "the parameters reach the query", (instr( s, "|All customers: " & SqlNum( "select count(*) " & w ) & " orders|" ) > 0) _
+            andalso (instr( s, "Orders from 01/01/2026 to 31/12/2026" ) > 0), s & " " & errs )
+        tkPrintDoc_Destroy( doc )
+        r.FromDate.wYear = 2030 : r.ToDate.wYear = 2030
+        doc = r.CreateDoc( errs )
+        s = DocText( doc )
+        tkTest_Check( "no rows: the no-data band", instr( s, "|No orders between these dates.|" ) > 0, s )
+        tkPrintDoc_Destroy( doc )
+    end scope
+    a.Close( )
+    f.Close( )
+    tkTest_PumpFor( h, 30 )
+end scope
+
+orderdb.CloseData( )
+fs.RemoveDirAll( dir_ )
+dim as int32 nFail = tkTest_Report( "tkOrders" )
+tkApp_Shutdown( )
+end nFail

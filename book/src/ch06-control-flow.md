@@ -121,12 +121,6 @@ contains the `match` runs — which only matters if the subject is a call with s
 and an `end match` closes it. A variable or a procedure called `match` keeps working.
 ```
 
-````admonish warning title="Status in this version"
-`match` arrives after tiko 0.1.6, the toolchain this book is pinned to. The listings in this
-section were compiled and run with the development toolchain; the book's harness reports them as
-blocked (`pin-0.1.6`) until the pin moves to a release that has them.
-````
-
 ## Repeating
 
 ```tiko

@@ -1,0 +1,208 @@
+' tkTokenBox self-test: one check per behaviour. Real windows, real SDL event queue: input claims
+' are made by PUSHING the SDL event a user would have produced and pumping. Two passes, scale pinned
+' at 1.0 and 1.75. The design: C:\dev\docs\tkControls\CHECKED-LISTS.md §8 (phase C4).
+'
+'   selftest            exit code = number of failures
+#import "vendor/tkControls/tkTokenBox"
+#import "vendor/tkControls/tkTest"
+using tkTokenBox
+using tkTextBox
+using tkItemPopup
+using tkListTree
+using tkTheme
+using tkTest
+using tkHost
+using tkPaint
+
+dim shared as long gChanged, gAdding, gRemoving
+dim shared as boolean gVetoAdd, gUpper, gVetoRemove
+
+function OnAdding( byval h as TK_WIDGET ptr, byref Text as ustring, byref Key as ustring ) as boolean
+    gAdding += 1
+    if gUpper then Text = ucase( Text ) : Key = ucase( Key )
+    return gVetoAdd = false
+end function
+function OnRemoving( byval h as TK_WIDGET ptr, byval idx as long ) as boolean
+    gRemoving += 1
+    return gVetoRemove = false
+end function
+sub OnChanged( byval h as TK_WIDGET ptr )
+    gChanged += 1
+end sub
+sub ResetCounts()
+    gChanged = 0 : gAdding = 0 : gRemoving = 0 : gVetoAdd = false : gUpper = false : gVetoRemove = false
+end sub
+
+function Keys( byval tb as TK_WIDGET ptr ) as ustring
+    return tkTokenBox_GetTokensText( tb )
+end function
+
+' Window pixels of a rect's centre inside widget w.
+sub ClickIn( byval h as TK_HOST ptr, byval w as TK_WIDGET ptr, byref rc as TKRECT )
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    tkTest_Click( h, a.left + (rc.left + rc.right) \ 2, a.top + (rc.top + rc.bottom) \ 2 )
+end sub
+
+sub RunPass( byval fScale as single )
+    tkTest_Begin( "scale " & fScale )
+    dim as TK_HOST ptr h = tkHost_Create( "tkTokenBox selftest", 480, 360, tkHost_FontDir() & TK_FONT_UI, fScale )
+    if h = 0 then tkTest_Check( "host", false, *SDL_GetError() ) : exit sub
+    dim as TTF_Font ptr f10 = tkHost_OpenFont( h, tkHost_FontDir() & TK_FONT_UI, 10 )
+    tkHost_Show( h )
+    tkTest_PumpFor( h, 300 )
+
+    dim as TK_WIDGET ptr tb = tkTokenBox_Create( tkHost_Root( h ), 600 )
+    dim as TK_WIDGET ptr other = tkTokenBox_Create( tkHost_Root( h ), 700 )     ' the next tab stop
+    dim as TK_WIDGET ptr ed = tkTokenBox_GetInput( tb )
+    tkTokenBox_SetFont( tb, f10 )
+    tkTokenBox_SetTokenAddingCallback( tb, @OnAdding )
+    tkTokenBox_SetTokenRemovingCallback( tb, @OnRemoving )
+    tkTokenBox_SetTokensChangedCallback( tb, @OnChanged )
+    tkTokenBox_SetPlaceholderText( tb, "Add a colour" )
+    tkWidget_SetPos( tb, tkHost_Scale( h, 20 ), tkHost_Scale( h, 20 ), tkHost_Scale( h, 300 ), tkHost_Scale( h, 32 ) )
+    tkWidget_SetPos( other, tkHost_Scale( h, 20 ), tkHost_Scale( h, 300 ), tkHost_Scale( h, 120 ), tkHost_Scale( h, 32 ) )
+    tkTokenBox_AddItem( tb, "Red", "red", 1 )
+    tkTokenBox_AddItem( tb, "Green" )
+    tkTokenBox_AddItem( tb, "Blue", "blue" )
+    tkTokenBox_AddItem( tb, "Gray", "gray" )
+    tkTest_Check( "no tokens: the placeholder is the input's cue", tkTextBox_GetCueBannerText( ed ) = "Add a colour" )
+
+    ' ---- the value pair (silent) ------------------------------------------------------------
+    ResetCounts()
+    tkTokenBox_SetTokensText( tb, "red; teal" )
+    tkTest_Check( "SetTokensText: an item's key is that item, else a free token; silent", (tkTokenBox_GetTokenCount( tb ) = 2) _
+        andalso (tkTokenBox_GetTokenText( tb, 0 ) = "Red") andalso (tkTokenBox_IsTokenFree( tb, 0 ) = false) andalso (tkTokenBox_GetTokenID( tb, 0 ) = 1) _
+        andalso tkTokenBox_IsTokenFree( tb, 1 ) andalso (Keys( tb ) = "red;teal") andalso (gChanged = 0) andalso (gAdding = 0) )
+    ' layout: on one line, in order, the input after them
+    dim as TKRECT r0, r1, rIn
+    tkTokenBox_GetChipRect( tb, 0, r0 ) : tkTokenBox_GetChipRect( tb, 1, r1 )
+    rIn.left = ed->x : rIn.top = ed->y
+    dim as long pad = tkHost_Scale( h, 4 ), gap = tkHost_Scale( h, 4 )
+    tkTest_Check( "chips flow from the left, gap apart; the input follows on their line", (r0.left = pad) andalso (r1.left = r0.right + gap) _
+        andalso (r1.top = r0.top) andalso (rIn.left = r1.right + gap) andalso (rIn.top = r1.top), r0.left & " " & r1.left & " " & rIn.left )
+
+    ' ---- typing -------------------------------------------------------------------------------
+    tkHost_SetFocus( h, tb )
+    tkTest_Check( "focus given to the box lands on the input", h->pFocus = ed )
+    ResetCounts()
+    tkTest_PushText( h, "Green," )
+    tkTest_Check( "a separator commits the text as a token (an item's, matched by text)", (Keys( tb ) = "red;teal;Green") _
+        andalso (tkTokenBox_GetInputText( tb ) = "") andalso (gChanged = 1) )
+    tkTest_PushText( h, "a;b;c" )
+    tkTest_Check( "a paste commits every piece before the last separator, one TokensChanged", (Keys( tb ) = "red;teal;Green;a;b") _
+        andalso (tkTokenBox_GetInputText( tb ) = "c") andalso (gChanged = 2) )
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_Check( "Enter commits the input", (Keys( tb ) = "red;teal;Green;a;b;c") andalso (tkTokenBox_GetInputText( tb ) = "") )
+    tkTest_PushText( h, "red," )
+    tkTest_Check( "a duplicate is refused and stays in the input", (tkTokenBox_GetTokenCount( tb ) = 6) andalso (tkTokenBox_GetInputText( tb ) = "red") )
+    tkTokenBox_SetInputText( tb, "" )
+    gVetoAdd = true
+    tkTest_PushText( h, "x," )
+    tkTest_Check( "TokenAdding vetoes", (tkTokenBox_GetTokenCount( tb ) = 6) andalso (tkTokenBox_GetInputText( tb ) = "x") )
+    gVetoAdd = false : gUpper = true
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_Check( "TokenAdding rewrites", tkTokenBox_GetTokenText( tb, 6 ) = "X" )
+    gUpper = false
+    tkTokenBox_SetEntryMode( tb, TKTB_ENTRY_ITEMS )
+    tkTest_PushText( h, "zzz" )
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_Check( "ITEMS mode refuses free text", (tkTokenBox_GetTokenCount( tb ) = 7) andalso (tkTokenBox_GetInputText( tb ) = "zzz") )
+    tkTokenBox_SetEntryMode( tb, TKTB_ENTRY_FREE )
+    tkTokenBox_SetInputText( tb, "" )
+
+    ' ---- the suggestions ----------------------------------------------------------------------
+    tkTokenBox_SetTokensText( tb, "Green" )
+    ResetCounts()
+    tkTest_PushText( h, "gr" )
+    dim as TK_WIDGET ptr sl = tkTokenBox_GetSuggestList( tb )
+    tkTest_Check( "typing opens the matching items, tokens left out (Gray, not Green)", tkTokenBox_IsSuggesting( tb ) andalso (sl <> 0) _
+        andalso (tkListTree_GetCount( sl ) = 1) andalso (tkListTree_GetText( sl, 0 ) = "Gray") )
+    tkTest_Check( "the list never takes the OS focus", (SDL_GetWindowFlags( tkTokenBox_GetSuggestHost( tb )->win ) and SDL_WINDOW_NOT_FOCUSABLE) <> 0 )
+    tkTest_PushText( h, "a" )
+    tkTest_Check( "text typed while the list is up reaches the input", tkTokenBox_GetInputText( tb ) = "gra" )
+    tkTest_PushKey( h, SDLK_RETURN )
+    tkTest_Check( "Enter picks the current suggestion, closes the list", (Keys( tb ) = "Green;gray") andalso (tkTokenBox_GetInputText( tb ) = "") _
+        andalso (tkTokenBox_IsSuggesting( tb ) = false) andalso (gChanged = 1) )
+    tkTest_PushKey( h, SDLK_DOWN )
+    tkTest_Check( "Down on an empty input lists every item not yet a token", tkTokenBox_IsSuggesting( tb ) _
+        andalso (tkListTree_GetCount( tkTokenBox_GetSuggestList( tb ) ) = 2) )
+    tkTest_PushKey( h, SDLK_TAB )
+    tkTest_Check( "Tab picks the current suggestion and moves the focus on", (Keys( tb ) = "Green;gray;red") andalso (h->pFocus <> ed) )
+
+    ' ---- removing: Backspace, the chips, the x ----------------------------------------------------
+    tkHost_SetFocus( h, tb )
+    ResetCounts()
+    tkTest_PushKey( h, SDLK_BACKSPACE )
+    tkTest_Check( "Backspace in an empty input removes the last token", (Keys( tb ) = "Green;gray") andalso (gChanged = 1) andalso (gRemoving = 1) )
+    gVetoRemove = true
+    tkTest_PushKey( h, SDLK_BACKSPACE )
+    tkTest_Check( "TokenRemoving vetoes", Keys( tb ) = "Green;gray" )
+    gVetoRemove = false
+    tkTokenBox_SetTokensText( tb, "red;Green;blue" )
+    tkTest_PushKey( h, SDLK_LEFT )
+    tkTest_PushKey( h, SDLK_LEFT )
+    tkTest_Check( "Left from the input's start walks into the chips", tkTokenBox_GetFocusedChip( tb ) = 1 )
+    tkTest_PushKey( h, SDLK_DELETE )
+    tkTest_Check( "Delete removes the focused chip; the focus stays at its place", (Keys( tb ) = "red;blue") andalso (tkTokenBox_GetFocusedChip( tb ) = 1) )
+    tkTest_PushKey( h, SDLK_RIGHT )
+    tkTest_Check( "Right past the last chip returns to the input", tkTokenBox_GetFocusedChip( tb ) = -1 )
+    dim as TKRECT rx
+    tkTokenBox_GetChipCloseRect( tb, 0, rx )
+    tkTest_PushText( h, "gr" )           ' Green and Gray: the list is up, and a click on an x must still land
+    dim as boolean bUp = tkTokenBox_IsSuggesting( tb )
+    ClickIn( h, tb, rx )
+    tkTest_Check( "a click on a chip's x removes it, even with the list up", bUp andalso (Keys( tb ) = "blue") andalso (tkTokenBox_IsSuggesting( tb ) = false) )
+    tkTokenBox_SetInputText( tb, "" )
+
+    ' ---- focus loss, MaxTokens, AutoHeight -----------------------------------------------------------
+    tkHost_SetFocus( h, tb )
+    tkTest_PushText( h, "q" )
+    tkHost_SetFocus( h, other )
+    tkTest_Check( "focus leaving commits the input", Keys( tb ) = "blue;q" )
+    tkTokenBox_SetMaxTokens( tb, 2 )
+    tkHost_SetFocus( h, tb )
+    tkTest_PushText( h, "w," )
+    tkTest_Check( "MaxTokens refuses one more", (tkTokenBox_GetTokenCount( tb ) = 2) andalso (tkTokenBox_GetInputText( tb ) = "w") )
+    tkTokenBox_SetMaxTokens( tb, 0 )
+    tkTokenBox_SetInputText( tb, "" )
+    dim as long h1 = tb->ch
+    tkTokenBox_SetAutoHeight( tb, true, 3 )
+    tkTokenBox_SetTokensText( tb, "alpha;bravo;charlie;delta;echo;foxtrot;golf;hotel;india;juliet" )
+    dim as TKRECT rLast
+    tkTokenBox_GetChipRect( tb, 9, rLast )
+    tkTest_Check( "AutoHeight: chips wrap and the box grows to MaxLines; the input's line stays in view", (tb->ch > h1) _
+        andalso (ed->y + ed->ch <= tb->ch) andalso (rLast.top > 0), "h " & h1 & " -> " & tb->ch )
+
+    ' ---- disabled -----------------------------------------------------------------------------
+    ' the input fills the field right of the chips: it must wear the field's disabled colour too
+    dim as TKTOKENBOX_COLORS cd
+    tkTokenBox_GetColors( tb, @cd )
+    dim as long px = tb->x + ed->x + ed->cw - 3, py = tb->y + ed->y + ed->ch \ 2
+    tkTokenBox_SetEnabled( tb, false )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "disabled: the input area wears BackColorDisabled", _
+        (tkTest_PixelAt( h, px, py ) and &hFFFFFFul) = (cd.BackColorDisabled and &hFFFFFFul), hex( tkTest_PixelAt( h, px, py ) ) )
+    tkTokenBox_SetEnabled( tb, true )
+    tkHost_RenderTo( h, false )
+    tkTest_Check( "enabled again: the input area wears BackColor", _
+        (tkTest_PixelAt( h, px, py ) and &hFFFFFFul) = (cd.BackColor and &hFFFFFFul), hex( tkTest_PixelAt( h, px, py ) ) )
+
+    ' ---- theme --------------------------------------------------------------------------------
+    dim as TKTOKENBOX_COLORS c
+    tkTokenBox_GetColors( tb, @c )
+    c.ChipBack = &hFF102030ul
+    tkTokenBox_SetColors( tb, @c )
+    tkTokenBox_ApplyTheme( tb, tkTheme_Light() )
+    tkTokenBox_GetColors( tb, @c )
+    tkTest_Check( "SetColors pins against ApplyTheme", c.ChipBack = &hFF102030ul )
+
+    tkHost_Destroy( h )
+end sub
+
+if tkTest_Init() = false then end 99
+RunPass( 1.0 )
+RunPass( 1.75 )
+dim as long nFail = tkTest_Report( "tkTokenBox" )
+tkTest_Quit()
+end nFail

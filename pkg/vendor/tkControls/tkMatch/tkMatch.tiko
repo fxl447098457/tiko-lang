@@ -1,0 +1,624 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkMatch -- text matching for filter-as-you-type: tkAutoComplete's list, tkDataGrid's quick
+' filter, tkComboBox's editable mode (docs/tkControls/AUTOCOMPLETE.md section 4). No window, no SDL:
+' a console program can use it, and tkEdit's tkc/fuzzy is a shim over its fuzzy part.
+'
+' MODES (TKMATCH_*), each against a KEY (the text folded once, at add time) and the text itself:
+'   PREFIX       the text starts with the query
+'   WORDPREFIX   a word of the text starts with it ("smi" -> "John Smith", "rect" -> "GetWindowRect")
+'   CONTAINS     anywhere
+'   FUZZY        the query's characters in order, scored by fzy (https://github.com/jhawthorn/fzy)
+' An empty query matches everything.
+'
+' FOLDING is LCASE on a USTRING, per code unit: measured 2026-11-22 (seed tiko 0.1.6, Windows and
+' Linux) it folds Latin-1, Latin Extended-A, Greek and Cyrillic, and U+1E9E to U+00DF; the length is
+' unchanged, so a position in the key is a position in the text. LCASE on a narrow STRING folds
+' bytes only -- which is why everything here takes ustring.
+'
+' NARROWING: every mode is monotone -- a text that matches a query matches every query the first
+' extends (tkMatch_Extends) -- so a keystroke that adds characters filters the previous MATCHED set,
+' not the whole source.
+'
+' FUZZY is tkEdit's fzy port (tkedit/src/core/fuzzy, which matched tiko-editor-tiko's edc/fuzzy),
+' moved here (AUTOCOMPLETE.md D-3). The scores are the same numbers, computed in the same order;
+' a score needs two rows of the matrices, positions need them whole. Character bonuses are decided
+' by a code unit's low byte, as fzy's 256-entry tables were.
+#module "tkMatch"
+
+public enum
+    TKMATCH_PREFIX = 0
+    TKMATCH_WORDPREFIX
+    TKMATCH_CONTAINS
+    TKMATCH_FUZZY
+end enum
+
+' fzy's constants
+public const TKMATCH_GAP_LEADING = -0.005
+public const TKMATCH_GAP_TRAILING = -0.005
+public const TKMATCH_GAP_INNER = -0.01
+public const TKMATCH_MATCH_CONSECUTIVE = 1.0
+public const TKMATCH_MATCH_SLASH = 0.9
+public const TKMATCH_MATCH_WORD = 0.8
+public const TKMATCH_MATCH_CAPITAL = 0.7
+public const TKMATCH_MATCH_DOT = 0.6
+public const TKMATCH_SCORE_MAX = 9999999999
+public const TKMATCH_SCORE_MIN = -9999999999
+
+' One highlighted span of a text, in its characters (code units), 0-based.
+public type TKMATCH_RUN
+    first as long
+    count as long
+end type
+
+' A match of a filter: the item's index in the source and its rank (higher first).
+public type TKMATCH_HIT
+    index as long
+    score as double
+end type
+
+' A query, prepared once per keystroke.
+public type TKMATCH_QUERY
+    mode          as long = TKMATCH_PREFIX
+    text          as ustring             ' as typed
+    folded        as ustring             ' what keys are compared with
+    caseSensitive as boolean
+end type
+
+' The fuzzy matrices, kept between calls so a filter does not allocate per item. One per thread.
+public type TKMATCH_WORK
+    rowsD(any) as double
+    rowsM(any) as double
+    bonus(any) as double
+end type
+
+
+' ==========================================================================================
+' Folding, words, queries
+' ==========================================================================================
+' The comparison key of a text: LCASE, per code unit (see the header).
+public function tkMatch_Fold( byref s as const ustring ) as ustring
+    return lcase( s )
+end function
+
+private function IsAlnumUnit_( byval c as ulong ) as boolean
+    if (c >= 48) andalso (c <= 57) then return true
+    if (c >= 65) andalso (c <= 90) then return true
+    if (c >= 97) andalso (c <= 122) then return true
+    return c >= 128                      ' anything past ASCII counts as a letter
+end function
+
+' Does a word start at text[i]? At 0; after a character that is no letter or digit (space, - _ .
+' / ( ...); at a lower-to-upper step ("getWindow"); at a letter after a digit or a digit after a
+' letter ("x64Release" has words x, 64, Release).
+public function tkMatch_IsWordStart( byref text as const ustring, byval i as long ) as boolean
+    if i <= 0 then return true
+    if i >= len( text ) then return false
+    dim as ulong c = text[i], p = text[i - 1]
+    if IsAlnumUnit_( c ) = false then return false
+    if IsAlnumUnit_( p ) = false then return true
+    if (p >= 97) andalso (p <= 122) andalso (c >= 65) andalso (c <= 90) then return true
+    dim as boolean pd = (p >= 48) andalso (p <= 57), cd = (c >= 48) andalso (c <= 57)
+    return pd <> cd
+end function
+
+public sub tkMatch_Prepare( byref q as TKMATCH_QUERY, byval mode as long, byref text as const ustring, _
+                            byval caseSensitive as boolean = false )
+    q.mode = mode
+    q.text = text
+    q.caseSensitive = caseSensitive
+    q.folded = iif( caseSensitive, text, tkMatch_Fold( text ) )
+end sub
+
+' The key a text is compared by under q (its fold, or the text when case-sensitive).
+public function tkMatch_KeyOf( byref q as const TKMATCH_QUERY, byref text as const ustring ) as ustring
+    if q.caseSensitive then return text
+    return tkMatch_Fold( text )
+end function
+
+' Does s start with pre at position at?
+private function StartsAt_( byref s as const ustring, byval at as long, byref pre as const ustring ) as boolean
+    dim as long n = len( pre )
+    if at + n > len( s ) then return false
+    for i as long = 0 to n - 1
+        dim as ulong a = s[at + i], b = pre[i]
+        if a <> b then return false
+    next
+    return true
+end function
+
+' Is every unit of needle in hay, in order (fzy's has_match, on keys)?
+private function Subsequence_( byref needle as const ustring, byref hay as const ustring ) as boolean
+    dim as long n = len( needle ), hlen = len( hay ), j = 0
+    if n > hlen then return false
+    for i as long = 0 to n - 1
+        dim as ulong c = needle[i]
+        while j < hlen
+            dim as ulong h = hay[j]
+            j += 1
+            if h = c then continue for
+        wend
+        return false
+    next
+    return true
+end function
+
+' May the MATCHED set of prev be filtered for q, instead of the whole source? True when every text
+' that matches q also matches prev: same mode and case rule, and q's query refines prev's (prefix:
+' extends it; contains: holds it; fuzzy: holds it as a subsequence).
+public function tkMatch_Extends( byref q as const TKMATCH_QUERY, byref prev as const TKMATCH_QUERY ) as boolean
+    if (q.mode <> prev.mode) orelse (q.caseSensitive <> prev.caseSensitive) then return false
+    if len( prev.folded ) = 0 then return true
+    select case q.mode
+    case TKMATCH_PREFIX, TKMATCH_WORDPREFIX
+        return StartsAt_( q.folded, 0, prev.folded )
+    case TKMATCH_CONTAINS
+        return instr( q.folded, prev.folded ) > 0
+    case TKMATCH_FUZZY
+        return Subsequence_( prev.folded, q.folded )
+    end select
+    return false
+end function
+
+
+' ==========================================================================================
+' fzy
+' ==========================================================================================
+' fzy's bonus_states[ bonus_index[ch] ][ last_ch ], as code instead of two shared tables.
+private function Bonus_( byval lastCh as ulong, byval ch as ulong ) as double
+    lastCh and= 255
+    ch and= 255
+    dim as long row = 0
+    if (ch >= 65) andalso (ch <= 90) then
+        row = 2
+    elseif ((ch >= 97) andalso (ch <= 122)) orelse ((ch >= 48) andalso (ch <= 57)) then
+        row = 1
+    end if
+    if row = 0 then return 0
+    select case lastCh
+    case 47 : return TKMATCH_MATCH_SLASH                    ' /
+    case 45, 95, 32 : return TKMATCH_MATCH_WORD             ' - _ space
+    case 46 : return TKMATCH_MATCH_DOT                      ' .
+    case 97 to 122
+        if row = 2 then return TKMATCH_MATCH_CAPITAL        ' a lower letter before a capital
+    end select
+    return 0
+end function
+
+private function Max2_( byval a as double, byval b as double ) as double
+    if a > b then return a
+    return b
+end function
+
+private sub Need_( byref w as TKMATCH_WORK, byval nD as long, byval nB as long )
+    if ubound( w.rowsD ) < nD - 1 then
+        redim w.rowsD( 0 to nD - 1 )
+        redim w.rowsM( 0 to nD - 1 )
+    end if
+    if ubound( w.bonus ) < nB - 1 then redim w.bonus( 0 to nB - 1 )
+end sub
+
+' fzy's compute: ln / lh are the folded needle and haystack, hay the haystack as written (its case
+' decides the bonuses). bFull keeps every row (for positions, row i at i * hlen); else two rows
+' alternate. Returns false when the lengths alone settle it (score in result).
+private function Compute_( byref ln as const ustring, byref lh as const ustring, byref hay as const ustring, _
+                           byref w as TKMATCH_WORK, byval bFull as boolean, byref result as double ) as boolean
+    dim as long n = len( ln ), hlen = len( lh )
+    if (n = 0) orelse (n > hlen) then
+        result = TKMATCH_SCORE_MIN
+        return false
+    end if
+    if (n = hlen) andalso (ln = lh) then
+        result = TKMATCH_SCORE_MAX
+        return false
+    end if
+    Need_( w, iif( bFull, n, 2 ) * hlen, hlen )
+    dim as ulong lastCh = 47
+    for j as long = 0 to hlen - 1
+        dim as ulong ch = hay[j]
+        w.bonus(j) = Bonus_( lastCh, ch )
+        lastCh = ch
+    next
+    dim as long cur = 0, prv = 0
+    for i as long = 0 to n - 1
+        dim as double prevScore = TKMATCH_SCORE_MIN, prevM = TKMATCH_SCORE_MIN, prevD = TKMATCH_SCORE_MIN
+        dim as double gap = TKMATCH_GAP_INNER
+        if i = n - 1 then gap = TKMATCH_GAP_TRAILING
+        if bFull then
+            cur = i * hlen : prv = (i - 1) * hlen
+        else
+            cur = (i and 1) * hlen : prv = ((i + 1) and 1) * hlen
+        end if
+        dim as ulong ci = ln[i]
+        for j as long = 0 to hlen - 1
+            dim as ulong cj = lh[j]
+            if ci = cj then
+                dim as double score = TKMATCH_SCORE_MIN
+                if i = 0 then
+                    score = (j * TKMATCH_GAP_LEADING) + w.bonus(j)
+                elseif j > 0 then
+                    score = Max2_( prevM + w.bonus(j), prevD + TKMATCH_MATCH_CONSECUTIVE )
+                end if
+                if i > 0 then
+                    prevD = w.rowsD(prv + j)
+                    prevM = w.rowsM(prv + j)
+                end if
+                w.rowsD(cur + j) = score
+                prevScore = Max2_( score, prevScore + gap )
+                w.rowsM(cur + j) = prevScore
+            else
+                if i > 0 then
+                    prevD = w.rowsD(prv + j)
+                    prevM = w.rowsM(prv + j)
+                end if
+                w.rowsD(cur + j) = TKMATCH_SCORE_MIN
+                prevScore = prevScore + gap
+                w.rowsM(cur + j) = prevScore
+            end if
+        next
+    next
+    result = w.rowsM(cur + hlen - 1)
+    return true
+end function
+
+' Every character of needle in haystack, in order, ignoring case (fzy's has_match).
+public function tkMatch_FuzzyHas( byref needle as const ustring, byref haystack as const ustring ) as boolean
+    return Subsequence_( tkMatch_Fold( needle ), tkMatch_Fold( haystack ) )
+end function
+
+' fzy's score of needle in haystack (higher is better); TKMATCH_SCORE_MIN for an empty needle or one
+' longer than haystack, TKMATCH_SCORE_MAX for the same text in another case. Meaningful only where
+' tkMatch_FuzzyHas is true.
+public function tkMatch_FuzzyScore( byref needle as const ustring, byref haystack as const ustring, _
+                                    byval pWork as TKMATCH_WORK ptr = 0 ) as double
+    dim as TKMATCH_WORK local_
+    if pWork = 0 then pWork = @local_
+    dim as double result
+    Compute_( tkMatch_Fold( needle ), tkMatch_Fold( haystack ), haystack, *pWork, false, result )
+    return result
+end function
+
+' The same score from keys already folded (the filter's path: no fold per item).
+public function tkMatch_FuzzyScoreKey( byref foldedNeedle as const ustring, byref haystack as const ustring, _
+                                       byref fkey as const ustring, byref w as TKMATCH_WORK ) as double
+    dim as double result
+    Compute_( foldedNeedle, fkey, haystack, w, false, result )
+    return result
+end function
+
+' The score, and where in haystack (0-based) each character of needle matched: positions(0 to
+' len(needle)-1), or erased when the needle is empty or longer than haystack. Of several best
+' alignments, the one fzy's backtrace takes (the latest in haystack).
+public function tkMatch_FuzzyPositions( byref needle as const ustring, byref haystack as const ustring, _
+                                        positions() as long, byval pWork as TKMATCH_WORK ptr = 0 ) as double
+    dim as TKMATCH_WORK local_
+    if pWork = 0 then pWork = @local_
+    erase positions
+    dim as ustring ln = tkMatch_Fold( needle ), lh = tkMatch_Fold( haystack )
+    dim as long n = len( ln ), hlen = len( lh )
+    dim as double result
+    if Compute_( ln, lh, haystack, *pWork, true, result ) = false then
+        if result = TKMATCH_SCORE_MAX then
+            redim positions( 0 to n - 1 )
+            for i as long = 0 to n - 1
+                positions(i) = i
+            next
+        end if
+        return result
+    end if
+    redim positions( 0 to n - 1 )
+    dim as boolean matchRequired = false
+    dim as long j = hlen - 1
+    for i as long = n - 1 to 0 step -1
+        while j >= 0
+            dim as double d = pWork->rowsD(i * hlen + j), m = pWork->rowsM(i * hlen + j)
+            if (d <> TKMATCH_SCORE_MIN) andalso (matchRequired orelse (d = m)) then
+                ' a score made by MATCH_CONSECUTIVE needs the previous character matched
+                if (i > 0) andalso (j > 0) then
+                    matchRequired = (m = pWork->rowsD((i - 1) * hlen + j - 1) + TKMATCH_MATCH_CONSECUTIVE)
+                else
+                    matchRequired = false
+                end if
+                positions(i) = j
+                j -= 1
+                exit while
+            end if
+            j -= 1
+        wend
+    next
+    return result
+end function
+
+
+' ==========================================================================================
+' One text
+' ==========================================================================================
+' Where q matches in a key: the first position (0 for PREFIX), or -1. WORDPREFIX needs the text
+' itself for its word starts.
+private function FindAt_( byref q as const TKMATCH_QUERY, byref text as const ustring, byref fkey as const ustring ) as long
+    dim as long n = len( q.folded )
+    if n = 0 then return 0
+    select case q.mode
+    case TKMATCH_PREFIX
+        return iif( StartsAt_( fkey, 0, q.folded ), 0, -1 )
+    case TKMATCH_CONTAINS
+        return instr( fkey, q.folded ) - 1
+    case TKMATCH_WORDPREFIX
+        dim as ulong c0 = q.folded[0]
+        dim as long last_ = len( fkey ) - n
+        for i as long = 0 to last_
+            dim as ulong c = fkey[i]
+            if c = c0 then
+                if tkMatch_IsWordStart( text, i ) andalso StartsAt_( fkey, i, q.folded ) then return i
+            end if
+        next
+        return -1
+    case TKMATCH_FUZZY
+        return iif( Subsequence_( q.folded, fkey ), 0, -1 )
+    end select
+    return -1
+end function
+
+' Does text (whose key is fkey -- tkMatch_KeyOf) match q?
+public function tkMatch_Test( byref q as const TKMATCH_QUERY, byref text as const ustring, byref fkey as const ustring ) as boolean
+    return FindAt_( q, text, fkey ) >= 0
+end function
+
+' The rank of a match (higher first), TKMATCH_SCORE_MIN when there is none. FUZZY: fzy's score.
+' The others: 3 = the text starts with the query, 2 = a word does, 1 = elsewhere (CONTAINS).
+public function tkMatch_Score( byref q as const TKMATCH_QUERY, byref text as const ustring, byref fkey as const ustring, _
+                               byval pWork as TKMATCH_WORK ptr = 0 ) as double
+    dim as long at = FindAt_( q, text, fkey )
+    if at < 0 then return TKMATCH_SCORE_MIN
+    if q.mode = TKMATCH_FUZZY then
+        if len( q.folded ) = 0 then return 0
+        dim as TKMATCH_WORK local_
+        if pWork = 0 then pWork = @local_
+        return tkMatch_FuzzyScoreKey( q.folded, text, fkey, *pWork )
+    end if
+    if at = 0 then return 3
+    if tkMatch_IsWordStart( text, at ) then return 2
+    ' CONTAINS: a later occurrence may start a word ("ab" in "cab abc")
+    if q.mode = TKMATCH_CONTAINS then
+        dim as long k = at + 1
+        do
+            k = instr( k + 1, fkey, q.folded )
+            if k = 0 then exit do
+            if tkMatch_IsWordStart( text, k - 1 ) then return 2
+        loop
+    end if
+    return 1
+end function
+
+' The spans of text to highlight for q: runs(0 to count-1); returns the count (0 = no match, or an
+' empty query). FUZZY merges fzy's positions into runs.
+public function tkMatch_Runs( byref q as const TKMATCH_QUERY, byref text as const ustring, byref fkey as const ustring, _
+                              runs() as TKMATCH_RUN, byval pWork as TKMATCH_WORK ptr = 0 ) as long
+    erase runs
+    dim as long n = len( q.folded )
+    if n = 0 then return 0
+    if q.mode = TKMATCH_FUZZY then
+        if Subsequence_( q.folded, fkey ) = false then return 0
+        ' fzy aligns the folded texts; under a case-sensitive query the positions are still
+        ' characters that match, which is all a highlight needs
+        dim as long pos_()
+        tkMatch_FuzzyPositions( q.text, text, pos_(), pWork )
+        dim as long cnt = 0
+        for i as long = 0 to ubound( pos_ )
+            if (cnt > 0) andalso (runs(cnt - 1).first + runs(cnt - 1).count = pos_(i)) then
+                runs(cnt - 1).count += 1
+            else
+                redim preserve runs( 0 to cnt )
+                runs(cnt).first = pos_(i)
+                runs(cnt).count = 1
+                cnt += 1
+            end if
+        next
+        return cnt
+    end if
+    dim as long at = FindAt_( q, text, fkey )
+    if at < 0 then return 0
+    redim runs( 0 to 0 )
+    runs(0).first = at
+    runs(0).count = n
+    return 1
+end function
+
+
+' ==========================================================================================
+' A set
+' ==========================================================================================
+' a before b in a ranked list: higher score, then lower index (stable)
+private function Before_( byref a as const TKMATCH_HIT, byref b as const TKMATCH_HIT ) as boolean
+    if a.score <> b.score then return a.score > b.score
+    return a.index < b.index
+end function
+
+private sub SortHits_( hits() as TKMATCH_HIT, byval n as long )
+    if n < 2 then exit sub
+    dim as TKMATCH_HIT tmp( 0 to n - 1 )
+    dim as long width_ = 1
+    ' bottom-up merge sort, src <-> tmp
+    dim as boolean inTmp = false
+    while width_ < n
+        for lo as long = 0 to n - 1 step 2 * width_
+            dim as long mid_ = lo + width_, hi = lo + 2 * width_
+            if mid_ > n then mid_ = n
+            if hi > n then hi = n
+            dim as long i = lo, j = mid_, k = lo
+            while k < hi
+                dim as boolean takeLeft
+                if i >= mid_ then
+                    takeLeft = false
+                elseif j >= hi then
+                    takeLeft = true
+                elseif inTmp then
+                    takeLeft = Before_( tmp(j), tmp(i) ) = false
+                else
+                    takeLeft = Before_( hits(j), hits(i) ) = false
+                end if
+                if takeLeft then
+                    if inTmp then
+                        hits(k) = tmp(i)
+                    else
+                        tmp(k) = hits(i)
+                    end if
+                    i += 1
+                else
+                    if inTmp then
+                        hits(k) = tmp(j)
+                    else
+                        tmp(k) = hits(j)
+                    end if
+                    j += 1
+                end if
+                k += 1
+            wend
+        next
+        inTmp = not inTmp
+        width_ *= 2
+    wend
+    if inTmp then
+        for k as long = 0 to n - 1
+            hits(k) = tmp(k)
+        next
+    end if
+end sub
+
+' Keep the best maxN of hits(0 to n-1) in hits(0 to maxN-1): a min-heap of the kept ones, its root
+' the worst; then sorted.
+private sub TopK_( hits() as TKMATCH_HIT, byval n as long, byval maxN as long )
+    ' heapify hits(0 to maxN-1) with the WORST at the root
+    for s as long = maxN \ 2 - 1 to 0 step -1
+        dim as long p = s
+        do
+            dim as long c = 2 * p + 1
+            if c >= maxN then exit do
+            if (c + 1 < maxN) andalso Before_( hits(c), hits(c + 1) ) then c += 1
+            if Before_( hits(c), hits(p) ) then exit do
+            swap hits(p), hits(c)
+            p = c
+        loop
+    next
+    for i as long = maxN to n - 1
+        if Before_( hits(i), hits(0) ) then
+            hits(0) = hits(i)
+            dim as long p = 0
+            do
+                dim as long c = 2 * p + 1
+                if c >= maxN then exit do
+                if (c + 1 < maxN) andalso Before_( hits(c), hits(c + 1) ) then c += 1
+                if Before_( hits(c), hits(p) ) then exit do
+                swap hits(p), hits(c)
+                p = c
+            loop
+        end if
+    next
+    SortHits_( hits(), maxN )
+end sub
+
+' Filters a source of texts and their keys for q.
+'   cand(0 to nCand-1)  the indexes to look at, in source order; nCand < 0 = every index of texts()
+'                       below nItems (nItems < 0: every element of texts(), whose arrays may then
+'                       be larger than the count -- a capacity)
+'                       (pass the previous call's matched() when tkMatch_Extends allows it)
+'   matched()           OUT: every index that matched, in source order -- the next keystroke's cand
+'   hits()              OUT: the result rows: at most maxResults (0 = no cap). bRank (always for FUZZY):
+'                       by score, ties in source order; else source order.
+' Returns how many matched in all (> ubound( hits ) + 1 when capped).
+public function tkMatch_Filter( byref q as const TKMATCH_QUERY, texts() as ustring, keys() as ustring, _
+                                cand() as long, byval nCand as long, matched() as long, hits() as TKMATCH_HIT, _
+                                byval maxResults as long = 0, byval bRank as boolean = false, _
+                                byval pWork as TKMATCH_WORK ptr = 0, byval nItems as long = -1 ) as long
+    dim as TKMATCH_WORK local_
+    if pWork = 0 then pWork = @local_
+    if q.mode = TKMATCH_FUZZY then bRank = true
+    dim as long nAll = nCand
+    if nCand < 0 then nAll = iif( nItems >= 0, nItems, ubound( texts ) + 1 )
+    redim matched( 0 to iif( nAll > 0, nAll - 1, 0 ) )
+    redim hits( 0 to iif( nAll > 0, nAll - 1, 0 ) )
+    dim as long nm = 0
+    dim as boolean bEmpty = len( q.folded ) = 0
+    for k as long = 0 to nAll - 1
+        dim as long idx = iif( nCand < 0, k, cand(k) )
+        dim as long at = 0
+        if bEmpty = false then at = FindAt_( q, texts(idx), keys(idx) )
+        if at >= 0 then
+            matched(nm) = idx
+            hits(nm).index = idx
+            if bRank then
+                if bEmpty then
+                    hits(nm).score = 0
+                else
+                    hits(nm).score = tkMatch_Score( q, texts(idx), keys(idx), pWork )
+                end if
+            else
+                hits(nm).score = 0
+            end if
+            nm += 1
+        end if
+    next
+    if nm = 0 then
+        erase matched
+        erase hits
+        return 0
+    end if
+    redim preserve matched( 0 to nm - 1 )
+    dim as long keep = nm
+    if (maxResults > 0) andalso (maxResults < nm) then keep = maxResults
+    if bRank then
+        if keep < nm then
+            TopK_( hits(), nm, keep )
+        else
+            SortHits_( hits(), nm )
+        end if
+    end if
+    redim preserve hits( 0 to keep - 1 )
+    return nm
+end function
+
+' Keys sorted ascending by code unit (tkMatch_Compare) and a PREFIX query: the matching keys are
+' keys(first to last), found by two binary searches (Qt's modelSorting). Returns the count.
+public function tkMatch_Compare( byref a as const ustring, byref b as const ustring ) as long
+    dim as long na = len( a ), nb = len( b ), n = iif( na < nb, na, nb )
+    for i as long = 0 to n - 1
+        dim as ulong ca = a[i], cb = b[i]
+        if ca <> cb then return iif( ca < cb, -1, 1 )
+    next
+    if na = nb then return 0
+    return iif( na < nb, -1, 1 )
+end function
+
+public function tkMatch_PrefixRange( byref foldedQuery as const ustring, keys() as ustring, _
+                                     byref first as long, byref last as long ) as long
+    dim as long lo = lbound( keys ), hi = ubound( keys ) + 1
+    first = 0 : last = -1
+    if hi <= lo then return 0
+    ' first key >= query
+    dim as long a = lo, b = hi
+    while a < b
+        dim as long m = (a + b) \ 2
+        if tkMatch_Compare( keys(m), foldedQuery ) < 0 then
+            a = m + 1
+        else
+            b = m
+        end if
+    wend
+    first = a
+    ' first key past the prefix block
+    b = hi
+    while a < b
+        dim as long m = (a + b) \ 2
+        if StartsAt_( keys(m), 0, foldedQuery ) then
+            a = m + 1
+        else
+            b = m
+        end if
+    wend
+    last = a - 1
+    return last - first + 1
+end function

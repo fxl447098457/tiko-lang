@@ -19,12 +19,6 @@ a program and runs it:
 tiko test
 ```
 
-```admonish warning title="Status in this version"
-`tiko test`, `test` blocks and std/testing arrive after tiko 0.1.6, the toolchain this book is pinned
-to. The listings in this section were compiled and run with the development toolchain; the book's
-harness reports them as blocked (`pin-0.1.6`) until the pin moves to a release that has them.
-```
-
 ### A test, and what it checks
 
 Here is a small project: a stack of `int32` in a module, and the tests that pin its behaviour down.
@@ -368,12 +362,6 @@ freed and then used: the pointer still holds a real address, and the program rea
 there now. **AddressSanitizer** can. Build with **`-fsanitize=address`** and every procedure checks
 each memory access against a map of what the program may touch, and freed blocks are held back
 from reuse, so a stale pointer lands on poisoned memory instead of someone else's data.
-
-```admonish warning title="Status in this version"
-`-fsanitize=address` arrives after tiko 0.1.6, the toolchain this book is pinned to. The listing in
-this section was compiled and run with the development toolchain; the book's harness reports it as
-blocked (`pin-0.1.6`) until the pin moves to a release that has it.
-```
 
 ```tiko
 {{#include ../examples/ch19/freed.tiko}}

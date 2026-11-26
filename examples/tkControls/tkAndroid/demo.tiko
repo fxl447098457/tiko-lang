@@ -1,0 +1,209 @@
+' tkAndroid demo: a touch-first task list, the A5 exit demo (docs/tiko-android A5 step 8). It runs on
+' the desktop as it is, and on Android as an app:
+'
+'   tiko -target android-x86_64 -app demo.tiko -appid org.tiko.tasks -applabel Tasks
+'
+' What it exercises there, all through tkHost, with no Android code of its own:
+'   the list scrolls with a swipe (the gesture layer), a tap selects a row
+'   the text box raises the soft keyboard, which pans to show the box
+'   a long press on the list opens its context menu (Edit, Delete) as a virtual popup
+'   Edit opens a second form -- a page over the whole window; BACK or Save closes it
+'   Delete asks first in a message box (a virtual dialog); BACK cancels it
+'   rotation lays everything out again (OnSize); BACK at the root ends the program
+' Sizes are design units, which on Android are dp: 48 is Material's touch target.
+#import "vendor/tkControls/tkListTree"
+#import "vendor/tkControls/tkTextBox"
+#import "vendor/tkControls/tkButton"
+#import "vendor/tkControls/tkContextMenu"
+#import "vendor/tkControls/tkMessageBox"
+using tkListTree
+using tkTextBox
+using tkButton
+using tkContextMenu
+using tkPopupMenu
+using tkMessageBox
+using tkTheme
+using tkHost
+using tkPaint
+
+const as long IDC_LIST = 100, IDC_ENTRY = 101, IDC_ADD = 102, IDC_MENU = 103
+const as long IDM_EDIT = 1, IDM_DELETE = 2
+const as long GAP = 12, TOUCH = 48, TITLE = 56
+
+dim shared as TK_HOST ptr gHost
+dim shared as TK_WIDGET ptr gList, gEntry, gAdd, gMenu
+dim shared as TTF_Font ptr gFont, gTitle, gGlyph
+
+private function S( byval h as TK_HOST ptr, byval v as long ) as long
+    return tkHost_Scale( h, v )
+end function
+
+' "x,y w h" of a widget in its window's coordinates: what probes/a5/taskscheck.sh taps.
+private function Where( byval w as TK_WIDGET ptr ) as string
+    dim as TKRECT a
+    tkWidget_AbsRect( w, a )
+    dim as long ox, oy
+    tkHost_Origin( w->pHost, ox, oy )
+    return (a.left + ox) & "," & (a.top + oy) & " " & (a.right - a.left) & " " & (a.bottom - a.top)
+end function
+
+sub OnSel( byval hList as TK_WIDGET ptr, byval row as integer )
+    print "tasks: selected " & row & " [" & tkListTree_GetText( hList, row ) & "]"
+end sub
+
+' The list's rows, drawn the stock way (tkListTree is owner-drawn: rows come from this callback).
+sub PaintRow( byval p as TKLISTTREE_PAINTINFO ptr )
+    tkListTree_PaintRowDefault( p )
+end sub
+
+sub Form_Paint( byval h as TK_HOST ptr, byval b as TK_PAINT ptr )
+    dim as TKRECT rc
+    tkRect_Set( rc, S( h, GAP ), 0, S( h, 400 ), S( h, TITLE ) )
+    b->SetColors( tkTheme_Get().TextHot, h->clrBack )
+    b->SetFont( gTitle )
+    b->PaintText( "Tasks  (" & tkListTree_GetCount( gList ) & ")", @rc, TK_DT_LEFT )
+end sub
+
+' Laid out from the surface's size, so a rotation (or a desktop resize) re-flows it.
+sub Form_Size( byval h as TK_HOST ptr )
+    dim as long pw, ph
+    tkHost_PixelSize( h, pw, ph )
+    dim as long g = S( h, GAP ), r = S( h, TOUCH ), bw = S( h, 96 )
+    tkWidget_SetPos( gEntry, g, S( h, TITLE ), pw - 3 * g - bw, r )
+    tkWidget_SetPos( gAdd, pw - g - bw, S( h, TITLE ), bw, r )
+    dim as long top = S( h, TITLE ) + r + g
+    tkWidget_SetPos( gList, g, top, pw - 2 * g, ph - top - g )
+    tkHost_Invalidate( h )
+    print "tasks: layout " & pw & "x" & ph & ", list at " & Where( gList )
+end sub
+
+sub OnAdd( byval hButton as TK_WIDGET ptr, byval id as long )
+    dim as ustring t = trim( tkTextBox_GetText( gEntry ) )
+    if len( t ) = 0 then exit sub
+    tkListTree_SetCurSel( gList, tkListTree_AddString( gList, t ) )
+    tkTextBox_SetText( gEntry, "" )
+    print "tasks: added [" & t & "], " & tkListTree_GetCount( gList ) & " now"
+    tkHost_Invalidate( gHost )
+end sub
+
+' ---- the edit page: a second form, which on Android is a page over the whole window ----------
+dim shared as TK_HOST ptr gPage
+dim shared as TK_WIDGET ptr gPageBox
+dim shared as long gPageRow
+
+function Page_Close( byval h as TK_HOST ptr ) as boolean
+    tkHost_EndModal( h, 0 )             ' BACK, or the window's close: leave without saving
+    return true
+end function
+
+sub Page_Save( byval hButton as TK_WIDGET ptr, byval id as long )
+    tkListTree_SetText( gList, gPageRow, tkTextBox_GetText( gPageBox ) )
+    print "tasks: row " & gPageRow & " is now [" & tkTextBox_GetText( gPageBox ) & "]"
+    tkHost_EndModal( gPage, 1 )
+end sub
+
+sub Page_Size( byval h as TK_HOST ptr )
+    dim as long pw, ph
+    tkHost_PixelSize( h, pw, ph )
+    dim as long g = S( h, GAP ), r = S( h, TOUCH )
+    tkWidget_SetPos( gPageBox, g, S( h, TITLE ), pw - 2 * g, r )
+    dim as TK_WIDGET ptr sv = tkHost_Root( h )->pLast
+    tkWidget_SetPos( sv, pw - g - S( h, 120 ), S( h, TITLE ) + r + g, S( h, 120 ), r )
+end sub
+
+sub Page_Paint( byval h as TK_HOST ptr, byval b as TK_PAINT ptr )
+    dim as TKRECT rc
+    tkRect_Set( rc, S( h, GAP ), 0, S( h, 400 ), S( h, TITLE ) )
+    b->SetColors( tkTheme_Get().TextHot, h->clrBack )
+    b->SetFont( gTitle )
+    b->PaintText( "Edit task", @rc, TK_DT_LEFT )
+end sub
+
+sub EditRow( byval row as long )
+    gPageRow = row
+    gPage = tkHost_Create( "Edit task", 360, 640, tkHost_FontDir() & TK_FONT_UI )
+    if gPage = 0 then exit sub
+    gPage->clrBack = tkTheme_Get().Window
+    gPage->OnCloseRequest = @Page_Close
+    gPage->OnSize = @Page_Size
+    gPage->OnPaint = @Page_Paint
+    gPageBox = tkTextBox_Create( tkHost_Root( gPage ), 1 )
+    tkTextBox_SetFont( gPageBox, gFont )
+    tkTextBox_SetText( gPageBox, tkListTree_GetText( gList, row ) )
+    dim as TK_WIDGET ptr sv = tkButton_Create( tkHost_Root( gPage ), 2 )
+    tkButton_SetText( sv, "Save" )
+    tkButton_SetFont( sv, gFont )
+    tkButton_SetClickCallback( sv, @Page_Save )
+    Page_Size( gPage )
+    tkHost_SetFocus( gPage, gPageBox )
+    print "tasks: edit page, save at " & Where( sv )
+    print "tasks: editing row " & row & ", saved=" & tkHost_RunModal( gPage )
+    tkHost_Destroy( gPage )
+    gPage = 0
+    tkHost_Invalidate( gHost )
+end sub
+
+sub OnMenu( byval hCtx as TK_WIDGET ptr, byval id as long )
+    dim as long row = tkListTree_GetCurSel( gList )
+    if row < 0 then exit sub
+    select case id
+    case IDM_EDIT
+        EditRow( row )
+    case IDM_DELETE
+        ' tkMessageBox_Show's box with the bundled icon font, so its glyphs are icons
+        dim as TK_WIDGET ptr box = tkMessageBox_Create( tkHost_Root( gHost ) )
+        tkMessageBox_SetCaption( box, "Tasks" )
+        tkMessageBox_SetText( box, "Delete """ & tkListTree_GetText( gList, row ) & """?" )
+        tkMessageBox_SetIconKind( box, MBX_ICON_WARNING )
+        tkMessageBox_SetFont( box, gFont )
+        tkMessageBox_SetGlyphFont( box, gGlyph )
+        tkMessageBox_AddPreset( box, MBX_BTN_YESNO )
+        dim as long r = tkMessageBox_DoModal( box )
+        print "tasks: delete row " & row & "? answer " & r
+        if r = MBX_IDYES then tkListTree_DeleteString( gList, row )
+        tkHost_Invalidate( gHost )
+    end select
+end sub
+
+' ---- start ----------------------------------------------------------------------------------
+if SDL_Init( SDL_INIT_VIDEO ) = false then print "SDL_Init: " & *SDL_GetError() : end 1
+if TTF_Init() = false then print "TTF_Init: " & *SDL_GetError() : end 1
+gHost = tkHost_Create( "Tasks", 360, 640, tkHost_FontDir() & TK_FONT_UI )
+if gHost = 0 then print "tasks: no window: " & *SDL_GetError() : end 1
+gHost->clrBack = tkTheme_Get().Window
+gFont = tkHost_OpenFont( gHost, tkHost_FontDir() & TK_FONT_UI, 14 )
+gTitle = tkHost_OpenFont( gHost, tkHost_FontDir() & TK_FONT_UI_BOLD, 18 )
+gGlyph = tkHost_OpenFont( gHost, tkHost_FontDir() & TK_FONT_ICONS, 20 )
+
+gEntry = tkTextBox_Create( tkHost_Root( gHost ), IDC_ENTRY )
+tkTextBox_SetFont( gEntry, gFont )
+gAdd = tkButton_Create( tkHost_Root( gHost ), IDC_ADD )
+tkButton_SetText( gAdd, "Add" )
+tkButton_SetFont( gAdd, gFont )
+tkButton_SetClickCallback( gAdd, @OnAdd )
+gList = tkListTree_Create( tkHost_Root( gHost ), IDC_LIST )
+tkListTree_SetFont( gList, gFont )
+tkListTree_SetBorderWidth( gList, 1 )
+tkListTree_SetRowHeight( gList, TOUCH )           ' a touch-sized row, not the font's height
+tkListTree_SetPaintCallback( gList, @PaintRow )
+tkListTree_SetSelChangeCallback( gList, @OnSel )
+tkListTree_BeginUpdate( gList )
+for i as long = 1 to 60
+    tkListTree_AddString( gList, "Task number " & i )
+next
+tkListTree_EndUpdate( gList )
+
+gMenu = tkContextMenu_Create( tkHost_Root( gHost ), IDC_MENU )
+tkPopupMenu_AddItem( tkContextMenu_GetMenu( gMenu ), IDM_EDIT, "Edit" )
+tkPopupMenu_AddItem( tkContextMenu_GetMenu( gMenu ), IDM_DELETE, "Delete" )
+tkContextMenu_SetCommandCallback( gMenu, @OnMenu )
+tkContextMenu_Attach( gMenu, gList )
+
+gHost->OnPaint = @Form_Paint
+gHost->OnSize = @Form_Size
+Form_Size( gHost )
+tkHost_Show( gHost )
+print "tasks: ready, " & tkListTree_GetCount( gList ) & " tasks, list at " & Where( gList ) & ", entry at " & Where( gEntry ) & ", add at " & Where( gAdd )
+tkHost_Run( gHost )
+print "tasks: bye"
+tkHost_Destroy( gHost )

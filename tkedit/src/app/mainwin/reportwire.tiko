@@ -1,0 +1,346 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' reportwire -- a .tkreport on the Report Designer's canvas (Report Designer RD5): which commands act
+' on it, what they do, and its generated module written on save and before a build (RD4's codegen).
+' The canvas has no palettes yet (RD6): the toolbox, field list and inspector are not shown for it.
+#module "mainwin"
+
+#import "std/containers"
+#import "std/fs"
+#import "std/strings"
+#import "tkc/i18n"
+#import "tkc/cmdids"
+#import "tka/documents"
+#import "tkd/rcanvas"
+#import "tkd/redits"
+#import "tkd/rcodegen"
+#import "tkd/rmodel"
+#import "tkd/rrecords"
+#import "tkd/rdialogs"
+#import "tkd/codegen"
+#import "vendor/tkControls/tkReportDef"
+#import "vendor/tkControls/tkHost"
+#import "vendor/tkControls/tkApp"
+#import "vendor/tkControls/tkPrintDialog"
+#import "vendor/tkControls/tkFileDialog"
+#import "vendor/tkControls/tkReportViewer"
+#import "vendor/tkControls/tkPrint"
+using containers
+using tkReportDef
+using tkHost
+using cmdids
+using tkApp
+using tkPrint
+using tkPrintDialog
+using tkFileDialog
+using tkReport
+
+private function ReportDesignPathOf_( byref reportPath as const ustring ) as ustring
+    return left( reportPath, len( reportPath ) - 9 ) & ".design.tiko"
+end function
+
+' With a report on its canvas: the edit commands it has, the Design menu's arrange commands, and
+' what does not act on the hidden text.
+function Window.ReportActs( byval id as Cmd ) as boolean
+    ' the Preview: only the toggle back and what acts on no buffer's text
+    dim as DocRef d = this.Active( )
+    if (d <> 0) andalso (d->Report <> 0) andalso d->Report->Previewing then
+        if id = Cmd.FormToggleView then return true
+        select case Keys.Commands( ).Info( id ).Group
+        case MenuGroup.Edit, MenuGroup.Search, MenuGroup.Design : return false
+        end select
+        return true
+    end if
+    select case id
+    case Cmd.Undo, Cmd.Redo, Cmd.Cut, Cmd.Copy, Cmd.Paste, Cmd.SelectAll, _
+         Cmd.SearchSymbol, Cmd.FindInProject, Cmd.GoBack, Cmd.GoForward
+        return true
+    case Cmd.ZoomIn, Cmd.ZoomOut, Cmd.ZoomReset, Cmd.FoldToggle, Cmd.FoldBelow, Cmd.FoldAll
+        return false
+    case Cmd.FormAlignLefts, Cmd.FormAlignCenters, Cmd.FormAlignRights, Cmd.FormAlignTops, Cmd.FormAlignMiddles, _
+         Cmd.FormAlignBottoms, Cmd.FormSameWidth, Cmd.FormSameHeight, Cmd.FormSameSize, Cmd.FormBringToFront, _
+         Cmd.FormSendToBack, Cmd.FormHSpaceEqual, Cmd.FormVSpaceEqual, Cmd.FormSnapToGrid, _
+         Cmd.FormNewForm, Cmd.FormNewReport, Cmd.FormTheme, Cmd.FormResources, Cmd.FormLanguages, Cmd.FormToggleView, _
+         Cmd.FormFloatToolbox, Cmd.FormFloatProperties, Cmd.FormTest
+        return true
+    end select
+    select case Keys.Commands( ).Info( id ).Group
+    case MenuGroup.Edit, MenuGroup.Search, MenuGroup.Design : return false
+    end select
+    return true
+end function
+
+function Window.ReportCommand( byval id as Cmd ) as boolean
+    dim as DocRef d = this.Active( )
+    dim as rcanvas.ReportCanvas ptr c = d->Report
+    select case id
+    case Cmd.Undo
+        if d->Main.CanUndo( ) then
+            d->Main.Undo( )
+            c->LoadText( d->Text( ) )
+        end if
+    case Cmd.Redo
+        if d->Main.CanRedo( ) then
+            d->Main.Redo( )
+            c->LoadText( d->Text( ) )
+        end if
+    case Cmd.Cut : c->Cut( )
+    case Cmd.Copy : c->Copy( )
+    case Cmd.Paste : c->Paste( )
+    case Cmd.SelectAll : c->SelectAll( )
+    case Cmd.FormAlignLefts : c->Align( redits.RAlign.RAlignLefts )
+    case Cmd.FormAlignCenters : c->Align( redits.RAlign.RAlignCenters )
+    case Cmd.FormAlignRights : c->Align( redits.RAlign.RAlignRights )
+    case Cmd.FormAlignTops : c->Align( redits.RAlign.RAlignTops )
+    case Cmd.FormAlignMiddles : c->Align( redits.RAlign.RAlignMiddles )
+    case Cmd.FormAlignBottoms : c->Align( redits.RAlign.RAlignBottoms )
+    case Cmd.FormSameWidth : c->Align( redits.RAlign.RSameWidth )
+    case Cmd.FormSameHeight : c->Align( redits.RAlign.RSameHeight )
+    case Cmd.FormSameSize : c->Align( redits.RAlign.RSameSize )
+    case Cmd.FormBringToFront : c->ToFront( )
+    case Cmd.FormSendToBack : c->ToBack( )
+    case Cmd.FormHSpaceEqual : c->Space( false )
+    case Cmd.FormVSpaceEqual : c->Space( true )
+    case Cmd.FormSnapToGrid
+        c->SnapToGrid = (c->SnapToGrid = false)
+        tkWidget_Invalidate( c->Frame )
+    case Cmd.FormTest : this.TestReport( )                       ' Test Report: its Preview in a window
+    case Cmd.FormFloatToolbox : RPalettes.ToggleFloat( 0 )      ' the toolbox and fields palette
+    case Cmd.FormFloatProperties : RPalettes.ToggleFloat( 1 )   ' the object tree and properties palette
+    case Cmd.FormToggleView
+        ' Design / Preview (RD8)
+        c->ReportPath = d->Path
+        dim as ustring errs = c->SetPreview( c->Previewing = false )
+        this.Layout( )
+        if c->Previewing then
+            tkHost_SetFocus( c->Viewer->pHost, c->Viewer )
+        else
+            tkHost_SetFocus( c->Glass->pHost, c->Glass )
+        end if
+        if len( errs ) then this.SetMessage( fs.PathFileName( d->Path ) & ": " & errs )
+    case else
+        return false
+    end select
+    this.ShowTitle( )
+    this.ShowStatus( )
+    return true
+end function
+
+' rptX.design.tiko from the report on the canvas, when it differs from the file (RD4's generator).
+function Window.WriteReportGenerated( byval d as DocRef ) as boolean
+    if (d = 0) orelse (d->Report = 0) orelse (len( d->Path ) = 0) then return true
+    dim as ustring moduleName = fs.PathStem( d->Path )
+    dim as Array( of ustring ) problems
+    rcodegen.Check( d->Report->Def, moduleName, problems )
+    if problems.Count( ) then
+        this.SetMessage( fs.PathFileName( d->Path ) & ": " & problems[0] )
+        return false
+    end if
+    dim as ustring generated = rcodegen.Generate( d->Report->Def, moduleName, fs.PathFileName( d->Path ), d->Text( ) )
+    dim as ustring target = ReportDesignPathOf_( d->Path ), none
+    if fs.IsFile( target ) then
+        if codegen.WithoutCr( fs.ReadAllText( target ).ValueOr( none ) ) = generated then return true
+    end if
+    if fs.WriteAtomic( target, generated ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( target ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    return true
+end function
+
+' A dialog's title: its toolbox row's words without the dots.
+private function DialogTitle_( byref s as const ustring ) as ustring
+    dim as ustring t = s
+    while (right( t, 1 ) = ".") orelse (right( t, 1 ) = wchr( &h2026 ))
+        t = left( t, len( t ) - 1 )
+    wend
+    return trim( t )
+end function
+
+' A Report Designer dialog over the active report (RD7). Each OK is ONE undoable edit: a list
+' dialog's copy is adopted whole, the expression editor's text applied as its row's edit, Page setup's
+' answer as the report's page. What is refused says why in the status bar.
+sub Window.ReportDialog( byref which as const ustring, byref target as const ustring, byref key_ as const ustring )
+    dim as DocRef d = this.Active( )
+    if (d = 0) orelse (d->Report = 0) then exit sub
+    dim as rcanvas.ReportCanvas ptr c = d->Report
+    dim as ustring fault
+    select case which
+    case "sources", "params", "calcs", "groups", "rules"
+        dim as rrecords.RSet k
+        dim as ustring title, item_
+        select case which
+        case "sources"
+            k = rrecords.RSet.RSetSources
+            title = DialogTitle_( i18n.Tr( "report.dlg_sources", "Data sources..." ) )
+        case "params"
+            k = rrecords.RSet.RSetParams
+            title = DialogTitle_( i18n.Tr( "report.dlg_params", "Parameters..." ) )
+        case "calcs"
+            k = rrecords.RSet.RSetCalcs
+            title = DialogTitle_( i18n.Tr( "report.dlg_calcs", "Calculated fields..." ) )
+        case "groups"
+            k = rrecords.RSet.RSetGroups
+            title = DialogTitle_( i18n.Tr( "report.dlg_groups", "Group and sort..." ) )
+        case else
+            k = rrecords.RSet.RSetRules
+            title = i18n.Tr( "report.rules", "Conditional styles" )
+            item_ = mid( target, 6 )
+        end select
+        RptRecDlg = new rdialogs.RecordDialog
+        RptRecDlg->Open( form, title, c->Def, k, item_ )
+        if RptRecDlg->Win then
+            dim as boolean ok = RptRecDlg->RunModal( )
+            dim as TK_REPORTDEF ptr nd = RptRecDlg->TakeWork( )
+            if ok andalso (nd <> 0) then fault = c->AdoptDef( nd )
+        end if
+        RptRecDlg->Close( )
+        delete RptRecDlg
+        RptRecDlg = 0
+    case "expr"
+        dim as ustring band
+        if left( target, 5 ) = "item:" then
+            dim as int32 ii = tkReportDef_FindItem( c->Def, mid( target, 6 ) )
+            if ii >= 0 then band = c->Def->items(ii).band
+        else
+            band = mid( target, 6 )
+        end if
+        dim as boolean noAgg
+        rmodel.IsExprKey( target, key_, noAgg )
+        RptExprDlg = new rdialogs.ExprDialog
+        RptExprDlg->Open( form, c->Def, band, noAgg, rmodel.GetProp( c->Def, target, key_ ) )
+        if RptExprDlg->Win then
+            dim as boolean ok = RptExprDlg->RunModal( )
+            if ok then fault = c->ApplyProp( target, key_, RptExprDlg->Text )
+        end if
+        RptExprDlg->Close( )
+        delete RptExprDlg
+        RptExprDlg = 0
+    case "page"
+        dim as TKPAGESETUP ps
+        tkReportDef_PageSetup( c->Def, ps )
+        RptPageDlg = tkPageSetupDialog_Create( tkForm_Host( form ), ps )
+        if RptPageDlg then
+            dim as boolean ok = tkPageSetupDialog_Run( RptPageDlg, ps )
+            RptPageDlg = 0
+            if ok then fault = c->ApplyPageSetup( ps )
+        end if
+    end select
+    if len( fault ) then this.SetMessage( fault )
+    this.ShowTitle( )
+    this.ShowStatus( )
+end sub
+
+' New Report: where (a folder of its own, as a form has), then the wizard; the report opens on its
+' canvas (RD8).
+function Window.NewReport( byref wanted as const ustring ) as boolean
+    dim as ustring picked = wanted
+    if len( picked ) = 0 then
+        dim as ustring where = "rptNew.tkreport"
+        if len( this.ActivePath( ) ) then where = fs.PathJoin( fs.PathParent( this.ActivePath( ) ), "rptNew.tkreport" )
+        picked = Pick( form, TKFD_SAVE, where )
+        if len( picked ) = 0 then return false
+    end if
+    dim as ustring name_ = fs.PathStem( picked )
+    dim as boolean ok = len( name_ ) > 0
+    for i as long = 1 to len( name_ )
+        dim as long ch = asc( mid( name_, i, 1 ) )
+        if ((ch >= 65) andalso (ch <= 90)) orelse ((ch >= 97) andalso (ch <= 122)) orelse (ch = 95) orelse ((i > 1) andalso (ch >= 48) andalso (ch <= 57)) then continue for
+        ok = false
+    next
+    if ok = false then
+        this.SetMessage( strings.Format( i18n.Tr( "message.bad_form_name", "{}: a form's name has to be an identifier" ), name_ ) )
+        return false
+    end if
+    dim as ustring folder = fs.PathParent( picked )
+    if lcase( fs.PathFileName( folder ) ) <> lcase( name_ ) then folder = fs.PathJoin( folder, name_ )
+    dim as ustring path = fs.PathJoin( folder, name_ & ".tkreport" )
+    if fs.IsFile( path ) then
+        this.SetMessage( strings.Format( i18n.Tr( "message.form_exists", "{} already exists" ), name_ ) )
+        return false
+    end if
+    RptWizDlg = new rdialogs.WizardDialog
+    RptWizDlg->Open( form, DialogTitle_( i18n.Tr( "commands.FormNewReport", "New Report..." ) ), name_ )
+    dim as boolean accepted = false
+    dim as ustring text
+    if RptWizDlg->Win then
+        accepted = RptWizDlg->RunModal( )
+        text = RptWizDlg->Text
+    end if
+    RptWizDlg->Close( )
+    delete RptWizDlg
+    RptWizDlg = 0
+    if accepted = false then return false
+    fs.CreateDirAll( folder )
+    if fs.WriteAllText( path, text ).IsOk( ) = false then
+        this.SetMessage( fs.PathFileName( path ) & ": " & i18n.Tr( "message.cannot_create", "can't be created" ) )
+        return false
+    end if
+    return this.OpenFile( path )
+end function
+
+' ---- Test Report (Alt+F5 on a report; author 2026-11-25) -----------------------------------------
+' The report's Preview in a window of its own, beside the designer: a second canvas, given the
+' report as it stands (unsaved edits too) and put straight into its Preview -- the same design data
+' (live SQLite, else the sample rows), the same parameter strip. Esc or its close button closes it;
+' Alt+F5 again makes it anew from the report as it is then.
+sub Window.TestReport( )
+    dim as DocRef d = this.Active( )
+    if (d = 0) orelse (d->Report = 0) then exit sub
+    this.CloseTestReport( )
+    dim as TK_HOST ptr mh = tkForm_Host( form )
+    TestRptForm = tkApp_NewForm( fs.PathFileName( d->Path ), 820, 720, form, mh->fScaleForced )
+    if TestRptForm = 0 then exit sub
+    TestRptForm->Tag = @this
+    TestRpt = new rcanvas.ReportCanvas
+    TestRpt->Create( tkForm_Widget( TestRptForm ), 1 )
+    dim as TK_WIDGET ptr r = tkForm_Widget( TestRptForm )
+    tkWidget_SetPos( TestRpt->Frame, 0, 0, r->cw, r->ch )
+    TestRpt->ReportPath = d->Path
+    TestRpt->LoadText( d->Text( ) )
+    dim as ustring errs = TestRpt->SetPreview( true )
+    tkForm_OnSize( TestRptForm, sub( byval f as TK_FORM ptr, byval cx as long, byval cy as long )
+        dim as Window ptr mw = f->Tag
+        if (mw->TestRpt <> 0) andalso (mw->TestRpt->Frame <> 0) then tkWidget_SetPos( mw->TestRpt->Frame, 0, 0, cx, cy )
+    end sub )
+    tkForm_OnClose( TestRptForm, function( byval f as TK_FORM ptr ) as boolean
+        cast( Window ptr, f->Tag )->TestReportTeardown( )   ' while its window still stands
+        return true
+    end function )
+    tkForm_OnDestroy( TestRptForm, sub( byval f as TK_FORM ptr )
+        cast( Window ptr, f->Tag )->TestReportGone( )
+    end sub )
+    tkForm_Host( TestRptForm )->OnPreKey = function( byval h as TK_HOST ptr, byval m as TK_MSG ptr ) as boolean
+        if m->key <> SDLK_ESCAPE then return false
+        tkForm_Close( tkForm_FromHost( h ) )
+        return true
+    end function
+    tkForm_Show( TestRptForm )
+    if len( errs ) then this.SetMessage( fs.PathFileName( d->Path ) & ": " & errs )
+end sub
+
+' The canvas and its Preview (the report copy, the design data) taken down, its window still there.
+sub Window.TestReportTeardown( )
+    if TestRpt = 0 then exit sub
+    TestRpt->Destroy( )
+    delete TestRpt
+    TestRpt = 0
+end sub
+
+sub Window.CloseTestReport( )
+    this.TestReportTeardown( )
+    if TestRptForm then tkForm_Destroy( TestRptForm )   ' TestReportGone from its OnDestroy
+    TestRptForm = 0
+end sub
+
+' Its window is gone. Closed the usual ways the canvas went first; else its widgets went with the
+' window, and the canvas (whose Destroy would reach them) is let go as it is.
+sub Window.TestReportGone( )
+    TestRpt = 0
+    TestRptForm = 0
+end sub

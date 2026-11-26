@@ -34,7 +34,7 @@ Passes a variable by reference, that is its address, to a subroutine or function
 
 ### Dialect Differences
 
-- In *[-lang fb](Compiler-Option-Lang)* dialect, [`ByVal`](Byval) is the default parameter passing convention for all built-in types except [`String`](String) and user-defined [`Type`](Type-Udt) which are passed `ByRef` by default. The [`ZString`](Zstring) and [`WString`](Wstring) built-in types are also passed `ByRef` by default, but passing [`ByVal`](Byval) is forbidden. Arrays are always passed `ByRef` and the use of the specifier `ByRef` or [`ByVal`](Byval) is forbidden.
+- In *[-lang fb](Compiler-Option-Lang)* dialect, [`ByVal`](Byval) is the default parameter passing convention for all built-in types except [`String`](String) and user-defined [`Type`](Type-Udt) which are passed `ByRef` by default. The [`ZString`](Zstring) and [`WString`](Wstring) built-in types are also passed `ByRef` by default, but passing [`ByVal`](Byval) is forbidden. Arrays are always passed `ByRef`: the specifier `ByRef` may be written on an array parameter (`Sub f( ByRef a() As Integer )`) and means the same as leaving it out, while [`ByVal`](Byval) is forbidden.
   In *[-lang qb](Compiler-Option-Lang)* and *[-lang fblite](Compiler-Option-Lang)* dialects, `ByRef` is the default parameter passing convention.
 
 ### Differences from QB

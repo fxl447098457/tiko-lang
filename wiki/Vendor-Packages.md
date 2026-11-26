@@ -46,6 +46,7 @@ Every routine, type and constant of the library's C header is callable as the li
 | `vendor/cJSON` | cJSON 1.7.19, built from master past it with four upstream security PRs applied | `static`, `dynamic` (the default) |
 | `vendor/cJSON/utils` | cJSON_Utils: JSON Pointer, Patch, Merge Patch (brings `vendor/cJSON`) | chosen on `vendor/cJSON` |
 | `vendor/pcre2` | PCRE2 10.49, the 8-bit library (UTF-8), with Unicode support and the JIT | `static`, `dynamic` (the default) |
+| `vendor/zint` | libzint 2.16.0, the barcode library: its BSD-3 backend, built without PNG output | `static`, `dynamic` (the default) |
 
 **`vendor/tkControls/<control>`** is tiko source, not a C library: owner-drawn controls on SDL3 for Windows, Linux and macOS, one module each. On macOS they run with Homebrew's SDL3. It links no library of its own (`vendor/SDL3` does) but has runtime files: its fonts, copied beside every program that imports it, and the scintk library for `tkCodeEdit`. `vendor/tkControls/tkCodeEdit` takes `link static`, which puts scintk inside the program. See [tkControls](Category-tkControls).
 
@@ -58,6 +59,8 @@ Every routine, type and constant of the library's C header is callable as the li
 **The packages' shared libraries on linux-x86_64 need glibc 2.34 or newer**, `vendor/raylib6`'s included: the toolchain builds raylib's from its source rather than shipping raylib's prebuilt one, which needs 2.38. On linux-arm64 the toolchain itself needs glibc 2.35 or newer.
 
 **`vendor/pcre2` is PCRE2's 8-bit library only**, so a pattern and a subject are bytes, or UTF-8 with `PCRE2_UTF`: assign a `ustring` to a `string` to get its UTF-8. Its names are the generic ones PCRE2 documents -- `pcre2_compile`, `pcre2_match`, `pcre2_match_data` -- each a `#define` of the `_8` name the library exports. A pattern or subject is a `PCRE2_SPTR`: `strptr( s )` of a `string` passes as one, a string literal does not. PCRE2 backtracks, so a pattern from outside the program can take exponential time: give `pcre2_match` a match context with `pcre2_set_match_limit` (and `pcre2_set_depth_limit`, `pcre2_set_heap_limit`). `pcre2_dfa_match` is no way out: it does not backtrack, but its time still grows steeply and the match limit does not stop it. See the [PCRE2 tutorial](PCRE2-Tutorial).
+
+**`vendor/zint` is libzint alone** (zint's command line and GUI are GPL and not shipped): `ZBarcode_Create`, `ZBarcode_Encode_and_Buffer_Vector`, `ZBarcode_Delete` and the rest, as its manual has them. Data is bytes; with `UNICODE_MODE` a `string` holding UTF-8 (assign a `ustring` to one). Empty data is an error. `encoded_data` is bit-packed: module (row, col) is `( encoded_data(row, col shr 3) shr ( col and 7 ) ) and 1`. With `scale = 0.5` the vector's units are modules. `ZBarcode_Print` writes BMP, EMF, GIF, PCX, EPS, SVG and TIF files, not PNG. [tkBarcode](tkBarcode) is the control built on it.
 
 **`vendor/SDL3` declares `SDL_main.h`'s routines but not its `main`**: `SDL_EnterAppMainCallbacks`, `SDL_RunApp` and `SDL_SetMainReady` (and on Windows `SDL_RegisterApp` and `SDL_UnregisterApp`), as C has them with `SDL_MAIN_HANDLED`. A program written with SDL's main callbacks calls `SDL_EnterAppMainCallbacks` itself; see the [SDL3 tutorial](SDL3-Tutorial).
 

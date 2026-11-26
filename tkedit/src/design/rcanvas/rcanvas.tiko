@@ -1,0 +1,1493 @@
+'    tkEdit - a minimalist keyboard-driven editor for the tiko compiler
+'    Copyright (C) 2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' rcanvas -- the Report Designer's canvas (Report Designer RD5): a .tkreport's bands stacked down
+' the page, each under a caption bar, with rulers along the top and the left.
+'
+' WYSIWYG BY CONSTRUCTION: each band is recorded into a one-page document of its own size through
+' tkReport's own item painter (tkReportDef_RecordBand), and replayed here at the canvas's pixels per
+' point. Fonts, metrics and wrapping are the printed report's; a field shows its expression.
+'
+' ONE WIDGET, NOT GLASS OVER CONTROLS: unlike the form canvas, nothing on a report is a live control,
+' so a single focusable widget (Glass) paints everything and takes the mouse and the keys. Its
+' scroll bars are its own. Mouse input arrives through real dispatch: a press captures the mouse,
+' and a capture taken away (TKM_CAPTURECHANGED) undoes the gesture -- seeded from the form canvas,
+' each comment audited.
+'
+' THE MODEL is a TK_REPORTDEF this canvas owns. A finished gesture writes it back as text
+' (tkReportDef_SaveText, canonical) through OnCommit: the document makes that ONE undoable edit
+' of its hidden buffer. Undo reloads the buffer's text (LoadText).
+'
+' GEOMETRY: points in the model, pixels on the screen at PX_PER_PT pixels a point times the host's
+' scale. ItemRect, BandBodyRect and CaptionRect answer in Glass pixels, for the host and the tests.
+#module "rcanvas"
+
+#import "std/containers"
+#import "vendor/tkControls/tkHost"
+#import "vendor/tkControls/tkScrollBar"
+#import "vendor/tkControls/tkTheme"
+#import "vendor/tkControls/tkPrint"
+#import "vendor/tkControls/tkReportDef"
+#import "../redits"
+#import "../rmodel"
+#import "../rpreview"
+#import "vendor/tkControls/tkReportViewer"
+#import "vendor/tkControls/tkTooltip"
+#import "std/fs"
+using containers
+using tkReportDef
+using tkHost
+using tkPaint
+using tkScrollBar
+using tkTheme
+using tkPrint
+using tkReport
+using tkReportViewer
+using tkTooltip
+
+public type RCommitSub as sub( byval owner as any ptr, byref text as const ustring )
+public type RChangedSub as sub( byval listener as any ptr )
+' A right click at x, y in Glass pixels, what it landed on already picked (c: the ReportCanvas).
+public type RMenuSub as sub( byval owner as any ptr, byval c as any ptr, byval x as long, byval y as long )
+
+public enum RDrag
+    RDragNone
+    RDragPressed       ' on an item, not moved past the threshold yet
+    RDragMove
+    RDragResize
+    RDragBand          ' a band's bottom edge: its height
+    RDragMarginL       ' the paper's left margin line: the left margin (author 2026-11-25)
+    RDragMarginR       ' the right margin line
+    RDragRubber
+end enum
+
+' A screen pixel at 96 dpi is 3/4 of a point: the canvas at scale 1 is the page at 100 %.
+public const as single PX_PER_PT = 96.0 / 72.0
+
+const as long RULER = 20           ' the top ruler's height, the left ruler's width
+const as long PAD = 16             ' around the paper
+const as long GUTTER_COL = 22      ' the band gutter's column, one per nesting level (author 2026-11-25)
+const as long BAR = 12             ' a scroll bar's thickness
+const as long GRIP = 6             ' a resize grip's side
+const as long EDGE = 3             ' a band's bottom edge reaches this far either side
+const as long THRESHOLD = 3        ' a press becomes a drag past this many pixels
+
+' An item as a gesture found it.
+public type RBase
+    id   as ustring
+    band as ustring
+    x    as float32
+    y    as float32
+    w    as float32
+    h    as float32
+end type
+
+public type ReportCanvas
+    Def        as TK_REPORTDEF ptr
+    Selected   as Array( of ustring )     ' item ids; the first is the anchor (the one with grips)
+    SelBand    as ustring                 ' a band picked by its caption (no item is selected then)
+    Tool       as ustring                 ' what a click in a band places: an item kind, or
+                                          ' "field:<kind>|<source>|<name>" from the field list; "" = select
+    SnapToGrid as boolean = true
+    Frame      as TK_WIDGET ptr
+    Glass      as TK_WIDGET ptr
+    HBar       as TK_WIDGET ptr
+    VBar       as TK_WIDGET ptr
+    Owner      as any ptr
+    OnCommit   as RCommitSub
+    Listener   as any ptr
+    OnChanged  as RChangedSub
+    MenuOwner  as any ptr
+    OnContextMenu as RMenuSub
+    Tip        as TKTIPHOST_STATE         ' the gutter's: a band's id and what it reads or groups by
+    Drag       as RDrag
+    StartX     as long
+    StartY     as long
+    NowX       as long
+    NowY       as long
+    Grip       as long = -1
+    PressBand  as int32 = -1              ' band index under the press
+    Bases      as Array( of RBase )
+    BaseHeight as float32
+    BaseMargin as float32                 ' the margin a margin drag started from, points
+    BasePageW  as float32                 ' ...and the page's width then
+    Order      as Array( of int32 )       ' band indexes, top to bottom
+    Depths     as Array( of int32 )
+    BodyTops   as Array( of long )        ' by position in Order: the body's top, content pixels
+    ContentW   as long
+    ContentH   as long
+    Docs       as Array( of any ptr )     ' by band index: the band recorded (TK_PRINTDOC ptr), 0 = to record
+    Rp         as TK_PRINTREPLAY ptr
+    ' the Preview (RD8): a viewer over a copy of the report bound to design data
+    Previewing as boolean
+    Viewer     as TK_WIDGET ptr
+    PreviewDef as TK_REPORTDEF ptr
+    Rows       as rpreview.RDesignData   ' the design data the Preview binds
+    ReportPath as ustring                 ' the .tkreport's path (its folder holds design_db and the sample)
+
+    declare function Create( byval parent as TK_WIDGET ptr, byval id as long ) as boolean
+    declare sub Destroy( )
+    declare function LoadText( byref text as const ustring ) as boolean
+    declare sub Commit( )
+    declare sub Changed( )
+    declare function Sc( byval v as long ) as long
+    declare function PxPerPt( ) as single
+    declare sub Relayout( )
+    declare sub PlaceSurface( )
+    declare sub Dirty( byval bi as int32 )
+    declare sub DirtyAll( )
+    declare function PosOf( byval bi as int32 ) as int32
+    declare function PaperLeft( ) as long
+    declare function ContentLeft( ) as long
+    declare function PaperWidthPx( ) as long
+    declare function BandBodyRect( byval bi as int32 ) as TKRECT
+    declare function CaptionRect( byval bi as int32 ) as TKRECT
+    declare function ItemRect( byval i as int32 ) as TKRECT
+    declare function GripRect( byval i as int32, byval g as long ) as TKRECT
+    declare function HitItem( byval x as long, byval y as long ) as int32
+    declare function HitBand( byval x as long, byval y as long ) as int32
+    declare function HitBandEdge( byval x as long, byval y as long ) as int32
+    declare function GutterW( ) as long
+    declare function HitMargin( byval x as long, byval y as long ) as long
+    declare sub OnHover( byval x as long, byval y as long )
+    declare function HitGrip( byval x as long, byval y as long ) as long
+    declare function IsSelected( byref id as const ustring ) as boolean
+    declare sub SelectOnly( byref id as const ustring )
+    declare sub SelectBand( byref id as const ustring )
+    declare function Subject( ) as ustring
+    declare function ApplyProp( byref target as const ustring, byref key_ as const ustring, byref value as const ustring ) as ustring
+    declare function InsertBand( byref kind as const ustring ) as boolean
+    declare function AdoptDef( byval nd as TK_REPORTDEF ptr ) as ustring
+    declare function SetPreview( byval on_ as boolean ) as ustring
+    declare function SamplePath( ) as ustring
+    declare function ApplyPageSetup( byref ps as TKPAGESETUP ) as ustring
+    declare function PlaceTool( byval x as long, byval y as long, byval mods as long ) as boolean
+    declare sub SelectNone( )
+    declare sub SelectAll( )
+    declare sub Toggle( byref id as const ustring )
+    declare sub OnPress( byval x as long, byval y as long, byval mods as long )
+    declare sub OnDragTo( byval x as long, byval y as long, byval mods as long )
+    declare sub OnRelease( byval x as long, byval y as long )
+    declare sub OnCancel( )
+    declare function OnKey( byval key as long, byval mods as long ) as boolean
+    declare sub Nudge( byval dx as float32, byval dy as float32, byval resize_ as boolean )
+    declare sub DeleteSelection( )
+    declare sub DeleteSubject( )
+    declare function CanDelete( ) as boolean
+    declare sub OnRightPress( byval x as long, byval y as long )
+    declare sub Copy( )
+    declare sub Cut( )
+    declare sub Paste( )
+    declare function CanPaste( ) as boolean
+    declare sub Align( byval mode as redits.RAlign )
+    declare sub Space( byval down_ as boolean )
+    declare sub ToFront( )
+    declare sub ToBack( )
+    declare sub Paint( byval b as TK_PAINT ptr )
+    declare sub PaintRulers( byval b as TK_PAINT ptr )
+    declare sub PaintGutter( byval b as TK_PAINT ptr )
+end type
+
+' ---- the widgets ---------------------------------------------------------------------------------
+' What the paper sits on: almost black, or almost white (the form canvas's backdrop).
+private function Backdrop_( ) as ulong
+    if tkTheme_Get( ).IsDark then return tkRGB( 18, 18, 20 )
+    return tkRGB( 250, 249, 246 )
+end function
+
+' The paper under the bands: white, but a soft grey in a dark theme -- full white glares there
+' (author 2026-11-25). The bands' ink is recorded black, so the paper stays light.
+private function Paper_( ) as ulong
+    if tkTheme_Get( ).IsDark then return tkRGB( 201, 201, 198 )
+    return tkRGB( 255, 255, 255 )
+end function
+
+' The margins' faint lines on it.
+private function MarginLine_( ) as ulong
+    if tkTheme_Get( ).IsDark then return tkRGB( 172, 172, 170 )
+    return tkRGB( 220, 220, 226 )
+end function
+
+private function GlassProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as ReportCanvas ptr c = w->pData
+    select case m->msg
+    case TKM_PAINT
+        c->Paint( m->pPaint )
+        return true
+    case TKM_LBUTTONDOWN
+        tkHost_SetFocus( w->pHost, w )
+        tkHost_SetCapture( w )
+        c->OnPress( m->x, m->y, SDL_GetModState( ) )
+        return true
+    case TKM_RBUTTONDOWN
+        tkHost_SetFocus( w->pHost, w )
+        c->OnRightPress( m->x, m->y )
+        return true
+    case TKM_RBUTTONUP
+        return true
+    case TKM_MOUSEMOVE
+        if c->Drag <> RDragNone then
+            c->OnDragTo( m->x, m->y, SDL_GetModState( ) )
+        else
+            c->OnHover( m->x, m->y )
+        end if
+        return true
+    case TKM_LBUTTONUP
+        ' finished first: giving up the capture is what TKM_CAPTURECHANGED reads as an interrupted gesture
+        c->OnRelease( m->x, m->y )
+        if tkHost_GetCapture( w->pHost ) = w then tkHost_ReleaseCapture( w->pHost )
+        return true
+    case TKM_CAPTURECHANGED
+        ' the gesture was taken away: nothing it did stands
+        if c->Drag <> RDragNone then c->OnCancel( )
+        return true
+    case TKM_MOUSEWHEEL
+        ' the wheel scrolls down; Shift+wheel, or a sideways wheel, across
+        dim as single wx = m->wheelX, wy = m->wheelY
+        if ((SDL_GetModState( ) and SDL_KMOD_SHIFT) <> 0) andalso (wx = 0) then
+            wx = -wy
+            wy = 0
+        end if
+        dim as long stp = c->Sc( 24 )
+        if (wy <> 0) andalso c->VBar->isVisible then tkScrollBar_SetPos( c->VBar, tkScrollBar_GetPos( c->VBar ) - cint( wy * stp ) )
+        if (wx <> 0) andalso c->HBar->isVisible then tkScrollBar_SetPos( c->HBar, tkScrollBar_GetPos( c->HBar ) + cint( wx * stp ) )
+        tkWidget_Invalidate( w )
+        return true
+    case TKM_KEYDOWN
+        return c->OnKey( m->key, m->mods )
+    case TKM_CHAR
+        return true                     ' the keys claimed above must not beep
+    case TKM_SETFOCUS, TKM_KILLFOCUS
+        tkWidget_Invalidate( w )
+        return true
+    end select
+    return false
+end function
+
+private sub OnBarScroll( byval hSB as TK_WIDGET ptr, byval newPos as integer )
+    dim as ReportCanvas ptr c = tkWidget_Parent( hSB )->pData
+    tkWidget_Invalidate( c->Glass )
+end sub
+
+private function FrameProc( byval w as TK_WIDGET ptr, byval m as TK_MSG ptr ) as boolean
+    dim as ReportCanvas ptr c = w->pData
+    select case m->msg
+    case TKM_PAINT
+        dim as TKRECT rc
+        tkRect_Set( rc, 0, 0, w->cw, w->ch )
+        m->pPaint->SetBackColor( Backdrop_( ) )
+        m->pPaint->PaintRect( @rc )
+        return true
+    case TKM_SIZE
+        c->PlaceSurface( )
+        return true
+    case TKM_SCALECHANGED
+        ' fonts are opened at a pixel size: the replay's go, and the layout is redone
+        if c->Rp then tkPrintReplay_Flush( c->Rp )
+        c->Relayout( )
+        return true
+    case TKM_THEMECHANGED
+        tkWidget_Invalidate( w )
+        return false
+    end select
+    return false
+end function
+
+' The gutter's tip: the band under the mouse in full -- "detail (d:Orders)" (its tool index is the band's).
+private function GutterTipText_( byval t as TK_TIP ptr, byval a as TK_WIDGET ptr, byval idx as long ) as ustring
+    dim as ReportCanvas ptr c = a->pData
+    if (c = 0) orelse (c->Def = 0) orelse (idx < 0) orelse (idx >= c->Def->nBands) then return ""
+    return BandCaption( c->Def->bands(idx) )
+end function
+
+function ReportCanvas.Create( byval parent as TK_WIDGET ptr, byval id as long ) as boolean
+    Frame = tkWidget_CreateChild( parent, id, @FrameProc, @this )
+    if Frame = 0 then return false
+    Glass = tkWidget_CreateChild( Frame, 1, @GlassProc, @this )
+    Glass->isFocusable = true
+    tkTipHost_Ensure( @Tip, Glass, @GutterTipText_ )
+    tkTipHost_SetToolIndex( @Tip, -1 )
+    HBar = tkScrollBar_Create( Frame, 2, false )
+    VBar = tkScrollBar_Create( Frame, 3, true )
+    tkScrollBar_SetScrollCallback( HBar, @OnBarScroll )
+    tkScrollBar_SetScrollCallback( VBar, @OnBarScroll )
+    return true
+end function
+
+sub ReportCanvas.Destroy( )
+    this.SetPreview( false )
+    this.DirtyAll( )
+    Docs.Clear( )
+    if Rp then tkPrintReplay_Destroy( Rp )
+    Rp = 0
+    if Def then tkReportDef_Destroy( Def )
+    Def = 0
+    tkTipHost_Destroy( @Tip )
+    if Frame then tkWidget_Destroy( Frame )
+    Frame = 0
+    Glass = 0
+end sub
+
+function ReportCanvas.Sc( byval v as long ) as long
+    return tkHost_Scale( Frame->pHost, v )
+end function
+
+function ReportCanvas.PxPerPt( ) as single
+    return PX_PER_PT * Frame->pHost->fScale
+end function
+
+' ---- the model -----------------------------------------------------------------------------------
+' The text as the canvas's report; false (nothing changed) when it does not read as one. The
+' selection keeps the items that are still there.
+function ReportCanvas.LoadText( byref text as const ustring ) as boolean
+    dim as ustring e
+    dim as TK_REPORTDEF ptr d = tkReportDef_LoadText( text, e )
+    if d = 0 then return false
+    this.DirtyAll( )
+    if Def then tkReportDef_Destroy( Def )
+    Def = d
+    dim as Array( of ustring ) keep
+    for each s as ustring in Selected
+        if tkReportDef_FindItem( Def, s ) >= 0 then keep.Push( s )
+    next
+    Selected = keep
+    if tkReportDef_FindBand( Def, SelBand ) < 0 then SelBand = ""
+    this.Relayout( )
+    this.Changed( )
+    return true
+end function
+
+' A gesture finished: the report as text to the owner (one undoable edit).
+sub ReportCanvas.Commit( )
+    if (Def <> 0) andalso (OnCommit <> 0) then OnCommit( Owner, tkReportDef_SaveText( Def ) )
+    this.Changed( )
+end sub
+
+' The selection, the model or the view changed.
+sub ReportCanvas.Changed( )
+    if Glass then tkWidget_Invalidate( Glass )
+    if OnChanged then OnChanged( Listener )
+end sub
+
+sub ReportCanvas.Dirty( byval bi as int32 )
+    if (bi < 0) orelse (bi >= Docs.Count( )) then exit sub
+    if Docs[bi] then tkPrintDoc_Destroy( cast( TK_PRINTDOC ptr, Docs[bi] ) )
+    Docs[bi] = 0
+end sub
+
+sub ReportCanvas.DirtyAll( )
+    for i as int32 = 0 to Docs.Count( ) - 1
+        this.Dirty( i )
+    next
+end sub
+
+' The bands' order and where each body starts; the scroll range.
+sub ReportCanvas.Relayout( )
+    if (Frame = 0) orelse (Def = 0) then exit sub
+    redits.BandOrder( Def, Order, Depths )
+    while Docs.Count( ) < Def->nBands
+        Docs.Push( 0 )
+    wend
+    BodyTops.Clear( )
+    dim as single s = this.PxPerPt( )
+    dim as long y = this.Sc( RULER ) + this.Sc( PAD )
+    for k as int32 = 0 to Order.Count( ) - 1
+        BodyTops.Push( y )                      ' back to back: their names are down the gutter
+        dim as long h = cint( Def->bands(Order[k]).height * s )
+        if h < 1 then h = 1
+        y += h
+    next
+    ContentH = y + this.Sc( PAD )
+    ContentW = this.GutterW( ) + this.Sc( RULER ) + 2 * this.Sc( PAD ) + this.PaperWidthPx( )
+    this.PlaceSurface( )
+end sub
+
+sub ReportCanvas.PlaceSurface( )
+    if Frame = 0 then exit sub
+    if Viewer then
+        tkWidget_Show( Viewer, Previewing )
+        if Previewing then tkWidget_SetPos( Viewer, 0, 0, Frame->cw, Frame->ch )
+    end if
+    tkWidget_Show( Glass, Previewing = false )
+    if Previewing then
+        tkWidget_Show( HBar, false )
+        tkWidget_Show( VBar, false )
+        exit sub
+    end if
+    dim as long bar_ = this.Sc( BAR )
+    dim as long cw = Frame->cw, ch = Frame->ch
+    dim as boolean showV = ContentH > ch
+    dim as boolean showH = ContentW > (cw - iif( showV, bar_, 0 ))
+    if showH andalso (ContentH > ch - bar_) then showV = true
+    dim as long vw = iif( showV, bar_, 0 ), hh = iif( showH, bar_, 0 )
+    dim as long inW = cw - vw, inH = ch - hh
+    tkWidget_Show( HBar, showH )
+    tkWidget_Show( VBar, showV )
+    tkWidget_SetPos( HBar, 0, inH, inW, hh )
+    tkWidget_SetPos( VBar, inW, 0, vw, inH )
+    tkScrollBar_SetRange( HBar, ContentW, inW, tkScrollBar_GetPos( HBar ) )
+    tkScrollBar_SetRange( VBar, ContentH, inH, tkScrollBar_GetPos( VBar ) )
+    tkWidget_SetPos( Glass, 0, 0, inW, inH )
+    tkWidget_Invalidate( Frame )
+end sub
+
+' ---- geometry (Glass pixels) ---------------------------------------------------------------------
+function ReportCanvas.PosOf( byval bi as int32 ) as int32
+    for k as int32 = 0 to Order.Count( ) - 1
+        if Order[k] = bi then return k
+    next
+    return -1
+end function
+
+private function ScrollX_( byval c as ReportCanvas ptr ) as long
+    if c->HBar->isVisible then return tkScrollBar_GetPos( c->HBar )
+    return 0
+end function
+
+private function ScrollY_( byval c as ReportCanvas ptr ) as long
+    if c->VBar->isVisible then return tkScrollBar_GetPos( c->VBar )
+    return 0
+end function
+
+' The band gutter down the left (fixed, as the left ruler beside it is): a column per nesting level.
+function ReportCanvas.GutterW( ) as long
+    dim as int32 md = 0
+    for each dp as int32 in Depths
+        if dp > md then md = dp
+    next
+    return (md + 1) * this.Sc( GUTTER_COL )
+end function
+
+function ReportCanvas.PaperLeft( ) as long
+    return this.GutterW( ) + this.Sc( RULER ) + this.Sc( PAD ) - ScrollX_( @this )
+end function
+
+' Where a band's x = 0 is: the paper's left edge plus the left margin.
+function ReportCanvas.ContentLeft( ) as long
+    return this.PaperLeft( ) + cint( Def->mL * this.PxPerPt( ) )
+end function
+
+function ReportCanvas.PaperWidthPx( ) as long
+    dim as single s = this.PxPerPt( )
+    return cint( (Def->mL + tkReportDef_ContentWidth( Def ) + Def->mR) * s )
+end function
+
+function ReportCanvas.BandBodyRect( byval bi as int32 ) as TKRECT
+    dim as TKRECT rc
+    dim as int32 k = this.PosOf( bi )
+    if k < 0 then return rc
+    dim as single s = this.PxPerPt( )
+    dim as long l = this.ContentLeft( ), t = BodyTops[k] - ScrollY_( @this )
+    dim as long h = cint( Def->bands(bi).height * s )
+    if h < 1 then h = 1
+    tkRect_Set( rc, l, t, l + cint( tkReportDef_ContentWidth( Def ) * s ), t + h )
+    return rc
+end function
+
+' The band's cell in the gutter: from its column to the gutter's right, beside its body; a band
+' with nested bands (deeper ones straight after it) reaches down beside theirs too, in its column
+' (theirs, deeper, lie over it there).
+function ReportCanvas.CaptionRect( byval bi as int32 ) as TKRECT
+    dim as TKRECT rc
+    dim as int32 k = this.PosOf( bi )
+    if k < 0 then return rc
+    dim as TKRECT body = this.BandBodyRect( bi )
+    dim as long bottom = body.bottom
+    for j as int32 = k + 1 to Order.Count( ) - 1
+        if Depths[j] <= Depths[k] then exit for
+        bottom = this.BandBodyRect( Order[j] ).bottom
+    next
+    tkRect_Set( rc, Depths[k] * this.Sc( GUTTER_COL ), body.top, this.GutterW( ), bottom )
+    return rc
+end function
+
+function ReportCanvas.ItemRect( byval i as int32 ) as TKRECT
+    dim as TKRECT rc
+    if (Def = 0) orelse (i < 0) orelse (i >= Def->nItems) then return rc
+    dim byref as TKRD_ITEM it = Def->items(i)
+    dim as TKRECT body = this.BandBodyRect( tkReportDef_FindBand( Def, it.band ) )
+    dim as single s = this.PxPerPt( )
+    tkRect_Set( rc, body.left + cint( it.x * s ), body.top + cint( it.y * s ), _
+                body.left + cint( (it.x + it.w) * s ), body.top + cint( (it.y + it.h) * s ) )
+    return rc
+end function
+
+' Grip g of item i: 0 top-left, then clockwise (1 top, 2 top-right, 3 right, 4 bottom-right,
+' 5 bottom, 6 bottom-left, 7 left).
+function ReportCanvas.GripRect( byval i as int32, byval g as long ) as TKRECT
+    dim as TKRECT r = this.ItemRect( i ), rc
+    dim as long half = this.Sc( GRIP ) \ 2
+    dim as long mx = (r.left + r.right) \ 2, my = (r.top + r.bottom) \ 2
+    dim as long x, y
+    select case g
+    case 0 : x = r.left : y = r.top
+    case 1 : x = mx : y = r.top
+    case 2 : x = r.right : y = r.top
+    case 3 : x = r.right : y = my
+    case 4 : x = r.right : y = r.bottom
+    case 5 : x = mx : y = r.bottom
+    case 6 : x = r.left : y = r.bottom
+    case else : x = r.left : y = my
+    end select
+    tkRect_Set( rc, x - half, y - half, x + half + 1, y + half + 1 )
+    return rc
+end function
+
+private function Inside_( byref rc as TKRECT, byval x as long, byval y as long ) as boolean
+    return (x >= rc.left) andalso (x < rc.right) andalso (y >= rc.top) andalso (y < rc.bottom)
+end function
+
+' The topmost item under (x, y): the last drawn. A thin item (a line) is found a few pixels around.
+function ReportCanvas.HitItem( byval x as long, byval y as long ) as int32
+    if Def = 0 then return -1
+    dim as long slack = this.Sc( 2 )
+    for i as int32 = Def->nItems - 1 to 0 step -1
+        dim as TKRECT rc = this.ItemRect( i )
+        rc.left -= slack : rc.top -= slack : rc.right += slack : rc.bottom += slack
+        if Inside_( rc, x, y ) then return i
+    next
+    return -1
+end function
+
+' The band whose caption or body is at y (anywhere across), -1 for none.
+function ReportCanvas.HitBand( byval x as long, byval y as long ) as int32
+    if Def = 0 then return -1
+    if x < this.GutterW( ) then
+        ' a gutter cell: the deepest under the point (a nested band's lies over its parent's)
+        dim as int32 best = -1, bestDepth = -1
+        for k as int32 = 0 to Order.Count( ) - 1
+            dim as TKRECT cell = this.CaptionRect( Order[k] )
+            if (x >= cell.left) andalso (x < cell.right) andalso (y >= cell.top) andalso (y < cell.bottom) andalso (Depths[k] > bestDepth) then
+                best = Order[k]
+                bestDepth = Depths[k]
+            end if
+        next
+        return best
+    end if
+    for k as int32 = 0 to Order.Count( ) - 1
+        dim as TKRECT body = this.BandBodyRect( Order[k] )
+        if (y >= body.top) andalso (y < body.bottom) then return Order[k]
+    next
+    return -1
+end function
+
+' A band whose bottom edge is at (x, y): dragging it sets the band's height.
+function ReportCanvas.HitBandEdge( byval x as long, byval y as long ) as int32
+    if Def = 0 then return -1
+    dim as long e = this.Sc( EDGE )
+    dim as long l = this.PaperLeft( ), r = l + this.PaperWidthPx( ), g = this.GutterW( )
+    dim as boolean onPaper = (x >= l) andalso (x < r)
+    if (onPaper = false) andalso ((x < 0) orelse (x >= g)) then return -1
+    for k as int32 = 0 to Order.Count( ) - 1
+        dim as TKRECT body = this.BandBodyRect( Order[k] )
+        if abs( y - body.bottom ) > e then continue for
+        ' in the gutter: from the band's own column across (author 2026-11-25)
+        if onPaper orelse (x >= Depths[k] * this.Sc( GUTTER_COL )) then return Order[k]
+    next
+    return -1
+end function
+
+' A margin line at (x, y), beside a band's body: 1 the left, 2 the right, 0 neither.
+function ReportCanvas.HitMargin( byval x as long, byval y as long ) as long
+    if (Def = 0) orelse (Order.Count( ) = 0) then return 0
+    dim as long e = this.Sc( EDGE )
+    dim as TKRECT first_ = this.BandBodyRect( Order[0] ), last_ = this.BandBodyRect( Order[Order.Count( ) - 1] )
+    if (y < first_.top) orelse (y >= last_.bottom) then return 0
+    dim as long cl = this.ContentLeft( ), cr = cl + cint( tkReportDef_ContentWidth( Def ) * this.PxPerPt( ) )
+    if abs( x - cl ) <= e then return 1
+    if abs( x - cr ) <= e then return 2
+    return 0
+end function
+
+' The mouse over a band's bottom edge, on the paper or in the gutter: the up-down cursor; over a
+' margin line (no item there): the left-right one. Over a gutter cell: that band's tip.
+sub ReportCanvas.OnHover( byval x as long, byval y as long )
+    dim as long cur = TK_CURSOR_ARROW
+    if (len( Tool ) = 0) andalso (this.HitBandEdge( x, y ) >= 0) then
+        cur = TK_CURSOR_SIZENS
+    elseif (len( Tool ) = 0) andalso (this.HitItem( x, y ) < 0) andalso (this.HitMargin( x, y ) > 0) then
+        cur = TK_CURSOR_SIZEWE
+    end if
+    tkWidget_SetCursor( Glass, cur )
+    tkTipHost_SetToolIndex( @Tip, iif( x < this.GutterW( ), this.HitBand( x, y ), -1 ) )
+end sub
+
+' The anchor's grip at (x, y), -1 for none.
+function ReportCanvas.HitGrip( byval x as long, byval y as long ) as long
+    if (Def = 0) orelse (Selected.Count( ) = 0) then return -1
+    dim as int32 i = tkReportDef_FindItem( Def, Selected[0] )
+    if i < 0 then return -1
+    for g as long = 0 to 7
+        dim as TKRECT rc = this.GripRect( i, g )
+        rc.left -= 1 : rc.top -= 1 : rc.right += 1 : rc.bottom += 1
+        if Inside_( rc, x, y ) then return g
+    next
+    return -1
+end function
+
+' ---- selection -----------------------------------------------------------------------------------
+function ReportCanvas.IsSelected( byref id as const ustring ) as boolean
+    for each s as ustring in Selected
+        if lcase( s ) = lcase( id ) then return true
+    next
+    return false
+end function
+
+sub ReportCanvas.SelectOnly( byref id as const ustring )
+    SelBand = ""
+    Selected.Clear( )
+    dim as ustring v = id
+    if len( v ) then Selected.Push( v )
+    this.Changed( )
+end sub
+
+sub ReportCanvas.SelectNone( )
+    SelBand = ""
+    Selected.Clear( )
+    this.Changed( )
+end sub
+
+sub ReportCanvas.SelectAll( )
+    SelBand = ""
+    Selected.Clear( )
+    for i as int32 = 0 to Def->nItems - 1
+        Selected.Push( Def->items(i).id )
+    next
+    this.Changed( )
+end sub
+
+' In or out of the selection; an item added becomes the anchor.
+sub ReportCanvas.Toggle( byref id as const ustring )
+    SelBand = ""
+    dim as Array( of ustring ) keep
+    dim as boolean was = false
+    for each s as ustring in Selected
+        if lcase( s ) = lcase( id ) then
+            was = true
+        else
+            keep.Push( s )
+        end if
+    next
+    if was then
+        Selected = keep
+    else
+        Selected.Clear( )
+        dim as ustring v = id
+        Selected.Push( v )
+        for each s as ustring in keep
+            Selected.Push( s )
+        next
+    end if
+    this.Changed( )
+end sub
+
+' ---- the mouse -----------------------------------------------------------------------------------
+private sub TakeBases_( byval c as ReportCanvas ptr )
+    c->Bases.Clear( )
+    for each s as ustring in c->Selected
+        dim as int32 i = tkReportDef_FindItem( c->Def, s )
+        if i < 0 then continue for
+        dim as RBase b
+        b.id = c->Def->items(i).id : b.band = c->Def->items(i).band
+        b.x = c->Def->items(i).x : b.y = c->Def->items(i).y
+        b.w = c->Def->items(i).w : b.h = c->Def->items(i).h
+        c->Bases.Push( b )
+    next
+end sub
+
+sub ReportCanvas.OnPress( byval x as long, byval y as long, byval mods as long )
+    if Def = 0 then exit sub
+    StartX = x : StartY = y : NowX = x : NowY = y
+    if len( Tool ) then
+        this.PlaceTool( x, y, mods )
+        Drag = RDragNone
+        exit sub
+    end if
+    Grip = this.HitGrip( x, y )
+    if Grip >= 0 then
+        TakeBases_( @this )
+        Drag = RDragResize
+        exit sub
+    end if
+    dim as int32 edge = this.HitBandEdge( x, y )
+    if edge >= 0 then
+        PressBand = edge
+        BaseHeight = Def->bands(edge).height
+        Drag = RDragBand
+        exit sub
+    end if
+    dim as int32 i = this.HitItem( x, y )
+    if i < 0 then
+        ' a margin line: the margin, dragged (an item over the line wins)
+        dim as long mg = this.HitMargin( x, y )
+        if mg > 0 then
+            BaseMargin = iif( mg = 1, Def->mL, Def->mR )
+            BasePageW = tkReportDef_ContentWidth( Def ) + Def->mL + Def->mR
+            if mg = 1 then Drag = RDragMarginL else Drag = RDragMarginR
+            exit sub
+        end if
+    end if
+    PressBand = this.HitBand( x, y )
+    ' a gutter cell picks its band
+    if (i < 0) andalso (PressBand >= 0) then
+        if x < this.GutterW( ) then
+            this.SelectBand( Def->bands(PressBand).id )
+            Drag = RDragNone
+            exit sub
+        end if
+    end if
+    if i >= 0 then
+        dim as ustring id = Def->items(i).id
+        if (mods and (SDL_KMOD_SHIFT or TK_KMOD_PRIMARY)) <> 0 then
+            this.Toggle( id )
+            Drag = RDragNone
+            exit sub
+        end if
+        if this.IsSelected( id ) = false then
+            this.SelectOnly( id )
+        elseif lcase( Selected[0] ) <> lcase( id ) then
+            this.Toggle( id )             ' out ...
+            this.Toggle( id )             ' ... and back in, as the anchor
+        end if
+        PressBand = tkReportDef_FindBand( Def, Def->items(i).band )
+        TakeBases_( @this )
+        Drag = RDragPressed
+        exit sub
+    end if
+    if (mods and (SDL_KMOD_SHIFT or TK_KMOD_PRIMARY)) = 0 then this.SelectNone( )
+    Drag = RDragRubber
+    tkWidget_Invalidate( Glass )
+end sub
+
+sub ReportCanvas.OnDragTo( byval x as long, byval y as long, byval mods as long )
+    if Def = 0 then exit sub
+    NowX = x : NowY = y
+    dim as single s = this.PxPerPt( )
+    dim as float32 g = iif( SnapToGrid andalso ((mods and SDL_KMOD_ALT) = 0), redits.GridPt( Def ), 0 )
+    select case Drag
+    case RDragPressed
+        if (abs( x - StartX ) > this.Sc( THRESHOLD )) orelse (abs( y - StartY ) > this.Sc( THRESHOLD )) then
+            Drag = RDragMove
+            this.OnDragTo( x, y, mods )
+        end if
+    case RDragMove
+        if Bases.Count( ) = 0 then exit sub
+        ' the band under the pointer takes the items from the press's band
+        dim as int32 target = this.HitBand( x, y )
+        if target < 0 then target = PressBand
+        dim as long shift = 0
+        if (target <> PressBand) andalso (PressBand >= 0) then
+            shift = this.BandBodyRect( target ).top - this.BandBodyRect( PressBand ).top
+        end if
+        dim as RBase a = Bases[0]
+        dim as float32 nx = redits.Snap( a.x + (x - StartX) / s, g )
+        dim as float32 ny = redits.Snap( a.y + (y - StartY - shift) / s, g )
+        if nx < 0 then nx = 0
+        if ny < 0 then ny = 0
+        dim as float32 ddx = nx - a.x, ddy = ny - a.y
+        for each b as RBase in Bases
+            dim as int32 i = tkReportDef_FindItem( Def, b.id )
+            if i < 0 then continue for
+            this.Dirty( tkReportDef_FindBand( Def, Def->items(i).band ) )
+            Def->items(i).x = redits.Round2( b.x + ddx )
+            Def->items(i).y = redits.Round2( b.y + ddy )
+            if (PressBand >= 0) andalso (lcase( b.band ) = lcase( Def->bands(PressBand).id )) then
+                Def->items(i).band = Def->bands(target).id
+            end if
+            this.Dirty( tkReportDef_FindBand( Def, Def->items(i).band ) )
+        next
+        tkWidget_Invalidate( Glass )
+    case RDragResize
+        if Bases.Count( ) = 0 then exit sub
+        dim as RBase a = Bases[0]
+        dim as int32 i = tkReportDef_FindItem( Def, a.id )
+        if i < 0 then exit sub
+        dim as float32 dx = (x - StartX) / s, dy = (y - StartY) / s
+        dim as float32 l = a.x, t = a.y, r = a.x + a.w, bt = a.y + a.h
+        if (Grip = 0) orelse (Grip = 6) orelse (Grip = 7) then l = redits.Snap( l + dx, g )
+        if (Grip = 2) orelse (Grip = 3) orelse (Grip = 4) then r = redits.Snap( r + dx, g )
+        if (Grip = 0) orelse (Grip = 1) orelse (Grip = 2) then t = redits.Snap( t + dy, g )
+        if (Grip = 4) orelse (Grip = 5) orelse (Grip = 6) then bt = redits.Snap( bt + dy, g )
+        ' a line may be flat; anything else keeps a point
+        dim as float32 least = 1
+        if Def->items(i).kind = "line" then least = 0
+        if r - l < least then
+            if (Grip = 0) orelse (Grip = 6) orelse (Grip = 7) then l = r - least else r = l + least
+        end if
+        if bt - t < least then
+            if (Grip = 0) orelse (Grip = 1) orelse (Grip = 2) then t = bt - least else bt = t + least
+        end if
+        Def->items(i).x = redits.Round2( l ) : Def->items(i).y = redits.Round2( t )
+        Def->items(i).w = redits.Round2( r - l ) : Def->items(i).h = redits.Round2( bt - t )
+        this.Dirty( tkReportDef_FindBand( Def, Def->items(i).band ) )
+        tkWidget_Invalidate( Glass )
+    case RDragBand
+        dim as float32 h = redits.Snap( BaseHeight + (y - StartY) / s, g )
+        if h < 1 then h = 1
+        if h <> Def->bands(PressBand).height then
+            Def->bands(PressBand).height = h
+            this.Dirty( PressBand )
+            this.Relayout( )
+            tkWidget_Invalidate( Glass )
+        end if
+    case RDragMarginL, RDragMarginR
+        ' the left line right widens the left margin, the right line left the right one; snapped,
+        ' never below 0, and at least an inch of content left between them
+        dim as float32 dx = (x - StartX) / s
+        dim as float32 m = redits.Snap( BaseMargin + iif( Drag = RDragMarginL, dx, -dx ), g )
+        dim as float32 other = iif( Drag = RDragMarginL, Def->mR, Def->mL )
+        if m > BasePageW - other - 72 then m = BasePageW - other - 72
+        if m < 0 then m = 0
+        if m <> iif( Drag = RDragMarginL, Def->mL, Def->mR ) then
+            if Drag = RDragMarginL then Def->mL = m else Def->mR = m
+            this.DirtyAll( )
+            this.Relayout( )
+            tkWidget_Invalidate( Glass )
+        end if
+    case RDragRubber
+        tkWidget_Invalidate( Glass )
+    end select
+end sub
+
+sub ReportCanvas.OnRelease( byval x as long, byval y as long )
+    dim as RDrag d = Drag
+    Drag = RDragNone
+    select case d
+    case RDragMove, RDragResize
+        this.Commit( )
+    case RDragBand
+        if Def->bands(PressBand).height <> BaseHeight then this.Commit( ) else this.Changed( )
+    case RDragMarginL
+        if Def->mL <> BaseMargin then this.Commit( ) else this.Changed( )
+    case RDragMarginR
+        if Def->mR <> BaseMargin then this.Commit( ) else this.Changed( )
+    case RDragRubber
+        dim as TKRECT band_
+        tkRect_Set( band_, iif( StartX < x, StartX, x ), iif( StartY < y, StartY, y ), _
+                    iif( StartX < x, x, StartX ) + 1, iif( StartY < y, y, StartY ) + 1 )
+        for i as int32 = 0 to Def->nItems - 1
+            dim as TKRECT rc = this.ItemRect( i )
+            if (rc.left < band_.right) andalso (rc.right >= band_.left) andalso (rc.top < band_.bottom) andalso (rc.bottom >= band_.top) then
+                if this.IsSelected( Def->items(i).id ) = false then Selected.Push( Def->items(i).id )
+            end if
+        next
+        this.Changed( )
+    case else
+        tkWidget_Invalidate( Glass )
+    end select
+end sub
+
+' Back to how the gesture found it.
+sub ReportCanvas.OnCancel( )
+    select case Drag
+    case RDragMove, RDragResize
+        for each b as RBase in Bases
+            dim as int32 i = tkReportDef_FindItem( Def, b.id )
+            if i < 0 then continue for
+            this.Dirty( tkReportDef_FindBand( Def, Def->items(i).band ) )
+            Def->items(i).band = b.band
+            Def->items(i).x = b.x : Def->items(i).y = b.y
+            Def->items(i).w = b.w : Def->items(i).h = b.h
+            this.Dirty( tkReportDef_FindBand( Def, b.band ) )
+        next
+    case RDragBand
+        Def->bands(PressBand).height = BaseHeight
+        this.Dirty( PressBand )
+        this.Relayout( )
+    case RDragMarginL, RDragMarginR
+        if Drag = RDragMarginL then Def->mL = BaseMargin else Def->mR = BaseMargin
+        this.DirtyAll( )
+        this.Relayout( )
+    end select
+    Drag = RDragNone
+    this.Changed( )
+end sub
+
+' ---- the keys ------------------------------------------------------------------------------------
+' Arrows move the selection a grid step (Primary: 0.1 pt), Shift+arrows size it; Del deletes; Esc
+' drops the selection; Tab and Shift+Tab walk the items.
+function ReportCanvas.OnKey( byval key as long, byval mods as long ) as boolean
+    if Def = 0 then return false
+    dim as float32 stp = iif( (mods and TK_KMOD_PRIMARY) <> 0, 0.1, redits.GridPt( Def ) )
+    dim as boolean sz = (mods and SDL_KMOD_SHIFT) <> 0
+    select case key
+    case SDLK_LEFT : this.Nudge( -stp, 0, sz )
+    case SDLK_RIGHT : this.Nudge( stp, 0, sz )
+    case SDLK_UP : this.Nudge( 0, -stp, sz )
+    case SDLK_DOWN : this.Nudge( 0, stp, sz )
+    case SDLK_DELETE
+        this.DeleteSubject( )
+    case SDLK_ESCAPE
+        if len( Tool ) then
+            Tool = ""
+            this.Changed( )
+            return true
+        end if
+        if (Selected.Count( ) = 0) andalso (len( SelBand ) = 0) then return false
+        this.SelectNone( )
+    case SDLK_TAB
+        if Def->nItems = 0 then return true
+        dim as int32 i = -1
+        if Selected.Count( ) then i = tkReportDef_FindItem( Def, Selected[0] )
+        if sz then i -= 1 else i += 1
+        if i < 0 then i = Def->nItems - 1
+        if i >= Def->nItems then i = 0
+        this.SelectOnly( Def->items(i).id )
+    case else
+        return false
+    end select
+    return true
+end function
+
+sub ReportCanvas.Nudge( byval dx as float32, byval dy as float32, byval resize_ as boolean )
+    if Selected.Count( ) = 0 then exit sub
+    for each s as ustring in Selected
+        dim as int32 i = tkReportDef_FindItem( Def, s )
+        if i < 0 then continue for
+        dim byref as TKRD_ITEM it = Def->items(i)
+        if resize_ then
+            it.w = redits.Round2( it.w + dx )
+            it.h = redits.Round2( it.h + dy )
+            if it.w < 1 then it.w = 1
+            if (it.h < 1) andalso (it.kind <> "line") then it.h = 1
+            if it.h < 0 then it.h = 0
+        else
+            it.x = redits.Round2( it.x + dx )
+            it.y = redits.Round2( it.y + dy )
+            if it.x < 0 then it.x = 0
+            if it.y < 0 then it.y = 0
+        end if
+        this.Dirty( tkReportDef_FindBand( Def, it.band ) )
+    next
+    this.Commit( )
+end sub
+
+' ---- edits ---------------------------------------------------------------------------------------
+sub ReportCanvas.DeleteSelection( )
+    if Selected.Count( ) = 0 then exit sub
+    redits.DeleteItems( Def, Selected )
+    Selected.Clear( )
+    this.DirtyAll( )
+    this.Relayout( )
+    this.Commit( )
+end sub
+
+' Delete, the key or the right-click menu's: the band picked, else the items selected.
+sub ReportCanvas.DeleteSubject( )
+    if len( SelBand ) then
+        redits.DeleteBand( Def, SelBand )
+        SelBand = ""
+        this.DirtyAll( )
+        this.Relayout( )
+        this.Commit( )
+    else
+        this.DeleteSelection( )
+    end if
+end sub
+
+function ReportCanvas.CanDelete( ) as boolean
+    return (Selected.Count( ) > 0) orelse (len( SelBand ) > 0)
+end function
+
+' A right click acts on what it lands on: an unselected item becomes the selection (a selected one
+' keeps the whole selection), a band's caption or body picks the band, the backdrop nothing. Then
+' the host's menu (mainwin's report menu).
+sub ReportCanvas.OnRightPress( byval x as long, byval y as long )
+    if (Drag <> RDragNone) orelse (Def = 0) then exit sub
+    if len( Tool ) then Tool = ""
+    dim as int32 i = this.HitItem( x, y )
+    if i >= 0 then
+        if this.IsSelected( Def->items(i).id ) = false then this.SelectOnly( Def->items(i).id )
+    else
+        dim as int32 bi = this.HitBand( x, y )
+        if bi >= 0 then
+            this.SelectBand( Def->bands(bi).id )
+        elseif (Selected.Count( ) > 0) orelse (len( SelBand ) > 0) then
+            this.SelectNone( )
+        end if
+    end if
+    tkWidget_Invalidate( Glass )
+    if OnContextMenu then OnContextMenu( MenuOwner, @this, x, y )
+end sub
+
+sub ReportCanvas.Copy( )
+    if Selected.Count( ) = 0 then exit sub
+    tkHost_SetClipboardText( redits.CopyText( Def, Selected ) )
+end sub
+
+sub ReportCanvas.Cut( )
+    if Selected.Count( ) = 0 then exit sub
+    this.Copy( )
+    this.DeleteSelection( )
+end sub
+
+function ReportCanvas.CanPaste( ) as boolean
+    if tkHost_HasClipboardText( ) = false then return false
+    return redits.IsClipText( tkHost_GetClipboardText( ) )
+end function
+
+' Into the anchor's band, a grid step down and across; else into the band picked, else into the
+' first band shown.
+sub ReportCanvas.Paste( )
+    if (Def = 0) orelse (Def->nBands = 0) then exit sub
+    dim as ustring text = tkHost_GetClipboardText( )
+    if redits.IsClipText( text ) = false then exit sub
+    dim as ustring band = Def->bands(Order[0]).id
+    if len( SelBand ) then band = SelBand          ' a band picked (its right-click menu): into it
+    if Selected.Count( ) then
+        dim as int32 i = tkReportDef_FindItem( Def, Selected[0] )
+        if i >= 0 then band = Def->items(i).band
+    end if
+    dim as float32 g = redits.GridPt( Def )
+    dim as Array( of ustring ) ids
+    if redits.PasteText( Def, text, band, g, g, ids ) = false then exit sub
+    Selected = ids
+    this.DirtyAll( )
+    this.Relayout( )
+    this.Commit( )
+end sub
+
+sub ReportCanvas.Align( byval mode as redits.RAlign )
+    if Selected.Count( ) < 2 then exit sub
+    redits.AlignItems( Def, Selected, mode )
+    this.DirtyAll( )
+    this.Commit( )
+end sub
+
+sub ReportCanvas.Space( byval down_ as boolean )
+    if Selected.Count( ) < 3 then exit sub
+    redits.SpaceEqual( Def, Selected, down_ )
+    this.DirtyAll( )
+    this.Commit( )
+end sub
+
+sub ReportCanvas.ToFront( )
+    if Selected.Count( ) = 0 then exit sub
+    redits.ToFront( Def, Selected )
+    this.DirtyAll( )
+    this.Commit( )
+end sub
+
+sub ReportCanvas.ToBack( )
+    if Selected.Count( ) = 0 then exit sub
+    redits.ToBack( Def, Selected )
+    this.DirtyAll( )
+    this.Commit( )
+end sub
+
+' ---- painting ------------------------------------------------------------------------------------
+' A band's caption: its id, kind, and what it shows or groups on (the file's own words).
+' A band's caption bar: its kind first, then its id and what it reads or groups by --
+' "detail (d:Orders)", "group_header (g1h:[Customer])", "report_header (title)" (author 2026-11-25).
+public function BandCaption( byref b as TKRD_BAND ) as ustring
+    dim as ustring extra = b.source
+    if len( b.group_ ) then
+        if len( extra ) then extra &= ", "
+        extra &= b.group_
+    end if
+    if len( extra ) then return b.kind & " (" & b.id & ":" & extra & ")"
+    return b.kind & " (" & b.id & ")"
+end function
+
+sub ReportCanvas.Paint( byval b as TK_PAINT ptr )
+    dim as TKTHEME_COLORS t = tkTheme_Get( )
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, Glass->cw, Glass->ch )
+    b->SetBackColor( Backdrop_( ) )
+    b->PaintRect( @rc )
+    if Def = 0 then exit sub
+    if (Rp <> 0) andalso (Rp->r <> b->renderer) then
+        tkPrintReplay_Destroy( Rp )
+        Rp = 0
+    end if
+    if Rp = 0 then Rp = tkPrintReplay_Create( b->renderer, b->engine )
+    dim as single s = this.PxPerPt( )
+    dim as long rl = this.Sc( RULER )
+    dim as TKRECT view_
+    tkRect_Set( view_, this.GutterW( ) + rl, rl, Glass->cw, Glass->ch )
+    b->PushClip( @view_ )
+    b->SetFont( Glass->pHost->pDefaultFont )
+    dim as long pl = this.PaperLeft( ), pw = this.PaperWidthPx( ), cl = this.ContentLeft( )
+    dim as long cr = cl + cint( tkReportDef_ContentWidth( Def ) * s )
+    for k as int32 = 0 to Order.Count( ) - 1
+        dim as int32 bi = Order[k]
+        dim as TKRECT body = this.BandBodyRect( bi )
+        if (body.bottom < view_.top) orelse (body.top > view_.bottom) then continue for
+        dim as TKRECT ln
+        ' the paper, the margins as faint lines, the band as recorded
+        dim as TKRECT paper
+        tkRect_Set( paper, pl, body.top, pl + pw, body.bottom )
+        b->SetBackColor( Paper_( ) )
+        b->PaintRect( @paper )
+        b->SetBackColor( MarginLine_( ) )
+        tkRect_Set( ln, cl - 1, body.top, cl, body.bottom ) : b->PaintRect( @ln )
+        tkRect_Set( ln, cr, body.top, cr + 1, body.bottom ) : b->PaintRect( @ln )
+        tkRect_Set( ln, pl, body.bottom - 1, pl + pw, body.bottom ) : b->PaintRect( @ln )   ' its bottom edge: drag it
+        while Docs.Count( ) <= bi
+            Docs.Push( 0 )
+        wend
+        if Docs[bi] = 0 then Docs[bi] = tkReportDef_RecordBand( Def, bi, tkReportDef_ContentWidth( Def ) )
+        if Docs[bi] then
+            tkPrintReplay_Page( Rp, cast( TK_PRINTDOC ptr, Docs[bi] ), 0, body.left + b->ox, body.top + b->oy, s, @b->rcCur )
+            b->ApplyClip( 0 )
+        end if
+    next
+    ' the selection: an outline round each, grips on the anchor
+    for each id as ustring in Selected
+        dim as int32 i = tkReportDef_FindItem( Def, id )
+        if i < 0 then continue for
+        dim as TKRECT r = this.ItemRect( i )
+        r.left -= 1 : r.top -= 1 : r.right += 1 : r.bottom += 1
+        b->SetPenColor( t.Accent )
+        b->PaintRoundOutline( @r, 0, 1 )
+    next
+    if Selected.Count( ) then
+        dim as int32 i = tkReportDef_FindItem( Def, Selected[0] )
+        if i >= 0 then
+            for g as long = 0 to 7
+                dim as TKRECT gr = this.GripRect( i, g )
+                b->SetBackColor( Paper_( ) )
+                b->PaintRect( @gr )
+                b->SetPenColor( t.Accent )
+                b->PaintRoundOutline( @gr, 0, 1 )
+            next
+        end if
+    end if
+    if Drag = RDragRubber then
+        dim as TKRECT r
+        tkRect_Set( r, iif( StartX < NowX, StartX, NowX ), iif( StartY < NowY, StartY, NowY ), _
+                    iif( StartX < NowX, NowX, StartX ), iif( StartY < NowY, NowY, StartY ) )
+        b->SetPenColor( t.Accent )
+        b->PaintRoundOutline( @r, 0, 1 )
+    end if
+    b->PopClip( )
+    this.PaintGutter( b )
+    this.PaintRulers( b )
+end sub
+
+' A band kind's shade in the gutter: its hue a little into the theme's surface, light or dark.
+private function BandShade_( byref kind as const ustring ) as ulong
+    dim as ulong hue
+    select case lcase( kind )
+    case "report_header", "report_footer" : hue = tkRGB( 96, 150, 220 )
+    case "page_header", "page_footer" : hue = tkRGB( 72, 180, 170 )
+    case "group_header", "group_footer" : hue = tkRGB( 150, 130, 220 )
+    case "detail" : hue = tkRGB( 110, 185, 110 )
+    case "detail_report" : hue = tkRGB( 210, 160, 80 )
+    case else : hue = tkRGB( 210, 110, 110 )      ' no_data
+    end select
+    dim as TKTHEME_COLORS t = tkTheme_Get( )
+    dim as long pct = iif( t.IsDark, 32, 40 )
+    dim as ulong c = t.Surface
+    dim as long br = (c shr 16) and 255, bg = (c shr 8) and 255, bb = c and 255
+    dim as long hr = (hue shr 16) and 255, hg = (hue shr 8) and 255, hb = hue and 255
+    return tkRGB( br + (hr - br) * pct \ 100, bg + (hg - bg) * pct \ 100, bb + (hb - bb) * pct \ 100 )
+end function
+
+' The gutter: each band's cell in its kind's shade, its kind written up it -- the rest in its tip
+' (author 2026-11-25); the band picked in the selection's colours. Nested bands' cells lie over their
+' parent's.
+sub ReportCanvas.PaintGutter( byval b as TK_PAINT ptr )
+    dim as TKTHEME_COLORS t = tkTheme_Get( )
+    dim as long rl = this.Sc( RULER ), g = this.GutterW( ), col = this.Sc( GUTTER_COL )
+    dim as TKRECT clip_, rc
+    tkRect_Set( clip_, 0, rl, g, Glass->ch )
+    b->PushClip( @clip_ )
+    b->SetBackColor( t.Window )
+    b->PaintRect( @clip_ )
+    b->SetFont( Glass->pHost->pDefaultFont )
+    for k as int32 = 0 to Order.Count( ) - 1
+        dim as int32 bi = Order[k]
+        dim as TKRECT cell = this.CaptionRect( bi )
+        if (cell.bottom < rl) orelse (cell.top > Glass->ch) then continue for
+        dim as boolean picked = (len( SelBand ) > 0) andalso (lcase( SelBand ) = lcase( Def->bands(bi).id ))
+        b->SetBackColor( iif( picked, t.Selected, BandShade_( Def->bands(bi).kind ) ) )
+        b->PaintRect( @cell )
+        b->SetBackColor( t.Border )
+        tkRect_Set( rc, cell.left, cell.bottom - 1, cell.right, cell.bottom ) : b->PaintRect( @rc )
+        tkRect_Set( rc, cell.left, cell.top, cell.left + 1, cell.bottom ) : b->PaintRect( @rc )
+        ' the kind in the band's own column, reading up
+        dim as TKRECT tr
+        tkRect_Set( tr, cell.left + 1, cell.top + this.Sc( 3 ), cell.left + col, cell.bottom - this.Sc( 3 ) )
+        b->SetForeColor( iif( picked, t.SelectedText, t.Text ) )
+        b->PaintTextRotated( Def->bands(bi).kind, @tr, TK_DT_CENTER or TK_DT_ELLIPSIS )
+    next
+    b->PopClip( )
+    b->SetBackColor( t.Border )
+    tkRect_Set( rc, g - 1, rl, g, Glass->ch ) : b->PaintRect( @rc )
+end sub
+
+' The rulers: across from the paper's left edge, down from each band's top; the margins shaded on
+' the top one. mm (a label each cm), inches (eighths, a label each inch) or points (6 pt, a label each 72).
+sub ReportCanvas.PaintRulers( byval b as TK_PAINT ptr )
+    dim as TKTHEME_COLORS t = tkTheme_Get( )
+    dim as single s = this.PxPerPt( )
+    dim as long rl = this.Sc( RULER )
+    dim as single unit = 72 / 25.4
+    dim as long every = 10
+    select case lcase( Def->units )
+    case "in" : unit = 9 : every = 8
+    case "pt" : unit = 6 : every = 12
+    end select
+    dim as TKRECT rc
+    tkRect_Set( rc, 0, 0, Glass->cw, rl )
+    b->SetBackColor( t.Window ) : b->PaintRect( @rc )
+    dim as long g = this.GutterW( )
+    tkRect_Set( rc, g, 0, g + rl, Glass->ch )
+    b->PaintRect( @rc )
+    dim as long pl = this.PaperLeft( ), pw = this.PaperWidthPx( ), cl = this.ContentLeft( )
+    dim as long cr = cl + cint( tkReportDef_ContentWidth( Def ) * s )
+    b->SetBackColor( t.Surface )
+    tkRect_Set( rc, pl, 0, cl, rl ) : b->PaintRect( @rc )
+    tkRect_Set( rc, cr, 0, pl + pw, rl ) : b->PaintRect( @rc )
+    b->SetFont( Glass->pHost->pDefaultFont )
+    b->SetForeColor( t.TextDim )
+    dim as TKRECT clip_
+    tkRect_Set( clip_, g + rl, 0, Glass->cw, rl )
+    b->PushClip( @clip_ )
+    dim as long n = 0
+    while true
+        dim as long x = pl + cint( n * unit * s )
+        if x > pl + pw then exit while
+        dim as long tick = iif( n mod every = 0, rl \ 2, iif( (every = 10) andalso (n mod 5 = 0), rl \ 3, rl \ 5 ) )
+        tkRect_Set( rc, x, rl - tick, x + 1, rl )
+        b->SetBackColor( t.TextDim ) : b->PaintRect( @rc )
+        if (n mod every = 0) andalso (n > 0) then
+            tkRect_Set( rc, x + this.Sc( 2 ), 0, x + this.Sc( 40 ), rl \ 2 + this.Sc( 2 ) )
+            b->PaintText( str( n \ every ), @rc, TK_DT_LEFT or TK_DT_ELLIPSIS )
+        end if
+        n += 1
+    wend
+    b->PopClip( )
+    tkRect_Set( clip_, g, rl, g + rl, Glass->ch )
+    b->PushClip( @clip_ )
+    for k as int32 = 0 to Order.Count( ) - 1
+        dim as TKRECT body = this.BandBodyRect( Order[k] )
+        if (body.bottom < rl) orelse (body.top > Glass->ch) then continue for
+        n = 0
+        while true
+            dim as long y = body.top + cint( n * unit * s )
+            if y > body.bottom then exit while
+            dim as long tick = iif( n mod every = 0, rl \ 2, iif( (every = 10) andalso (n mod 5 = 0), rl \ 3, rl \ 5 ) )
+            tkRect_Set( rc, g + rl - tick, y, g + rl, y + 1 )
+            b->SetBackColor( t.TextDim ) : b->PaintRect( @rc )
+            n += 1
+        wend
+    next
+    b->PopClip( )
+    ' the corner, over the gutter too
+    tkRect_Set( rc, 0, 0, g + rl, rl )
+    b->SetBackColor( t.Window ) : b->PaintRect( @rc )
+    tkRect_Set( rc, g + rl - 1, 0, g + rl, Glass->ch ) : b->SetBackColor( t.Border ) : b->PaintRect( @rc )
+    tkRect_Set( rc, 0, rl - 1, Glass->cw, rl ) : b->PaintRect( @rc )
+end sub
+
+' ---- the palettes' side (RD6) --------------------------------------------------------------------
+sub ReportCanvas.SelectBand( byref id as const ustring )
+    Selected.Clear( )
+    SelBand = id
+    this.Changed( )
+end sub
+
+' What the inspector shows: the anchor item, else the band picked, else the report.
+function ReportCanvas.Subject( ) as ustring
+    if Selected.Count( ) then return "item:" & Selected[0]
+    if len( SelBand ) then return "band:" & SelBand
+    return ""
+end function
+
+' One property, as the inspector edits it. The report must still read back as a .tkreport (the
+' file's reader decides what a colour, a level or a reset may be); else nothing changes and the
+' answer is why. "" = done, as one undoable edit.
+function ReportCanvas.ApplyProp( byref target as const ustring, byref key_ as const ustring, byref value as const ustring ) as ustring
+    if Def = 0 then return "?"
+    dim as ustring before = tkReportDef_SaveText( Def )
+    dim as ustring fault = rmodel.SetProp( Def, target, key_, value )
+    if len( fault ) = 0 then
+        dim as ustring e
+        dim as TK_REPORTDEF ptr t = tkReportDef_LoadText( tkReportDef_SaveText( Def ), e )
+        if t then
+            tkReportDef_Destroy( t )
+        else
+            fault = e
+            dim as long nl = instr( fault, wchr( 10 ) )
+            if nl > 0 then fault = left( fault, nl - 1 )
+        end if
+    end if
+    if len( fault ) then
+        ' back to how it was: the model, not just the one field
+        dim as ustring e
+        dim as TK_REPORTDEF ptr t = tkReportDef_LoadText( before, e )
+        if t then
+            tkReportDef_Destroy( Def )
+            Def = t
+        end if
+        this.DirtyAll( )
+        this.Relayout( )
+        this.Changed( )
+        return fault
+    end if
+    ' a renamed item or band keeps its selection
+    if (key_ = "id") andalso (left( target, 5 ) = "item:") andalso (Selected.Count( ) > 0) then
+        dim as ustring v = value
+        Selected[0] = v
+    end if
+    if (key_ = "id") andalso (left( target, 5 ) = "band:") then SelBand = value
+    this.DirtyAll( )
+    this.Relayout( )
+    this.Commit( )
+    return ""
+end function
+
+' Insert band: a band of kind, selected. False when the report cannot take one (redits.CanInsertBand).
+' A detail_report goes under the detail of the band selected, or of the first item selected.
+function ReportCanvas.InsertBand( byref kind as const ustring ) as boolean
+    if Def = 0 then return false
+    dim as ustring under = SelBand
+    if (len( under ) = 0) andalso (Selected.Count( ) > 0) then
+        dim as int32 ii = tkReportDef_FindItem( Def, Selected[0] )
+        if ii >= 0 then under = Def->items(ii).band
+    end if
+    dim as ustring id = redits.InsertBand( Def, kind, under )
+    if len( id ) = 0 then return false
+    Selected.Clear( )
+    SelBand = id
+    this.DirtyAll( )
+    this.Relayout( )
+    this.Commit( )
+    return true
+end function
+
+' A click with a tool: what the tool places, in the band's body under the click, snapped. A field
+' from the field list brings its caption into the header above unless Shift is down. False (the
+' tool stays) when the click is not in a band's body.
+function ReportCanvas.PlaceTool( byval x as long, byval y as long, byval mods as long ) as boolean
+    dim as int32 bi = this.HitBand( x, y )
+    if bi < 0 then return false
+    dim as TKRECT body = this.BandBodyRect( bi )
+    if y < body.top then return false
+    dim as single s = this.PxPerPt( )
+    dim as float32 g = 0
+    if SnapToGrid then g = redits.GridPt( Def )
+    dim as float32 px = redits.Snap( (x - body.left) / s, g ), py = redits.Snap( (y - body.top) / s, g )
+    if px < 0 then px = 0
+    if py < 0 then py = 0
+    dim as ustring band = Def->bands(bi).id, id, caption
+    if left( Tool, 6 ) = "field:" then
+        dim as ustring t = mid( Tool, 7 )
+        dim as long a = instr( t, "|" )
+        dim as long b = instr( a + 1, t, "|" )
+        dim as ustring kind_ = left( t, a - 1 ), src = mid( t, a + 1, b - a - 1 ), nm = mid( t, b + 1 )
+        select case kind_
+        case "f"
+            id = redits.PlaceField( Def, band, px, py, src, nm, (mods and SDL_KMOD_SHIFT) = 0, caption )
+        case "p", "b"
+            id = redits.AddItem( Def, "field", band, px, py )
+            if len( id ) then
+                dim as ustring ex = nm
+                if kind_ = "p" then ex = "@" & nm
+                Def->items(tkReportDef_FindItem( Def, id )).expr = ex
+            end if
+        end select
+    else
+        id = redits.AddItem( Def, Tool, band, px, py )
+    end if
+    Tool = ""
+    if len( id ) = 0 then
+        this.Changed( )
+        return false
+    end if
+    Selected.Clear( )
+    SelBand = ""
+    Selected.Push( id )
+    this.DirtyAll( )
+    this.Relayout( )
+    this.Commit( )
+    return true
+end function
+
+' A dialog's edited copy of the report in place of the canvas's, as ONE undoable edit (RD7). The copy
+' must read back as a .tkreport; else it is dropped and the answer is why. The canvas owns nd after.
+function ReportCanvas.AdoptDef( byval nd as TK_REPORTDEF ptr ) as ustring
+    if nd = 0 then return "?"
+    dim as ustring e
+    dim as TK_REPORTDEF ptr t = tkReportDef_LoadText( tkReportDef_SaveText( nd ), e )
+    if t = 0 then
+        tkReportDef_Destroy( nd )
+        dim as long nl = instr( e, wchr( 10 ) )
+        if nl > 0 then e = left( e, nl - 1 )
+        return e
+    end if
+    tkReportDef_Destroy( t )
+    this.DirtyAll( )
+    if Def then tkReportDef_Destroy( Def )
+    Def = nd
+    dim as Array( of ustring ) keep
+    for each s as ustring in Selected
+        if tkReportDef_FindItem( Def, s ) >= 0 then keep.Push( s )
+    next
+    Selected = keep
+    if tkReportDef_FindBand( Def, SelBand ) < 0 then SelBand = ""
+    this.Relayout( )
+    this.Commit( )
+    return ""
+end function
+
+' Page setup's answer: paper, orientation, margins (tkReportDef_SetPageSetup), one undoable edit.
+function ReportCanvas.ApplyPageSetup( byref ps as TKPAGESETUP ) as ustring
+    if Def = 0 then return "?"
+    dim as ustring e
+    dim as TK_REPORTDEF ptr nd = tkReportDef_LoadText( tkReportDef_SaveText( Def ), e )
+    if nd = 0 then return e
+    tkReportDef_SetPageSetup( nd, ps )
+    return this.AdoptDef( nd )
+end function
+
+' ---- the Preview (RD8) -----------------------------------------------------------------------------
+' <rpt>.sample.toml beside the report: its design rows.
+function ReportCanvas.SamplePath( ) as ustring
+    if len( ReportPath ) = 0 then return ""
+    return fs.PathJoin( fs.PathParent( ReportPath ), fs.PathStem( ReportPath ) & ".sample.toml" )
+end function
+
+' The Preview on: a viewer in place of the bands, showing a copy of the report made in-process
+' (tkReportDef) over design data (rpreview: live SQLite, else the sample rows), its parameter strip
+' working. Off: the bands again. The answer is what could not be bound or made ("" = shown).
+function ReportCanvas.SetPreview( byval on_ as boolean ) as ustring
+    dim as ustring errs
+    if on_ = false then
+        if Viewer then tkReportViewer_SetReportDef( Viewer, 0 )
+        if PreviewDef then tkReportDef_Destroy( PreviewDef )
+        PreviewDef = 0
+        Rows.Release( )
+        Rows.Sources.Clear( )
+        Previewing = false
+        if Frame then this.PlaceSurface( )
+        return ""
+    end if
+    if (Def = 0) orelse (Frame = 0) then return "?"
+    if Previewing then this.SetPreview( false )
+    PreviewDef = tkReportDef_LoadText( tkReportDef_SaveText( Def ), errs )
+    if PreviewDef = 0 then return errs
+    dim as ustring sample, none_, dir_
+    if len( ReportPath ) then dir_ = fs.PathParent( ReportPath )
+    dim as ustring sp = this.SamplePath( )
+    if len( sp ) andalso fs.IsFile( sp ) then sample = fs.ReadAllText( sp ).ValueOr( none_ )
+    rpreview.BindDesignData( PreviewDef, dir_, sample, Rows, errs )
+    if Viewer = 0 then Viewer = tkReportViewer_Create( Frame, 4 )
+    Previewing = true
+    this.PlaceSurface( )
+    tkReportViewer_SetReportDef( Viewer, PreviewDef )
+    if tkReportViewer_GetDocument( Viewer ) = 0 then
+        ' why the report could not be made: the definition says, made once more here
+        dim as ustring why
+        dim as TK_PRINTDOC ptr t = tkReportDef_CreateDoc( PreviewDef, why )
+        if t then tkPrintDoc_Destroy( t )
+        if len( why ) then errs = why
+    end if
+    return errs
+end function

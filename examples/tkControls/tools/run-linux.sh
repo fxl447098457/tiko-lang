@@ -44,12 +44,16 @@ case " ${names[*]} " in
         TIKO_VENDOR_CACHE=${TIKO_VENDOR_CACHE:-$HOME/.cache/tko-vendorfetch} sh "$W/build/vendorfetch.sh" --module SDL3 \
             || { echo "vendorfetch.sh failed: no static SDL3"; exit 1; } ;;
 esac
-# tkContacts keeps its data in SQLite: vendor/sqlite3's library (built from source once, then cached).
+# tkContacts, tkGridData, tkReportBarcode and the report suites read SQLite: vendor/sqlite3's library (built from source once, then cached).
 case " ${names[*]} " in
-    *" tkContacts "*|"  ")
+    *" tkContacts "*|*" tkGridData "*|*" tkReportBarcode "*|*" tkReport "*|*" tkReportDef "*|*" tkReportDesigner "*|"  ")
         TIKO_VENDOR_CACHE=${TIKO_VENDOR_CACHE:-$HOME/.cache/tko-vendorfetch} sh "$W/build/vendorfetch.sh" --module sqlite3 \
             || { echo "vendorfetch.sh failed: no sqlite3"; exit 1; } ;;
 esac
+# tkBarcode links libzint (vendor/zint, built from source once, then cached); tkMeta's table, and so
+# every designed form, imports it.
+TIKO_VENDOR_CACHE=${TIKO_VENDOR_CACHE:-$HOME/.cache/tko-vendorfetch} sh "$W/build/vendorfetch.sh" --module zint \
+    || { echo "vendorfetch.sh failed: no zint"; exit 1; }
 export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir EGL_LOG_LEVEL=fatal
 [ -n "$LIB" ] && export LD_LIBRARY_PATH=$LIB
 export TIKO_PKG=$W/pkg

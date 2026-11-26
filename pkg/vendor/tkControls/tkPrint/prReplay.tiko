@@ -1,0 +1,315 @@
+'    Copyright (C) 2016-2026 Paul Squires, PlanetSquires Software
+'
+'    This Source Code Form is subject to the terms of the Mozilla Public
+'    License, v. 2.0. If a copy of the MPL was not distributed with this
+'    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+'
+' tkPrint -- replay: a page's ops back to pixels on any SDL renderer, at any scale.
+'
+' A TK_PRINTREPLAY belongs to one renderer and caches what replay needs there: fonts opened at
+' the pixel sizes asked for, and textures made from the document's images. The preview keeps one
+' per window; raster export makes one per page on a software renderer over a surface.
+'
+' Every op is mapped (point * pxPerPt + origin) and handed to TK_PAINT.PlayOp, the same AA
+' primitives tkPaint draws with. Pens and font sizes scale with the page. LATE text is resolved
+' here: {p} and {n} filled in, measured in the replay font, aligned in its rect.
+#module "tkPrint"
+
+#import "../tkHost"
+using tkHost
+using tkPaint
+
+public type PR_RFONT
+    path   as string
+    face   as long
+    style  as long
+    q      as long                 ' the size in 1/64 pixels (FreeType's 26.6)
+    f      as TTF_Font ptr
+end type
+
+public type PR_RTEX
+    doc    as TK_PRINTDOC ptr
+    img    as long
+    s      as SDL_Surface ptr     ' the surface it was made from (a cleared doc reuses indices)
+    tex    as SDL_Texture ptr
+end type
+
+public type TK_PRINTREPLAY as TK_PRINTREPLAY_
+
+public type TK_PRINTREPLAY_
+    r         as SDL_Renderer ptr
+    engine    as TTF_TextEngine ptr
+    bOwnEng   as boolean
+    fonts(any) as PR_RFONT
+    nFonts    as long
+    texs(any) as PR_RTEX
+    nTexs     as long
+end type
+
+' engine 0: the replay makes its own renderer text engine.
+public function tkPrintReplay_Create( byval r as SDL_Renderer ptr, byval engine as TTF_TextEngine ptr = 0 ) as TK_PRINTREPLAY ptr
+    if r = 0 then return 0
+    dim as TK_PRINTREPLAY ptr rp = new TK_PRINTREPLAY
+    rp->r = r
+    rp->engine = engine
+    if engine = 0 then
+        rp->engine = TTF_CreateRendererTextEngine( r )
+        rp->bOwnEng = true
+    end if
+    return rp
+end function
+
+' Fonts and textures go; the renderer and a borrowed engine stay.
+public sub tkPrintReplay_Flush( byval rp as TK_PRINTREPLAY ptr )
+    if rp = 0 then exit sub
+    for i as long = 0 to rp->nFonts - 1
+        tkHost_CloseFont( rp->fonts(i).f )
+    next
+    rp->nFonts = 0
+    for i as long = 0 to rp->nTexs - 1
+        if rp->texs(i).tex then SDL_DestroyTexture( rp->texs(i).tex )
+    next
+    rp->nTexs = 0
+end sub
+
+public sub tkPrintReplay_Destroy( byval rp as TK_PRINTREPLAY ptr )
+    if rp = 0 then exit sub
+    tkPrintReplay_Flush( rp )
+    if rp->bOwnEng andalso (rp->engine <> 0) then TTF_DestroyRendererTextEngine( rp->engine )
+    delete rp
+end sub
+
+' A doc font at px pixels (to 1/64 px, FreeType's own precision, so a replay at the recorded scale
+' rasterises exactly as the original font did), opened once per replay.
+private function FontAt( byval rp as TK_PRINTREPLAY ptr, byval doc as TK_PRINTDOC ptr, byval fi as long, _
+                         byval px as single ) as TTF_Font ptr
+    if (fi < 0) orelse (fi >= doc->nFonts) orelse (px <= 0) then return 0
+    dim as long q = clng( int( px * 64 + 0.5 ) )
+    if q < 1 then q = 1
+    dim byref as PR_FONTREF fr = doc->fonts(fi)
+    for i as long = 0 to rp->nFonts - 1
+        if (rp->fonts(i).q = q) andalso (rp->fonts(i).face = fr.face) andalso (rp->fonts(i).style = fr.style) _
+           andalso (rp->fonts(i).path = fr.path) then return rp->fonts(i).f
+    next
+    if rp->nFonts >= 128 then tkPrintReplay_Flush( rp )         ' a zoom sweep: start over
+    dim as TTF_Font ptr f = tkHost_OpenFontFace( fr.path, 12, fr.face )
+    if f = 0 then return 0
+    TTF_SetFontSizeDPI( f, q / 64, 72, 72 )
+    if fr.style then TTF_SetFontStyle( f, fr.style )
+    if rp->nFonts > ubound( rp->fonts ) then redim preserve rp->fonts( 0 to rp->nFonts * 2 + 7 )
+    rp->fonts(rp->nFonts).path = fr.path
+    rp->fonts(rp->nFonts).face = fr.face
+    rp->fonts(rp->nFonts).style = fr.style
+    rp->fonts(rp->nFonts).q = q
+    rp->fonts(rp->nFonts).f = f
+    rp->nFonts += 1
+    return f
+end function
+
+private function TexOf( byval rp as TK_PRINTREPLAY ptr, byval doc as TK_PRINTDOC ptr, byval ii as long ) as SDL_Texture ptr
+    if (ii < 0) orelse (ii >= doc->nImgs) then return 0
+    dim as SDL_Surface ptr s = doc->imgs(ii)
+    if s = 0 then return 0
+    for i as long = 0 to rp->nTexs - 1
+        if (rp->texs(i).doc = doc) andalso (rp->texs(i).img = ii) andalso (rp->texs(i).s = s) then return rp->texs(i).tex
+    next
+    dim as SDL_Texture ptr t = SDL_CreateTextureFromSurface( rp->r, s )
+    if t = 0 then return 0
+    SDL_SetTextureBlendMode( t, SDL_BLENDMODE_BLEND )
+    if rp->nTexs > ubound( rp->texs ) then redim preserve rp->texs( 0 to rp->nTexs * 2 + 7 )
+    rp->texs(rp->nTexs).doc = doc
+    rp->texs(rp->nTexs).img = ii
+    rp->texs(rp->nTexs).s = s
+    rp->texs(rp->nTexs).tex = t
+    rp->nTexs += 1
+    return t
+end function
+
+' Late text: {p} -> page number (from 1), {n} -> page count.
+public function PrLateText( byref fmt as string, byval page as long, byval count as long, byval doc as TK_PRINTDOC ptr = 0 ) as string
+    dim as string s = fmt
+    dim as long i
+    if doc then                                ' {s:N} = late slot N (tkPrintDoc_SetSlot)
+        i = instr( s, "{s:" )
+        while i
+            dim as long e = instr( i, s, "}" )
+            dim as long n = valint( mid( s, i + 3, e - i - 3 ) )
+            dim as string v
+            if (n >= 0) andalso (n < doc->nSlots) then v = doc->slots(n)
+            s = left( s, i - 1 ) & v & mid( s, e + 1 )
+            i = instr( s, "{s:" )
+        wend
+    end if
+    i = instr( s, "{p}" )
+    while i
+        s = left( s, i - 1 ) & (page + 1) & mid( s, i + 3 )
+        i = instr( s, "{p}" )
+    wend
+    i = instr( s, "{n}" )
+    while i
+        s = left( s, i - 1 ) & count & mid( s, i + 3 )
+        i = instr( s, "{n}" )
+    wend
+    return s
+end function
+
+' Replay page 'page' with its top-left at (x, y) pixels and pxPerPt pixels per point. pClip
+' (renderer pixels) narrows the page's own rect. The page is NOT filled: paper is the caller's.
+public function tkPrintReplay_Page( byval rp as TK_PRINTREPLAY ptr, byval doc as TK_PRINTDOC ptr, byval page as long, _
+                                    byval x as single, byval y as single, byval pxPerPt as single, _
+                                    byval pClip as TKRECT ptr = 0 ) as boolean
+    if (rp = 0) orelse (doc = 0) orelse (page < 0) orelse (page >= doc->nPages) orelse (pxPerPt <= 0) then return false
+    dim as PR_PAGE ptr pp = doc->pages(page)
+    dim as single s = pxPerPt
+    dim as TK_PAINT p
+    p.renderer = rp->r
+    p.engine = rp->engine
+    p.fScale = 1
+    dim as long l = clng( int( x ) ), t = clng( int( y ) )
+    p.Begin( l, t, clng( -int( -(x + pp->wPt * s) ) ) - l, clng( -int( -(y + pp->hPt * s) ) ) - t, pClip )
+    if tkRect_IsEmpty( p.rcClip ) then return true
+    dim as SDL_FPoint buf()
+    for i as long = 0 to pp->nOps - 1
+        dim byref as PR_OP q = pp->ops(i)
+        dim as TK_RECOP o
+        o.op = q.op : o.c = q.c : o.w = q.w * s : o.nDash = q.nDash : o.bRound = q.bRound : o.n = q.n
+        o.rc.x = q.x * s + x : o.rc.y = q.y * s + y : o.rc.w = q.cw * s : o.rc.h = q.ch * s
+        if q.bGrad then
+            o.bGrad = true : o.gc0 = q.gc0 : o.gc1 = q.gc1
+            o.gx0 = q.gx0 * s + x : o.gy0 = q.gy0 * s + y : o.gx1 = q.gx1 * s + x : o.gy1 = q.gy1 * s + y
+        end if
+        select case q.op
+        case TKREC_FILLPOLY, TKREC_STROKE, TKREC_STROKEOPEN
+            if q.n > ubound( buf ) + 1 then redim buf( 0 to q.n - 1 )
+            for k as long = 0 to q.n - 1
+                buf(k).x = pp->pts(q.i0 + k).x * s + x
+                buf(k).y = pp->pts(q.i0 + k).y * s + y
+            next
+            o.pts = @buf(0)
+            p.PlayOp( o )
+        case TKREC_FILLRECT
+            ' EDGES, NOT ORIGIN + SIZE: SDL's software renderer truncates x and w (y and h)
+            ' separately, so abutting rects opened 1-px gaps and bars lost a pixel (measured with
+            ' tkBarcode, BC2: 700 white hairlines through a Data Matrix at 600 dpi, unreadable).
+            ' Round both edges to the pixel grid; a rect that had any width keeps one pixel.
+            dim as single ex1 = int( o.rc.x + 0.5 ), ex2 = int( o.rc.x + o.rc.w + 0.5 )
+            dim as single ey1 = int( o.rc.y + 0.5 ), ey2 = int( o.rc.y + o.rc.h + 0.5 )
+            if (o.rc.w > 0) andalso (ex2 <= ex1) then ex2 = ex1 + 1
+            if (o.rc.h > 0) andalso (ey2 <= ey1) then ey2 = ey1 + 1
+            o.rc.x = ex1 : o.rc.w = ex2 - ex1 : o.rc.y = ey1 : o.rc.h = ey2 - ey1
+            p.PlayOp( o )
+        case TKREC_GRADRECT, TKREC_CLIP
+            p.PlayOp( o )
+        case TKREC_TEXT
+            o.pFont = FontAt( rp, doc, q.font, q.size * s )
+            if o.pFont = 0 then continue for
+            o.sText = pp->strs(q.i0)
+            o.x = q.x * s + x : o.y = q.y * s + y
+            p.PlayOp( o )
+        case TKREC_IMAGE
+            o.tex = TexOf( rp, doc, q.img )
+            if o.tex = 0 then continue for
+            if q.sw > 0 then o.src.x = q.sx : o.src.y = q.sy : o.src.w = q.sw : o.src.h = q.sh
+            p.PlayOp( o )
+        case PR_LATE
+            dim as TTF_Font ptr f = FontAt( rp, doc, q.font, q.size * s )
+            if f = 0 then continue for
+            dim as string u8 = PrLateText( pp->strs(q.i0), page, doc->nPages, doc )
+            dim as single tw = tkText_WidthU8( f, u8 ), fh = TTF_GetFontHeight( f )
+            dim as single bx = q.x * s + x, by = q.y * s + y, bw = q.cw * s, bh = q.ch * s
+            o.op = TKREC_TEXT : o.pFont = f : o.sText = u8
+            select case q.flags and 3
+            case TK_DT_CENTER : o.x = bx + (bw - tw) / 2
+            case TK_DT_RIGHT : o.x = bx + bw - tw
+            case else : o.x = bx
+            end select
+            o.y = by + (bh - fh) / 2
+            if q.flags and TK_DT_TOP then o.y = by
+            if q.flags and TK_DT_BOTTOM then o.y = by + bh - fh
+            o.x = int( o.x + 0.5 ) : o.y = int( o.y + 0.5 )
+            p.PlayOp( o )
+        end select
+    next
+    SDL_SetRenderClipRect( rp->r, 0 )
+    return true
+end function
+
+' ---- raster --------------------------------------------------------------------------------
+' Page 'page' as a surface at dpi dots per inch (ARGB8888), on white unless bTransparent. The
+' caller destroys it. 0 when it cannot be made (the page too big for one surface: > 2^28 pixels).
+public function tkPrintDoc_RenderSurface( byval doc as TK_PRINTDOC ptr, byval page as long, byval dpi as single, _
+                                          byval bTransparent as boolean = false ) as SDL_Surface ptr
+    if (doc = 0) orelse (page < 0) orelse (page >= doc->nPages) orelse (dpi <= 0) then return 0
+    dim as PR_PAGE ptr pp = doc->pages(page)
+    dim as single s = dpi / TK_PT_PER_INCH
+    dim as long w = clng( int( pp->wPt * s + 0.5 ) ), h = clng( int( pp->hPt * s + 0.5 ) )
+    if (w < 1) orelse (h < 1) orelse (clngint( w ) * h > (1 shl 28)) then return 0
+    dim as SDL_Surface ptr surf = SDL_CreateSurface( w, h, SDL_PIXELFORMAT_ARGB8888 )
+    if surf = 0 then return 0
+    dim as SDL_Renderer ptr r = SDL_CreateSoftwareRenderer( surf )
+    if r = 0 then SDL_DestroySurface( surf ) : return 0
+    SDL_SetRenderDrawBlendMode( r, SDL_BLENDMODE_BLEND )
+    if bTransparent then
+        SDL_SetRenderDrawColor( r, 255, 255, 255, 0 )
+    else
+        SDL_SetRenderDrawColor( r, 255, 255, 255, 255 )
+    end if
+    SDL_RenderClear( r )
+    dim as TK_PRINTREPLAY ptr rp = tkPrintReplay_Create( r )
+    tkPrintReplay_Page( rp, doc, page, 0, 0, s )
+    SDL_FlushRenderer( r )
+    tkPrintReplay_Destroy( rp )
+    SDL_DestroyRenderer( r )
+    return surf
+end function
+
+' Pages first..last (from 0; last -1 = to the end) as PNG files at dpi. In pathPattern "{p}"
+' becomes the page number (from 1); without it, more than one page gets "-<n>" before the
+' extension. FALSE at the first page that fails.
+public function tkPrintDoc_ExportPng( byval doc as TK_PRINTDOC ptr, byref pathPattern as ustring, byval dpi as single, _
+                                      byval first as long = 0, byval last as long = -1 ) as boolean
+    if doc = 0 then return false
+    if last < 0 then last = doc->nPages - 1
+    if first < 0 then first = 0
+    if (first > last) orelse (last >= doc->nPages) then return false
+    dim as string pat = pathPattern
+    for i as long = first to last
+        dim as string path = pat
+        if instr( path, "{p}" ) then
+            path = PrLateText( path, i, doc->nPages )
+        elseif last > first then
+            dim as long dot = instrrev( path, "." ), sl = instrrev( path, "/" )
+            if instrrev( path, "\" ) > sl then sl = instrrev( path, "\" )
+            if dot > sl then
+                path = left( path, dot - 1 ) & "-" & (i + 1) & mid( path, dot )
+            else
+                path &= "-" & (i + 1)
+            end if
+        end if
+        dim as SDL_Surface ptr surf = tkPrintDoc_RenderSurface( doc, i, dpi )
+        if surf = 0 then return false
+        dim as boolean ok = IMG_SavePNG( surf, strptr( path ) )
+        SDL_DestroySurface( surf )
+        if ok = false then return false
+    next
+    return true
+end function
+
+' ---- late slots (Report Designer RD2) -----------------------------------------------------------
+' A slot is text known only when its scope closes (a group's total printed in its header). A
+' LATE text names it as {s:N}; replay and the PDF read the slot when they draw.
+public function tkPrintDoc_NewSlot( byval doc as TK_PRINTDOC ptr ) as long
+    if doc = 0 then return -1
+    if doc->nSlots > ubound( doc->slots ) then redim preserve doc->slots( 0 to doc->nSlots * 2 + 15 )
+    doc->slots(doc->nSlots) = ""
+    doc->nSlots += 1
+    return doc->nSlots - 1
+end function
+
+' Set slot n's text: every LATE text that names it shows it from now on.
+public sub tkPrintDoc_SetSlot( byval doc as TK_PRINTDOC ptr, byval n as long, byref text as string )
+    if (doc = 0) orelse (n < 0) orelse (n >= doc->nSlots) then exit sub
+    if doc->slots(n) = text then exit sub
+    doc->slots(n) = text
+    doc->serial += 1             ' pages already shown are drawn again (the preview caches by serial)
+end sub

@@ -16,6 +16,8 @@ Define created at compile time if the compilation target uses the X86 or X86_64 
 
 ## Remarks
 
+In tiko, [`TIKO_ARCH_X86_64`](Category-Tiko-Compiler-Define) is tiko's own name for the same test (`windows-x86_64` and `linux-x86_64`); tiko code uses it.
+
 ### Differences from QB
 
 - New to FreeBASIC
@@ -23,6 +25,7 @@ Define created at compile time if the compilation target uses the X86 or X86_64 
 ### See also
 
 - [`__FB_ARM__`](Fb-Arm)
+- [`TIKO_ARCH_X86_64`](Category-Tiko-Compiler-Define)
 - [Compiler Option: -target](Compiler-Option-Target)
 
 ## Examples

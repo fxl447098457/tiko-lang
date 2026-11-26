@@ -118,7 +118,7 @@ private function UserConvCost_ _
         return CONV_USERDEF + iif( nrt = t, 0, CONV_NUMERIC )
     end if
 
-    '' A CONVERSION CONSTRUCTOR on the destination -- any arity-1 constructor whose
+    '' A CONVERSION CONSTRUCTOR on the destination -- any one-argument constructor whose
     '' parameter is not the destination type itself, which is the copy constructor.
     if c.types->Kind( t ) = Tko.TK_UDT then
         dim as Tko.SymbolId cur = UdtMemberSym_( c, t, "__ctor" )
@@ -127,7 +127,7 @@ private function UserConvCost_ _
             guard += 1
             dim as Tko.Symbol ptr s = c.syms->SymbolAt( cur )
             if s = nullptr then exit while
-            if ProcParamCount_( c, cur ) = 1 then
+            if Tko.Check.StructorTakesOne( *c.ast, *c.syms, cur ) then   '' a defaulted tail too (structpick.tiko)
                 dim as Tko.TypeId pt = ProcParamTypeAt_( c, cur, 0 )
                 if pt <> Tko.TYPE_NONE then
                     dim as Tko.TypeId pu = c.types->Unqualify( pt )
@@ -807,6 +807,7 @@ private function ResolveCall_ _
         walk = ws->nextOverload
     wend
     dim as boolean overloaded = (ncand > 1)
+    dim as boolean refusalsTrusted = true   '' every refused candidate refused on grounds the scoring models -- RefusalTrusted_
 
     dim as Tko.SymbolId cur = callee
 
@@ -891,6 +892,7 @@ private function ResolveCall_ _
                 dim as int32 total = 0
                 dim as int32 ai = 0
                 dim as boolean viable = true
+                dim as Tko.TypeId refA = Tko.TYPE_NONE, refP = Tko.TYPE_NONE   '' the pair a refusal was judged on
                 for i as int32 = 0 to pp->count - 1
                     dim as Tko.NodeId prm = c.ast->ChildAt( pp->first, i )
                     if c.ast->Kind( prm ) <> Tko.N_PARAM then continue for
@@ -903,6 +905,7 @@ private function ResolveCall_ _
                     '' against a parameter that must be written.
                     if ai >= argT.Count then exit for
                     dim as Tko.TypeId at2 = cast( Tko.TypeId, argT[ai] )
+                    refA = Tko.TYPE_NONE : refP = Tko.TYPE_NONE
                     if at2 = Tko.TYPE_NONE then
                         if sp2->b = Tko.NODE_NONE then
                             viable = false
@@ -912,6 +915,7 @@ private function ResolveCall_ _
                         continue for
                     end if
                     dim as Tko.TypeId pt = c.info->TypeOf_( sp2->a )
+                    refA = at2 : refP = pt
 
                     '' A SPAN FOR AN 'x()' PARAMETER (docs/tiko-slices RFC-0003 §6): its element
                     '' exactly, one dimension, a const element only for a const one. One worse
@@ -1163,14 +1167,16 @@ private function ResolveCall_ _
                 if viable andalso expandTV then
                     dim as Tko.NodeId tvBad
                     dim as int32 tvCost = PackedArgsCost_( c, tvPrm, argFirst, ai, argT, overloaded, tvBad )
-                    if tvCost < 0 then viable = false else total += tvCost + CONV_EXPANDED
+                    if tvCost < 0 then viable = false : refA = Tko.TYPE_NONE else total += tvCost + CONV_EXPANDED
                 end if
-                if viable then RankOffer_( c, best, bestCost, ties, cur, total )
+                if viable then RankOffer_( c, best, bestCost, ties, cur, total ) else refusalsTrusted = refusalsTrusted andalso RefusalTrusted_( c, refA, refP )
             end if
         end if
         cur = s->nextOverload
     wend
 
+    '' SCORED AND NOT BOUND: lowering must not run the name's first overload (SemanticInfo.unbound).
+    c.info->SetUnbound( id, overloaded andalso ((best = Tko.SYMBOL_NONE) orelse (ties > 0)) andalso (c.info->AmbiguousOf( id ) <> Tko.AMB_PROPERTY_SET) )
     if best = Tko.SYMBOL_NONE then
         '' NO MATCHING OVERLOADED FUNCTION -- fbc error 99. Reported only for a genuine
         '' OVERLOAD SET, and only when every argument already has a type.
@@ -1196,7 +1202,7 @@ private function ResolveCall_ _
                 end if
                 dim as Tko.TypeId a2u = c.types->Unqualify( a2t )
                 dim as Tko.TypeKind a2k = c.types->Kind( a2u )
-                if cbool( a2k <> Tko.TK_BUILTIN ) andalso cbool( a2k <> Tko.TK_POINTER ) andalso (UdtArgInert_( c, a2u, callee ) = false) then
+                if cbool( a2k <> Tko.TK_BUILTIN ) andalso cbool( a2k <> Tko.TK_POINTER ) andalso (UdtArgInert_( c, a2u, callee ) = false) andalso (refusalsTrusted = false) then
                     allTyped = false
                     exit for
                 end if
@@ -1266,9 +1272,9 @@ private function ResolveCall_ _
         '' candidates both viable with no argument (one of them through a DEFAULTED
         '' parameter) is refused, while the same pair with only one viable is not.
         ''
-        '' Guarded exactly as the no-match report above is, and for the same reasons: a
-        '' UDT argument brings conversions and generics this scoring does not model, and
-        '' an untyped one means something earlier declined.
+        '' Guarded as the no-match report above is, and for the same reasons: a UDT argument
+        '' can bring conversions and generics this scoring does not model, and an untyped one
+        '' means something earlier declined.
         dim as boolean tieTyped = true
         for i as int32 = 0 to argT.Count - 1
             dim as Tko.TypeId a3 = cast( Tko.TypeId, argT[i] )
@@ -1285,6 +1291,13 @@ private function ResolveCall_ _
                 if FixedStringElem( c.types->Unqualify( a3 ), *c.types ) <> Tko.TYPE_NONE then
                     a3k = Tko.TK_BUILTIN
                 end if
+            end if
+            '' ...AND A UDT WHOSE CASTS ARE ALL SCORED, when no candidate was refused on grounds the
+            '' scoring does not model (RefusalTrusted_): two conversion constructors, or a type itself
+            '' against another's constructor in a crossed pair, are fbc-modern 1.20's 98 (measured
+            '' 2026-11-23, tests/diagnostics/overload-udt-tie) -- tiko stopped on TKO0994 there.
+            if (a3k = Tko.TK_UDT) andalso refusalsTrusted then
+                if UdtCastsInert_( c, c.types->Unqualify( a3 ) ) then a3k = Tko.TK_BUILTIN
             end if
             if (a3k <> Tko.TK_BUILTIN) andalso (a3k <> Tko.TK_POINTER) then
                 tieTyped = false

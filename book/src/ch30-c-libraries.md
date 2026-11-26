@@ -824,7 +824,7 @@ text in it:
 Everything after the directives is raylib's example as it is written in C. A few lines are new:
 
 - **Linked statically**, raylib needs a different set of system libraries on each platform, so
-  the `#foreignlib` line is chosen with `#ifdef __FB_WIN32__`. On Linux it is the list raylib's
+  the `#foreignlib` line is chosen with `#ifdef TIKO_OS_WINDOWS`. On Linux it is the list raylib's
   documentation gives: OpenGL, the maths library, threads, `dl`, `rt` and X11.
 - **`SetTraceLogLevel( LOG_WARNING )`** comes first because raylib reports everything it does,
   about forty lines when a window opens, on standard output. The listings keep it quiet so that

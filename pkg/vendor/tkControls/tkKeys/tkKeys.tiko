@@ -11,7 +11,9 @@
 ' THE KEY IS THE UNSHIFTED ONE. SDL3 reports a key event's keycode with the modifiers applied, so
 ' Shift+/ arrives as '?' and Ctrl+Shift+/ could never match the chord "Ctrl+Shift+/" a user
 ' wrote. A chord is matched on the key its SCANCODE gives with no modifiers (tkKeys_FromMsg);
-' letters are kept lowercase, as SDL's own keycodes are.
+' letters are kept lowercase, as SDL's own keycodes are. On a layout where a bound symbol needs
+' Shift or AltGr (Spanish '/' is Shift+7), the chord is on the key that types it: Ctrl+/ is
+' Ctrl+7 there (tkKeys_LookupMsg) -- see "non-US layouts" below.
 '
 ' "PRIMARY" IS THE COMMAND KEY OF THE PLATFORM: Ctrl on Windows and Linux, Cmd on macOS. Stored
 ' shortcuts say "Primary+S" (tkKeys_Format( c, true )) so one keybindings file serves every OS;
@@ -56,6 +58,25 @@ public function tkKeys_ModsFromSDL( byval m as long ) as long
     return r
 end function
 
+private function IsLetter( byval k as long ) as boolean
+    return (k >= asc( "a" )) andalso (k <= asc( "z" ))
+end function
+
+' A key as a chord stores it: letters lowercase; a layout's own unshifted '+' (Spanish, German,
+' Nordic) is the "Plus" key, which is SDLK_EQUALS -- the =+ key of a US keyboard.
+private function NormKey( byval k as long ) as long
+    if (k >= asc( "A" )) andalso (k <= asc( "Z" )) then return k + 32
+    if k = SDLK_PLUS then return SDLK_EQUALS
+    return k
+end function
+
+' The letter a US keyboard has at this scancode, 0 for any other key. A layout without Latin
+' letters (Cyrillic, Greek) still answers Ctrl+S on its S key, as Win32's VK_S does.
+public function tkKeys_LatinLetter( byval sc as long ) as long
+    if (sc >= SDL_SCANCODE_A) andalso (sc <= SDL_SCANCODE_Z) then return asc( "a" ) + sc - SDL_SCANCODE_A
+    return 0
+end function
+
 ' The chord a key message carries: the scancode's UNSHIFTED key when there is one (a real
 ' keyboard), the keycode lowercased otherwise (a synthesised event).
 public function tkKeys_FromMsg( byval m as TK_MSG ptr ) as TK_CHORD
@@ -66,9 +87,78 @@ public function tkKeys_FromMsg( byval m as TK_MSG ptr ) as TK_CHORD
         dim as long k = SDL_GetKeyFromScancode( m->scancode, SDL_KMOD_NONE, false )
         if k <> 0 then c.key = k
     end if
-    if (c.key >= asc( "A" )) andalso (c.key <= asc( "Z" )) then c.key += 32
+    c.key = NormKey( c.key )
     c.mods = tkKeys_ModsFromSDL( m->mods )
     return c
+end function
+
+' ---- non-US layouts ------------------------------------------------------------------------------
+' tiko-editor's rule (keybind.tiko frmKeyboard_OEMtoVirtKey): a symbol in a chord is the KEY THAT
+' TYPES IT on the current layout, whatever Shift or AltGr that takes, and the chord's own
+' modifiers are kept. On Spanish or German '/' is Shift+7, so Ctrl+/ is Ctrl+7 and Ctrl+Shift+/
+' is Ctrl+Shift+7; on Spanish '\' is AltGr+(the key left of 1), so Ctrl+Shift+\ is
+' Ctrl+Shift+(that key). A key message can mean up to four chords, tried in this order
+' (tkKeys_LookupMsg):
+'   0. the layout's unshifted key with the modifiers held (tkKeys_FromMsg);
+'   1. the character the key types with Shift, same modifiers;
+'   2. the character the key types with AltGr, same modifiers;
+'   3. on a layout without Latin letters, the US letter at that position.
+' 1-3 only when the layout's key is not a Latin letter (AZERTY's A is A, not Q), Ctrl, Alt or Cmd
+' is held (a bare key is typing), and AltGr is not (AltGr+key types a character).
+public type TK_CHORDS
+    n as long
+    c( 0 to 3 ) as TK_CHORD
+end type
+
+private sub AddChord( byref r as TK_CHORDS, byval k as long, byval mods as long )
+    if k = 0 then exit sub
+    for i as long = 0 to r.n - 1
+        if r.c(i).key = k then exit sub
+    next
+    r.c(r.n).key = k : r.c(r.n).mods = mods : r.n += 1
+end sub
+
+' The pure part, for a layout the test machine does not have: base, shifted and altgr are what the
+' layout types at the scancode plain, with Shift and with AltGr; latin is tkKeys_LatinLetter of it;
+' sdlMods SDL_KMOD_*.
+public function tkKeys_ChordsFor( byval base_ as long, byval shifted as long, byval altgr as long, _
+                                  byval latin as long, byval sdlMods as long ) as TK_CHORDS
+    dim as TK_CHORDS r
+    dim as long mods = tkKeys_ModsFromSDL( sdlMods )
+    base_ = NormKey( base_ )
+    r.c(0).key = base_ : r.c(0).mods = mods : r.n = 1   ' base_ 0 (a dead key SDL has no code for) binds nothing
+    if IsLetter( base_ ) then return r
+    if (mods and (TKKEY_CTRL or TKKEY_ALT or TKKEY_GUI)) = 0 then return r
+    if (sdlMods and (SDL_KMOD_RALT or SDL_KMOD_MODE)) then return r
+    shifted = NormKey( shifted ) : altgr = NormKey( altgr )
+    if IsLetter( shifted ) = false then AddChord( r, shifted, mods )
+    if IsLetter( altgr ) = false then AddChord( r, altgr, mods )
+    if base_ > 127 then AddChord( r, latin, mods )
+    return r
+end function
+
+public function tkKeys_ChordsOf( byval m as TK_MSG ptr ) as TK_CHORDS
+    dim as TK_CHORDS r
+    if m = 0 then return r
+    if m->scancode = 0 then                     ' synthesised: no layout to ask
+        r.c(0) = tkKeys_FromMsg( m ) : r.n = 1
+        return r
+    end if
+    dim as long sc = m->scancode
+    dim as long base_ = SDL_GetKeyFromScancode( sc, SDL_KMOD_NONE, false )
+    if base_ = 0 then base_ = m->key
+    return tkKeys_ChordsFor( base_, SDL_GetKeyFromScancode( sc, SDL_KMOD_SHIFT, false ), _
+                             SDL_GetKeyFromScancode( sc, SDL_KMOD_MODE, false ), tkKeys_LatinLetter( sc ), m->mods )
+end function
+
+' TRUE when the message is the chord c by any of its readings.
+public function tkKeys_MsgIs( byval m as TK_MSG ptr, byref c as TK_CHORD ) as boolean
+    if c.key = 0 then return false
+    dim as TK_CHORDS cs = tkKeys_ChordsOf( m )
+    for i as long = 0 to cs.n - 1
+        if (cs.c(i).key = c.key) andalso (cs.c(i).mods = c.mods) then return true
+    next
+    return false
 end function
 
 ' ---- names ---------------------------------------------------------------------------------------
@@ -260,6 +350,17 @@ public function tkKeys_Lookup( byval km as TK_KEYMAP ptr, byref c as TK_CHORD ) 
     return 0
 end function
 
+' The command a key message runs: the first of its chords (tkKeys_ChordsOf) that is bound, 0 when none.
+public function tkKeys_LookupMsg( byval km as TK_KEYMAP ptr, byval m as TK_MSG ptr ) as long
+    if km = 0 then return 0
+    dim as TK_CHORDS cs = tkKeys_ChordsOf( m )
+    for i as long = 0 to cs.n - 1
+        dim as long cmd = tkKeys_Lookup( km, cs.c(i) )
+        if cmd then return cmd
+    next
+    return 0
+end function
+
 ' ---- attaching a map to a surface ---------------------------------------------------------------
 type TKKEYS_ATTACH
     h   as TK_HOST ptr
@@ -271,8 +372,7 @@ dim shared as TKKEYS_ATTACH gAttach( 0 to 31 )
 private function PreKey( byval h as TK_HOST ptr, byval m as TK_MSG ptr ) as boolean
     for i as long = 0 to ubound( gAttach )
         if (gAttach(i).h = h) andalso (gAttach(i).km <> 0) then
-            dim as TK_CHORD c = tkKeys_FromMsg( m )
-            dim as long cmd = tkKeys_Lookup( gAttach(i).km, c )
+            dim as long cmd = tkKeys_LookupMsg( gAttach(i).km, m )
             if cmd = 0 then return false
             if gAttach(i).cb then gAttach(i).cb( h, cmd )
             return true
