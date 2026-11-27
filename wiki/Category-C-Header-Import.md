@@ -135,7 +135,7 @@ function C         ( byval x as int32 ) as int32 : return x : end function
 
 `pascal` is **not** in that set and still warns. It is not a mangling or a register difference — it reverses the argument order, on x86-64 as anywhere else, so a `pascal` procedure called through a `cdecl` pointer with `(1, 2)` returns `21`.
 
-> The `cdecl`/`stdcall` distinction is real only on x86, and tiko does not target 32-bit (`-m32` is `TKO0104: 32-bit targets are not supported; x86-64 only`), so a warning on that mismatch would have nothing to protect.
+> The `cdecl`/`stdcall` distinction is real on x86. tiko's `win32` target keeps those conventions distinct; the interchangeable 64-bit rule above does not apply there.
 >
 > tiko accepts all three without a warning. A `pascal` procedure draws the warning `TKO0830`, and through the imported `cdecl` pointer with `(1, 2)` it returns `21`, because tiko passes a `pascal` procedure's arguments in reverse. Measured through a function-pointer typedef imported with `#cinclude`, on windows-x86_64.
 

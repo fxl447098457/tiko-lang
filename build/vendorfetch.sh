@@ -290,10 +290,28 @@ entry( ) {
                 # sources must dllexport what the DLL exports -- their cflags say how.
                 # -implib:, not /implib: -- MSYS would rewrite a leading slash as a path.
                 _imp="$(cygpath -m "$_x" 2>/dev/null || printf '%s' "$_x")/$(basename "$_sh" .dll).lib"
+                _implibopt=-Wl,-implib:
+                _sharedrt=
+                case "$TRIPLE" in
+                    *-windows-msvc) ;;
+                    *) _implibopt=-Wl,--out-implib,
+                       case "$TRIPLE" in i686-*) _mgcc=i686-w64-mingw32-gcc.exe ;; *) _mgcc=x86_64-w64-mingw32-gcc.exe ;; esac
+                       _libgcc=$("$TIKO_MINGW_ROOT/bin/$_mgcc" -print-libgcc-file-name)
+                       # i686 clang can otherwise bind the division helpers through
+                       # libgcc_s's import DLL; link the real libgcc objects instead.
+                       _divobjs=
+                       for _member in _divdi3.o _udivdi3.o _moddi3.o _umoddi3.o; do
+                           if "$AR" t "$_libgcc" | tr -d '\r' | grep -qx "$_member"; then
+                               ( cd "$_x" && "$AR" x "$_libgcc" "$_member" )
+                               _divobjs="$_divobjs $_x/$_member"
+                           fi
+                       done
+                       _sharedrt="$_divobjs -static-libstdc++ -Wl,-Bstatic -lgcc -lgcc_eh -lwinpthread -Wl,-Bdynamic" ;;
+                esac
                 # shellcheck disable=SC2086
                 "$CLANG" --target=$TRIPLE $SYSROOTOPT -shared -fuse-ld=lld -o "$_mdir/$_sh" \
-                    -Wl,-implib:"$_imp" \
-                    $_objs $(_get libs) || die "$_mod: linking $_sh failed"
+                    "$_implibopt$_imp" \
+                    $_objs $(_get libs) $_sharedrt || die "$_mod: linking $_sh failed"
             elif [ "$HOST" = macos ]; then
                 # THE INSTALL NAME IS @rpath/<its own name>, the soname's counterpart: a program
                 # records it, and finds the copy beside it through its '@loader_path' run path.

@@ -208,8 +208,8 @@ Every diagnostic has a stable `TKOnnnn` id, a location and a caret. Add
 
 | | |
 | --- | --- |
-| **Compiles to** | Native x86-64 and arm64 executables, DLLs / shared objects / dylibs and static libraries, through LLVM |
-| **Platforms** | Windows x86-64 (MSVC ABI, no Visual Studio needed), Linux x86-64, Linux arm64 (aarch64, glibc 2.35 or newer), and macOS on Apple Silicon (arm64, macOS 13 or newer). Experimental: Android 10 or newer, arm64 phones and the x86-64 emulator, built from Windows as a signed APK ([Android](wiki/Android.md)) |
+| **Compiles to** | Native x86, x86-64 and arm64 executables, DLLs / shared objects / dylibs and static libraries, through LLVM |
+| **Platforms** | Windows x86-64 (MSVC ABI, no Visual Studio needed), Windows x86-64 and x86 (MinGW ABI, no Visual Studio needed), Linux x86-64, Linux arm64 (aarch64, glibc 2.35 or newer), and macOS on Apple Silicon (arm64, macOS 13 or newer). Experimental: Android 10 or newer, arm64 phones and the x86-64 emulator, built from Windows as a signed APK ([Android](wiki/Android.md)) |
 | **Types** | Static, with inference (`var`), fixed-width names (`int32`, `uint8`, `float64`, …), generics, tuples, UDTs with methods, properties, operator overloading, single inheritance and virtual methods |
 | **Memory** | Deterministic: scope-based destruction, `defer`, `SharedPtr` / `WeakPtr`; no GC |
 | **Errors** | `Result( of T, E )` and `Optional( of T )`, plus runtime checks up to array bounds and null pointers with `-exx` |

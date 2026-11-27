@@ -8,12 +8,14 @@ about the command line that does all of that, and about what a shipped program d
 
 ## Targets
 
-tiko builds for six targets, chosen with `-target`. The two Android ones are experimental, and only
+tiko builds for eight targets, chosen with `-target`. The two Android ones are experimental, and only
 the Windows toolchain has them ([Android](#android), below):
 
 | Target | Builds | Default on |
 |---|---|---|
 | `windows-x86_64` | a Windows x86-64 executable, linked against Microsoft's Universal C Runtime | Windows |
+| `win64` | a Windows x86-64 executable, linked against the MinGW C runtime | — |
+| `win32` | a Windows x86 executable, linked against the MinGW C runtime | — |
 | `linux-x86_64` | a Linux x86-64 executable, linked against the system's C library | x86-64 Linux |
 | `linux-arm64` | a Linux arm64 (aarch64) executable, linked against the system's C library | arm64 Linux |
 | `macos-arm64` | a macOS executable for Apple Silicon, linked by Apple's linker against the macOS SDK | macOS |

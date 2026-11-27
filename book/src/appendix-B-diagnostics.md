@@ -24,7 +24,7 @@ Text like ‹arg1› marks where the compiler substitutes a name, type or path.
 | `TKO0101` | error | option '‹arg1›' requires an argument |
 | `TKO0102` | error | no input files |
 | `TKO0103` | error | unknown target '‹arg1›' |
-| `TKO0104` | error | 32-bit targets are not supported; x86-64 only |
+| `TKO0104` | error | 32-bit targets are supported on Windows only; '‹arg1›' has no 32-bit member |
 | `TKO0105` | warning | unknown diagnostic id '‹arg1›' |
 | `TKO0106` | error | '‹arg1›' is not a recognised value for '‹arg2›' |
 | `TKO0108` | error | '‹arg1›' is a Windows resource script; the target is not Windows |

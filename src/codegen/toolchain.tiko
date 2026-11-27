@@ -615,7 +615,7 @@ end function
 '' THE SYSROOT FOR A TARGET, and the order: the environment's own (TIKO_SYSROOT), then
 '' the tree the matching gcc lives in, then nothing -- which leaves clang to its own
 '' discovery, and the cfg's --sysroot with it.
-private function SysrootFor_( byref target as TargetDescription ) as string
+function TargetSysroot( byref target as TargetDescription ) as string
     dim as string env_ = environ( "TIKO_SYSROOT" )
     if len( env_ ) > 0 then return env_
     return MingwSysroot_( target )
@@ -649,7 +649,7 @@ private function CompileIrArgs_ _
     '' THE HEADERS MUST BE THE TARGET'S OWN: a clang.cfg's --sysroot names ONE tree, and
     '' the 32-bit target would take the 64-bit headers -- a silent ABI mismatch, which is
     '' worse than a link error. The command line's --sysroot wins over the cfg's.
-    dim as string sr = SysrootFor_( target )
+    dim as string sr = TargetSysroot( target )
     if len( sr ) > 0 then cmd += " --sysroot=" & Q( sr )
     if t.optSize then
         cmd += " -Os"
@@ -767,22 +767,13 @@ function LinkExe _
     dim as boolean macho = (target.objFormat = OBJ_MACHO)
     dim as string cmd = "-target " & target.triple & " -fuse-ld=lld"
     dim as boolean viaLld = true
-    '' AN EXPLICIT SYSROOT, when the environment names one (TIKO_SYSROOT). A clang.cfg
-    '' beside clang pins a --sysroot of its own, and the option it carries wins over the
-    '' driver's gcc discovery while a command-line -target wins over the cfg's --target:
-    '' measured, a cfg with 'sysroot=D:/tiko-test/mingw64' made every win32 link answer
-    '' 'unable to find -lmingw32' -- the 64-bit root has no i686 libraries. A --sysroot
-    '' HERE comes after the cfg's and wins; unset, nothing changes and the driver keeps
-    '' discovering the sysroot from the gcc on PATH, which is how the CI mingw lanes and
-    '' every stock install work. The MSVC flavor names its roots with /winsysroot and is
-    '' not touched; Mach-O has TIKO_SDKROOT below.
-    dim as string sysrootEnv = environ( "TIKO_SYSROOT" )
-    if (len( sysrootEnv ) > 0) andalso (macho = false) andalso (target.layout.isMsvc = false) then
-        cmd += " --sysroot=" & Q( sysrootEnv )
-    elseif (macho = false) andalso (target.layout.isMsvc = false) then
-        '' ...and otherwise the tree the matching gcc lives in, which is the one clang's own
-        '' driver would use and the one a clang.cfg cannot name for both widths.
-        dim as string sr = MingwSysroot_( target )
+    '' THE SAME SYSROOT THE COMPILE USES: TIKO_SYSROOT first, then the tree the
+    '' matching gcc lives in. A clang.cfg beside clang can pin only one width, so
+    '' naming it here keeps win32 and win64 from borrowing each other's headers
+    '' and import libraries. MSVC names its roots with /winsysroot; Mach-O has
+    '' TIKO_SDKROOT below.
+    if (macho = false) andalso (target.layout.isMsvc = false) then
+        dim as string sr = TargetSysroot( target )
         if len( sr ) > 0 then cmd += " --sysroot=" & Q( sr )
     end if
     '' ...WHERE THERE IS ONE. Ubuntu's clang package does not carry lld, and on such a
@@ -1285,9 +1276,13 @@ function LinkExe _
     '' runtime -- it shares __fb_ctx and calls fb_End -- so on GNU ld this order
     '' alone would leave those calls unresolved; the ELF group above is what makes it
     '' link. lld-link and ld64 resolve it in either order.
+    dim as boolean hasGfx = false
     for i as int32 = 0 to t.libPaths.Count - 1
         dim as string gfxLib = t.libPaths[i] & "/libtkogfx.a"
-        if FileExists_( gfxLib ) then cmd += " " & Q( gfxLib )
+        if FileExists_( gfxLib ) then
+            cmd += " " & Q( gfxLib )
+            hasGfx = true
+        end if
     next
 
     '' THE SYSTEM LIBRARIES THE RUNTIME REACHES INTO, and they are not the same set on
@@ -1391,6 +1386,7 @@ function LinkExe _
         '' (mingw64/x86_64-w64-mingw32/lib/libwinpthread.a).
         cmd += " -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic"
         cmd += " -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -static-libgcc"
+        if hasGfx then cmd += " -lgdi32 -lwinmm"
     elseif macho then
         '' MACH-O. libm and pthreads are inside libSystem, which clang's darwin driver always
         '' links; tgoto and tputs come from the SDK's ncurses, macOS's terminfo.

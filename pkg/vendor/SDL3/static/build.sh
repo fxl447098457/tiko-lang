@@ -59,12 +59,14 @@ OUT=$HERE/bin/$HOST
 [ "$HOST" = android ] && OUT=$HERE/bin/android-$ARCH
 OUTS="$OUT/SDL3_${HOST}_$ARCH$FLAVOUR_TAG.a $OUT/SDL3_ttf_${HOST}_$ARCH$FLAVOUR_TAG.a $OUT/SDL3_image_${HOST}_$ARCH$FLAVOUR_TAG.a"
 [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ] && OUTS="$OUTS $OUT/SDL3.dll $OUT/SDL3_ttf.dll $OUT/SDL3_image.dll"
+[ "$HOST" = windows ] && [ "$FLAVOUR" = mingw ] && \
+    OUTS="$OUTS $OUT/SDL3_${HOST}_${ARCH}_mingw.dll $OUT/SDL3_ttf_${HOST}_${ARCH}_mingw.dll $OUT/SDL3_image_${HOST}_${ARCH}_mingw.dll"
 [ "$HOST" = android ] && OUTS="$OUTS $OUT/classes.dex"
 JAVA_TIKO=$HERE/android/org/tiko/app/TikoActivity.java
 
 # macOS has no sha256sum; its shasum is the same digest.
 digest() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
-STAMP=$( { for f in "$@"; do basename "$f"; done; cat "$0"; [ "$HOST" = android ] && cat "$JAVA_TIKO"; echo "$HOST"; [ "$HOST" = windows ] && echo "$FLAVOUR"; [ "$ARCH" = x86_64 ] || echo "$ARCH"; } | digest | cut -c1-16 )
+STAMP=$( { for f in "$@"; do basename "$f"; done; cat "$0"; [ "$HOST" = android ] && cat "$JAVA_TIKO"; echo "$HOST"; [ "$HOST" = windows ] && echo "$FLAVOUR"; [ "$HOST" = windows ] && [ "$FLAVOUR" = mingw ] && echo "$TIKO_MINGW_ROOT"; [ "$ARCH" = x86_64 ] || echo "$ARCH"; } | digest | cut -c1-16 )
 fresh=1
 for o in $OUTS; do [ -f "$o" ] || fresh=0; done
 [ "$fresh" = 1 ] && [ "$(cat "$OUT/.stamp" 2>/dev/null)" = "$STAMP" ] && exit 0
@@ -92,6 +94,17 @@ for f in "$@"; do tar -xf "$f" -C "$W/src" --exclude='*/Xcode'; done
 dir_of() { find "$W/src" -maxdepth 1 -type d -name "$1" | head -1; }
 # SDL_image comes from a commit's archive (SDL_image-<sha>), not a release's (SDL3_image-<ver>).
 SRCDIR_IMG=$(dir_of 'SDL3_image-*'); [ -n "$SRCDIR_IMG" ] || SRCDIR_IMG=$(dir_of 'SDL_image-*')
+if [ "$HOST" = windows ] && [ "$FLAVOUR" = mingw ]; then
+    # Name the shared target itself, so SDL3_ttf/image's import tables and the
+    # installed CMake target all refer to the architecture-qualified DLL.
+    sed -i "s/OUTPUT_NAME \"SDL3\"/OUTPUT_NAME \"SDL3_${HOST}_${ARCH}_mingw\"/g" \
+        "$(dir_of 'SDL3-*')/CMakeLists.txt"
+    sed -i 's/set(harfbuzz_link_libraries Threads::Threads)/set(harfbuzz_link_libraries "-Wl,-Bstatic" winpthread "-Wl,-Bdynamic")/' \
+        "$(dir_of 'SDL3_ttf-*')/CMakeLists.txt"
+    hb_static=$(cygpath -m "$W/inst/lib/libharfbuzz.a")
+    sed -i "s|set(harfbuzz_link_libraries harfbuzz::harfbuzz)|set(harfbuzz_link_libraries \"$hb_static\" \"-Wl,-Bstatic\" winpthread \"-Wl,-Bdynamic\")|" \
+        "$(dir_of 'SDL3_ttf-*')/CMakeLists.txt"
+fi
 
 C=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
    -DCMAKE_INSTALL_PREFIX="$W/inst" -DCMAKE_PREFIX_PATH="$W/inst" -DCMAKE_INSTALL_LIBDIR=lib
@@ -104,7 +117,10 @@ windows)
         # the width as well as the runtime: mingw64 or mingw32.
         MG=${TIKO_MINGW_ROOT:?SDL3 static: the MinGW tree is TIKO_MINGW_ROOT}
         C+=(-DCMAKE_C_COMPILER="$MG/bin/gcc.exe" -DCMAKE_CXX_COMPILER="$MG/bin/g++.exe"
-            -DCMAKE_RC_COMPILER="$MG/bin/windres.exe")
+            -DCMAKE_RC_COMPILER="$MG/bin/windres.exe"
+            -DCMAKE_C_FLAGS="-I$(cygpath -m "$W/inst/include/harfbuzz")"
+            -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
+            -DCMAKE_CXX_STANDARD_LIBRARIES="-static-libstdc++ -static-libgcc -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic")
     else
     CL=${TIKO_CLANG:-"C:/Program Files/LLVM/bin/clang.exe"}
     C+=(-DCMAKE_C_COMPILER="$CL" -DCMAKE_CXX_COMPILER="$(dirname "$CL")/clang++.exe"
@@ -158,8 +174,7 @@ step img "$SRCDIR_IMG" "${IMGX[@]}"
 # WINDOWS' DLLS: an SDL build of their own, shared only, so the static archive above never holds
 # dllexport objects; and an install prefix of their own (W/dll), because a shared SDL3_ttf's
 # import library has the static one's name. They link the static FreeType and HarfBuzz in W/inst.
-if [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ]; then
-    # Windows paths: MSYS rewrites one path in an argument, not a ;-list of them.
+if [ "$HOST" = windows ]; then
     WM=$(cygpath -m "$W")
     D=(-DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$WM/dll" -DCMAKE_PREFIX_PATH="$WM/dll;$WM/inst")
     step sdl-dll "$(dir_of 'SDL3-*')" "${D[@]}" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF \
@@ -237,10 +252,18 @@ if [ "$HOST" = android ]; then
             { echo "SDL3 static: stripping $(basename "$a") failed" >&2; exit 1; }
     done
 fi
-if [ "$HOST" = windows ] && [ "$FLAVOUR" = msvc ]; then
+if [ "$HOST" = windows ]; then
     for d in SDL3 SDL3_ttf SDL3_image; do
-        [ -f "$W/dll/bin/$d.dll" ] || { echo "SDL3 static: no $d.dll under $W/dll/bin" >&2; ls "$W/dll/bin" >&2; exit 1; }
-        cp -f "$W/dll/bin/$d.dll" "$OUT/$d.dll"
+        src="$W/dll/bin/$d.dll"
+        if [ "$FLAVOUR" = mingw ] && [ "$d" = SDL3 ]; then
+            src="$W/dll/bin/SDL3_${HOST}_${ARCH}_mingw.dll"
+        fi
+        [ -f "$src" ] || { echo "SDL3 static: no $d.dll under $W/dll/bin" >&2; ls "$W/dll/bin" >&2; exit 1; }
+        if [ "$FLAVOUR" = mingw ]; then
+            cp -f "$src" "$OUT/${d}_${HOST}_${ARCH}_mingw.dll"
+        else
+            cp -f "$src" "$OUT/$d.dll"
+        fi
     done
 fi
 # SDL'S JAVA, ONCE: javac at Java 8 against the newest android.jar (SDL's own Gradle build uses

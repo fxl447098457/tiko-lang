@@ -18,7 +18,6 @@ Each of these is a diagnostic, not a silent difference:
 | `GOSUB` | error 146 in `-lang fb` (it is valid only in `fblite` and `qb`) | `TKO0409: 'GOSUB' is not available in the fb dialect` |
 | inline `ASM` | compiles | `TKO0407: inline assembly is not supported; compile that module with fbc` |
 | `-lang`, `-gen` | accepted | `TKO0100: unknown option` |
-| `-m32`, `-target win32` | | `TKO0104`, `TKO0103`: x86-64 only |
 
 `GOSUB` is the one row where the two compilers agree in `-lang fb`: both refuse it. Code that asks for another dialect is what tiko refuses.
 
@@ -80,7 +79,9 @@ Across the vendored fbc suite, every line tiko gives `TKO0968` (22) or `TKO0970`
 
 **A Linux program that links a shared library from `#foreignlib` gets a run path of `$ORIGIN`.** fbc writes none, so its program finds a `.so` beside it only through `LD_LIBRARY_PATH`; tiko's finds it there, and `LD_LIBRARY_PATH` still wins. A program that links no shared library from `#foreignlib` is linked exactly as before, and `-norpath` turns the run path off. See [Vendor Packages](Vendor-Packages).
 
-**Graphics works on all four targets.** libtkogfx, tiko's graphics library, ships for `windows-x86_64`, `linux-x86_64`, `linux-arm64` and `macos-arm64`, so a `SCREEN` / `PSET` program builds and runs unchanged on each. On Windows it draws through GDI. On Linux it uses X11, loaded when a window opens: libtkogfx loads libX11 (and libXext, libXrandr if present) at run time, so the program links with no X11 library and needs an X display (XWayland included) only to open its window. On macOS it uses Cocoa, reached through the Objective-C runtime: a program that opens a window runs its `main( )` on a thread of its own while AppKit keeps the main thread. On every target, `GFX_NULL` or `FBGFX=null` draws with no window at all. fbc's OpenGL driver and Linux framebuffer (`FBDev`) driver are not provided.
+**`win32` and `win64` are tiko's MinGW Windows targets.** `win32` builds an i686 executable and `win64` an x86-64 one; both link the MinGW C runtime (`msvcrt.dll`) and need no Visual Studio. `windows-x86` is accepted as an alias for `win32`. The default Windows target remains `windows-x86_64` with the Microsoft ABI and UCRT.
+
+**Graphics works on all six desktop targets.** libtkogfx ships for `windows-x86_64`, `win64`, `win32`, `linux-x86_64`, `linux-arm64` and `macos-arm64`, so a `SCREEN` / `PSET` program builds and runs unchanged on each. On Windows it draws through GDI. On Linux it uses X11, loaded when a window opens: libtkogfx loads libX11 (and libXext, libXrandr if present) at run time, so the program links with no X11 library and needs an X display (XWayland included) only to open its window. On macOS it uses Cocoa, reached through the Objective-C runtime: a program that opens a window runs its `main( )` on a thread of its own while AppKit keeps the main thread. On every target, `GFX_NULL` or `FBGFX=null` draws with no window at all. fbc's OpenGL driver and Linux framebuffer (`FBDev`) driver are not provided.
 
 **`macos-arm64` is a tiko target, named `-target macos-arm64`.** `-target darwin` is refused (`TKO0103`). It defines `TIKO_OS_MACOS` and `TIKO_ARCH_ARM64`, and for fbc's headers `__FB_DARWIN__`, `__FB_UNIX__`, `__FB_ARM__` and `__FB_64BIT__`, and not `__FB_X86__`, so code under `#ifdef __FB_X86__` is left out there. `WSTRING` is 4 bytes, as on Linux. Graphics draws through Cocoa (above).
 

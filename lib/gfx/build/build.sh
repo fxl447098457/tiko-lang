@@ -3,13 +3,11 @@
 #
 #   build/build.sh [Debug|Release|RelWithDebInfo] [target ...]
 #
-# FOUR TARGETS: windows-x86_64, linux-x86_64, macos-arm64 and linux-arm64 (docs/graphics
-# RFC-0012, phase P1). Any host builds any of them -- the library is one `tiko -c`
-# per target, and nothing here needs the target's SDK -- and with no target named
-# the host's own is built. driver/window.ti picks the platform: the Win32 window on
-# Windows, and on Linux and macOS, until their drivers land (X11 L1, Cocoa M1),
-# driver/nodisplay: GFX_NULL and FBGFX=null screens work and a windowed SCREEN
-# answers an error, as gfxlib2 does when no driver loads.
+# SIX TARGETS: windows-x86_64, win64, win32, linux-x86_64, macos-arm64 and
+# linux-arm64. Any host builds any of them -- the library is one `tiko -c` per
+# target, and nothing here needs the target's SDK. With no target named the
+# host's own is built. driver/window.ti picks GDI on Windows, X11 on Linux and
+# Cocoa on macOS; GFX_NULL and FBGFX=null need no display on any target.
 #
 # windows-x86_64 IS THE MICROSOFT ABI (TARGET_WINDOWS_X86_64, added 2026-09-05), and
 # there is no MSVC libfbgfx anywhere to fall back to: fbc's is MinGW, so it cannot go
@@ -21,8 +19,8 @@
 # entry-point layer the only public surface.
 #
 # THE COMPILER IS TIKO (bootstrap plan, phase G, 2026-10-10): the tree's bin/tiko, or
-# TKOGFX_TIKO, which targets windows-x86_64 itself -- one step, no clang retarget. Measured
-# when it changed: the same 368 functions and the same 83 public symbols as fbc's build.
+# TKOGFX_TIKO. It targets each member of the Windows/Linux/macOS family directly --
+# one step, no clang retarget. The public surface remains the same 83 symbols.
 # An fbc builds it only as the ORACLE, when TIKO_ORACLE_FBC names one -- to tell a
 # library difference from a compiler difference; nothing shipped is built that way. That
 # fbc must understand -z msvc (fbc-modern's working tree, 2026-09-05 or later): without it
@@ -94,8 +92,8 @@ esac
 
 for target in $TARGETS; do
     case "$target" in
-        windows-x86_64|linux-x86_64|macos-arm64|linux-arm64) ;;
-        *) die "unsupported target '$target' (windows-x86_64, linux-x86_64, macos-arm64, linux-arm64)" ;;
+        windows-x86_64|win64|win32|linux-x86_64|macos-arm64|linux-arm64) ;;
+        *) die "unsupported target '$target' (windows-x86_64, win64, win32, linux-x86_64, macos-arm64, linux-arm64)" ;;
     esac
     if [ -n "${TIKO_ORACLE_FBC:-}" ] && [ "$target" != "windows-x86_64" ]; then
         die "the fbc oracle builds windows-x86_64 only, not '$target'"

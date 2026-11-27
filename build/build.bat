@@ -3,6 +3,7 @@ rem build.bat -- build tiko-lang with the stage0 compiler: a tiko seed.
 rem
 rem   build\build.bat [Debug^|Release^|RelWithDebInfo^|MinSizeRel] [--test-runner] [--no-dll] [--oracle]
 rem   build\build.bat [Release^|MinSizeRel] --dll
+rem   build\build.bat Release --lib
 rem
 rem A compiler build also builds the editor's bin\parser.dll and copies it beside tkEdit
 rem (%TIKO_EDITOR_DIR%, default tkedit\bin in this tree). '--no-dll' skips both.
@@ -13,6 +14,8 @@ rem Configuration flags live here and nowhere else (docs/plan/02 section 3).
 setlocal enabledelayedexpansion
 
 set "ROOT=%~dp0.."
+set "LIBHOSTARCH=x86_64"
+if /i "%PROCESSOR_ARCHITECTURE%"=="x86" set "LIBHOSTARCH=x86"
 set "CFG=%~1"
 if "%CFG%"=="" set "CFG=Debug"
 if "%CFG%"=="--test-runner" set "CFG=Debug"
@@ -20,16 +23,19 @@ if "%CFG%"=="--no-dll" set "CFG=Debug"
 if "%CFG%"=="--oracle" set "CFG=Debug"
 rem '--dll' anywhere: build the editor's parser.dll INSTEAD of the compiler (below).
 set "DLL=0"
+set "SCANLIB=0"
 set "NODLL=0"
 set "TESTRUNNER=0"
 set "ORACLE=0"
 for %%a in (%*) do (
     if /i "%%~a"=="--dll" set "DLL=1"
+    if /i "%%~a"=="--lib" set "SCANLIB=1"
     if /i "%%~a"=="--no-dll" set "NODLL=1"
     if /i "%%~a"=="--oracle" set "ORACLE=1"
     if /i "%%~a"=="--test-runner" set "TESTRUNNER=1"
 )
 if "%CFG%"=="--dll" set "CFG=Release"
+if "%CFG%"=="--lib" set "CFG=Release"
 rem fbc cannot build this tree any more: its source imports the std modules (2026-10-10).
 rem '--oracle' and MinSizeRel were fbc builds of the compiler -- see build.sh.
 if "%ORACLE%"=="1" goto :nooracle
@@ -125,6 +131,14 @@ for /f "usebackq delims=" %%f in ("%ROOT%\build\sources.txt") do (
 if not exist "%ROOT%\bin" mkdir "%ROOT%\bin"
 if not exist "%ROOT%\build\obj\%CFG%" mkdir "%ROOT%\build\obj\%CFG%"
 
+rem THE EDITOR'S SCANNER AS A STATIC ARCHIVE -- the Windows peer of build.sh's --lib.
+if "%SCANLIB%"=="1" (
+    call :buildlib
+    if errorlevel 1 exit /b 1
+    echo build: ok
+    exit /b 0
+)
+
 rem THE EDITOR'S DLL -- see the peer note in build.sh. The main module is left out, and
 rem NEVER -exx: a failed runtime check ends the process, and in a DLL that is the editor.
 if "%DLL%"=="1" (
@@ -134,6 +148,43 @@ if "%DLL%"=="1" (
     exit /b 0
 )
 goto :compiler
+
+:buildlib
+    if "%ORACLE%"=="1" (
+        echo build: --lib builds the scanner with a tiko seed, not the fbc oracle 1>&2
+        exit /b 1
+    )
+    set "LIBSRC="
+    for %%f in (!SOURCES!) do if /i not "%%~nf"=="!MAINMOD!" set "LIBSRC=!LIBSRC! %%f"
+    set "LIBFLAGS=!FLAGS:-exx=! -mt"
+    set "LIBARCH=%LIBHOSTARCH%"
+    set "LIBTARGET="
+    set "LIBTAG="
+    if /i "%LIBHOSTARCH%"=="x86" (
+        set "LIBARCH=x86"
+        set "LIBTARGET=-target win32"
+        set "LIBTAG=_mingw"
+    ) else if /i "%TIKO_BUILD_FLAVOUR%"=="mingw" (
+        set "LIBTARGET=-target win64"
+        set "LIBTAG=_mingw"
+    )
+    if /i "%TIKO_BUILD_FLAVOUR%"=="mingw" goto :libmingw
+    goto :librun
+:libmingw
+    if /i "%TIKO_MINGW_TARGET:~0,4%"=="i686" (
+        set "LIBARCH=x86"
+        set "LIBTARGET=-target win32"
+    )
+:librun
+    set "LIBOUT=bin\parser_windows_!LIBARCH!!LIBTAG!.a"
+    echo build: !LIBOUT! [%CFG%] with %STAGE0%
+    if exist "%ROOT%\!LIBOUT!" del /f /q "%ROOT%\!LIBOUT!"
+    pushd "%ROOT%"
+    "%STAGE0%" -lib !LIBSRC! src\api\tikoparser.tiko -i src !INCOPT! !LIBFLAGS! !LIBTARGET! -o "!LIBOUT!"
+    if errorlevel 1 ( popd & exit /b 1 )
+    popd
+    if not exist "%ROOT%\!LIBOUT!" ( echo build: no !LIBOUT! 1>&2 & exit /b 1 )
+    exit /b 0
 
 :builddll
     set "LIBSRC="

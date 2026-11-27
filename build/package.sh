@@ -23,18 +23,16 @@
 # ---------------------------------------------------------------- what it is NOT
 #
 # THIS DOES NOT PRODUCE A SELF-CONTAINED TOOLCHAIN, and the manifest it writes says
-# so. One thing stays external, and one is optional:
+# so. clang and the MinGW sysroots stay external; the Android NDK/SDK are optional.
 #
 #   clang    src/codegen/toolchain.tiko runs clang for BOTH steps -- the .ll to .o
 #            compile and the link. It is found at C:\Program Files\LLVM\bin, or
 #            wherever TIKO_CLANG points. Bundling LLVM is a gigabyte and a separate
 #            decision, so a packaged toolchain depends on an installed one.
 #
-#   win64    -target win64, the MinGW ABI, is NOT PACKAGED (the author's order,
-#            2026-10-10; decision Q2): no lib/win64, no MinGW runtime. The compiler
-#            still accepts the target -- build tiko-rt for it (lib/rt/build/build.sh
-#            Release win64) and link with a MinGW-w64 on PATH. windows-x86_64, the
-#            default, and linux-x86_64 need nothing of the kind.
+#   MinGW   -target win64 and win32 are packaged on Windows. Their runtime,
+#            graphics and vendor archives are built here; linking needs the
+#            matching MinGW-w64 sysroot on PATH (or TIKO_SYSROOT).
 #
 # Neither is a packaging bug. Both are written into MANIFEST.txt so that a
 # toolchain cannot be passed on with them invisible.
@@ -96,7 +94,7 @@ usage( ) {
 while [ $# -gt 0 ]; do
     case $1 in
         --config)    CFG=$2;      shift 2 ;;
-        --mingw-lib) die "--mingw-lib is gone: -target win64 is not packaged since 2026-10-10" ;;
+        --mingw-lib) die "--mingw-lib is gone: use TIKO_BUILD_FLAVOUR=mingw build/build.sh Release --lib" ;;
         --third-party-inc) TPINC=$2; shift 2 ;;
         --out)       OUT=$2;      shift 2 ;;
         --no-build)  DO_BUILD=0;  shift ;;
@@ -122,27 +120,15 @@ esac
 #
 # The target list is the host's rather than a choice.
 #
-# WIN32 IS GONE, and it took packaging with it. D14 made x86-64 the only
-# architecture -- -m32 is now an error and TargetFromName knows no "win32" -- so
-# lib/rt/build/common.sh dropped it from RT_TARGETS, and the guard below then
-# died with "no runtime for win32" on every single run. Nothing could be
-# packaged on Windows at all, which is also why no libtkogfx ever reached a
-# toolchain: the script never got as far as copying one.
-#
-# WINDOWS-X86_64 IS THE DEFAULT and is listed first. It is the only target lib/gfx
-# builds, so it is the only one where a SCREEN program links; and it is the ONE
-# target that needs nothing behind it. That is measured, 2026-09-06: a program
-# built for windows-x86_64 against lib/windows-x86_64 alone -- no fbc directory, none to
-# have -- linked and ran. tiko-rt's MSVC archive carries no MinGW imports
-# (build/abidelta.sh, and gatemsvc.sh at 3,922,073 assertions). win64 needed fbc's
-# libfb behind it until decision 0015 (D15); now it needs only fbc's CRT behind it.
-#
-# win64, the MinGW ABI, is not packaged -- see 'what it is NOT' above.
+# WINDOWS PACKAGES THE WHOLE FAMILY: windows-x86_64 (the Microsoft ABI and
+# default on a 64-bit host), plus win64 and win32 (the MinGW ABI). A 32-bit
+# Windows host packages win32 as its default. The MinGW targets need no Visual
+# Studio; their runtime, graphics and vendor archives are built from this tree.
 
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
         HOST=windows; EXT=".exe"; BINSUB=""
-        TARGETS="windows-x86_64"
+        TARGETS="windows-x86_64 win64 win32"
         # The compiler's own default on this host -- HostTarget( ), src/types/type.tiko.
         DEFTARGET=windows-x86_64
         CLANG_DEFAULT='C:\Program Files\LLVM\bin\clang.exe'
@@ -174,6 +160,12 @@ esac
 case $HOST in
     linux-arm64) HOSTOS=linux; HOSTARCH=arm64 ;;
     macos)       HOSTOS=macos; HOSTARCH=arm64 ;;
+    windows)
+        HOSTOS=windows
+        case "$(uname -m)" in
+            i386|i486|i586|i686|x86) HOSTARCH=x86; DEFTARGET=win32; TARGETS="win32" ;;
+            *)                       HOSTARCH=x86_64 ;;
+        esac ;;
     *)           HOSTOS=$HOST; HOSTARCH=x86_64 ;;
 esac
 
@@ -189,15 +181,53 @@ if [ "$WITH_ANDROID" = "1" ]; then
 fi
 is_android( ) { case $1 in android-*) return 0 ;; esac; return 1; }
 
-# WHICH TARGETS HAVE A GRAPHICS LIBRARY. windows-x86_64, where tiko emits the
-# Microsoft ABI and there is no MSVC libfbgfx anywhere to fall back on; and
-# linux-x86_64 since the X11 driver landed (docs/graphics RFC-0012 L2), which loads
-# libX11 at run time, so the package gains no X11 dependency; and macos-arm64 since
-# its Cocoa driver (RFC-0012 M1), which reaches AppKit through the Objective-C
-# runtime and needs fbrt0's tko_darwin_entry -- built by this same package.
+# The two MinGW sysroots are external toolchains, as clang is. Name them explicitly
+# or let the architecture-prefixed GCC on PATH identify them.
+mingw_root_( ) {
+    local g p
+    g=$(command -v "$1-w64-mingw32-gcc.exe" 2>/dev/null || true)
+    [ -n "$g" ] || return 1
+    p=$(cygpath -m "$g" 2>/dev/null || printf '%s' "$g")
+    dirname "$(dirname "$p")"
+}
+MINGW64_ROOT=${TIKO_MINGW64_ROOT:-}
+MINGW32_ROOT=${TIKO_MINGW32_ROOT:-}
+NEED_MSVC_VENDOR=0
+NEED_MINGW64_VENDOR=0
+NEED_MINGW32_VENDOR=0
+for _t in $TARGETS; do
+    case $_t in
+        windows-x86_64) NEED_MSVC_VENDOR=1 ;;
+        win64) NEED_MINGW64_VENDOR=1 ;;
+        win32) NEED_MINGW32_VENDOR=1 ;;
+    esac
+done
+if [ "$NEED_MINGW64_VENDOR" = "1" ]; then
+    [ -n "$MINGW64_ROOT" ] || MINGW64_ROOT=$(mingw_root_ x86_64) || \
+        die "no x86_64 MinGW sysroot -- set TIKO_MINGW64_ROOT or put x86_64-w64-mingw32-gcc.exe on PATH"
+fi
+if [ "$NEED_MINGW32_VENDOR" = "1" ]; then
+    [ -n "$MINGW32_ROOT" ] || MINGW32_ROOT=$(mingw_root_ i686) || \
+        die "no i686 MinGW sysroot -- set TIKO_MINGW32_ROOT or put i686-w64-mingw32-gcc.exe on PATH"
+fi
+BASE_PATH=$PATH
+BASE_TIKO_SYSROOT=${TIKO_SYSROOT:-}
+use_target_env( ) {
+    case $1 in
+        win64) PATH="$MINGW64_ROOT/bin:$BASE_PATH"; TIKO_SYSROOT=$MINGW64_ROOT ;;
+        win32) PATH="$MINGW32_ROOT/bin:$BASE_PATH"; TIKO_SYSROOT=$MINGW32_ROOT ;;
+        *)     PATH=$BASE_PATH; TIKO_SYSROOT=$BASE_TIKO_SYSROOT ;;
+    esac
+    export PATH TIKO_SYSROOT
+}
+
+# WHICH TARGETS HAVE A GRAPHICS LIBRARY. The Windows family draws through GDI;
+# linux-x86_64 loads X11 at run time, so the package gains no X11 dependency; and
+# macos-arm64 reaches AppKit through the Objective-C runtime and needs fbrt0's
+# tko_darwin_entry -- built by this same package.
 # Kept as a list rather than a test so that the day another appears, this is the
 # line that changes.
-GFX_TARGETS="windows-x86_64 linux-x86_64 macos-arm64 linux-arm64"
+GFX_TARGETS="windows-x86_64 win64 win32 linux-x86_64 macos-arm64 linux-arm64"
 
 gfx_has_target( ) {
     for __g in $GFX_TARGETS; do [ "$1" = "$__g" ] && return 0; done
@@ -207,7 +237,7 @@ gfx_has_target( ) {
 [ -n "$OUT" ] || OUT="$ROOT/toolchains/tiko-$HOST"
 
 MINGW_STATE="not applicable on this host"
-[ "$HOST" = "windows" ] && MINGW_STATE="-target win64 (MinGW) is not packaged"
+[ "$HOST" = "windows" ] && MINGW_STATE="-target win64 and win32 (MinGW) packaged"
 
 # THE THIRD-PARTY BINDINGS' SOURCE: the one given, else the seed's inc/ -- the pinned
 # seed's (seed/cache) or, failing that, a locally packaged toolchain's, the same search
@@ -233,8 +263,8 @@ if [ "$DO_BUILD" = "1" ]; then
     # THE COMPILER FIRST, THEN THE REST WITH IT. The runtime is built by tiko since
     # 2026-10-10 -- by THIS compiler, bin/tiko, not by the seed that built it: a seed
     # may predate a fix the runtime's own source needs (seed-1 does: R1-R3). So the
-    # compiler builds alone, and the runtimes and the graphics library then build
-    # concurrently, each into its own obj/<target>/<config> tree.
+    # compiler builds alone, then each target's runtime, size runtime and graphics
+    # build in sequence with that target's PATH and sysroot.
     mkdir -p "$ROOT/lib/rt/obj" "$ROOT/lib/gfx/obj"
     note "building the compiler [$CFG]"
     # --no-dll: no editor DLL -- tkedit links its scanner in (build.sh --lib, below).
@@ -244,56 +274,31 @@ if [ "$DO_BUILD" = "1" ]; then
     fi
     note "compiler built"
     TKORT_TIKO="$ROOT/bin/tiko$EXT"; export TKORT_TIKO
-    _pids_rt=""
     for t in $TARGETS; do
+        use_target_env "$t"
         note "building the runtime [$CFG $t]"
-        sh "$ROOT/lib/rt/build/build.sh" "$CFG" "$t" >"$ROOT/lib/rt/obj/package-$t.log" 2>&1 &
-        _pids_rt="$_pids_rt $t:$!"
-        # THE SIZE RUNTIME BESIDE IT: MinSizeRel writes libfb-s.a / libfbmt-s.a (and the pic
-        # pair), which the driver links under '-Os'. Its own obj/ tree and archive names, so
-        # it builds concurrently with the one above; it leaves fbrt0.o to that one.
+        if ! sh "$ROOT/lib/rt/build/build.sh" "$CFG" "$t" >"$ROOT/lib/rt/obj/package-$t.log" 2>&1; then
+            tail -20 "$ROOT/lib/rt/obj/package-$t.log" >&2
+            die "the runtime build failed for $t -- lib/rt/obj/package-$t.log"
+        fi
+        note "runtime built [$t]"
         note "building the size runtime [MinSizeRel $t]"
-        sh "$ROOT/lib/rt/build/build.sh" MinSizeRel "$t" >"$ROOT/lib/rt/obj/package-$t-s.log" 2>&1 &
-        _pids_rt="$_pids_rt $t-s:$!"
-    done
-    # The graphics library too -- see the note below on why its failure is not fatal.
-    _pids_gfx=""
-    for t in $TARGETS; do
-        gfx_has_target "$t" || continue
-        note "building the graphics library [$CFG $t]"
-        sh "$ROOT/lib/gfx/build/build.sh" "$CFG" "$t" >"$ROOT/lib/gfx/obj/package-$t.log" 2>&1 &
-        _pids_gfx="$_pids_gfx $t:$!"
-    done
-    for _tp in $_pids_rt; do
-        if ! wait "${_tp#*:}"; then
-            tail -20 "$ROOT/lib/rt/obj/package-${_tp%%:*}.log" >&2
-            die "the runtime build failed for ${_tp%%:*} -- lib/rt/obj/package-${_tp%%:*}.log"
+        if ! sh "$ROOT/lib/rt/build/build.sh" MinSizeRel "$t" >"$ROOT/lib/rt/obj/package-$t-s.log" 2>&1; then
+            tail -20 "$ROOT/lib/rt/obj/package-$t-s.log" >&2
+            die "the size runtime build failed for $t -- lib/rt/obj/package-$t-s.log"
         fi
-        note "runtime built [${_tp%%:*}]"
-    done
-
-    # THE GRAPHICS LIBRARY IS BUILT, NOT SCAVENGED. It used to be neither: the
-    # copy below looked for an archive nobody here had built, so whether a
-    # toolchain shipped graphics came down to whether someone had happened to
-    # run lib/gfx/build/build.sh by hand first, and to which configuration.
-    #
-    # A FAILURE HERE IS NOTED, NOT FATAL, and that is deliberate: aborting the whole
-    # package because the graphics library could not build would take the compiler
-    # and runtime down with it. The manifest records the reason instead, so the
-    # absence is never silent.
-    # obj/ IS GITIGNORED, so a fresh clone or worktree has none -- the mkdir above makes
-    # it, or the redirect failed before build.sh ran, reporting a build failure that never
-    # happened and packaging whatever stale archive was lying about.
-    for _tp in $_pids_gfx; do
-        _gl="$ROOT/lib/gfx/obj/package-${_tp%%:*}.log"
-        if wait "${_tp#*:}"; then
-            note "graphics library built [${_tp%%:*}]"
-        else
-            GFX_FAIL=$( grep -m1 -iE 'error|die|no ' "$_gl" | cut -c1-120 )
-            [ -n "$GFX_FAIL" ] || GFX_FAIL="see lib/gfx/obj/package-${_tp%%:*}.log"
-            note "WARNING: graphics build failed for ${_tp%%:*} -- $GFX_FAIL"
+        if gfx_has_target "$t"; then
+            note "building the graphics library [$CFG $t]"
+            if sh "$ROOT/lib/gfx/build/build.sh" "$CFG" "$t" >"$ROOT/lib/gfx/obj/package-$t.log" 2>&1; then
+                note "graphics library built [$t]"
+            else
+                GFX_FAIL=$( grep -m1 -iE 'error|die|no ' "$ROOT/lib/gfx/obj/package-$t.log" | cut -c1-120 )
+                [ -n "$GFX_FAIL" ] || GFX_FAIL="see lib/gfx/obj/package-$t.log"
+                note "WARNING: graphics build failed for $t -- $GFX_FAIL"
+            fi
         fi
     done
+    PATH=$BASE_PATH; TIKO_SYSROOT=$BASE_TIKO_SYSROOT; export PATH TIKO_SYSROOT
 else
     note "--no-build: packaging what is already built"
     # WHAT bin/ HOLDS IS WHAT build.sh LAST STAMPED, and a newer timestamp cannot tell a
@@ -464,7 +469,20 @@ rm -rf "$OUT"/pkg/vendor/*/patches     # fetch.toml's too: vendorfetch.sh reads 
 rm -rf "$OUT/pkg/vendor/tkControls/fonts" "$OUT/pkg/vendor/tkControls/tkCodeEdit/scintk/bin" \
        "$OUT/pkg/vendor/tkControls/tkCodeEdit/scintk/out" "$OUT/pkg/vendor/SDL3/static/bin" \
        "$OUT/pkg/vendor/raylib6/shared/bin"
-sh "$ROOT/build/vendorfetch.sh" --out "$OUT/pkg" || die "vendorfetch.sh failed: the vendor packages have no binaries"
+if [ "$NEED_MSVC_VENDOR" = "1" ]; then
+    sh "$ROOT/build/vendorfetch.sh" --out "$OUT/pkg" || die "vendorfetch.sh failed for MSVC"
+fi
+if [ "$NEED_MINGW64_VENDOR" = "1" ]; then
+    TIKO_VENDOR_FLAVOUR=mingw TIKO_VENDOR_ARCH=x86_64 TIKO_MINGW_ROOT="$MINGW64_ROOT" \
+        sh "$ROOT/build/vendorfetch.sh" --out "$OUT/pkg" || die "vendorfetch.sh failed for MinGW64"
+fi
+if [ "$NEED_MINGW32_VENDOR" = "1" ]; then
+    TIKO_VENDOR_FLAVOUR=mingw TIKO_VENDOR_ARCH=x86 TIKO_MINGW_ROOT="$MINGW32_ROOT" \
+        sh "$ROOT/build/vendorfetch.sh" --out "$OUT/pkg" || die "vendorfetch.sh failed for MinGW32"
+fi
+if [ "$HOST" != "windows" ]; then
+    sh "$ROOT/build/vendorfetch.sh" --out "$OUT/pkg" || die "vendorfetch.sh failed: the vendor packages have no binaries"
+fi
 for t in $TARGETS; do
     is_android "$t" || continue
     sh "$ROOT/build/vendorfetch.sh" --out "$OUT/pkg" --target "$t" || die "vendorfetch.sh --target $t failed"
@@ -473,12 +491,26 @@ for t in $TARGETS; do
     [ -f "$OUT/pkg/vendor/SDL3/lib/android/classes.dex" ] || die "packaged vendor/SDL3 has no lib/android/classes.dex -- 'tiko -app' would refuse"
     note "vendor packages -> pkg/vendor/*/lib for $t"
 done
+VENDOR_TABLES=""
+for t in $TARGETS; do
+    case $t in
+        windows-x86_64) _vt=windows ;;
+        win64) _vt=windows-mingw ;;
+        win32) _vt=windows-mingw-x86 ;;
+        *) _vt=$t ;;
+    esac
+    case " $VENDOR_TABLES " in *" $_vt "*) ;; *) VENDOR_TABLES="$VENDOR_TABLES $_vt" ;; esac
+done
 for _vm in "$OUT"/pkg/vendor/*/; do
     _vft="$ROOT/pkg/vendor/$( basename "$_vm" )/fetch.toml"
-    if grep -q "^\[$HOST\." "$_vft" 2>/dev/null; then
+    _has=0
+    for _vt in $VENDOR_TABLES; do
+        if grep -q "^\[$_vt\." "$_vft" 2>/dev/null; then _has=1; fi
+    done
+    if [ "$_has" = "1" ]; then
         [ -n "$( ls "$_vm/lib" 2>/dev/null )" ] || die "packaged $_vm has no lib/ -- '#import \"vendor/...\"' would not link"
     else
-        note "packaged $_vm has no $HOST binaries: its fetch.toml has no [$HOST.<n>] entry"
+        note "packaged $_vm has no binaries for targets $TARGETS"
     fi
     [ -f "$_vm/LICENSE" ] || die "packaged $_vm has no LICENSE"
 done
@@ -638,6 +670,7 @@ if [ -z "${TIKO_AR:-}" ] && [ "$HOST" = "macos" ] && ! command -v llvm-ar > /dev
 fi
 FBCU_STATE=""
 for t in $TARGETS; do
+    use_target_env "$t"
     _fo="$OUT/.fbcunit.$t"
     rm -rf "$_fo"; mkdir -p "$_fo"
     _fok=1
@@ -788,6 +821,7 @@ verify_gfx( ) {
     _tmp="$OUT/.verifygfx.$_t"
     rm -rf "$_tmp"; mkdir -p "$_tmp"
     printf 'screenres 64, 48, 32, , -1
+screenset 0, 0
 pset ( 3, 4 ), &hFF8040
 dim as long c = point( 3, 4 )
 screen 0
@@ -893,7 +927,8 @@ print win.UpperCase( "tiko" ); " "; hex( gdiplus.GDIP_ARGB( &hFF, 1, 2, 3 ) )
 ' > "$_tmp/syswin.tiko"
         ( cd "$OUT" && TIKO_MODCACHE=".verifysyswin.$_t/cache" "./${BINSUB}tiko$EXT" -target "$_t" \
             ".verifysyswin.$_t/syswin.tiko" -o ".verifysyswin.$_t/syswin$EXT" ) >"$_tmp/log" 2>&1 || true
-        if [ -f "$_tmp/syswin$EXT" ] && [ "$( "$_tmp/syswin$EXT" 2>/dev/null | tr -d '' )" = "TIKO FF010203" ]; then
+        if [ -f "$_tmp/syswin$EXT" ] && [ "$( "$_tmp/syswin$EXT" 2>/dev/null | tr -d '
+' )" = "TIKO FF010203" ]; then
             VERIFY_LINES="$VERIFY_LINES
   $_t  sys/win PASS -- all seven modules imported, compiled, linked and ran"
         else
@@ -991,6 +1026,7 @@ print "app ok"
 
 if [ "$DO_VERIFY" = "1" ]; then
     for t in $TARGETS; do
+        use_target_env "$t"
         if is_android "$t"; then
             note "verifying $t: compile and link (no device here)"
             verify_android "$t"
@@ -1008,6 +1044,7 @@ else
     VERIFY_LINES="
   not run -- pass --verify to compile and run a program per target"
 fi
+PATH=$BASE_PATH; TIKO_SYSROOT=$BASE_TIKO_SYSROOT; export PATH TIKO_SYSROOT
 
 # ---------------------------------------------------------------- the editor
 #
@@ -1039,19 +1076,38 @@ if [ "$DO_TKEDIT" = "1" ]; then
     # bin/parser_<os>_<arch>.a with THE COMPILER JUST PACKAGED -- the one that builds tkedit below, so
     # each std module is one copy at tkedit's link (bin/ keeps the tree's compiler untouched)
     note "building tikoParser for tkedit"
-    if ! TIKO_SEED="$OUT/${BINSUB}tiko$EXT" sh "$ROOT/build/build.sh" Release --lib >>"$_tklog" 2>&1; then
-        _tkfail="tikoParser did not build"
+    TKEDIT_TARGET=$DEFTARGET
+    if [ "$HOST" = "windows" ]; then
+        if [ "$HOSTARCH" = "x86" ]; then
+            TKEDIT_TARGET=win32; TIKO_MINGW_TARGET=i686-w64-mingw32; TKEDIT_MINGW_ROOT=$MINGW32_ROOT
+        else
+            TKEDIT_TARGET=win64; TIKO_MINGW_TARGET=x86_64-w64-mingw32; TKEDIT_MINGW_ROOT=$MINGW64_ROOT
+        fi
+        if ! TIKO_SEED="$OUT/${BINSUB}tiko$EXT" TIKO_BUILD_FLAVOUR=mingw \
+                 TIKO_MINGW_TARGET="$TIKO_MINGW_TARGET" TIKO_MINGW_ROOT="$TKEDIT_MINGW_ROOT" \
+                 TIKO_SYSROOT="$TKEDIT_MINGW_ROOT" \
+                 sh "$ROOT/build/build.sh" Release --lib >>"$_tklog" 2>&1; then
+            _tkfail="tikoParser did not build"
+        fi
+        _tkp="$ROOT/bin/parser_windows_${HOSTARCH}_mingw.a"
+    else
+        if ! TIKO_SEED="$OUT/${BINSUB}tiko$EXT" sh "$ROOT/build/build.sh" Release --lib >>"$_tklog" 2>&1; then
+            _tkfail="tikoParser did not build"
+        fi
+        case $HOST in
+            macos) _tkp="$ROOT/bin/parser_macos_arm64.a" ;;
+            *)     _tkp="$ROOT/bin/parser_${HOSTOS}_${HOSTARCH}.a" ;;
+        esac
     fi
-    case $HOST in
-        macos) _tkp="$ROOT/bin/parser_macos_arm64.a" ;;
-        *)     _tkp="$ROOT/bin/parser_${HOSTOS}_${HOSTARCH}.a" ;;
-    esac
     [ -n "$_tkfail" ] || [ -f "$_tkp" ] || _tkfail="no $_tkp after the build"
     if [ -z "$_tkfail" ]; then
         note "building tkedit with the packaged compiler"
         rm -rf "$TKSRC/src/app/out/release"
+        if [ "$HOST" = "windows" ]; then
+            export TIKO_SYSROOT="$TKEDIT_MINGW_ROOT" TIKO_MINGW_ROOT="$TKEDIT_MINGW_ROOT"
+        fi
         if ! ( cd "$TKSRC/src/app" && TIKO_MODCACHE="$TKSRC/out/modcache-package" \
-                 "$OUT/${BINSUB}tiko$EXT" build --profile release ) >>"$_tklog" 2>&1; then
+                 "$OUT/${BINSUB}tiko$EXT" build -target "$TKEDIT_TARGET" --profile release ) >>"$_tklog" 2>&1; then
             _tkfail="the build failed -- lib/rt/obj/package-tkedit.log"
         fi
     fi
@@ -1222,10 +1278,10 @@ SIZE=$( du -sh "$OUT" | cut -f1 | tr -d ' ' )
     say "                  where there is one -- the compiler looks for all"
     say "                  three in the same directory."
     if [ "$HOST" = "windows" ]; then
-        say "-target win64 (the MinGW ABI) is not packaged: no lib/win64. The"
-        say "                  compiler accepts it; its runtime is built from"
-        say "                  lib/rt in tiko-lang, and it links with a MinGW-w64"
-        say "                  on PATH."
+        say "-target win64 and win32 (the MinGW ABI) are packaged with their"
+        say "                  runtime, graphics and static vendor archives. Linking"
+        say "                  needs the matching MinGW-w64 sysroot on PATH or"
+        say "                  TIKO_SYSROOT; no Visual Studio is required."
         say
         say "lib/windows-x86_64/*.lib   MSVC-format import libraries for the Windows"
         say "                  DLLs, built from tiko-lang's lib/implib/*.def by"

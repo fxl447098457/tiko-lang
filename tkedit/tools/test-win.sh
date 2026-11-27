@@ -32,10 +32,19 @@ run() {      # run <name> <dir> <command...>
 # THIS compiler (its std module objects are one copy at the link). Made here when it is missing or older
 # than the compiler; a log of the build goes to out/parserlib.log.
 parserlib() {
-    local lib=$ROOT/../bin/parser_windows_x86_64.a
+    local lib arch=x86_64 tag=
+    if [ "${TIKO_BUILD_FLAVOUR:-}" = mingw ]; then
+        tag=_mingw
+        case "${TIKO_MINGW_TARGET:-x86_64-w64-mingw32}" in
+            i686-*) arch=x86 ;;
+        esac
+    fi
+    lib=$ROOT/../bin/parser_windows_${arch}${tag}.a
     [ -f "$lib" ] && [ "$lib" -nt "$TIKO" ] && return 0
     mkdir -p "$ROOT/out"
-    ( cd "$ROOT/.." && TIKO_SEED="$TIKO" bash build/build.sh Release --lib ) > "$ROOT/out/parserlib.log" 2>&1 \
+    ( cd "$ROOT/.." && TIKO_SEED="$TIKO" TIKO_BUILD_FLAVOUR="${TIKO_BUILD_FLAVOUR:-}" \
+        TIKO_MINGW_TARGET="${TIKO_MINGW_TARGET:-}" bash build/build.sh Release --lib ) \
+        > "$ROOT/out/parserlib.log" 2>&1 \
         || { echo "parser library: BUILD FAILED (out/parserlib.log)"; bad=$((bad+1)); return 1; }
 }
 

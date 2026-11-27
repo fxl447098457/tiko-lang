@@ -69,6 +69,13 @@ int shapes_log(int level, const char *fmt, ...);
 void shapes_sort(void *base, size_t n, size_t size, compare_fn cmp);
 static inline int shapes_twice(int x) { return x + x; }
 
+#if defined(__i386__) && defined(_WIN32)
+int __attribute__((stdcall)) shapes_stdcall(int value);
+int __attribute__((pascal)) shapes_pascal(int value);
+typedef int (__attribute__((stdcall)) *stdcall_fn)(int);
+typedef int (__attribute__((pascal)) *pascal_fn)(int);
+#endif
+
 /* globals */
 extern int shapes_count;
 extern const char *const shapes_version;
@@ -81,7 +88,10 @@ int print(const char *s);
 struct type_names { int mod; int next; int dim; int string; };
 
 /* __int128: tiko's int128 / uint128, under both spellings clang has -- the keyword and its
-   builtin typedefs. A record holding one is 16-aligned by its own rule, not over-aligned. */
+   builtin typedefs. A record holding one is 16-aligned by its own rule, not over-aligned.
+   Clang's C frontend refuses __int128 on i386, so win32 exercises the calling-convention
+   declarations above instead. */
+#if !defined(__i386__)
 typedef __int128 shapes_i128;
 typedef unsigned __int128 shapes_u128;
 typedef __int128_t shapes_i128t;
@@ -91,3 +101,4 @@ __int128 shapes_wide(__int128 a, unsigned __int128 *b, struct wide16 w);
 /* a 128-bit macro value: libclang reads only its low 64 bits, so none is kept */
 #define SHAPES_WIDE_BIG ((__int128)1 << 100)
 #define SHAPES_WIDE_ONES (~(unsigned __int128)0)
+#endif

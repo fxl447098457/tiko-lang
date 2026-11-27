@@ -120,9 +120,9 @@ A subcommand is the first word on the command line. It builds a project from its
 
 | Option | What it does |
 |---|---|
-| `-target ‹name›` | windows-x86_64 (the Windows default), linux-x86_64, linux-arm64, macos-arm64, android-x86_64 or android-arm64 |
-| `-m64` | 64-bit target (the only supported width) |
-| `-m32` | rejected: 32-bit is not supported (x86-64 only) |
+| `-target ‹name›` | windows-x86_64 (the Windows default), win64, win32, linux-x86_64, linux-arm64, macos-arm64, android-x86_64 or android-arm64 |
+| `-m64` | the 64-bit member of the target's family (the default width) |
+| `-m32` | the 32-bit member of the target's family; Windows only (win32) |
 | `-s ‹console|gui›` | Windows subsystem of an executable; console is the default |
 | `-t ‹kbytes›` | stack reserve and commit of a Windows executable or DLL, in KB (default 2048, minimum 64) |
 

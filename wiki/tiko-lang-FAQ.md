@@ -16,13 +16,15 @@ If it is `#lang "fb"` code, that is the aim. The known exceptions are listed on 
 Normally not. Toolchains are published ready-built as GitHub [Releases](https://github.com/PaulSquires/tiko-lang/releases) -- the newest one titled *tiko toolchains* -- with one archive per host: `tiko-windows-x86_64-<commit>.zip`, `tiko-linux-x86_64-<commit>.tar.gz`, `tiko-linux-arm64-<commit>.tar.gz` and `tiko-macos-arm64-<commit>.tar.gz`. Unpack the one for your host -- it holds one directory, `tiko-lang/`, with the compiler and the tkEdit editor -- and it is ready; the only other thing it needs is clang, to run (see *Which backends?* below). Building tiko from its source is for working on the compiler itself: `bash build/package.sh --verify` builds a toolchain for your host, compiling tiko with the seed -- the earlier tiko release `sh seed/fetch-seed.sh` fetches. See [Quick Start](Quick-Start).
 
 **Which targets are supported?**
-- `windows-x86_64`: the default on Windows, and it needs no Visual Studio.
+- `windows-x86_64`: the default on Windows, linked against Microsoft's Universal C Runtime; it needs no Visual Studio.
+- `win64`: Windows x86-64 with the MinGW ABI and C runtime; it needs no Visual Studio.
+- `win32`: Windows x86 with the MinGW ABI and C runtime; it needs no Visual Studio.
 - `linux-x86_64`: the default on x86-64 Linux.
 - `linux-arm64`: the default on arm64 (aarch64) Linux, with glibc 2.35 or newer.
 - `macos-arm64`: the default on macOS (Apple Silicon, macOS 13 or newer). Programs for it link on a Mac, because the link needs Apple's linker and SDK; elsewhere `-c` compiles an object.
 - `android-arm64` (phones and tablets) and `android-x86_64` (the emulator): *experimental*. Android 10 or newer, built from the Windows toolchain with Android's NDK; `-app` makes an installable APK. See [Android](Android).
 
-ARM64 means Linux and macOS: there is no Windows ARM64 target. `-m32` and `-target win32` are refused.
+ARM64 means Linux, macOS and Android: there is no Windows ARM64 target. `-m32` selects `win32` on Windows; another target family has no 32-bit member and reports `TKO0104`.
 
 **Which backends?**
 One: tiko emits LLVM IR and runs clang. There is no `-gen` switch. clang 18 or newer must be installed; tiko takes `TIKO_CLANG` first, then the default install path, then `clang` on `PATH`. See [LLVM Backend](Category-LLVM-Backend).

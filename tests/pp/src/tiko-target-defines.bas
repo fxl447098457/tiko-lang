@@ -36,7 +36,16 @@
         #error "__FB_LINUX__ defined on Android -- fbc does not"
     #endif
 #endif
-#if defined( TIKO_ARCH_X86_64 ) = defined( TIKO_ARCH_ARM64 )
+#if defined( TIKO_ARCH_X86_64 )
+    #if defined( TIKO_ARCH_ARM64 ) orelse defined( TIKO_ARCH_X86_32 )
+        #error "more than one TIKO_ARCH_* defined"
+    #endif
+#elseif defined( TIKO_ARCH_ARM64 )
+    #ifdef TIKO_ARCH_X86_32
+        #error "more than one TIKO_ARCH_* defined"
+    #endif
+#elseif defined( TIKO_ARCH_X86_32 )
+#else
     #error "not exactly one TIKO_ARCH_* defined"
 #endif
 #ifdef TIKO_ARCH_X86_64
@@ -47,6 +56,18 @@
         #error "TIKO_ARCH_X86_64 without __FB_X86__"
     #endif
     #print arch=x86_64
+#endif
+#ifdef TIKO_ARCH_X86_32
+    #if TIKO_ARCH_X86_32 <> 1
+        #error "TIKO_ARCH_X86_32 is not 1"
+    #endif
+    #ifndef __FB_X86__
+        #error "TIKO_ARCH_X86_32 without __FB_X86__"
+    #endif
+    #ifdef __FB_64BIT__
+        #error "TIKO_ARCH_X86_32 with __FB_64BIT__"
+    #endif
+    #print arch=x86
 #endif
 #ifdef TIKO_ARCH_ARM64
     #if TIKO_ARCH_ARM64 <> 1
