@@ -142,7 +142,8 @@ beside it.
 tkEdit looks for lldb-dap on your `PATH`, then where LLVM installs it. If it cannot find one, it
 says so in the status line; set its path as `adapter` in the `[debug]` table of `settings.toml`.
 
-- **Windows:** lldb-dap is in LLVM's `bin` folder, beside clang. It needs a 64-bit Python on the
+- **Windows:** lldb-dap is in LLVM's `bin` folder, beside clang. Use a native i686 adapter for a
+  `win32` program; a 64-bit adapter cannot reliably step through WOW64. It needs Python on the
   `PATH`: any **Python 3** for LLVM 23 (it loads `python3.dll`), **Python 3.10** for LLVM 21
   (`python310.dll`). tkEdit checks for the one your LLVM loads before it starts.
 - **Linux:** install your distribution's `lldb` package, which provides `lldb-dap` or a

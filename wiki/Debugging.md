@@ -121,11 +121,11 @@ A click in the margin toggles a bookmark; `margin_click = "breakpoint"` in the `
 
 ### lldb-dap
 
-tkEdit looks for lldb-dap on the `PATH`, then in LLVM's usual places; `adapter` in the `[debug]` table of `settings.toml` names it explicitly.
+tkEdit looks for lldb-dap on the `PATH`, then in LLVM's usual places; `adapter` in the `[debug]` table of `settings.toml` names it explicitly. `TKEDIT_LLDB_DAP` overrides both for a test or a portable toolchain.
 
 | System | lldb-dap |
 | --- | --- |
-| Windows | LLVM's `bin` folder, beside clang. It loads a 64-bit Python, which must be on the `PATH`: LLVM 23 takes any **Python 3** (`python3.dll`), LLVM 21 only **Python 3.10** (`python310.dll`). tkEdit reads which from `liblldb.dll` and checks for it before it starts. |
+| Windows | LLVM's `bin` folder, beside clang. A 64-bit program uses the 64-bit adapter; a `win32` program needs a native i686 adapter because 64-bit lldb cannot step through WOW64 reliably. Keep the adapter's `liblldb.dll` and any LLVM runtime DLLs beside it. The adapter loads Python: LLVM 23 takes any **Python 3** (`python3.dll`), LLVM 21 only **Python 3.10** (`python310.dll`). tkEdit reads which from `liblldb.dll` and checks for it before it starts. |
 | Linux | The distribution's `lldb` package: `lldb-dap`, or a numbered `lldb-dap-NN` (the newest is taken). |
 | macOS | Apple's Command Line Tools. macOS lets it control a program only in **Developer Mode** -- `sudo DevToolsSecurity -enable` -- or when the dialog asking for it is allowed. |
 

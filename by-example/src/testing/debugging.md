@@ -67,12 +67,14 @@ them all, and the buttons at the end of its tab row remove the selected one,
 or every one. Resting the mouse on a name in the source shows its value.
 
 ```admonish info title="lldb-dap"
-tkEdit drives **lldb-dap**, from LLVM. On Windows it is beside clang, and it
-needs Python 3.10 (64-bit) on the `PATH`. On Linux it is in the `lldb`
-package. On macOS it comes with the Command Line Tools, and macOS lets it
+tkEdit drives **lldb-dap**, from LLVM. On Windows it is beside clang; a `win32`
+program needs a native i686 adapter, while a 64-bit program uses the 64-bit one.
+It needs Python 3.10 on the `PATH` for LLVM 21, or any Python 3 for LLVM 23. On
+Linux it is in the `lldb` package. On macOS it comes with the Command Line Tools, and macOS lets it
 control a program only in Developer Mode (`sudo DevToolsSecurity -enable`) or
 when you allow it. When it is somewhere else, set its path as `adapter` in the
-`[debug]` table of `settings.toml`.
+`[debug]` table of `settings.toml`, or set `TKEDIT_LLDB_DAP` for a test or
+portable toolchain.
 ```
 
 ### Activities

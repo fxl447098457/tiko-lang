@@ -270,7 +270,9 @@ end function
 
 ' The adapter: the one set (settings), else platform.FindLldbDap's search.
 public function Engine_AdapterPath( ) as string
-    dim as ustring found = platform.FindLldbDap( gDbgE.adapter )
+    dim as ustring configured = gDbgE.adapter
+    if len( configured ) = 0 then configured = environ( "TKEDIT_LLDB_DAP" )
+    dim as ustring found = platform.FindLldbDap( configured )
     return found
 end function
 
@@ -305,6 +307,21 @@ private function PeU64_( byref f as fs.File, byval at_ as longint ) as ulongint
     dim as ulongint v = 0
     f.ReadAt( at_, cptr( ubyte ptr, @v ), 8 )
     return v
+end function
+
+private function PeIs32_( byref f as fs.File ) as boolean
+    dim as long peOff = cast( long, PeU32_( f, &h3C ) )
+    if PeU32_( f, peOff ) <> &h4550 then return false
+    return PeU16_( f, peOff + 4 ) = &h14C
+end function
+
+private function DebuggeeIs32_( ) as boolean
+    dim as fs.File f
+    dim as ustring uexe = gDbgE.exe
+    if f.OpenRead( uexe ).IsOk( ) = false then return false
+    dim as boolean is32 = PeIs32_( f )
+    f.Close( )
+    return is32
 end function
 
 ' PE: lld-link writes a section name longer than eight bytes as '/NNN', an offset into the COFF
@@ -628,6 +645,11 @@ private sub HandleStop_( byref d as JDOC, byval body as long )
     gDbgE.atEntry = false
 
     dim as boolean isExc = (why = "exception")
+    if isExc andalso (instr( lcase( desc ), "exception 0x4000001f" ) > 0) then
+        dim as JDOC c
+        Dap_Request( "continue", "{""threadId"":" & tid & "}", c )
+        exit sub
+    end if
     dim as boolean isBrk = (instr( lcase( desc ), "0x80000003" ) > 0)
     dim as boolean isBreakExc = isExc andalso isBrk
     ' LINUX / macOS: a pause stops the process with SIGSTOP, which lldb-dap 22 reports as an
@@ -792,8 +814,47 @@ private sub Configure_( )
 end sub
 
 #if defined( TIKO_OS_WINDOWS )
+' A 32-bit image is launched by lldb itself. Attaching to a suspended WOW64
+' process makes 64-bit lldb stop in Wow64AllocateTemp before user breakpoints.
+private function LaunchDap32_( ) as boolean
+    dim as JDOC d
+    Dap_Request( "initialize", "{""clientID"":""tkedit"",""adapterID"":""lldb-dap"",""linesStartAt1"":true," & _
+                 """columnsStartAt1"":true,""pathFormat"":""path""}", d )
+    dim as string dirOf = left( gDbgE.exe, instrrev( gDbgE.exe, any "\/" ) )
+    dim as string argJ = ""
+    for each a as ustring in gDbgE.args
+        dim as string a8 = a
+        argJ &= iif( len( argJ ), ",", "" ) & Q_( a8 )
+    next
+    dim as string req = "{""program"":" & Q_( gDbgE.exe ) & ",""cwd"":" & Q_( dirOf ) & _
+                        ",""args"":[" & argJ & "],""stopOnEntry"":false,""initCommands"":" & InitCommands_( ) & "}"
+    dim as long launchSeq = Dap_Send( "launch", req )
+    dim as string whyNot
+    if WaitInitialized_( launchSeq, whyNot ) = false then
+        Dap_Close( )
+        Fail_( whyNot )
+        return false
+    end if
+    Configure_( )
+    dim as string resp
+    if Dap_Wait( launchSeq, resp, 15000 ) = false then
+        Dap_Close( ) : Fail_( "lldb-dap did not answer" ) : return false
+    end if
+    JParse( d, resp )
+    if JBool( d, JGet( d, 0, "success" ) ) = false then
+        dim as string why = JGetStr( d, JGet( d, JGet( d, 0, "body" ), "error" ), "format" )
+        if len( why ) = 0 then why = JGetStr( d, 0, "message" )
+        Dap_Close( )
+        Fail_( why )
+        return false
+    end if
+    gDbgE.running = true
+    return true
+end function
+
 ' WINDOWS: the program created suspended in a console of its own, lldb-dap attached, resumed.
 private function Launch_( ) as boolean
+    if DebuggeeIs32_( ) then return LaunchDap32_( )
     dim as string dirOf = left( gDbgE.exe, instrrev( gDbgE.exe, any "\/" ) )
     ' the command line as Run's .cmd writes it: the program and each argument in quotes
     dim as ustring q = chr( 34 )
@@ -1302,15 +1363,20 @@ end sub
 ' program's; one they do is theirs unless lldb can place it elsewhere (a module of data alone has
 ' no lines for it to look at, and a program's own 'strings.tiko' has).
 private function IsLibFile_( byref file_ as const string, byref libNames as const string, byval fid as long ) as boolean
-    if instr( libNames, "|" & lcase( file_ ) & "|" ) = 0 then return false
+    dim as boolean known = instr( libNames, "|" & lcase( file_ ) & "|" ) > 0
     dim as JDOC d
     if Dap_Request( "evaluate", "{""expression"":" & Q_( "`source info -f " & file_ & " -c 1" ) & ",""frameId"":" & fid & _
-                    ",""context"":""repl""}", d, 5000 ) = false then return true
+                    ",""context"":""repl""}", d, 5000 ) = false then return known
     dim as string text = rtrim( JGetStr( d, JGet( d, 0, "body" ), "result" ), any !"\r\n " )
     dim as long p = instrrev( text, "): " )
-    if p = 0 then return true
+    if p = 0 then return known
     dim as ustring where_ = mid( text, p + 3 ), lib_ = gDbgE.libDir
-    return fs.PathStartsWith( where_, lib_ )
+    if (len( lib_ ) > 0) andalso fs.PathStartsWith( where_, lib_ ) then return true
+    dim as string key = lcase( where_ )
+    for i as long = 1 to len( key )
+        if key[i - 1] = asc( "\" ) then key[i - 1] = asc( "/" )
+    next
+    return (instr( key, "/lib/rt/src/" ) > 0) orelse (instr( key, "/pkg/" ) > 0)
 end function
 
 ' One line of 'target variable -c': "app.exe`file.tiko:12: (type) name = value". FALSE for a line
@@ -1359,6 +1425,7 @@ private sub ListAllGlobals_( byval fid as long )
         if e = 0 then e = len( text ) + 1
         dim as string file_, nm
         if ParseGlobalLine_( rtrim( mid( text, st, e - st ), chr( 13 ) ), file_, nm ) then
+            if (lcase( nm ) = "__ctor_list__") orelse (lcase( nm ) = "__dtor_list__") then st = e + 1 : continue do
             dim as boolean seen = false
             for i as long = 0 to gDbgE.extN - 1
                 if lcase( gDbgE.extNames(i) ) = lcase( nm ) then seen = true : exit for
@@ -1421,8 +1488,10 @@ private sub EnsureScopes_( byval fi as long, byval wantGlobals as boolean )
             gDbgE.locFirst( fi ) = LoadVars_( ref_, fid, "", gDbgE.locCount( fi ) )
             gDbgE.locLoaded( fi ) = true
         elseif (nm = "globals") andalso wantGlobals then
-            gDbgE.globFirst = LoadVars_( ref_, fid, "", gDbgE.globCount )
-            gDbgE.globLoaded = true
+            '' lldb's frame globals include the linked runtime. The filtered
+            '' 'target variable' list below contains the program's modules only.
+            gDbgE.globFirst = gDbgE.poolN
+            gDbgE.globCount = 0
         end if
     next
     if wantGlobals then
